@@ -1,4 +1,4 @@
-project_state_version: 9
+project_state_version: 10
 run_name: qm9cond_costgt
 tag: real
 seed: 12345
@@ -23,34 +23,6 @@ lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1
 min_lr: 1.0e-06
-lr_warmup_ratio: 10
-adaptive_lr:
-  control_flow_lr: false
-  warmup_steps: 1000
-  envelope_freeze: true
-  seed_lr: 0.000125
-  bounds:
-  - 0.01
-  - 2000.0
-  calibration:
-    alpha_target: 4.0
-    eta_up: 0.25
-    eta_down: 0.5
-  divergence_loss_abs: 1000000000.0
-  divergence_grad_abs: 1000000000.0
-  divergence_cut: 0.5
-  ray_calibration:
-    period: 500
-    n_sub: 8
-    alphas:
-    - 0
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
 weight_decay: 0.0001
 use_weight_decay: false
 compile_policy: auto
@@ -65,7 +37,7 @@ grad_clip_guard:
   max_ratio: 100.0
   refresh_on_stage: true
 ema_decay: null
-max_reloads_per_1k_steps: 0.2
+max_reloads_per_1k_steps: 1.0
 model:
   full_flow: false
   s_emb_dim: 512
@@ -401,7 +373,7 @@ controller:
   lookahead_horizon: 5
   lookahead_trend_alpha: 0.1
 grad_geometry:
-  enabled: true
+  enabled: false
   every: 50
 buffers:
   prior_buffer:
@@ -475,3 +447,19 @@ energy_config:
   lj_coeff: 1.0
   reward_range: 250
   analyze_kwargs: {}
+lr_control:
+  seed_lr: 0.000125
+  control_flow_lr: false
+  ray_calibration:
+    period: 500
+    n_sub: 8
+    alphas:
+    - 0
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+  mode: bracket

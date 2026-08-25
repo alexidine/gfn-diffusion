@@ -55,8 +55,11 @@ already evaluated at each alpha to form the sum, so they are free, and branch
 disagreement (fwd wanting 4x while replay wants 0.25x) is worth surfacing.
 """
 
+import contextlib
 import math
 from collections.abc import Mapping
+
+import numpy as np
 
 import torch
 
@@ -87,8 +90,28 @@ class RayCalibration:
                  n_sub: int = 8,
                  period: int = 500,
                  t_crit: float = 2.0,
-                 enabled: bool = False):
+                 enabled: bool = False,
+                 log_grid: bool = False,
+                 dual_score: bool = False):
         self.enabled = bool(enabled)
+        self.log_grid = bool(log_grid)
+        # SCORE EVERY ALPHA A SECOND WAY, and log the disagreement.
+        #
+        # The ray rates a step by replaying the STORED trajectory at each alpha.
+        # For a branch that trains on stored trajectories (`replay`) that is the
+        # trained objective exactly. For one whose live draw re-samples a
+        # backward path every step (`bwd` with dataset/prior sampling) it is
+        # not, and the two can rank step sizes differently -- the stored path
+        # was drawn from P_B at theta_before, so it goes off-distribution as
+        # alpha moves theta.
+        #
+        # With this on, each sub-batch is scored at every alpha BOTH ways and
+        # both are bracketed. `rayfresh/*` reports the second reading and
+        # `rayfresh/gap_octaves` their distance. NOTHING ACTUATES ON IT: the
+        # controller is still handed the replayed reading, so a run with this
+        # on is a run with a diagnostic, not a run with a different controller.
+        self.dual_score = bool(dual_score)
+        self.last_fresh = {}
         self.alphas = tuple(float(a) for a in alphas)
         if 0.0 not in self.alphas:
             raise ValueError('alphas must include 0.0 -- it is the baseline of every contrast')
@@ -219,7 +242,7 @@ class RayCalibration:
         return True
 
     @torch.no_grad()
-    def measure(self, draw_fn, loss_fn) -> dict | None:
+    def measure(self, draw_fn, loss_fn, loss_fn_alt=None) -> dict | None:
         """
         draw_fn() -> one fresh sub-batch. Called n_sub times.
         loss_fn(batch) -> the policy loss on `batch` at the CURRENT params,
@@ -227,6 +250,15 @@ class RayCalibration:
         docstring). A float is read as the composite alone.
         Neither may mutate training state: no tracker updates, no buffer writes,
         no log Z updates.
+
+        loss_fn_alt, optional, DIAGNOSTIC: a second scorer over the same batch
+        and the same alphas, bracketed identically and reported as
+        `rayfresh/*`. Nothing actuates on it -- the return value is still the
+        primary reading. Used to score each alpha the way training actually
+        does (fresh backward path) alongside the way the ray does it
+        (replayed), so the two can be compared on the same batches at the same
+        parameters. It is called under `_rng_pinned`, so it neither breaks the
+        pairing across alphas nor moves the run's random stream.
 
         Returns the reading, or None if there was no step to measure.
         """
@@ -258,21 +290,46 @@ class RayCalibration:
             # Sub-batch OUTER, alpha INNER: holds one sub-batch at a time and
             # keeps every contrast within a single batch.
             losses = []            # [k][i] -> {component: loss}, sub-batches x alphas
-            for _k in range(self.n_sub):
-                batch = draw_fn()
-                if batch is None:
-                    self._skip('no_batch')
-                    break
-                row = []
-                for a in self.alphas:
-                    _set(a)
-                    row.append(_as_components(loss_fn(batch)))
-                losses.append(row)
-                del batch
+            fresh = [] if loss_fn_alt is not None else None
+            if fresh is not None:
+                # Cleared up front so a stale reading cannot be re-logged if this
+                # calibration fails to produce one -- the exact way a dead sensor
+                # comes to look like a live one.
+                self.last_fresh = {}
+            with contextlib.ExitStack() as stack:
+                # Entered ONCE around the whole loop, so the run's random stream
+                # is restored exactly once and the sub-batches are independent
+                # draws from it in between.
+                couple = (stack.enter_context(_rng_pinned())
+                          if fresh is not None else None)
+                for _k in range(self.n_sub):
+                    batch = draw_fn()
+                    if batch is None:
+                        self._skip('no_batch')
+                        break
+                    row = []
+                    for a in self.alphas:
+                        _set(a)
+                        row.append(_as_components(loss_fn(batch)))
+                    losses.append(row)
+                    if fresh is not None:
+                        # SAME batch, SAME alphas, SAME parameters -- only the
+                        # scoring rule differs, so any gap between the two
+                        # readings is the scoring rule and nothing else.
+                        reseed = couple()
+                        frow = []
+                        for a in self.alphas:
+                            reseed()
+                            _set(a)
+                            frow.append(_as_components(loss_fn_alt(batch)))
+                        fresh.append(frow)
+                    del batch
             if len(losses) < 2:
                 self._skip('too_few_subbatches')
                 return None
             reading = self._summarise(losses, math.sqrt(sq))
+            if fresh is not None and len(fresh) >= 2:
+                self.last_fresh = self._reading(fresh, math.sqrt(sq)) or {}
             if reading is not None and self._armed_at is not None:
                 # Satisfied THIS period. Keyed on the armed step, so a calibration
                 # delayed across a boundary consumes that boundary too rather than
@@ -338,8 +395,19 @@ class RayCalibration:
                 'tests': tests}
 
     def _summarise(self, losses, step_norm):
+        """`_reading`, and it is THE one the controller reads (`self.last`)."""
+        got = self._reading(losses, step_norm)
+        if got is not None:
+            self.last = got
+        return got
+
+    def _reading(self, losses, step_norm):
         """
         Turn the [sub-batch][alpha] table of COMPONENT dicts into a reading.
+
+        PURE -- stores nothing. The dual-scoring diagnostic brackets its second
+        table with exactly this code, so the two readings are comparable by
+        construction rather than by a parallel implementation that could drift.
 
         `composite` carries the decision; every other component is bracketed the
         same way and reported as a diagnostic. A component missing from some
@@ -363,7 +431,7 @@ class RayCalibration:
 
         agg = [sum(row[i][COMPOSITE] for row in losses) / K
                for i in range(len(self.alphas))]
-        self.last = {
+        return {
             'alpha_star': primary['alpha_star'],
             'status': primary['status'],
             'lo': primary['lo'], 'hi': primary['hi'],
@@ -374,7 +442,6 @@ class RayCalibration:
             'aggregate': dict(zip(self.alphas, agg)),
             'losses': losses,
         }
-        return self.last
 
     # -------------------------------------------------------------------- log
 
@@ -426,25 +493,118 @@ class RayCalibration:
             'raycal/n_sub': float(r['n_sub']),
             'raycal/step_norm': r['step_norm'],
         }
-        # Per-tested-alpha evidence: the mean paired difference and its t. These
-        # ARE the measurement -- alpha_star is only their summary, so a reader who
-        # distrusts the bracket can rebuild it from these.
-        for x in r['tests']:
-            tag = f"{x['alpha']:g}".replace('.', 'p')
-            out[f'raycal/dL_{tag}'] = x['mean']
-            out[f'raycal/t_{tag}'] = max(-99.0, min(99.0, x['t']))
-        for a, v in r['aggregate'].items():
-            out[f"raycal/L_{f'{a:g}'.replace('.', 'p')}"] = v
+        # THE PER-ALPHA GRID IS NOT LOGGED (owner decision, 2026-08-23). It used
+        # to publish L_/dL_/t_ per tested alpha -- one key per rung per
+        # statistic, so a doubling grid of 8 alphas emitted ~20 keys and made
+        # this family the largest LR block in the run, burying `alpha_star` and
+        # `status`, the only two anything actuates on.
+        #
+        # WHAT THAT COSTS, stated rather than discovered: the grid was the raw
+        # evidence behind the bracket, so a reading that looks wrong can no
+        # longer be re-derived from the run alone -- `status` and `refused_reason`
+        # are now the whole audit trail. `r['tests']` and `r['aggregate']` are
+        # still built and still returned by `measure`, so a caller that wants the
+        # bracket has it; only the logging is gone.
+        #
         # Per-branch brackets, FREE: each branch is already evaluated at each
         # alpha to form the composite. Diagnostic only -- nothing actuates on
         # them -- but branch disagreement is the reading that says the fused
         # step is a compromise rather than a consensus.
+        # ...and the grid itself, OPT-IN (`ray_calibration.log_grid: true`). Off
+        # by default for the parsimony reason above, but a reading that looks
+        # wrong cannot be re-derived without it -- so it is one key away rather
+        # than a code change, for exactly the diagnosis this was needed for.
+        if self.log_grid:
+            for x in r['tests']:
+                tag = f"{x['alpha']:g}".replace('.', 'p')
+                out[f'raygrid/dL_{tag}'] = x['mean']
+                out[f'raygrid/t_{tag}'] = max(-99.0, min(99.0, x['t']))
+            for a, v in r['aggregate'].items():
+                out[f"raygrid/L_{f'{a:g}'.replace('.', 'p')}"] = v
         for name, c in r.get('components', {}).items():
             if name == COMPOSITE:
                 continue
-            out[f'raycal/alpha_star_{name}'] = c['alpha_star']
-            out[f'raycal/status_{name}'] = float(self._STATUS.get(c['status'], -1))
+            out[f'raycal/branch/alpha_star_{name}'] = c['alpha_star']
+            out[f'raycal/branch/status_{name}'] = float(self._STATUS.get(c['status'], -1))
+        # THE DIAGNOSTIC PAIR (`ray_calibration.dual_score: true`). Same batches,
+        # same alphas, same parameters, scored under a freshly sampled backward
+        # path instead of the stored one. Read `gap_octaves` first: it is
+        # log2(fresh alpha* / replayed alpha*), so 0 says the two objectives rank
+        # step sizes identically and the replayed reading is sound on this stage,
+        # while a large positive value says the replayed reading is calling for a
+        # smaller step than the trained objective wants. NaN either side means
+        # that reading did not resolve, which is itself informative -- a fresh
+        # pass that never brackets is a different failure from one that brackets
+        # somewhere else.
+        f = self.last_fresh
+        if f:
+            out['rayfresh/alpha_star'] = f['alpha_star']
+            out['rayfresh/status'] = float(self._STATUS.get(f['status'], -1))
+            a_f, a_r = f['alpha_star'], r['alpha_star']
+            if (math.isfinite(a_f) and math.isfinite(a_r)
+                    and a_f > 0.0 and a_r > 0.0):
+                out['rayfresh/gap_octaves'] = math.log2(a_f / a_r)
+            for name, c in f.get('components', {}).items():
+                if name == COMPOSITE:
+                    continue
+                out[f'rayfresh/branch/alpha_star_{name}'] = c['alpha_star']
+                out[f'rayfresh/branch/status_{name}'] = float(
+                    self._STATUS.get(c['status'], -1))
+            if self.log_grid:
+                for a, v in f['aggregate'].items():
+                    out[f"rayfresh/L_{f'{a:g}'.replace('.', 'p')}"] = v
         return out
+
+
+@contextlib.contextmanager
+def _rng_pinned():
+    """Common random numbers across the alpha grid, and no net RNG consumption.
+
+    TWO jobs, both required for a fresh-sampling pass to mean anything.
+
+    COUPLING, WITHIN A SUB-BATCH AND ONLY THERE. The bracket differences
+    L(2a) - L(0) are taken within a sub-batch. If every evaluation drew its own
+    backward path, that difference would be dominated by path noise rather than
+    by the parameter change, and the t-test would report noise at high
+    confidence -- precisely the failure that restricted this sensor to stored
+    trajectories in the first place. `couple()` hands back a `reseed` to call
+    before each alpha, making the sampled path a deterministic function of theta
+    so the contrast isolates the step.
+
+    Each sub-batch gets its OWN seed, and that two-level shape is the whole
+    reason this is not a single rewind. n_sub replicates sharing one seed would
+    share their path noise entirely, so the spread ACROSS sub-batches -- the
+    denominator of the t-statistic -- would carry none of it: the variance would
+    be understated and every bracket overconfident. A diagnostic built to expose
+    a sampling defect must not quietly commit one.
+
+    NEUTRALITY. The replayed pass consumes no RNG by construction, which is what
+    makes probed and unprobed runs comparable (`Trainer._probe_dealer`). A fresh
+    pass consumes plenty. Restoring on exit preserves that property, so turning
+    the diagnostic on does not itself change the run it is measuring.
+    """
+    cpu = torch.get_rng_state()
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    npy = np.random.get_state()
+
+    def couple():
+        # Drawn FROM the outer stream, so it differs sub-batch to sub-batch --
+        # and the outer stream is restored below, so drawing it costs nothing.
+        seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
+
+        def reseed():
+            torch.manual_seed(seed)          # CPU and every CUDA device
+            np.random.seed(seed)
+
+        return reseed
+
+    try:
+        yield couple
+    finally:
+        torch.set_rng_state(cpu)
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+        np.random.set_state(npy)
 
 
 def _as_components(value):

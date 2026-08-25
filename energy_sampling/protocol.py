@@ -153,7 +153,19 @@ SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
 # declared rather than derived from the active loss coefficients.
-LR_SENSOR_KINDS = ('ray', 'plateau', 'hyper', 'none')
+# DIAGNOSTIC ONLY since the LR bracket took over actuation (controller.py).
+# `plateau` is gone entirely -- it was a pure actuator with nothing to report.
+# `ray` and `hyper` are retained, OFF unless a stage names one, and neither
+# reaches a learning rate: alpha* was measured uncorrelated with the rate it
+# steered, and cos is a stationarity statistic with no fixed point. No canonical
+# config declares either.
+LR_SENSOR_KINDS = ('ray', 'hyper', 'none')
+
+#: `hot_lr_sensor.action`. ONE value, deliberately -- see Stage._parse_hot_lr_sensor.
+HOT_LR_ACTIONS = ('report',)
+#: `hot_lr_sensor.form`. `absolute` is required on a channel that crosses zero
+#: (`bwd/mle` runs +9.75 to -33.74); `log` is the log ratio to the floor.
+HOT_LR_FORMS = ('log', 'absolute')
 RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift', 'floor',
              'abs', 'if_missing', 'lookahead', 'anneal'}
 TERM_KEYS = {'metric', 'above', 'below', 'abs', 'patience'}
@@ -207,7 +219,7 @@ class Stage:
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
-                               'mle_gate'}
+                               'mle_gate', 'hot_lr_sensor'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -268,6 +280,7 @@ class Stage:
         self.buffer_servo = self._parse_buffer_servo(spec.get('buffer_servo'))
         self.lr_sensor = self._parse_lr_sensor(spec.get('lr_sensor'))
         self.mle_gate = self._parse_mle_gate(spec.get('mle_gate'))
+        self.hot_lr_sensor = self._parse_hot_lr_sensor(spec.get('hot_lr_sensor'))
         self.exit = self._parse_exit(spec.get('exit'))
         self.on_exit = self._parse_actions(spec.get('on_exit'), 'on_exit')
         self.on_enter = self._parse_actions(spec.get('on_enter'), 'on_enter')
@@ -395,6 +408,117 @@ class Stage:
             bounds[mode] = [lo, hi]
         return bounds
 
+    #: Everything a `hot_lr_sensor` block may contain. CLOSED: an unknown key
+    #: here would be a threshold the run silently does not apply.
+    _HOT_KEYS = frozenset({'action', 'channel', 'form', 'rows', 'above',
+                           'floor_percentile', 'row_steps'})
+
+    def _parse_hot_lr_sensor(self, node):
+        """The stage's "the LR is hot" drawdown sensor. REPORT-ONLY; moves nothing.
+
+        Fills a measured gap: `lr_ctrl/divergences` was 0 in all 97 stage segments
+        examined, including all 19 failures, so the hard tripwire does not fire on
+        this failure mode at all. The sensor compares the channel's current level
+        against the 10th percentile of a short trailing window and fires on a
+        single row. It says "destabilising", never "the LR caused it".
+
+        THRESHOLDS ARE PER-STAGE CALIBRATION DATA, like the grad-clip guard's
+        quantile. They are not derivable at runtime and they do not transfer
+        between stages -- the equilibration bar would fire on most healthy
+        `var_conditioning` runs. A stage that wants a sensor states its own
+        numbers; a stage that omits the block has none.
+
+        The three validated sensors:
+
+            hot_lr_sensor:                 # train_prior
+              channel: bwd/mle
+              form: absolute               # bwd/mle crosses zero
+              rows: 31                     # 300 steps at a 10-step cadence
+              above: 5.0
+
+            hot_lr_sensor:                 # equilibration
+              channel: fwd/scatter_err
+              rows: 11                     # 100 steps
+              above: 2.0
+
+            hot_lr_sensor:                 # var_conditioning
+              channel: fwd/vg_lb           # FORWARD branch: bwd/vg_lb has no
+              rows: 11                     # clean band under any statistic tested
+              above: 3.0
+
+        `rows` is W, the window length the thresholds were fitted at, and it is
+        the primary quantity rather than a step count: the statistic is over rows,
+        and the lookback in steps follows as `(rows - 1) * row_steps`.
+        """
+        if node is None:
+            return None
+        if not isinstance(node, dict):
+            raise TypeError(f"stage '{self.name}': hot_lr_sensor must be a mapping, "
+                            f"got {type(node)}")
+        bad = set(node) - self._HOT_KEYS
+        if bad:
+            raise ValueError(f"stage '{self.name}': unknown hot_lr_sensor keys "
+                             f"{sorted(bad)} (known: {sorted(self._HOT_KEYS)})")
+
+        out = {'action': node.get('action', 'report'),
+               'form': node.get('form', 'log'),
+               'row_steps': int(node.get('row_steps', 10)),
+               'floor_percentile': float(node.get('floor_percentile', 10.0))}
+
+        # ACTION IS A CLOSED VOCABULARY OF ONE. Report-only is not a default to
+        # be overridden -- making this actuate is a code change with a review,
+        # not a config edit. `ray_calibration.enabled` is why: a second switch
+        # that could disagree with the thing it switched.
+        if out['action'] not in HOT_LR_ACTIONS:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.action must be one of "
+                f"{list(HOT_LR_ACTIONS)}, got {out['action']!r}. This sensor is "
+                f"report-only: nothing downstream can move a learning rate from "
+                f"it, so any other value would describe behaviour that does not "
+                f"exist.")
+        if out['form'] not in HOT_LR_FORMS:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.form must be one of "
+                f"{list(HOT_LR_FORMS)}, got {out['form']!r}. Use 'absolute' on a "
+                f"channel that crosses zero -- the log ratio is undefined there.")
+
+        channel = node.get('channel')
+        if not isinstance(channel, str) or channel.partition('/')[0] not in MODES:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.channel must be "
+                f"'<mode>/<channel>' with mode in {MODES}, got {channel!r}. The "
+                f"branch is part of the calibration: `bwd/vg_lb` has no clean band "
+                f"under any statistic tested, so a config that generalises a "
+                f"channel name across branches is a bug.")
+        out['channel'] = channel
+
+        out['rows'] = int(node.get('rows', 0))
+        if out['rows'] < 3:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.rows must be >= 3, got "
+                f"{out['rows']}. The floor is a percentile over the window, and "
+                f"below three rows it degenerates to the minimum -- which has zero "
+                f"breakdown, so one spuriously low row would inflate every "
+                f"subsequent reading for a full lookback.")
+        if out['row_steps'] < 1:
+            raise ValueError(f"stage '{self.name}': hot_lr_sensor.row_steps must be "
+                             f">= 1, got {out['row_steps']}")
+
+        above = node.get('above')
+        out['above'] = float('nan') if above is None else float(above)
+        if not math.isfinite(out['above']) or out['above'] <= 0:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.above must be a positive "
+                f"finite number, got {above!r}. A sensor with no threshold cannot "
+                f"fire, and one that cannot fire reports a clean run "
+                f"indistinguishably from one that is not running.")
+        if not 0.0 <= out['floor_percentile'] < 50.0:
+            raise ValueError(
+                f"stage '{self.name}': hot_lr_sensor.floor_percentile must lie in "
+                f"[0, 50), got {out['floor_percentile']}. It names the FLOOR of the "
+                f"window; at or above the median it is not a floor.")
+        return out
+
     def _parse_mle_gate(self, node):
         """The MLE descent gate's parameters, or None if this stage has no gate.
 
@@ -432,41 +556,42 @@ class Stage:
 
     def _parse_lr_sensor(self, node):
         """
-        Which LR sensor this stage runs.
+        An OPTIONAL, OFF-BY-DEFAULT DIAGNOSTIC this stage may run. It reaches no
+        learning rate.
 
-          kind: plateau   ReduceLROnPlateau. Track each channel's best value and
-                          cut the LR when none of them has improved for
-                          `patience` checks. One criterion covers rising,
-                          stalled and blown-up alike -- all three are just "no
-                          improvement over best".
-          kind: ray       the alpha* ray calibration. Scores the FUSED COMPOSITE
-                          this stage's own step descends, on batches harvested
-                          from its own live steps (lr_larder.py), so it is
-                          coherent wherever every active branch can be replayed
-                          through get_gfn_backward_loss. It used to draw from
-                          replay and score replay_loss_coeffs, which confined it
-                          to a fused replay-TB stage and is why phase 1 was never
-                          measured. Optional `period` / `n_sub` override the
-                          global ray_calibration values FOR THIS STAGE, because
-                          the probe's overhead is its fixed cost divided by the
-                          stage's step cost and stages differ by >10x.
-          kind: hyper     hypergradient: peak_scale *= exp(beta * cos), where
-                          cos is between the current gradient and the direction
-                          the previous step actually moved the policy. Reads no
-                          loss, so unlike `ray` it is coherent whatever the stage
-                          trains -- which is why it is the sensor for stages that
-                          do not train replay TB. `beta` is a BANDWIDTH and has
-                          no universal value (bench: per-cell optimum spans 20x),
-                          so it is required rather than defaulted.
-          kind: none      this stage deliberately has no LR sensor.
+        THIS BLOCK NO LONGER STEERS ANYTHING. Learning rates are set by the
+        brute-force bracket (controller.py, lr_bracket.py), which is a run-level
+        mechanism rather than a per-stage one: burn in, checkpoint, trial a fixed
+        grid, promote a rung a safety margin below the lowest failure, hold. Both
+        sensors below survive only as instruments, so a future claim about either
+        can be measured rather than argued about, and no canonical config
+        declares one.
+
+          kind: ray       the alpha* ray calibration -- scores the fused
+                          composite this stage's step descends, on batches
+                          harvested from its own live steps (lr_larder.py).
+                          RETIRED AS AN ACTUATOR 2026-08-23 by its own acceptance
+                          test: alpha* is s*/lr, so the slope of log(alpha*)
+                          against log(lr) must be -1, and it measured 0.00 +- 0.2
+                          across twelve runs, two stages and 2.7 decades. It is
+                          also not free -- about 4.8% of step time at period 500
+                          on `train_prior` -- so declaring it is a deliberate
+                          purchase. Optional `period` / `n_sub` override the
+                          global values for this stage.
+          kind: hyper     the hypergradient cosine between the current gradient
+                          and the direction the previous step moved the policy.
+                          Retired as an actuator for a different reason: cos is a
+                          STATIONARITY statistic, negative at every stable rate
+                          once the iterate has equilibrated, so it has no fixed
+                          point to steer to. `beta` is still required, because a
+                          recorded bandwidth that was never chosen is not a
+                          record of anything.
+          kind: none      this stage deliberately runs no diagnostic.
 
         `none` is spelled out rather than left to omission, so "no sensor" is a
-        decision in the config and not an oversight. OMITTING the block means the
-        same thing -- no sensor -- but silently. It did NOT always: omission used
-        to arm the ray probe under the global ray_calibration.enabled, which put
-        a replay-dependent sensor into stages that never train replay. See
-        train.py::_ray_probe_armed and _check_ray_wiring, which reports at
-        startup when ray_calibration and the stages disagree about who is asking.
+        decision in the config and not an oversight. Omitting the block means the
+        same thing -- and, since nothing here actuates, omission is now the
+        correct default rather than a trap.
         """
         if node is None:
             return None
@@ -530,9 +655,9 @@ class Stage:
             # measurement. The probe's absolute cost is n_sub x len(alphas)
             # forward passes over one batch; its OVERHEAD is that divided by the
             # stage's step cost, and stages differ by more than an order of
-            # magnitude. Measured on elj/mipcas: ~28 training steps per
+            # magnitude. Measured on elj/mipcas: ~24 training steps per
             # calibration on `train_prior` (a bwd/dataset step runs no rollout
-            # and no energy call, median 0.158 s) = 5.6% at period 500, against
+            # and no energy call, median 0.158 s) = 4.8% at period 500, against
             # the 1.2% recorded for the same probe on the fused stage. One
             # global period cannot serve both. Absent = the global value.
             bad = set(node) - {'kind', 'period', 'n_sub'}
@@ -557,42 +682,6 @@ class Stage:
                                      f"interval is built from -- got {node['n_sub']!r}")
                 out['n_sub'] = n_sub
             return out
-
-        bad = set(node) - {'kind', 'metrics', 'factor', 'patience', 'threshold', 'cooldown'}
-        if bad:
-            raise ValueError(f"stage '{self.name}': lr_sensor unknown keys {sorted(bad)}")
-
-        metrics = [str(m) for m in (node.get('metrics') or [])]
-        if not metrics:
-            raise ValueError(f"stage '{self.name}': lr_sensor kind 'plateau' needs a "
-                             f"non-empty 'metrics' list, e.g. [fwd/vg_lb, bwd/vg_lb]")
-        for m in metrics:
-            if m.partition('/')[0] not in MODES:
-                raise ValueError(f"stage '{self.name}': lr_sensor metric {m!r} must be "
-                                 f"'<mode>/<channel>' with mode in {MODES}")
-        node['metrics'] = metrics
-
-        factor = float(node.get('factor', 0.5))
-        if not 0.0 < factor < 1.0:
-            raise ValueError(f"stage '{self.name}': lr_sensor.factor must be in (0, 1), got {factor}")
-        node['factor'] = factor
-        # checks, not train steps -- one check per 10 train steps
-        node['patience'] = int(node.get('patience', 30))
-        node['cooldown'] = int(node.get('cooldown', 10))
-        if node['patience'] < 1 or node['cooldown'] < 0:
-            raise ValueError(f"stage '{self.name}': lr_sensor.patience must be >= 1 and "
-                             f"cooldown >= 0")
-        # ABSOLUTE improvement that counts as progress, in the channel's own
-        # units. Absolute rather than relative because these channels are
-        # unbounded below (bwd/mle has no lower bound and crosses zero), so a
-        # fractional bar has nothing to be relative to: abs(best) * frac grows
-        # without limit as the run improves, and the multiplicative form flips
-        # sign once best goes negative. 0.0 = any improvement counts, which is
-        # the right default on a SMOOTHED input.
-        node['threshold'] = float(node.get('threshold', 0.0))
-        if node['threshold'] < 0:
-            raise ValueError(f"stage '{self.name}': lr_sensor.threshold must be >= 0")
-        return node
 
     def _parse_balance(self, node):
         if node is None:
@@ -1046,11 +1135,20 @@ class Stage:
         # reads must not be allowed to skip its force-refresh rollout
         if self.buffer_servo is not None:
             names += [self.buffer_servo['numerator'], self.buffer_servo['denominator']]
-        # ...and so does a plateau LR sensor: a branch whose channel it watches
-        # must keep producing fresh stats, or the sensor reads a frozen series and
-        # never sees an improvement -- which would make it cut forever.
-        if self.lr_sensor is not None and self.lr_sensor['kind'] == 'plateau':
-            names += list(self.lr_sensor['metrics'])
+        # ...and so does the hot-LR sensor. This clause used to name the plateau
+        # LR sensor, for the same reason, and it went dead when `plateau` left
+        # LR_SENSOR_KINDS -- a gate on a retired key can never fire, so it reads
+        # as "this is handled" while handling nothing. The sensor advances its
+        # window ONLY on fresh writes, so a channel whose branch is dormant is
+        # never written, the window never fills, and the sensor reports
+        # NO_READING for the whole stage without ever claiming to be blind.
+        # Naming it here is what keeps its branch's force-refresh rollout alive.
+        # Note this is currently a no-op on mk_dev -- all four declared channels
+        # already sit in read_modes via the balance rules -- which is exactly the
+        # accident it exists to stop depending on: var_conditioning reads
+        # {bwd, fwd} only, so a replay/* sensor there would be silently blind.
+        if self.hot_lr_sensor is not None:
+            names.append(self.hot_lr_sensor['channel'])
         out = set()
         for name in names:
             direction = name.partition('/')[0]
@@ -1415,11 +1513,10 @@ class StageProtocol:
         # the outgoing stage's loss windows are a stale ceiling for the incoming
         # stream, its best-checkpoint minima shouldn't gate the new stage's
         # 'best' saves, and its Adam moments describe the wrong loss surface.
-        # rearm_warmup must run with m.stage already switched (its _state()
-        # phase-sync branch runs first and it overrides). No fire-cooldown
-        # re-arm any more: the v7 divergence bar sits at ~1e9, which transition
-        # turbulence does not reach, so there is nothing for a transition to
-        # protect it from.
+        # `LRController.on_stage_change` must run with m.stage already switched.
+        # It re-enters burn-in, which is not optional at a transition: rebuilding
+        # the optimizers restarts Adam's step counter, and bracketing from a
+        # counter at t=10 measures 0.153 of the rate under test.
         m.combo_loss_record = []
         # batch sizer: its conclusion and rung table describe the OUTGOING stage's
         # step-cost and occupancy profile -- carried over, they would answer the
@@ -1456,9 +1553,9 @@ class StageProtocol:
         m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
         m.init_schedulers_optimizers()
         m.set_loss_coeffs()
-        warmup_steps = m.lr_controller.rearm_warmup()
-        if warmup_steps:
-            print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_steps} train steps")
+        burn_in_steps = m.lr_controller.on_stage_change()
+        if burn_in_steps:
+            print(f"protocol: optimizers rebuilt, LR burn-in over {burn_in_steps} train steps")
         # The adaptive clip bar is calibrated against a gradient distribution, and
         # a stage boundary is where that distribution moves -- new coeffs, new
         # branch fracs, fresh Adam moments, sometimes a different train_mode
@@ -1501,8 +1598,8 @@ class StageProtocol:
         elif name == 'rebuild_prior_by_churn':
             self.m.rebuild_prior_by_churn(int(arg) if arg else None)
         elif name == 'set_lr_flow':
-            # The flow/Z group is exempt from the warmup envelope and the servo
-            # (adaptive_lr.control_flow_lr: false), so nothing else will move it
+            # The flow/Z group is exempt from the bracket's scale
+            # (lr_control.control_flow_lr: false), so nothing else will move it
             # and nothing else will move it BACK -- this is the only lever on it.
             # It is a stage action because the right rate is a property of what
             # the flow head IS on this route: a LearnableScalar unconditionally
@@ -1578,23 +1675,23 @@ class StageProtocol:
             # this one may not permit -- re-measure rather than carry them over
             m.batch_sizer = None
         elif name == 'set_lr_policy':
-            # PER-STAGE BASE RATE for the servo-managed policy groups. adaptive_lr.
-            # seed_lr is ONE number for every stage, but a bwd MLE stage and a fused
-            # VarGrad stage on a per-condition target do not want the same rate --
-            # so the servo had to discover the difference from scratch, through a
-            # ramp, at every transition. Measured on the QM9 conditional route: the
-            # controller settled 3-7x BELOW seed_lr in three independent runs.
-            # This sets the BASE only. The group stays servo-managed, because
+            # PER-STAGE BASE RATE for the managed policy groups. lr_control.seed_lr
+            # is ONE number for every stage, but a bwd MLE stage and a fused VarGrad
+            # stage on a per-condition target do not want the same rate, and the
+            # bracket's candidate grid is a set of MULTIPLIERS on this base -- so a
+            # base that is wrong by 10x moves the whole grid off the interesting
+            # region and the bracket reports unbracketed_high or all_failed rather
+            # than a boundary.
+            # This sets the BASE only. The group stays bracket-managed, because
             # _managed_keys reads args.lr_servo_managed -- recorded by
-            # resolve_derived_config at load -- and not the live value. So the
-            # sensor keeps full authority; it just starts from a sane place.
-            # _apply_lrs recomputes base * peak_scale * envelope on the next tick.
+            # resolve_derived_config at load -- and not the live value.
+            # _apply_lrs recomputes base * scale on the next tick.
             v = float(arg)
             m = self.m
             for key in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
                 setattr(m.args, key, v)
             print(f"protocol: lr_policy/back/replay/fused -> {v:g} on entering "
-                  f"'{self.stage.name}' (base only; servo still owns peak_scale)")
+                  f"'{self.stage.name}' (base only; the bracket still owns the scale)")
 
     def _snapshot(self, tag: str):
         """Pre-transition snapshot: the untouched end-state of the outgoing
@@ -1641,29 +1738,42 @@ class StageProtocol:
         bootstrap_log_z's docstring."""
         m = self.m
         if (not m.gfn_model.full_flow) and (not m.gfn_model.conditional):
-            # PREFER THE TRACKER'S ema_logw over the eval's raw forward Jensen, which is
-            # what the conditional branch below has always done (bootstrap_log_z regresses
-            # onto ema_logw, "NEVER ema_log_z_emp"). The scalar branch was the odd one out.
+            # ANCHOR ON THE FORWARD BRANCH, because the forward branch is what
+            # log_Z's fixed point IS. In the TB stages this action opens, `fwd`
+            # carries freeze_policy and `bwd`/`replay` carry freeze_z, so the
+            # forward loss is the only thing that trains the scalar and TB drives
+            # it to E[log w] under FORWARD samples. Anchoring anywhere else does
+            # not change that fixed point, only how far the scalar has to travel
+            # to reach it -- and it travels under a Huber whose gradient is capped
+            # at fwd_loss_coeffs.beta, so a large opening offset descends at a rate
+            # independent of its own size while every other branch's residual is
+            # carried along with it.
             #
-            # All three candidates estimate different things:
-            #   ema_log_z_emp  logmeanexp -- (nearly) UNBIASED for log Z, and unusable as
-            #                  an anchor: logsumexp has no 1/n dilution, so one bad
-            #                  off-policy sample sends it to billions of nats. Feeding it
-            #                  back measurably broke a live run. See ConditionLogZTracker
-            #                  .lookup.
-            #   ema_logw       E[log w], the Jensen bound -- structurally BELOW log Z, but
-            #                  it is what TB's squared residual actually converges to, and
-            #                  the tracker's copy is rank-trimmed, 1/n-diluted and EMA'd
-            #                  over an evidence half-life.
-            #   eval_fwd/jensen_z  the SAME estimand as ema_logw, raw: one eval, no trim,
-            #                  no EMA, and taken on FORWARD samples, which MLE's
-            #                  mode-covering objective deliberately spreads into
-            #                  clash regions. Measured on tetraglycine it swung -5,210 to
-            #                  -15,233 between adjacent evals while ema_logw sat at -239,
-            #                  so the anchor depended on which eval the transition hit --
-            #                  and it left log_Z ~8,000 nats from its fixed point, a debt
-            #                  phase 2 then spent its whole budget servicing.
+            # The three candidates:
+            #   eval_fwd/jensen_z  E[log w] on forward eval samples: the fixed
+            #                  point itself, measured raw -- one eval, no trim, no
+            #                  EMA. Noisy exactly when the forward policy is bad,
+            #                  which is accepted: a noisy reading of the right
+            #                  quantity beats a clean reading of another one.
+            #   ema_logw       the tracker's E[log w], rank-trimmed, 1/n-diluted
+            #                  and EMA'd over an evidence half-life. NOT the same
+            #                  estimand unless the same sampler feeds it: the
+            #                  tracker is updated by whichever branches ran, so
+            #                  after a bwd-only MLE phase 1 its ema_logw is the
+            #                  ANCHOR level, and anchoring there hands phase 2 the
+            #                  full anchor-to-policy gap as an opening transient.
+            #                  Kept as the fallback for a transition with no eval
+            #                  stream.
+            #   ema_log_z_emp  logmeanexp -- (nearly) UNBIASED for log Z, and
+            #                  unusable as an anchor: logsumexp has no 1/n
+            #                  dilution, so one bad off-policy sample sends it to
+            #                  billions of nats. Feeding it back measurably broke a
+            #                  live run. See ConditionLogZTracker.lookup.
             empirical_z, src = None, None
+            if eval_metrics is not None and 'eval_fwd/jensen_z' in eval_metrics:
+                empirical_z = eval_metrics['eval_fwd/jensen_z']
+                src = 'eval_fwd/jensen_z'
+            tracked = None
             tracker = getattr(m, 'condition_log_z', None)
             if tracker is not None:
                 # plain lists, not tensor ops: this module is deliberately torch-free.
@@ -1671,21 +1781,21 @@ class StageProtocol:
                 seen = [v for c, v in zip(tracker.count.tolist(), tracker.ema_logw.tolist())
                         if c >= tracker.min_visits and v == v]
                 if seen:
-                    empirical_z = sum(seen) / len(seen)
-                    src = f'condition_log_z.ema_logw ({len(seen)} visited)'
+                    tracked = (sum(seen) / len(seen), len(seen))
             if empirical_z is None:
-                # cold tracker (too few visits): fall back to the old source rather than
-                # refuse to bootstrap at all
-                if eval_metrics is None or 'eval_fwd/jensen_z' not in eval_metrics:
+                # no eval stream (a transition that did not fire at an eval): take
+                # the tracker rather than refuse to bootstrap at all
+                if tracked is None:
                     raise RuntimeError(
-                        "bootstrap_z needs either a visited condition_log_z tracker or "
-                        "eval metrics (eval_fwd/jensen_z) -- it can only run from an "
+                        "bootstrap_z needs either eval metrics (eval_fwd/jensen_z) or "
+                        "a visited condition_log_z tracker -- it can only run from an "
                         "eval-time transition")
-                empirical_z = eval_metrics['eval_fwd/jensen_z']
-                src = 'eval_fwd/jensen_z (tracker cold)'
-            raw = (eval_metrics or {}).get('eval_fwd/jensen_z')
+                empirical_z, src = tracked[0], f'condition_log_z.ema_logw ({tracked[1]} visited, no eval stream)'
+            # both levels in the same line: their GAP is the handoff quality, and
+            # it is the opening transient phase 2 has to absorb
             print(f"bootstrap_z: log_Z <- {empirical_z:.3f} from {src}"
-                  + (f" (eval_fwd/jensen_z was {raw:.3f})" if raw is not None else ""))
+                  + (f" (condition_log_z.ema_logw was {tracked[0]:.3f} over {tracked[1]} visited)"
+                     if tracked is not None else " (tracker cold)"))
             m.gfn_model.flow_model.scalar.data.fill_(empirical_z)
             m.ema_model.flow_model.scalar.data.fill_(empirical_z)
         else:
@@ -2294,17 +2404,17 @@ class StageProtocol:
         these off args on every manage call, so the change takes effect on the
         next churn with no plumbing."""
         rb = self.m.args.buffers.replay_buffer
+        # `toxic_min_draws` used to be scaled here too. It is a DELETED
+        # retirement (utils._RETIRED_KEYS), so no config can set it: the base
+        # captured 0.0 every time and the branch that scaled it was unreachable.
         if self._rb_base is None:
             self._rb_base = {'churn_rate': float(rb.churn_rate),
-                             'mean_residence_steps': float(rb.mean_residence_steps),
-                             'toxic_min_draws': float(getattr(rb, 'toxic_min_draws', 0) or 0)}
+                             'mean_residence_steps': float(rb.mean_residence_steps)}
         base = self._rb_base
         rb.churn_rate = max(1, int(round(base['churn_rate'] * boost)))
         # floor at 2 steps: below that the hazard evicts essentially the whole
         # buffer every call and replay stops being a buffer at all
         rb.mean_residence_steps = max(2.0, base['mean_residence_steps'] / boost)
-        if base['toxic_min_draws'] > 0:
-            rb.toxic_min_draws = max(2, int(round(base['toxic_min_draws'] / boost)))
 
     def _nudge_mode_fracs(self, boost):
         """EMA nudge of the fracs toward a target split, with PER-MODE floors

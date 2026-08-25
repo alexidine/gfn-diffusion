@@ -301,9 +301,15 @@ def eval_figs(fwd_stats,
         scaled_energy = sample_batch[energy_function]
 
     with fig_guard('Lattice Latents Distribution'):
+        # gauge_fix follows the route: on toys every latent dim is real, and
+        # re-pinning the samples' free axes here made the figure show delta
+        # functions the prior does not contain (P1, toy_wk_aug24 2026-08-24) --
+        # the very artifact that surfaced the target-pinning bug upstream.
+        from energies.molecular_crystal import is_crystal_energy
         fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
             space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
             show=False, return_fig=True, override_energy=scaled_energy,
+            gauge_fix_free_axes=is_crystal_energy(energy_function),
             aux_dists=[anchor_latents] if anchor_latents is not None else None)
     with fig_guard('Sample Scatter'):
         # subsampled: the funnel is a density scatter and reads the same at 2k

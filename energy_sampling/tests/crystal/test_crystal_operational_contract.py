@@ -20,7 +20,7 @@ import pytest
 import config_snapshot
 import utils
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 

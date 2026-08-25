@@ -46,6 +46,18 @@ def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
     return softened_energy
 
 
+#: The energies whose batch is only a CONTAINER: no cell is ever built, every
+#: latent dim is a real coordinate of the field. Single source for is_crystal --
+#: the instance attribute below and name-only callers (eval figure code) must
+#: agree, or the toy gauge-fix bug (P1, 2026-08-24) comes back split-brained.
+TOY_ENERGY_FUNCTIONS = ('latent_harmonic', 'latent_multiharmonic')
+
+
+def is_crystal_energy(name: str) -> bool:
+    """Mirrors MolecularCrystal.is_crystal for callers holding only the name."""
+    return name not in TOY_ENERGY_FUNCTIONS
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -177,7 +189,7 @@ class MolecularCrystal(BaseSet):
         self.latent_energy = self.energy_function in ['latent_harmonic',
                                                       'latent_multiharmonic',
                                                       'latent_gaussian']
-        self.is_crystal = not self.energy_function in ['latent_harmonic', 'latent_multiharmonic']  # not a toy model
+        self.is_crystal = is_crystal_energy(self.energy_function)  # not a toy model
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
@@ -454,7 +466,12 @@ class MolecularCrystal(BaseSet):
         if self.max_z_prime > 1:
             zp_ordering_energy = self.compute_zp_order_penalty(crystal_batch, raw_latents)
 
-        latents = crystal_batch.latent_params()
+        # Gauge by route: on toys every latent dim is real data and the default
+        # gauge-fix MUTATES the batch's centroids in place -- this call, running
+        # inside the init analysis pass, was what re-pinned the toy prior's
+        # u,v,w after every other read had been converted (P1 tripwire hunt,
+        # 2026-08-24).
+        latents = crystal_batch.latent_params(gauge_fix_free_axes=self.is_crystal)
         if raw_latents is not None:
             upper_violation = F.relu(raw_latents - 1)
             lower_violation = F.relu(-(raw_latents + 1))
@@ -571,7 +588,10 @@ class MolecularCrystal(BaseSet):
 
     def compute_jacobian(self, crystal_batch, temperature):
         """jacobian correction for aunit positions and orientation angles only"""
-        latent_rotvecs = crystal_batch.latent_params()[:, -3 * crystal_batch.max_z_prime:]
+        # rotvec columns only, but the CALL still gauge-fixes centroids in place
+        # under the default -- same route gating as generator_energy (P1)
+        latent_rotvecs = crystal_batch.latent_params(
+            gauge_fix_free_axes=self.is_crystal)[:, -3 * crystal_batch.max_z_prime:]
         sph_rotvec = lat2sph_rotvec(latent_rotvecs, crystal_batch.max_z_prime)
         sph = sph_rotvec.view(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
         theta = sph[..., 0]  # polar angle

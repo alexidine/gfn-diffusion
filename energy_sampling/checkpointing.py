@@ -73,10 +73,13 @@ MODELLER_STATE_DEFAULTS = {
     'bwd_frac': 1.0,
     'replay_frac': 0.0,
     'combo_loss_record': [],
-    # LRController state (see controller.py): a missing/mismatched 'ver' means
-    # "not yet attached" -- the controller builds a fresh state on its first
-    # tick, so disabled runs carry this dict around inertly
-    'lr_ctrl': {'phase_seen': None, 'scale': None},
+    # LRController state (see controller.py): the live scale, the step this
+    # stage's burn-in started at, and the LR bracket's own phase/verdict. A
+    # missing/mismatched 'ver' means "not yet attached, or written by a
+    # controller this build does not speak" -- discarded and rebuilt, never
+    # reinterpreted, because a v8 dict carries a peak_scale, a warmup envelope
+    # and a freeze latch that have no meaning under the bracket.
+    'lr_ctrl': {'ver': None, 'scale': None, 'stage_entry_step': 0, 'bracket': None},
 }
 
 # Buffers live in their own sidecar file rather than inside each checkpoint:
@@ -652,11 +655,34 @@ class Checkpointer:
         m.gfn_model.train()
         m.ema_model.eval()
 
-    def load_optimizer_state(self, checkpoint):
+    def load_optimizer_state(self, checkpoint, strict: bool = False):
+        """Restore every optimizer's state, including Adam's step counter.
+
+        `strict` TURNS THE TWO FALLBACKS BELOW INTO ERRORS, and the LR bracket
+        passes it. Outside a bracket, "no saved state for this optimizer" and
+        "the param groups no longer line up" are legitimate recovery: the run
+        continues with that optimizer fresh, which is worse than a perfect resume
+        and much better than refusing to start.
+
+        INSIDE A CANDIDATE TRIAL THEY ARE A CORRUPTED MEASUREMENT THAT LOOKS
+        NORMAL. `opt.load_state_dict` is what carries `state[p]['step']`, and
+        Adam's update scales as sqrt(1 - beta2^t) / (1 - beta1^t) relative to
+        steady state -- 0.153 at t=10, 0.309 at t=100, 0.795 at t=1000. A trial
+        that silently restarted the counter would run at 15-30% of its nominal
+        rate for its first hundred steps, so a too-hot rung survives because the
+        rate under test is not the rate applied, and the bracket then reports a
+        boundary it never found. A printed line in a log nobody reads mid-run is
+        not a defence against that.
+        """
         m = self.modeller
         saved_optimizers = checkpoint['optimizers']
         for key, opt in m.optimizers.items():
             if key not in saved_optimizers:
+                if strict:
+                    raise KeyError(
+                        f"no saved optimizer state for '{key}'. Starting it fresh would "
+                        f"reset Adam's step counter, and a trial from a reset counter "
+                        f"measures a rate that is not the one under test.")
                 print(f"No saved optimizer state for '{key}' - starting it fresh")
                 continue
             try:
@@ -664,6 +690,11 @@ class Checkpointer:
             except (ValueError, RuntimeError) as e:
                 # e.g. checkpoint predates flow params folding into the policy
                 # optimizers, so param group counts no longer line up
+                if strict:
+                    raise RuntimeError(
+                        f"could not restore optimizer state for '{key}': {e}. Starting "
+                        f"it fresh would reset Adam's step counter and corrupt the "
+                        f"measurement.") from e
                 print(f"Could not restore optimizer state for '{key}' ({e}) - starting it fresh")
 
     def load_model_only(self, path, load_optimizers: bool = False):

@@ -18,7 +18,7 @@ GPU -- which is the point of the guard at `train.py:130`.
 import pytest
 import torch
 
-from bench.fake_modeller import (MK_DEV_ADAPTIVE, MK_DEV_BATCH, MK_DEV_CALIBRATION,
+from bench.fake_modeller import (MK_DEV_BATCH, MK_DEV_CONTROL, MK_DEV_HARD_FAILURE,
                                  MK_DEV_LR, MK_DEV_RAYCAL, FakeModeller, FakeStage,
                                  make_args)
 from bench.real_modeller import build_real_modeller
@@ -31,7 +31,7 @@ def real():
 
 
 #: distinguishes "the key is absent" from "the key is None", which a config
-#: legitimately is (adaptive_lr.restart_after).
+#: legitimately is (lr_control.fixed_scale on a bracket-mode config).
 _MISSING = object()
 
 
@@ -67,15 +67,14 @@ DEFERRED_SURFACE = ['optimizers', 'fused_accum_count']
 #: Config values that are collections without meaningful order.
 UNORDERED_KEYS = {'lr_servo_managed'}
 
-#: args keys the controllers read. DOTTED WHERE THE REAL CONFIG NESTS THEM: the
-#: ray block moved under `adaptive_lr` (utils._RETIRED_KEYS, "moved ->
-#: adaptive_lr.ray_calibration"), and a top-level-only check cannot see that move
-#: -- `adaptive_lr` is present either way, so the block could go missing in
-#: silence.
+#: args keys the controllers read. DOTTED WHERE THE REAL CONFIG NESTS THEM: a
+#: top-level-only check cannot see a nested block go missing, because
+#: `lr_control` is present either way. `hard_failure` is the one that matters --
+#: without it the bracket falls back to bars that cannot fail a candidate.
 ARGS_SURFACE = [
     'lr_policy', 'lr_back', 'lr_replay', 'lr_fused', 'lr_flow', 'min_lr',
-    'lr_warmup_ratio', 'lr_servo_managed', 'adaptive_lr',
-    'adaptive_lr.ray_calibration',
+    'lr_servo_managed', 'lr_control',
+    'lr_control.hard_failure', 'lr_control.ray_calibration',
     'batch_size', 'max_batch_size', 'grow_batch_size', 'batch_growth_factor',
     'batch_growth_cap', 'batch_growth_interval', 'batch_util_target',
     'max_step_seconds', 'oom_batch_shrink_factor',
@@ -142,9 +141,9 @@ def test_fake_supplies_the_deferred_surface(real):
 @pytest.mark.parametrize('block,source,path', [
     ('lr', MK_DEV_LR, None),
     ('batch', MK_DEV_BATCH, None),
-    ('adaptive_lr', MK_DEV_ADAPTIVE, 'adaptive_lr'),
-    ('calibration', MK_DEV_CALIBRATION, 'adaptive_lr.calibration'),
-    ('ray_calibration', MK_DEV_RAYCAL, 'adaptive_lr.ray_calibration'),
+    ('lr_control', MK_DEV_CONTROL, 'lr_control'),
+    ('hard_failure', MK_DEV_HARD_FAILURE, 'lr_control.hard_failure'),
+    ('ray_calibration', MK_DEV_RAYCAL, 'lr_control.ray_calibration'),
 ])
 def test_transcribed_defaults_match_the_shipping_config(real, block, source, path):
     """
@@ -161,7 +160,7 @@ def test_transcribed_defaults_match_the_shipping_config(real, block, source, pat
 
     drift = {}
     for key, mine in source.items():
-        if key == 'calibration' or not hasattr(node, key):
+        if key in ('hard_failure', 'ray_calibration') or not hasattr(node, key):
             continue
         theirs = getattr(node, key)
         if key in UNORDERED_KEYS:
@@ -192,14 +191,18 @@ def test_the_retired_ray_keys_are_gone_from_the_bench_too(real):
     stayed in this bench after the trainer deleted it (utils._RETIRED_KEYS
     retires both the top-level block and `enabled` in either spelling).
 
-    Both directions, because both were wrong: the block MOVED under adaptive_lr,
-    and its flag was DELETED in favour of deriving the switch from the stages
-    that declare `lr_sensor: {kind: ray}`.
+    Both directions, because both were wrong: the block MOVED (now under
+    `lr_control`), and its flag was DELETED in favour of deriving the switch
+    from the stages that declare `lr_sensor: {kind: ray}`.
     """
     assert _dig(real.args, 'ray_calibration') is _MISSING, (
         'a top-level ray_calibration block survived the load -- it is retired '
-        '(moved under adaptive_lr), so the preflight should have refused it')
-    assert _dig(real.args, 'adaptive_lr.ray_calibration.enabled') is _MISSING, (
+        '(moved under lr_control), so the preflight should have refused it')
+    assert _dig(real.args, 'adaptive_lr') is _MISSING, (
+        '`adaptive_lr` is RETIRED WHOLE at state 10 -- the adaptive controller it '
+        'named no longer exists, and a config still carrying it must fail at load '
+        'rather than have its warmup/alpha_target keys silently ignored')
+    assert _dig(real.args, 'lr_control.ray_calibration.enabled') is _MISSING, (
         '`enabled` is deleted: the switch is which stages declare '
         'lr_sensor: {kind: ray}, and a second flag could disagree with them')
     assert 'enabled' not in MK_DEV_RAYCAL, (
@@ -208,7 +211,8 @@ def test_the_retired_ray_keys_are_gone_from_the_bench_too(real):
     # ...and the retired spellings must FAIL here rather than being carried as
     # private bench keys, which is what the unchecked nested branch allowed.
     for retired in ('ray_calibration.enabled', 'ray_calibration.period',
-                    'adaptive_lr.ray_calibration.enabled'):
+                    'lr_control.ray_calibration.enabled',
+                    'adaptive_lr.warmup_steps', 'adaptive_lr.bounds'):
         with pytest.raises(KeyError):
             make_args(**{retired: False})
 

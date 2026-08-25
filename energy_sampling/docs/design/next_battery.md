@@ -96,7 +96,7 @@ research question. Ordered by how much they distort a battery.
 | a | **Z-level tether (`level_gap`)** | `level_gap_coeff_rms` reads **exactly the clamp (10.0) on 54–93 % of ticks**; the true per-condition gap is ~710 nats, 71x the clamp. It is a **constant-magnitude, sign-only force applied permanently**, carrying no information about the gap it should close, and it never relaxed in 14,000 steps | `MECHANISM` |
 | b | **Balance controller** | `kind: proportional`, `drive: relative`, targets fwd 1.0 / bwd 1.0 — but `fwd/logw_std_within` operates at 40–190, so the fwd drive is 10–46x the bwd drive. Every arm runs at **~0.9 fwd / 0.1 bwd**, not the configured 0.5/0.5, and `Bwd Frac` sits exactly on the 0.1 floor for a quarter to a third of ticks on two arms | `MECHANISM` |
 | c | **Anchor buffer** | `anchor_admitted_last_n` median **0.0 for the whole stage, every arm**. The health gate is `tb_resid_clipped < 0.5`, and `frac(\|fwd/tb_resid_clipped\| < 0.5)` is 0.000–0.032 — **the gate is shut ~100 % of the time** | `REPLICATED` |
-| d | **Hypergradient LR loop** | `peak_scale *= exp(beta·cos)` every step: a **pure integrator on log(peak_scale) with no restoring term**. The measured `cos` is statistically indistinguishable from zero on **4 of 6 arms** (first- and second-half means have opposite signs), so the LR random-walks. `b005_sym` integrated to `lr_ctrl/scale` = 0.00400, **exactly the lower bound**, and sat at 250x below seed LR for 466 ticks. Two gen-A runs railed the *other* way and detonated to `logw_std_within` 2.3e6 | `MECHANISM` + `OBSERVED` |
+| d | **Hypergradient LR loop** (history; **the fix is §1.5’s new design, not a bandwidth sweep**) | `peak_scale *= exp(beta·cos)` every step: a **pure integrator on log(peak_scale) with no restoring term**. The measured `cos` is statistically indistinguishable from zero on **4 of 6 arms** (first- and second-half means have opposite signs), so the LR random-walks. `b005_sym` integrated to `lr_ctrl/scale` = 0.00400, **exactly the lower bound**, and sat at 250x below seed LR for 466 ticks. Two gen-A runs railed the *other* way and detonated to `logw_std_within` 2.3e6 | `MECHANISM` + `OBSERVED` |
 
 (a) is the "Z level tether" suspect, and it is confirmed as a defect — though note
 it is at the clamp on *every* arm equally, so it explains the *level* of the stall,
@@ -204,7 +204,7 @@ OOM** — the batch collapse is a consequence, not a cause.
 - **Ambiguous controller metric names.** `health_gate_ceiling_metric` and
   `anchor.ceiling` both resolve a bare `tb_resid_clipped` that is logged under five
   namespaces differing by a factor of 78. Unauditable.
-- **Ray probe censoring**: `raycal/t_16` is clamped at ±99 on **50 %** of ticks and
+- **Ray probe censoring** (the PRE-generalisation probe — see §1.5; recorded because it is why the old runs’ LR axis is unreadable, not as a fix queue item): `raycal/t_16` is clamped at ±99 on **50 %** of ticks and
   `t_32` on **83 %**; `alpha_star` is grid-quantised to five values. Against
   `alpha_target: 4.0` the servo dithers `peak_scale` over 0.707–1.297 every 500
   steps — a standing ±30 % LR modulation that never settles.
@@ -243,6 +243,62 @@ T (memory scales with it), the number of crystals per energy call, and accepting
 sub-batching again. That is a battery question (§3.5 B4), not a sizer question —
 Phase 6 optimizes throughput and has nothing to say about whether the resulting
 gradient is good enough.
+
+---
+
+### 1.5 SUPERSEDED by the new LR design (2026-08-22)
+
+`docs/design/lr_handoff_2026-08-21.md` is now the authority on LR control, and it
+retires several things this document was building arms around. Read it before
+touching any LR arm here.
+
+**What changed.**
+
+- **`ray` is generalised** — it now scores *the loss the stage actually trains*
+  rather than replay TB. So **`ray` is coherent on `var_conditioning`**, and the
+  statement elsewhere in this document that it is not is **wrong and superseded**.
+- **The per-reading servo is replaced by a pooled estimator.**
+  `adaptive_lr.calibration.mode` now defaults to **`pooled`**; `servo` restores the
+  retired v8 rule for comparison. Absent key = pooled.
+- **Initial calibration is a checkpointed ramp** (`lr_ramp.py`, `lr_ramp_probe.py`,
+  `lr_pool.py`, `lr_larder.py`).
+- **`hyper` is not the future.** "Magnitude-only edge guard: **recommended
+  AGAINST**, on measurement. Not built." §1.1(d)'s description of the hypergradient
+  integrator stands as an account of what the *old* runs did — and it is why those
+  runs are unreadable — but **the fix is the new design, not a bandwidth sweep**.
+  Arms proposed here against `hyper` beta are withdrawn.
+
+**Its own validation queue owns most of what §3.5's LR arms were reaching for**, and
+duplicating it would be waste. V1 (long cruise, unconditional, local) is RUNNING;
+V2 is the conditional analogue; V3 is the cluster set. Two of V3's items are
+load-bearing for the costings in §4: the probe overhead ("~28 training steps per
+calibration, 5.6 % at period 500 on phase 1, 1.2 % fused") is a **local,
+compile-off** number that must be re-measured, and `period: 1500` for elj phase 1 is
+derived from it and **must not ship to the cluster unchecked**.
+
+**Two places this battery is the natural home for a queue item, rather than a
+duplicate of one:**
+
+1. **V3's "nothing has run the pooled estimator alongside a moving batch size."**
+   §3.5's batch arms (B1–B4) are exactly that experiment. Carry the new sensor on
+   them and they answer both questions for one cost — batch changes the gradient
+   noise `alpha_target` exists to cover, so the two are coupled anyway.
+2. **V3's "`alpha_target` per route, only worth doing at length."** The 7-day
+   production runs are the only production-length thing in this plan. Pin the rates
+   as explicit floats at a known-good hand-tuned rate and read the reported alpha*
+   off — a sensor-only arm, no actuation.
+
+**⚑ One unimplemented owner decision gates the handoff arms.** The settling gate
+holds `peak_scale` at 1.0 for `MIN_STAGE_STEPS` (300) across a stage transient, and
+on a toy route that is 50–70x hot: both pooled arms "spent 300 steps being cooked
+before their first move, and never recovered inside 620 steps." **Every arm in this
+document crosses a stage boundary**, and §3.1's handoff is precisely such a
+transient. The three options on the table are (1) let the ramp start during the
+transient, (2) allow ONE conservative downward cut during it, (3) require a sane
+seed; (2) is recommended, (1) is the durable answer, **and none is implemented.**
+
+That makes the settling gate an **A-tier arm, not just a prerequisite** — see
+§3.5 A11.
 
 ---
 
@@ -713,6 +769,18 @@ A10 is not optional. A detector validated only on a positive is a detector with 
 unmeasured false-positive rate, and this one can cut the learning rate of a 7-day
 run.
 
+**A11 · The settling gate** (UMA, same reload point as A1–A6; ~10.6 h). The pooled
+estimator holds `peak_scale` at 1.0 for `MIN_STAGE_STEPS` (300) across a stage
+transient, and on the toy route that is 50–70x hot — both pooled arms "spent 300
+steps being cooked before their first move, and never recovered inside 620 steps."
+§3.1's handoff **is** such a transient, so this is not a separate concern from A1–A6;
+it is the same one with a name. Run the recommended-but-unimplemented option (2):
+**allow one conservative downward cut during the transient** — act only on a
+resolved reading below target, only downward, at most once per stage. A2 (warmup not
+re-armed) is close to option (3) "require a sane seed", so the two together bracket
+the owner decision that §1.5 flags as open. `lrpool/holding_on_transient` publishes
+the gate's cost, so the readout already exists.
+
 #### Tier B — informs the production config. ELJ, 24 h/arm.
 
 **B1–B4 · Effective batch at fixed wall clock.** Batch pinned (growth off) at 1k /
@@ -730,15 +798,26 @@ The old runs used the fixed normalizer and were well-behaved; the new ones let a
 22x larger gradient through. Pick the winner here at ELJ rates, then carry it into
 A5 to test the interaction that actually matters.
 
-**B8–B10 · LR aggressiveness.** **Prerequisite, not an arm: fix the ray probe
-first.** `raycal/t_16` is censored at ±99 on 50 % of ticks and `t_32` on 83 %, and
-`alpha_star` is quantised to five grid values — so the servo dithers `peak_scale`
-over 0.707–1.297 every 500 steps and any `alpha_star` above ~8 is read off an
-unresolved bracket. Extend the ladder and log uncensored `t` values, then run:
-`alpha_target` 4 (control) / 8 / **servo off at a well-chosen fixed LR**. The third
-arm is the important one — on the conditional route the servo walked the LR out of
-the band where quality responded, and whether a servo beats a good constant is an
-open question on both routes.
+**B8–B9 · LR, rewritten against the new design (§1.5).** The old plan here — fix
+the ray probe's censoring, then sweep `alpha_target` against a servo-off control —
+is **withdrawn**. `ray` is generalised, the servo is replaced by a pooled estimator,
+and `hyper` is recommended against; `lr_handoff_2026-08-21.md`'s V1/V2/V3 queue owns
+validating that, and a parallel sweep here would duplicate it. What remains, because
+this battery is the natural home for it and the queue is not:
+
+- **B8 — the pooled estimator against a moving batch size.** V3 records that
+  *nothing has run it that way*, and batch is what moves the gradient noise
+  `alpha_target` exists to cover. This is not a separate arm: **carry the new sensor
+  on B1–B4** and the batch axis answers both questions at one cost.
+- **B9 — `alpha_target` per route, sensor-only.** Pin the rates as explicit floats
+  at a known-good hand-tuned rate and read the reported alpha* off, with no
+  actuation. V3 notes this is "only worth doing at length", and the 7-day production
+  runs (5b) are the only production-length thing in this plan — so this rides them
+  rather than costing its own arm.
+
+**Not an arm, but do not lose it:** the probe-overhead numbers behind
+`period: 1500` for elj phase 1 are local and compile-off, and must be re-measured
+before that period ships to the cluster.
 
 #### Tier C — the science. ELJ, and can run alongside production.
 
@@ -770,6 +849,73 @@ buffer's three size knobs are three handles on **one** steady state
 (`occupancy = churn_rate × mean_residence_steps`), so an arm that moves them
 independently changes occupancy and reuse together and cannot be read.
 
+#### Tier D — unconditional VarGrad, and what a premature prior costs
+
+Two angles that cross cleanly, so they are one 3x2 design rather than two batteries.
+ELJ, and they can run alongside production — but a positive result on D1 would feed
+back into the production config, so run them early in stage 6 rather than late.
+
+**D0 · Grouping shakeout (1 run, ~300 steps, <1 h). Do this first.**
+Unconditional VarGrad is **config-only, no code change** — `condition_id` is a
+mixed-radix combination of `mol_id` and the dense-local SG/Z' index, so on a
+single-molecule single-SG run it is **constant across the batch, not `None`**. The
+branch guard is `vg_by_condition and condition_id is not None and (vg_lb > 0 …)`, so
+setting `vg_by_condition: 1` on the replay bank fires the condition-grouped path with
+**one group spanning the whole batch** — which is exactly batch-level VarGrad.
+
+The shakeout exists because that is an inference from the key's construction, and it
+has a cheap direct tell: **`vg_n_groups` must read ~1 and `vg_group_size_mean` ~ the
+batch size.** If `vg_n_groups` comes back large, the run carries more than one SG or
+Z' and the arm is not what was intended. If instead the *tile* path fires — `repeats:
+1` on stored trajectories — groups are singletons and **VarGrad reads identically
+zero**, which looks like a well-behaved loss rather than an error. This is the R2
+liveness failure mode, so measure it rather than assume it.
+
+**D1–D6 · The cross.** Phase 2 ∈ {TB `equilibration` (control), VarGrad}; phase-1
+exit ∈ {0.5x, 1.0x, 2.0x the gate's natural step}. Force the exit at fixed steps
+rather than moving `mle_gate.min_rate`, so the axis does not inherit the gate's own
+route-dependence.
+
+The VarGrad phase-2 spec, per the ask: a `var_conditioning`-shaped stage with the
+**replay** bank in place of fwd, and **sidecar-only Z** — `freeze_z: 1`, `emp_z: 0`,
+`emp_z_persistent: 0`, `z_level: 0`, `z_calibration.enabled: false`. Z is tracked for
+monitoring and trains nothing.
+
+**Why crossing is justified here when it is not in §2.3:** the interaction *is* the
+question. Does a reward-free objective tolerate an undercooked prior better than TB
+does? Neither margin alone answers it.
+
+**The angle worth stating loudest** (`CONJECTURE`): **a sidecar-only-Z phase 2 should
+remove §3.1's handoff failure mode by construction.** That failure was a Z excursion
+— `bootstrap_z` put Z 18.6 nats above what the policy supported and the re-armed LR
+ramp dragged it back down through the policy, costing ~1,300 steps plus an unfinished
+recovery. With Z out of the loss there is no Z to excurse and `bootstrap_z` becomes a
+monitoring no-op. If D1 shows that, it changes the production config, not just this
+battery — which is why D belongs early.
+
+**Three properties of replay-VarGrad to design against, none of them blockers:**
+
+- **It trains only where the buffer has mass.** The group centre is a statistic over
+  stored rows, so the objective is VarGrad restricted to buffer support. That
+  promotes the replay buffer's churn and residence knobs from §5's "open-ended"
+  list to **first-order for this arm** — but they must still move together
+  (`occupancy = churn_rate x mean_residence_steps`).
+- **The Huber basin transfers.** §2.2b's mechanism is a property of
+  `beta * smooth_l1(centre, log_ratio, beta)`, not of the fwd bank, so
+  `replay_loss_coeffs.beta` (10 by default) carries the same saturation and the same
+  basin. Log `tb_resid_clipped` on the replay bank and check it stays inside the knee.
+- **Off-policy is documented safe for this grouping** — the cross-terminal
+  condition-grouped form is called out as off-policy safe as a policy loss, unlike the
+  tile-grouped form. `traj_grads: 0` on replay (the default) is correct here.
+
+**Prior art to reuse, not rediscover:** the phase-1 exit is governed by a single live
+gate. Of the three declared conditions, `eval/wass_debiased` is dead and `bwd/tbc < 2`
+is a no-op (§1.3), so `gates/mle_flat` alone decides — and it behaves very differently
+by route. `nehzor_uma` ran phase 1 for 15,670 steps against `nehzor_elj`'s 7,440 and
+exited at `mle_gate_rate` −0.152 against −0.046, i.e. **declared flat while still
+descending 3.3x faster**. So "the natural exit" is itself route-dependent, which is
+the second reason to pin the exits at fixed steps.
+
 #### What a 7-day run actually buys, and why Tier A pays for itself
 
 At the measured phase-2 rate a 7-day UMA run is roughly **10 h of phase 1 plus
@@ -786,6 +932,56 @@ leaves `checkpoint_name` null on some arms, which spends ~10 h of each run
 re-deriving a prior and makes the four runs non-comparable), and **fix T across all
 four plus the acridines** — since `eval_T` is pinned to it, a T that differs by arm
 means the arms are not on one ruler.
+
+### 3.6 Tier P — the workout
+
+**Two runs: one unconditional elj, one conditional elj. Converge phase 1 properly,
+then 10–20k steps of phase 2.** The job is to exercise the machinery end to end on
+current code and see what it looks like — not to converge anything and not to rank
+anything.
+
+**Why elj only is the right call.** A workout tests the *machinery* — protocol and
+stage transitions, the new LR ramp and pooled estimator, the phase-6 batch sizer,
+buffers, balance, metrics, checkpointing — and all of that is energy-agnostic. Paying
+4–20x for an MLIP step to exercise the same code paths buys nothing. The known gap is
+narrow and already covered elsewhere: `internal_oom_recovery: false`,
+`traj_checkpoint: true`, the energy-timing instrumentation and the OOM ladder are
+MLIP-only paths this will not touch, and they are §1.4's and Tier A's business. The
+acridine question likewise keeps its own shakeout at 5a.
+
+| run | route | phase 1 | phase 2 | duration |
+|---|---|---|---|---|
+| **W1** | unconditional elj (**mipcas** — 1,141 steps/h, the fastest and the longest clean track record) | to convergence, ~7.4k | 20k | **~24 h** |
+| **W2** | conditional elj, `var_conditioning` | to convergence, ~5.2k | 20k | **~10 h at batch 4k, ~32–46 h at batch 20k** |
+
+**W2's duration is decided by stage 1**, which makes the utilization pre-check
+critical-path rather than a battery nicety: at batch 20,000 the conditional route runs
+550–800 steps/h, at batch 4,000 roughly 2,600. If 4k clears the cluster's 60 % bar,
+W2 costs ~10 h instead of ~40.
+
+**"Converge phase 1 nicely" is a real instruction, not a formality.** The MLE gate is
+the *only* live phase-1 exit condition (§1.3), and it is route-dependent enough to
+have declared `nehzor_uma` flat while it was still descending 3.3x faster than its elj
+sibling. For the workout, run past the gate — or tighten `min_rate` — and confirm
+from the `bwd/mle` slope and `mle_gate_rate` that it is genuinely flat rather than
+gate-flat.
+
+That has a payoff beyond the workout: **a properly converged phase-1 exit is the 1.0x
+reference point Tier D's premature-exit axis is defined against**, and it is the
+fresh, loadable `phase1_exit` checkpoint that stage 0.5a may show Tier A needs.
+
+**Acceptance is the analysis package's check output, not a number** — nothing INERT,
+nothing NO_TRACE, no unexpected §4 confound flags, figures actually fired, and the
+runtime effective batch at or above baseline (§1.3). All *did it run* questions.
+
+**Run it after stage 0.** A workout of a machine with four railed controls (§1.1) and
+a dead exit gate re-measures known defects instead of exercising the shipped one.
+
+**What it must not be used for.** Single seed. §0.1's replicate spread is ×0.30–×16.7
+on the variance/coverage family, so nothing quantitative leaves these two runs and
+W1 vs W2 is not a comparison. One free observation to expect rather than design for:
+20k phase-2 steps on the conditional route runs well past the ~13k where §2.2 found
+improvement stops, so the workout will incidentally re-observe that on current code.
 
 ---
 
@@ -819,15 +1015,18 @@ that single fact decides most of the budget below — see stage 1.
 
 | stage | runs | what | route / reload point | steps | batch | h/run | GPU-h | gates? |
 |---|---:|---|---|---:|---:|---:|---:|:---:|
-| **0** | — | fix §1.1, §1.2, §1.3; delete the vestigial `exit:`/`naive`; fix the ray probe censoring | code only | — | — | — | **0** | **yes** |
-| **1** | 2 | **utilization pre-check** — cheapest pinned batch that clears the cluster's 60 % bar | conditional, batch 4,000 and 8,000 | — | 4k / 8k | 2.0 | **4** | no |
+| **0** | — | fix §1.1, §1.2, §1.3; delete the vestigial `exit:`/`naive`; settle the §1.5 settling-gate decision | code only | — | — | — | **0** | **yes** |
+| **0.5a** | 1 | **checkpoint/config load check** — do the `prod0810` configs and `phase1_exit` checkpoints still load after STATE 2–9? Decides whether Tier A is reload probes or needs regenerating | — | — | — | ~0 | **0** | **yes** |
+| **0.5b** | 2 | **Tier P — the workout**: W1 uncond elj (mipcas), W2 cond elj. Phase 1 to real convergence, then 10–20k phase-2 steps. Acceptance = clean `analysis` checks, NOT a metric | uncond + cond elj | ~7.4k/5.2k + 20k | live | 24 / 10–46 | **34–70** | **yes** |
+| **1** | 2 | **utilization pre-check** — cheapest pinned batch that clears the cluster's 60 % bar | conditional, batch 4,000 and 8,000 | — | 4k / 8k | 2.0 | **4** | **feeds W2** |
 | **2** | 7 | conditional reload probes: 1 control + 3 LR band + tether + balance + condition draw | conditional, from a `var_conditioned`-age ckpt | 2,000 | 20k | 3.3 | **23** | no |
 | **3a** | 6 | **A1–A6 handoff** | `ur4bodzn` phase1_exit @15,670, **uma** | 2,000 | live | 10.6 | **64** | **yes** |
 | **3b** | 3 | **A7–A9 divergence bars** | `mipcas_uma` phase1_exit @8,740, **uma** | 2,660 | live | 6.0 | **18** | **yes** |
 | **3c** | 1 | **A10 false-positive test** | `nehzor_elj`, healthy | 5,000 | live | 7.2 | **7** | **yes** |
+| **3d** | 1 | **A11 settling gate** — one conservative cut during the transient | `ur4bodzn` phase1_exit, **uma** | 2,000 | live | 10.6 | **11** | **yes** |
 | **4a** | 4 | **B1–B4 effective batch** at fixed wall clock (1k / 4k / 16k / 1k+floor) | uncond elj | — | pinned | 24 | **96** | no |
 | **4b** | 3 | **B5–B7 grad clip** (`auto` / fixed normalizer / tightened guard) | uncond elj | — | live | 24 | **72** | no |
-| **4c** | 3 | **B8–B10 LR** (`alpha_target` 4 / 8 / servo off at fixed LR) | uncond elj, *after* the probe fix | — | live | 24 | **72** | no |
+| **4c** | 0 | **B8–B9 LR** — folded into 4a (sensor on the batch arms) and 5b (sensor-only alpha* read) | — | — | — | — | **0** | no |
 | **5a** | 2 | **acridine shakeout** — does it hold a sane batch and leave `train_prior`? | acridine, mace | — | live | 12 | **24** | gates 5c |
 | **5b** | 4 | **production**, warm-started, fixed T | mipcas/nehzor × elj/uma | — | live | 168 | **672** | — |
 | **5c** | 3 | **acridine production** | acridine sg9_zp2 / sg14_zp2 / sg14_zp1 | — | live | 48 | **144** | — |
@@ -835,17 +1034,19 @@ that single fact decides most of the budget below — see stage 1.
 | **6b** | 3 | **C3–C5 T** (40 / 60 / 100) at fixed wall clock | uncond elj | — | live | 24 | **72** | no |
 | **6c** | 3 | **C6–C8 `t_scale`** — branches off one warm start | uncond elj | — | live | 24 | **72** | no |
 | **6d** | 32 | **conditional battery** — 16 arms x 2 seeds, in sequence: huber basin (4, tether OFF, ~1,500 steps) -> gradient noise / group size (3) -> step_var clamp (1) -> Z tether gain (5) -> Z target (2) -> huber beta on the QM9 route (1) | conditional, warm from `phase1_exit` | 1.5k–8k | 20k | 0.5–13.3 | **310** | no |
+| **6e** | 1 | **D0 grouping shakeout** — `vg_n_groups` ~1 and `vg_group_size_mean` ~ batch, or the arm is not what was intended | uncond elj | 300 | live | 0.5 | **1** | gates 6f |
+| **6f** | 6 | **D1–D6 VarGrad x prior quality** — phase 2 ∈ {TB, VarGrad/replay, sidecar-only Z} x phase-1 exit ∈ {0.5x, 1x, 2x} | uncond elj | — | live | 24 | **144** | no |
 
 ### 4.3 Totals, and the number that matters
 
 | bundle | GPU-h | GPU-days |
 |---|---:|---:|
-| **gates only** (stages 0–3) | 116 | **~5** |
+| **gates only** (stages 0–3, incl. Tier P) | 161–197 | **~7–8** |
 | production (stage 5) | 840 | ~35 |
-| gates + production | 956 | **~40** |
-| Tier B (stage 4) | 240 | ~10 |
-| Tier C + conditional battery (stage 6) | 502 | ~21 |
-| everything (stages 0–6) | 1,698 | **~71** |
+| gates + production | 1,001–1,037 | **~42–43** |
+| Tier B (stage 4) | 168 | ~7 |
+| Tier C + D + conditional battery (stage 6) | 647 | ~27 |
+| everything (stages 0–6) | 1,816–1,852 | **~76–77** |
 
 **The headline: the gating work costs ~5 GPU-days on top of a ~35-day production
 plan — about 13 %** — and it is aimed at a handoff that cost `nehzor_uma` on the
@@ -860,12 +1061,23 @@ GPU-days for two 2-hour runs. The 2-hour duration is not padding: `gpu_util_poli
 averages over a 7,200 s window, so a shorter run cannot fill the number the cluster
 actually judges.
 
-**What I would cut, in order.** 4c (LR) first — it needs the ray-probe fix landed to
-be readable at all, so it is the axis most likely to be wasted. Then 6b (T) and 6c
-(`t_scale`), which are genuine science but change nothing about the production runs
-already in flight. I would not cut 4a or 4b: both inform the production config, both
-are cheap ELJ time, and 4a (B4 specifically) is the only thing that tells you whether
-the MLIP arms' 69–188 batch regime is survivable at all.
+**What I would cut, in order.** 6b (T) and 6c (`t_scale`) first — genuine science
+that changes nothing about production runs already in flight. I would not cut 4a or
+4b: both inform the production config, both are cheap ELJ time, 4a now also carries
+the new sensor and so answers a V3 queue item (§1.5), and B4 specifically is the only
+run that tells you whether the MLIP arms' 69–188 batch regime is survivable at all.
+
+**Two ordering constraints that are not about cost.** V2 — the conditional analogue
+in `lr_handoff_2026-08-21.md`'s queue — **gates 6d**. It has to establish that the
+condition grouping survives the larder round trip (`raycal/status_fwd` and
+`status_bwd` must RESOLVE, and a grouping collapsed to singletons would read as
+`unresolved` forever rather than as an error), that ray works on a composite with no
+replay branch, and that the ramp's re-arm rate limit holds on a stage whose
+composition moves. Until it does, an LR-controller failure on `var_conditioning` is
+indistinguishable from a loss-term result, and 6d's arms are unreadable. **And V2's
+own known detonator is §2.2b's failure** — the three Z keys must be set or the stage
+escapes the Huber basin within ~30 steps — so V2 and 6d's huber arms are studying the
+same mechanism from opposite ends and should share a config base.
 
 **What must not be run concurrently with itself.** 6d's three axes are sequential by
 design (§2.3) — run Z level, then group size on its winner, then huber beta. The 20

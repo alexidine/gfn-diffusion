@@ -50,47 +50,48 @@ from energy_sampling.utils import MetricTracker
 # resolution, and the point here is to control every input explicitly.
 MK_DEV_LR = dict(
     lr_policy=1.25e-4, lr_back=1.25e-4, lr_replay=1.25e-4, lr_fused=1.25e-4,
-    lr_flow=0.1, min_lr=1.0e-8, lr_warmup_ratio=10,
+    lr_flow=0.1, min_lr=1.0e-8,
     # what resolve_derived_config records for every lr_* key written `auto`;
-    # an empty set is the controller's own control arm (reads and logs, actuates nothing)
+    # an empty set is the controller's own control arm (reads and logs, actuates
+    # nothing), which is also what makes the bracket's bias-correction check
+    # abstain rather than refuse
     lr_servo_managed=('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'),
 )
 
-MK_DEV_ADAPTIVE = dict(
-    warmup_steps=1000, seed_lr=1.25e-4, bounds=(0.01, 2000.0),
-    divergence_loss_abs=1.0e9, divergence_grad_abs=1.0e9, divergence_cut=0.5,
-    # relative bar, as a multiple of the QUIETEST loss the current stage has
-    # produced on that branch -- the absolute bars above are a numerical-death
-    # backstop and cannot see a 100x excursion on an O(1) loss. Transcribed from
-    # the shipping value rather than disabled here: a bench that starts from a
-    # different configuration than production is the drift test_fidelity exists
-    # to catch.
-    divergence_loss_rel=100.0,
-    control_flow_lr=False, restart_after=None,
+# `lr_control`, transcribed from configs/mk_dev.yaml. The bench starting from a
+# different configuration than production is exactly the drift test_fidelity
+# exists to catch, so these are the shipping numbers rather than convenient ones.
+MK_DEV_CONTROL = dict(
+    mode='bracket', seed_lr=1.25e-4, control_flow_lr=False,
+    burn_in_steps=3000, burn_in_scale=0.05, min_root_bias_correction=0.9,
+    candidate_scales=(0.05, 0.1, 0.2, 0.4, 0.8, 1.6),
+    trial_steps=150, safety_rungs=1, repeat_every=20000,
+    boundary_confirm_repeats=1, boundary_densify=True,
+    fixed_scale=0.2, verbose=True,
 )
 
-MK_DEV_CALIBRATION = dict(alpha_target=4.0, eta_up=0.25, eta_down=0.5)
+# The hard-failure bars. `loss_abs`/`grad_abs` are BACKSTOPS: the load-bearing
+# bar is derived at bracket time from the root's own loss span, because at 1e9
+# the shipped bars caught numerical death and nothing else -- a rate one rung too
+# hot on this route took the loss from about -25 to +318, finite and eight orders
+# of magnitude under them. Anything >= 1e8 is refused at construction.
+MK_DEV_HARD_FAILURE = dict(
+    loss_excursion_k=10.0, grad_excursion_x=100.0,
+    loss_abs=1.0e6, grad_abs=1.0e6, root_window=200, min_observations=20,
+    cruise_rederive=True, cruise_settle_steps=200,
+)
 
-# The block lives UNDER adaptive_lr (utils._RETIRED_KEYS: "moved ->
-# adaptive_lr.ray_calibration"), because it parameterises one of the LR sensors.
-#
-# `enabled` IS NOT HERE, and its absence is the mechanism rather than an
-# omission: the flag is deleted in both spellings, and a stage declaring
-# `lr_sensor: {kind: ray}` IS the switch (train.py:1871 passes
-# `enabled=bool(self._ray_askers())`). The bench derives it the same way, from
-# FakeStage.lr_sensor via FakeModeller._ray_askers.
+# `ray` is a DIAGNOSTIC now and reaches no learning rate. `enabled` IS NOT HERE,
+# and its absence is the mechanism rather than an omission: a stage declaring
+# `lr_sensor: {kind: ray}` IS the switch, and the bench derives it the same way
+# from FakeStage.lr_sensor via FakeModeller._ray_askers.
 MK_DEV_RAYCAL = dict(period=500, n_sub=8, alphas=(0, 1, 2, 4, 8, 16, 32, 64))
 
-# The three coefficient banks, transcribed from configs/mk_dev.yaml. Only the
-# keys the probe gate reads are here: LarderScorer.refusal asks whether the FWD
-# bank carries a term the backward (replay) evaluator has no counterpart for,
-# and all four are 0 on the canonical route. `var_conditioning` runs emp_z 1.0,
-# which is the case the refusal exists for -- flip it in a test, do not ship it
-# as a default here.
 MK_DEV_BANKS = dict(
     fwd_loss_coeffs=dict(tb=1.0, z_level=0.0, emp_z=0.0, emp_z_persistent=0.0,
                          traj_grads=0.0, reward_grads=0.0),
-    bwd_loss_coeffs=dict(tb=1.0, traj_grads=1.0),
+    bwd_loss_coeffs=dict(tb=1.0, traj_grads=1.0, vg_by_condition=0.0,
+                         vg_lb=0.0, vg_lme=0.0),
     replay_loss_coeffs=dict(tb=1.0, traj_grads=0.0),
 )
 
@@ -123,7 +124,7 @@ def make_args(**overrides):
     """
     Build an args namespace shaped like the real one, with mk_dev defaults.
 
-    Nested blocks are addressed with dots: make_args(**{'adaptive_lr.warmup_steps': 0}).
+    Nested blocks are addressed with dots: make_args(**{'lr_control.trial_steps': 20}).
     The controller reads them via getattr chains, so SimpleNamespace is faithful.
 
     THE DOTTED PATH IS THE SHIPPING SPELLING, and unknown keys raise in EVERY
@@ -133,19 +134,19 @@ def make_args(**overrides):
     dict nobody compared against the real config, so the bench kept steering a
     flag production had deleted.
     """
-    adaptive = dict(MK_DEV_ADAPTIVE)
-    calibration = dict(MK_DEV_CALIBRATION)
+    control = dict(MK_DEV_CONTROL)
+    hard_failure = dict(MK_DEV_HARD_FAILURE)
     raycal = dict(MK_DEV_RAYCAL)
     banks = {k: dict(v) for k, v in MK_DEV_BANKS.items()}
     flat = {**MK_DEV_LR, **MK_DEV_BATCH}
 
-    #: prefix -> the block it addresses. LONGEST FIRST: 'adaptive_lr.' is a
+    #: prefix -> the block it addresses. LONGEST FIRST: 'lr_control.' is a
     #: prefix of the other two, so an unordered scan would file
-    #: 'adaptive_lr.ray_calibration.period' into the adaptive block under a key
+    #: 'lr_control.ray_calibration.period' into the control block under a key
     #: literally named 'ray_calibration.period'. The empty prefix is top level.
-    blocks = (('adaptive_lr.calibration.', calibration),
-              ('adaptive_lr.ray_calibration.', raycal),
-              ('adaptive_lr.', adaptive),
+    blocks = (('lr_control.hard_failure.', hard_failure),
+              ('lr_control.ray_calibration.', raycal),
+              ('lr_control.', control),
               ('fwd_loss_coeffs.', banks['fwd_loss_coeffs']),
               ('bwd_loss_coeffs.', banks['bwd_loss_coeffs']),
               ('replay_loss_coeffs.', banks['replay_loss_coeffs']),
@@ -158,16 +159,15 @@ def make_args(**overrides):
             raise KeyError(
                 f'{key!r} is not a known arg. Add it to the MK_DEV_* dicts if the '
                 f'real config has it -- silently accepting unknown keys is how a '
-                f'bench ends up testing a config the trainer would reject. Two '
-                f'live cases: the ray block MOVED to adaptive_lr.ray_calibration, '
-                f'and its `enabled` was DELETED (utils._RETIRED_KEYS) -- the '
-                f'switch is now a stage declaring lr_sensor: {{kind: ray}}.')
+                f'bench ends up testing a config the trainer would reject. The live '
+                f'case: `adaptive_lr` was RETIRED WHOLE at state 10 and replaced by '
+                f'`lr_control`, so every warmup/envelope/alpha_target key is gone.')
         block[name] = value
 
-    adaptive['calibration'] = SimpleNamespace(**calibration)
-    adaptive['ray_calibration'] = SimpleNamespace(**raycal)
+    control['hard_failure'] = SimpleNamespace(**hard_failure)
+    control['ray_calibration'] = SimpleNamespace(**raycal)
     flat.update({k: SimpleNamespace(**v) for k, v in banks.items()})
-    return SimpleNamespace(adaptive_lr=SimpleNamespace(**adaptive), **flat)
+    return SimpleNamespace(lr_control=SimpleNamespace(**control), **flat)
 
 
 class FakeStage:

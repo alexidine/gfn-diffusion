@@ -130,7 +130,13 @@ profiling:
   enabled: false
   regions: null
   trace:
-    enabled: true
+    # OFF. This block is PROFILING SCAFFOLDING inherited from the config these
+    # were derived from, and on a RESUMED run it fires at once: step_ind restores
+    # past `start_step`, so the window opens on the first step and closing a
+    # record_shapes trace of a full crystal batch pins a core and allocates tens
+    # of GB. Diagnosed by py-spy on elj_p2_cruise -- the stack was sitting in
+    # torch.profiler stop_trace, not in anything this run is testing.
+    enabled: false
     start_step: 150          # past CUDA context creation and cold caches
     active_steps: 8          # SAME window as the conformer profile, for comparability
     outdir: profiling_results

@@ -626,6 +626,19 @@ MECHANISMS = (
     Mechanism('adaptive_lr.enabled', 'global', 'adaptive_lr_enabled',
               Declare.TRUTHY, ('lr_ctrl/scale',), Rule.MOVES,
               note='the earlier declaring key for the same controller'),
+    # THE THIRD ERA, and its trace had to change WITH the mechanism rather than
+    # inherit the two above. `lr_ctrl/scale` under the bracket is piecewise
+    # constant BY DESIGN -- burn-in scale, then the promoted rung, and nothing in
+    # between -- so `Rule.MOVES` on it would report a correctly-working bracket
+    # as inert on any run whose selection happened to land on the burn-in scale,
+    # and would report EVERY fixed-mode run as inert. `lr_bracket/phase` moves in
+    # both modes (burn_in -> cruise) and moves only when the machine advances,
+    # which is the thing being asserted.
+    Mechanism('lr_control', 'global', 'lr_control_seed_lr', Declare.POSITIVE,
+              ('lr_bracket/phase',), Rule.MOVES,
+              note='the brute-force bracket (project state 10). A flat scale is '
+                   'NOT evidence of inertness here -- that is what the mechanism '
+                   'does between selections'),
 
     # --- Z calibration. Measured inert on 11 of 69 runs that enable it.
     Mechanism('z_calibration', 'global', 'z_calibration_enabled', Declare.TRUTHY,
@@ -733,7 +746,10 @@ R11_ROUTES = (Route.TB_UNCONDITIONAL,)
 # A censored estimator reported AT its censoring bound is not a reading. These
 # are the bounds this codebase imposes, with the series they clamp.
 CENSORED = {
-    # ray_calibration clamps its t-statistics to +/-99 before logging.
+    # ray_calibration clamped its per-alpha t-statistics to +/-99 before logging.
+    # That grid stopped being logged on 2026-08-23, so this entry is HISTORICAL:
+    # it still reads runs recorded before the change and matches nothing in a
+    # current one. Remove it once those runs stop mattering.
     'raycal/t_': 99.0,
 }
 # Config keys that name a clip a series can pin against.

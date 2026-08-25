@@ -76,22 +76,28 @@ def test_absent_is_not_zero():
 
 
 def test_frozen_tiers_are_labelled_not_scored():
-    """At `dihedral`, r/theta are pinned at the reference, so any in-range fraction is 1.0
-    BY CONSTRUCTION. Publishing that 1.0 is the same failure as a test that cannot fail."""
+    """At `dihedral`, r/theta are pinned at the reference, so any excursion is 0 BY
+    CONSTRUCTION. Publishing that 0 is the same failure as a test that cannot fail.
+
+    The frozen flag replaces the value; it never sits beside one. A tier that published
+    both would let a reader take the 0 at face value.
+    """
     en = _en(PROPANOL, level='dihedral')
     out = cm.geometry_stats(en, _box(en))
     assert out['geom/r_frozen'] == 1 and out['geom/theta_frozen'] == 1
-    assert 'geom/r_in_range_frac' not in out and 'geom/theta_in_range_frac' not in out, \
-        'a frozen block published an in-range fraction that cannot be anything but 1.0'
+    assert 'geom/r_worst_abs' not in out and 'geom/theta_worst_abs' not in out, \
+        'a frozen block published a worst-case excursion that cannot be anything but 0'
     assert out.get('geom/all_in_range_frozen') == 1
     assert 'geom/all_in_range' not in out
 
-    # at `full` the same blocks ARE free, so the metric must actually be scored
+    # at `full` the same blocks ARE free, so the metric must actually be scored -- and the
+    # frozen flag must be GONE, not set to 0 beside the value
     enf = _en(PROPANOL, level='full')
     full = cm.geometry_stats(enf, _box(enf))
-    assert full['geom/r_frozen'] == 0 and 'geom/r_in_range_frac' in full
-    assert 'geom/all_in_range' in full
-    print('PASS  frozen tiers labelled, free tiers scored')
+    assert 'geom/r_frozen' not in full and 'geom/theta_frozen' not in full
+    assert 'geom/r_worst_abs' in full and 'geom/all_in_range' in full
+    assert len(full) == 3, f'geom/ is a three-key guard; got {sorted(full)}'
+    print('PASS  frozen tiers labelled, free tiers scored, three keys either way')
 
 
 def test_geometry_detects_out_of_range():
@@ -132,7 +138,8 @@ def test_coverage_catches_mode_collapse():
     assert narrow['cover/n_missed'] > wide['cover/n_missed'], \
         f"collapsed sampler missed {narrow['cover/n_missed']} basins, spread missed " \
         f"{wide['cover/n_missed']} -- coverage did not distinguish them"
-    assert narrow['cover/n_missed'] == narrow['cover/n_accessible'] - 1, \
+    const = cm.cover_constants(en, ref)
+    assert narrow['cover/n_missed'] == const['cover/n_accessible'] - 1, \
         'a point mass should occupy exactly one basin'
     assert narrow['cover/worst_frac'] == 0.0
     assert narrow['cover/occupancy_entropy'] < 0.05 < wide['cover/occupancy_entropy'], \
@@ -154,7 +161,9 @@ def test_single_basin_abstains_rather_than_reading_as_collapsed():
         assert 'cover/occupancy_entropy' not in out
         print('PASS  single-basin molecule abstains on occupancy entropy')
     else:
-        assert out['cover/occupancy_entropy_available'] == 1
+        assert 'cover/occupancy_entropy' in out
+        assert 'cover/occupancy_entropy_available' not in out, \
+            'a LIVE metric announced its own presence; the flag is for absence only'
         print('PASS  cyclohexane has >1 accessible basin; entropy is published')
 
 
@@ -266,12 +275,13 @@ def test_accepts_device_tensors():
     out.update(cm.energy_component_stats(en, x))
     out.update(cm.geometry_stats(en, x))
     out.update(cm.dof_class_stats(en, x, reference=x))
-    out.update(cm.dof_element_stats(en, x))
+    out.update(cm.dof_element_stats(en, x, reference=x))
     out.update(cm.ring_stats(en, x))
     out.update(cm.basin_coverage(en, x, ref))
+    out.update(cm.cover_constants(en, ref))
     out.update(cm.thermal_stats(en, e, -1.0))
     out.update(cm.energy_vs_reference(e, e))
-    assert out['E/total_available'] == 1
+    assert 'E/total_mean' in out
     print(f'PASS  every entry point accepts CUDA tensors ({len(out)} keys)')
 
 
@@ -303,9 +313,11 @@ def test_coupling_detects_dependence_and_abstains_on_collapse():
     assert abs(a['cover/coupling_tc_debiased']) < 0.15,         f"independent draws reported TC {a['cover/coupling_tc_debiased']}"
     assert b['cover/coupling_tc_debiased'] > 0.5,         f"locked-together groups reported TC {b['cover/coupling_tc_debiased']} -- coupling "         f"was not detected"
     assert b['cover/coupling_n_suppressed'] > a['cover/coupling_n_suppressed']
-    assert c['cover/coupling_available'] == 0 and 'cover/coupling_tc' not in c,         'a collapsed sampler must ABSTAIN; TC = 0 there reads as "marginals trustworthy"'
-    # the null control must actually be near zero, or `debiased` is meaningless
-    assert a['cover/coupling_tc_null'] < 0.15
+    assert c['cover/coupling_available'] == 0 and 'cover/coupling_tc_debiased' not in c,         'a collapsed sampler must ABSTAIN; TC = 0 there reads as "marginals trustworthy"'
+    # The shuffle null is subtracted inside and no longer published, so it is gated
+    # INDIRECTLY and the two assertions above are what do it: a null large enough to make
+    # `debiased` meaningless would have to cancel the coupled case as well, and `b > 0.5`
+    # fails if it does. Asserting on a key that no longer exists is what would be vacuous.
     print(f"PASS  coupling separates independent ({a['cover/coupling_tc_debiased']:+.4f}) "
           f"from coupled ({b['cover/coupling_tc_debiased']:+.4f}), abstains on collapse")
 
@@ -390,6 +402,118 @@ def test_ring_torsion_stats_abstains_on_acyclic():
     print('PASS  ring torsion stats abstain on an acyclic molecule')
 
 
+def test_dof_element_ratio_localises_a_widened_column():
+    """dof_elem/ exists to say WHICH element owns the column that dof/*_sd_ratio_max
+    found. So widening one element's columns must move that element's ratio and leave the
+    others at ~1 -- and it must be a MAX, so widening a SINGLE column of a group is enough.
+
+    Before this was a ratio the group published raw sds with no reference, which cannot
+    fail this test in either direction: 0.010 is neither right nor wrong on its own.
+    """
+    en = _en(PROPANOL, level='full')
+    ref = _box(en, n=512, scale=0.2, seed=3)
+    block = np.asarray(en._free_block)
+    owner = cm._central_elements(en)
+
+    base = cm.dof_element_stats(en, _box(en, n=512, scale=0.2, seed=4), reference=ref)
+    ratio_keys = [k for k in base if k.endswith('_sd_ratio')]
+    assert ratio_keys, 'a reference was supplied and no ratio was published'
+    assert not any(k.endswith('_sd') for k in base), \
+        'a raw sd was published beside a ratio; the two must never share an axis'
+    for k in ratio_keys:
+        assert 0.7 < base[k] < 1.4, f'{k} = {base[k]} on two draws from one distribution'
+
+    # widen exactly ONE column, and pick the group it belongs to
+    target = None
+    for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi')):
+        for zval in np.unique(owner):
+            idx = np.flatnonzero((block == cls) & (owner == zval))
+            if idx.size >= 2:                      # >= 2 so the MAX-vs-mean gate bites
+                target = (cname, cm._SYM.get(int(zval), f'Z{int(zval)}'), int(idx[0]))
+                break
+        if target:
+            break
+    assert target is not None, 'no element group with >= 2 columns to test the max on'
+    cname, sym, col = target
+
+    x = _box(en, n=512, scale=0.2, seed=4)
+    x[:, col] *= 5.0
+    wide = cm.dof_element_stats(en, x, reference=ref)
+    hit = f'dof_elem/{cname}_{sym}_sd_ratio'
+    assert wide[hit] > 3.0, \
+        f'{hit} = {wide[hit]:.2f} after one of its columns was widened 5x -- a mean over ' \
+        f'the group would have diluted it, which is the failure this MAX exists to avoid'
+    for k in ratio_keys:
+        if k != hit:
+            assert abs(wide[k] - base[k]) < 1e-6, f'{k} moved when {hit} was widened'
+    print(f'PASS  dof_elem ratio localises a widened column ({hit}: '
+          f'{base[hit]:.2f} -> {wide[hit]:.2f}), others unmoved')
+
+
+def test_presence_is_not_announced_but_absence_is():
+    """THE CONSOLIDATION'S LOAD-BEARING RULE. `*_available = 1` beside a value was a key
+    per metric carrying no information; `*_available = 0` INSTEAD of a value is the whole
+    absent-is-not-zero rule and must survive. Both halves are gated here, because dropping
+    the second along with the first is the easy mistake and it is silent.
+    """
+    en = _en(PROPANOL, level='full')
+    x = _box(en, n=128, scale=0.2)
+    live = {}
+    live.update(cm.energy_component_stats(en, x))
+    live.update(cm.geometry_stats(en, x))
+    live.update(cm.dof_class_stats(en, x, reference=x))
+    live.update(cm.dof_element_stats(en, x, reference=x))
+    ones = {k: v for k, v in live.items() if k.endswith('_available') and v == 1}
+    assert not ones, f'live metrics announced their own presence: {sorted(ones)}'
+
+    # ... and the abstaining direction still fires. An empty array has nothing to average,
+    # and a molecule with no ring has no closure -- both must produce the flag, not a 0.
+    out = {}
+    cm._quantiles(np.array([]), 'x/thing', out)
+    cm._mean_only(np.array([np.nan, np.inf]), 'x/small', out)
+    assert out == {'x/thing_available': 0, 'x/small_available': 0}, out
+    assert cm.ring_stats(en, x)['ring/available'] == 0
+    print('PASS  presence is not announced, absence still is')
+
+
+def test_minor_energy_terms_keep_their_share_but_lose_their_histogram():
+    """The E/ trim must not break the partition over terms. Every term keeps a mean and a
+    share -- so a molecule whose energy moves to a term outside FULL_QUANTILE_TERMS is
+    still VISIBLE, which is what makes the fixed tuple auditable rather than a blind spot.
+    """
+    en = _en(PROPANOL, level='full')
+    out = cm.energy_component_stats(en, _box(en, n=128, scale=0.2))
+    comp = cm.energy_components(en, _box(en, n=128, scale=0.2))
+    for name in comp:
+        assert f'E/{name}_mean' in out and f'E/{name}_share' in out, \
+            f'{name} lost its level or its share; the term partition is incomplete'
+        has_block = f'E/{name}_p50' in out
+        assert has_block == (name in cm.FULL_QUANTILE_TERMS), \
+            f'{name} percentile block = {has_block}, but FULL_QUANTILE_TERMS says ' \
+            f'{name in cm.FULL_QUANTILE_TERMS}'
+    print(f'PASS  every term keeps mean+share; percentile blocks only for '
+          f'{cm.FULL_QUANTILE_TERMS}')
+
+
+def test_cover_constants_carry_the_denominators():
+    """The three live cover/ keys are unreadable without these, so dropping them from the
+    per-eval log is only sound if they are still PRODUCED. A `cover_constants` that
+    abstained or returned an empty dict would make `n_missed = 0` uninterpretable and
+    nothing else in the suite would notice.
+    """
+    en = _en(PROPANOL, level='full')
+    ref = basin_reference(en)
+    const = cm.cover_constants(en, ref, u_star=40.0, target_tc=cm.target_coupling(ref))
+    for k in ('cover/n_modes', 'cover/n_accessible', 'cover/expected_frac',
+              'cover/coupling_n_groups', 'cover/nonthermal_u_star'):
+        assert k in const, f'{k} missing; a live cover/ key lost its denominator'
+    assert const['cover/expected_frac'] == 1.0 / const['cover/n_accessible']
+    assert const['cover/n_accessible'] <= const['cover/n_modes']
+    assert cm.cover_constants(en, None)['cover/available'] == 0
+    print(f"PASS  cover constants carry the denominators "
+          f"({const['cover/n_accessible']} of {const['cover/n_modes']} basins accessible)")
+
+
 TESTS = [test_absent_is_not_zero,
          test_frozen_tiers_are_labelled_not_scored,
          test_geometry_detects_out_of_range,
@@ -405,6 +529,10 @@ TESTS = [test_absent_is_not_zero,
          test_target_coupling_is_sampler_independent,
          test_ring_torsion_stats_separate_width_from_structure,
          test_ring_torsion_stats_abstains_on_acyclic,
+         test_dof_element_ratio_localises_a_widened_column,
+         test_presence_is_not_announced_but_absence_is,
+         test_minor_energy_terms_keep_their_share_but_lose_their_histogram,
+         test_cover_constants_carry_the_denominators,
          test_accepts_device_tensors]
 
 if __name__ == '__main__':

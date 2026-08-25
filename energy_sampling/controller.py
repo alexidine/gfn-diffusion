@@ -1,1548 +1,384 @@
+"""
+The learning-rate controller: ONE multiplier over the managed policy optimizers,
+moved only by the brute-force bracket (`lr_bracket.py`), plus the always-on hard
+tripwire.
+
+    lr = base_lr x scale
+
+`scale` is piecewise constant and every value it takes is auditable: it is the
+configured burn-in scale, a configured candidate rung under trial, or the rung
+the bracket promoted. There is no envelope, no warmup ramp, no decay leg and no
+continuous servo underneath it -- a hidden multiplier would mean the rate under
+test is not the rate applied, which is precisely how a bracket comes to report a
+boundary it never found.
+
+WHAT THIS REPLACED, AND WHY. Controller v8 moved `peak_scale` from a per-stage
+declared sensor: `ray` (a line-search optimum alpha*), `hyper` (a hypergradient
+cosine) or `plateau`, under a warmup envelope with its own freeze rules, with a
+pooled estimator and a periodic re-probe on top. The ray was killed on
+2026-08-23 by its own acceptance test -- alpha* is defined as s*/lr, so the slope
+of log(alpha*) against log(lr) MUST be -1, and measured 0.00 +- 0.2 across twelve
+runs, two stages and 2.7 decades of rate. The sensor was uncorrelated with the
+variable it steered. Everything built on it -- the pool, the sweep, the rung
+ladder, the alpha target -- inherited that. A cruise that held one rate for 1,200
+steps with zero moves was reported as the controller working; it is the null
+output, and the null output is what a dead sensor produces.
+
+The bracket cannot fail that way. Its only reading is "did this candidate
+detonate", which is not a statistic.
+
+WHAT SURVIVES FROM v8, and it is deliberately little:
+
+  * the ACTUATOR -- `_apply_lrs`, the managed-key rule, the flow-head pin, the
+    max_lr rail and the min_lr floor. That layer was never in question.
+  * the HARD TRIPWIRE -- non-finite readings and absolute bars. Its bars are no
+    longer the only ones: see `lr_bracket_probe.HardFailureBars`, which derives a
+    bar from the root's own loss scale, because at 1e9 the shipped bars caught
+    numerical death and nothing else.
+  * `ray` and `hyper` as OPTIONAL, OFF-BY-DEFAULT DIAGNOSTICS. They no longer
+    reach any learning rate, and no canonical config declares one. They are kept
+    reachable so a future claim about either can be measured rather than argued
+    about; their reporting is off unless a stage explicitly asks.
+
+WHAT IS GONE: `plateau`, the pooled estimator (`lr_pool`), the rung ladder
+(`lr_ramp`), the sweep (`lr_sweep`), the warmup envelope and its freeze rules,
+the divergence LR cut and its ceiling, the alpha target, the warm restart.
+"""
+
+from __future__ import annotations
+
 import math
 from collections import deque
 
-from energy_sampling.lr_pool import (NOISE_FLOOR_DEX, OptimumPool,
-                                     raise_cap_from_grid)
+from energy_sampling.lr_bracket import BURN_IN, CRUISE, LRBracket
+from energy_sampling.lr_bracket_probe import BracketDriver, HardFailureBars
+from energy_sampling.utils import is_cuda_oom
 
 
 class LRController:
-    """
-    LR controller v8: a warmup envelope under a peak set by a PER-STAGE SENSOR,
-    plus one coarse divergence bar.
-
-        lr = base_lr x peak_scale x envelope(t)
-
-    `envelope` is a fixed warmup ramp, restarted at every stage transition.
-    `peak_scale` is moved by whichever sensor the CURRENT STAGE declares
-    (protocol.py `lr_sensor`, parsed at Stage._parse_lr_sensor) and by nothing
-    else:
-
-        kind: ray      on_calibration(), at most once per
-                       ray_calibration.period steps. Scores the FUSED COMPOSITE
-                       the stage's own step descends, on batches harvested from
-                       its own live steps (lr_larder.py), so it is coherent
-                       wherever every active branch can be replay-scored. It
-                       used to draw from replay and score replay_loss_coeffs,
-                       which confined it to a fused stage training replay TB and
-                       is why phase 1 was never measured
-        kind: hyper    on_hypergradient(), EVERY step, each move bounded by
-                       exp(+-beta). Scores no loss, so it is coherent whatever
-                       the stage trains
-        kind: plateau  on_plateau(), on a ReduceLROnPlateau verdict. Cuts only
-        kind: none     nothing moves it; the LRs sit at their resolved base
-
-    Omitting the block entirely means no sensor -- silently -- so `auto` keys
-    stay at adaptive_lr.seed_lr for the whole stage while the config reads as
-    adaptive. on_divergence() also cuts peak_scale, whatever the sensor. All
-    three sensors HOLD THROUGH WARMUP, for the reason written at
-    on_calibration.
-
-    WHAT V8 DELETED, AND WHY. v7 estimated alpha* online: a 3-point parabola per
-    probe, then a windowed median, a censoring taxonomy, quorum fractions, a
-    ramp/cruise state machine, a boost leg, and a relative damage tripwire. Every
-    one of those existed to defend a statistic that could not carry the decision.
-    alpha* was formed as a RATIO whose denominator, the second difference, has a
-    per-probe sd/mean around 3.3 on this route -- so ~40% of single fits came back
-    concave and were discarded as 'censored', the median bound to the probe span,
-    the IQR collapsed, and the trigger's own quorum became unreachable because
-    censored readings sat in its denominator but could never enter its numerator.
-    Measured consequence: a 55x LR ramp with the trigger never firing, ending in
-    non-finite gradients (lrdisc v1, 2026-08-10).
-
-    v8 does not form that ratio. ray_calibration.py measures the sign of a paired
-    loss difference, which answers "is alpha* above this alpha" directly, and
-    brackets alpha* on a doubling grid. See that module for the identity.
-
-    THE SETPOINT IS NOT 1. alpha* = 1 is the one-step optimum along a frozen ray,
-    and it is ABOVE the rate a run survives: the step that maximises expected
-    progress is |g|^2 / (g'Hg + tr(H*Sigma)), and a ray probe at fixed theta
-    cannot see the tr(H*Sigma) term. Measured on this route (tuphwfkm): stable,
-    improving training sat at alpha* 3.6-5.0, and an excursion to alpha* ~2.8
-    visibly degraded it. `alpha_target` therefore defaults to 4 -- roughly a
-    quarter of the one-step optimum -- and is a per-route quantity to re-measure,
-    not a constant.
-
-    THE UPDATE IS ASYMMETRIC, on principle rather than for tuning:
-
-        peak_scale <- peak_scale x (alpha_hat / alpha_target) ^ eta
-
-    with eta = eta_up when raising and eta_down when lowering. Raising is
-    speculative -- it is licensed by a one-step measurement that cannot see
-    multi-step effects -- while lowering is the safe direction, because
-    undertraining is recovered and damage is not. So eta_up is small and eta_down
-    is large. This is also what makes a per-interval overshoot bounded: the LR
-    cannot move far up between calibrations, but can be halved in one.
-
-    Because the alpha grid is log-spaced, the response is automatically
-    proportional to log-distance from target and saturates at the grid edge -- a
-    rate far below target moves fast, a rate near target moves slowly, and a
-    reading outside the grid is treated as a BOUND and never extrapolated.
-
-    CEILING. A divergence records the peak_scale that blew up, and it is
-    permanent for the run (reset only at a stage transition, whose surface is
-    different). It is INSTANCE state, never in lr_ctrl: the rewind that follows a
-    divergence restores lr_ctrl from a healthy checkpoint and would otherwise
-    erase the evidence.
-
-    lr_ctrl state ver=8 invalidates v1-v7; a stale dict is DISCARDED and rebuilt,
-    never reinterpreted.
-    """
+    """Owns every learning rate the run writes, and hosts the bracket."""
 
     CHANNELS = ('fwd', 'bwd', 'replay', 'fused')
 
-    # Policy optimizer keys -> the args attribute holding their base LR. The flow
-    # head is deliberately absent: it is pinned, not scheduled.
+    #: Policy optimizer keys -> the args attribute holding their base LR. The
+    #: flow head is deliberately absent: it is pinned, not scheduled.
     _POLICY_BASE = {'fwd': 'lr_policy', 'bwd': 'lr_back', 'replay': 'lr_replay',
                     'fused': 'lr_fused'}
 
-    _STATE_VER = 8
+    #: ver 10 invalidates every earlier lr_ctrl dict. A v8 state carries
+    #: `peak_scale`, an envelope, a freeze latch and a ramp clock, none of which
+    #: has a meaning here. DISCARD, never reinterpret.
+    _STATE_VER = 10
 
     def __init__(self, modeller):
         self.modeller = modeller
         self._report = {}
-        self._ceiling = None          # peak_scale a divergence proved unusable
-        self._divergences = 0
+        self._divergences = 0            # DISASTER tier: rewind + cut
+        self._moderate_fires = 0         # MODERATE tier: cut in place, no rewind
+        self._fire_cooldown_until = 0
         self._calibrations = 0
-        self._last = {}               # last calibration's decision, for the log
-        self._plateau_last = {}       # last plateau decision, same purpose
-        self._hyper_win = None        # hypergradient readings since the last report() drain
         self._hypergrads = 0
-        self._plateau_cuts = 0
-        self._restarts = 0
-        self._lr_capped_groups = 0    # param groups max_lr bound on the last _apply_lrs
-        self._lr_floored_groups = 0   # ...and min_lr; a floor that binds is a clamp, not a default
-        # ------------------------------------------- the pooled ray estimator
-        # Section 6B of docs/design/lr_handoff_2026-08-21.md. `mode: servo`
-        # restores the retired per-reading rule; it is kept reachable so the
-        # replacement can be compared against it rather than argued about.
-        self.pool = OptimumPool(
-            half_life=float(self._cal_cfg('pool_half_life', 8.0)),
-            min_readings=int(self._cal_cfg('pool_min_readings', 3)),
-            move_t=float(self._cal_cfg('move_t', 2.0)),
-            noise_floor_dex=float(self._cal_cfg('noise_floor_dex', NOISE_FLOOR_DEX)))
-        self._pool_stage = None       # stage the pool's regime belongs to
-        self._pool_epoch = 0          # bumped when the loss composition moves
-        self._pool_composition = None
-        self._pool_branches = None  # the composition the current epoch started at
-        self._pool_entry = 0          # step_ind the current stage was entered at
-        self._zp = deque(maxlen=self.Z_CAL_SETTLED_OBS)
-        self._transient_timeout = False
-        self._hot_cuts = 0            # cuts made while the pool had no verdict
-        self._pool_last = {}
-        # ---------------------------------------- the checkpointed ramp (7)
-        # ABSENT BLOCK = OFF, so every existing config is unchanged. The ramp
-        # takes ownership of peak_scale for its duration and hands it to the
-        # pooled estimator at `cruise_scale`; nothing else moves it meanwhile.
-        self._ramp_cfg = getattr(getattr(self.modeller.args, 'adaptive_lr', None),
-                                 'ramp', None)
-        self.ramp = None              # the live RampDriver, or None
-        self._ramp_armed = False      # a stage/composition change wants a ramp
-        self._ramp_reason = None
-        self._ramp_coherence_at = None
-        # RUN-LEVEL counters, kept HERE and not on the driver. A stage change
-        # arms a NEW ramp with a new driver, so the driver's own counters restart
-        # -- which made the run summary report `ramp/rollbacks 0` for a run whose
-        # first ramp had descended six rungs and rolled back. Those are facts
-        # about the run, so they accumulate across ramps.
-        self._ramps_started = 0
-        self._ramp_started_at = None   # step the live ramp began, for the re-arm gate
-        self._ramp_suppressed = 0      # composition re-arms refused as too soon
-        self._ramp_rollbacks = 0
-        self._ramp_snapshots = 0
-        self._ramp_rungs_clean = 0
-        # Seeded so a controller whose `tick` has not run yet still ADMITS
-        # readings. An unset pool key never matches `_regime_key`, so without
-        # this every reading would be refused as regime_changed -- silently, and
-        # only on the paths that call on_calibration without the host loop.
-        self.pool.reset(self._regime_key())
-        self._check_bars()
+        self._lr_capped_groups = 0
+        self._lr_floored_groups = 0
+        self._skip_steps = 0          # promoted steps the host loop must skip
+        self._last_scale_reason = 'init'
 
-    def adopt_alpha_grid(self, alphas) -> None:
-        """Derive the pool's raise cap from the sensor's own alpha grid.
+        cfg = self._cfg_node()
+        # NO `lr_control` BLOCK AT ALL means no LR control was configured, and
+        # the honest reading of that is "run the base rates", not "bracket".
+        # Defaulting the mode to `bracket` here made such a config LOAD CLEANLY
+        # -- every invariant abstains, because with no `auto` rate there is
+        # nothing for them to judge -- and then raise on the absent candidate
+        # grid when this constructor ran, i.e. a queued job dying at step 0 with
+        # a message about a key the config never mentions.
+        default_mode = 'bracket' if cfg is not None else 'fixed'
+        hf = getattr(cfg, 'hard_failure', None)
+        self.bars = HardFailureBars(
+            loss_excursion_k=float(_get(hf, 'loss_excursion_k', 10.0)),
+            grad_excursion_x=float(_get(hf, 'grad_excursion_x', 100.0)),
+            loss_abs=_get(hf, 'loss_abs', 1.0e6),
+            grad_abs=_get(hf, 'grad_abs', 1.0e6),
+            root_window=int(_get(hf, 'root_window', 200)),
+            min_observations=int(_get(hf, 'min_observations', 20)))
+        # THE BARS ARE DRAWN TWICE, because they do two jobs at two different
+        # rates. The root bars are fitted to burn-in -- a deliberately cold rate
+        # -- and that is the right scale for judging a TRIAL, since every trial
+        # restores that same root and is comparable to it. It is the wrong scale
+        # for the LIVE TRIPWIRE, which then runs for the rest of the stage at the
+        # promoted rate: a hotter rate moves the loss more for ordinary reasons,
+        # so a bar fitted cold is crossed by healthy training and the response is
+        # a rewind charged to max_reloads_per_1k_steps.
+        self._cruise_rederive = bool(_get(hf, 'cruise_rederive', True))
+        self._cruise_settle_steps = int(_get(hf, 'cruise_settle_steps', 200))
+        if self._cruise_settle_steps < 0:
+            raise ValueError(
+                f'lr_control.hard_failure.cruise_settle_steps must be >= 0, got '
+                f'{self._cruise_settle_steps}')
+        self.bracket = LRBracket(
+            mode=str(_get(cfg, 'mode', default_mode)),
+            burn_in_steps=int(_get(cfg, 'burn_in_steps', 3000)),
+            burn_in_scale=float(_get(cfg, 'burn_in_scale', 0.05)),
+            min_root_bias_correction=float(_get(cfg, 'min_root_bias_correction', 0.9)),
+            candidate_scales=_get(cfg, 'candidate_scales', ()) or (),
+            trial_steps=int(_get(cfg, 'trial_steps', 150)),
+            safety_rungs=int(_get(cfg, 'safety_rungs', 1)),
+            repeat_every=int(_get(cfg, 'repeat_every', 0) or 0),
+            boundary_confirm_repeats=int(_get(cfg, 'boundary_confirm_repeats', 1)),
+            boundary_densify=bool(_get(cfg, 'boundary_densify', False)),
+            # 1.0 when nothing is configured: the base rates, unmodified.
+            fixed_scale=_get(cfg, 'fixed_scale', None if cfg is not None else 1.0),
+            loss_abs=self.bars.loss_abs,
+            grad_abs=self.bars.grad_abs,
+            trial_settle_steps=int(_get(cfg, 'trial_settle_steps', 10)),
+            logz_detour_nats=_get(cfg, 'logz_detour_nats', 2.0))
+        self.driver = None            # a live BracketDriver, or None
 
-        Called when `RayCalibration` is built -- which is AFTER this controller,
-        and again at every stage transition, so the cap follows a per-stage grid
-        if one is ever configured. See lr_pool.raise_cap_from_grid: the cap is
-        'never raise further than the next reading can still measure', which on
-        the shipping grid reproduces the log10(4) constant it replaces.
-        """
-        self.pool.max_raise_dex = raise_cap_from_grid(
-            alphas, float(self._cal_cfg('alpha_target', 4.0)))
+        # THE ROOT'S LOSS SCALE, collected during burn-in. Kept on the INSTANCE
+        # rather than in `lr_ctrl`: it is a within-process observation, and a
+        # window restored from a checkpoint would describe a rate and a stage
+        # this process never ran. A resume therefore refills it before the
+        # bracket arms -- which is a bounded wait, because it fills at one
+        # observation per step.
+        self._loss_history = {c: deque(maxlen=self.bars.root_window)
+                              for c in self.CHANNELS}
+        self._grad_history = deque(maxlen=self.bars.root_window)
+        #: The post-promotion redraw, or None when nothing is pending. It carries
+        #: its own clock rather than counting from the promotion step, because
+        #: `_open_bracket` returns a horizon the host loop then SKIPS -- so the
+        #: step the run resumes at is not the step promotion happened at. The
+        #: clock starts on the first cruise tick instead.
+        self._cruise_bar = None
+        #: Which rate the LIVE bars were fitted at: the cold burn-in one, or the
+        #: promoted one. Published, because the two answer the same question with
+        #: different tolerances and a reader of a rewind needs to know which.
+        self._bars_redrawn = False
+
+        self._check_schema()
+        self._check_rails()
+        self._check_bar_window()
+        # MATERIALISE THE STATE NOW, so `stage_entry_step` is stamped at
+        # construction rather than whenever something first happens to call
+        # `_state()`. Burn-in length is an EXACT quantity -- "exactly
+        # burn_in_steps at burn_in_scale" -- and a lazily stamped entry step
+        # makes it depend on call order, which is how a run burns in for
+        # burn_in_steps minus one and nothing says so. A checkpoint restore
+        # overwrites this dict wholesale afterwards, which is correct: the
+        # restored entry step is the one that stage really started at.
+        self._state()
 
     # ------------------------------------------------------------------ config
 
-    def _cfg(self, name, default):
-        return getattr(getattr(self.modeller.args, 'adaptive_lr', None), name, default)
+    def _cfg_node(self):
+        return getattr(self.modeller.args, 'lr_control', None)
 
-    def _cal_cfg(self, name, default):
-        node = getattr(getattr(self.modeller.args, 'adaptive_lr', None), 'calibration', None)
-        return getattr(node, name, default) if node is not None else default
+    def _cfg(self, name, default=None):
+        return _get(self._cfg_node(), name, default)
 
     def _managed_keys(self):
-        """Config keys the controller owns -- those written `auto`, recorded by
-        resolve_derived_config at load. Empty set = it reads and logs but
-        actuates nothing, which is its own control arm."""
+        """Config keys the bracket owns -- those written `auto`, recorded by
+        resolve_derived_config at load. Empty set = the controller reads and logs
+        but actuates nothing, which is its own documented control arm."""
         return set(getattr(self.modeller.args, 'lr_servo_managed', ()) or ())
 
-    def _check_bars(self):
-        """Divergence bars are a sanity floor, not a calibration. Refuse a bar low
-        enough to fire on ordinary training: a graduated divergence bar is the
-        deleted cut tier coming back in through the config."""
-        for name in ('divergence_loss_abs', 'divergence_grad_abs'):
-            bar = self._cfg(name, 1.0e9)
-            if bar is not None and float(bar) < 1.0e5:
+    def managed_optimizer_keys(self):
+        """The optimizers `scale` actually reaches. `lr_bracket_probe` asks,
+        because a bias-correction refusal taken over an optimizer the bracket
+        does not steer would be a refusal about an irrelevant fact."""
+        managed = self._managed_keys()
+        return {k for k, base in self._POLICY_BASE.items() if base in managed}
+
+    def stepping_optimizer_keys(self):
+        """The managed optimizers THIS STAGE ACTUALLY STEPS.
+
+        MANAGED IS NOT THE SAME AS STEPPING, and conflating them welded the
+        bracket shut on every canonical config. `mk_dev` writes all four policy
+        rates `auto`, so the managed set is {fwd, bwd, replay, fused} -- but a
+        stage runs ONE train_mode, so `train_prior` (bwd) steps only 'bwd' and
+        `equilibration` (fused) steps only 'fused'. The other three optimizers
+        exist, hold no state, and report an Adam step counter of None.
+
+        The bias-correction check reads the WORST managed optimizer and maps a
+        counter of None to 0.0 -- correctly, since an optimizer that has never
+        stepped is the extreme case of an unequilibrated one. Taken over
+        optimizers the stage never steps, that made the worst value 0.0 on every
+        stage of every canonical config, so the bracket refused every time and
+        reported it as caution. A mechanism that always declines and says it is
+        being careful is precisely the failure this design exists to avoid, and
+        no test caught it because the driver's fake trainer has exactly one
+        managed optimizer and always steps it.
+
+        Mirrors `step_loss`: a bwd/fwd/replay stage steps that branch then
+        'flow'; a fused stage steps 'fused' alone (its param groups already
+        carry the flow head at lr_flow). 'flow' is never managed.
+        """
+        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
+        mode = getattr(stage, 'train_mode', None)
+        if mode is None:
+            return self.managed_optimizer_keys()
+        stepping = {'fused'} if mode == 'fused' else {mode}
+        return self.managed_optimizer_keys() & stepping
+
+    #: Everything `lr_control` may contain. CLOSED, and it has to be: the whole
+    #: `adaptive_lr` block was retired into this one, so the natural mistake when
+    #: migrating by hand is to carry a key across -- `warmup_steps`, `bounds`,
+    #: `alpha_target`, `divergence_cut`. The retired-key gate cannot see those,
+    #: because it matches on the OLD path, so without this they would land in a
+    #: live block and be silently ignored: a config that reads as configuring a
+    #: warmup and behaves as having none.
+    _KEYS = frozenset({
+        'mode', 'seed_lr', 'control_flow_lr',
+        'burn_in_steps', 'burn_in_scale', 'min_root_bias_correction',
+        'candidate_scales', 'trial_steps', 'safety_rungs', 'repeat_every',
+        'boundary_confirm_repeats', 'boundary_densify', 'fixed_scale',
+        'verbose', 'hard_failure', 'ray_calibration',
+        'trial_settle_steps', 'logz_detour_nats',
+        'fire_cut_factor', 'fire_cooldown_steps',
+    })
+    _HARD_FAILURE_KEYS = frozenset({
+        'loss_excursion_k', 'grad_excursion_x', 'loss_abs', 'grad_abs',
+        'root_window', 'min_observations',
+        'cruise_rederive', 'cruise_settle_steps',
+    })
+
+    def _check_schema(self):
+        """Refuse an unknown key under `lr_control`. See `_KEYS`."""
+        for node, known, where in ((self._cfg_node(), self._KEYS, 'lr_control'),
+                                   (getattr(self._cfg_node(), 'hard_failure', None),
+                                    self._HARD_FAILURE_KEYS, 'lr_control.hard_failure')):
+            if node is None:
+                continue
+            unknown = sorted(k for k in vars(node)
+                             if not k.startswith('_') and k not in known)
+            if unknown:
                 raise ValueError(
-                    f'adaptive_lr.{name} = {bar:g} is below 1e5. This bar exists only to '
-                    f'catch numerical explosion; anything that fires on ordinary training '
-                    f'is a graduated cut tier, which v8 deleted on evidence.')
-        # max_lr vs min_lr CANNOT be resolved by clamp order -- whichever is
-        # applied second wins, so one of the two bounds is silently defeated and
-        # the run trains at a rate neither bound describes. Refuse it here, where
-        # the constructor already refuses an incoherent divergence bar.
+                    f'{where}: unknown key(s) {unknown}. Expected a subset of '
+                    f'{sorted(known)}. `adaptive_lr` was retired INTO this block, so '
+                    f'a key carried across by hand lands here and would otherwise be '
+                    f'ignored in silence -- the config would read as configuring '
+                    f'something the run does not have.')
+
+    def _check_rails(self):
+        """max_lr vs min_lr CANNOT be resolved by clamp order -- whichever is
+        applied second wins, so one bound is silently defeated and the run trains
+        at a rate neither describes."""
         cap = getattr(self.modeller.args, 'max_lr', None)
-        if cap is not None:
-            cap = float(cap)
-            floor = float(getattr(self.modeller.args, 'min_lr', 0.0) or 0.0)
-            if cap <= 0.0:
-                raise ValueError(f'max_lr = {cap:g} must be positive, or null for no cap.')
-            if cap < floor:
-                raise ValueError(
-                    f'max_lr = {cap:g} is below min_lr = {floor:g}. Clamping to both is '
-                    f'not possible: whichever is applied second wins and the other bound '
-                    f'is silently defeated. Raise max_lr or lower min_lr.')
+        if cap is None:
+            return
+        cap = float(cap)
+        floor = float(getattr(self.modeller.args, 'min_lr', 0.0) or 0.0)
+        if cap <= 0.0:
+            raise ValueError(f'max_lr = {cap:g} must be positive, or null for no cap.')
+        if cap < floor:
+            raise ValueError(
+                f'max_lr = {cap:g} is below min_lr = {floor:g}. Clamping to both is not '
+                f'possible: whichever is applied second wins and the other bound is '
+                f'silently defeated. Raise max_lr or lower min_lr.')
 
     def announce(self):
-        cal = getattr(self.modeller, 'ray_cal', None)
-        on = cal is not None and getattr(cal, 'enabled', False)
-        mode = self._cal_mode()
-        print(f"lr_ctrl v8: calibration {'ON' if on else 'off'}"
-              + (f" (period {cal.period}, n_sub {cal.n_sub}, alphas {list(cal.alphas)})" if on else '')
-              + f" | target alpha* {self._cal_cfg('alpha_target', 4.0)}"
-              + (f" | POOLED estimator (half-life {self.pool.half_life:g} readings,"
-                 f" min {self.pool.min_readings}, move at {self.pool.move_t:g} se)"
-                 if mode == 'pooled' else
-                 f" | RETIRED per-reading servo, eta up/down "
-                 f"{self._cal_cfg('eta_up', 0.25)}/{self._cal_cfg('eta_down', 0.5)}")
-              + f" | managed {','.join(sorted(self._managed_keys())) or 'NOTHING (control arm)'}")
-
-    # -------------------------------------------------------------- divergence
-
-    #: Observations on a channel before its relative bar arms. Without it the
-    #: first loss of a stage becomes the reference and the second can convict.
-    _REL_MIN_OBS = 50
-    #: Floor under the reference, so a loss that legitimately approaches zero
-    #: cannot drag the bar to zero with it and convict ordinary noise.
-    _REL_FLOOR = 1.0e-3
-
-    def _rel_loss_bar(self, step_type, current_loss):
-        """Update this channel's stage-scoped running minimum and return the
-        relative divergence bar, or None while the rule is unset or unarmed.
-
-        Reads the CURRENT loss into the minimum BEFORE returning a bar, so a
-        genuinely new low can never convict itself."""
-        mult = self._cfg('divergence_loss_rel', None)
-        if mult is None or float(mult) <= 0:
-            return None
-        st = self._state()
-        book = st.setdefault('rel_loss', {})
-        seen = book.get(step_type)
-        value = float(current_loss)
-        if math.isfinite(value):
-            if seen is None:
-                book[step_type] = [value, 1]
-            else:
-                seen[0] = min(seen[0], value)
-                seen[1] += 1
-            seen = book[step_type]
-        if seen is None or seen[1] < self._REL_MIN_OBS:
-            return None
-        # A RATIO NEEDS A POSITIVE REFERENCE. If the channel's running minimum is
-        # at or below the floor the loss is not a positive-scale quantity -- an
-        # MLE/NLL channel passes through zero and goes NEGATIVE -- and clamping
-        # to the floor does not rescue the ratio, it manufactures a FIXED
-        # ABSOLUTE bar of floor*mult and convicts every ordinary value above it.
-        #
-        # Measured: p4_mace_mle's bwd MLE ran 2.77 -> -0.48, so the minimum went
-        # negative, the bar collapsed to 1e-3*100 = 0.1, and a mid-descent loss
-        # of 0.19 was called a divergence. Four rewinds later the run aborted.
-        #
-        # So the rule DECLINES on such a channel rather than guessing a scale.
-        # It is not left unguarded: divergence_loss_abs and divergence_grad_abs
-        # still apply, and this says so ONCE per channel rather than going quiet.
-        if seen[0] <= self._REL_FLOOR:
-            if step_type not in st.setdefault('rel_declined', set()):
-                st['rel_declined'].add(step_type)
-                print(f"lr_ctrl: relative divergence rule DECLINED on "
-                      f"'{step_type}' -- its running minimum {seen[0]:.4g} is at "
-                      f"or below the floor {self._REL_FLOOR:g}, so the channel "
-                      f"has no positive scale to take a ratio against. Absolute "
-                      f"bars still apply.")
-            return None
-        return seen[0] * float(mult)
-
-    def check_spike(self, step_type, current_loss, grad_norm):
-        """The one always-on tripwire. Returns 'diverged' or None.
-
-        Non-finite readings, a finite reading past an absolute ~1e9 bar, or --
-        where `divergence_loss_rel` is set -- a reading more than that multiple
-        above the QUIETEST loss this stage has produced. No cooldown, no latch:
-        at these bars a second reading is a second explosion, and train.py's
-        `max_reloads_per_1k_steps` budget is what stops a rewind loop. Note it is
-        a RATE, not a count -- a long run is not aborted for the same per-step
-        behaviour as a short one.
-
-        WHY A RELATIVE BAR EXISTS AT ALL. The absolute 1e9 is a backstop against
-        numerical death, not a statement about training: a route whose loss lives
-        at O(1) can go up a hundredfold -- destroying the run -- and never come
-        near it. On a well-behaved stage that excursion IS the event worth
-        rewinding from, and it is invisible to a bar six orders of magnitude
-        above the operating point.
-
-        THE REFERENCE IS THE STAGE'S OWN MINIMUM, and it is per stage for the
-        same reason peak_scale is: stages differ in loss SCALE by orders of
-        magnitude (an MLE stage and a VarGrad stage are not comparable), so a
-        minimum carried across a transition would either never fire or fire
-        immediately. `rearm_warmup` clears it.
-
-        THREE GUARDS, because a ratio is easy to make trigger-happy:
-          * ARMING. The bar is inert until `_REL_MIN_OBS` observations on the
-            channel, so the first reading cannot become the reference and
-            convict the second.
-          * A FLOOR. The reference is `max(min_seen, _REL_FLOOR)`, so a loss that
-            legitimately touches ~0 cannot make the bar ~0 with it.
-          * PER CHANNEL. fwd, bwd and replay have different scales; a shared
-            minimum would be the smallest of them and would convict the others.
-        """
-        checks = []
-        if current_loss is not None and step_type in self.CHANNELS:
-            checks.append((f'{step_type}_loss', float(current_loss),
-                           self._cfg('divergence_loss_abs', 1.0e9)))
-            rel = self._rel_loss_bar(step_type, current_loss)
-            if rel is not None:
-                checks.append((f'{step_type}_loss_rel', float(current_loss), rel))
-        if grad_norm is not None:
-            checks.append(('grad_norm', float(grad_norm),
-                           self._cfg('divergence_grad_abs', 1.0e9)))
-        for channel, value, bar in checks:
-            if math.isfinite(value) and (bar is None or value < float(bar)):
-                continue
-            self._divergences += 1
-            print(f"lr_ctrl DIVERGENCE: {channel} = {value:.4g} "
-                  f"(bar {float(bar) if bar is not None else float('nan'):.4g}) "
-                  f"at step {self.modeller.step_ind} -- reload + peak cut")
-            return 'diverged'
-        return None
-
-    def on_divergence(self, count: int = 1):
-        """Cut the peak and record the ceiling. Called by train.py AFTER the
-        rewind, so recompute the envelope rather than trusting the restored one."""
-        cut = float(self._cfg('divergence_cut', 0.5)) ** max(int(count), 1)
-        st = self._state()
-        st['envelope'] = self._envelope(st)
-        lo, hi = self._peak_bounds()
-        # A divergence IS the ramp's hard-failure condition: nonfinite values or
-        # runaway state, with no persistence rule and no dwell. It rolls the
-        # rejected rung back and finishes, so the cut below applies to a restored
-        # peak rather than compounding on a damaged one.
-        if self.ramp is not None and self.ramp.ladder.state == 'running':
-            self.ramp.ladder.observe_hard_failure('divergence')
-            self.ramp.apply(self.ramp.ladder.tick(
-                int(getattr(self.modeller, 'step_ind', 0))))
-        st['peak_scale'] = max(lo, min(hi, float(st['peak_scale']) * cut))
-        self._ceiling = st['peak_scale']
-        print(f"lr_ctrl: peak_scale -> {st['peak_scale']:.4g} (ceiling recorded)")
-        self._apply_lrs(st)
-
-    def _current_ceiling(self):
-        return self._ceiling
-
-    # ------------------------------------------------------------- calibration
-
-    def calibration_refusal(self) -> str | None:
-        """Why a ray calibration's reading would be thrown away, decided WITHOUT
-        measuring anything -- or None if it would be acted on.
-
-        THE POINT OF A SEPARATE PREDICATE. `RayCalibration.measure` used to draw
-        `n_sub` sub-batches from the replay buffer, and those draws consume RNG
-        that nothing restores -- so a calibration whose reading was discarded
-        still shifted every subsequent training step (findings.md F-039), and a
-        probed run was not comparable with an unprobed one. THAT COST IS GONE:
-        the larder dealer is deterministic and consumes no RNG. What the
-        predicate still buys is the parameter clone and `n_sub * len(alphas)`
-        forward passes, which is smaller but real -- and it remains the one
-        place the rule lives, so the gate that skips the probe and the gate that
-        refuses the reading cannot drift apart.
-
-        `on_calibration` consults this too, so the two cannot drift: the gate
-        that skips the probe and the gate that refuses the reading are the same
-        function, not two copies of one rule.
-
-        DECIDABLE IN ADVANCE (returned by this function): nothing, currently.
-        This function is kept because it is the one place the rule lives and the
-        probe path still asks before drawing; the warmup case moved below.
-
-        DECIDABLE IN ADVANCE, AND DECIDED ELSEWHERE. `Modeller._probe_refusal`
-        adds two structural refusals this function cannot see, because they are
-        facts about the STAGE's loss composition rather than about the
-        controller: an active branch whose bank the replay evaluator has no
-        counterpart for, and a step with no active branch at all. They use the
-        same `RayCalibration.refuse` path and consume the period identically.
-
-        DECIDABLE IN ADVANCE, AND DELIBERATELY NOT REFUSED:
-
-          warmup   the envelope is deliberately below 1, so the step just taken
-                   is a scheduled fraction of the operating step and alpha* rates
-                   THAT. peak_scale is the multiplier on the un-suppressed rate,
-                   so ACTING would inflate it by exactly the warmup factor and
-                   hand that back the moment the envelope releases -- a jump of
-                   lr_warmup_ratio, all at once. That argument is unchanged and
-                   `on_calibration` still declines to actuate here. It is an
-                   argument against acting, not against LOOKING: the reading is
-                   what tells the ramp to stop, and a ramp nothing watches was
-                   the worse failure. Freeze-only during warmup.
-
-          an empty `lr_servo_managed` means peak_scale reaches no learning rate,
-          but `_managed_keys` calls that "its own control arm" -- the controller
-          reads and logs while actuating nothing, and there the reading IS the
-          deliverable. "No LR moved" is not the same as "the reading was thrown
-          away", and conflating them would delete a documented operating mode.
-
-        NOT DECIDABLE IN ADVANCE, and named here so the gap is explicit rather
-        than papered over. Each of these IS the measurement, so no predicate can
-        anticipate it and the draws are genuinely spent to find out:
-
-          unresolved       no paired test cleared its CI
-          inconsistent     the tests contradict (lo >= hi)
-          bad alpha_star   non-finite or non-positive
-          no_batch /       the deal ran short mid-calibration
-          too_few_subbatches
-          clamped          peak_scale already at a `bounds`/ceiling edge, so the
-                           multiplier is a no-op -- depends on alpha_star
-        """
-        st = self._state()
-        # WARMUP IS NO LONGER A REFUSAL, and that is a deliberate reversal. It
-        # used to be, because acting on a reading taken under a suppressed
-        # envelope would inflate the peak by exactly the warmup factor. That
-        # reason is intact and is why `on_calibration` still refuses to ACTUATE
-        # during the ramp -- but it is an argument against acting, not against
-        # LOOKING, and the ramp needs something watching it. At period 500
-        # against a 1000-step warmup this sensor gets two readings, so it cannot
-        # average and instead freezes the ramp on the first downward one.
-        #
-        # THE PROBE IS NOT FREE, though it is cheaper than when this reversal
-        # was made: arming here used to shift every subsequent step, because
-        # `measure` drew n_sub sub-batches whose RNG nothing restored (findings
-        # F-039). The larder dealer consumes no RNG, so what remains is compute.
-        return None
-
-    # ------------------------------------------------- the regime and its gate
-
-    #: L1 distance on the NORMALISED branch-weight vector that counts as a new
-    #: loss regime. Branch dormancy flips and coefficient ramps are special
-    #: cases of the same move, so one number covers all three.
-    COMPOSITION_L1 = 0.2
-
-    #: Frac below which a branch is treated as OFF for regime purposes. The pool
-    #: resets when the SET of active branches changes -- a discontinuity in what
-    #: the composite IS -- and not on continuous reweighting within a fixed set,
-    #: which the pool's own exponential forgetting already handles.
-    #:
-    #: WHY THIS REPLACED A PURE L1 TRIGGER. An L1 bar fires on cumulative DRIFT,
-    #: and a balance controller drifting steadily crosses it over and over.
-    #: Measured on elj_p2_cruise: the fracs ran 0.42/0.53 -> 0.02/0.93 across the
-    #: stage, tripping SIX pool resets, and `lrpool/n` never got above 1 in 2000
-    #: steps -- the LR controller was muted for the whole run by a loop doing
-    #: exactly what it was configured to do. A slow reweighting is not a new
-    #: objective; a branch switching on or off is.
-    BRANCH_ACTIVE_FRAC = 0.05
-
-    #: `z_cal/p` below this counts as "the log-Z level shift is done".
-    Z_CAL_SETTLED = 0.1
-
-    #: Consecutive OBSERVATIONS required, not one. `z_calibration_tick` pre-sets
-    #: `z_cal/p` to 0.0 and then returns early on several paths (mid-grad-accum,
-    #: scrambled conditions), so a single 0 can mean "did not run" rather than
-    #: "settled". Requiring a run of them makes those spurious zeros harmless.
-    Z_CAL_SETTLED_OBS = 5
-
-    #: Floor for stages that publish no `z_cal/p` at all, so "no signal" cannot
-    #: mean "no wait". Stage entry is transient for hundreds to a couple of
-    #: thousand steps whether or not a sidecar happens to measure it.
-    MIN_STAGE_STEPS = 300
-
-    #: ...and a CEILING on the same wait, because the z_cal condition can go
-    #: unmet FOREVER. Measured on `elj_long_cruise` at the phase 1 -> 2
-    #: transition: `z_cal/p` fell 15.5 -> 0.135 and then went back UP to 0.85,
-    #: never producing five consecutive readings under the bar, while `bwd/loss`
-    #: ran 183 -> 2344. The gate waits for the log-Z level to stop moving; the
-    #: level will not stop moving while the rate is too hot; and the controller
-    #: could not cut the rate until the gate opened. A circular wait is not a
-    #: wait. Past this the stage is treated as settled, and it says so.
-    MAX_TRANSIENT_STEPS = 2000
-
-    def _composition(self):
-        """The stage's live loss mixture, normalised. Its L1 movement is the
-        regime trigger, and it is read from the FRACS rather than from what any
-        probe happens to hold -- the question is whether the objective the run
-        trains has changed, which is true whether or not a newly-woken branch
-        has been harvested yet."""
-        m = self.modeller
-        fr = {k: float(getattr(m, f'{k}_frac', 0.0) or 0.0)
-              for k in ('fwd', 'bwd', 'replay')}
-        tot = sum(fr.values())
-        if tot > 0:
-            fr = {k: v / tot for k, v in fr.items()}
-        return fr
-
-    def _regime_key(self):
-        """The pool's regime: (stage, composition epoch).
-
-        THE STAGE NAME IS READ LIVE, not from `_pool_stage`, and the difference
-        matters on exactly one step. `tick` is what notices a transition and
-        resets the pool, and `on_calibration` runs EARLIER in the same iteration
-        -- so on the first step of a new stage a key built from `_pool_stage`
-        would still name the outgoing one, and a reading taken under the new
-        objective would be pooled with estimates of a different number. Reading
-        it live makes that case a counted `regime_changed` refusal instead.
-
-        (In practice the transition also empties the larder, so the calibration
-        would defer for n_sub steps anyway. Relying on that is not the same as
-        being correct.)
-        """
-        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
-        return (getattr(stage, 'name', None), self._pool_epoch)
-
-    def tick(self):
-        """Once per host-loop iteration: keep the pool's regime and its settling
-        gate current.
-
-        SEPARATE FROM `step()`, which runs on the 10-step reporting clock. The
-        settling signal is a report dict that is CLEARED each time it is
-        published, so a 10-step sampler would miss most of them and the gate
-        would take ten times as long to open as it looks like it does.
-        """
-        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
-        name = getattr(stage, 'name', None)
-        if name != self._pool_stage:
-            # A stage change is a new objective. Readings from the outgoing one
-            # estimate a different number, so the window starts empty.
-            self._pool_stage, self._pool_epoch = name, 0
-            self._pool_entry = int(getattr(self.modeller, 'step_ind', 0))
-            self._pool_composition = self._composition()
-            # Adopt the NEW stage's branch set without comparing it against the
-            # outgoing one -- a stage change already reset the pool, and a
-            # spurious second reset would re-arm the ramp on the next tick.
-            self._pool_branches = frozenset(
-                b for b, v in self._pool_composition.items()
-                if v >= self.BRANCH_ACTIVE_FRAC)
-            self._zp.clear()
-            self._transient_timeout = False
-            self.pool.reset(self._regime_key())
-            self._arm_ramp('stage_change')
+        b = self.bracket
+        managed = ','.join(sorted(self._managed_keys())) or 'NOTHING (control arm)'
+        if b.mode == 'fixed':
+            print(f'lr_ctrl (bracket v10): FIXED mode -- burn-in {b.burn_in_steps} steps '
+                  f'at scale {b.burn_in_scale:g}, then scale {b.fixed_scale:g} held for '
+                  f'the stage. No trials, no re-bracketing. Managed: {managed}')
             return
-        now = self._composition()
-        was = self._pool_composition or now
-        if sum(abs(now.get(k, 0.0) - was.get(k, 0.0)) for k in set(now) | set(was)) \
-                >= self.COMPOSITION_L1:
-            self._pool_composition = now
-        # THE REGIME IS THE ACTIVE BRANCH SET, not the exact weights. See
-        # BRANCH_ACTIVE_FRAC.
-        active = frozenset(b for b, v in now.items() if v >= self.BRANCH_ACTIVE_FRAC)
-        if self._pool_branches is not None and active != self._pool_branches:
-            self._pool_epoch += 1
-            self.pool.reset(self._regime_key())
-            self._arm_ramp('composition_change')
-            print(f"lr_ctrl: active branches "
-                  f"{sorted(self._pool_branches)} -> {sorted(active)}; the "
-                  f"composite changed shape, so the pool restarts")
-        self._pool_branches = active
-        rep = getattr(self.modeller, '_z_cal_report', None) or {}
-        if 'z_cal/p' in rep:
-            self._zp.append(float(rep['z_cal/p']))
-        self._drive_ramp()
+        print(f'lr_ctrl (bracket v10): burn-in {b.burn_in_steps} steps at scale '
+              f'{b.burn_in_scale:g} (min root bias correction '
+              f'{b.min_root_bias_correction:g}), then {len(b.candidate_scales)} fixed-LR '
+              f'trials of {b.trial_steps} steps each over scales '
+              f'{[round(s, 6) for s in b.candidate_scales]}; select {b.safety_rungs} '
+              f'rung(s) below the lowest failure'
+              + (f', confirmed x{b.boundary_confirm_repeats}'
+                 if b.boundary_confirm_repeats else ', UNCONFIRMED (one failure decides)')
+              + (', densified' if b.boundary_densify else '')
+              + f'. Re-bracket: '
+              + ('once per stage' if b.repeat_every <= 0
+                 else f'every {b.repeat_every} promoted steps')
+              + f'. Managed: {managed}')
+        print(f'lr_ctrl: bracket cost ~'
+              f'{len(b.candidate_scales) * b.trial_steps} discarded steps per cycle')
 
-    def _ramp_enabled(self):
-        return bool(getattr(self._ramp_cfg, 'enabled', False))
-
-    def _arm_ramp(self, why):
-        """A stage or composition change REQUESTS a ramp (section 7, 'after
-        calibration'). It does not start one: `_drive_ramp` waits for the
-        settling gate, per DECISION 8c.
-
-        RATE-LIMITED, on evidence. Section 7 asks for a new ramp on "stage
-        changes, MATERIAL loss-composition changes, or PERSISTENT sampler drift"
-        -- and the composition trigger was inherited from the POOL, where a reset
-        costs nothing. For the ramp a restart discards a rung of real training,
-        and on a fused stage the balance controller nudges the fracs every tick.
-        Measured on elj/mipcas: entering `equilibration`, the ramp re-armed
-        TWICE IN 30 STEPS on `composition_change` and could never have completed
-        a rung.
-
-        So a stage change always re-arms -- that is unambiguous -- while a
-        composition change may not restart a ramp that began less than one
-        residence ago. Refusals are counted, because a ramp that is being
-        starved and one that is quietly working look identical otherwise.
-        """
-        if not self._ramp_enabled():
-            return
-        step = int(getattr(self.modeller, 'step_ind', 0))
-        gap = int(getattr(self._ramp_cfg, 'min_residence_steps', 500))
-        if (why != 'stage_change' and self._ramp_started_at is not None
-                and step - self._ramp_started_at < gap):
-            self._ramp_suppressed += 1
-            return
-        # A ramp in flight is DISCARDED rather than rolled back. Its rung
-        # evidence describes an objective the run has just left, so it is stale
-        # either way -- but the STEPS it took were real training on a valid
-        # objective at the time, and throwing the weights away would discard
-        # those too. The new ramp starts from wherever the rate now sits and
-        # classifies it like any other rung.
-        self._retire_ramp()
-        self._ramp_armed = True
-        self._ramp_reason = why
-
-    def _retire_ramp(self):
-        """Bank the outgoing ramp's totals before dropping it."""
-        if self.ramp is not None:
-            self._ramp_rollbacks += self.ramp.n_rollbacks
-            self._ramp_snapshots += self.ramp.n_snapshots
-            self._ramp_rungs_clean += len(
-                [h for h in self.ramp.ladder.history if h['verdict'] == 'clean'])
-        self.ramp = None
-
-    def _ramp_totals(self) -> dict:
-        live = self.ramp
-        clean = 0 if live is None else len(
-            [h for h in live.ladder.history if h['verdict'] == 'clean'])
-        return {
-            'ramp/ramps': float(self._ramps_started),
-            'ramp/rollbacks_total': float(
-                self._ramp_rollbacks + (0 if live is None else live.n_rollbacks)),
-            'ramp/snapshots_total': float(
-                self._ramp_snapshots + (0 if live is None else live.n_snapshots)),
-            'ramp/rungs_clean_total': float(self._ramp_rungs_clean + clean),
-            'ramp/rearms_suppressed': float(self._ramp_suppressed),
-        }
-
-    def _drive_ramp(self):
-        """Start, feed and step the ramp. One call per host-loop iteration."""
-        if not self._ramp_enabled():
-            return
-        step = int(getattr(self.modeller, 'step_ind', 0))
-        st = self._state()
-        if self.ramp is None:
-            # DECISION 8c: not through the stage-entry transient. A rung
-            # classified against a moving log-Z level describes the transition.
-            if not (self._ramp_armed and self._settled()):
-                return
-            if self._ramping(st):
-                return          # nor through the warmup envelope: see below
-            from energy_sampling.lr_ramp import RampLadder
-            from energy_sampling.lr_ramp_probe import RampDriver
-            cfg = self._ramp_cfg
-            ladder = RampLadder(
-                alpha_target=float(self._cal_cfg('alpha_target', 4.0)),
-                factor=float(getattr(cfg, 'factor', 1.5)),
-                min_residence_steps=int(getattr(cfg, 'min_residence_steps', 500)),
-                adam_beta2=getattr(cfg, 'adam_beta2', 0.999),
-                # DERIVED from the noise floor and the rung spacing unless the
-                # config names one -- the cruise controller's 3 is too coarse to
-                # resolve a rung. See RampLadder.__init__.
-                min_readings=getattr(cfg, 'min_readings', None),
-                move_t=float(self._cal_cfg('move_t', 2.0)),
-                persistence=int(getattr(cfg, 'persistence', 2)),
-                min_adverse_families=int(getattr(cfg, 'min_adverse_families', 2)),
-                max_scale=float(getattr(cfg, 'max_scale', self._peak_bounds()[1])),
-                min_scale=float(getattr(cfg, 'min_scale', self._peak_bounds()[0])),
-                cruise_backoff_rungs=int(getattr(cfg, 'cruise_backoff_rungs', 0)))
-            self.ramp = RampDriver(self.modeller, ladder,
-                                   verbose=bool(getattr(cfg, 'verbose', True)))
-            self._ramp_armed = False
-            self._ramps_started += 1
-            self._ramp_started_at = step
-            self._ramp_coherence_at = step
-            cost = ladder.projected_cost(st['peak_scale'], ladder.max_scale)
-            print(f"ramp: armed by {self._ramp_reason} at peak_scale "
-                  f"{st['peak_scale']:.4g}; residence {ladder.residence} steps "
-                  f"({ladder.residence_bound_by}); budget to the ceiling "
-                  f"~{cost['rungs']} rungs / {cost['steps']} steps, of which "
-                  f"{cost['discarded']} are discarded on the rejected rung")
-            self.ramp.apply(ladder.start(float(st['peak_scale']), step))
-            return
-        if self.ramp.ladder.state != 'running':
-            return
-        # COHERENCE ON ITS OWN CADENCE, slower than the tracker's EMA writes.
-        # Sampling every step would count one stale EMA reading as `persistence`
-        # independent ones -- the exact trap `MetricTracker.written_at` exists
-        # for, one level up.
-        every = int(getattr(self._ramp_cfg, 'coherence_every', 100))
-        if step - (self._ramp_coherence_at or step) >= every:
-            self._ramp_coherence_at = step
-            self.ramp.ladder.observe_coherence(
-                self.ramp.coherence(float(getattr(self._ramp_cfg, 'ratio', 3.0))))
-        self.ramp.apply(self.ramp.ladder.tick(step))
-
-    def _settled(self):
-        """Is the stage past its opening transient?
-
-        A rate measured while log Z is still making a large level shift describes
-        the transition, not the stage, and does not extrapolate to it. Readings
-        taken before this opens are LOOKED AT and logged but never pooled.
-        """
-        rel = int(getattr(self.modeller, 'step_ind', 0)) - self._pool_entry
-        if rel < self.MIN_STAGE_STEPS:
-            return False
-        if not self._zp:                # no z sidecar here -> the floor is the gate
-            return True
-        if (len(self._zp) >= self.Z_CAL_SETTLED_OBS
-                and all(v < self.Z_CAL_SETTLED for v in self._zp)):
-            return True
-        # THE WAIT IS BOUNDED -- see MAX_TRANSIENT_STEPS. The z_cal condition can
-        # go unmet indefinitely on a run whose level is being moved BY the rate
-        # the gate is stopping the controller from fixing.
-        if rel >= self.MAX_TRANSIENT_STEPS:
-            if not self._transient_timeout:
-                self._transient_timeout = True
-                print(f"lr_ctrl: stage transient never settled -- {rel} steps "
-                      f"with z_cal/p still above {self.Z_CAL_SETTLED}; treating "
-                      f"the stage as settled so the estimator can act")
-            return True
-        return False
-
-    def on_calibration(self, reading):
-        """
-        Apply one periodic ray calibration. `reading` is ray_calibration's dict.
-
-        Acts only on a reading that resolved. 'unresolved' (no test cleared its
-        CI) and 'inconsistent' (tests contradict) produce NO move -- that is the
-        whole fallback policy, and it is deliberate that there is no other one.
-        A calibration that cannot see the answer must not guess it.
-        """
-        st = self._state()
-        status = reading.get('status')
-        alpha = reading.get('alpha_star', float('nan'))
-        self._calibrations += 1
-        self._last = {'status': status, 'alpha_star': alpha, 'applied': 0.0}
-        # Kept as the authoritative refusal even though the probe path now checks
-        # it BEFORE drawing: this is the rule, and `calibration_refusal` is the
-        # same function, so a caller that reaches here anyway still gets it.
-        refusal = self.calibration_refusal()
-        if refusal is not None:
-            self._last['status'] = refusal
-            return
-        if status not in ('bracketed', 'above_range', 'below_range'):
-            return
-        if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
-            return
-        target = float(self._cal_cfg('alpha_target', 4.0))
-        # DURING THE RAMP THIS READING STOPS IT AND DOES NOTHING ELSE. Actuating
-        # is still refused for the original reason -- the envelope is
-        # deliberately below 1, so the multiplier would be applied to a rate that
-        # is about to be raised by the ramp anyway -- but a resolved reading
-        # BELOW target says the rate is already hotter than we steer to, and that
-        # is exactly the "stop climbing" verdict the ramp needs.
-        #
-        # FIRST READING, NO AVERAGING, unlike hyper. With period 500 against a
-        # 1000-step warmup there are two readings in the whole ramp, so there is
-        # nothing to average over -- and the asymmetry licenses it: freezing
-        # early costs some warmup, not the operating point.
-        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
-            self._last['status'] = 'warmup_ramp'
-            if alpha < target:
-                self._freeze_envelope(
-                    st, f'ray alpha* {alpha:.3g} below target {target:g} on its '
-                        f'first resolved reading of the ramp')
-            return
-        # WHILE A RAMP IS RUNNING IT OWNS peak_scale. The reading goes to the
-        # rung's own pool and nothing else moves the rate -- two controllers
-        # steering one actuator is how a units mismatch turns into what looks
-        # like instability (handoff section 8a).
-        if self.ramp is not None and self.ramp.ladder.state == 'running':
-            self.ramp.ladder.observe_ray(reading, float(st['peak_scale']),
-                                         int(getattr(self.modeller, 'step_ind', 0)))
-            self._last['status'] = 'ramp'
-            return
-        mult = (self._pooled_multiplier(st, reading, target)
-                if self._cal_mode() == 'pooled'
-                else self._servo_multiplier(alpha, target))
-        if mult is None or mult == 1.0:
-            return
-        lo, hi = self._peak_bounds()
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            hi = min(hi, ceiling)
-        before = float(st['peak_scale'])
-        st['peak_scale'] = max(lo, min(hi, before * mult))
-        self._last['applied'] = st['peak_scale'] / before if before else 1.0
-        st['envelope'] = self._envelope(st)
-        self._apply_lrs(st)
-
-    def _cal_mode(self):
-        mode = str(self._cal_cfg('mode', 'pooled'))
-        if mode not in ('pooled', 'servo'):
-            raise ValueError(
-                f"adaptive_lr.calibration.mode = {mode!r}; expected 'pooled' "
-                f"(the estimator, default) or 'servo' (the retired v8 rule).")
-        return mode
-
-    def _servo_multiplier(self, alpha, target):
-        """The RETIRED per-reading rule, kept reachable under `mode: servo`.
-
-        Both of its measured defects are properties of this expression rather
-        than of its constants: it moves on every reading, and the within-stage
-        optimum is stationary, so it tracks white noise; and eta_up != eta_down
-        rectifies that symmetric noise into one-directional drift, which put the
-        measured equilibrium +0.043..+0.059 dex off target. See lr_pool.py.
-        """
-        ratio = alpha / max(target, 1e-9)
-        eta = float(self._cal_cfg('eta_up' if ratio > 1.0 else 'eta_down',
-                                  0.25 if ratio > 1.0 else 0.5))
-        return ratio ** eta
-
-    def _pooled_multiplier(self, st, reading, target):
-        """Fold the reading into the regime's pool and ask what it implies.
-
-        Returns None while the reading is not poolable or the pool has nothing
-        to say -- both of which are HOLDS, and both of which reach the log with
-        their evidence attached, because "no move" and "no power to move" have
-        to be distinguishable there.
-        """
-        peak = float(st['peak_scale'])
-        settled = self._settled()
-        if settled:
-            self.pool.observe(reading, peak,
-                              int(getattr(self.modeller, 'step_ind', 0)),
-                              self._regime_key())
-        else:
-            self._last['status'] = 'unsettled'
-            self._pool_last = {'action': 'hold', 'reason': 'stage_transient',
-                               'multiplier': 1.0}
-        # CAN THE POOL SPEAK AT ALL? Only a window that is both settled and long
-        # enough has a verdict of its own; anything else is SILENCE, and silence
-        # must not be read as "hold".
-        if settled and len(self.pool.rows) >= self.pool.min_readings:
-            v = self.pool.verdict(peak, target)
-            self._pool_last = v
-            return float(v['multiplier']) if v['action'] == 'move' else None
-        # SILENT, and the log has to say WHY. `_too_hot_cut` overwrites this when
-        # it fires; when it does not, this is what distinguishes "the window is
-        # short" from "the estimator looked and held".
-        self._pool_last = {
-            'action': 'hold', 'multiplier': 1.0, 'n': len(self.pool.rows),
-            'reason': ('stage_transient' if not settled else
-                       f'pool_short_{len(self.pool.rows)}_of_{self.pool.min_readings}')}
-        return self._too_hot_cut(reading, target)
-
-    def _too_hot_cut(self, reading, target):
-        """The one move allowed while the pool cannot speak. DOWNWARD ONLY.
-
-        WHY THIS EXISTS. Measured on `elj_long_cruise` at the phase 1 -> 2
-        transition. `rearm_warmup` resets peak_scale to 1.0 per stage and the
-        envelope re-ramps, so the rate climbed 32x back to seed over 300 steps.
-        The regime change had just reset the pool, so a verdict needed the
-        settling gate PLUS `min_readings` calibrations -- and the settling gate
-        never opened, because `z_cal/p` stays high while the level is being moved
-        by the very rate nothing could cut. The sensor read alpha* = 1 against a
-        target of 4 -- "at least four times too hot", with its own t-test behind
-        it -- and the controller sat on it while `bwd/loss` ran 183 -> 2344.
-
-        A pooled estimate is the right instrument for WHERE TO SIT. It is the
-        wrong instrument for "this is on fire", and making the second wait on the
-        first is what produced a circular wait.
-
-        So a RESOLVED reading strictly below target cuts, bounded, whenever the
-        pool has no verdict of its own. It never RAISES -- a raise is speculative
-        and is exactly what wants pooled evidence. It never fires once the pool
-        CAN speak, so it cannot reintroduce the per-reading servo by the back
-        door.
-        """
-        status = reading.get('status')
-        alpha = reading.get('alpha_star', float('nan'))
-        if status not in ('bracketed', 'below_range'):
-            return None
-        if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
-            return None
-        if alpha >= target:
-            return None
-        # MATERIALITY BAR, and without it this path is the servo again. A single
-        # reading one bracket below target is the ORDINARY SAWTOOTH -- alpha*
-        # alternates 2.83 / 5.66 about a target of 4 at a perfectly good rate --
-        # and cutting on it is exactly the noise-chasing the pooled estimator
-        # exists to stop. Caught by `test_a_single_reading_no_longer_moves_the_rate`
-        # the moment this path was added.
-        #
-        # The bar is `move_t * noise_floor`, the same span the POOL requires
-        # before it will move -- so one reading has to be MORE convincing on its
-        # own than the pooled bar would be, which is the right asymmetry for
-        # acting on a sample of one. At the measured 0.22 dex that is 0.44 dex,
-        # a factor of ~2.75: the sawtooth's lower rung (0.15 dex) is well inside
-        # it and the live failure (alpha* 1 against target 4, 0.602 dex) is well
-        # outside.
-        gap_dex = math.log10(target / alpha)
-        bar = self.pool.move_t * self.pool.noise_floor
-        if gap_dex <= bar:
-            return None
-        # Bounded by the same span a raise is, so one noisy reading cannot cut by
-        # orders of magnitude. Two calibrations still reach 16x.
-        floor = 10.0 ** (-self.pool.max_raise_dex)
-        mult = max(alpha / target, floor)
-        self._hot_cuts += 1
-        self._last['status'] = 'too_hot_unpooled'
-        self._pool_last = {'action': 'move', 'reason': 'too_hot_pool_silent',
-                           'multiplier': mult, 'n': len(self.pool.rows)}
-        print(f"lr_ctrl: CUT x{mult:.3g} on alpha* {alpha:.3g} vs target "
-              f"{target:g} ({gap_dex:.2f} dex below, bar {bar:.2f}) -- the pool "
-              f"cannot speak yet ({len(self.pool.rows)} of "
-              f"{self.pool.min_readings} readings), and a gate that delays an "
-              f"ESTIMATE must not block a CUT")
-        return mult
-
-    def on_plateau(self, fired: bool, factor: float):
-        """
-        Apply one ReduceLROnPlateau verdict. Held through warmup for the same
-        reason the sensor declines to look: the envelope is deliberately moving
-        the LR there, so a lack of progress is not evidence about the operating
-        point.
-        """
-        st = self._state()
-        self._plateau_last = {'fired': bool(fired), 'applied': 0.0, 'status': 'clean'}
-        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
-            self._plateau_last['status'] = 'warmup'
-            return
-        if not fired:
-            return
-        lo, hi = self._peak_bounds()
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            hi = min(hi, ceiling)
-        before = float(st['peak_scale'])
-        st['peak_scale'] = max(lo, min(hi, before * float(factor)))
-        self._plateau_last['applied'] = st['peak_scale'] / before if before else 1.0
-        self._plateau_last['status'] = 'cut'
-        self._plateau_cuts += 1
-        st['envelope'] = self._envelope(st)
-        self._apply_lrs(st)
-        print(f"lr_ctrl: plateau cut -> peak_scale {st['peak_scale']:.4g}")
-
-    def _hyper_window(self):
-        """The per-reporting-period accumulator `_emit` publishes and `report`
-        drains. Lazily created, so `None` means UNAMBIGUOUSLY 'this sensor has
-        not fired since the last report' -- which is the whole point; see _emit."""
-        w = self._hyper_win
-        if w is None:
-            w = self._hyper_win = {'n': 0, 'cos_sum': 0.0, 'abscos_sum': 0.0,
-                                   'abscos_max': 0.0, 'log_applied': 0.0,
-                                   'nonfinite': 0, 'status': 'clean'}
-        return w
-
-    def _clip_saturated(self, st, clip_ratio):
-        """Is the gradient clip firing so hard that `cos` has stopped being a
-        learning-rate statistic? Updates the persistence EMA as a side effect.
-
-        `clip_ratio` is pre-clip grad norm / the guard's bar for that branch,
-        handed in by the caller because the guard's own counters are DRAINED at
-        every report and reading them here would race the reporter.
-
-        WHY THIS IS NOT A REFUSAL. `ray` answers an unusable reading with "no
-        move" (on_calibration: "a calibration that cannot see the answer must not
-        guess it"). That is right for `ray` and wrong here, because the state
-        that makes cos unusable is itself unambiguous evidence about the rate:
-        once the clip binds on essentially every step the update magnitude is set
-        by the LR alone, decoupled from curvature, and a rate that does that is
-        too high. So the correct response is to CUT, not to abstain.
-
-        MEASURED, 2026-08-17, hyperslope_aug17: `gradclip/fused_fire_rate` is
-        0.000 through every healthy window (lr8e5, hl28) and 1.000 through every
-        window in which cos misreads (lr2e4, lr5e4) -- with lr2e4's pre-clip norm
-        at 3.7e4 against a healthy 37. The separation is total, so the threshold
-        does not need to be delicate.
-
-        PERSISTENCE, NOT ONE READING. The guard targets a 1-p fire rate (0.01 at
-        the shipped p=0.99), so single firings are the design and only a
-        SUSTAINED rate means anything. The default bar is 0.5 -- fifty times the
-        design rate -- and a full window must elapse before it may fire at all.
-        """
-        bar = self._cfg('hyper_clip_fire_rate_max', 0.5)
-        if bar is None or clip_ratio is None:
-            return False
-        try:
-            ratio = float(clip_ratio)
-        except (TypeError, ValueError):
-            return False
-        if not math.isfinite(ratio):
-            ratio = float('inf')        # non-finite grad IS saturation, not a skip
-        span = max(1, int(self._cfg('hyper_clip_window', 50)))
-        alpha = 2.0 / (span + 1.0)
-        fired = 1.0 if ratio >= 1.0 else 0.0
-        prev = st.get('hyper_clip_ema')
-        st['hyper_clip_ema'] = fired if prev is None else alpha * fired + (1.0 - alpha) * prev
-        st['hyper_clip_n'] = int(st.get('hyper_clip_n', 0)) + 1
-        # THE EMA IS NEVER RESET, and that is load-bearing. An earlier version
-        # cleared it on each cut to rate-limit the braking, which also cleared
-        # the SUPPRESSION -- so between cuts cos resumed integrating and simply
-        # out-ran the brake. Measured on the first version of
-        # test_sustained_clip_saturation_cuts_the_rate: cos +0.5 lifts peak_scale
-        # by exp(beta*0.5) per firing, x3.49 over a 50-firing window, against a
-        # single x0.5 cut -- a NET RISE of 1.75x per window while the clip was
-        # pinned. Suppression has to be continuous; only the cut is rate-limited,
-        # which _clip_saturation_cut does with its own counter.
-        return st['hyper_clip_n'] >= span and st['hyper_clip_ema'] > float(bar)
-
-    def _clip_saturation_cut(self, st, w):
-        """Cut the peak because the clip is saturated, and re-arm the detector.
-
-        TWO EFFECTS, ON DIFFERENT CLOCKS. Reaching here at all means cos is not
-        integrated this firing -- that suppression is CONTINUOUS, for as long as
-        the clip stays saturated, because a statistic measuring clip geometry
-        should never move the rate. The CUT is rate-limited to one per window:
-        halving on every firing would compound to 0.5**n and floor the rate
-        inside a single window. So the response is "stop listening to cos, and
-        halve once per window of sustained evidence" -- hard, but recoverable,
-        and it cannot be out-run by cos the way a reset-on-cut version was."""
-        cut = float(self._cfg('hyper_clip_cut', 0.5))
-        span = max(1, int(self._cfg('hyper_clip_window', 50)))
-        w['n'] += 1
-        w['status'] = 'clip_saturated'
-        since = int(st.get('hyper_clip_n', 0)) - int(st.get('hyper_clip_cut_at', -span))
-        if since < span:
-            return                      # suppressed, but not yet due another cut
-        lo, hi = self._peak_bounds()
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            hi = min(hi, ceiling)
-        before = float(st['peak_scale'])
-        st['peak_scale'] = max(lo, min(hi, before * cut))
-        st['hyper_clip_cut_at'] = int(st.get('hyper_clip_n', 0))
-        w['clip_cuts'] = int(w.get('clip_cuts', 0)) + 1
-        if before > 0 and st['peak_scale'] > 0:
-            w['log_applied'] += math.log(st['peak_scale'] / before)
-        self._clip_cuts = getattr(self, '_clip_cuts', 0) + 1
-        if self._clip_cuts == 1:
-            print(f"lr_ctrl: CLIP SATURATED -- the grad clip is firing on "
-                  f"essentially every step, so cos is measuring clip geometry "
-                  f"rather than curvature and the rate is too high on that "
-                  f"evidence alone. peak_scale {before:.4g} -> "
-                  f"{st['peak_scale']:.4g}. Further cuts are silent.")
-        st['envelope'] = self._envelope(st)
-        self._apply_lrs(st)
-
-    def on_hypergradient(self, cos: float, beta: float, beta_down: float = None,
-                         cos_target: float = 0.0, clip_ratio: float = None):
-        """
-        Apply one hypergradient verdict: `peak_scale *= exp(beta * cos)`.
-
-        `cos` is the cosine between the CURRENT gradient and the direction the
-        PREVIOUS step actually moved the policy in. The identity is
-        `dL/d(lr) = -<g_t, d_{t-1}>`, so a positive cosine means the last step
-        was too short and a negative one means it overshot.
-
-        WHY THIS EXISTS ALONGSIDE `on_calibration`. The ray probe scores a LOSS,
-        which requires that loss to be one the stage actually trains -- the
-        precondition written at `protocol.py::_parse_lr_sensor` ("only coherent
-        in a fused stage that trains replay TB ... anywhere else it rates a loss
-        nobody is optimising"). Measured on run 7tjno8m6, whose `var_conditioning`
-        stage pins replay to 0.0 and trains VarGrad on fwd/bwd: 35% of
-        calibrations came back `inconsistent` and the t-statistic alternated sign
-        at the +-99 clamp between consecutive readings, while the same code on
-        `prod0810_mipcas_elj` -- an equilibration stage with replay live at
-        0.05-0.6 -- scored 100 bracketed of 102 with zero inconsistent.
-
-        This sensor reads the gradient and the realised displacement, both of
-        which exist whatever the branch mixture is and whatever loss family the
-        stage trains. It cannot be pointed at the wrong loss because it does not
-        score a loss.
-
-        BOUNDED BY CONSTRUCTION: `cos` is a cosine, so one step can move the peak
-        by at most `exp(+-beta)` however wrong the rate is. That is what makes it
-        safe to run every step, and also what makes it slow to make a large
-        correction -- the trade is intrinsic, not a tuning error.
-
-        NO SINGLE beta IS ROBUST ACROSS PROBLEM FAMILIES. Swept on the bench over
-        12 cells (two optimizers x tracking and MLE surfaces), the best worst-case
-        beta was 0.1 at 3.2x the best fixed rate, and the per-cell optimum spanned
-        20x. beta is a BANDWIDTH: a stage whose optimum keeps moving wants a high
-        one, a stage whose optimum is static wants a low one to reject noise. It
-        is therefore per-stage config with no default that claims universality.
-        """
-        st = self._state()
-        w = self._hyper_window()
-        # THE REGIME GATE RUNS FIRST, before anything reads cos -- including
-        # during warmup, where the envelope is deliberately holding the rate
-        # BELOW the operating point, so a saturated clip there is worse news
-        # still. See _clip_saturated for why this CUTS rather than abstains.
-        if self._clip_saturated(st, clip_ratio):
-            self._clip_saturation_cut(st, w)
-            return
-        # Held through warmup for exactly the reason `on_calibration` and
-        # `on_plateau` are: the envelope is deliberately ramping the rate, so a
-        # cosine measured through that suppression is not evidence about the
-        # operating point.
-        # HYPER DOES NOT HOLD THROUGH WARMUP -- and it is the reason the ramp can
-        # self-terminate. `_maybe_freeze_envelope` freezes the envelope once this
-        # sensor has pulled peak_scale materially off its high-water mark, which
-        # requires the sensor to be moving peak_scale DURING the ramp. Reinstating
-        # the hold here would silently disable that freeze, since peak_scale would
-        # sit at 1.0 for the whole warmup and could never fall.
-        # ray and plateau still hold: both score a LOSS, which a deliberate ramp
-        # really does distort. This one scores no loss.
-        if not (isinstance(cos, float) and math.isfinite(cos)):
-            w['n'] += 1
-            w['nonfinite'] += 1
-            w['status'] = 'nonfinite'
-            return
-        # STEER TO cos == cos_target, NOT to cos == 0. The fixed point of
-        # peak_scale *= exp(beta*cos) is cos == 0, which is the one-step optimum --
-        # the rate adaptive_lr.calibration's own comment says a run does not
-        # survive, because a local probe cannot see the gradient-noise term. `ray`
-        # carries that margin as alpha_target: 4.0 (it runs at a QUARTER of the
-        # greedy optimum); this is hyper's equivalent, and 0.0 reproduces the old
-        # behaviour exactly.
-        err = float(cos) - float(cos_target)
-        # up/down is decided by the ERROR, not by the raw cosine: with a positive
-        # target, a small positive cos now means "hotter than intended" and must
-        # take the down branch.
-        #
-        # ASYMMETRIC BY DEFAULT, for the reason `ray` ships eta_up 0.25 against
-        # eta_down 0.5: a raise is licensed only by a local reading that cannot
-        # see multi-step damage, while a cut is the recoverable direction --
-        # undertraining is recovered, a detonation is not. `beta_down` has been
-        # plumbed through protocol.py since this sensor shipped and was set by
-        # nothing, so in practice the gain was symmetric everywhere. Setting
-        # hyper_down_gain to 1.0 restores that exactly.
-        if beta_down is None:
-            beta_down = float(beta) * float(self._cfg('hyper_down_gain', 2.0))
-        b = float(beta if err > 0 else beta_down)
-        # THE RAMP IS DETERMINISTIC; THIS SENSOR ONLY DECIDES WHEN IT ENDS.
-        #
-        # During warmup the envelope is deliberately holding the rate
-        # lr_warmup_ratio below the operating point, so `err` is structurally
-        # POSITIVE -- that is the suppression reflected back, not evidence that
-        # the rate is too low. Actuating on it made peak_scale climb AGAINST the
-        # ramp: measured on the bench, to the 2000x bound in ~76 steps at
-        # beta 0.1, which destroys the one property the ramp exists to provide.
-        #
-        # So the reading feeds a SMOOTHED error instead of the actuator, and the
-        # ramp ends when that average shows the rate approaching the STABILITY
-        # EDGE -- "ramp until it starts to bite, then stop". Smoothed because
-        # one reading is noise (measured swinging -0.2 to +0.4 through a live
-        # warmup). This IS a safety catch and should be rare: on a healthy run
-        # the ramp is expected to run its budget and arrive at the configured
-        # rate, with rate SELECTION left to the probe that follows.
-        if self._ramping(st):
-            span = max(1, int(self._cfg('warmup_freeze_cos_window', 25)))
-            n = int(st.get('hyper_cos_n', 0)) + 1
-            prev = st.get('hyper_cos_ema')
-            a = 2.0 / (span + 1.0)
-            st['hyper_cos_ema'] = err if prev is None else a * err + (1.0 - a) * prev
-            st['hyper_cos_n'] = n
-            # The statistic is still MEASURED and published; only the actuation
-            # is withheld, so the sensor channel cannot go dark through a ramp.
-            w['n'] += 1
-            w['cos_sum'] += float(cos)
-            w['abscos_sum'] += abs(float(cos))
-            w['abscos_max'] = max(w['abscos_max'], abs(float(cos)))
-            w['status'] = 'warmup_ramp'
-            # A FULL WINDOW BEFORE IT MAY FIRE, so one early reading cannot end
-            # the ramp -- the failure the high-water rule below was built against.
-            # THE BAR IS NEGATIVE, NOT ZERO, AND THE NUMBER MEANS SOMETHING.
-            # At stationarity cos ~ -eta*lambda/2 (docs/hypergradient_review.md
-            # section 2.1), so |cos| estimates the distance to the stability
-            # edge: eta_edge/eta ~ 1/|cos|. A bar at -0.25 therefore reads
-            # "stop ramping at a QUARTER of the edge" -- the same margin
-            # alpha_target 4 already encodes for `ray`.
-            #
-            # At 0.0 this fired on noise, because the equilibrium value of the
-            # statistic is ALREADY slightly negative: the ramp then froze at
-            # its starting value and the stage trained there for good.
-            # Measured 2026-08-21 -- toy froze at envelope 0.1102 on a smoothed
-            # err of -0.000, elj phase 1 (race_L1c_wandb) at 0.2154 on -0.006,
-            # both a fraction of a s.d. from zero against sd(cos) 0.06-0.17.
-            # Both are ~40x below this bar.
-            #
-            # The failure mode also flips to the safe side: the worst case is
-            # now "ramp completes to the CONFIGURED seed" rather than "ramp
-            # never leaves the floor", and a probe follows shortly after to set
-            # the operating rate anyway.
-            #
-            # NOT YET MEASURED: the |cos| ~ eta*lambda/2 relation is derived at
-            # stationarity and a ramp is transient, so 0.25 is an argument, not
-            # a calibration. configs/hyperslope_aug17 is the ladder that would
-            # earn it -- regress cos on pinned log lr and read off where the
-            # magnitude sits relative to the edge.
-            bar = float(self._cfg('warmup_freeze_cos_bar', -0.25))
-            if n >= span and st['hyper_cos_ema'] <= bar:
-                self._freeze_envelope(
-                    st, f'smoothed err {st["hyper_cos_ema"]:+.3f} <= {bar:+.2f} '
-                        f'over a {span}-step mean -- ~1/{1.0 / max(abs(bar), 1e-9):.0f} '
-                        f'of the stability edge (cos target {float(cos_target):+.3g})')
-            return
-        lo, hi = self._peak_bounds()
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            hi = min(hi, ceiling)
-        before = float(st['peak_scale'])
-        # THE LEAK. Without it this is a pure integrator in log space -- pole
-        # exactly on the unit circle, infinite DC gain -- so ANY constant bias in
-        # the error produces unbounded exponential drift in the rate, and
-        # zero-mean noise produces an unbounded random walk. The `bounds` clip is
-        # saturation, not a restoring force, which is why the failure looks like
-        # "railed at 0.01" rather than "drifted somewhere unhelpful".
-        #
-        #     log peak <- (1 - lam) * log peak + b * err
-        #
-        # moves the pole to 1 - lam. A sustained bias then buys a FINITE offset
-        # b*err_bar/lam instead of a ramp, and the stationary spread under noise
-        # is sigma*sqrt(b*tau_c/(2*lam)) instead of growing without limit. The
-        # controller's total authority becomes exactly b*err_bar/lam, so lam is
-        # chosen by inverting that: pick how far the rate may travel from seed
-        # against the worst sustained bias, and solve. Measured on this route the
-        # per-firing |err| runs 0.01-0.05, so lam 2e-3 at beta 0.05 bounds the
-        # excursion near 3x.
-        #
-        # DEFAULT 0.0 = OFF = today's behaviour, bit for bit. It is off rather
-        # than on because lam encodes a timescale, and the only route it has been
-        # measured on is the QM9 conditional one; a default here would be a
-        # universal claim the measurements do not support -- the same reason
-        # `beta` has no default.
-        lam = float(self._cfg('peak_leak', 0.0) or 0.0)
-        if lam > 0.0 and before > 0.0:
-            logp = (1.0 - lam) * math.log(before) + b * err
-            st['peak_scale'] = max(lo, min(hi, math.exp(logp)))
-        else:
-            st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
-        w['n'] += 1
-        w['cos_sum'] += float(cos)
-        w['abscos_sum'] += abs(float(cos))
-        w['abscos_max'] = max(w['abscos_max'], abs(float(cos)))
-        # ACCUMULATED IN LOG SPACE, because the actuator is multiplicative: the
-        # period's total move is the product of its per-firing multipliers, and
-        # summing the ratios instead would report a period that halved then
-        # doubled as having moved by 2.5x rather than 1.0.
-        if before > 0 and st['peak_scale'] > 0:
-            w['log_applied'] += math.log(st['peak_scale'] / before)
-        w['status'] = 'clean'
-        self._hypergrads = getattr(self, '_hypergrads', 0) + 1
-        # ANNOUNCE THE FIRST FIRE, once, the way the other two sensors announce
-        # their actions. A per-step sensor must not print per step, but a sensor
-        # that silently never runs is the failure this whole exercise was about:
-        # the ray probe spent a live run rating a branch pinned to zero weight,
-        # and nothing said so.
-        if self._hypergrads == 1:
-            print(f"lr_ctrl: hypergradient sensor live (beta {b:g}) -- first "
-                  f"reading cos {cos:+.3f}, peak_scale {before:.4g} -> "
-                  f"{st['peak_scale']:.4g}")
-        st['envelope'] = self._envelope(st)
-        self._apply_lrs(st)
-
-    # -------------------------------------------------------------------- state
-
-    def _fresh_state(self, phase):
-        return {
-            'ver': self._STATE_VER,
-            'phase_seen': phase,
-            'stage_start_step': int(self.modeller.step_ind),
-            'peak_scale': 1.0,
-            # per-stage, so each stage ramps and freezes on its own evidence
-            'peak_high_water': 1.0,
-            'envelope_frozen_at': None,
-            # hyper's warmup ramp-exit detector: an EMA of the cos ERROR and the
-            # count behind it. Read with .get() everywhere, so a state restored
-            # from before these existed simply starts the average fresh.
-            'hyper_cos_ema': None,
-            'hyper_cos_n': 0,
-            # WHERE THE RAMP STARTS. At a cold start there is no previous rate to
-            # continue from, so it is the configured 1/lr_warmup_ratio below seed;
-            # at a stage transition `rearm_warmup` overwrites it with the rate the
-            # OUTGOING stage was actually running.
-            'ramp_from': 1.0 / self.modeller.args.lr_warmup_ratio,
-            'envelope': 1.0 / self.modeller.args.lr_warmup_ratio,
-        }
+    # -------------------------------------------------------------- actuation
 
     def _state(self):
         m = self.modeller
         st = getattr(m, 'lr_ctrl', None)
         if not isinstance(st, dict) or st.get('ver') != self._STATE_VER:
             if isinstance(st, dict) and st.get('ver') is not None:
-                # DISCARD, never reinterpret. v7 and earlier carried disc_state,
-                # disc_since, disc_ramp_base and a peak_scale accumulated by a
-                # different rule; silently reusing any of it would let a deleted
-                # state machine steer a controller that no longer has one.
                 print(f"lr_ctrl: discarding stale state ver={st.get('ver')} "
-                      f"(this controller is ver={self._STATE_VER}); rebuilding from seed")
-            st = self._fresh_state(m.phase)
+                      f'(this controller is ver={self._STATE_VER}); the bracket has no '
+                      f'peak_scale, envelope or ramp clock to reinterpret it into.')
+            st = {'ver': self._STATE_VER,
+                  'scale': float(self.bracket.scale_now()),
+                  'stage_entry_step': int(getattr(m, 'step_ind', 0) or 0),
+                  'bracket': None}
             m.lr_ctrl = st
-        elif st.get('phase_seen') != m.phase:
-            st['phase_seen'] = m.phase
-        if st.get('stage_start_step', 0) > m.step_ind:
-            st['stage_start_step'] = int(m.step_ind)
-        st.setdefault('peak_scale', 1.0)
-        st.setdefault('envelope', 1.0)
+            self.bracket.load_state_dict(None)
+        elif st.get('bracket') is not None and not getattr(self, '_bracket_loaded', False):
+            restored = self.bracket.load_state_dict(st['bracket'])
+            self._bracket_loaded = True
+            if restored and getattr(self.bracket, 'resumed_mid_bracket', False):
+                print('lr_ctrl: resumed inside a bracket cycle. The candidate states '
+                      'lived in host memory and died with the process, so the cycle is '
+                      're-armed from the resumed state rather than half-restored -- the '
+                      'resumed state is already mature, so burn-in is not repeated '
+                      'beyond refilling the loss window the bars are derived from.')
+        st.setdefault('scale', float(self.bracket.scale_now()))
         return st
 
-    def rearm_warmup(self):
-        """Protocol.advance hook at every stage transition: restart the warmup
-        clock (the optimizers were rebuilt onto a surface with different
-        curvature) and forget the ceiling, whose evidence describes a surface
-        that no longer exists.
-
-        peak_scale is RESET to 1.0, so each stage re-discovers its own peak.
-        Carrying it forward would impose the previous stage's verdict on a
-        surface with different curvature, and measured peaks differ
-        substantially between stages and runs.
-
-        The reset is NOT free, and deliberately so: `ray` and `hyper` both
-        climb, so a stage that inherited a high peak pays warmup plus a
-        re-climb to get back to it. That cost is accepted in exchange for never
-        carrying a stale verdict across a surface change.
-
-        BUT THE RESET IS ONLY SAFE BECAUSE THE RAMP ABSORBS IT, so this method
-        owns re-arming the ramp as much as it owns the reset, and the two are
-        one transaction:
-
-          `ramp_from` <- the scale the OUTGOING stage was actually running
-                         (peak x envelope), so peak_scale -> 1.0 changes no
-                         learning rate on the transition step itself. The ramp
-                         then walks that back up to seed, and a stage that ran
-                         hotter than seed gets no ramp (see `_ramp_from`).
-          `envelope_frozen_at` <- None, or the outgoing stage's freeze latch
-                         short-circuits `_envelope` and there is NO RAMP AT ALL
-                         to absorb the reset. Measured, mmnxotsr 2026-08-20:
-                         train_prior froze its ramp at envelope 0.1194 and the
-                         latch survived every later transition, so phase 1 -> 2
-                         landed as a bare 81x step in ONE optimizer step, on the
-                         same step Adam's moments were rebuilt. This method used
-                         to print "LR re-warming" and then not re-warm.
-          `peak_high_water` / `hyper_cos_*` <- the freeze rules' own evidence,
-                         which describes the outgoing surface.
-
-        Returns the warmup length in TRAIN STEPS."""
-        m = self.modeller
+    def set_scale(self, scale, why=None):
+        """Move the one multiplier, and say so. Every caller is the bracket, a
+        stage transition, or (owner decision 2026-08-24) a FIRE RESPONSE -- the
+        moderate cut and the disaster rewind-cut, both of which stand until the
+        scheduled re-race re-measures the rate."""
         st = self._state()
-        st['phase_seen'] = m.phase
-        self._ceiling = None
-        # READ BEFORE RESETTING: this is the rate the outgoing stage settled on.
-        outgoing = float(st.get('peak_scale', 1.0)) * float(st.get('envelope', 1.0))
-        st['ramp_from'] = outgoing
-        # The new stage's ramp has not been RELEASED yet -- the clock starts when
-        # the transient settles, not at the boundary. See _ramp_elapsed.
-        st['ramp_released_at'] = None
-        st['ramp_z_gated'] = True
-        st['peak_scale'] = 1.0
-        st['peak_high_water'] = 1.0
-        st['envelope_frozen_at'] = None
-        st['hyper_cos_ema'] = None
-        st['hyper_cos_n'] = 0
-        st['restart_step'] = int(m.step_ind)
-        st['stage_start_step'] = int(m.step_ind)
-        # the relative divergence bar's reference is per stage -- see
-        # check_spike. Loss SCALE differs by orders of magnitude between stages,
-        # so a minimum carried across would either never fire or fire at once.
-        st['rel_loss'] = {}
-        st['envelope'] = self._envelope(st)
+        st['scale'] = float(scale)
+        self._last_scale_reason = str(why or 'set')
         self._apply_lrs(st)
-        warmup_steps = int(self._cfg('warmup_steps', 1000))
-        start = self._ramp_from(st)
-        if start >= 1.0:
-            print(f"lr_ctrl: no warmup ramp -- the outgoing stage was running at "
-                  f"scale {outgoing:.4g}, at or above seed, so peak_scale 1.0 "
-                  f"applies immediately")
-        else:
-            print(f"lr_ctrl: warmup ramp re-armed -- envelope {start:.4g} -> 1.0 "
-                  f"over {warmup_steps} train steps ({1.0 / start:.1f}x), "
-                  f"continuing the outgoing stage's rate")
-        return warmup_steps
+        return st['scale']
 
-    # ----------------------------------------------------------------- envelope
+    @property
+    def scale(self):
+        return float(self._state()['scale'])
 
-    def _elapsed(self, st):
-        return max(0, int(self.modeller.step_ind) - int(st.get('stage_start_step', 0)))
-
-    def _ramping(self, st) -> bool:
-        """Is the warmup envelope still MOVING? Not the same as "inside the
-        warmup step budget", and the difference is 800 steps of dead time.
-
-        hyper is held to freeze-only while the ramp runs, because a cosine
-        measured through a deliberately-suppressed rate says "too cold" whatever
-        the operating point is. That argument expires the moment the ramp is
-        FROZEN: the envelope is then a constant, the rate is no longer being
-        walked, and a reading is ordinary evidence again.
-
-        It expires the same way when there is NOTHING TO RAMP -- `ramp_from` at
-        1.0, which is what a stage that ran at or above seed hands over. The
-        envelope is a constant there too, so holding the sensor for the warmup
-        budget would be the same dead time with no suppression to justify it.
-
-        Keying the hold on `warmup_steps` alone kept the sensor mute for the rest
-        of the budget after an early freeze. Measured, run
-        newlogic_qm9cond_newlogic 2026-08-17: var_conditioning opened at step
-        150, the ramp froze at 350 on a negative smoothed cos, and hyper then sat
-        in freeze-only mode until 1150 -- 800 steps, 16% of the run, at a
-        constant 1.98e-5 with cos reading -0.02 to -0.04 throughout and
-        hypergrads stuck at 0.
-        """
-        return (st.get('envelope_frozen_at') is None
-                and self._ramp_from(st) < 1.0
-                and self._elapsed(st) < int(self._cfg('warmup_steps', 1000)))
-
-    def _ramp_from(self, st):
-        """The envelope value the current ramp starts at, in (0, 1].
-
-        Clamped to 1.0 at the top because THE RAMP HAS NO DECAY LEG: a stage
-        whose outgoing rate was at or above seed gets no ramp at all (the
-        exponent below collapses to 1.0 everywhere), which is the cut to seed
-        that `rearm_warmup` intends, applied at once rather than annealed."""
-        v = st.get('ramp_from')
-        if v is None:                     # state restored from before this key
-            v = 1.0 / float(self.modeller.args.lr_warmup_ratio)
-        return min(1.0, max(1e-12, float(v)))
-
-    def _envelope(self, st):
-        """Ramp -> hold, in [ramp_from, 1.0]. No decay leg: the calibration rates
-        the PRODUCT peak x envelope, so a deterministic multiplier on it is
-        absorbed and only inflates peak against its bounds.
-
-        THE RAMP STARTS AT THE OUTGOING RATE, NOT AT A FIXED FRACTION OF SEED.
-        A fixed 1/lr_warmup_ratio floor is anchored to `seed_lr`, and a stage
-        that ran for thousands of steps has usually moved a long way from it --
-        so "reset to a low rate and re-ramp" would reset to a rate far ABOVE the
-        one the run had settled on. Measured, mmnxotsr 2026-08-20: train_prior
-        exited at peak_scale 0.0113 x envelope 0.1194 = 1.7e-7, while
-        seed_lr/lr_warmup_ratio is 1.25e-5 -- the "low" starting point was 74x
-        HOTTER than the rate it was meant to be lower than. Starting at the
-        outgoing scale makes the boundary continuous in LR by construction.
-
-        The ceiling stays 1.0 (= seed): every stage gets one ramp back up to the
-        seed rate and no further, with `bounds` remaining the sensor's own
-        post-ramp exploration range."""
-        # A FROZEN envelope short-circuits the ramp -- see _maybe_freeze_envelope.
-        frozen = st.get('envelope_frozen_at')
-        if frozen is not None:
-            return float(frozen)
-        warmup_steps = max(1, int(self._cfg('warmup_steps', 1000)))
-        elapsed = self._ramp_elapsed(st)
-        if elapsed >= warmup_steps:
-            return 1.0
-        return self._ramp_from(st) ** (1.0 - elapsed / warmup_steps)
-
-    def _ramp_elapsed(self, st):
-        """Steps of ramp actually SERVED. The clock does not start until the
-        stage has settled.
-
-        WHY THE RAMP IS Z-GATED AND NOT STEP-GATED. The envelope used to climb on
-        a step clock while the SENSOR waited on a z_cal clock, and the two can
-        disagree without limit. Measured on `elj_long_cruise` at the phase 1 -> 2
-        transition: the envelope finished its 300-step climb -- taking the rate
-        32x back up to seed -- while `z_cal/p` was still 15.5 and falling, so the
-        pooled estimator was still muzzled. The run raised the rate to full seed
-        during precisely the window in which nothing could judge it.
-
-        Holding the rate at the OUTGOING scale until the level settles is also
-        the physically right thing, not merely the safe one. The TB residual is
-        `log_pf + log_Z - log_pb - log_r`; while log_Z is hundreds of nats out,
-        the residual is dominated by the Z error and a policy gradient taken
-        against it is chasing that error rather than any policy defect. And it
-        costs nothing to wait: `lr_flow` is pinned high and is untouched by
-        peak_scale or by the envelope, so Z converges on its own clock while the
-        policy is held. A low policy rate during the Z transient makes policy
-        runaway impossible by construction.
-
-        The wait is bounded by `_settled` itself (MAX_TRANSIENT_STEPS), so a
-        level that never settles cannot hold the ramp shut forever.
-        """
-        # ONLY A RE-ARMED RAMP IS GATED. At run start there is no outgoing stage
-        # to hold at and no transition to be discontinuous across, so the initial
-        # warmup keeps the plain step clock it has always had -- every existing
-        # config's opening behaviour is unchanged, and the change is confined to
-        # the boundary where the failure was observed.
-        if not st.get('ramp_z_gated'):
-            return self._elapsed(st)
-        # RELEASE IS ONE-WAY. Checking `_settled()` first made it reversible, and
-        # a reversible release is a 32x LR flip: `_settled` reads a ROLLING
-        # window of z_cal/p, so a level that dips under the bar and comes back
-        # sent the envelope from 1.0 straight back to `ramp_from`. Measured on
-        # elj_p2_cruise: env oscillated 0.03125 <-> 1.0 across the run and
-        # bwd/loss jumped 717 -> 4119 on the first flip. Once a stage has been
-        # judged settled, the ramp it earned is not taken away -- if the level
-        # moves again that is what the SENSOR and the emergency cut are for, not
-        # something to re-litigate with a schedule.
-        released = st.get('ramp_released_at')
-        if released is None:
-            if not self._settled():
-                return 0
-            released = st['ramp_released_at'] = int(
-                getattr(self.modeller, 'step_ind', 0))
-            held = self._elapsed(st)
-            if held > 0:
-                print(f"lr_ctrl: ramp released after {held} steps held at the "
-                      f"outgoing scale {self._ramp_from(st):.4g} -- the stage "
-                      f"transient has settled, so the envelope may climb")
-        return max(0, int(getattr(self.modeller, 'step_ind', 0)) - int(released))
-
-    # ----------------------------------------------------------------- actuator
-
-    def _peak_bounds(self):
-        b = self._cfg('bounds', (0.01, 2000.0))
-        return float(b[0]), float(b[1])
+    def live_rates(self) -> dict:
+        """What each managed optimizer's first group is ACTUALLY set to. The
+        bracket logs this beside the candidate identifier, because 'the rate
+        under test' is a claim about the optimizer, not about the config."""
+        out = {}
+        for key, opt in self.modeller.optimizers.items():
+            if opt.param_groups:
+                out[key] = float(opt.param_groups[0]['lr'])
+        return out
 
     def _max_lr(self):
-        """The absolute ceiling on any rate this controller writes, or None.
-
-        A RAIL, NOT A RANGE. `adaptive_lr.bounds` stays wide on purpose -- the
-        controller is meant to find its own operating range, and narrowing bounds
-        to express a safety limit would also delete the exploration. This is the
-        separate thing: a hard number, in absolute learning-rate units, that no
-        group may exceed however the servo got there.
-
-        Measured 2026-08-17 (hyperslope_aug17, QM9 conditional, rate pinned per
-        arm): 5e-6 through 8e-5 run 2000 steps clean, 2e-4 goes non-finite at
-        step 1560, 5e-4 at step 560. The survivable range is about 16x wide,
-        against `bounds` defaults spanning 200,000x -- four orders of magnitude
-        more room than the run tolerates. Absent (the default) is no cap, which
-        reproduces the behaviour of every config that predates the key."""
         cap = getattr(self.modeller.args, 'max_lr', None)
         return None if cap is None else float(cap)
 
     def _apply_lrs(self, st):
-        """lr = base x peak_scale x envelope, capped at max_lr and floored at
-        min_lr -- EXCEPT the flow (Z head) groups, pinned flat at lr_flow, and
-        except groups whose base LR was configured as an explicit float, which
-        the controller does not own (peak_scale does not apply to them; the
-        envelope still does).
+        """lr = base x scale, capped at max_lr and floored at min_lr -- EXCEPT
+        the flow (Z head) groups, pinned flat at lr_flow, and except groups whose
+        base LR was configured as an explicit float, which the bracket does not
+        own and which therefore receive their float unmodified.
 
-        THE CAP APPLIES TO EVERY GROUP THIS METHOD WRITES, including the two the
-        servo does not own:
-
-          the FLOW group, because it is the one rate with no other guard at all.
-          peak_scale never reaches it (control_flow_lr is false), the envelope
-          never reaches it, and a divergence cut cannot move it -- so before this
-          cap there was no mechanism by which any controller could lower it. The
-          conditional route's flow head is a real network, and this base config
-          warns it diverges at the canonical lr_flow 0.1.
-
-          EXPLICIT-FLOAT groups, because the rail is about what the optimizer
-          actually receives, not about who chose it. For those the cap binds iff
-          the written float itself exceeds it, since the envelope only reduces.
-
-        The cap is the LAST transform before the floor, so it binds on the
-        product rather than on any one factor, and `_check_bars` has already
-        refused a cap below min_lr -- otherwise the two clamps would fight and
-        whichever ran second would silently win."""
+        THE CAP APPLIES TO EVERY GROUP THIS METHOD WRITES, the flow group
+        included: nothing else can lower it -- the scale never reaches it and
+        there is no divergence cut any more -- so without the cap there is no
+        mechanism by which any controller could.
+        """
         m = self.modeller
         a = m.args
-        control_flow = self._cfg('control_flow_lr', False)
+        control_flow = bool(self._cfg('control_flow_lr', False))
         managed = self._managed_keys()
-        env = st['envelope']
-        peak = float(st['peak_scale'])
+        scale = float(st['scale'])
         cap = self._max_lr()
-        capped = 0
-        floored = 0
+        capped = floored = 0
         for key, opt in m.optimizers.items():
             n_groups = len(opt.param_groups)
             for gi, g in enumerate(opt.param_groups):
                 is_flow_group = key == 'flow' or (key == 'fused' and gi == n_groups - 1)
                 if is_flow_group and not control_flow:
-                    # pinned, so no min_lr floor here either -- unchanged
-                    want = a.lr_flow
+                    want = a.lr_flow                # pinned; no min_lr floor here
                     if cap is not None and want > cap:
                         want, capped = cap, capped + 1
                     g['lr'] = want
@@ -1554,339 +390,657 @@ class LRController:
                 else:
                     base_key = self._POLICY_BASE[key]
                 base = getattr(a, base_key)
-                scale = env * (peak if base_key in managed else 1.0)
-                want = base * scale
+                want = base * (scale if base_key in managed else 1.0)
                 if cap is not None and want > cap:
                     want, capped = cap, capped + 1
-                # A BINDING FLOOR IS AS INVISIBLE AS A BINDING CEILING, and on
-                # this route it is the more likely of the two: measured quality
-                # optimum on the conditional VarGrad route is ~2e-6 to 2e-5,
-                # against a shipped min_lr of 1e-6 -- so the floor sits barely
-                # below the good range and a controller asking to go lower is
-                # silently refused. It also truncates the BOTTOM OF THE RAMP once
-                # seed_lr is set sensibly: seed 5e-6 at lr_warmup_ratio 10 starts
-                # at 5e-7, under the floor, so warmup would begin clamped.
+                # A BINDING FLOOR IS AS INVISIBLE AS A BINDING CEILING, and it is
+                # the more likely of the two here: a burn-in scale is deliberately
+                # small, so a floor set anywhere near the operating range silently
+                # turns the conservative rate into a hotter one -- and then the
+                # root is not the rate the config named.
                 if want < a.min_lr:
                     floored += 1
                 g['lr'] = max(a.min_lr, want)
-        # A BINDING RAIL MUST BE VISIBLE. A clamped controller and a satisfied
-        # one are otherwise indistinguishable from the rate alone, which is the
-        # failure this module has now logged four separate times.
         self._lr_capped_groups = capped
         self._lr_floored_groups = floored
 
-    # --------------------------------------------------------------------- tick
-
     def step(self):
-        """One controller evaluation. Re-stamps the envelope and the LRs; it does
-        NOT move peak_scale, except for a warm restart -- otherwise only
-        on_calibration, on_hypergradient, on_plateau and on_divergence do."""
+        """Re-stamp every learning rate from the current scale. Called on the
+        10-step reporting clock; it does NOT move the scale."""
         st = self._state()
-        self._maybe_restart(st)
-        self._maybe_freeze_envelope(st)
-        st['envelope'] = self._envelope(st)
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            st['peak_scale'] = min(float(st['peak_scale']), ceiling)
         self._apply_lrs(st)
         self._emit(st)
         return self.modeller.optimizers['fwd'].param_groups[0]['lr']
 
-    def _freeze_enabled(self) -> bool:
-        """Whether the warmup ramp may be frozen at all. `adaptive_lr.envelope_freeze`,
-        default TRUE.
+    # -------------------------------------------------------------- tripwire
 
-        A BOOLEAN, WHERE IT USED TO BE A THRESHOLD. `envelope_freeze_drop` named
-        how far peak_scale had to fall from its high-water mark, per sensor,
-        because the freeze read the actuator and the actuator carried the
-        sensor's noise. It does not any more: no sensor moves peak_scale during a
-        ramp, so the only thing that can is on_divergence, whose cut is
-        unambiguous by construction. Measured before removing it -- every
-        threshold from 0.0 to 0.4 returned the identical verdict, since
-        divergence_cut 0.5 is a 50% fall against a largest default of 5%. Nothing
-        noisy reaches this decision, so there is nothing left to threshold.
-        Retired at state 7."""
-        return bool(self._cfg('envelope_freeze', True))
+    def observe(self, step_type, loss, grad_norm):
+        """One training step's reading, EVERY step. Returns 'diverged' or None.
 
-    def _maybe_freeze_envelope(self, st):
-        """Stop the warmup ramp the moment the sensor is materially pulling AGAINST
-        it, and hold the envelope there for the rest of the stage.
-
-        WHY THE RAMP NEEDS AN OFF SWITCH AT ALL. `warmup_steps` is a step count, so
-        the ramp ends on a constant rather than on evidence, and it re-arms at every
-        stage transition -- which is exactly where the optimizers are fresh and the
-        loss surface just changed. Whatever the rate is doing, the envelope keeps
-        climbing to 1.0 on schedule. It also fights `on_divergence`: that cuts
-        peak_scale, while the envelope goes on re-inflating the product underneath
-        it.
-
-        WHY THE TRIGGER IS THE ACTUATOR, NOT THE SENSOR. The obvious rule is "freeze
-        when cos goes negative", but cos is noisy about zero -- measured swinging
-        -0.2 to +0.4 through a live warmup -- so a single negative reading fires
-        within a few steps and the ramp never happens at all. peak_scale is the
-        integral of those readings, so noise averages out of it while a sustained
-        too-hot verdict accumulates. Freezing on a fall from its own HIGH-WATER mark
-        also means the test cannot be tripped by the climb itself.
-
-        Recoverable by construction: after the freeze the sensor still owns
-        peak_scale in both directions, with `bounds` (default 2000x) far above
-        anything the ramp would have reached. Freezing early costs some warmup, not
-        the operating point.
-
-        Per stage: `_fresh_state` at a cold start and `rearm_warmup` at every
-        transition clear both fields, so each stage ramps and freezes on its own
-        evidence.
+        Two jobs, and they are the same measurement: collect the root's loss
+        scale during burn-in, and judge the live step against the bars derived
+        from it. Direct conditions only -- non-finite values, an absolute
+        backstop, and an excursion measured against the root's own scale. There
+        is no fitted trend, no loss ratio, no cosine and no composite score,
+        because a graduated too-hot indicator is what v8 deleted on evidence and
+        what this mechanism exists not to reintroduce.
         """
-        if st.get('envelope_frozen_at') is not None:
-            return
-        if self._elapsed(st) >= int(self._cfg('warmup_steps', 1000)):
-            return                       # ramp already finished; nothing to freeze
-        peak = float(st['peak_scale'])
-        hw = float(st.get('peak_high_water', peak))
-        if peak >= hw:
-            st['peak_high_water'] = peak
-            return
-        st['peak_high_water'] = hw
-        if not self._freeze_enabled():   # ramp to hold regardless
-            return
-        # peak < hw is established above, and the only thing that can have moved
-        # it during a ramp is on_divergence -- so ANY fall here is a divergence,
-        # which needs no threshold to be believed.
-        self._freeze_envelope(
-            st, f'peak_scale {peak:.4g} is {100.0 * (1.0 - peak / hw):.1f}% off its '
-                f'high-water {hw:.4g}, i.e. the sensor is pulling against the ramp')
+        if loss is not None and step_type in self.CHANNELS:
+            v = float(loss)
+            if math.isfinite(v):
+                self._loss_history[step_type].append(v)
+        if grad_norm is not None and math.isfinite(float(grad_norm)):
+            self._grad_history.append(float(grad_norm))
+        why = self.bars.judge(step_type, None if loss is None else float(loss),
+                              None if grad_norm is None else float(grad_norm))
+        if why is None:
+            return None
+        # TWO TIERS (owner decision 2026-08-24). A MODERATE fire -- a finite
+        # excursion over the derived bar -- cuts the rate in place and keeps
+        # training: the state is intact, just too hot, and a rewind would spend
+        # a reload re-entering the same neighborhood. A DISASTER -- non-finite,
+        # or an absolute backstop -- rewinds to the rolling checkpoint AND cuts.
+        # Either stands until the scheduled re-race (repeat_every) re-measures
+        # the rate from live state; neither is a permanent verdict.
+        step = int(getattr(self.modeller, 'step_ind', 0))
+        if '_excursion_' in why:
+            if step < int(self._fire_cooldown_until):
+                return None            # one incident, one cut -- not a machine gun
+            factor = float(self._cfg('fire_cut_factor', 0.5))
+            cooldown = int(self._cfg('fire_cooldown_steps', 100))
+            self._moderate_fires += 1
+            self._fire_cooldown_until = step + cooldown
+            new = self.set_scale(self.scale * factor, why='moderate_fire')
+            print(f'lr_ctrl MODERATE FIRE: {why} at step {step} -- rate cut in '
+                  f'place to scale {new:.4g} (x{factor:g}, cooldown {cooldown}); '
+                  f'no rewind. The scheduled re-race re-measures the rate.')
+            return None
+        # NOT counted here: every 'diverged' return leads into fire_loss_spike,
+        # whose on_divergence() call is the single counting seat -- the
+        # non-finite-gradient path reaches fire_loss_spike WITHOUT passing
+        # through this method (current_loss is None there), so counting at
+        # detection either doubles this channel or misses that path.
+        print(f'lr_ctrl DISASTER: {why} at step {step} '
+              f'(scale {self.scale:.4g}) -- reload')
+        return 'diverged'
 
-    def _freeze_envelope(self, st, reason: str):
-        """Latch the warmup ramp at its current envelope, once, with a reason.
+    #: Kept under its old name because `bench/` and the smoke harnesses call it;
+    #: it is the same judgement as `observe` without the history side effect.
+    #: UNLIKE observe it still counts at detection: harness callers have no
+    #: rewind path, so no on_divergence() ever follows a hit here.
+    def check_spike(self, step_type, current_loss, grad_norm):
+        why = self.bars.judge(step_type,
+                              None if current_loss is None else float(current_loss),
+                              None if grad_norm is None else float(grad_norm))
+        if why is None:
+            return None
+        self._divergences += 1
+        return 'diverged'
 
-        THREE PATHS REACH THIS and they are deliberately different shapes, each
-        matched to how often its sensor speaks:
+    def on_divergence(self, count: int = 1):
+        """Called after a rewind. THE COUNTING SEAT -- and since the owner's
+        two-tier decision (2026-08-24) it also CUTS: a disaster rewind restores
+        healthy weights, and re-entering them at the same rate is how the toy
+        workout's death loops re-detonated every 2 steps. The cut stands until
+        the scheduled re-race re-measures the rate. The rewind budget
+        (max_reloads_per_1k_steps) remains the backstop for a loop the cuts
+        cannot break.
 
-          hyper   every step, so it can afford to average -- fires on a smoothed
-                  error reaching the setpoint (on_hypergradient)
-          ray     once per `period` (500) against a 1000-step ramp, so averaging
-                  is not available: it fires on the FIRST downward reading
-                  (on_calibration)
-          divergence / plateau  moved peak_scale off its high-water mark
-                  (_maybe_freeze_envelope, above)
+        This is the ONE place `lr_ctrl/divergences` increments. `observe`
+        counting at detection too used to double every event (observed as
+        #2/#4/#6 across three rewinds on toy_wk_aug24), and this channel's
+        absolute counts are what calibration work reasons from -- the
+        hot-sensor sweep leaned on '0 in all 97 segments'. Counting here covers
+        both real paths once each: bar-fired (observe -> fire_loss_spike) and
+        non-finite gradient (monitor_losses -> fire_loss_spike, which never
+        passes through observe because its current_loss is None). Known
+        undercount: fire_loss_spike's UNRECOVERABLE branch raises before
+        reaching this, so the final fatal event of an aborting run is not in
+        the counter -- the abort message is its record.
 
-        Idempotent, so a second trigger in the same stage is a no-op rather than
-        re-latching at a lower envelope. `_fresh_state` (cold start) and
-        `rearm_warmup` (every transition) clear the field, so each stage ramps
-        and freezes on its own evidence.
-
-        `envelope_freeze: false` still means FREEZE OFF, and it is honoured
-        here rather than at each caller so the off switch cannot be bypassed by
-        adding a path. Only its ON/OFF sense applies to the two new callers: its
-        numeric value is a fall-from-high-water threshold, which is meaningless
-        for a rule that reads a smoothed cos or a single alpha*."""
-        if st.get('envelope_frozen_at') is not None:
-            return
-        if not self._freeze_enabled():
-            return
-        st['envelope_frozen_at'] = self._envelope(st)
-        print(f"lr_ctrl: warmup ramp FROZEN at envelope "
-              f"{st['envelope_frozen_at']:.4g} -- {reason}")
-
-    def _maybe_restart(self, st):
-        """Warm restart (SGDR-style): put peak_scale back to 1.0 and let the
-        plateau rule decay it again.
-
-        The plateau rule is a pure ratchet, and "no improvement" cannot tell
-        too-hot from too-cold -- descent rate is an inverted U in LR -- so an
-        over-cut run keeps cutting toward the floor. A periodic reset bounds that
-        without a servo that tries to hunt the peak, and cannot oscillate.
-
-        ONE trigger: restart_after train steps since the last restart.
-        adaptive_lr.restart_after: null disables it, which is the default.
-
-        There is deliberately NO floor trigger. Restarting because peak_scale
-        reached its floor multiplies the LR by 1/floor in a single step -- 100x
-        at the old 0.01 bound -- and that detonated five of six qm9anchor_aug14
-        arms from a healthy state. It also fired regardless of which sensor moved
-        peak_scale, so a hypergradient run correctly tracking a descending
-        optimum was reset by plateau-rule machinery it never used. peak_scale
-        sitting at the floor means the FLOOR IS TOO HIGH; lower the bound.
+        Unlike v8 the cut records no permanent ceiling and runs no recovery
+        ramp: it is a flat factor, LOUD, and it expires at the next re-race.
         """
-        every = self._cfg('restart_after', None)
-        if every is None:
-            return
-        since = int(self.modeller.step_ind) - int(st.get('restart_step', 0))
-        if since < int(every):
-            return
-        st['peak_scale'] = 1.0
-        st['restart_step'] = int(self.modeller.step_ind)
-        self._restarts += 1
-        print(f"lr_ctrl: warm restart ({since} steps) -- peak_scale -> 1.0")
+        self._divergences += max(int(count), 1)
+        factor = float(self._cfg('fire_cut_factor', 0.5))
+        new = self.set_scale(self.scale * factor, why='disaster_rewind_cut')
+        print(f'lr_ctrl: disaster #{self._divergences} -- rewound, and the rate is '
+              f'CUT to scale {new:.4g} (x{factor:g}): re-entering restored weights '
+              f'at the rate that just detonated them is a loop (toy_wk_aug24). '
+              f'The scheduled re-race re-measures; if this repeats the reload '
+              f'budget aborts the run.')
 
-    _STATUS = {'unresolved': 0, 'bracketed': 1, 'above_range': 2,
-               'below_range': 3, 'inconsistent': 4, 'warmup': 5,
-               # the reading was taken, and deliberately not pooled: the stage's
-               # opening transient describes the transition rather than the
-               # stage. Distinct from 'unresolved', which is the SENSOR failing.
-               'unsettled': 6,
-               # ...and this one CUT while the pool was silent: a resolved
-               # reading below target, downward only, bounded. See _too_hot_cut.
-               'too_hot_unpooled': 8,
-               # ...and this one went to a RUNNING RAMP's rung pool instead,
-               # which owns peak_scale for its duration.
-               'ramp': 7}
-    # 'warmup' deliberately shares code 5 with _STATUS so the two sensors' status
-    # channels read on one scale
-    _PLATEAU_STATUS = {'clean': 0, 'cut': 1, 'warmup': 5}
-    # 'warmup_ramp' is the freeze-only warmup mode; 'clip_saturated' is the
-    # regime gate having cut on clip evidence rather than on cos.
-    _HYPER_STATUS = {'clean': 0, 'warmup': 1, 'nonfinite': 2,
-                     'warmup_ramp': 1, 'clip_saturated': 3}
+    # ---------------------------------------------------------------- the seat
 
-    def in_warmup(self) -> bool:
-        """Whether the LR envelope is still ramping. Public because a sensor may
-        need to decline to SAMPLE during warmup, not merely to act."""
+    def tick(self) -> int:
+        """One host-loop iteration. Returns the number of PROMOTED steps the
+        caller's step clock must skip -- the winner's horizon, never the sum of
+        all trial compute.
+
+        This is the whole control law. Read it top to bottom: burn in for a fixed
+        number of steps, take a root, run the grid, promote, hold. There is no
+        settling gate, no quorum, no retry and no wait on a learned metric --
+        every branch below either advances or returns.
+        """
+        m = self.modeller
         st = self._state()
-        return self._ramping(st)
+        step = int(getattr(m, 'step_ind', 0))
+        b = self.bracket
+        skip = 0
+
+        if (b.phase == CRUISE and not self.bars.loss_bar and self._bars_ready()
+                and self._cruise_bar is None):
+            # (a pending refit that SUSPENDED the bars leaves loss_bar empty on
+            # purpose; `_cruise_bar` is what tells the two states apart)
+            # A RESUME LANDS HERE WITH NO BARS AT ALL. `bars.derive` runs once,
+            # inside `_open_bracket` -- and a run resumed mid-cruise never calls
+            # it, because burn-in and the bracket are both behind it. The derived
+            # excursion bar is the run's only tripwire that can fire on this
+            # route, so without this the whole remaining stage trains on the
+            # absolute backstops alone: exactly the 1e9 situation this design
+            # replaced, arriving through the resume path instead of the config.
+            why = self.bars.derive(self._loss_history, self._grad_history)
+            print('lr_ctrl: resumed into cruise -- hard-failure bars re-derived '
+                  'from the post-resume window: '
+                  + (self.bars.scale_note if why is None
+                     else 'NOT DERIVED ({})'.format(why)))
+
+        if b.phase == BURN_IN:
+            elapsed = step - int(st.get('stage_entry_step', 0))
+            if b.burn_in_complete(elapsed) and self._bars_ready():
+                skip = self._open_bracket(step)
+        elif b.phase == CRUISE and b.repeat_due(step):
+            # A REPEAT TAKES THE CURRENT MATURE STATE AS THE NEW ROOT and runs
+            # the same explicit grid again. No second burn-in: the run has been
+            # training at a promoted rate, so the optimizers are at steady state
+            # by construction and the bias-correction check passes trivially.
+            print(f'lr_ctrl: re-bracketing -- {step - int(b.promoted_at)} promoted steps '
+                  f'since the last selection')
+            skip = self._open_bracket(step)
+
+        if b.phase == CRUISE:
+            b.note_promoted_steps(1)
+            if self._cruise_bar is not None:
+                self._tick_cruise_bar(step)
+        # RE-READ THE STATE. `lr_ctrl` is in `TrainerSnapshot.FIELDS`, so every
+        # trial restore REPLACES `modeller.lr_ctrl` with a fresh dict -- which
+        # leaves the `st` captured at the top of this method pointing at an
+        # orphan. Writing the bracket's verdict into that orphan means a
+        # checkpoint taken on this iteration records a bracket that never
+        # happened, and a resume from it re-runs one that already has.
+        st = self._state()
+        st['bracket'] = b.state_dict()
+        st['scale'] = float(st.get('scale', b.scale_now()))
+        return int(skip)
+
+    def _bars_ready(self) -> bool:
+        """Has the root window filled enough to derive a bar that can fire?
+
+        A BOUNDED WAIT, not a settling gate: the window fills at exactly one
+        observation per training step, so this resolves in at most
+        `hard_failure.min_observations` steps and cannot be held open by
+        anything the rate is itself moving. It exists for the resume case, where
+        burn-in is already complete by step count but this process has seen no
+        losses yet -- and bracketing with no derived bar is bracketing with bars
+        that cannot fire.
+        """
+        if self.bracket.mode == 'fixed':
+            return True
+        best = max((len(v) for v in self._loss_history.values()), default=0)
+        return best >= self.bars.min_observations
+
+    def _keep_rate(self):
+        """The rate a refusal should fall back to.
+
+        On the first cycle nothing has been measured, so it is the burn-in scale
+        -- the safe answer, and labelled as one. On a REPEAT the run already has
+        a rate a previous bracket measured and that has been training ever since,
+        and dropping that to the burn-in scale would make a refused re-bracket
+        COST the run its operating point for no evidential reason."""
+        promoted = self.bracket.promoted_scale
+        return self.bracket.burn_in_scale if promoted is None else float(promoted)
+
+    def _train_mode(self):
+        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
+        return getattr(stage, 'train_mode', None) or 'fused'
+
+    def _check_bar_window(self):
+        """`min_observations` above `root_window` can never be satisfied.
+
+        The window is a deque of maxlen `root_window`, so a larger requirement
+        means `_bars_ready` returns False on every step for the life of the run:
+        burn-in never ends, no bracket is ever armed, and NOTHING SAYS SO -- the
+        run just trains at the burn-in scale forever, which is a plausible enough
+        thing to see that nobody would look. That is an unbounded wait, which
+        this design does not have anywhere else, so it is refused at construction
+        rather than diagnosed after a wasted job."""
+        if self.bracket.mode != 'bracket':
+            return
+        if self.bars.min_observations > self.bars.root_window:
+            raise ValueError(
+                'lr_control.hard_failure.min_observations ({}) is above '
+                'root_window ({}). The observation window is a ring of '
+                'root_window entries, so the requirement can never be met: '
+                'burn-in would never end, no bracket would ever run, and the run '
+                'would train at the burn-in scale for its whole life without '
+                'saying so.'.format(self.bars.min_observations,
+                                    self.bars.root_window))
+
+    def _arm_cruise_bar(self, promoted_scale, suspend: bool):
+        """Queue a refit of the bars at the rate the run is about to hold.
+
+        NOT ARMED when the promoted rate IS the burn-in rate -- a refusal, or a
+        grid whose bottom rung was selected. The root bars already describe that
+        rate, so a refit would spend 400 steps to arrive at the same answer.
+
+        `suspend` DECIDES WHAT GUARDS THE REFIT WINDOW, and the two callers want
+        opposite things because they know different amounts about the rate:
+
+          bracket mode (suspend=True)   the promoted rate survived a full trial
+            horizon minutes ago. The cold bar is now the likelier source of a
+            wrong answer than the rate is, so it comes down and the backstops
+            stand for the window.
+          fixed mode (suspend=False)    NOTHING tested this rate; it was asserted
+            from outside. A bar that is too tight costs a rewind, an absent one
+            costs the run, so the cold bar stays live until the refit replaces
+            it.
+        """
+        if not self._cruise_rederive:
+            return
+        if promoted_scale is None:
+            return
+        if float(promoted_scale) == float(self.bracket.burn_in_scale):
+            self._cruise_bar = None
+            return
+        # `prev_*`, not `root_*`: on a repeat_every re-bracket the bars standing
+        # here were derived at the PREVIOUS PROMOTED rate, not at burn-in.
+        self._cruise_bar = {'prev_loss': dict(self.bars.loss_bar),
+                            'prev_grad': self.bars.grad_bar,
+                            'suspended': bool(suspend)}
+        self._bars_redrawn = False
+        held = ('SUSPENDED (non-finite and the absolute backstops stand meanwhile)'
+                if suspend else
+                'HELD LIVE -- nothing tested this rate, so a bar that is too tight '
+                'beats no bar at all')
+        if suspend:
+            self.bars.loss_bar = {}
+            self.bars.grad_bar = None
+        print(f'lr_ctrl: rate promoted to scale {float(promoted_scale):g} -- the '
+              f'excursion bars fitted at the burn-in rate are {held}. They are '
+              f'refitted from {self.bars.root_window} steps of ordinary training at '
+              f'the new rate, after a {self._cruise_settle_steps}-step settle.')
+
+    def _tick_cruise_bar(self, step: int):
+        """Advance the post-promotion redraw: settle, clear, collect, refit.
+
+        THE CLOCK IS THIS METHOD'S OWN CALL COUNT, not `step_ind`. `_open_bracket`
+        returns the winning trial's horizon and the host loop SKIPS that many
+        steps off its iterator, so `step_ind` jumps forward by up to a full trial
+        the instant a rate is promoted. A clock written as `step + settle` would
+        be in the past before the first cruise step ran, and the settle it exists
+        to enforce would be skipped entirely. This method is called once per real
+        cruise step, which is exactly the quantity being counted.
+
+        THE SETTLE IS NOT A CONVERGENCE GATE. It is a fixed number of steps
+        discarded because the rate has just changed by up to the width of the
+        grid, and the steps immediately after that change are the transient, not
+        the behaviour the bar is meant to describe. Nothing here waits on a
+        learned metric.
+        """
+        cb = self._cruise_bar
+        n = cb['ticks'] = cb.get('ticks', 0) + 1
+        settle = self._cruise_settle_steps
+        if n < settle:
+            return
+        if n == settle:
+            # Drop the burn-in observations: they were taken at the cold rate,
+            # and mixing them with post-promotion ones fits the bar to neither.
+            for q in self._loss_history.values():
+                q.clear()
+            self._grad_history.clear()
+            return
+        filled = max((len(v) for v in self._loss_history.values()), default=0)
+        # THE DEADLINE IS NOT OPTIONAL. A stage whose steps do not all land on
+        # one channel may never fill a window, and without a deadline the refit
+        # would stay pending for the rest of the stage -- leaving the tripwire
+        # suspended, silently, which is strictly worse than the cold bar this
+        # exists to replace.
+        deadline = settle + 4 * self.bars.root_window
+        if filled < self.bars.root_window and n < deadline:
+            return
+        self._redraw_bars_for_cruise(step, filled)
+        self._cruise_bar = None
+
+    def _redraw_bars_for_cruise(self, step: int, filled: int):
+        """Refit the bars to the promoted rate, falling back to the stashed
+        previous bars for anything the new window cannot replace.
+
+        `HardFailureBars.derive` rebuilds its table from scratch, so a channel
+        that fired before and not since would come back with no bar at all.
+        Keeping the previous bar for such a channel is the conservative
+        direction -- it was fitted at a colder rate, so it is tighter than a
+        correct one, and a tight bar costs a rewind where an absent one costs
+        the run.
+        """
+        cb = self._cruise_bar or {}
+        old_loss = dict(cb.get('prev_loss') or {})
+        old_grad = cb.get('prev_grad')
+        why = self.bars.derive(self._loss_history, self._grad_history)
+        if why is not None:
+            self.bars.loss_bar, self.bars.grad_bar = old_loss, old_grad
+            print(f'lr_ctrl: cruise bars NOT redrawn at step {step} ({why}) -- '
+                  f'restoring the bars fitted at the previous rate, which are '
+                  f'TIGHTER than this one warrants but are not absent.')
+            return
+        carried = [c for c in old_loss if c not in self.bars.loss_bar]
+        for c in carried:
+            self.bars.loss_bar[c] = old_loss[c]
+        if self.bars.grad_bar is None and old_grad is not None:
+            self.bars.grad_bar = old_grad
+            carried.append('grad')
+        self._bars_redrawn = True
+        note = (f' Kept the previous bar for {carried} -- no post-promotion window.'
+                if carried else '')
+        short = (f' Window short ({filled}/{self.bars.root_window}) at the deadline.'
+                 if filled < self.bars.root_window else '')
+        print(f'lr_ctrl: hard-failure bars REDRAWN at step {step} from ordinary '
+              f'training at the promoted scale {self.scale:.4g} -- '
+              f'{self.bars.scale_note}.{note}{short}')
+
+    def _cancel_pending_refit(self):
+        """Put back whatever a pending post-promotion refit took down.
+
+        `repeat_every` can re-open a bracket while a refit is still pending -- at
+        the shipped 20000 against a ~400-step refit it cannot in practice, but
+        the two are independent clocks and nothing enforces the ordering. Without
+        this the stash is dropped: a refit that had SUSPENDED the bars leaves
+        them empty, and if the re-opened bracket then refuses (its own window was
+        just cleared) the stage runs on the absolute backstops alone for the rest
+        of its life. Restoring first is free -- a successful derive overwrites
+        them a moment later anyway.
+        """
+        cb = self._cruise_bar
+        if cb is None:
+            return
+        if cb.get('suspended'):
+            self.bars.loss_bar = dict(cb.get('prev_loss') or {})
+            self.bars.grad_bar = cb.get('prev_grad')
+        self._cruise_bar = None
+
+    def _open_bracket(self, step: int) -> int:
+        """Burn-in is over. Take the root and either bracket from it or say why
+        not. Returns promoted steps to skip."""
+        self._cancel_pending_refit()
+        b = self.bracket
+        if b.mode == 'fixed':
+            # THE DERIVED BARS ARE STILL WORTH HAVING HERE, even though nothing
+            # is being bracketed. Fixed mode chooses the rate from outside; it
+            # does not make the rate safe, and without this the run's only
+            # hard-failure guard for the whole stage is the absolute backstop --
+            # which is what caught nothing on this route when the loss went from
+            # about -25 to +318. A refusal is NOT fatal in this mode: there is no
+            # measurement to corrupt, so it says so and carries on.
+            why = self.bars.derive(self._loss_history, self._grad_history)
+            if why is None:
+                print(f'lr_ctrl: hard-failure bars derived from burn-in -- '
+                      f'{self.bars.scale_note}')
+            else:
+                print(f'lr_ctrl: NO derived hard-failure bar ({why}) -- fixed mode '
+                      f'continues on the absolute backstops alone.')
+            self.set_scale(b.fixed_scale, why='fixed_mode')
+            b.promote(b.fixed_scale, step)
+            self._arm_cruise_bar(b.fixed_scale, suspend=False)
+            print(f'lr_ctrl: burn-in complete at step {step}; FIXED mode -- holding '
+                  f'scale {b.fixed_scale:g} for the stage. No trials run.')
+            return 0
+
+        if not self.stepping_optimizer_keys():
+            # THE DOCUMENTED CONTROL ARM: every lr_* key is an explicit float, so
+            # the scale reaches no optimizer. There is no rate under test, so
+            # spending N x trial_steps discarding training to measure one would
+            # be pure waste -- and the "boundary" it found would describe a
+            # multiplier nothing applies.
+            self.set_scale(b.refuse('no managed learning rate this stage steps -- '
+                                    'the scale reaches no optimizer that takes a '
+                                    'step here (the control arm)',
+                                    scale=self._keep_rate(), step=step),
+                           why='control_arm')
+            print('lr_ctrl: no learning rate this stage steps is bracket-managed, so '
+                  'no trials are run. The controller reads and logs while actuating '
+                  'nothing.')
+            return 0
+        # DON'T CALIBRATE A FINISHED STAGE (owner decision 2026-08-24). If the
+        # stage's exit trigger is already armed, a transition executes at the
+        # next eval and rebuilds the optimizers anyway -- trials would spend
+        # N x trial_steps measuring a rate with no stage left to run on, and
+        # the promoted rate's only product would be exit-window jitter (seen on
+        # the toy: the ladder ran after MLE had fully converged). Same family
+        # as the control-arm refusal: declining work, not steering a rate.
+        if bool((getattr(self.modeller, 'stage_ctrl', None) or {}).get('exit_armed')):
+            self.set_scale(b.refuse('the stage exit trigger is armed -- a transition '
+                                    'is imminent, so there is no stage left to run a '
+                                    'selected rate on',
+                                    scale=self._keep_rate(), step=step),
+                           why='stage_finished')
+            print('lr_ctrl: NOT bracketing -- the stage exit trigger is already armed; '
+                  'holding the current rate until the transition re-brackets.')
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.run.summary[f'lr_bracket/refusal_step_{int(step)}'] = \
+                        'exit trigger armed; stage finished'
+            except Exception:
+                pass
+            return 0
+        driver = BracketDriver(self.modeller, b, self.bars,
+                               verbose=bool(self._cfg('verbose', True)))
+        refusal = self.bars.derive(self._loss_history, self._grad_history)
+        if refusal is None:
+            # INSIDE THE GUARD. Taking the root is the single largest allocation
+            # the mechanism makes -- it copies the model, every optimizer's
+            # moments and all three buffers off the card in one go -- so it is
+            # the most likely place for the bracket to OOM, and it sat outside
+            # the try/except that the abort path documents as covering it.
+            try:
+                refusal = driver.take_root(step)
+            except Exception as e:                   # noqa: BLE001 -- classified
+                if is_cuda_oom(e):
+                    self.modeller.handle_train_epoch_error(e, self._train_mode())
+                refusal = ('the root snapshot could not be taken ({}: {})'
+                           .format(type(e).__name__, e))
+        if refusal is not None:
+            driver.release()
+            self.set_scale(b.refuse(refusal, scale=self._keep_rate(), step=step),
+                           why='bracket_refused')
+            print(f'lr_ctrl: REFUSING TO BRACKET -- {refusal}\n'
+                  f'          Holding the burn-in scale {b.burn_in_scale:g} for the rest '
+                  f'of the stage. This is the safe answer, not a measured one.')
+            # The refusal is race telemetry too -- keyed by STEP, not by cycle:
+            # begin_bracket never ran, so a later successful repeat takes the
+            # next cycle index and must not overwrite this record. Fire-and-
+            # forget, same contract as _publish_race.
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.run.summary[f'lr_bracket/refusal_step_{int(step)}'] = str(refusal)
+            except Exception:
+                pass
+            return 0
+        print(f'lr_ctrl: hard-failure bars derived from the root -- {self.bars.scale_note}')
+        self.driver = driver
+        b.begin_bracket(step, driver.root_bias_correction()[0])
+        # CAPTURED, NOT READ LATER. `_emit` runs on the 10-step reporting clock,
+        # by which time the whole bracket has completed inside this one tick and
+        # `self.driver` is None again -- so `driver.report()` was dead code and
+        # `lr_bracket/held_mb` could never be published. Take it here.
+        self._bracket_report = {}
+        try:
+            skip = driver.run(step)
+            self._bracket_report = driver.report()
+        except Exception as e:                       # noqa: BLE001 -- classified
+            # AN ABORTED BRACKET MUST NOT ABORT THE RUN, and this seat is outside
+            # the host loop's `try/except (RuntimeError, ValueError)` -- that one
+            # wraps `train_step` alone, so anything raised in here would leave
+            # the training loop entirely.
+            #
+            # AN OOM IS THE CASE THIS EXISTS FOR. It says nothing about the rate,
+            # so it may not convict a candidate; but it is also not fatal --
+            # trials run at the live batch size, and the bracket makes an OOM
+            # MORE likely by holding several full trainer snapshots in host
+            # memory while the card is already loaded. Hand it to the shared
+            # recovery path (which cuts the batch and records the ceiling), put
+            # the trainer back on the root, and hold the burn-in scale: the safe
+            # answer, labelled as one rather than dressed up as a measurement.
+            reason = f'{type(e).__name__}: {e}'
+            if is_cuda_oom(e):
+                # THE STAGE'S OWN TRAIN MODE, not a label.
+                # `handle_train_epoch_error` gates the batch cut and the OOM
+                # ceiling on `step_type in TRAIN_MODES` -- eval OOMs have a
+                # different memory profile and must not install a train-batch
+                # ceiling. A trial step IS a train step of this stage's mode, so
+                # passing a descriptive string like 'lr_bracket' silently skipped
+                # both halves of the recovery and left the batch untouched for
+                # the next attempt.
+                self.modeller.handle_train_epoch_error(e, self._train_mode())
+            try:
+                if driver.root is not None:
+                    driver.root.restore()
+            except Exception as restore_error:       # noqa: BLE001
+                reason += f' (and the root would not restore: {restore_error})'
+            self.set_scale(b.refuse(f'bracket aborted -- {reason}',
+                                    scale=self._keep_rate(), step=step),
+                           why='bracket_aborted')
+            print(f'lr_ctrl: BRACKET ABORTED -- {reason}\n'
+                  f'          Restored the root and holding the burn-in scale '
+                  f'{b.burn_in_scale:g}. No boundary was measured.')
+            skip = 0
+        finally:
+            self.driver = None
+            driver.release()
+        # ARMED AFTER THE CYCLE, from whatever the bracket actually settled on --
+        # a promotion, a refusal, or an abort all land in `promoted_scale`, and
+        # only the first of the three is a rate the root bars do not describe.
+        self._arm_cruise_bar(b.promoted_scale, suspend=True)
+        return skip
+
+    def on_stage_change(self):
+        """Protocol.advance hook. The optimizers were rebuilt onto a surface with
+        different curvature, so the promoted rate describes a surface that no
+        longer exists: the stage re-enters burn-in and re-brackets.
+
+        A GENUINE STAGE TRANSITION RUNS ANOTHER FIXED BURN-IN, and it has to --
+        rebuilding the optimizers restarts Adam's step counter, and bracketing
+        from a counter at t=10 measures 0.153 of the rate under test.
+
+        Returns the burn-in length in train steps, for the caller's log.
+        """
+        m = self.modeller
+        st = self._state()
+        st['stage_entry_step'] = int(m.step_ind)
+        b = self.bracket
+        b.phase = BURN_IN
+        b.promoted_scale = None
+        b.promoted_at = None
+        b.refusal = None
+        for q in self._loss_history.values():
+            q.clear()
+        self._grad_history.clear()
+        # THE BARS GO WITH THE WINDOW. Clearing the observations but keeping the
+        # bars fitted to them left the outgoing stage's bars deciding rewinds
+        # through the incoming stage's burn-in -- a different train_mode, a
+        # different composite, and a loss scale that can differ by orders of
+        # magnitude. Until the new root is taken the absolute backstops stand
+        # alone, which is what a stage with no measured scale yet has earned.
+        self.bars.loss_bar = {}
+        self.bars.grad_bar = None
+        self.bars.scale_note = ''
+        # NOT `_cancel_pending_refit`: a stage change is exactly the case where
+        # the outgoing bars must NOT be put back.
+        self._cruise_bar = None
+        self._bars_redrawn = False
+        self.set_scale(b.burn_in_scale, why='stage_change')
+        print(f'lr_ctrl: stage change -- burn-in restarted, {b.burn_in_steps} steps at '
+              f'scale {b.burn_in_scale:g}. The optimizers were rebuilt, so Adam\'s step '
+              f'counter is back at zero and nothing may be bracketed until it is not.')
+        return b.burn_in_steps
+
+    #: The name protocol.py and the smoke harnesses still call. Same transaction.
+    rearm_warmup = on_stage_change
+
+    def in_burn_in(self) -> bool:
+        return self.bracket.phase == BURN_IN
+
+    #: Retained spelling for the diagnostic sensors, which decline to sample
+    #: while the rate is deliberately conservative.
+    in_warmup = in_burn_in
+
+    # ------------------------------------------------- diagnostics (off by default)
+
+    def calibration_refusal(self):
+        """Why a ray reading would be thrown away, decided without measuring --
+        or None. The ray is a DIAGNOSTIC here: it reaches no learning rate, so
+        the only refusal left is 'nothing asked for it'."""
+        return None
+
+    def on_calibration(self, reading):
+        """Record one ray calibration. IT MOVES NOTHING.
+
+        The sensor is retained as an optional, off-by-default diagnostic so a
+        future claim about it can be measured rather than argued about. It is
+        wired to no actuator: alpha* does not respond to the learning rate (the
+        slope of log alpha* against log lr measured 0.00 +- 0.2 where -1 is
+        required), so any rate it set would be a number with no relationship to
+        the rate.
+        """
+        self._calibrations += 1
+        self._last_ray = dict(reading or {})
+
+    def on_hypergradient(self, cos, beta=None, beta_down=None, cos_target=0.0,
+                         clip_ratio=None):
+        """Record one hypergradient cosine. IT MOVES NOTHING -- same contract as
+        `on_calibration`. `cos` is a stationarity statistic: it is negative at
+        every stable rate once the iterate has equilibrated, so it has no fixed
+        point to steer to."""
+        if cos is None or not math.isfinite(float(cos)):
+            return
+        self._hypergrads += 1
+        self._last_cos = float(cos)
+
+    # ---------------------------------------------------------------- report
 
     def _emit(self, st):
+        """The LR channel. Pared to what a reader needs to reconstruct the rate
+        and the experiment that chose it -- and deliberately NOT carrying alpha*
+        or cos, which would read as explanations for a selection neither entered.
+        """
         self._report = {
-            'lr_ctrl/envelope': st['envelope'],
-            'lr_ctrl/peak_scale': st['peak_scale'],
-            'lr_ctrl/scale': st['envelope'] * st['peak_scale'],
-            # THE RAMP, NOT THE STEP BUDGET. This used to read
-            # elapsed < warmup_steps, which reports 1 for the full budget after
-            # an early freeze -- so the metric claimed a ramp was running while
-            # the envelope was a constant, and disagreed with in_warmup(), the
-            # predicate the sensors actually gate on.
-            'lr_ctrl/warmup': float(self._ramping(st)),
-            'lr_ctrl/ramp_from': self._ramp_from(st),
+            'lr_ctrl/scale': float(st['scale']),
             'lr_ctrl/divergences': float(self._divergences),
-            'lr_ctrl/calibrations': float(self._calibrations),
+            'lr_ctrl/moderate_fires': float(self._moderate_fires),
         }
+        self._report.update(self.bracket.report())
+        self._report.update(self.bars.report())
+        self._report['lr_bracket/bars_redrawn'] = float(bool(self._bars_redrawn))
+        self._report.update(getattr(self, '_bracket_report', None) or {})
         # Published only when a cap is configured, so its ABSENCE means "no rail"
         # rather than "rail never bound" -- two states a constant 0.0 could not
-        # tell apart. A non-zero value means the servo is asking for a rate the
-        # rail is refusing, i.e. peak_scale no longer describes the live rate.
+        # tell apart.
         if self._max_lr() is not None:
             self._report['lr_ctrl/lr_capped_groups'] = float(self._lr_capped_groups)
-        # Always published: min_lr has no "off", so unlike the cap there is no
-        # absent-means-no-rail state to preserve. Non-zero means the servo is
-        # asking for a rate the floor is refusing, i.e. peak_scale has stopped
-        # describing the live rate at the bottom as well as the top.
         self._report['lr_ctrl/lr_floored_groups'] = float(self._lr_floored_groups)
-        if self._last:
-            # The ACTUATOR beside the sensor, always: a controller that is
-            # holding and one that is satisfied are otherwise indistinguishable
-            # from peak_scale alone, which is the failure this module has logged
-            # three separate times.
-            self._report['lr_ctrl/cal_applied'] = float(self._last.get('applied', 0.0))
-            s = self._last.get('status')
-            self._report['lr_ctrl/cal_status'] = float(self._STATUS.get(s, -1))
-        # THE POOL'S EVIDENCE, not just its verdict. Published whenever the
-        # estimator is the live rule, and published even when the window is too
-        # short to speak -- an estimator that is holding and one that has no
-        # power to do anything else are otherwise identical from `cal_applied`
-        # alone, which is exactly the confusion this file has logged three times.
-        # Published ALWAYS once non-zero: a run that needed the emergency cut and
-        # one that never did must be distinguishable from the log.
-        if self._hot_cuts:
-            self._report['lr_ctrl/hot_cuts'] = float(self._hot_cuts)
-        if self._ramp_enabled():
-            self._report.update(self._ramp_totals())
-        if self.ramp is not None:
-            self._report.update(self.ramp.report())
-        elif self._ramp_enabled():
-            # ARMED BUT NOT STARTED is its own state and has to look like one.
-            # Without this the block is configured, the ramp is waiting on the
-            # settling gate, and NO `ramp/*` key exists at all -- which reads
-            # exactly like a ramp that was never wired up. That confusion is the
-            # one this file has logged three separate times.
-            self._report['ramp/armed'] = float(self._ramp_armed)
-            self._report['ramp/settled'] = float(self._settled())
-        if self._cal_mode() == 'pooled':
-            self._report.update(self.pool.report(
-                peak_scale=float(st['peak_scale']),
-                alpha_target=float(self._cal_cfg('alpha_target', 4.0))))
-            if self._pool_last.get('reason'):
-                self._report['lrpool/holding_on_transient'] = float(
-                    self._pool_last['reason'] == 'stage_transient')
-        # Same discipline for the plateau sensor: publish the ACTUATOR beside the
-        # sensor, so a sensor that is never firing and one that is never running
-        # can be told apart from the log alone.
-        if self._plateau_last:
-            self._report['lr_ctrl/plateau_applied'] = float(self._plateau_last.get('applied', 0.0))
-            self._report['lr_ctrl/plateau_status'] = float(
-                self._PLATEAU_STATUS.get(self._plateau_last.get('status'), -1))
-            self._report['lr_ctrl/plateau_cuts'] = float(self._plateau_cuts)
-        # Same contract as the block above: a sensor that is never FIRING and one
-        # that is never RUNNING must be distinguishable from the log alone. This
-        # sensor has no equivalent of `raycal/status` to fall back on, so without
-        # a counter a misconfigured stage would look identical to a quiet one.
-        #
-        # ONE-SHOT, DRAINED BY report(). A reporting period in which the sensor
-        # did not fire publishes NO cos/applied/status AT ALL, rather than
-        # republishing the last live reading. Measured 2026-08-17 on the qm9
-        # conditional route: after the fused branch began returning non-finite
-        # gradients at step 902 -- which returns from train.py::step_loss BEFORE
-        # the sensor block, so nothing fires -- run `liveservo` emitted the same
-        # cos (-0.267178) for 327 consecutive rows with `hypergrads` frozen at
-        # 379 and `peak_scale` frozen at 2.0929. A dead sensor read exactly like a
-        # working one, and any statistic taken off the channel was then an average
-        # over a repeated constant. `hypergrads` is deliberately still published
-        # once the sensor has EVER fired, precisely so a flat counter beside an
-        # absent cos reads as 'stopped' rather than 'never configured'.
-        #
-        # AND THE READING IS THE PERIOD, NOT THE LAST FIRING. peak_scale is the
-        # integral of every firing in the period, but this channel used to carry
-        # only the last one. With fused_grad_accum_min_samples above the batch
-        # size the optimizer -- and so the sensor -- steps once per several
-        # step_ind, giving ~5 firings per reported row, so the published cos was
-        # one sample of five while the actuator moved on all five. hyper_cos is
-        # now the MEAN over the period and hyper_applied the TOTAL multiplier, so
-        # the sensor channel and the actuator channel describe the same steps.
-        w = self._hyper_win
-        if self._hypergrads or w is not None:
+        # THE DIAGNOSTIC SENSORS ARE SILENT UNLESS THEY RAN. A channel that
+        # publishes a constant whether or not the sensor fired is how a dead
+        # sensor reads exactly like a working one.
+        if self._calibrations:
+            self._report['lr_ctrl/calibrations'] = float(self._calibrations)
+        if self._hypergrads:
             self._report['lr_ctrl/hypergrads'] = float(self._hypergrads)
-        if w is not None and w['n']:
-            live = w['n'] - w['nonfinite']
-            if live:
-                self._report['lr_ctrl/hyper_cos'] = w['cos_sum'] / live
-                # THE MAGNITUDE CHANNEL, and it is a different statistic from
-                # the one above rather than a convenience. The standing proposal
-                # for `hyper` is to keep it as a magnitude-only EDGE GUARD:
-                # |cos| ~ eta*lambda/2 estimates distance to the stability edge,
-                # where the SIGN is uninformative once the iterate has
-                # equilibrated. `hyper_cos` is the mean of the SIGNED cosine, so
-                # a symmetric oscillation cancels in it and reads as a small
-                # number -- exactly the case the guard would care about most.
-                # Testing the proposal needs mean|cos| and the period's worst
-                # single reading, so both are published.
-                self._report['lr_ctrl/hyper_abscos'] = w['abscos_sum'] / live
-                self._report['lr_ctrl/hyper_abscos_max'] = w['abscos_max']
-            self._report['lr_ctrl/hyper_applied'] = math.exp(w['log_applied'])
-            self._report['lr_ctrl/hyper_status'] = float(
-                self._HYPER_STATUS.get(w['status'], -1))
-            # the denominator behind the two averages above, so a period built
-            # from one firing and one built from ten are not read alike
-            self._report['lr_ctrl/hyper_n'] = float(w['n'])
-            # The brake, beside the sensor. A period in which the gate fired is
-            # one where peak_scale moved on CLIP evidence and not on cos, so a
-            # reader comparing hyper_cos against hyper_applied would otherwise
-            # find them inconsistent with no way to see why.
-            if w.get('clip_cuts'):
-                self._report['lr_ctrl/hyper_clip_cuts'] = float(w['clip_cuts'])
-            ema = self._state().get('hyper_clip_ema')
-            if ema is not None:
-                self._report['lr_ctrl/clip_fire_ema'] = float(ema)
-        ceiling = self._current_ceiling()
-        if ceiling is not None:
-            self._report['lr_ctrl/peak_ceiling'] = ceiling
+            if getattr(self, '_last_cos', None) is not None:
+                self._report['lr_ctrl/hyper_cos'] = float(self._last_cos)
 
     def report(self):
-        """The metrics for one reporting period. TAKING THE REPORT ENDS THE
-        PERIOD: the hypergradient accumulator is drained here, so the next report
-        describes what that period did or says nothing. Same one-shot discipline
-        train.py uses for `_grad_nonfinite`. The caller must therefore be the
-        reporter -- train.py::ten_step_reporting, which runs immediately after
-        step_lr_schedule() so `_emit` has already published this period's
-        reading. A second caller would silently eat readings."""
-        out = dict(self._report)
-        self._hyper_win = None
-        return out
+        return dict(self._report)
+
+
+def _get(node, name, default=None):
+    return default if node is None else getattr(node, name, default)

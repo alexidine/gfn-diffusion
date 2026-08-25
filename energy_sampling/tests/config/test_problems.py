@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 PROBLEMS = HERE / 'configs' / 'problems.yaml'
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 

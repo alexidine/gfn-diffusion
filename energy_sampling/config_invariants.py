@@ -29,6 +29,7 @@ this module exists to prevent.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -61,7 +62,7 @@ class Violation:
 #
 # This function exists because the stage list used to be read from the literal
 # path `protocol.stages` in six places. Four of those are validators, and
-# `auto_lr_requires_an_adaptive_sensor` returns [] on absence while utils makes
+# `auto_lr_requires_lr_control` returns [] on absence while utils makes
 # it a RAISING load gate -- so a restructure that moved the list would have
 # silently disarmed the gate rather than tripping it. One resolver means the next
 # move has one place to change.
@@ -316,9 +317,6 @@ def effective_batch_meets_baseline(cfg: dict) -> list[Violation]:
     return []
 
 
-# Sensor kinds that actually move the learning rate. `none` (and an omitted
-# block, which means the same thing silently) does not.
-_ADAPTIVE_SENSOR_KINDS = frozenset({'ray', 'plateau', 'hyper'})
 _LR_KEYS = ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused')
 
 
@@ -326,28 +324,27 @@ def _is_auto(v) -> bool:
     return isinstance(v, str) and v.strip().lower() == 'auto'
 
 
-def auto_lr_requires_an_adaptive_sensor(cfg: dict,
-                                        auto_keys: Optional[list] = None) -> list[Violation]:
-    """`auto` must yield to an adaptive scheme. A float must not.
+def auto_lr_requires_lr_control(cfg: dict,
+                                auto_keys: Optional[list] = None) -> list[Violation]:
+    """`auto` must yield to something that can move it. A float must not.
 
     THE TWO SPELLINGS MEAN OPPOSITE THINGS and resolve to the same number, which
     is what makes the failure silent:
 
-      auto   -> servo-managed. The rate is seeded at adaptive_lr.seed_lr and an
-                adaptive sensor owns it from there.
-      float  -> a fixed peak. It takes the warmup envelope and divergence
-                handling, and `peak_scale` never applies to it
-                (controller.py::_apply_lrs: `env * (peak if managed else 1.0)`).
+      auto   -> bracket-managed. The rate is seeded at lr_control.seed_lr and the
+                brute-force bracket owns the multiplier over it from there.
+      float  -> a fixed rate. It takes divergence handling and the max_lr rail,
+                and the bracket's scale never applies to it
+                (controller.py::_apply_lrs: `scale if managed else 1.0`).
 
-    So `auto` with no adaptive sensor anywhere is a contradiction: the key is
-    marked servo-managed, nothing ever moves peak_scale off 1.0, and the run
-    trains at the seed for its whole life while the config reads as adaptive.
-    Since the sensor is OPT-IN PER STAGE and an omitted block means `none`
-    SILENTLY, this is reachable by leaving something out rather than by writing
-    anything wrong.
+    So `auto` with no `lr_control` block is a contradiction: the key is marked
+    managed, nothing sets the scale, and the run trains at the seed for its whole
+    life while the config reads as adaptive.
 
-    Checked per stage, not globally: a sensor on the terminal stage does nothing
-    for a phase-1 LR.
+    THIS IS A RUN-LEVEL CHECK, where its predecessor was per stage. That is the
+    substantive change: the bracket is not declared per stage and cannot be
+    omitted from one, so the way this used to fail -- a stage quietly missing an
+    `lr_sensor` block -- no longer exists.
 
     `auto_keys` EXISTS BECAUSE THE EVIDENCE IS DESTROYED BY RESOLUTION.
     `resolve_derived_config` overwrites the string `auto` with the seed float in
@@ -361,29 +358,197 @@ def auto_lr_requires_an_adaptive_sensor(cfg: dict,
     if not auto_keys:
         return []                      # every rate explicitly pinned: nothing to own
 
-    stages = active_stages(cfg)
-    if not stages:
-        return []                      # no protocol to reason about
+    node = _get(cfg, 'lr_control')
+    if isinstance(node, dict) and node.get('mode') in ('bracket', 'fixed'):
+        return []
+    how = ('there is no `lr_control` block' if node is None
+           else f"`lr_control.mode` is {(node or {}).get('mode')!r}")
+    return [Violation(
+        ERROR, 'auto_lr_requires_lr_control',
+        f"{', '.join(auto_keys)} {'are' if len(auto_keys) > 1 else 'is'} `auto` "
+        f"(bracket-managed), but {how}. Nothing would set the scale, so the run "
+        f"trains at lr_control.seed_lr throughout while the config reads as "
+        f"adaptive. Add `lr_control: {{mode: bracket, ...}}`, or write an "
+        f"explicit float for any rate meant to be fixed.")]
 
+
+def lr_bracket_is_well_formed(cfg: dict) -> list[Violation]:
+    """The bracket's two ways of returning the same answer forever.
+
+    Both of these load as a working configuration, run every seam correctly, and
+    report a selection. Neither has measured anything.
+
+      A GRID THAT CANNOT FAIL. The bracket's only reading is "did this candidate
+      detonate", so its top rungs have to be EXPECTED to fail. A grid whose whole
+      span sits inside the safe region finds no boundary on any cycle, reports
+      `unbracketed_high` every time, and selects one rung below its own ceiling
+      -- a number the config chose, dressed as a measurement.
+
+      BARS THAT CANNOT FIRE. The shipped divergence bars were 1e9, which catches
+      numerical overflow and nothing else. Measured on this route, a rate one
+      rung too hot took the loss from about -25 to +318: finite, and eight orders
+      of magnitude under the bar. Every rung then completes its horizon and
+      counts as a survivor, which is the same failure by the other route.
+
+    The live bars are DERIVED at bracket time from the root's own loss span
+    (lr_bracket_probe.HardFailureBars), so they can always fire; what this rule
+    refuses is a configuration that leans on the absolute backstops instead.
+
+    ERROR, not BASELINE. A bracket that cannot fail a candidate is not a bracket,
+    and the whole point of replacing the previous controller was that its
+    machinery fired perfectly around a number that meant nothing.
+    """
+    node = _get(cfg, 'lr_control')
+    if not isinstance(node, dict):
+        return []
+    # A CONTROL ARM HAS NO GRID TO JUDGE. With every lr_* key written as an
+    # explicit float the bracket's scale reaches no optimizer, so there is no
+    # rate under test -- and the documented arm in which the controller reads and
+    # logs while actuating nothing must stay expressible.
+    #
+    # BUT `mode: bracket` IS THE WRONG WAY TO SPELL IT, and it fails LATE if
+    # left: the config loads, and `LRBracket` then refuses the absent candidate
+    # grid when the controller is constructed at run start -- a crash at step 0
+    # of a queued job rather than a message at load. Say so here instead.
+    if not any(_is_auto(cfg.get(k)) for k in _LR_KEYS):
+        if node.get('mode', 'bracket') == 'bracket':
+            return [Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                "every lr_* rate is an explicit float, so nothing is "
+                "bracket-managed, but lr_control.mode is 'bracket'. There is no "
+                "rate under test and no grid to trial. Write `mode: fixed` with "
+                "`fixed_scale: 1.0` -- that is what a run with fixed rates does "
+                "-- or set a rate to `auto`.")]
+        return []
     out = []
-    for st in stages:
-        if not isinstance(st, dict):
-            continue
-        sensor = st.get('lr_sensor')
-        kind = sensor.get('kind') if isinstance(sensor, dict) else None
-        if kind in _ADAPTIVE_SENSOR_KINDS:
-            continue
-        how = 'declares no lr_sensor' if sensor is None else f"declares lr_sensor kind {kind!r}"
+    mode = node.get('mode', 'bracket')
+    if mode == 'fixed':
+        if _num(node.get('fixed_scale')) is None:
+            out.append(Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                "lr_control.mode 'fixed' needs an explicit lr_control.fixed_scale -- "
+                "the point of the mode is that the rate is stated in the config "
+                "rather than discovered."))
+        return out
+
+    scales = node.get('candidate_scales')
+    safety = int(_num(node.get('safety_rungs', 1)) or 0)
+    if not isinstance(scales, (list, tuple)) or len(scales) < safety + 2:
         out.append(Violation(
-            ERROR, 'auto_lr_requires_an_adaptive_sensor',
-            f"stage {st.get('name')!r} {how}, but {', '.join(auto_keys)} "
-            f"{'are' if len(auto_keys) > 1 else 'is'} `auto`. `auto` hands the "
-            f"rate to a servo; with no adaptive sensor in this stage nothing "
-            f"moves it, so it trains at adaptive_lr.seed_lr throughout while the "
-            f"config reads as adaptive. Either declare a sensor (ray / plateau / "
-            f"hyper) or write an explicit float, which takes the warmup envelope "
-            f"and divergence handling without pretending to adapt."))
+            ERROR, 'lr_bracket_is_well_formed',
+            f"lr_control.candidate_scales has "
+            f"{0 if not isinstance(scales, (list, tuple)) else len(scales)} rungs, "
+            f"which cannot support safety_rungs {safety}: the grid needs one rung to "
+            f"fail and {safety} below it to select from."))
+    else:
+        vals = [_num(v) for v in scales]
+        if any(v is None or v <= 0 for v in vals):
+            out.append(Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                f"lr_control.candidate_scales must all be positive numbers, got {scales}."))
+        elif any(b <= a for a, b in zip(vals, vals[1:])):
+            out.append(Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                f"lr_control.candidate_scales must be STRICTLY ASCENDING, got {scales}. "
+                f"Selection is defined by position in this ordering, so an unsorted "
+                f"grid makes the safety margin mean nothing."))
+        elif vals[-1] / vals[0] < 4.0:
+            out.append(Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                f"lr_control.candidate_scales spans only {vals[-1] / vals[0]:.3g}x "
+                f"({vals[0]:g} to {vals[-1]:g}). The top rungs must be EXPECTED to "
+                f"fail; a narrower grid reports unbracketed_high every cycle and the "
+                f"bracket will never have measured a boundary."))
+
+    for key in ('loss_abs', 'grad_abs'):
+        bar = _num(_get(cfg, f'lr_control.hard_failure.{key}'))
+        if bar is not None and bar >= 1.0e8:
+            out.append(Violation(
+                ERROR, 'lr_bracket_is_well_formed',
+                f"lr_control.hard_failure.{key} = {bar:g} is a numerical-overflow "
+                f"backstop, not a bar that can fail a candidate: a rate one rung too "
+                f"hot on this route took the loss to +318 from about -25. Under a bar "
+                f"this high every rung survives, no boundary is found, and the bracket "
+                f"returns the same answer forever while appearing to work."))
+
+    settle = _num(_get(cfg, 'lr_control.hard_failure.cruise_settle_steps'))
+    if settle is not None and settle < 0:
+        out.append(Violation(
+            ERROR, 'lr_bracket_is_well_formed',
+            f"lr_control.hard_failure.cruise_settle_steps = {settle:g} is negative. "
+            f"It is the number of steps discarded after a rate change before the "
+            f"excursion bars are refitted at the new rate."))
+    burn = _num(node.get('burn_in_steps'))
+    scale = _num(node.get('burn_in_scale'))
+    if burn is not None and scale is not None and burn > 0 and not scale > 0:
+        out.append(Violation(
+            ERROR, 'lr_bracket_is_well_formed',
+            f"lr_control.burn_in_scale = {scale!r} is not positive. Burn-in is "
+            f"conservative but it must still TRAIN -- an inert burn-in reaches the "
+            f"root with the transients it exists to pass through still running."))
     return out
+
+
+def burn_in_reaches_adam_steady_state(cfg: dict) -> list[Violation]:
+    """Burn-in must be long enough that the root is at steady state.
+
+    Optimizers are rebuilt at every stage transition, so Adam's step counter
+    restarts and its update carries sqrt(1 - beta2^t) / (1 - beta1^t) relative to
+    steady state:
+
+        t     10     100    500    1000   3000
+        f     0.153  0.309  0.627  0.795  0.975
+
+    Bracket from a young root and EVERY trial descended from it runs at that
+    fraction of its nominal rate -- so a too-hot rung survives because the rate
+    under test is not the rate applied, and the bracket reports a boundary it
+    never found. Burn-in is paid ONCE and trials are paid N times, so it is the
+    cheap place to spend steps.
+
+    BASELINE, not ERROR, and the difference is deliberate: the run REFUSES to
+    bracket at runtime if the measured factor is under
+    `min_root_bias_correction` (lr_bracket_probe.BracketDriver.take_root), which
+    reads the optimizer's actual counter. This rule is the same arithmetic done
+    in advance, from the config, so the refusal is not the first time anyone
+    hears about it. It cannot be an ERROR because a stage that does not rebuild
+    its optimizers enters with t already large, which the config cannot see.
+    """
+    node = _get(cfg, 'lr_control')
+    if not isinstance(node, dict) or node.get('mode', 'bracket') != 'bracket':
+        return []
+    if not any(_is_auto(cfg.get(k)) for k in _LR_KEYS):
+        return []                      # a control arm brackets nothing
+    burn = _num(node.get('burn_in_steps'))
+    want = _num(node.get('min_root_bias_correction', 0.9)) or 0.9
+    if burn is None:
+        return []
+    beta1, beta2 = 0.9, 0.999
+    adam = _get(cfg, 'adam') or {}
+    if isinstance(adam, dict):
+        betas = adam.get('betas')
+        if isinstance(betas, (list, tuple)) and len(betas) == 2:
+            beta1, beta2 = float(betas[0]), float(betas[1])
+    t = int(burn)
+    if t <= 0:
+        return []
+    factor = math.sqrt(max(0.0, 1.0 - beta2 ** t)) / (1.0 - beta1 ** t)
+    if factor >= want:
+        return []
+    # smallest t clearing the bar, reported so the fix is a number rather than
+    # an instruction to experiment
+    need = t
+    while need < 100000:
+        need += 50
+        if math.sqrt(max(0.0, 1.0 - beta2 ** need)) / (1.0 - beta1 ** need) >= want:
+            break
+    return [Violation(
+        BASELINE, 'burn_in_reaches_adam_steady_state',
+        f"lr_control.burn_in_steps = {t} gives an Adam bias correction of "
+        f"{factor:.3f} at beta2 {beta2:g}, under min_root_bias_correction {want:g}. "
+        f"Every trial from that root would run at {factor:.2f}x the rate under test, "
+        f"so a too-hot rung survives for a reason unrelated to the rate -- and the "
+        f"run will REFUSE to bracket rather than measure it. Raise burn_in_steps to "
+        f"about {need}.")]
 
 
 def lr_probe_is_retired(cfg: dict) -> list[Violation]:
@@ -458,17 +623,34 @@ def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violatio
 EXIT_TICK_STEPS = 10
 
 
+#: gates published from the EVAL path, not the 10-step tick block. Their patience is
+#: therefore denominated in eval_period. See _exit_metric_cadence.
+_EVAL_CADENCE_GATES = frozenset({'progress_done'})
+
+
 def _exit_metric_cadence(cfg: dict, metric: str) -> Optional[float]:
     """Train steps between successive WRITES of `metric`, or None if the config
     does not determine it.
 
-    `eval/*` is written once per evaluation. `gates/*` is published from the
+    `eval/*` is written once per evaluation. MOST `gates/*` are published from the
     same 10-step block that runs the tick, and `dir/*` rides the metric tracker,
     written by whichever branch produced the sample -- both are tick-rate or
-    faster, so the tick is the binding cadence for them."""
+    faster, so the tick is the binding cadence for them.
+
+    THE EXCEPTION IS `_EVAL_CADENCE_GATES`, and it is not a special case so much as
+    a correction. A gate is only as fresh as its INPUTS: gates/progress_done is
+    published by Modeller.progress_metrics off the eval path, because the marginal
+    and energy metrics it reads exist only there. Classifying it at tick rate would
+    understate its patience cost by eval_period/10 -- 50x at the shipped 500 --
+    and the obvious "fix" of publishing it every tick would be worse: it would
+    republish a STALE verdict, and _advance_term counts fresh writes, so a single
+    measurement would advance the streak many times. That is exactly the bug this
+    whole rule exists to prevent."""
     if not isinstance(metric, str):
         return None
     if metric.startswith('eval/'):
+        return _num(_get(cfg, 'eval_period'))
+    if metric.startswith('gates/') and metric[len('gates/'):] in _EVAL_CADENCE_GATES:
         return _num(_get(cfg, 'eval_period'))
     return float(EXIT_TICK_STEPS)
 
@@ -958,7 +1140,9 @@ RULES = (
     every_protocol_parses,
     vargrad_needs_groups,
     conditional_z_settings_are_conditional,
-    auto_lr_requires_an_adaptive_sensor,
+    auto_lr_requires_lr_control,
+    lr_bracket_is_well_formed,
+    burn_in_reaches_adam_steady_state,
     periodic_centroids_needs_one_crystal_space_group,
     lr_probe_is_retired,
     exit_patience_is_reachable,

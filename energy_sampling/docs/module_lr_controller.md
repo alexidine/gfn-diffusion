@@ -1,17 +1,20 @@
 # Module: LR controller (`controller.py`)
 
-> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
-> Use this document for explanation and navigation; verify material claims
-> against current code, canonical config, and focused tests. See
-> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
-
-Pass 1 (audit + rationalize) 2026-08-03. **Rewritten 2026-08-08 for v7** — the
-middle layer and the decay leg were deleted and the α\* servo was built, so most
-of what pass 1 documented no longer exists. Unconditional route only. Empirical
-claims tagged by warrant class.
-
-Companion: [`step_probe.py`](../step_probe.py) is the sensor and has its own
-module docstring; `to_do_rebuild.md` §A holds the design argument.
+> **SUPERSEDED — READ [`lr_controller_spec.md`](lr_controller_spec.md) INSTEAD.**
+> Everything below describes controller v7/v8: an alpha\* servo over `peak_scale`
+> under a warmup envelope, with a pooled estimator, per-stage sensors and a
+> divergence cut. **None of that exists.** The `ray` sensor it is built on was
+> killed 2026-08-23 by its own acceptance test — `alpha*` is `s*/lr`, so the
+> slope of `log(alpha*)` against `log(lr)` must be −1, and it measured 0.00 ± 0.2
+> across twelve runs and two stages. Learning rates are now set by a brute-force
+> bracket (`lr_bracket.py`): burn in, checkpoint, trial a fixed grid, keep a rung
+> below the lowest failure.
+>
+> This file is kept as the RECORD of what the retired design was and why each
+> piece of it existed — several of those arguments survive the mechanism (the
+> asymmetry of raising versus lowering, why a graduated cut tier was deleted, why
+> the flow head is pinned). Do not build on it, and do not read any claim here as
+> current behaviour.
 
 ---
 

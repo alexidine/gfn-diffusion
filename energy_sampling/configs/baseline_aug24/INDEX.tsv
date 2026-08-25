@@ -1,0 +1,11 @@
+arm	question
+base24_u0_fixed005	conservative floor control
+base24_u1_fixed04	operator-chose-well baseline
+base24_u2_fixed12	operator-chose-hot control
+base24_u3_bracket	THE feature arm; acceptance bar vs best fixed
+base24_u4_bracket_norepeat	repeat cost isolation (single key vs U3)
+base24_h1_hot2x	sensor calibration 2x, bar parked
+base24_h2_hot4x	sensor calibration 4x = measured edge, bar parked
+base24_c0_fixed04	conditional baseline
+base24_c1_bracket	var_conditioning under the bracket
+base24_c2_hot2x	conditional hot point, fwd/vg_lb channel

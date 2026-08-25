@@ -54,10 +54,10 @@ def test_the_min_lr_floor_cannot_truncate_the_bottom_of_the_ladder():
 # ------------------------------------------------------------------- null
 
 def test_null_does_not_move_its_rate_after_warmup():
-    """Null is the do-nothing control: past the warmup envelope its rate is
-    constant, so any arm that matches it is also doing nothing."""
+    """Null is the do-nothing control: past burn-in its rate is constant, so
+    any arm that matches it is also doing nothing."""
     run = _run(Null, steps=1400)
-    warm = int(run.m.args.adaptive_lr.warmup_steps)
+    warm = int(run.m.args.lr_control.burn_in_steps)
     after = set(_lrs(run)[warm + 50:])
     assert len(after) == 1, f'null moved the rate: {sorted(after)[:5]}'
 
@@ -66,10 +66,10 @@ def test_null_does_not_move_its_rate_after_warmup():
 
 def test_hyper_moves_the_rate_and_respects_its_own_gain_cap():
     """Per-step moves are bounded by exp(beta) BY CONSTRUCTION -- cos is a
-    cosine. Checked past warmup, where the envelope is no longer ramping and
-    the only thing moving the rate is the arm."""
+    cosine. Checked past burn-in, where the controller is holding and the only
+    thing moving the rate is the arm."""
     run = _run(Hyper, steps=1400)
-    warm = int(run.m.args.adaptive_lr.warmup_steps)
+    warm = int(run.m.args.lr_control.burn_in_steps)
     lrs = _lrs(run)[warm + 50:]
     assert len(set(lrs)) > 10, 'hyper did not move the rate'
     jumps = [abs(math.log(b) - math.log(a)) for a, b in zip(lrs, lrs[1:])]

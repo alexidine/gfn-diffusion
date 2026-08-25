@@ -150,9 +150,14 @@ WALLCLOCK_EXACT = frozenset({
 DETERMINISTIC_OVERRIDE = frozenset({'Batch Size'})
 WALLCLOCK_PREFIXES = ('gpu/', 'vram/')
 #: `_ms` is here because the NULL TEST put it here. `probe/churn_add_ms_max` and
-#: `probe/churn_purge_ms_max` are millisecond timers that matched none of the
+#: `probe/churn_purge_ms_max` were millisecond timers that matched none of the
 #: other rules, and they were the entire content of a 42-value non-zero null at
-#: 600 steps -- a length that first reaches the buffer-churn code they time.
+#: 600 steps -- a length that first reaches the buffer-churn code they timed.
+#: Those two keys were retired on 2026-08-23, and the `_ms` suffix now has NO
+#: live instance: `RegionProfiler.report()` defaults to prefix `perf`, but its
+#: only production caller passes `prefix='energy_gpu'` and keeps one key. The
+#: rule stays anyway -- it was calibrated by a null, and dropping it for want of
+#: a current example is how the null's finding gets lost.
 #: Note it does NOT catch `_rms` (`tracker/logw_std_rms` and friends survive as
 #: deterministic), which was checked against all 522 logged keys rather than
 #: assumed.
@@ -327,64 +332,66 @@ def _retired_paths_in(cfg: dict) -> list[tuple[str, str]]:
 
 
 def pin_auto_lr_without_sensor(cfg: dict) -> list[str]:
-    """Translate a PRE-SENSOR config's `auto` rates into the floats they trained
+    """Translate a PRE-BRACKET config's `auto` rates into the floats they trained
     at, in place. Returns the notes; returns [] and touches nothing otherwise.
 
     WHY THIS IS NEEDED AT ALL. The pre-consolidation canonical config does not
     LOAD under current code, and migration cannot repair it. Two blockers, and
     they are different in kind:
 
-      * five retired keys -- mechanical, and `config_state.migrate` fixes them;
-      * `lr_policy/lr_back/lr_replay/lr_fused: auto` with no stage declaring an
-        `lr_sensor`. Phase 1 made that a RAISING load gate. Migration refuses
-        it, correctly: picking a sensor is judgment, and a migration that picks
-        one produces a config that loads and trains on a number nobody chose.
+      * retired keys -- mechanical, and `config_state.migrate` fixes them;
+      * `lr_policy/lr_back/lr_replay/lr_fused: auto` with nothing that can move
+        them. Under the sensor-era schema that meant no stage declared an
+        `lr_sensor`; under the bracket it means the migrated `lr_control` block
+        carries no candidate grid, because state 10's migration deliberately
+        REFUSES to invent one (a grid that cannot fail makes the bracket return
+        the same answer forever while appearing to work). Either way, migration
+        is right to refuse: choosing it is judgment.
 
-    WHY PINNING IS A TRANSLATION AND NOT A GUESS. The gate's own rule
-    (`config_invariants.auto_lr_requires_an_adaptive_sensor`) documents what the
-    two spellings do:
+    WHY PINNING IS A TRANSLATION AND NOT A GUESS. The two spellings do this:
 
-      auto   servo-managed; seeded at adaptive_lr.seed_lr, owned by a sensor
-      float  a fixed peak; takes the warmup envelope and divergence handling,
-             and `peak_scale` never applies to it
+      auto   managed; seeded at seed_lr, and a scale is applied over it
+      float  a fixed rate; the managed scale never applies to it
 
-    In the pre-consolidation config there was NO sensor, so nothing ever moved
-    `peak_scale` off 1.0 and the rate sat at `seed_lr` for the whole run -- which
-    the plan states independently ('previously neither did, so all four `auto`
-    rates sat at the seed for entire runs'). Envelope: applies to both. Divergence
-    handling: applies to both. `peak_scale`: 1.0 in both. So the float and the
-    sensorless `auto` are the same run, and writing the float is how that run is
-    spelled under the current schema.
+    In the pre-consolidation config nothing ever moved the scale off 1.0 and the
+    rate sat at `seed_lr` for the whole run -- which the plan states
+    independently ('previously neither did, so all four `auto` rates sat at the
+    seed for entire runs'). So the float and the unmanaged `auto` are the SAME
+    RUN, and writing the float is how that run is spelled under the current
+    schema. The block is rewritten to `mode: fixed, fixed_scale: 1.0` for the
+    same reason: a fixed scale of exactly 1.0 over the base rate is what that
+    config did, stated in the vocabulary that now exists.
 
     It is still an assumption, it is still reported on every run that triggers
     it, and it is deliberately NOT silent -- because what it does not preserve is
-    the thing tier C is about to measure: the current config DOES declare
-    sensors, so the LR trajectories diverge by design from here."""
-    import config_invariants
+    the thing tier C is about to measure: the current config runs a BRACKET, so
+    the LR trajectories diverge by design from here."""
     import utils
 
     auto = [k for k in utils._LR_KEYS if utils._is_auto(cfg.get(k))]
     if not auto:
         return []
-    violations = config_invariants.auto_lr_requires_an_adaptive_sensor(
-        cfg, auto_keys=auto)
-    if not violations:
-        return []
-    seed = (cfg.get('adaptive_lr') or {}).get('seed_lr')
+    control = cfg.get('lr_control') or {}
+    if control.get('candidate_scales') or control.get('mode') == 'fixed':
+        return []                       # it can already move them: nothing to repair
+    seed = control.get('seed_lr')
     if not isinstance(seed, (int, float)) or isinstance(seed, bool):
         raise ValueError(
-            f'{auto} are `auto` with no stage sensor, and adaptive_lr.seed_lr is '
-            f'{seed!r} -- there is no number to pin them to, so what this config '
-            f'trained at cannot be reconstructed.')
+            f'{auto} are `auto` with no bracket able to move them, and '
+            f'lr_control.seed_lr is {seed!r} -- there is no number to pin them '
+            f'to, so what this config trained at cannot be reconstructed.')
     for k in auto:
         cfg[k] = float(seed)
-    stages = sorted({getattr(v, 'detail', str(v)).split("'")[1]
-                     for v in violations if "'" in getattr(v, 'detail', str(v))})
-    return [f'REPAIR: {", ".join(auto)} were `auto` with no lr_sensor on '
-            f'stage(s) {stages or "?"} -- pinned to adaptive_lr.seed_lr='
-            f'{float(seed):g}, the rate this config actually trained at. '
-            f'`auto` without a sensor is a raising load gate under current code; '
-            f'see pin_auto_lr_without_sensor.']
+    # ...and state the rate policy in the current vocabulary rather than leaving
+    # a half-migrated bracket block that would fail validation for want of a grid
+    # nobody chose.
+    cfg['lr_control'] = {**control, 'mode': 'fixed', 'fixed_scale': 1.0,
+                         'burn_in_steps': 0, 'burn_in_scale': 1.0}
+    return [f'REPAIR: {", ".join(auto)} were `auto` with no bracket able to move '
+            f'them -- pinned to lr_control.seed_lr={float(seed):g}, the rate this '
+            f'config actually trained at, and the block set to mode: fixed, '
+            f'fixed_scale 1.0. `auto` with nothing to move it is a raising load '
+            f'gate under current code; see pin_auto_lr_without_sensor.']
 
 
 def registry_overrides() -> tuple[dict, list[str]]:

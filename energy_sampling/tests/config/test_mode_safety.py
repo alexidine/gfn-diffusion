@@ -35,7 +35,7 @@ import yaml
 
 import config_snapshot as cs
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 
@@ -131,38 +131,36 @@ def test_canonical_config_loads(raw):
     assert _load(copy.deepcopy(raw)) is not None
 
 
-def test_auto_lr_without_a_sensor_is_refused_at_load(raw):
+def test_auto_lr_without_lr_control_is_refused_at_load(raw):
     """A config that reads as adaptive and trains at a fixed seed must not start.
-    This is the gate, not just the report -- the whole cost of the failure is that
-    it is invisible for the length of a run."""
+    This is the GATE, not just the report -- the whole cost of the failure is
+    that it is invisible for the length of a run."""
     cfg = copy.deepcopy(raw)
-    for st in cfg['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
-    with pytest.raises(ValueError, match='adaptive sensor'):
+    cfg.pop('lr_control', None)
+    with pytest.raises(ValueError, match='nothing can move them'):
         _load(cfg)
 
 
-def test_explicit_float_lrs_need_no_sensor_at_load(raw):
-    """A float is a fixed peak by intent: it takes the warmup envelope and
-    divergence handling but never peak_scale, so it has nothing to yield to."""
+def test_explicit_float_lrs_need_no_lr_control_at_load(raw):
+    """A float is a fixed rate by intent: it takes divergence handling and the
+    max_lr rail but never the bracket's scale, so it has nothing to yield to."""
     cfg = copy.deepcopy(raw)
-    for st in cfg['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
+    cfg.pop('lr_control', None)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
     assert _load(cfg) is not None
 
 
-def test_hyper_only_config_loads_with_the_ray_block_present(raw):
-    """`hyper` does not use the ray block at all, and no stage asks for ray -- so
-    the block is inert. That must LOAD, not fail: the parameters are shared
-    storage, and a run with no replay-TB stage is a legitimate configuration.
+def test_a_config_with_no_diagnostic_sensor_loads_with_the_ray_block_present(raw):
+    """No stage asks for `ray`, so the block is inert -- and that must LOAD, not
+    fail. The parameters are shared storage for a diagnostic that reaches no
+    learning rate, and declaring no sensor is the canonical posture.
 
-    There is no longer an `enabled` flag to turn off; a stage's
-    `lr_sensor: {kind: ray}` declaration is the only switch."""
+    There is no `enabled` flag to turn off; a stage's `lr_sensor: {kind: ray}`
+    declaration is the only switch."""
     cfg = copy.deepcopy(raw)
     for st in cfg['protocols']['unconditional_tb']['stages']:
-        st['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+        st.pop('lr_sensor', None)
     assert _load(cfg) is not None
 
 
@@ -172,7 +170,7 @@ def test_the_retired_ray_enabled_flag_is_refused(raw):
     silently ignoring it would leave the author believing they had switched
     something off."""
     cfg = copy.deepcopy(raw)
-    cfg['adaptive_lr']['ray_calibration']['enabled'] = False
+    cfg['lr_control']['ray_calibration']['enabled'] = False
     with pytest.raises(ValueError, match='retired config keys'):
         _load(cfg)
 
@@ -182,15 +180,15 @@ def test_the_old_top_level_ray_block_is_refused(raw):
     unclaimed, train.py's getattr would fall through to the code defaults --
     which default `enabled` to False and would silently kill the probe."""
     cfg = copy.deepcopy(raw)
-    cfg['ray_calibration'] = cfg['adaptive_lr'].pop('ray_calibration')
+    cfg['ray_calibration'] = cfg['lr_control'].pop('ray_calibration')
     with pytest.raises(ValueError, match='retired config keys'):
         _load(cfg)
 
 
 def test_lr_flow_auto_is_refused(raw):
-    """`lr_flow` is NOT servo-managed -- alpha* is measured over policy params
-    only, so the flow groups are exempt from the envelope AND peak_scale, and no
-    resolver fills it in. Before this guard, `auto` stayed the STRING 'auto' and
+    """`lr_flow` is NOT bracket-managed -- the flow groups are pinned flat and
+    exempt from the bracket's scale, and no resolver fills it in. Before this
+    guard, `auto` stayed the STRING 'auto' and
     was assigned straight to param_group['lr'], failing somewhere downstream that
     said nothing about the config."""
     cfg = copy.deepcopy(raw)

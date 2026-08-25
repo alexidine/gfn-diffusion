@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 sys.path.insert(0, str(HERE / 'configs'))
 
 import config_snapshot                          # noqa: E402
@@ -53,7 +53,19 @@ CANONICAL_DRIFT = {
     # The warmup ramp-exit window was added 2026-08-17 and no historical arm
     # carries it; it is ADDED rather than CHANGED, but list it so a rename is
     # not silently absorbed.
-    'config.adaptive_lr.warmup_freeze_cos_window',
+    # The whole LR block was replaced at state 10: `adaptive_lr` (an envelope, an
+    # alpha* target and a pooled estimator) became `lr_control` (a burn-in, a
+    # candidate grid and derived hard-failure bars). No historical arm can carry
+    # the new spelling, and none of the old spelling survives, so the entire
+    # subtree is canonical drift rather than an arm's choice.
+    'config.lr_control', 'config.adaptive_lr', 'config.lr_warmup_ratio',
+    # ...and its per-stage half. Every historical arm declares `lr_sensor` on
+    # every stage, because under the sensor-era schema an `auto` rate with no
+    # sensor was a raising load gate. Canonical declares NONE: `ray` and `hyper`
+    # reach no learning rate any more, so an omitted block is the correct default
+    # rather than a trap, and `plateau` no longer parses at all.
+    'stages[0].lr_sensor', 'stages[1].lr_sensor', 'stages[2].lr_sensor',
+    'stages[3].lr_sensor', 'stages[4].lr_sensor',
     # min_lr dropped 1e-6 -> 1e-8 on 2026-08-17. It is a NUMERICAL BACKSTOP, not a
     # policy: at 1e-6 it sat barely below the conditional VarGrad quality optimum,
     # so a controller asking to go lower was refused silently. Historical arms
@@ -78,6 +90,39 @@ CANONICAL_DRIFT = {
     # conditional arms still carry it, so canonical is missing a block they have.
     # Reported on the STAGE summary's own path, not under config.*
     'stages[1].exit',
+    # Both terminal stages moved their ENTRY fracs to bwd's ceiling on
+    # 2026-08-23 (unconditional 0.45/0.50 -> 0.93/0.02 bwd/replay, conditional
+    # 0.5/0.5 -> 0.9/0.1 bwd/fwd). These seed the balance integrator rather than
+    # setting a held mix, so the change is to where the stage starts; the
+    # settled allocation is still the controller's. Historical arms carry the
+    # old entry point. Reported on BOTH paths, since config_snapshot emits the
+    # resolved config and the parsed stage summary separately.
+    'config.protocols.unconditional_tb.stages[1].fracs.bwd',
+    'config.protocols.unconditional_tb.stages[1].fracs.replay',
+    'config.protocols.conditional_vargrad.stages[1].fracs.bwd',
+    'config.protocols.conditional_vargrad.stages[1].fracs.fwd',
+    'stages[1].fracs.bwd', 'stages[1].fracs.replay', 'stages[1].fracs.fwd',
+    # train_prior's exit moved to the target-based progress gate on 2026-08-24
+    # (gates/mle_flat patience 5 -> gates/progress_done patience 1, on BOTH
+    # routes -- the warm start does not differ by route). mle_flat survives as a
+    # diagnostic publisher, but no canonical exit consumes it: a slope bar on a
+    # channel with an unknown additive constant cannot be calibrated, and the
+    # old bwd/tbc term was UNSATISFIABLE outright once tbc's coefficient went to
+    # 0 (the metric is never logged, a missing metric holds the streak, so the
+    # stage could never advance). Historical arms carry the old exit.
+    'config.protocols.unconditional_tb.stages[0].exit',
+    'config.protocols.conditional_vargrad.stages[0].exit',
+    'stages[0].exit',
+    # ...and the same 2026-08-24 canonical edit turned tbc off (its exit
+    # consumer is gone) and dropped the bwd repeats tiling to 1 with it (K > 1
+    # existed to condition the TBC estimate; without tbc it is pure batch cost).
+    # Historical arms carry tbc 1.0 / repeats 2.0.
+    'config.protocols.unconditional_tb.stages[0].loss_coeffs.bwd.tbc',
+    'config.protocols.unconditional_tb.stages[0].loss_coeffs.bwd.repeats',
+    'config.protocols.conditional_vargrad.stages[0].loss_coeffs.bwd.tbc',
+    'config.protocols.conditional_vargrad.stages[0].loss_coeffs.bwd.repeats',
+    'stages[0].effective_loss_coeffs.bwd.tbc',
+    'stages[0].effective_loss_coeffs.bwd.repeats',
 }
 
 
@@ -92,8 +137,12 @@ _BSZ_COMMON = {
     # armed canonical (batch_util_target 60, grow true) can no longer express
     # without saying so
     'grow_batch_size': False, 'batch_util_target': 0,
-    'adaptive_lr.warmup_steps': 10,
-    'adaptive_lr.ray_calibration.period': 200,
+    # the battery predates the bracket and ran a fixed rate throughout, which is
+    # exactly what `mode: fixed` says under the current schema; the historical
+    # spelling was four explicit floats under a controller nothing moved.
+    'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
+    'lr_control.burn_in_steps': 10, 'lr_control.burn_in_scale': 1.0,
+    'lr_control.ray_calibration.period': 200,
     'condition_log_z.half_life_visits': 7.0,
     'lr_policy': 1.25e-4, 'lr_back': 1.25e-4,
     'lr_replay': 1.25e-4, 'lr_fused': 1.25e-4,
@@ -123,7 +172,7 @@ def _spec_elj_b500():
         problem='mipcas_elj', batch_size=500, max_batch_size=500,
         fused_grad_accum_min_samples=500, epochs=1900, eval_period=500,
         figs_period=1000, **{**_BSZ_COMMON,
-                             'adaptive_lr.ray_calibration.n_sub': 16})
+                             'lr_control.ray_calibration.n_sub': 16})
 
 
 def _spec_qm9_conditional():

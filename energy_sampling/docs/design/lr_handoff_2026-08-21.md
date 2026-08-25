@@ -1,5 +1,22 @@
 # LR control — session record and implementation plan, 2026-08-21
 
+> **SUPERSEDED 2026-08-23. DO NOT BUILD FROM SECTIONS 6–8.** This document's
+> conclusion — "go back to `ray`" (section 5) and everything built on it: the
+> generalised ray, the pooled estimator, the checkpointed ramp, the sweep — rests
+> on a sensor that does not measure the learning rate. `alpha*` is defined as
+> `s*/lr`, so the slope of `log(alpha*)` against `log(lr)` MUST be −1; measured
+> on `bracketed` readings across twelve runs, two stages and spans up to 2.7
+> decades, it was 0.00 ± 0.2 and several slopes were positive.
+>
+> The replacement is a brute-force bracket — burn in, checkpoint, trial a fixed
+> grid of rates from that checkpoint, keep a rung below the lowest failure. See
+> [`../lr_controller_spec.md`](../lr_controller_spec.md) for current behaviour
+> and `project_ray_sensor_postmortem` in memory for the autopsy.
+>
+> **Sections 1–5 are still worth reading**, and section 9 especially: the reason
+> the frozen-data race was retired (wrong objective) is unaffected, and the
+> pitfalls are real. What is dead is the direction, not the evidence.
+
 **Read this first if you are picking up learning-rate control.** It is the
 single source: what was tried today, what it measured, why the direction
 reversed, and what to build. Sections 1–5 are the narrative and the evidence;
@@ -587,8 +604,8 @@ The toy validated the mechanism; this is the route `mk_dev` runs.
   property of the sensor rather than of a route.
 
 **⚠ AND THE COST IS 4-5x WHAT THE FUSED-STAGE FIGURE SUGGESTS.** Measured here:
-a calibration costs **~28 training steps** on `train_prior` (median step 0.158 s;
-calibration step 4.5 s), which is **5.6% at period 500** against the **1.2%**
+a calibration costs **~24 training steps** on `train_prior` (median step 0.158 s;
+calibration step 4.5 s), which is **4.8% at period 500** against the **1.2%**
 recorded for the same probe on the fused stage.
 
 The absolute cost is similar -- `n_sub x len(alphas)` = 64 forward passes over
@@ -805,20 +822,293 @@ real questions, not just stale expectations:
   pool looked merely quiet rather than starved. It now falls back to
   `alpha_star`, and still refuses a reading with no usable bound at all.
 
+### `hyper` as a magnitude-only edge guard: MEASURED, and it does not warn
+
+Section 5 proposes keeping `hyper` as a guard on the grounds that `|cos| ~
+eta*lambda/2` estimates distance to the stability edge. Tested directly with a
+purposeful blow-up on elj/mipcas phase 1: two runs identical but for a PINNED
+learning rate, `lr_servo_managed` empty so the sensor reads and logs while moving
+nothing. Control at 1.25e-4; hot at 2.0e-3, ~16x, which detonates.
+
+`hyper_cos` was the mean of the SIGNED cosine, in which a symmetric oscillation
+cancels -- the wrong statistic for this question -- so `lr_ctrl/hyper_abscos` and
+`hyper_abscos_max` were added first.
+
+| | control (1x) | hot (16x) |
+|---|---|---|
+| mean\|cos\|, steps 20-100 | **0.165** | **0.142** |
+| worst single reading in any period | 0.47 | 0.25 |
+| `bwd/mle` at step 100 | 3.83 | 4.92 |
+| what happened next | trains on | 36.4 at 110, non-finite grads by 124, aborted |
+
+**The theory predicts the hot arm's |cos| should be ~16x LARGER. It is slightly
+SMALLER, and its worst reading is half the control's.** During the detonation
+|cos| then collapses toward zero -- 0.068, 0.034, 0.014 -- while
+`grad_norm_pre_clip` runs 122 -> 4.1e8. It moves the wrong way at the moment it
+would matter most.
+
+**The mechanism, and it is the useful part.** On the hot arm the gradient clip
+fired on essentially every step from step 20 (`gradclip/bwd_fire_rate` 1.0),
+which is exactly the regime `LRController._clip_saturated` already declares cos
+invalid in: once the clip binds every step the update magnitude is set by the LR
+alone and cos stops being a curvature statistic. So a magnitude-only edge guard
+would be blind PRECISELY IN THE HIGH-RATE REGIME IT EXISTS FOR. (The control arm
+saturates intermittently too, so this is a property of the route as much as of
+the rate.)
+
+**Recommendation: do not build it.** Scope the claim honestly -- one route, one
+stage (bwd MLE+TBC), one seed -- and note that the failure here is abrupt, finite
+to non-finite in ~15 steps, so there may be no approach phase for any
+approach-detector to see. If it is revisited, the test that would decide it is a
+route or stage where the clip does NOT saturate at the elevated rate; the
+`hyper_abscos` channel is now published, so that measurement costs a run and no
+code.
+
+### THE LADDER IS RETIRED. The rate search is now a fast explicit sweep
+
+**Section 7's geometric rung ladder never completed a cycle on a real route.**
+Across every run attempted it held each candidate rate for a full Adam-moment
+residence (1000 steps at beta2 0.999), moved one rung, and ran out of budget
+before accepting anything. Measured on elj/mipcas: three rungs, 3,000+ steps,
+zero clean rungs, cruise never reached.
+
+The diagnosis is not that the residence was too long. **The ladder bought the
+same thing at every rung -- evidence that a rate is sustainable over many steps
+-- when that evidence is only needed at the ONE rate it keeps.** Everywhere else
+the question is just "which order of magnitude", and a single ray reading answers
+it: at step 3000 of that run, before the ladder had done anything, one reading
+already implied `lr* ~ 2.2e-05`. The ladder then climbed to 1.25e-04 and spent
+3,000 steps walking back down.
+
+**What makes the replacement work is the sensor's dynamic range.** The alpha grid
+tests alpha* against {1, 2, 4, 8, 16, 32}, so ONE reading localises the optimum
+anywhere from 1x to 32x above the current rate -- about 1.5 decades -- plus two
+censored tails. Probing at doublings is therefore enough, and **the sweep needs
+no configured ceiling**: while readings come back `above_range` the optimum is
+still above, and the first `below_range` says it has been passed.
+
+    settle (TB stages only) -> sweep -> select -> verify -> cruise
+
+- **settle** -- unchanged, but now applies only where it means something. TB's
+  residual carries `log_Z`, so a re-levelling level corrupts it; VarGrad is
+  `var(log w)` with no `log_Z` term and is level-invariant by construction, so a
+  VarGrad stage does not wait at all. Owner call. An unreadable loss bank assumes
+  TB and waits -- "could not tell" fails toward the cautious answer.
+- **sweep** -- start 3 decades below the configured rate (far enough that the
+  starting point needs no prior guess), climb geometrically over ~1000 steps,
+  snapshot on a RATE grid every doubling, probe with cheap readings.
+- **select** -- the highest swept rate whose reading still had alpha* >= target.
+  One target, one yardstick; no second criterion to reconcile.
+- **verify** -- ONE full residence at that rate. The only place sustained-rate
+  evidence is bought, and it cannot pass for lack of readings.
+- **cruise** -- the pooled estimator, unchanged.
+
+Cost: ~1,500 step-equivalents to reach cruise, against the 3,000-4,000 the ladder
+spent without getting there.
+
+**What it gives up, stated rather than glossed:** the ladder had sustained-rate
+evidence at every rate it examined; the sweep has one-step evidence across many
+rates and sustained evidence at exactly one. A rate fine for one step and not for
+a thousand is caught at `verify` or nowhere, and a verify failure costs the
+sweep. That is the accepted trade -- sustained evidence at rates you will not use
+is precisely what the ladder spent its budget on.
+
+The ladder remains reachable as `ramp.kind: ladder` so the two can be compared;
+`sweep` is the default.
+
+#### Two refinements the owner called, 2026-08-23
+
+**Settle waits at the SWEEP's start rate, not the outgoing stage's.** The settle
+window exists to wait for log-Z calibration, which is LR-INSENSITIVE -- so
+nothing about it should depend on what the previous stage happened to converge
+to. It also removes a discontinuity: the rate used to sit at the outgoing value
+through settle and then fall three decades the instant the sweep armed. It now
+goes there once and climbs from where it already is.
+
+**Periodic re-probe: `ramp.reprobe_every`, OFF by default.** Cruise moves only on
+a persistent pooled offset, so nothing would ever re-examine the rate over a
+100k-step stage while the model, buffers and loss composition all change beneath
+it. A re-probe costs a sweep plus a full verify residence (~1,500-2,000 steps
+here), so 10-20k is roughly a 10% duty cycle; 1k would spend more time searching
+than cruising.
+
+**Verify hands over the rate IT measured**, not the one the sweep selected. The
+sweep picks from one reading per rate taken while moving past; verify has several
+at a fixed rate after a residence, on the RESTORED weights -- a different model
+from the one the sweep measured. Strictly better evidence, and usually different:
+on `elj_sweep_v6` verify read alpha* 8.66 against a target of 4 and corrected the
+rate x2.16.
+
+#### VALIDATED END TO END on elj/mipcas (`elj_sweep_v6`, 3,291 steps)
+
+Every phase fired, in order, on the real crystal route:
+
+| phase | what happened |
+|---|---|
+| settle | held 301 steps until log-Z stopped moving |
+| sweep | climbed 0.001 -> 0.0546 over 6 readings; alpha* fell 32 -> 22.6 -> 5.66 -> 1.41 |
+| select | highest rate still meeting target -> 0.02911, snapshot RESTORED |
+| verify | 1,000-step residence; alpha* 8.66 -> corrected the rate x2.16 |
+| cruise | held 0.06299 for 1,200+ steps, 14 readings, ZERO moves |
+
+The cruise hold is the result the whole redesign was for: `lr_fwd` constant to the
+last digit while alpha* bounced 11.3 -> 4 -> 5.66 -> 2.83 -> 2 -> 4. The gap
+converged to ~0 and the bar shrank 0.255 -> 0.132 as evidence accumulated.
+
+**And a cruise CORRECTION was demonstrated separately** (`elj_cruise_probe`,
+~7 minutes on phase-1 steps, search disabled so nothing else owns the rate):
+
+    step 300   peak 1 -> 0.25     EMERGENCY CUT (hot_cuts 0->1, pool_n 1)
+    step 500   peak 0.25 -> 0.103 POOLED MOVE   (pool_n 3, the pool can now speak)
+    step 500+  held 0.103         gap inside bar across six calibrations
+
+So the full ladder of authority is exercised: the unpooled cut acts while the
+pool is silent, hands over the moment it can speak, and the pool corrects once
+and then holds.
+
+⚠ `lrpool/sd` came back at **0.353** on that phase-1 stage, against the 0.22
+floor. The floor is a FLOOR and the larger observed value took over, which is why
+the bar sat at 0.28-0.42 and the hold was correct rather than lucky -- but it
+means per-reading noise is route- AND stage-dependent, and 0.22 should not be
+quoted as a constant.
+
+#### The seam contract
+
+Every defect in this controller has lived where two pieces meet, never inside a
+piece -- a missing `observe_coherence`, a `history` row whose shape depends on the
+search kind, a `.state` attribute only one search has, two clocks that disagree.
+Component tests cannot see any of those, and each cost a GPU run to find.
+
+`tests/lr/test_lr_sweep.py` now drives EVERY controller entry point against BOTH
+search kinds, so a method one has and the other lacks fails in seconds rather
+than 40 minutes in, or -- worse -- at report time after an hour of correct
+training. Verified by re-introducing all three seam bugs at once and requiring
+the contract tests to fail.
+
+### The validation queue
+
+Every run so far is SHORT (longest ~3,900 steps against a 30-100k production
+stage), UNCONDITIONAL, and LOCAL (RTX 5080, `compile` off). Three things follow
+that nothing here has established, in the order they are worth doing. Each is
+written as what it must ESTABLISH, because "run it and see" is how a validation
+turns into a demonstration.
+
+#### V1 — long cruise, unconditional, local (RUNNING)
+
+`configs/elj_long_cruise.yaml`, elj/mipcas, 20k steps, `period: 500`,
+`eval_period: 500` so it crosses into the fused stage. Must establish:
+
+- **the pooled estimate STAYS PUT over a production-length stage.** The
+  variogram says the optimum is stationary to 40k steps, so a long hold is the
+  real test of the estimator rather than of its convergence -- which is all the
+  1,600-step run showed.
+- **cruise on a FUSED stage for a meaningful stretch.** Nothing has done this:
+  the fused runs were short, and until the re-arm rate limit the ramp restarted
+  every ~30 steps there.
+- `warmup_steps` is raised to 300 so the warmup freeze covers the settling gate
+  (see `warmup_covers_the_stage_transient`); the elj base config ships 150 and
+  every crystal run reported above therefore had a 150-step blind window.
+
+#### V2 — the conditional analogue
+
+`protocol: conditional_vargrad`, stages `train_prior -> var_conditioning`, with
+`lr_sensor: {kind: ray}` on `var_conditioning`. Bases:
+`configs/qm9anchor_aug14/` (NB that is TWO experiments -- its configs were
+rewritten mid-battery) or `cond_aug11/`.
+
+**Owner assessment 2026-08-22, and it is the right one: this should just work,
+and `var_conditioning` is SIMPLER for the sensor than a fused stage.** Two
+active branches rather than three, one loss family (VarGrad) on both, no replay
+branch -- so no importance weights, no buffer dependency, and no TB/MLE/VarGrad
+mixture in the composite. The two preconditions are:
+
+1. **Ignore the Z sidecars.** Done -- `emp_z`/`emp_z_persistent`/`z_level` are
+   zeroed in every bank before scoring. This is what unblocked the stage; its
+   fwd bank runs `emp_z: 1.0` and was refused outright before.
+2. **Enough rows per condition in the harvested batch.** See below.
+
+**The grouping itself is NOT a risk, and an earlier draft of this section said
+it was.** The larder stores the WHOLE batch including `condition_id` unchanged,
+so a replayed record rebuilds exactly the live step's groups -- verified, and
+pinned by `test_condition_ids_survive_the_larder_round_trip_unchanged`.
+
+What IS worth watching, in order:
+
+- **Group size is EMERGENT: rows / n_conditions in that batch.** It is a
+  property of the BATCH, not of the larder, and it is the same number the live
+  step already depends on -- so the sensor inherits it rather than adding a
+  requirement. The consequence when it is small is a RESOLUTION one, not a
+  correctness one: a noisy per-batch VarGrad widens the spread across
+  sub-batches, so the paired CI widens and more readings come back
+  `unresolved`. The levers are `n_sub` and batch size, not anything
+  ray-specific. Read `raycal/status_{fwd,bwd}` -- persistent `unresolved` here
+  means "not enough rows per condition", not "the sensor is broken".
+- **A silent regrouping if `condition_id` were ever dropped.**
+  `get_gfn_backward_loss` gates the condition-grouped VarGrad on
+  `condition_id is not None`; without it, control falls through to the LEGACY
+  repeats-grouped branch, which for same-terminal tiles is TBC in disguise -- a
+  different objective, computed with no error. `LarderScorer` now REFUSES that
+  case rather than scoring it. Nothing produces it today; the guard is for when
+  something does.
+- **ray on a composite with NO TB branch.** Both branches VarGrad, replay pinned
+  at 0. Every composite measured so far contained TB, and alpha* is a curvature
+  statistic of whatever loss it is given.
+- **Whether one residence is a long enough re-arm floor.**
+  `var_conditioning` carries four railed controls and is terminal by design, so
+  its composition moves more than `equilibration`'s. If
+  `ramp/rearms_suppressed` climbs without bound, the floor is too short.
+
+⚠ Plan for the known detonator: the three Z keys
+(`condition_log_z.{fwd,bwd,replay}_tb_z_source`, `z_calibration.enabled`,
+`lr_flow`) are UNCONDITIONAL defaults that must be set for this route, or
+`var_conditioning` blows up within ~30 steps -- and that failure is an escape
+from the Huber basin, so it diverges ON the objective and `beta` is the lever.
+**A blow-up must not be read as an LR-controller result until those are
+confirmed set.**
+
+#### V3 — cluster variants
+
+The local numbers do NOT transfer, and one of them is already load-bearing in a
+recommendation:
+
+- **RE-MEASURE THE PROBE OVERHEAD.** "~24 training steps per calibration, 4.8%
+  at period 500 on phase 1 against 1.2% on the fused stage" is a LOCAL,
+  COMPILE-OFF measurement. Policy rollout is dispatch-bound locally and is not
+  on an A100 with `compile` on, so the denominator moves and the ratio with it.
+  **The `period: 1500` suggested for elj phase 1 is derived from that local
+  number and must not be shipped to the cluster unchecked.**
+- **production LENGTH and a real batch.** 30-100k steps at batch 1000-20000,
+  where the batch sizer is also live. Nothing has run the pooled estimator
+  alongside a moving batch size, and batch changes the gradient noise that
+  `alpha_target` exists to cover.
+- **`alpha_target` per route, finally measurable.** Pin the rates as explicit
+  floats at a known-good hand-tuned rate and read the reported alpha* off -- the
+  sensor-only arm section 6C asks for. It is only worth doing at length.
+- **MLIP routes (UMA / MACE).** Two separate questions. The probe makes no
+  energy call, so UMA's non-determinism cannot enter through the reward -- but
+  the POLICY forward pass has not been checked for reproducibility there, and
+  the ray's paired difference assumes the same batch at the same parameters
+  gives the same loss. Measure the ray's own noise floor per route
+  (`lrpool/sd`) rather than assuming the 0.22 dex that elj and the toy agreed
+  on. Separately, a UMA step is seconds, so the overhead FRACTION is tiny while
+  the absolute cost is not.
+- SLURM `--time` set to the likely need, never the 48 h max; 16 A100s
+  concurrent.
+
 ### Still owed
 
-- **`hyper` as a magnitude-only edge guard (6D "keep").** NOT built. It is
-  currently a sign-driven integrator (`peak_scale *= exp(beta*cos)`), and
-  section 5's argument is that the sign is uninformative once equilibrated while
-  `|cos| ~ eta*lambda/2` is a real distance-to-edge reading. Converting it needs
-  an actuation rule section 6 does not give: what a large `|cos|` should DO, and
-  by how much. Owner call.
-- **`persistence` and per-rung `min_readings` for the ramp** have to be set from
-  the route's measured per-reading noise. See the `ramp_cold` finding above.
+- **`hyper` as a magnitude-only edge guard: recommended AGAINST**, on the
+  measurement above. Not built.
 - **`alpha_target` per route.** See below.
-- **`max_raise_dex` has not been measured**, only reasoned. log10(4) is one
-  grid doubling either side of the target; the right value is a property of the
-  exposure window (`period` x step cost) and should be measured per route.
+- **`persistence` for the ramp** is still 2 and still a guess. The other two
+  constants it sat beside are now DERIVED: per-rung `min_readings` from the
+  noise floor and the rung spacing (7 at factor 1.5, against the inherited 3
+  whose bar could not resolve a rung at all), and `max_raise_dex` from the alpha
+  grid -- "never raise further than the next reading can still measure", which
+  reproduces the log10(4) constant it replaces. Persistence resists this
+  treatment because consecutive verdicts over a ROLLING pool share most of their
+  readings, so they are not independent trials and the nominal persistence
+  overstates what it buys.
 
 ### Behaviour changes a reader should know about
 

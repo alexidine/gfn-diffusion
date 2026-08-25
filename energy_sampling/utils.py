@@ -398,6 +398,11 @@ _RETIRED_KEYS = {
     'adaptive_lr.ray_calibration.enabled':
         "deleted (see ray_calibration.enabled) -- derived from the stages that "
         "declare lr_sensor kind 'ray'.",
+    'lr_control.ray_calibration.enabled':
+        "deleted -- the switch is which stages declare `lr_sensor: {kind: ray}`, "
+        "and a second flag could disagree with them. `ray` is a DIAGNOSTIC since "
+        "state 10 and reaches no learning rate at all, so an `enabled: true` here "
+        "would read as arming a controller that does not exist.",
     'buffers.replay_buffer.admit_temperature':
         "deleted (see admit_cap_max) -- admission and the displacement purge "
         "both draw uniformly now, so there is no softmax temperature left to set.",
@@ -434,6 +439,43 @@ _RETIRED_KEYS = {
         "buffers.prior_buffer.condition_block_m) -- gated on replay "
         "vg_by_condition plus vg_lb/vg_lme, so likewise a coefficient of the "
         "replay loss rather than a setting of the replay store.",
+    # ---------------------------------------------------------- state 9 -> 10
+    'adaptive_lr':
+        "RETIRED WHOLE (state 10) and replaced by `lr_control` -- the adaptive "
+        "controller it named no longer exists. `ray` was killed 2026-08-23 by its "
+        "own acceptance test: alpha* is defined as s*/lr, so the slope of "
+        "log(alpha*) against log(lr) must be -1, and it measured 0.00 +- 0.2 "
+        "across twelve runs, two stages and 2.7 decades of rate -- the sensor was "
+        "uncorrelated with the variable it steered, and the pool, the sweep, the "
+        "rung ladder and alpha_target all inherited that. Learning rates are now "
+        "set by a brute-force bracket: burn in at a conservative fixed rate, "
+        "checkpoint, run a configured grid of fixed-LR trials from that "
+        "checkpoint, and keep the highest rung a safety margin below the lowest "
+        "one that detonated.\n"
+        "    KEYS THAT MOVED, values unchanged: seed_lr, control_flow_lr -> "
+        "lr_control.*; divergence_loss_abs -> lr_control.hard_failure.loss_abs; "
+        "divergence_grad_abs -> lr_control.hard_failure.grad_abs.\n"
+        "    KEYS THAT ARE GONE: warmup_steps, envelope_freeze, "
+        "warmup_freeze_cos_window (the warmup envelope is replaced by burn-in, "
+        "which is a FIXED SCALE for a FIXED number of steps -- a continuous "
+        "multiplier under a candidate rung would mean the rate under test is not "
+        "the rate applied); bounds (the candidate grid IS the range); "
+        "divergence_cut (a hard failure no longer cuts the rate: the rate was "
+        "chosen by a bracket, and a silent cut hides that selection error); "
+        "divergence_loss_rel (superseded by a bar derived from the root's own "
+        "loss SPAN, which unlike a ratio is well defined on the signed MLE "
+        "channel where the ratio rule correctly declined); calibration.* "
+        "(alpha_target, eta_up, eta_down); restart_after; ramp.*.\n"
+        "    ray_calibration.* moves to lr_control.ray_calibration and is now a "
+        "DIAGNOSTIC, off unless a stage explicitly declares lr_sensor kind 'ray'.",
+    'lr_warmup_ratio':
+        "deleted (state 10) with the warmup envelope. The bracket's burn-in "
+        "replaces it and is a different object: a fixed multiplier held for a "
+        "fixed number of steps, not a ramp. The ramp had to go because the "
+        "candidate rungs are meant to be auditable effective rates, and an "
+        "envelope underneath them makes the rate under test differ from the rate "
+        "applied -- which is exactly how a too-hot rung survives its trial. Set "
+        "lr_control.burn_in_scale and lr_control.burn_in_steps.",
 }
 
 
@@ -566,33 +608,36 @@ def _is_auto(v):
     return v is None or (isinstance(v, str) and v.strip().lower() == 'auto')
 
 
-def _require_adaptive_sensor(args, managed, seed_lr):
-    """Every stage must have something that can move a servo-managed LR.
+def _require_lr_control(args, managed, seed_lr):
+    """A `auto` learning rate must have something that can move it.
 
-    Per stage, not globally: a sensor on the terminal stage does nothing for a
-    phase-1 rate, and a run whose phase 1 is pinned at the seed while the config
-    reads as adaptive is the same silent failure as one with no sensor at all.
+    Under the bracket that something is a run-level block, not a per-stage
+    sensor: `lr_control` sets the multiplier every managed group runs at, and
+    without the block there is nothing to set it. Resolving `auto` to the seed
+    and leaving it there is the silent failure this gate exists for -- the config
+    reads as "let the system choose" and behaves as "pinned at a number nobody
+    chose".
 
     The rule and its message are shared with
-    `config_invariants.auto_lr_requires_an_adaptive_sensor`, which reports the
-    same condition without raising; this is the load gate."""
+    `config_invariants.auto_lr_requires_lr_control`, which reports the same
+    condition without raising; this is the load gate."""
     import config_invariants
 
     # `managed` is passed explicitly: this runs AFTER the `auto` strings have been
     # overwritten with the seed, so re-deriving them from args would find none and
     # the gate would pass on exactly the configs it exists to reject.
-    violations = config_invariants.auto_lr_requires_an_adaptive_sensor(
+    violations = config_invariants.auto_lr_requires_lr_control(
         _namespace_to_dict(args), auto_keys=list(managed))
     if not violations:
         return
+    detail = '\n'.join(f'  {v.detail}' for v in violations)
     raise ValueError(
-        f"{', '.join(managed)} set to `auto` (servo-managed), seeded at "
-        f"{seed_lr:.3g}, but not every stage has an adaptive sensor to move it:\n"
-        + '\n'.join(f'  {v.detail}' for v in violations)
-        + "\n\nDeclare `lr_sensor` on each stage (kind: ray | plateau | hyper), or "
-          "write an explicit float for any rate that is meant to be fixed -- a "
-          "float still takes the warmup envelope and divergence handling, it just "
-          "does not pretend to adapt.")
+        f"{', '.join(managed)} set to `auto` (bracket-managed), seeded at "
+        f"{seed_lr:.3g}, but nothing can move them:\n{detail}\n\n"
+        f"Add an `lr_control` block (mode: bracket | fixed), or write an explicit "
+        f"float for any rate that is meant to be fixed -- a float still takes "
+        f"divergence handling and the max_lr rail, it just does not pretend to be "
+        f"discovered.")
 
 
 def _grad_median(T):
@@ -626,11 +671,12 @@ def resolve_derived_config(args):
 
     resolved = {}
 
-    # LRs: `auto` hands the key to the servo, seeded low. The set of managed
-    # keys is recorded on args because _apply_lrs needs to know which groups
-    # peak_scale applies to -- once resolved, `auto` and an explicit float are
-    # indistinguishable as values, and that distinction IS the semantics.
-    seed_lr = float(getattr(getattr(args, 'adaptive_lr', None), 'seed_lr', None)
+    # LRs: `auto` hands the key to the LR BRACKET, seeded at lr_control.seed_lr.
+    # The set of managed keys is recorded on args because _apply_lrs needs to
+    # know which groups the bracket's scale applies to -- once resolved, `auto`
+    # and an explicit float are indistinguishable as values, and that
+    # distinction IS the semantics.
+    seed_lr = float(getattr(getattr(args, 'lr_control', None), 'seed_lr', None)
                     or _SERVO_SEED_LR)
     managed = []
     for name in _LR_KEYS:
@@ -653,12 +699,12 @@ def resolve_derived_config(args):
         # stage asking (the LRs then sat at the seed for the whole run, which is
         # exactly what it was written to prevent), and it would REJECT a config
         # driven entirely by `hyper`, which does not use ray_calibration at all.
-        _require_adaptive_sensor(args, managed, seed_lr)
+        _require_lr_control(args, managed, seed_lr)
 
-    # `lr_flow` IS NOT SERVO-MANAGED and deliberately not in _LR_KEYS: alpha* is
-    # measured over policy parameters only, and _apply_lrs exempts the flow
-    # groups from both the envelope and peak_scale. So `auto` has no resolver
-    # here and no servo to hand it to -- it stays the STRING 'auto' and is
+    # `lr_flow` IS NOT BRACKET-MANAGED and deliberately not in _LR_KEYS: the
+    # bracket steers policy rates, and _apply_lrs pins the flow groups flat. So
+    # `auto` has no resolver here and nothing to hand it to -- it stays the
+    # STRING 'auto' and is
     # assigned straight to param_group['lr'] (controller.py) and to the optimizer
     # constructor (train.py), failing somewhere downstream that says nothing
     # about the config. Reject it here, where the reason is visible.
@@ -666,9 +712,9 @@ def resolve_derived_config(args):
     if not isinstance(flow, (int, float)) or isinstance(flow, bool):
         raise ValueError(
             f"lr_flow must be an explicit number, got {flow!r}. It is NOT "
-            f"servo-managed -- alpha* is measured over policy parameters only, so "
-            f"the flow (Z head) groups are exempt from both the warmup envelope "
-            f"and peak_scale, and there is no rule that would resolve `auto` for "
+            f"bracket-managed -- the flow (Z head) groups are pinned flat and "
+            f"exempt from the bracket's scale, and there is no rule that would "
+            f"resolve `auto` for "
             f"it. Write the number: the value depends on WHAT THE FLOW HEAD IS, "
             f"which is a LearnableScalar when `model.full_flow` is false and the "
             f"run is unconditional, and a network otherwise -- and a rate suited "

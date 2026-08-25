@@ -17,7 +17,7 @@ import yaml
 
 import config_snapshot as cs
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 
@@ -71,9 +71,10 @@ def test_auto_swapped_for_its_own_resolved_value_is_caught(tmp_path, raw, base_s
     """THE case the resolved value alone cannot see.
 
     `lr_policy: auto` and `lr_policy: 1.25e-4` resolve to the SAME number and mean
-    opposite things -- servo-managed versus a fixed peak the servo never touches.
-    A comparator that only checked resolved values would wave this through."""
-    seed = raw['adaptive_lr']['seed_lr']
+    opposite things -- bracket-managed versus a fixed rate the bracket's scale
+    never touches. A comparator that only checked resolved values would wave this
+    through."""
+    seed = raw['lr_control']['seed_lr']
     new = copy.deepcopy(raw)
     new['lr_policy'] = seed                      # identical number, explicit
     cand = snap_of(tmp_path, 'explicit_lr.yaml', new)
@@ -227,15 +228,15 @@ def test_an_unloadable_reference_is_reported_not_raised(tmp_path, raw, base_snap
 
     The reference is normally the committed config, and the usual reason to
     tighten a rule is that the committed config violates it -- so the tool would
-    die in exactly the case it exists for. Here: strip the lr_sensors, which makes
-    `auto` learning rates unowned and the config unloadable."""
+    die in exactly the case it exists for. Here: drop `lr_control`, which leaves
+    the `auto` learning rates with nothing to move them and the config
+    unloadable."""
     stale = copy.deepcopy(raw)
-    for st in stale['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
+    stale.pop('lr_control', None)
     old = snap_of(tmp_path, 'stale_ref.yaml', stale)
 
     assert 'load_error' in old
-    assert 'adaptive sensor' in old['load_error']
+    assert 'nothing can move them' in old['load_error']
 
     c = cs.compare(old, base_snap)
     assert not c.behaviour_preserved, 'no comparison happened, so nothing is preserved'
@@ -245,8 +246,7 @@ def test_an_unloadable_reference_is_reported_not_raised(tmp_path, raw, base_snap
 
 def test_an_unloadable_candidate_is_reported_separately(tmp_path, raw, base_snap):
     stale = copy.deepcopy(raw)
-    for st in stale['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
+    stale.pop('lr_control', None)
     c = cs.compare(base_snap, snap_of(tmp_path, 'stale_cand.yaml', stale))
     assert c.candidate_error and not c.reference_error
     assert 'CANDIDATE DOES NOT LOAD' in c.render()

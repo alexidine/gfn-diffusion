@@ -72,7 +72,7 @@ def engine(exit_block, second_stage=True):
         _accum_floor_warned_stage=None, batch_size_last_grow=0,
         fwd_frac=0.0, bwd_frac=1.0, replay_frac=0.0,
         init_schedulers_optimizers=lambda: None, set_loss_coeffs=lambda: None,
-        lr_controller=SimpleNamespace(rearm_warmup=lambda: 0),
+        lr_controller=SimpleNamespace(on_stage_change=lambda: 0),
         grad_guard=SimpleNamespace(refresh=lambda reason=None: None),
         checkpointer=SimpleNamespace(save=lambda tag: None))
     return StageProtocol(m), m

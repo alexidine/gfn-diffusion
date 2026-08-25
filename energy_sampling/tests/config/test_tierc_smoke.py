@@ -195,7 +195,7 @@ def test_wallclock_values_do_not_make_traces_differ():
     'train_step_time', 'eval_sampling_time', 'samples_per_sec',
     'gpu/util_recent', 'gpu/util_policy', 'vram/peak_reserved_mb',
     'energy/seconds', 'energy/ms_per_sample', 'energy/frac_of_step',
-    'initialization_time', 'probe/step_time_max10',
+    'initialization_time', 'energy/seconds_gpu',
 ])
 def test_timing_and_occupancy_are_not_compared(name):
     assert T.is_wallclock(name, T.registry_wallclock_metrics())
@@ -213,11 +213,18 @@ def test_deterministic_quantities_are_compared(name):
 def test_millisecond_timers_are_excluded_and_rms_metrics_are_not():
     """THE DEFECT THIS WAS WRITTEN FOR, and the reason the rule is narrow.
 
-    `probe/churn_add_ms_max` and `probe/churn_purge_ms_max` are millisecond
+    `probe/churn_add_ms_max` and `probe/churn_purge_ms_max` were millisecond
     timers that matched none of the original rules. They were the ENTIRE content
     of a 42-value non-zero null at 600 steps -- the first length that reaches the
-    buffer-churn code they time, which is why the 30-step null passed without
-    them.
+    buffer-churn code they timed, which is why the 30-step null passed without
+    them. Both keys were retired on 2026-08-23 and are kept here as the rule's
+    regression case: `is_wallclock` is a pure function of the NAME, so the rule
+    must keep classifying that shape whether or not anything emits it today.
+
+    NOTE: nothing does. `RegionProfiler.report()` defaults to prefix `perf`, but
+    its only production caller passes `prefix='energy_gpu'` and keeps just one
+    key, so the `_ms` suffix has ZERO live instances. The rule is retained
+    against the shape returning, not against a current key.
 
     The `_ms` rule must not catch `_rms`. `tracker/logw_std_rms` and its three
     siblings are deterministic statistics, and excluding them would drop real
@@ -225,6 +232,7 @@ def test_millisecond_timers_are_excluded_and_rms_metrics_are_not():
     reg = T.registry_wallclock_metrics()
     assert T.is_wallclock('probe/churn_add_ms_max', reg)
     assert T.is_wallclock('probe/churn_purge_ms_max', reg)
+    assert T.is_wallclock('perf/energy_ms', reg)      # the shape, not a live key
     for name in ('tracker/logw_std_rms', 'tracker/tb_err_rms',
                  'tracker/z_bias_rms', 'tracker/z_grad_rms'):
         assert not T.is_wallclock(name, reg), name
@@ -344,35 +352,43 @@ def test_stage_patch_returns_every_stage():
 
 # ------------------------------------------------------------ the LR pin ----
 
-_SENSORLESS = {
+#: A config as `config_state.migrate` leaves a historical one: the `adaptive_lr`
+#: block has been lifted to `lr_control`, carrying seed_lr, and the migration has
+#: deliberately NOT invented a candidate grid -- so nothing can move the four
+#: `auto` rates and the config does not load.
+_UNMANAGED = {
     'lr_policy': 'auto', 'lr_back': 'auto', 'lr_replay': 'auto',
     'lr_fused': 'auto',
-    'adaptive_lr': {'seed_lr': 1.25e-4},
+    'lr_control': {'mode': 'bracket', 'seed_lr': 1.25e-4},
     'protocol': 'p',
     'protocols': {'p': {'stages': [{'name': 's', 'train_mode': 'bwd'}]}},
 }
 
 
-def test_pin_translates_a_sensorless_auto_into_the_rate_it_trained_at():
-    cfg = copy.deepcopy(_SENSORLESS)
+def test_pin_translates_an_unmanaged_auto_into_the_rate_it_trained_at():
+    cfg = copy.deepcopy(_UNMANAGED)
     notes = T.pin_auto_lr_without_sensor(cfg)
     assert notes and notes[0].startswith('REPAIR:')
     assert cfg['lr_policy'] == pytest.approx(1.25e-4)
     assert cfg['lr_fused'] == pytest.approx(1.25e-4)
+    # ...and the rate policy is stated in the vocabulary that now exists: a
+    # fixed scale of exactly 1.0 over the base rate is what that config did.
+    assert cfg['lr_control']['mode'] == 'fixed'
+    assert cfg['lr_control']['fixed_scale'] == 1.0
 
 
-def test_pin_is_inert_when_a_stage_declares_a_sensor():
+def test_pin_is_inert_when_the_bracket_can_actually_move_the_rate():
     """It must fire ONLY on the config that cannot load. Pinning a config whose
-    stages declare sensors would silently disable the servo -- turning the
-    repair into the largest behaviour change in the comparison."""
-    cfg = copy.deepcopy(_SENSORLESS)
-    cfg['protocols']['p']['stages'][0]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.1}
+    bracket has a real candidate grid would silently disable the bracket --
+    turning the repair into the largest behaviour change in the comparison."""
+    cfg = copy.deepcopy(_UNMANAGED)
+    cfg['lr_control']['candidate_scales'] = [0.05, 0.2, 0.8]
     assert T.pin_auto_lr_without_sensor(cfg) == []
     assert cfg['lr_policy'] == 'auto'
 
 
 def test_pin_is_inert_when_the_rates_are_already_explicit():
-    cfg = copy.deepcopy(_SENSORLESS)
+    cfg = copy.deepcopy(_UNMANAGED)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3e-4
     assert T.pin_auto_lr_without_sensor(cfg) == []
@@ -383,8 +399,8 @@ def test_pin_refuses_rather_than_inventing_a_rate():
     reconstructed. Picking a plausible number produces a config that loads and
     trains on a value nobody chose -- the same reason `config_state.migrate`
     reports judgment cases instead of guessing them."""
-    cfg = copy.deepcopy(_SENSORLESS)
-    cfg['adaptive_lr']['seed_lr'] = None
+    cfg = copy.deepcopy(_UNMANAGED)
+    cfg['lr_control']['seed_lr'] = None
     with pytest.raises(ValueError, match='no number to pin'):
         T.pin_auto_lr_without_sensor(cfg)
 

@@ -64,9 +64,37 @@ class Arm:
     def __init__(self, name):
         self.name = name
 
+    #: How long the shipping burn-in runs before an arm may act. SHORTER THAN
+    #: PRODUCTION, and it has to be said out loud: canonical burns in for 3,000
+    #: steps to reach Adam steady state before it brackets, which is longer than
+    #: this whole battery. A bench that inherited it would hold every arm for the
+    #: entire run and every board would read as "no controller moves the rate" --
+    #: the pass-through failure `null` exists to catch, arriving through the
+    #: config instead of through the arms.
+    BURN_IN_STEPS = 50
+
     def args_overrides(self):
-        """Config the run should be built with. Sensors off unless asked for."""
-        return {'lr_servo_managed': ('lr_policy', 'lr_fused')}
+        """Config the run should be built with. Sensors off unless asked for.
+
+        `mode: fixed` IS THE POINT, not a convenience. Under it the shipping
+        controller burns in, promotes `fixed_scale`, and then holds -- so it is a
+        pure ACTUATOR and the arm owns the rate. In `bracket` mode the controller
+        would run its own candidate trials against whatever the arm was doing,
+        and the board would be comparing two controllers per row.
+
+        The bracket gets compared here the way everything else does: as an ARM
+        (see `Bracket`), on the same board as the fixed ladder.
+        """
+        return {'lr_servo_managed': ('lr_policy', 'lr_fused'),
+                'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
+                'lr_control.burn_in_steps': self.BURN_IN_STEPS,
+                'lr_control.burn_in_scale': 1.0,
+                # SILENCED HERE rather than in the transcribed defaults: a
+                # battery is hundreds of cells and the controller's announce is
+                # per run, but `MK_DEV_*` has to keep saying what the shipping
+                # config says or test_fidelity's drift check is measuring the
+                # bench against itself.
+                'lr_control.verbose': False}
 
     def lr_sensor(self):
         """
@@ -113,29 +141,42 @@ class Arm:
         pass
 
     # -- shared actuator ---------------------------------------------------
+    #: How far an arm may move the rate from its seed, in either direction. A
+    #: RAIL, not a tuning range: it exists so a runaway arm cannot spend the
+    #: whole battery at 1e6 x seed and drown the board in non-finite rows.
+    #:
+    #: IT LIVES HERE NOW, and that is the substantive change. It used to be
+    #: `adaptive_lr.bounds`, read off the shipping controller -- but the bracket
+    #: has no such knob: its candidate grid IS its range, and there is no
+    #: continuous scale for a rail to bound. An arm that wants a rail owns it.
+    SCALE_BOUNDS = (1.0e-3, 1.0e3)
+
     @staticmethod
     def _scale_peak(run, factor):
         """
-        Multiply `peak_scale`, respecting the SHIPPING bounds, ceiling and
-        warmup hold. This is the actuator every arm shares; the update LAW is
-        what differs between them, and that difference is the point rather than
-        a flaw.
+        Multiply the controller's one scale, bounded, and hold off during
+        burn-in. This is the actuator every arm shares; the update LAW is what
+        differs between them, and that difference is the point.
+
+        NONE OF THESE LAWS HAS A PRODUCTION COUNTERPART ANY MORE. The shipping
+        controller sets its rate by a brute-force bracket -- burn in, checkpoint,
+        trial a fixed grid, keep a rung below the lowest failure -- and `ray`,
+        `hyper` and `plateau` reach no learning rate. What these arms are FOR is
+        unchanged and is the reason they were not deleted with the sensors: they
+        are the alternatives the bracket has to beat on a board where a fixed
+        ladder is also running, and an alternative nobody can run is not a
+        comparison.
         """
         ctrl = run.m.lr_controller
-        st = ctrl._state()
-        # The SHIPPING warmup hold, taken from the controller rather than
-        # reimplemented: `on_calibration` and `on_plateau` both gate on exactly
-        # this (controller.py:186, :217). Acting during warmup would let an arm
-        # move a rate the envelope is deliberately ramping.
-        if ctrl._elapsed(st) < int(ctrl._cfg('warmup_steps', 1000)):
+        # THE SHIPPING HOLD, taken from the controller rather than
+        # reimplemented. Burn-in is deliberately conservative and step-counted;
+        # an arm acting inside it would be steering a rate the run is holding
+        # low on purpose, and every reading it took would rate that suppression
+        # rather than the operating point.
+        if ctrl.in_burn_in():
             return
-        lo, hi = ctrl._peak_bounds()
-        ceiling = ctrl._current_ceiling()
-        if ceiling is not None:
-            hi = min(hi, ceiling)
-        st['peak_scale'] = max(lo, min(hi, float(st['peak_scale']) * float(factor)))
-        st['envelope'] = ctrl._envelope(st)
-        ctrl._apply_lrs(st)
+        lo, hi = Arm.SCALE_BOUNDS
+        ctrl.set_scale(max(lo, min(hi, ctrl.scale * float(factor))), why='bench_arm')
 
 
 class Fixed(Arm):
@@ -146,9 +187,13 @@ class Fixed(Arm):
         self.lr = float(lr)
 
     def args_overrides(self):
+        # `mode: fixed` with `burn_in_steps: 0` is how "this rate, from step 0,
+        # unmodified" is spelled now. The old spelling was `lr_warmup_ratio: 1`
+        # to defeat the warmup envelope; there is no envelope to defeat.
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
                 'lr_servo_managed': (),      # nothing manages it
-                'lr_warmup_ratio': 1}        # and no warmup envelope
+                'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
+                'lr_control.burn_in_steps': 0, 'lr_control.burn_in_scale': 1.0}
 
 
 class Null(Arm):
@@ -159,8 +204,8 @@ class Null(Arm):
         self.lr = float(lr)
 
     def args_overrides(self):
-        return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused')}
+        return {**super().args_overrides(),
+                'lr_policy': self.lr, 'lr_fused': self.lr}
 
 
 class Hyper(Arm):
@@ -183,8 +228,8 @@ class Hyper(Arm):
         self.beta_down = float(beta if beta_down is None else beta_down)
 
     def args_overrides(self):
-        return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused')}
+        return {**super().args_overrides(),
+                'lr_policy': self.lr, 'lr_fused': self.lr}
 
     def reset(self, run):
         self._prev = None
@@ -305,20 +350,13 @@ class HyperStep(Hyper):
         if self.period > 1 and run.m.step_ind % self.period:
             return
         err = cos - self.target
-        if not self.target:
-            # THROUGH THE SHIPPING SENSOR. `LRController.on_hypergradient` exists
-            # (controller.py:237), train.py calls it on exactly this operand
-            # (:3089) -- the realised displacement --
-            # and protocol.py lists 'hyper' as a first-class lr_sensor kind.
-            # Verified bit-identical to the local actuator on all six tracking
-            # cells, so routing through it changes no number and buys the
-            # production counters, the status channel and the first-fire
-            # announce, none of which any bench cell used to exercise.
-            run.m.lr_controller.on_hypergradient(err, self.beta, self.beta_down)
-            return
-        # A NONZERO TARGET IS A BENCH EXTENSION. The shipping sensor has no
-        # setpoint, so it cannot carry this; using the local actuator keeps the
-        # reported `hyper_cos` the raw cosine rather than a shifted error.
+        # STILL REPORTED THROUGH THE SHIPPING SENSOR, for its counters and its
+        # status channel -- but `on_hypergradient` no longer moves any rate, so
+        # the actuation below is the arm's own. `cos` was retired as an actuator
+        # for a different reason than the ray: it is a STATIONARITY statistic,
+        # negative at every stable rate once the iterate has equilibrated, so it
+        # has no fixed point to steer to.
+        run.m.lr_controller.on_hypergradient(err, self.beta, self.beta_down)
         beta = self.beta if err > 0 else self.beta_down
         self._scale_peak(run, math.exp(beta * err))
 
@@ -364,8 +402,8 @@ class HyperSNR(Arm):
         self.period = int(period)
 
     def args_overrides(self):
-        return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused')}
+        return {**super().args_overrides(),
+                'lr_policy': self.lr, 'lr_fused': self.lr}
 
     def reset(self, run):
         self.snr_log = []
@@ -404,10 +442,29 @@ class HyperSNR(Arm):
 
 class RayRay(Arm):
     """
-    The shipping probe in both roles. Verdicts go through the REAL
-    `LRController.on_calibration`, so this arm carries the production
-    `ratio**eta` damping, the abstention policy and the recorded ceiling.
+    The shipping probe as a SENSOR, with the retired servo law reimplemented
+    here as the arm's own.
+
+    IT USED TO DELEGATE ITS VERDICT to `LRController.on_calibration`, which
+    carried the `(alpha/target)**eta` damping, the abstention policy and the
+    recorded ceiling. That call now RECORDS AND MOVES NOTHING: the ray was
+    retired as an actuator when the slope of log(alpha*) against log(lr)
+    measured 0.00 +- 0.2 where -1 is required, i.e. the statistic was
+    uncorrelated with the rate it steered.
+
+    So the law lives here, and the arm is honest about what it is: the rule the
+    project used to ship, kept runnable so the bracket can be compared against
+    it rather than merely declared better. `on_calibration` is still called, for
+    the counters and the status channel.
     """
+
+    #: The retired servo's constants, transcribed from the controller that used
+    #: to hold them. `eta_up` is the smaller of the two ON PRINCIPLE: raising is
+    #: licensed only by a one-step measurement that cannot see multi-step damage,
+    #: while lowering is the recoverable direction.
+    ALPHA_TARGET = 4.0
+    ETA_UP = 0.25
+    ETA_DOWN = 0.5
 
     #: The probe pays for paired sub-batches; that IS its cost and its noise
     #: robustness. Larger than the train batch, as in production.
@@ -423,9 +480,9 @@ class RayRay(Arm):
         self.period = int(period)
 
     def args_overrides(self):
-        return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'adaptive_lr.ray_calibration.period': self.period}
+        return {**super().args_overrides(),
+                'lr_policy': self.lr, 'lr_fused': self.lr,
+                'lr_control.ray_calibration.period': self.period}
 
     def lr_sensor(self):
         """THE ARM'S SWITCH. `ray_calibration.enabled: True` used to sit in
@@ -464,7 +521,17 @@ class RayRay(Arm):
             return
         st = reading.get('status', '?')
         self.readings[st] = self.readings.get(st, 0) + 1
+        # Still routed through the shipping sensor, for its counters and status
+        # channel. It actuates nothing; the law below is the arm's.
         m.lr_controller.on_calibration(reading)
+        if st not in ('bracketed', 'above_range', 'below_range'):
+            return                       # unresolved / inconsistent: no move
+        alpha = reading.get('alpha_star')
+        if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
+            return
+        ratio = alpha / self.ALPHA_TARGET
+        eta = self.ETA_UP if ratio > 1 else self.ETA_DOWN
+        self._scale_peak(run, ratio ** eta)
 
 
 class RampPlateau(Arm):
@@ -488,8 +555,8 @@ class RampPlateau(Arm):
         self.period = int(period)
 
     def args_overrides(self):
-        return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused')}
+        return {**super().args_overrides(),
+                'lr_policy': self.lr, 'lr_fused': self.lr}
 
     def reset(self, run):
         self._ema = None
@@ -529,7 +596,11 @@ class RampPlateau(Arm):
             return
         self._bad += 1
         if self._bad >= self.PLATEAU['patience']:
-            m.lr_controller.on_plateau(True, self.PLATEAU['factor'])
+            # THE LAW IS THE ARM'S, and now the actuation is too.
+            # `LRController.on_plateau` is gone -- `plateau` was a pure actuator
+            # with nothing to report, so it was deleted rather than demoted to a
+            # diagnostic like `ray` and `hyper`. The cut itself is unchanged.
+            self._scale_peak(run, self.PLATEAU['factor'])
             self._bad = 0
             self._cool = self.PLATEAU['cooldown']
 

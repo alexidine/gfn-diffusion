@@ -49,33 +49,14 @@ from train import BULKY_ATTR_EXCLUDE_KEYS, Modeller
 #: to ConformerTorsions, which takes no **kwargs and would raise on any of them.
 _NON_ENERGY_KEYS = ('internal_prior_path', 'prior_sample_size', 'reward_range',
                     'density_coeff', 'reduction_coeff', 'analyze_kwargs',
-                    'internal_oom_recovery', 'prior_relax_steps')
+                    'internal_oom_recovery', 'prior_relax_steps', 'prior_dataset_path')
 
 
-def _column_w1(samples, reference, periodic, n_offsets: int = 24):
-    """Per-column 1-D Wasserstein distance, CIRCULAR on the periodic columns.
+#: Re-exported so existing imports and tests keep resolving; the definitions live in
+#: progress_metrics because nothing in them is conformer-specific.
+from progress_metrics import (_PROGRESS_GATE, _column_w1, _column_w1_ratio,  # noqa: F401
+                              progress_gate)
 
-    Quantile form (mean |sorted difference|) rather than scipy, so it costs nothing and
-    tolerates unequal sample counts.
-
-    A periodic column lives on a circle of period 2, so a distribution straddling the wrap
-    would read as maximally far from an identical one centred at zero. The circular
-    distance is therefore the minimum over a rigid rotation of the sampler, scanned on a
-    coarse grid -- exact when the two differ by a shift, and an upper bound otherwise,
-    which is the safe direction for a "worst columns" ranking.
-    """
-    q = np.linspace(0.0, 1.0, 512)
-    out = np.zeros(samples.shape[1])
-    for j in range(samples.shape[1]):
-        b = np.quantile(reference[:, j], q)
-        v = samples[:, j]
-        d = float(np.abs(np.quantile(v, q) - b).mean())
-        if periodic[j]:
-            for off in np.linspace(-1.0, 1.0, n_offsets, endpoint=False):
-                w = ((v + off + 1.0) % 2.0) - 1.0
-                d = min(d, float(np.abs(np.quantile(w, q) - b).mean()))
-        out[j] = d
-    return out
 
 
 class ConformerModeller(Modeller):
@@ -357,7 +338,9 @@ class ConformerModeller(Modeller):
         metrics.update(cm.energy_component_stats(en, state))
         metrics.update(cm.geometry_stats(en, state))
         metrics.update(cm.dof_class_stats(en, state, reference=prior_x))
-        metrics.update(cm.dof_element_stats(en, state))
+        # SAME reference as dof_class_stats, so the per-element ratios are the drill-down
+        # for that group's sd_ratio_max rather than a second, unreferenced set of spreads.
+        metrics.update(cm.dof_element_stats(en, state, reference=prior_x))
         metrics.update(cm.ring_stats(en, state))
         # per-CYCLE ring torsion distributions against the prior. The pooled phi histogram
         # averages two rings that can fail in OPPOSITE directions into one blob -- on
@@ -377,15 +360,26 @@ class ConformerModeller(Modeller):
         # same call as basin_coverage on purpose: read alone it rewards mode collapse,
         # because an abandoned basin drops out of the grouping instead of failing it, so
         # n_missed has to be on the same panel. See basin_nonthermal.
+        u_star = (float(getattr(self.args, 'nonthermal_entropy_per_dim', 4.0) or 0.0)
+                  * int(en.ndim))
         metrics.update(cm.basin_nonthermal(
-            en, state, e, self._e_min, self._basin_ref,
-            float(getattr(self.args, 'nonthermal_entropy_per_dim', 4.0) or 0.0)
-            * int(en.ndim)))
-        metrics.update(cm.thermal_stats(en, e[finite], self._e_min))
-        if prior_y is not None:
-            metrics.update(cm.energy_vs_reference(e[finite], prior_y))
-        metrics.update(cm.feature_correlations(
-            e, self._molecule_features(sample_batch), 'corr_E/'))
+            en, state, e, self._e_min, self._basin_ref, u_star))
+        # THE DENOMINATORS FOR THE THREE LIVE cover/ KEYS, once. n_missed = 0 is
+        # meaningless without n_accessible, worst_frac is only readable against the uniform
+        # expectation, and coupling_tc_debiased only against the target's own coupling --
+        # but none of them move within a run, so they are a startup line rather than three
+        # more flat traces on the dashboard.
+        if not getattr(self, '_cover_constants_logged', False):
+            self._cover_constants_logged = True
+            const = cm.cover_constants(en, self._basin_ref, u_star=u_star,
+                                       target_tc=self._target_coupling)
+            print('cover/ constants (fixed for this run, not logged): '
+                  + ', '.join(f'{k.split("/")[-1]}={v:.4g}' if isinstance(v, float)
+                              else f'{k.split("/")[-1]}={v}' for k, v in const.items()))
+        # Marginal fit, energy-marginal overlap and the exit verdict are emitted by
+        # Modeller.progress_metrics (train.py), which is ROUTE-AGNOSTIC -- it reads
+        # everything through _batch_latents, so the crystal route gets the identical
+        # measurement. Duplicating it here would double-log and let the two drift.
 
     # ---------------------------------------------------------------- energy
 
@@ -722,13 +716,61 @@ class ConformerModeller(Modeller):
         finally:
             self.prior_dataset = saved
 
-    def init_prior_dataset(self):
-        """Phase 1's dataset: draws from the fitted prior, scored at init.
+    def _load_prior_dataset(self, path):
+        """Read a prebuilt conformer state set off disk, and PROVE it belongs to this run.
 
-        NO FILE IS LOADED. The crystal route reads a prepared prior dataset off disk; the
-        conformer track has a fitted InternalPrior instead, so the equivalent is to sample
-        it. Owner decision 2026-08-20: sample ``prior_sample_size`` rows, score them once
-        here, and use that as the phase-1 dataset.
+        A state tensor carries no self-description: rows built for another molecule, another
+        `level`, or another `energy_clip` load without complaint and train against energies
+        that mean something else. So two checks, and the second is the one that bites.
+
+        1. Metadata equality on the keys that change what an energy MEANS -- smiles, level,
+           force_field, energy_clip, data_ndim.
+        2. RE-SCORE the loaded states and compare against the stored energies. Metadata can
+           be right while the file is stale (rebuilt force field, changed spanning tree),
+           and only recomputation catches that. `prebuilt_sample_to_reward` reads the baked
+           energy and REFUSES to recompute, so a mismatch that slips through here is never
+           caught later -- it just trains on wrong rewards.
+        """
+        from energies.conformer_data import bake_energies
+
+        blob = torch.load(path, weights_only=False)
+        want = {'smiles': self.energy_function.smiles,
+                'level': getattr(self.energy_function, 'level', None),
+                'force_field': getattr(self.energy_function, 'force_field', None),
+                'energy_clip': getattr(self.args.energy_config, 'energy_clip', None),
+                'data_ndim': int(self.energy_function.data_ndim)}
+        bad = {k: (blob.get(k), v) for k, v in want.items()
+               if v is not None and k in blob and blob[k] != v}
+        if bad:
+            raise SystemExit(
+                f'prior_dataset_path={path!r} was not built for this run:\n' +
+                '\n'.join(f'  {k}: file has {a!r}, run wants {b!r}' for k, (a, b) in bad.items()))
+
+        states = torch.as_tensor(blob['states'], dtype=self.energy_function.dtype,
+                                 device=self.device)
+        stored = torch.as_tensor(blob['energies']).to(states.device).double()
+        fresh = bake_energies(self.energy_function, states).detach().double()
+        gap = (fresh - stored).abs()
+        finite = torch.isfinite(gap)
+        worst = float(gap[finite].max()) if bool(finite.any()) else float('inf')
+        if worst > 1e-2:
+            raise SystemExit(
+                f'prior_dataset_path={path!r} re-scores differently from its stored '
+                f'energies (worst |delta| = {worst:.4g} kcal/mol over {len(states):,} rows). '
+                'The file is stale with respect to the current energy definition; rebuild '
+                'it rather than training on rewards that no longer describe these states.')
+        print(f'prior dataset: {len(states):,} states loaded from {path} and re-scored '
+              f'(worst |delta| {worst:.2e} kcal/mol) -- provenance verified')
+        return states, fresh.to(self.energy_function.dtype)
+
+    def init_prior_dataset(self):
+        """Phase 1's dataset: a prebuilt set off disk, or draws from the fitted prior.
+
+        `energy_config.prior_dataset_path` loads a set built by
+        `build_conformer_prior_dataset.py`. With it unset the conformer track has no file to
+        read -- unlike the crystal route -- so the equivalent is to sample the fitted
+        InternalPrior: `prior_sample_size` rows, scored once here (owner decision
+        2026-08-20).
 
         Scored at init for the same reason the crystal route re-analyses its prior at init:
         ``prebuilt_sample_to_reward`` reads a baked ``conformer_energy`` off the graph and
@@ -740,15 +782,20 @@ class ConformerModeller(Modeller):
         """
         from energies.conformer_data import attach_states, bake_energies, condition_from_energy
 
-        if self.internal_prior is None:
-            raise SystemExit(
-                'energy_config.internal_prior_path is unset and prior_path is null, so '
-                'there is nothing to seed phase 1 from. Point one of them at a prior.')
-
+        path = getattr(self.args.energy_config, 'prior_dataset_path', None)
         n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
-        rng = self._prior_rng
-        states, stats = self._draw_prior_states(n, rng, report=True)
-        energies = bake_energies(self.energy_function, states)
+        if path:
+            states, energies = self._load_prior_dataset(path)
+            stats = {}
+        else:
+            if self.internal_prior is None:
+                raise SystemExit(
+                    'energy_config.internal_prior_path and prior_dataset_path are both '
+                    'unset and prior_path is null, so there is nothing to seed phase 1 '
+                    'from. Point one of them at a prior.')
+            rng = self._prior_rng
+            states, stats = self._draw_prior_states(n, rng, report=True)
+            energies = bake_energies(self.energy_function, states)
 
         cond = condition_from_energy(self.energy_function,
                                      identifier=self.energy_function.smiles)
@@ -767,9 +814,17 @@ class ConformerModeller(Modeller):
                                              exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                              )
         e = energies.detach().cpu().numpy()
-        print(f'prior dataset: {n} states sampled from the fitted InternalPrior and scored '
-              f'at init -- median {np.median(e):.1f}, p10 {np.percentile(e, 10):.1f}, '
-              f'p90 {np.percentile(e, 90):.1f} kcal/mol')
+        src = f'loaded from {path}' if path else \
+            f'{n} states sampled from the fitted InternalPrior and scored at init'
+        # T_eff/T is the reading that says whether these terminals are THERMAL (2.0) or a
+        # curated low-energy set (well below it). Both are legitimate -- TB is off-policy,
+        # so the fixed point does not depend on the backward terminal distribution -- but
+        # which one is in play changes what the backward branch is teaching, and it should
+        # never be a surprise. Measured on the filtered tetraglycine set: 1.18.
+        teff = 1 + 2 * (float(np.median(e)) - float(e.min())) / self.energy_function.ndim
+        print(f'prior dataset: {src} -- median {np.median(e):.1f}, '
+              f'p10 {np.percentile(e, 10):.1f}, p90 {np.percentile(e, 90):.1f} kcal/mol, '
+              f'T_eff/T = {teff:.2f} (2.0 = thermal, lower = curated/cold)')
         if stats.get('n_closure_bonds'):
             print(f'  ring closure {stats["closure_err"]:.4f} A = '
                   f'{stats["closure_sigma"]:.2f} bond-sigma over {stats["n_rings"]} '

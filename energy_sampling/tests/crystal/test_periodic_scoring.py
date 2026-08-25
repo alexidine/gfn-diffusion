@@ -13,7 +13,8 @@ import sys
 
 import pytest
 
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))   # tests/<area>/x.py -> energy_sampling/
 for _root in (os.path.dirname(_here),                                   # gfn_diffusion
               os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
     if _root not in sys.path:

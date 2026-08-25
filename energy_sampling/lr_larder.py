@@ -131,6 +131,40 @@ class Larder:
         """
         self.rings.clear()
 
+    @staticmethod
+    def _bytes(v) -> int:
+        """Host bytes held by one harvested field.
+
+        Approximate by design -- it walks tensors and PyG stores and counts
+        `element_size * nelement`, which is the storage that actually dominates.
+        Approximate is enough: the question this answers is "is the larder tens
+        of megabytes or tens of gigabytes", and nothing in between changes a
+        decision.
+        """
+        if v is None:
+            return 0
+        if torch.is_tensor(v):
+            return v.element_size() * v.nelement()
+        # a PyG Data/Batch: sum its tensor stores
+        store = getattr(v, '_store', None) or getattr(v, '__dict__', {})
+        items = store.items() if hasattr(store, 'items') else []
+        return sum(t.element_size() * t.nelement()
+                   for _k, t in items if torch.is_tensor(t))
+
+    def nbytes(self) -> int:
+        """Host bytes the whole larder is holding, right now.
+
+        MEASURED RATHER THAN ASSUMED, and that distinction cost a run. `depth`
+        was set to `4 * n_sub` on the reasoning that headroom above n_sub "only
+        buys older data" -- true, but it says nothing about the PRICE, and the
+        price is per branch. Phase 1 has one branch; a fused crystal stage has
+        three, each holding full trajectories and PyG graphs for a batch of
+        1000. `nbytes()` stays so the cost is never again a thing
+        anyone has to reason about.
+        """
+        return sum(sum(self._bytes(f) for f in rec)
+                   for ring in self.rings.values() for rec in ring)
+
     def eligible(self, branch: str, before_step: int) -> list:
         """This branch's records that did NOT feed the step being rated."""
         return [r for r in self.rings.get(branch, ()) if r.step < before_step]
@@ -271,13 +305,62 @@ class LarderScorer:
                 print(f"larder: {branch} bank " + '; '.join(bits))
         return cached
 
+    @staticmethod
+    def _check_condition_grouping(bank, rec):
+        """A condition-grouped bank replayed WITHOUT condition_id silently
+        computes a different loss. Refuse instead.
+
+        `get_gfn_backward_loss` gates the condition-grouped VarGrad on
+        `vg_by_condition and condition_id is not None and (vg_lb > 0 or
+        vg_lme > 0)`. Drop the ids and that `is not None` fails, so control falls
+        through to the LEGACY repeats-grouped branch -- which for same-terminal
+        tiles is TBC in disguise. A different objective, computed with no error
+        and no warning, and the ray would then be rating a loss the stage does
+        not train.
+
+        The larder stores the WHOLE batch, so the ids do come back unchanged and
+        the groups are identical to the live step's by construction -- verified.
+        This guard is for the case where that stops being true.
+        """
+        if not (float(getattr(bank, 'vg_by_condition', 0) or 0) > 0.5):
+            return
+        if not (float(getattr(bank, 'vg_lb', 0) or 0) > 0
+                or float(getattr(bank, 'vg_lme', 0) or 0) > 0):
+            return
+        if rec.condition_id is None:
+            raise BranchRefused(
+                f"branch {rec.branch!r} trains condition-grouped VarGrad "
+                f"(vg_by_condition) but its harvested record carries no "
+                f"condition_id. Replaying it would fall through to the LEGACY "
+                f"repeats-grouped VarGrad -- a different objective, silently.")
+
     @torch.no_grad()
-    def score(self, rec: Harvested, discretizer) -> float:
-        """One harvested batch, one number, at the current parameters."""
+    def score(self, rec: Harvested, discretizer, resample: bool = False) -> float:
+        """One harvested batch, one number, at the current parameters.
+
+        `resample=False` -- the default, and the ONLY thing the controller ever
+        actuates on -- REPLAYS the stored path: passing `trajectories=` routes
+        `get_gfn_backward_loss` to `get_traj_replay`, which treats the path as
+        data and re-scores it under the current parameters.
+
+        `resample=True` passes `trajectories=None`, so the same terminal states
+        are scored under a path sampled FRESH from the current P_B --
+        `get_traj_bwd`. That is what a `bwd` branch whose live draw sets
+        `traj=None` (`bwd_sampling_mode: dataset` or `prior`) actually trains
+        on, and it is not the same objective. Along the ray the stored path was
+        sampled from P_B at theta_before, so as alpha grows it goes
+        off-distribution for the P_B being scored: the replayed loss can rise
+        where the trained one falls. DIAGNOSTIC ONLY -- see `RayCalibration`.
+
+        Neither costs an energy call: `log_r` is stored either way. The fresh
+        pass is backward-sampling passes only.
+        """
         dev = self.m.device
         traj = to_device(rec.traj, dev)
+        bank = self.bank(rec.branch)
+        self._check_condition_grouping(bank, rec)
         loss, _ = get_gfn_backward_loss(
-            self.bank(rec.branch),
+            bank,
             traj[:, -1] if traj.dim() == 3 else traj,
             self.m.gfn_model,
             to_device(rec.log_r, dev),
@@ -286,7 +369,7 @@ class LarderScorer:
             condition=to_device(rec.condition, dev),
             repeats=rec.repeats,
             report_losses=False,
-            trajectories=traj,
+            trajectories=None if resample else traj,
             condition_log_z=self.m.condition_log_z,
             condition_id=to_device(rec.condition_id, dev),
             tb_z_source=self.m.tb_z_source(rec.branch),

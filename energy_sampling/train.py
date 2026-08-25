@@ -49,7 +49,7 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
-    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS
+    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling.grad_clip_guard import GradClipGuard
@@ -478,8 +478,14 @@ class Modeller:
         conformer graph and does not merely go unused there -- MXtalBase defers unknown
         attributes to the PyG store, which raises. Sizes, devices and exclude-key sets stay
         at the call sites because they are the caller's business.
+
+        ``x_fn`` lives here because it IS the data model: how the GFN state is
+        read off a stored graph. None = latent_params() with its crystal
+        gauge-fix; toy routes read gauge-FREE (every latent dim is real there --
+        the fix for P1's delta-pinned u,v,w targets, 2026-08-24).
         """
-        return dict(max_z_prime=max(self.args.z_primes))
+        return dict(max_z_prime=max(self.args.z_primes),
+                    x_fn=None if self.energy_function.is_crystal else toy_latent_params)
 
     def _eval_extra_stats(self, mol_batch):
         """Per-sample columns the eval accumulator should carry beyond the TB family.
@@ -541,8 +547,13 @@ class Modeller:
         rationale as buffer_cls -- ``MXtalBase.__getattr__`` defers to the PyG store, so
         ``latent_params`` does not go unused on a conformer graph, it raises. Crystal
         behaviour is unchanged: the same call, at the same sites.
+
+        Gauge-fixing follows the route: crystals fix the free centroid axes (pure
+        translation gauge, held dead in the SDE); toys must NOT (every dim is
+        real there -- the P1 delta-target fix, 2026-08-24).
         """
-        return batch.latent_params()
+        return batch.latent_params(
+            gauge_fix_free_axes=self.energy_function.is_crystal)
 
     def _buffer_y_fn(self):
         """The batch KEY a churned buffer reads its scalar `y` from.
@@ -2500,7 +2511,7 @@ class Modeller:
             # pass whose MLIP chunk size collapsed to 144 on the uma arm.
             with torch.no_grad():
                 energy, prior = self.energy_function.batched_analyze_crystal_batch(
-                    prior.latent_params(),
+                    self._batch_latents(prior),
                     prior,
                     self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
                                                                      device=self.device),
@@ -2535,7 +2546,6 @@ class Modeller:
         self.prior_dataset = CrystalBuffer(prior,
                                            device=self.buffer_device,
                                            **self._buffer_kwargs(),
-                                           x_fn=None,  # 'latent_params',
                                            y_fn=self._buffer_y_fn(),
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
@@ -2944,15 +2954,23 @@ class Modeller:
             # adequate for a 1e9 numerical-death bar and not for a bar derived
             # from the run's own loss scale: a too-hot rate detonates in tens of
             # steps, and the same window feeds the bracket's bars.
-            current_fwd = self.metric_tracker.get('fwd', 'r2')
-            current_bwd = self.metric_tracker.get('bwd', 'r2')
-            current_replay = self.metric_tracker.get('replay', 'r2')
-
-            if current_fwd is None and current_bwd is None and current_replay is None:
-                self.combo_loss_record.append(float('inf'))
-            else:
-                total = (current_fwd or 0) + (current_bwd or 0) + (current_replay or 0)
-                self.combo_loss_record.append(3 - total)  # (1-x) + (1-y) + (1-z) = 3-x-y-z
+            #
+            # THE 'BEST' SCORE (owner decision 2026-08-24): fwd/tb_err_worst +
+            # bwd/tb_err_worst, a channel that is not yet logged reading +LARGE.
+            # The old r2-combo was DEGENERATE on the MLE warm start (bwd/r2 runs
+            # negative and declining there), so 'best' froze at the first finite
+            # tracker reading (~step 300) on every route's phase 1 -- toy_wk_aug24
+            # died rewinding into that frozen record. The +LARGE convention is
+            # benign: within any stage the missing-channel set is fixed, so the
+            # constant cancels out of every comparison; when a dark channel comes
+            # alive the combo DROPS by LARGE (a fully-informed state is a fair
+            # new record), and transitions clear the record anyway.
+            LARGE = 1.0e6
+            current_fwd = self.metric_tracker.get('fwd', 'tb_err_worst')
+            current_bwd = self.metric_tracker.get('bwd', 'tb_err_worst')
+            self.combo_loss_record.append(
+                (LARGE if current_fwd is None else float(current_fwd)) +
+                (LARGE if current_bwd is None else float(current_bwd)))
 
     def _rewind_checkpoint_path(self):
         """Pick fire_loss_spike's rewind target, NEVER reverting to an earlier
@@ -2963,18 +2981,16 @@ class Modeller:
         hung 11k steps fitting a 174k broad buffer a z_match Z was never
         calibrated for).
 
-        Prefer the same-stage 'best' ONLY WHILE IT IS FRESH. 'best' is linked on
-        a quality-record condition, and on stages where that record freezes early
-        ('best of the r2-combo samples' is degenerate on the MLE warm start, so it
-        latched at the first finite tracker reading ~step 300) a rewind restored
-        a near-init model whose raw loss re-tripped the excursion bar on the very
-        next step -- a guaranteed loop straight through the reload budget
-        (toy_wk_aug24, 4 rewinds in 4 steps, abort). A 'best' more than
-        10 x eval_period behind the present is that frozen record, not a
-        recovery point, so fall through to the ROLLING checkpoint ('running',
-        <= 50 steps old, saved before the bar fired). Then this stage's
-        'stage_start' turnover point (post-on_enter, healthy by construction),
-        then bare 'best' so behavior is never worse than before the fix.
+        LR-DIVERGENCE REWINDS TARGET THE ROLLING CHECKPOINT (owner decision
+        2026-08-24): 'running' is <= 50 steps old and saved before the bar
+        fired, so it is the most recent state known to predate the incident.
+        'best' is a QUALITY record, not a recovery point -- its selector can
+        legitimately lag far behind the present (its old r2 form froze at
+        ~step 300 on every warm start, and rewinding into that near-init state
+        re-tripped the bar every 2 steps until the budget aborted the run,
+        toy_wk_aug24). Order: same-stage 'running'; else this stage's
+        'stage_start' turnover point (post-on_enter, healthy by construction);
+        else 'best' so behavior is never worse than having no rule.
         """
         idx = {s.name: s.index for s in self.protocol.stages}
         current = idx.get(self.protocol.stage.name, -1)
@@ -2990,26 +3006,17 @@ class Modeller:
             except Exception:
                 return None, None, path
 
-        stale_after = 10 * int(getattr(self.args, 'eval_period', 250) or 250)
-        best_idx, best_step, best_path = stage_and_step('best')
-        best_fresh = (best_step is not None
-                      and self.step_ind - int(best_step) <= stale_after)
-        if best_idx is not None and best_idx >= current and best_fresh:
-            return best_path
-        if best_idx is not None and best_idx >= current and not best_fresh:
-            run_idx, run_step, run_path = stage_and_step('running')
-            if run_idx is not None and run_idx >= current:
-                print(f"rewind: 'best' is {self.step_ind - int(best_step)} steps stale "
-                      f"(> {stale_after}) -- its quality record froze, so it is not a "
-                      f"recovery point; rewinding to the rolling checkpoint "
-                      f"(step {run_step}) instead")
-                return run_path
-            return best_path        # stale but same-stage, and nothing fresher exists
+        run_idx, run_step, run_path = stage_and_step('running')
+        if run_idx is not None and run_idx >= current:
+            return run_path
         start_idx, start_step, start_path = stage_and_step('stage_start')
         if start_idx == current:
-            print(f"rewind: 'best' stage {best_idx} precedes current stage {current}; "
-                  f"reverting to this stage's start rather than reversing the phase")
+            print(f"rewind: no same-stage rolling checkpoint; reverting to this "
+                  f"stage's start rather than reversing the phase")
             return start_path
+        best_idx, best_step, best_path = stage_and_step('best')
+        if best_idx is not None and best_idx >= current:
+            return best_path
         return best_path if os.path.exists(best_path) else None
 
     def fire_loss_spike(self):
@@ -6561,7 +6568,6 @@ class Modeller:
                 sample_batch,
                 device=self.buffer_device,
                 **self._buffer_kwargs(),
-                x_fn=None,  # 'latent_params',
                 y_fn=self._buffer_y_fn(),
                 exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
             )
@@ -7436,7 +7442,6 @@ class Modeller:
                 sample_batch.subsample_new_batch(add_inds),
                 device=self.buffer_device,
                 **self._buffer_kwargs(),
-                x_fn=None,
                 y_fn=self._buffer_y_fn(),
                 traj=flow_states[add_inds.to(flow_states.device)],
                 init_loss=resid[add_inds].abs(),
@@ -7621,7 +7626,6 @@ class Modeller:
             seed_batch,
             device=self.buffer_device,
             **self._buffer_kwargs(),
-            x_fn=None,
             y_fn=self._buffer_y_fn(),
             exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
         )
@@ -7973,8 +7977,7 @@ class Modeller:
                     sample_batch,
                     device=self.buffer_device,
                     **self._buffer_kwargs(),
-                    x_fn=None,  # 'latent_params',
-                    y_fn=self._buffer_y_fn(),
+                        y_fn=self._buffer_y_fn(),
                     exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
                 )
             else:

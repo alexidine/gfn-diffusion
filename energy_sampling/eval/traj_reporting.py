@@ -416,13 +416,11 @@ def to_scalars(res):
         _trapz = getattr(np, "trapezoid", None) or np.trapz
         out["delta_overlap"] = float(_trapz(np.minimum(hF, hB), c))  # 0..1
 
-    sk = res.get("step_kl")
-    if sk is not None:
-        kl_fb, _, kl_sym = (_np(x) for x in sk)
-        out["stepkl_sum"] = float(kl_sym.sum())
-        out["stepkl_max"] = float(kl_fb.max())
-        out["stepkl_argmax_t"] = int(kl_fb.argmax())
-        out["stepkl_drift"] = float(kl_fb[-1] - kl_fb[0])   # growth over t
+    # 'stepkl_sum/max/argmax_t/drift' retired 2026-08-23 (owner decision). They
+    # reduced the per-timestep fwd/bwd step-kernel KL curve to four numbers; the
+    # curve itself is what carries the information and nothing read the
+    # reductions. `res['step_kl']` is still computed by traj_overlap_report for
+    # any caller that wants the curve -- only the logging is gone.
 
     mv = res.get("mmd_vs_t")
     if mv is not None:

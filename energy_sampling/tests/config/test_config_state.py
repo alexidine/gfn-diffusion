@@ -21,7 +21,7 @@ from config_state import (CHANGES, CURRENT_STATE_VERSION, UNSTAMPED_VERSION,
                           VERSION_KEY, Change, Transition, config_version, migrate,
                           state_changes)
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 # The problem identity: migration versions the config SCHEMA and must never touch
@@ -230,12 +230,18 @@ def test_migration_does_not_mutate_its_input():
 
 
 def test_rename_moves_the_key_and_keeps_the_value():
+    """The rename engine, checked on a nested block.
+
+    NB the vehicle used to be `adaptive_lr.cut_ratio -> divergence_cut`, and the
+    final assertion has to be made on the REPORT rather than on the output: state
+    10 retires `adaptive_lr` whole, so a 0 -> 10 migration renames the key and
+    then lifts the block away underneath it. Both steps are correct; asserting on
+    the intermediate state would pin a value no migrated config ever holds."""
     cfg = {'adaptive_lr': {'cut_ratio': 0.25, 'warmup_steps': 1000}}
     out, report = migrate(cfg)
-    assert 'cut_ratio' not in out['adaptive_lr']
-    assert out['adaptive_lr']['divergence_cut'] == 0.25
-    assert out['adaptive_lr']['warmup_steps'] == 1000  # untouched neighbour
     assert any('rename' in a and 'cut_ratio' in a for a in report.applied)
+    assert 'adaptive_lr' not in out, 'state 10 retires the block whole'
+    assert 'lr_control' in out
 
 
 def test_nested_rename_across_blocks():
@@ -256,13 +262,21 @@ def test_removal_drops_the_key():
 
 
 def test_absent_keys_produce_no_report_lines():
-    """A clean config must migrate silently. A migration that narrates work it did
-    not do is noise, and noise is what stops people reading migration reports."""
+    """A clean config must migrate near-silently. A migration that narrates work
+    it did not do is noise, and noise is what stops people reading migration
+    reports.
+
+    THE ONE TRANSFORM IS NOT NOISE, and it is worth naming rather than excusing:
+    state 7 ADDS `adaptive_lr.envelope_freeze` and state 10 RETIRES the whole
+    `adaptive_lr` block, so a state-0 config walking the full chain acquires that
+    block and then has it lifted away. The transform reports because it really
+    did change the config."""
     cfg = {'batch_size': 1000}
     out, report = migrate(cfg)
     assert out[VERSION_KEY] == CURRENT_STATE_VERSION
     assert report.needs_judgment == []
-    assert all('add' in a for a in report.applied)  # only the version stamp
+    assert 'adaptive_lr' not in out
+    assert all('add' in a or 'custom transform' in a for a in report.applied)
 
 
 def test_manual_key_is_reported_and_left_alone():

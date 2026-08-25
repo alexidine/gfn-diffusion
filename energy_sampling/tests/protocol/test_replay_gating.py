@@ -35,7 +35,8 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))   # tests/<area>/x.py -> energy_sampling/
 for p in (_here, os.path.dirname(_here),
           os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
     p = os.path.abspath(p)
@@ -109,6 +110,12 @@ def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
     """
     proto = SimpleNamespace(stage=stg, stages=[stg])
     proto.mode_boostable = MethodType(StageProtocol.mode_boostable, proto)
+    # ...and the REAL flag reader, for the same reason. Which stages run the Z
+    # sidecar is a stage flag: `z_calibration.enabled` was relocated INTO
+    # `flags: {z_calibration: true}`, so a stub that answered from the block
+    # would be modelling the retired contract, which is the defect that made
+    # replay_in_play's z_calibration clause dead in the first place.
+    proto.flag = MethodType(StageProtocol.flag, proto)
     m = SimpleNamespace(
         protocol=proto,
         step_ind=step_ind,
@@ -126,7 +133,19 @@ def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
                                alphas=(0.0, 1.0, 2.0), n_sub=2, period=10,
                                enabled=ray_enabled),
     )
-    for name in ('replay_in_play', 'manage_replay_buffer',
+    # _probe_refusal is bound too, and its state stubbed: _ray_probe_armed calls
+    # it on any stage that DOES declare a ray sensor, so without it this suite
+    # could only ever exercise the early-return cases (no sensor / none / hyper)
+    # and would raise on the one case the test is named for.
+    #
+    # `larder=None` is the faithful stub here: these tests are about whether the
+    # probe ARMS, and a run with no larder refuses structurally -- which is a
+    # verdict, not an error.
+    m.larder = None
+    m._probe_weights = {}
+    m._probe_refusals_seen = set()
+    m._probe_exclude_from = None
+    for name in ('replay_in_play', 'manage_replay_buffer', '_probe_refusal',
                  '_ray_probe_armed', '_check_ray_wiring', '_ray_askers'):
         setattr(m, name, MethodType(getattr(Modeller, name), m))
     return m
@@ -157,9 +176,10 @@ def check(name, got, want):
 def test_replay_in_play():
     """The predicate, over the real protocol's stages and the three consumers."""
     print('replay_in_play')
-    zc_replay = SimpleNamespace(enabled=True, mode='replay')
-    zc_rollout = SimpleNamespace(enabled=True, mode='rollout')
-    zc_off = SimpleNamespace(enabled=False, mode='replay')
+    # The block says HOW the sidecar runs; the stage flag says WHETHER. Both
+    # axes are exercised, because the clause under test needs both.
+    zc_replay = SimpleNamespace(mode='replay')
+    zc_rollout = SimpleNamespace(mode='rollout')
     cases = [
         # (name, modeller, expected)
         ('var_conditioning (replay pinned at 0)',
@@ -170,10 +190,11 @@ def test_replay_in_play():
          modeller(stage(NAIVE), zc_rollout), True),
         ('var_conditioning + lr_sensor ray',
          modeller(stage(VAR_CONDITIONING, lr_sensor={'kind': 'ray'}), zc_rollout), True),
-        ('var_conditioning + z_calibration mode replay',
-         modeller(stage(VAR_CONDITIONING), zc_replay), True),
-        ('var_conditioning + z_calibration replay but DISABLED',
-         modeller(stage(VAR_CONDITIONING), zc_off), False),
+        ('var_conditioning + z_calibration mode replay, stage FLAGGED',
+         modeller(stage(VAR_CONDITIONING, flags={'z_calibration': True}),
+                  zc_replay), True),
+        ('...same block, stage does NOT flag it: off by omission',
+         modeller(stage(VAR_CONDITIONING), zc_replay), False),
         ('var_conditioning, no z_calibration block at all',
          modeller(stage(VAR_CONDITIONING), None), False),
         # the parser requires a pin to agree with the stage's entry frac, so the
@@ -191,7 +212,7 @@ def test_pin_is_load_bearing():
     """MUTATION. Reading the pin by presence -- what Stage.active_modes does --
     must give the WRONG answer on var_conditioning, or this suite is blind."""
     print('pin read by value, not presence (mutation)')
-    m = modeller(stage(VAR_CONDITIONING), SimpleNamespace(enabled=False, mode='rollout'))
+    m = modeller(stage(VAR_CONDITIONING), SimpleNamespace(mode='rollout'))
     ok = check('engine says replay is boostable (the trap)',
                m.protocol.mode_boostable('replay'), True)
     ok &= check('replay_in_play corrects it', m.replay_in_play(), False)
@@ -204,7 +225,7 @@ def test_manage_replay_buffer_returns_first():
     """The gate must fire AHEAD of every read of fwd_stats -- the flow_states
     transfer is the cost, not the bookkeeping."""
     print('manage_replay_buffer early return')
-    off = modeller(stage(VAR_CONDITIONING), SimpleNamespace(enabled=False, mode='rollout'))
+    off = modeller(stage(VAR_CONDITIONING), SimpleNamespace(mode='rollout'))
     ok = True
     try:
         off.manage_replay_buffer(Poisoned(), sample_batch=None)
@@ -216,7 +237,7 @@ def test_manage_replay_buffer_returns_first():
 
     # MUTATION: the same call on a stage that DOES use replay must reach the
     # body. If it does not, the test above proves nothing.
-    on = modeller(stage(NAIVE), SimpleNamespace(enabled=False, mode='rollout'))
+    on = modeller(stage(NAIVE), SimpleNamespace(mode='rollout'))
     try:
         on.manage_replay_buffer(Poisoned(), sample_batch=None)
         print('  FAIL  naive stage: manage_replay_buffer returned early too')

@@ -345,3 +345,46 @@ THE BATCH SIZER IS REPLACED (phase 6: replace, do not patch further). The throug
 
 - Local shakeout 2026-08-19 (configs/synth_aug19/): the ladder walks and advances 1000 -> 1600 on the shipped capped-geometric step, with the per-rung reading taken from raw occupancy samples rather than the trailing windowed mean.
 - MEASURED consequence of arming the ladder, and the reason max_batch_size is a budgeting decision rather than a free bound: at max_batch_size 20000 the ladder is 21 rungs, and a rung needs both a batch_growth_interval dwell and 3 occupancy samples at gpu_util_sample_period_s -- >= 63 min of calibration per stage on a fast route, and ~2.5 h per rung at prod0810-scale MLIP step times, where the walk cannot finish inside a job at all.
+
+## STATE 10 — THE ADAPTIVE LR CONTROLLER IS REPLACED BY A BRUTE-FORCE BRACKET, and the `adaptive_lr` block is retired whole in favour of `lr_control`.
+
+THE ADAPTIVE LR CONTROLLER IS REPLACED BY A BRUTE-FORCE BRACKET, and the `adaptive_lr` block is retired whole in favour of `lr_control`. The mechanism is: burn in for a fixed number of steps at a fixed conservative scale; checkpoint the complete mature trainer state; run a configured grid of fixed-LR continuations from that one checkpoint; take the lowest rung that detonated as the boundary, confirm it under a derived seed, and keep the highest rung `safety_rungs` below it for the rest of the stage.
+    WHY. `ray` was killed 2026-08-23 by its own acceptance test. alpha* is defined as s*/lr, so the slope of log(alpha*) against log(lr) MUST be -1; measured on `bracketed` readings only, across twelve runs, two stages and rate spans up to 2.7 decades, it was 0.00 +- 0.2 and several slopes were POSITIVE. The sensor was uncorrelated with the variable it steered. The pooled estimator, the sweep, the rung ladder and `alpha_target` were all built on it and inherit that. A 1,200-step cruise with zero moves had been reported as the controller working; it is the null output, and the null output is what a dead sensor produces.
+    THE WARMUP ENVELOPE GOES WITH IT, and not incidentally: candidate rungs have to be auditable EFFECTIVE rates, and a continuous multiplier underneath them means the rate under test is not the rate applied -- which is exactly how a too-hot rung survives its trial. Burn-in replaces it: a fixed scale for a fixed number of steps.
+    `ray` and `hyper` SURVIVE AS OPT-IN DIAGNOSTICS that reach no learning rate, off unless a stage names one; `plateau` is deleted entirely, having been a pure actuator with nothing to report.
+    THE HARD-FAILURE BARS ARE DRAWN TWICE, because they do two jobs at two rates. Fitted to the tail of burn-in they are the right scale for judging a TRIAL -- every trial restores that same root and is comparable to it. They are the wrong scale for the LIVE TRIPWIRE, which then judges every training step for the rest of the stage at a promoted rate up to the top of the grid: a hotter rate moves the loss more for ordinary reasons, so a bar fitted cold is crossed by healthy training and each crossing costs a rewind against max_reloads_per_1k_steps. After promotion the bars are refitted from a window of ordinary training AT the promoted rate. What guards that window depends on whether anything tested the rate: `bracket` mode SUSPENDS the cold bars, since the rate just survived a trial horizon and the cold bar is now the likelier source of a wrong answer; `fixed` mode keeps them live, since nothing tested that rate and a too-tight bar beats no bar. A stage change now clears the BARS as well as the window -- clearing only the observations left the outgoing stage's bars deciding rewinds through the incoming stage's burn-in.
+
+**Components:** `controller.py`, `lr_bracket.py`, `lr_bracket_probe.py`, `train.py`, `protocol.py`, `checkpointing.py`, `config_invariants.py`, `configs/mk_dev.yaml`
+
+**Added:**
+
+- `lr_control.hard_failure.cruise_rederive` = `True`
+- `lr_control.hard_failure.cruise_settle_steps` = `200`
+
+**Removed:**
+
+- `lr_warmup_ratio` -- the warmup envelope is gone. Burn-in is a fixed scale held for a fixed number of steps, not a ramp, so there is no ratio to start from.
+- `lr_control.ray_calibration.enabled` -- the switch is which stages declare lr_sensor kind ray, and a second flag could disagree with them. `ray` reaches no learning rate now, so `enabled: true` would read as arming a controller that does not exist.
+
+**Moved:**
+
+- `adaptive_lr` -> -> `lr_control` (see _lift_lr_control). The transferable values are carried; the three that need JUDGMENT are left ABSENT so the config fails validation naming them, rather than loading with numbers nobody chose. Three of the new block's load-bearing values have no defensible derivation from the old one:
+  * `candidate_scales` -- the grid must be wide enough that its TOP RUNGS ARE EXPECTED TO FAIL. `adaptive_lr.bounds` was a sanity rail spanning 200,000x, which says nothing about where this route detonates; a grid derived from it would report unbracketed_high forever.
+  * `burn_in_steps` -- it has to reach Adam steady state (bias correction sqrt(1-beta2^t)/(1-beta1^t) >= min_root_bias_correction, about t=1700 at beta2 0.999). `warmup_steps` was a ramp length chosen for a different job and its shipped 1000 gives 0.795.
+  * `hard_failure.loss_abs` / `grad_abs` -- the shipped 1.0e+9 bars are refused now, because a bar that cannot fail a candidate makes the bracket return the same answer forever. A migration that carried them over would produce a config that loads and measures nothing.
+Carried across UNCHANGED by hand: seed_lr, control_flow_lr, ray_calibration.*. Simply dropped: warmup_steps, envelope_freeze, warmup_freeze_cos_window, bounds, divergence_cut, divergence_loss_rel, calibration.*, restart_after, ramp.*.
+
+**Invariants:**
+
+- Exactly one thing moves a learning rate: LRController.set_scale, called only by the bracket or by a stage transition. There is no envelope, no decay leg and no sensor in the actuation path, so the effective rate of any step is base_lr x a scale written in the config.
+- A bracket refuses to run rather than measure badly: from a root whose Adam bias correction is under min_root_bias_correction (computed from the optimizer's real step counter), or with a loss window too short for a hard-failure bar to be derived from it.
+- Candidate trials are isolated. Two candidates at the same scale produce bitwise-identical losses, the optimizer step counter round-trips or the restore RAISES, and a candidate that hard-fails ends its trial rather than lowering its own rate.
+- Discarded trial compute does not advance the promoted logical clock: after promotion the run resumes at root_step + trial_steps, not after the sum of all trial compute, and repeat_every counts only promoted steps.
+- `ray` and `hyper` reach no learning rate under any configuration, and publish nothing unless a stage declares them.
+- The bars judging live training describe the rate live training is running at: refitted after promotion from a window of ordinary steps at the promoted rate, and cleared -- not carried -- at a stage change.
+
+**Validation:**
+
+- tests/lr/test_lr_bracket.py -- the selection cases (normal, non-monotone, all-fail, no-fail), the confirmation and densification caps, and the grid/bar validation refusals.
+- tests/lr/test_lr_bracket_driver.py -- state isolation proven by running two candidates at the SAME scale and requiring bitwise-identical losses; a corrupted optimizer restore raising rather than printing; the promoted clock advancing by exactly one horizon.
+- tests/lr/test_lr_bracket_driver.py -- the two-bar section, whose premise (that ordinary training at the promoted rate crosses a bar fitted at the burn-in rate) is MEASURED on the fixture rather than assumed, and whose mutation case requires cruise_rederive: false to produce several times the false divergences.

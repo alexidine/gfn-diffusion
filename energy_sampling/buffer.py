@@ -56,6 +56,21 @@ def strip_lazy_sg_caches(batch):
     return batch
 
 
+def toy_latent_params(batch):
+    """Gauge-FREE latent read, the buffers' x_fn on NON-CRYSTAL (toy) routes.
+
+    latent_params() gauge-fixes the free centroid axes -- correct for crystals,
+    where those axes are pure translation gauge and the SDE holds them dead. On
+    a toy the batch is only a container and every latent dim is a real
+    coordinate of the energy field (resolve_dead_rows returns () there for
+    exactly this reason), so the gauge-fix rewrites live data: on P1 it pinned
+    the multiharmonic toy's u,v,w targets to delta functions the prior does not
+    contain (toy_wk_aug24, 2026-08-24). Module-level, not a lambda, because
+    x_fn is pickled into the buffer's checkpoint state by reference.
+    """
+    return batch.latent_params(gauge_fix_free_axes=False)
+
+
 def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)
 

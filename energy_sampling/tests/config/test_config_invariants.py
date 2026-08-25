@@ -18,7 +18,7 @@ import yaml
 import config_invariants as ci
 from config_invariants import BASELINE, ERROR, RULES, check, errors
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 
@@ -240,44 +240,84 @@ def test_a_well_formed_inactive_protocol_passes(canonical):
     assert errors(cfg) == [], [str(e) for e in errors(cfg)]
 
 
-def test_auto_lr_with_no_sensor_anywhere_is_an_error(canonical):
-    """`auto` claims a servo owns the rate. With no adaptive sensor nothing moves
-    peak_scale off 1.0, so the run trains at the seed for its whole life while the
-    config reads as adaptive."""
+def test_auto_lr_with_no_lr_control_block_is_an_error(canonical):
+    """`auto` claims something owns the rate. With no `lr_control` block nothing
+    sets the scale, so the run trains at the seed for its whole life while the
+    config reads as adaptive.
+
+    A RUN-LEVEL CHECK, where its predecessor was per stage. That is the
+    substantive change: the bracket is not declared per stage and cannot be
+    omitted from one, so the old way of failing -- a stage quietly missing its
+    `lr_sensor` block -- no longer exists."""
     cfg = copy.deepcopy(canonical)
-    for st in cfg['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
-    assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+    cfg.pop('lr_control', None)
+    assert _fires(cfg, 'auto_lr_requires_lr_control')
 
 
-def test_auto_lr_with_sensor_kind_none_is_also_an_error(canonical):
-    """`{kind: none}` and an omitted block mean the same thing. Only the second
-    is silent, but neither owns an `auto` rate."""
+def test_auto_lr_with_an_unknown_mode_is_also_an_error(canonical):
     cfg = copy.deepcopy(canonical)
-    for st in cfg['protocols']['unconditional_tb']['stages']:
-        st['lr_sensor'] = {'kind': 'none'}
-    assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+    cfg['lr_control']['mode'] = 'adaptive'
+    assert _fires(cfg, 'auto_lr_requires_lr_control')
 
 
-def test_one_stage_missing_a_sensor_still_fires(canonical):
-    """Checked PER STAGE: a sensor on the terminal stage does nothing for a
-    phase-1 learning rate."""
+def test_a_grid_that_cannot_fail_is_an_error(canonical):
+    """The bracket's only reading is "did this detonate", so its top rungs have
+    to be EXPECTED to fail. A grid inside the safe region finds no boundary on
+    any cycle, reports unbracketed_high every time and selects one rung below its
+    own ceiling -- a number this config chose, dressed as a measurement."""
     cfg = copy.deepcopy(canonical)
-    cfg['protocols']['unconditional_tb']['stages'][0].pop('lr_sensor', None)
-    v = [x for x in check(cfg) if x.rule == 'auto_lr_requires_an_adaptive_sensor']
-    assert len(v) == 1 and repr(cfg['protocols']['unconditional_tb']['stages'][0]['name']) in v[0].detail
+    cfg['lr_control']['candidate_scales'] = [0.1, 0.15, 0.2]
+    assert _fires(cfg, 'lr_bracket_is_well_formed')
 
 
-def test_explicit_float_lrs_need_no_sensor(canonical):
-    """The other half of the rule: a float is a fixed peak that takes the warmup
-    envelope and divergence handling only, so it has nothing to yield to and must
-    not be flagged."""
+def test_an_unsorted_grid_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['candidate_scales'] = [0.05, 0.4, 0.2, 1.6]
+    assert _fires(cfg, 'lr_bracket_is_well_formed')
+
+
+def test_a_divergence_bar_that_cannot_fire_is_an_error(canonical):
+    """MEASURED: a rate one rung too hot on this route took the loss from about
+    -25 to +318 -- finite, and eight orders of magnitude under a 1e9 bar. Under
+    it every rung completes, counts as a survivor, and the bracket returns the
+    same answer forever while every seam fires correctly."""
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['hard_failure']['loss_abs'] = 1.0e9
+    assert _fires(cfg, 'lr_bracket_is_well_formed')
+
+
+def test_a_control_arm_declaring_bracket_mode_is_an_error(canonical):
+    """Every rate an explicit float means nothing is bracket-managed -- a
+    documented control arm, and it must stay expressible. But `mode: bracket` is
+    the wrong way to spell it and it fails LATE: the config loads, and `LRBracket`
+    then refuses the absent candidate grid when the controller is CONSTRUCTED, so
+    a queued job dies at step 0 instead of saying so at load."""
     cfg = copy.deepcopy(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
-    for st in cfg['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
-    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+    assert _fires(cfg, 'lr_bracket_is_well_formed')
+
+    cfg['lr_control'] = {'mode': 'fixed', 'fixed_scale': 1.0}
+    assert not _fires(cfg, 'lr_bracket_is_well_formed'), (
+        'the control arm must remain expressible as `mode: fixed`')
+
+
+def test_fixed_mode_without_a_scale_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control'] = {'mode': 'fixed'}
+    assert _fires(cfg, 'lr_bracket_is_well_formed')
+
+
+def test_a_burn_in_short_of_adam_steady_state_is_reported(canonical):
+    """BASELINE, not ERROR: the run refuses to bracket at runtime if the MEASURED
+    factor is under the bar, reading the optimizer's real step counter. This is
+    the same arithmetic done in advance so the refusal is not the first anyone
+    hears of it -- and it cannot be an ERROR, because a stage that does not
+    rebuild its optimizers enters with t already large, which the config cannot
+    see."""
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['burn_in_steps'] = 100      # bias correction 0.309
+    assert _fires(cfg, 'burn_in_reaches_adam_steady_state', severity=ci.BASELINE)
 
 
 def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
@@ -291,15 +331,25 @@ def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
     resolved = copy.deepcopy(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         resolved[k] = 1.25e-4                       # as resolution leaves it
-    for st in resolved['protocols']['unconditional_tb']['stages']:
-        st.pop('lr_sensor', None)
+    resolved.pop('lr_control', None)
 
     # derived from the config: the evidence is gone, so nothing fires
-    assert ci.auto_lr_requires_an_adaptive_sensor(resolved) == []
+    assert ci.auto_lr_requires_lr_control(resolved) == []
     # told what was managed: fires correctly
-    told = ci.auto_lr_requires_an_adaptive_sensor(
+    told = ci.auto_lr_requires_lr_control(
         resolved, auto_keys=['lr_policy', 'lr_back', 'lr_replay', 'lr_fused'])
     assert told and all(v.severity == ERROR for v in told)
+
+
+def test_explicit_float_lrs_need_no_lr_control(canonical):
+    """The other half of the rule: a float is a fixed rate that takes divergence
+    handling and the max_lr rail only, so it has nothing to yield to and must not
+    be flagged."""
+    cfg = copy.deepcopy(canonical)
+    for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
+        cfg[k] = 3.0e-4
+    cfg.pop('lr_control', None)
+    assert not _fires(cfg, 'auto_lr_requires_lr_control')
 
 
 def test_no_config_can_make_ray_incoherent_any_more(canonical):
@@ -472,21 +522,27 @@ def test_an_unmeasured_metric_abstains(canonical):
 
 
 def test_patience_on_a_coarse_metric_that_outruns_the_run_is_an_error(canonical):
-    """`patience` counts WRITES of its metric. eval/wass_debiased is written
-    once per eval_period (250 here), so patience 5 needs 1,250 train steps; a
-    1,000-step run can never reach it and the stage exits on its other terms
-    while the config reads as if this one gates."""
-    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=5)
+    """`patience` counts WRITES of its metric. The coarse term here is now
+    gates/progress_done -- published off the EVAL path, not the 10-step tick block,
+    because the marginal and energy metrics it reads exist only there -- so it is
+    written once per eval_period (250 here). patience 5 therefore needs 1,250 train
+    steps; a 1,000-step run can never reach it and the stage exits on its other
+    terms while the config reads as if this one gates."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 0, patience=5)
     cfg['epochs'] = 1000
     assert _fires(cfg, 'exit_patience_is_reachable', severity=ERROR)
 
 
 def test_patience_on_a_coarse_metric_that_fits_is_a_baseline(canonical):
-    """Same term in a run long enough to satisfy it. Reachable, so not an
-    error -- but the same integer on a tick-cadence term in the same block
-    costs 50 steps rather than 1,250, and nothing at the point of writing it
-    says so."""
-    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=5)
+    """Same term in a run long enough to satisfy it. Reachable, so not an error --
+    but the same integer on a tick-cadence term in the same block costs 50 steps
+    rather than 1,250, and nothing at the point of writing it says so.
+
+    This is why _EVAL_CADENCE_GATES exists: gates/* is tick-rate by default, and
+    classifying gates/progress_done that way would understate its patience cost by
+    eval_period/10. Publishing it every tick instead would be worse -- it would
+    republish a stale verdict, and _advance_term counts fresh writes."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 0, patience=5)
     assert _fires(cfg, 'exit_patience_is_reachable', severity=BASELINE)
     assert errors(cfg) == []
 
@@ -504,7 +560,7 @@ def test_patience_one_is_always_reachable(canonical):
     """One measurement is one measurement at any cadence. This is the shape
     prod0810 actually shipped (`eval/wass_debiased` with no patience key), and
     it is NOT a fault -- see the streak tests for what was wrong with it."""
-    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=1)
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 0, patience=1)
     # 100 steps is shorter than ONE eval_period (250) and still fine: the term
     # needs a single write, and evaluation() forces one at step 50. Long enough,
     # though, for the sibling tick terms -- patience 5 at 10 steps is 50 -- so
@@ -747,7 +803,7 @@ def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check
     that is asserted to pass and never shown capable of failing."""
-    src = (HERE / 'test_config_invariants.py').read_text(encoding='utf-8')
+    src = Path(__file__).read_text(encoding='utf-8')
     for rule in RULES:
         assert f"'{rule.__name__}'" in src, (
             f'rule {rule.__name__} has no mutation test in this file')
@@ -795,3 +851,13 @@ def test_the_lr_probe_rule_abstains_on_a_config_without_the_block(canonical):
     """Mutation guard: the canonical config has never carried it, so the rule
     must be silent there -- a rule that fires on every config is not a rule."""
     assert not _fires(copy.deepcopy(canonical), 'lr_probe_is_retired')
+
+
+def test_the_canonical_burn_in_reaches_steady_state(canonical):
+    """mk_dev runs burn_in_steps 3000, which is a bias correction of 0.975 at
+    beta2 0.999 -- so the root the bracket measures from applies the rate its
+    config names. The test is here so a burn_in_steps edit cannot silently take
+    it back to 0.795 (t=1000) or 0.309 (t=100), where every trial would run at a
+    fraction of the rate under test."""
+    assert not _fires(canonical, 'burn_in_reaches_adam_steady_state',
+                      severity=ci.BASELINE)

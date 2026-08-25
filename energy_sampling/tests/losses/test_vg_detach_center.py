@@ -36,7 +36,8 @@ import sys
 import torch
 import torch.nn.functional as F
 
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))   # tests/<area>/x.py -> energy_sampling/
 for p in (_here, os.path.dirname(_here),
           os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
     p = os.path.abspath(p)

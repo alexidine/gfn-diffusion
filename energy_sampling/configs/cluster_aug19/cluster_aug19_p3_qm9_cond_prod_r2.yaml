@@ -489,7 +489,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 1da55f8b769e
+  canonical_sha: 0602bf407f17
   project_state_version: 9
   problem: qm9_conditional
-  generated_utc: '2026-08-23T01:41:17Z'
+  generated_utc: '2026-08-23T14:27:48Z'

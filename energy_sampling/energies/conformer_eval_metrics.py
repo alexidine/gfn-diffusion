@@ -13,6 +13,12 @@ FOUR RULES THIS MODULE FOLLOWS, all of them lessons already paid for elsewhere i
     molecule, a correlation across one condition) is reported as an explicit
     ``*_available = 0`` plus no value, never as 0.0 or as a nan that averages into
     something. A metric that abstains silently passes exactly the case it exists to catch.
+    The flag is published ONLY WHEN IT IS 0: a live metric is identified by its value
+    being there, and a companion ``= 1`` beside every number was a second key per metric
+    carrying no information. Absence is still labelled, which is the whole rule -- what is
+    gone is the redundant announcement of presence. (``ring/``, ``ringtor/`` and
+    ``corr_E/`` are deliberately left on the older both-ways convention; they abstain on
+    every acyclic single-molecule run, which is the case the flag exists for.)
   * A DEGENERATE BAR IS LABELLED. Where a fraction is 1.0 BY CONSTRUCTION -- bond and
     angle ranges at `torsion`/`dihedral`, where r and theta are frozen at the reference --
     the value is suppressed and an ``*_frozen`` flag published instead. Publishing 1.0
@@ -36,6 +42,19 @@ ENERGY_TERMS = ('bond', 'angle', 'lj', 'torsion', 'stretch_bend', 'oop', 'electr
 #: element -> symbol, for naming the per-element breakdown. Matches dof_features.ELEMENTS.
 _SYM = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17: 'Cl'}
 
+#: Energy terms that get the full quantile block; every other term gets its mean and its
+#: share only. The distinction is between a term whose SHAPE is read -- the clash tail on
+#: LJ, the angle strain that dominates a strained conformer -- and one whose contribution
+#: is small enough that only its level matters.
+#:
+#: FIXED, NOT CHOSEN PER EVAL from the measured shares. A threshold on the live share
+#: would make a term drifting across it appear and disappear from the charts, which is a
+#: worse failure than logging it always. The choice is auditable rather than hidden
+#: because ``{term}_share`` is still published for EVERY term including these two, so a
+#: molecule whose spectrum puts the mass somewhere else shows up here as a large share on
+#: a term with no histogram -- which is the signal to change this tuple.
+FULL_QUANTILE_TERMS = ('lj', 'angle')
+
 
 def _host(t, dtype=None):
     """-> numpy on the HOST. Every public entry point funnels its inputs through this.
@@ -48,6 +67,21 @@ def _host(t, dtype=None):
     return a.astype(dtype) if dtype is not None else a
 
 
+def _mean_only(v, prefix, out):
+    """The mean alone, for a term outside ``FULL_QUANTILE_TERMS``.
+
+    Abstains explicitly on an empty or all-nonfinite array rather than publishing a nan,
+    on the same rule as ``_quantiles`` -- a small term is still a term that can go absent.
+    """
+    v = _host(v, np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        out[f'{prefix}_available'] = 0
+        return out
+    out[f'{prefix}_mean'] = float(v.mean())
+    return out
+
+
 def _quantiles(v, prefix, out, hist=True):
     """mean / p10 / p50 / p90 / max, plus the raw array so wandb draws the histogram."""
     v = _host(v, np.float64)
@@ -55,7 +89,6 @@ def _quantiles(v, prefix, out, hist=True):
     if v.size == 0:
         out[f'{prefix}_available'] = 0
         return out
-    out[f'{prefix}_available'] = 1
     out[f'{prefix}_mean'] = float(v.mean())
     out[f'{prefix}_p10'] = float(np.percentile(v, 10))
     out[f'{prefix}_p50'] = float(np.percentile(v, 50))
@@ -104,7 +137,13 @@ def energy_components(en, x, chunk: int = 8192) -> dict:
 
 
 def energy_component_stats(en, x, prefix: str = 'E/') -> dict:
-    """Histogram + quantiles for the total and every component.
+    """Histogram + quantiles for the total and the major components; means for the rest.
+
+    Which terms are 'major' is ``FULL_QUANTILE_TERMS``, a fixed tuple -- see its comment
+    for why the set is not derived from the live shares. Every term keeps its mean and
+    its share, so the partition over terms is still complete and a shift in which term
+    carries the energy is still visible; what the minor terms lose is their percentile
+    block and their histogram.
 
     When ``energy_clip`` is active the components are RAW and do not sum to the optimised
     potential (see energy_components), so the clipped total is published beside them along
@@ -115,7 +154,10 @@ def energy_component_stats(en, x, prefix: str = 'E/') -> dict:
     out = {}
     total = np.zeros(len(next(iter(comp.values()))))
     for name, v in comp.items():
-        _quantiles(v, f'{prefix}{name}', out)
+        if name in FULL_QUANTILE_TERMS:
+            _quantiles(v, f'{prefix}{name}', out)
+        else:
+            _mean_only(v, f'{prefix}{name}', out)
         total = total + v
     _quantiles(total, f'{prefix}total', out)
     # the share each term carries, so a component that starts dominating is visible without
@@ -154,11 +196,90 @@ def energy_vs_reference(sample_e, reference_e, prefix: str = 'E/') -> dict:
         return {f'{prefix}vs_ref_available': 0}
     ref_med = float(np.median(r))
     return {
-        f'{prefix}vs_ref_available': 1,
         f'{prefix}ref_median': ref_med,
         f'{prefix}frac_below_ref_median': float((s < ref_med).mean()),
         f'{prefix}median_gain_vs_ref': ref_med - float(np.median(s)),
         f'{prefix}min_gain_vs_ref': float(r.min()) - float(s.min()),
+    }
+
+
+def energy_marginal_overlap(sample_e, reference_e, temperature: float = 1.0,
+                            reps: int = 4, cache: dict = None, prefix: str = 'E/') -> dict:
+    """Does the sampler's ENERGY distribution match the reference's? Not "is it better".
+
+    WHY THIS IS NOT ``energy_vs_reference``. That one is one-sided by design -- it asks
+    whether training bought lower energies, and ``frac_below_ref_median`` reads 0.5 for a
+    sampler that is indistinguishable from the reference. But it reads 0.5 just as happily
+    for a sampler with the RIGHT median and TWICE the spread, which is a badly wrong
+    distribution scoring the converged value. Overlap needs a two-sided statistic.
+
+    WHY IT IS NOT REDUNDANT WITH THE PER-COLUMN MARGINALS. Energy is a scalar function of
+    all coordinates jointly, so it is sensitive to CORRELATIONS that no 1-D marginal can
+    see: a sampler can reproduce every column's marginal exactly and still assemble them
+    into combinations the target never visits, which shows up here and nowhere else. The
+    two checks are complementary, and on a molecule with real coupling neither substitutes
+    for the other.
+
+    THREE READINGS, because one number cannot carry both questions:
+      w1_kT     the displacement in units of kT -- an EFFECT SIZE. Physical, n-independent,
+                and the number to answer "is this close".
+      w1_ratio  the same W1 over its own two-sample floor -- a SIGNIFICANCE measure, 1.0 =
+                indistinguishable at this n. Falls as ~n^-1/2, so it tightens with sample
+                size and must not be gated on without pinning n.
+      overlap   the literal shared area of the two densities, in [0, 1], reported beside
+                the floor a perfect sampler would score -- which is NOT 1.0 at finite n,
+                and reads lower the more bins are used, so the bare value means nothing
+                without its floor next to it.
+    """
+    s = _host(sample_e, np.float64)
+    r = _host(reference_e, np.float64)
+    s, r = s[np.isfinite(s)], r[np.isfinite(r)]
+    n = int(s.size)
+    if n < 32 or r.size < 4 * n:
+        return {}
+
+    def _w1(a, b):
+        q = np.linspace(0.0, 1.0, 512)
+        return float(np.abs(np.quantile(a, q) - np.quantile(b, q)).mean())
+
+    def _ovl(a, b, lo, hi, bins=64):
+        pa, _ = np.histogram(a, bins=bins, range=(lo, hi), density=False)
+        pb, _ = np.histogram(b, bins=bins, range=(lo, hi), density=False)
+        pa = pa / max(pa.sum(), 1)
+        pb = pb / max(pb.sum(), 1)
+        return float(np.minimum(pa, pb).sum())
+
+    if cache is None:
+        cache = {}
+    key = ('e', n)
+    got = cache.get(key)
+    if got is None:
+        rng = np.random.default_rng(0)
+        fw, fo = [], []
+        for _ in range(reps):
+            idx = rng.permutation(r.size)
+            a, b = r[idx[:n]], r[idx[n:]]
+            fw.append(_w1(a, b))
+            lo, hi = float(min(a.min(), b.min())), float(max(a.max(), b.max()))
+            fo.append(_ovl(a, b, lo, hi))
+        got = (float(np.median(fw)), float(np.median(fo)))
+        cache[key] = got
+    floor_w1, floor_ovl = got
+
+    w1 = _w1(s, r)
+    lo, hi = float(min(s.min(), r.min())), float(max(s.max(), r.max()))
+    ovl = _ovl(s, r, lo, hi)
+    kT = float(temperature) if float(temperature) > 0 else 1.0
+    return {
+        f'{prefix}emarg_w1_kT': w1 / kT,
+        f'{prefix}emarg_w1_ratio': w1 / max(floor_w1, 1e-12),
+        f'{prefix}emarg_w1_floor': floor_w1,
+        f'{prefix}emarg_overlap': ovl,
+        f'{prefix}emarg_overlap_floor': floor_ovl,
+        # overlap normalised by what perfection scores: 1.0 = as overlapping as two draws
+        # of the target are with each other
+        f'{prefix}emarg_overlap_rel': ovl / max(floor_ovl, 1e-12),
+        f'{prefix}emarg_n': float(n),
     }
 
 
@@ -180,8 +301,7 @@ def thermal_stats(en, energies, e_min: float, prefix: str = 'E/') -> dict:
         return {f'{prefix}excess_available': 0}
     T = float(en.temperature)
     excess = (e - e_min) / T
-    out = {f'{prefix}excess_available': 1,
-           f'{prefix}e_min_reference': float(e_min)}
+    out = {f'{prefix}e_min_reference': float(e_min)}
     _quantiles(excess, f'{prefix}excess_kt', out)
     med = float(np.median(excess))
     out[f'{prefix}T_eff_over_T'] = 1.0 + 2.0 * med / max(int(en.ndim), 1)
@@ -211,16 +331,22 @@ def geometry_stats(en, x, prefix: str = 'geom/') -> dict:
     Re-deriving a chemical range in angstroms here would be a second, disagreeing
     definition of the same thing.
 
-    Two levels, because they answer different questions:
-      * ``*_frac``      -- fraction of individual bonds/angles in range. Degrades smoothly.
-      * ``all_in_range``-- fraction of MOLECULES with every bond AND angle in range. This is
-        the one that matters for whether a sample is usable, and it is much harsher: one
-        bad bond in 11 makes the whole conformer wrong.
+    THREE KEYS, AND THAT IS THE WHOLE GROUP. This is a GUARD, not a distribution, so it
+    has exactly two questions to answer:
+      * ``all_in_range`` -- DID IT FIRE. Fraction of MOLECULES with every bond AND angle
+        in range. The harsh reading, and the one that decides whether a sample is usable:
+        one bad bond in 11 makes the whole conformer wrong.
+      * ``*_worst_abs``  -- HOW CLOSE IS IT to firing. The worst |x| anywhere in the batch,
+        against a limit of 1.
+    The per-column in-range fractions and the per-molecule worst-case quantile blocks that
+    used to sit here were eighteen further keys, and on a tier where the sampler stays an
+    order of magnitude inside the window they could only restate a guard that has never
+    fired. ``all_in_range`` already carries the per-molecule tail this group needs.
 
     FROZEN TIERS ARE LABELLED, NOT SCORED. At `torsion` and `dihedral` the r and theta
-    blocks are held at the reference, so every fraction here is 1.0 by construction. That
-    is published as ``*_frozen = 1`` with no fraction, because a 1.0 that cannot be
-    anything else is not evidence.
+    blocks are held at the reference, so a worst-case excursion is 0 by construction. That
+    is published as ``*_frozen = 1`` INSTEAD OF the value, never beside it, because a 0
+    that cannot be anything else is not evidence.
     """
     x = _host(x)
     cols = _dof_class_columns(en)
@@ -234,13 +360,9 @@ def geometry_stats(en, x, prefix: str = 'geom/') -> dict:
             out[f'{prefix}{name}_frozen'] = 1
             continue
         any_scored = True
-        out[f'{prefix}{name}_frozen'] = 0
-        inb = np.abs(x[:, idx]) <= 1.0
-        out[f'{prefix}{name}_in_range_frac'] = float(inb.mean())
-        out[f'{prefix}{name}_worst_abs'] = float(np.abs(x[:, idx]).max())
-        # per-molecule worst, so the tail is visible rather than averaged away
-        _quantiles(np.abs(x[:, idx]).max(axis=1), f'{prefix}{name}_worst_per_mol', out)
-        ok_all &= inb.all(axis=1)
+        a = np.abs(x[:, idx])
+        out[f'{prefix}{name}_worst_abs'] = float(a.max())
+        ok_all &= (a <= 1.0).all(axis=1)
     if any_scored:
         out[f'{prefix}all_in_range'] = float(ok_all.mean())
     else:
@@ -269,7 +391,6 @@ def dof_class_stats(en, x, reference=None, prefix: str = 'dof/') -> dict:
         if idx.size == 0:
             out[f'{prefix}{name}_available'] = 0
             continue
-        out[f'{prefix}{name}_available'] = 1
         sub = x[:, idx]
         # the pooled distribution over every column of the class, as a histogram. Pooled
         # rather than per-column on purpose: per-column is d histograms (30 at
@@ -327,27 +448,49 @@ def _central_elements(en):
     return owner
 
 
-def dof_element_stats(en, x, prefix: str = 'dof_elem/') -> dict:
+def dof_element_stats(en, x, reference=None, prefix: str = 'dof_elem/') -> dict:
     """Spread per (DoF class, central-atom element). Bounded at 3 x 8 groups.
 
-    Answers "is it the oxygens' angles that are drifting, or the carbons'" without a
-    per-atom breakdown that grows with the molecule.
+    THE DRILL-DOWN FOR ``dof/*_sd_ratio_max``. That number says one column of a class
+    carries k times the prior's spread; this says which ELEMENT owns it, and it does so
+    without a per-atom breakdown that grows with the molecule.
+
+    A RATIO, NOT A RAW SPREAD, whenever a reference population is given. A bare
+    ``r_N_sd = 0.010`` cannot be judged right or wrong: there is no bar for it, and a
+    dozen such numbers side by side are unreadable -- which is what made this group
+    useless for the drill-down it exists to serve. Against the prior's own spread on the
+    SAME columns, 1.0 means "matches the prior" on every group of every molecule.
+
+    MAX over the group's columns, matching ``dof_class_stats``. One column blowing up is
+    the failure; a mean over the group's healthy columns is exactly what hides it.
+
+    The raw sd is published only where there is no reference to divide by, and under a
+    DIFFERENT key name, so a ratio and an unreferenced spread can never land on one axis.
     """
     x = _host(x)
+    ref = _host(reference) if reference is not None else None
+    if ref is not None and (ref.ndim != 2 or ref.shape[1] != x.shape[1]):
+        ref = None
     block = _host(en._free_block)
     try:
         owner = _central_elements(en)
     except Exception:
         return {f'{prefix}available': 0}
-    out = {f'{prefix}available': 1}
+    out = {}
     for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi')):
         for zval in np.unique(owner):
             idx = np.flatnonzero((block == cls) & (owner == zval))
             if idx.size == 0:
                 continue
             sym = _SYM.get(int(zval), f'Z{int(zval)}')
-            out[f'{prefix}{cname}_{sym}_sd'] = float(x[:, idx].std(axis=0).mean())
+            sd = x[:, idx].std(axis=0)
             out[f'{prefix}{cname}_{sym}_n'] = int(idx.size)
+            rsd = ref[:, idx].std(axis=0) if ref is not None else None
+            good = rsd > 1e-9 if rsd is not None else None
+            if good is not None and bool(np.any(good)):
+                out[f'{prefix}{cname}_{sym}_sd_ratio'] = float((sd[good] / rsd[good]).max())
+            else:
+                out[f'{prefix}{cname}_{sym}_sd'] = float(sd.mean())
     return out
 
 
@@ -393,6 +536,13 @@ def basin_coverage(en, x, basin_ref, prefix: str = 'cover/') -> dict:
     reachable combinations and the metric can report full coverage for a sampler that never
     reaches a genuinely distinct conformer. Read `n_missed` as a lower bound on what is
     missing, never as proof nothing is.
+
+    THREE KEYS, and the denominators they are read against live in ``cover_constants``.
+    ``n_modes``, ``n_accessible`` and the uniform-occupancy expectation do not move within
+    a run -- they are fixed by the molecule -- so logging them every eval produced flat
+    traces, while ``missed_frac`` was ``n_missed`` over one of them. They still have to be
+    RECORDED, because ``n_missed = 0`` says nothing without knowing how many basins were on
+    the table, so they are printed once at startup instead of deleted.
     """
     from energies.prior_diagnostics import basin_counts
 
@@ -411,13 +561,8 @@ def basin_coverage(en, x, basin_ref, prefix: str = 'cover/') -> dict:
         return {f'{prefix}available': 0}
     frac = counts / n
     res = {
-        f'{prefix}available': 1,
-        f'{prefix}n_modes': int(len(combos)),
-        f'{prefix}n_accessible': int(acc.sum()),
         f'{prefix}n_missed': int((counts[acc_idx] == 0).sum()),
-        f'{prefix}missed_frac': float((counts[acc_idx] == 0).mean()),
         f'{prefix}worst_frac': float(frac[acc_idx].min()),
-        f'{prefix}expected_frac': 1.0 / int(acc.sum()),
     }
     # occupancy entropy over accessible basins, normalised: 1 = uniform over them, -> 0 =
     # collapsed onto one. Mode collapse as a scalar -- but ONLY defined with something to
@@ -425,7 +570,6 @@ def basin_coverage(en, x, basin_ref, prefix: str = 'cover/') -> dict:
     # collapsed, when it is in fact fully covered; that is a false alarm, so it abstains.
     if acc_idx.size >= 2:
         res[f'{prefix}occupancy_entropy'] = _norm_entropy(frac[acc_idx])
-        res[f'{prefix}occupancy_entropy_available'] = 1
     else:
         res[f'{prefix}occupancy_entropy_available'] = 0
     return res
@@ -601,8 +745,13 @@ def basin_coupling(en, x, basin_ref, target_tc=None, n_null: int = 8, seed: int 
     SMALL n MANUFACTURES COUPLING: plug-in entropy is biased low, and the joint has far
     more bins than any marginal, so its bias is larger and TC is biased UP. ``tc_null`` is
     TC on column-shuffled labels -- destroys the coupling, preserves every marginal and n --
-    and ``tc_debiased`` is the number to read. Same null/debiased convention the route
-    already uses for wass.
+    and ``tc_debiased``, the only one published, is the number to read. Same null/debiased
+    convention the route already uses for wass.
+
+    THE TARGET'S OWN COUPLING is a run constant and lives in ``cover_constants``. A
+    ``tc_debiased`` above it means the policy learned a DIFFERENT dependence structure than
+    the target has -- which every per-column statistic in ``dof_class_stats`` is blind to
+    by construction, since the marginals can all match while the joint is wrong.
     """
     from energies.prior_diagnostics import rotamer_group_labels
 
@@ -635,30 +784,21 @@ def basin_coupling(en, x, basin_ref, target_tc=None, n_null: int = 8, seed: int 
         nulls.append(_total_correlation(S, sizes, len(combos)))
     tc_null = float(np.mean(nulls))
 
-    h_marg = sum(_entropy_nats(np.bincount(L[:, i], minlength=sizes[i]))
-                 for i in range(L.shape[1]))
-
     # combos the marginals say should be populated but which have NO samples
     marg = [np.bincount(L[:, i], minlength=sizes[i]) / n for i in range(L.shape[1])]
     pred = np.array([np.prod([marg[i][c[i]] for i in range(len(sizes))]) for c in combos])
     seen = np.bincount(_mixed_radix(L, sizes), minlength=len(combos))
     suppressed = int(((seen == 0) & (pred * n >= 10.0)).sum())
 
+    # TWO KEYS. `tc` and `tc_null` are the halves of `tc_debiased`, which is the one that
+    # is READ (raw TC is biased up and is not comparable across n); `tc_norm` rescales the
+    # same quantity a second way; and `tc_gap` is `tc_debiased` minus a run constant, so it
+    # is the same trace shifted. The target's own coupling moves to `cover_constants`,
+    # which is where the subtraction can be done by eye.
     out = {
-        f'{prefix}coupling_available': 1,
-        f'{prefix}coupling_n_groups': len(groups),
-        f'{prefix}coupling_tc': float(tc),
-        f'{prefix}coupling_tc_null': tc_null,
         f'{prefix}coupling_tc_debiased': float(tc - tc_null),
-        f'{prefix}coupling_tc_norm': float(tc / h_marg) if h_marg > 1e-12 else 0.0,
         f'{prefix}coupling_n_suppressed': suppressed,
     }
-    if target_tc is not None and np.isfinite(target_tc):
-        out[f'{prefix}coupling_tc_target'] = float(target_tc)
-        # non-zero => the policy learned a DIFFERENT dependence structure than the target
-        # has. Every per-column statistic in dof_class_stats is blind to this by
-        # construction: marginals can all match while the joint is wrong.
-        out[f'{prefix}coupling_tc_gap'] = float((tc - tc_null) - target_tc)
     return out
 
 
@@ -736,15 +876,43 @@ def basin_nonthermal(en, x, energies, e_min, basin_ref, u_star, prefix: str = 'c
         return {f'{prefix}nonthermal_available': 0,
                 f'{prefix}nonthermal_n_basins': int(occupied.size)}
     fracs = np.array([bad[lab == b].mean() for b in occupied], dtype=np.float64)
-    return {
-        f'{prefix}nonthermal_available': 1,
-        f'{prefix}nonthermal_n_basins': int(occupied.size),
-        f'{prefix}nonthermal_u_star': float(u_star),
-        f'{prefix}nonthermal_pooled_frac': float(bad.mean()),
-        f'{prefix}nonthermal_worst_basin_frac': float(fracs.max()),
-        f'{prefix}nonthermal_basin_spread': float(fracs.max() - fracs.min()),
-        f'{prefix}nonthermal_basins_failing': int((fracs > 0).sum()),
-    }
+    # ONE KEY: the worst basin. `pooled_frac` is the modeller's own 'Nonthermal Fraction'
+    # recomputed on this route's grouping, `basin_spread` is the worst minus a minimum that
+    # is 0 whenever anything is clean, `basins_failing` counts what `worst > 0` already
+    # announces, and `u_star` is the threshold from the config. The worst basin is the
+    # alarm; the rest were four ways of restating it.
+    return {f'{prefix}nonthermal_worst_basin_frac': float(fracs.max())}
+
+
+def cover_constants(en, basin_ref, u_star=None, target_tc=None,
+                    prefix: str = 'cover/') -> dict:
+    """The coverage group's RUN CONSTANTS -- for printing ONCE, not for logging.
+
+    Every value here is fixed by the molecule and the config for the whole run, so logged
+    per eval they were flat traces taking chart space from the three numbers that move.
+    They are not redundant, though, and that is why this exists rather than a deletion:
+    ``n_missed = 0`` is meaningless without ``n_accessible``, ``worst_frac`` is only
+    readable against the uniform expectation ``1/n_accessible``, and ``coupling_tc_debiased``
+    is only interpretable against the target's own coupling. Print this line at startup and
+    the three live keys become readable; drop it and they do not.
+    """
+    out = {}
+    if basin_ref is None or 'skipped' in basin_ref:
+        out[f'{prefix}available'] = 0
+        out[f'{prefix}skipped'] = (basin_ref or {}).get('skipped', 'no basin reference')
+        return out
+    acc = np.asarray(basin_ref['accessible'], dtype=bool)
+    n_acc = int(acc.sum())
+    out[f'{prefix}n_modes'] = int(len(basin_ref['combos']))
+    out[f'{prefix}n_accessible'] = n_acc
+    if n_acc:
+        out[f'{prefix}expected_frac'] = 1.0 / n_acc
+    out[f'{prefix}coupling_n_groups'] = int(len(basin_ref['groups']))
+    if target_tc is not None and np.isfinite(target_tc):
+        out[f'{prefix}coupling_tc_target'] = float(target_tc)
+    if u_star is not None and np.isfinite(u_star):
+        out[f'{prefix}nonthermal_u_star'] = float(u_star)
+    return out
 
 
 def _norm_entropy(p):

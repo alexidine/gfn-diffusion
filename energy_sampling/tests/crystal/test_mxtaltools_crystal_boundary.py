@@ -32,7 +32,7 @@ from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 

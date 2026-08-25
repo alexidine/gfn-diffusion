@@ -126,7 +126,7 @@ class Run:
         # does, because that declaration is what arms the probe.
         self.m = FakeModeller(args, game.optimizers,
                               stage=FakeStage(lr_sensor=arm.lr_sensor()))
-        rc = args.adaptive_lr.ray_calibration
+        rc = args.lr_control.ray_calibration
         # ENABLED IS DERIVED, not configured -- train.py:1871 passes exactly
         # `bool(self._ray_askers())`. There is no `ray_calibration.enabled` to
         # set any more (utils._RETIRED_KEYS deletes both spellings), so the arm's
@@ -191,9 +191,26 @@ class Run:
                                   if p.grad is not None]).float()
         grad_norm = float(g_before.norm()) if g_before is not None else None
 
+        # THE CONTROLLER'S OWN SEAT, once per step, exactly where train.py puts
+        # it. Without this the LR bracket never leaves burn-in, `in_burn_in()`
+        # stays true for the whole battery, and the shared actuator holds EVERY
+        # arm for every step -- so every board reads "no controller moves the
+        # rate", which is the pass-through failure `null` exists to catch
+        # arriving through the harness instead of through the arms. It was
+        # measured exactly that way when the bracket landed.
+        #
+        # The return value is the promoted horizon a bracket wants the host's
+        # step clock to skip. Arms run the controller in `mode: fixed`, which
+        # never brackets and so always returns 0; a `Bracket` arm would need the
+        # bench to honour it.
+        skipped = m.lr_controller.tick()
+        assert not skipped, (
+            'the controller asked the bench to skip {} steps, but this runner has '
+            'no skippable clock -- an arm put it in bracket mode'.format(skipped))
+
         # --- train.py's step body ORDER, which the old harness inverted:
         #     1992 batch sizer | 1996 lr_controller.step() | 1998 monitor_losses
-        #     (check_spike at 2082) | 2007 on_plateau. The batch sizer is not exercised here.
+        #     (check_spike at 2082). The batch sizer is not exercised here.
         if m.step_ind % 10 == 0:
             m.lr_controller.step()
 

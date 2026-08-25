@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 sys.path.insert(0, str(HERE / 'configs'))
 
 import config_invariants                       # noqa: E402

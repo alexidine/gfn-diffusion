@@ -1,4 +1,4 @@
-project_state_version: 9
+project_state_version: 10
 run_name: b500
 tag: bsz
 seed: 12345
@@ -23,34 +23,6 @@ lr_replay: 0.000125
 lr_fused: 0.000125
 lr_flow: 0.1
 min_lr: 1.0e-06
-lr_warmup_ratio: 10
-adaptive_lr:
-  control_flow_lr: false
-  warmup_steps: 10
-  seed_lr: 0.000125
-  bounds:
-  - 0.01
-  - 2000.0
-  calibration:
-    alpha_target: 4.0
-    eta_up: 0.25
-    eta_down: 0.5
-  divergence_loss_abs: 1000000000.0
-  divergence_grad_abs: 1000000000.0
-  divergence_cut: 0.5
-  ray_calibration:
-    period: 200
-    n_sub: 16
-    alphas:
-    - 0
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-  envelope_freeze: true
 weight_decay: 0.0001
 use_weight_decay: false
 compile_policy: auto
@@ -65,7 +37,7 @@ grad_clip_guard:
   max_ratio: 100.0
   refresh_on_stage: true
 ema_decay: null
-max_reloads_per_1k_steps: 0.2
+max_reloads_per_1k_steps: 1.0
 model:
   full_flow: false
   s_emb_dim: 512
@@ -392,7 +364,7 @@ controller:
   lookahead_horizon: 5
   lookahead_trend_alpha: 0.1
 grad_geometry:
-  enabled: true
+  enabled: false
   every: 50
 buffers:
   prior_buffer:
@@ -465,3 +437,22 @@ energy_config:
   reward_range: 250
   analyze_kwargs: {}
 checkpoint_read_only: true
+lr_control:
+  seed_lr: 0.000125
+  control_flow_lr: false
+  ray_calibration:
+    period: 200
+    n_sub: 16
+    alphas:
+    - 0
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+  mode: fixed
+  fixed_scale: 1.0
+  burn_in_steps: 0
+  burn_in_scale: 1.0

@@ -22,28 +22,28 @@ import pytest
 
 import conftest as C
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 
 # Files known to build models, run rollouts, or read the data drive. Each must
 # land in `slow` however the classifier is implemented. This is a floor, not the
 # definition -- the classifier is mechanical and covers more than this list.
 KNOWN_EXPENSIVE = (
-    'test_dead_latent_rows_deep.py',   # explicitly a statistical suite
-    'test_conformer_levels.py',
-    'test_periodic_scoring.py',
-    'test_batch_invariance.py',        # loads real priors off the data drive
-    'test_mxtaltools_crystal_boundary.py',  # CPU synthetic boundary; constructs crystal graphs
-    'test_latent_gaussian.py',
+    'tests/crystal/test_dead_latent_rows_deep.py',   # explicitly a statistical suite
+    'tests/conformer/test_conformer_levels.py',
+    'tests/crystal/test_periodic_scoring.py',
+    'tests/crystal/test_batch_invariance.py',        # loads real priors off the data drive
+    'tests/crystal/test_mxtaltools_crystal_boundary.py',  # CPU synthetic boundary; constructs crystal graphs
+    'tests/crystal/test_latent_gaussian.py',
     'bench/test_surface_fitness.py',   # defers `import torch` into the body
     'bench/test_tracking.py',          # ditto
 )
 
 # Files that must stay in the fast lane, or the dev loop stops being a loop.
 KNOWN_CHEAP = (
-    'test_crystal_operational_contract.py',
-    'test_config_state.py',
-    'test_config_invariants.py',
-    'test_problems.py',
+    'tests/crystal/test_crystal_operational_contract.py',
+    'tests/config/test_config_state.py',
+    'tests/config/test_config_invariants.py',
+    'tests/config/test_problems.py',
     'analysis/tests/test_keys.py',
     'analysis/tests/test_features.py',
 )
@@ -57,8 +57,9 @@ class _FakeModule:
 @pytest.mark.parametrize('rel', KNOWN_EXPENSIVE)
 def test_known_expensive_files_classify_slow(rel):
     path = HERE / rel
-    if not path.exists():
-        pytest.skip(f'{rel} not present')
+    assert path.exists(), (
+        f'{rel} is named as a tier floor but is not there. If it moved, '
+        f'update this list -- skipping would empty the floor silently.')
     assert C._module_imports_torch(_FakeModule(path)), \
         f'{rel} must classify as slow'
 
@@ -66,8 +67,9 @@ def test_known_expensive_files_classify_slow(rel):
 @pytest.mark.parametrize('rel', KNOWN_CHEAP)
 def test_known_cheap_files_classify_fast(rel):
     path = HERE / rel
-    if not path.exists():
-        pytest.skip(f'{rel} not present')
+    assert path.exists(), (
+        f'{rel} is named as a tier floor but is not there. If it moved, '
+        f'update this list -- skipping would empty the floor silently.')
     assert not C._module_imports_torch(_FakeModule(path)), \
         f'{rel} must stay in the fast lane'
 
@@ -106,6 +108,15 @@ def test_an_unreadable_module_is_slow_not_fast(tmp_path):
 def test_every_test_file_gets_exactly_one_tier():
     """No file may be both, and none may be neither -- either would make the two
     lanes stop partitioning the suite."""
-    for path in list(HERE.glob('test_*.py')) + list(HERE.glob('*/test_*.py')):
+    # tests/<area>/ is two levels below HERE; bench/ is one and analysis/tests/
+    # is two. Enumerated rather than rglob'd, because rglob would walk configs/,
+    # wandb/ and .claude/ -- exactly what pytest.ini's norecursedirs keeps out.
+    paths = (list(HERE.glob('*/test_*.py'))
+             + list(HERE.glob('tests/*/test_*.py'))
+             + list(HERE.glob('analysis/tests/test_*.py'))
+             + list(HERE.glob('bench/old/test_*.py')))
+    # a glob that silently matches nothing would make this test vacuous
+    assert len(paths) > 50, f'glob found only {len(paths)} test files'
+    for path in paths:
         slow = C._module_imports_torch(_FakeModule(path))
         assert isinstance(slow, bool), path

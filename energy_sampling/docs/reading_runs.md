@@ -3,7 +3,8 @@
 How a GFN run is read here. State: present tense, overwritten in place.
 
 Scope: this is the *interpretive* layer — what to look at, in what order, and what
-a shape means. Metric **definitions** live in `module_metrics.md`; the mechanics of
+a shape means. §8 covers the run that is still going; everything else assumes it
+has stopped. Metric **definitions** live in `module_metrics.md`; the mechanics of
 pulling data out of wandb live in the `local-wandb-reading` memory. Cross-reference
 those, do not restate them.
 
@@ -213,3 +214,50 @@ to test, which voids its hypotheses outright.
   has repeatedly been right.
 - **Complexity that grows while results get worse is the tell.** Patch-on-patch is
   the failure mode to watch for; build in simple concrete steps instead.
+
+## 8. Watching a run in flight
+
+A finished run is the expensive way to learn something the first few hundred steps
+already said. Most of what a run has to teach arrives early, and the discipline is
+knowing what to look at and when to stop — not watching harder.
+
+- **Name the question, the metric, and both answers before launching.** "Does the
+  controller cut when the rate jumps at the transition" → `lr_ctrl/peak_scale`
+  falls within N calibrations of the boundary, or it does not. A run without a
+  pre-named falsifier is a demonstration, and you will watch it to the end because
+  nothing tells you when to stop.
+- **Compute when the metric can FIRST move, and check just after that** — not on a
+  clock, and never by polling for completion. The answer is usually a sum of
+  configured waits: a settling gate, plus `min_readings × period`, plus a
+  residence, plus `eval_period` for anything that only publishes at eval. If that
+  sum is longer than the run, the run cannot answer the question and should be
+  reconfigured rather than started.
+- **Stop when the question is answered, including when the answer is no.** A
+  diverging run has already told you; the remaining hours are GPU time, not
+  evidence. Keep the log — it is the finding.
+- **Watch the ACTUATOR against the thing it is supposed to be controlling**, on the
+  same axis: `lr_ctrl/peak_scale` and `lr_fused` beside the loss, `Bwd/Replay Frac`
+  beside the metrics their balance rule reads. A controller that should have acted
+  and has not is visible in seconds this way and in nothing else.
+- **Read the "why am I silent" channels first when a controller looks inert.**
+  `lrpool/n`, `lrpool/holding_on_transient`, `raycal/skipped|deferred|refused`,
+  `ramp/rearms_suppressed`. These exist precisely so that "held because the
+  evidence says hold" and "never got to look" are distinguishable, and they turn a
+  multi-hour diagnosis into a single glance.
+
+### Live tells that mean stop now
+
+- **A controller that should have acted and has not.** Confirm against its own
+  silence channels before concluding it is broken — it is usually gated, and the
+  gate is the finding.
+- **A loop moving faster than its configured gain allows.** Check whether a fade
+  or converge term has come unpinned rather than assuming the gain was edited:
+  `converge_floor` fades toward zero near convergence and sits at its MAXIMUM
+  while the metrics are far from it, so a diverging run gets full gain
+  continuously.
+- **A window that keeps resetting.** Any counter that returns to zero repeatedly
+  (`lrpool/n`, an exit streak, a pool) is being cleared by something upstream, and
+  no amount of waiting will fill it.
+- **Two clocks that can disagree.** Where one mechanism advances on steps and
+  another on a measured signal, they will eventually disagree without bound. That
+  is a design fault, not a tuning one.

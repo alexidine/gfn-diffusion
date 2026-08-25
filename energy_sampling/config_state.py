@@ -922,6 +922,144 @@ CHANGES: tuple[Change, ...] = (
             'where the walk cannot finish inside a job at all.',
         ),
     ),
+
+    Change(
+        state=10,
+        summary=(
+            "THE ADAPTIVE LR CONTROLLER IS REPLACED BY A BRUTE-FORCE BRACKET, and "
+            "the `adaptive_lr` block is retired whole in favour of `lr_control`. "
+            "The mechanism is: burn in for a fixed number of steps at a fixed "
+            "conservative scale; checkpoint the complete mature trainer state; run "
+            "a configured grid of fixed-LR continuations from that one checkpoint; "
+            "take the lowest rung that detonated as the boundary, confirm it under "
+            "a derived seed, and keep the highest rung `safety_rungs` below it for "
+            "the rest of the stage.\n"
+            "    WHY. `ray` was killed 2026-08-23 by its own acceptance test. "
+            "alpha* is defined as s*/lr, so the slope of log(alpha*) against "
+            "log(lr) MUST be -1; measured on `bracketed` readings only, across "
+            "twelve runs, two stages and rate spans up to 2.7 decades, it was "
+            "0.00 +- 0.2 and several slopes were POSITIVE. The sensor was "
+            "uncorrelated with the variable it steered. The pooled estimator, the "
+            "sweep, the rung ladder and `alpha_target` were all built on it and "
+            "inherit that. A 1,200-step cruise with zero moves had been reported "
+            "as the controller working; it is the null output, and the null output "
+            "is what a dead sensor produces.\n"
+            "    THE WARMUP ENVELOPE GOES WITH IT, and not incidentally: candidate "
+            "rungs have to be auditable EFFECTIVE rates, and a continuous "
+            "multiplier underneath them means the rate under test is not the rate "
+            "applied -- which is exactly how a too-hot rung survives its trial. "
+            "Burn-in replaces it: a fixed scale for a fixed number of steps.\n"
+            "    `ray` and `hyper` SURVIVE AS OPT-IN DIAGNOSTICS that reach no "
+            "learning rate, off unless a stage names one; `plateau` is deleted "
+            "entirely, having been a pure actuator with nothing to report.\n"
+            "    THE HARD-FAILURE BARS ARE DRAWN TWICE, because they do two jobs "
+            "at two rates. Fitted to the tail of burn-in they are the right scale "
+            "for judging a TRIAL -- every trial restores that same root and is "
+            "comparable to it. They are the wrong scale for the LIVE TRIPWIRE, "
+            "which then judges every training step for the rest of the stage at a "
+            "promoted rate up to the top of the grid: a hotter rate moves the loss "
+            "more for ordinary reasons, so a bar fitted cold is crossed by healthy "
+            "training and each crossing costs a rewind against "
+            "max_reloads_per_1k_steps. After promotion the bars are refitted from "
+            "a window of ordinary training AT the promoted rate. What guards that "
+            "window depends on whether anything tested the rate: `bracket` mode "
+            "SUSPENDS the cold bars, since the rate just survived a trial horizon "
+            "and the cold bar is now the likelier source of a wrong answer; "
+            "`fixed` mode keeps them live, since nothing tested that rate and a "
+            "too-tight bar beats no bar. A stage change now clears the BARS as "
+            "well as the window -- clearing only the observations left the "
+            "outgoing stage's bars deciding rewinds through the incoming stage's "
+            "burn-in."),
+        components=('controller.py', 'lr_bracket.py', 'lr_bracket_probe.py',
+                    'train.py', 'protocol.py', 'checkpointing.py',
+                    'config_invariants.py', 'configs/mk_dev.yaml'),
+        transition=Transition(
+            removed={
+                'lr_warmup_ratio':
+                    'the warmup envelope is gone. Burn-in is a fixed scale held '
+                    'for a fixed number of steps, not a ramp, so there is no '
+                    'ratio to start from.',
+                'lr_control.ray_calibration.enabled':
+                    'the switch is which stages declare lr_sensor kind ray, and '
+                    'a second flag could disagree with them. `ray` reaches no '
+                    'learning rate now, so `enabled: true` would read as arming '
+                    'a controller that does not exist.',
+            },
+            moved={
+                'adaptive_lr':
+                    "-> `lr_control` (see _lift_lr_control). The transferable "
+                    "values are carried; the three that need JUDGMENT are left "
+                    "ABSENT so the config fails validation naming them, rather "
+                    "than loading with numbers nobody chose. Three of the new "
+                    "block's load-bearing values "
+                    "have no defensible derivation from the old one:\n"
+                    "  * `candidate_scales` -- the grid must be wide enough that "
+                    "its TOP RUNGS ARE EXPECTED TO FAIL. `adaptive_lr.bounds` was "
+                    "a sanity rail spanning 200,000x, which says nothing about "
+                    "where this route detonates; a grid derived from it would "
+                    "report unbracketed_high forever.\n"
+                    "  * `burn_in_steps` -- it has to reach Adam steady state "
+                    "(bias correction sqrt(1-beta2^t)/(1-beta1^t) >= "
+                    "min_root_bias_correction, about t=1700 at beta2 0.999). "
+                    "`warmup_steps` was a ramp length chosen for a different job "
+                    "and its shipped 1000 gives 0.795.\n"
+                    "  * `hard_failure.loss_abs` / `grad_abs` -- the shipped "
+                    "1.0e+9 bars are refused now, because a bar that cannot fail "
+                    "a candidate makes the bracket return the same answer forever. "
+                    "A migration that carried them over would produce a config "
+                    "that loads and measures nothing.\n"
+                    "Carried across UNCHANGED by hand: seed_lr, control_flow_lr, "
+                    "ray_calibration.*. Simply dropped: warmup_steps, "
+                    "envelope_freeze, warmup_freeze_cos_window, bounds, "
+                    "divergence_cut, divergence_loss_rel, calibration.*, "
+                    "restart_after, ramp.*.",
+            },
+            added={
+                'lr_control.hard_failure.cruise_rederive': True,
+                'lr_control.hard_failure.cruise_settle_steps': 200,
+            },
+            migrate_fn=lambda cfg: _lift_lr_control(cfg),
+        ),
+        invariants=(
+            'Exactly one thing moves a learning rate: LRController.set_scale, '
+            'called only by the bracket or by a stage transition. There is no '
+            'envelope, no decay leg and no sensor in the actuation path, so the '
+            'effective rate of any step is base_lr x a scale written in the '
+            'config.',
+            'A bracket refuses to run rather than measure badly: from a root '
+            'whose Adam bias correction is under min_root_bias_correction '
+            "(computed from the optimizer's real step counter), or with a loss "
+            'window too short for a hard-failure bar to be derived from it.',
+            'Candidate trials are isolated. Two candidates at the same scale '
+            'produce bitwise-identical losses, the optimizer step counter '
+            'round-trips or the restore RAISES, and a candidate that hard-fails '
+            'ends its trial rather than lowering its own rate.',
+            'Discarded trial compute does not advance the promoted logical clock: '
+            'after promotion the run resumes at root_step + trial_steps, not after '
+            'the sum of all trial compute, and repeat_every counts only promoted '
+            'steps.',
+            '`ray` and `hyper` reach no learning rate under any configuration, and '
+            'publish nothing unless a stage declares them.',
+            'The bars judging live training describe the rate live training is '
+            'running at: refitted after promotion from a window of ordinary steps '
+            'at the promoted rate, and cleared -- not carried -- at a stage '
+            'change.',
+        ),
+        validation=(
+            'tests/lr/test_lr_bracket.py -- the selection cases (normal, '
+            'non-monotone, all-fail, no-fail), the confirmation and densification '
+            'caps, and the grid/bar validation refusals.',
+            'tests/lr/test_lr_bracket_driver.py -- state isolation proven by '
+            'running two candidates at the SAME scale and requiring bitwise-'
+            'identical losses; a corrupted optimizer restore raising rather than '
+            'printing; the promoted clock advancing by exactly one horizon.',
+            'tests/lr/test_lr_bracket_driver.py -- the two-bar section, whose '
+            'premise (that ordinary training at the promoted rate crosses a bar '
+            'fitted at the burn-in rate) is MEASURED on the fixture rather than '
+            'assumed, and whose mutation case requires cruise_rederive: false to '
+            'produce several times the false divergences.',
+        ),
+    ),
 )
 
 
@@ -954,6 +1092,65 @@ def _lift_protocol(cfg: dict) -> None:
     name = 'migrated'
     cfg.setdefault('protocols', {})[name] = node
     cfg['protocol'] = name
+
+
+#: The learning rates the bracket can manage, and how `auto` is spelled.
+#: Duplicated from `utils._LR_KEYS` deliberately: migrations run on RAW
+#: dicts before anything imports the trainer, and this module has no
+#: runtime dependency on it.
+_LR_AUTO_KEYS = ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused')
+
+
+def _is_auto_value(v) -> bool:
+    return isinstance(v, str) and v.strip().lower() == 'auto'
+
+
+def _lift_lr_control(cfg: dict) -> None:
+    """state 9 -> 10: `adaptive_lr` becomes `lr_control`.
+
+    MECHANICAL FOR THE TRANSFERABLE VALUES ONLY, and the omissions are the
+    point. `seed_lr`, `control_flow_lr` and the whole `ray_calibration` block
+    mean exactly what they meant; they are carried. Everything else described a
+    warmup envelope, a pooled alpha* estimator or a divergence cut, none of which
+    exists, so it is dropped.
+
+    WHAT THIS DELIBERATELY DOES NOT WRITE: `candidate_scales`, `burn_in_steps`
+    and the hard-failure bars. None can be derived from the old block --
+    `bounds` was a 200,000x sanity rail that says nothing about where a route
+    detonates, `warmup_steps` was a ramp length chosen for a different job, and
+    the shipped 1e9 bars are refused now precisely because they cannot fail a
+    candidate. Guessing any of the three produces a config that LOADS and
+    MEASURES NOTHING, which is the exact failure the bracket replaced. Leaving
+    them out makes `config_invariants.lr_bracket_is_well_formed` name them.
+    """
+    old = cfg.pop('adaptive_lr', None)
+    cfg.pop('lr_warmup_ratio', None)
+    if not isinstance(old, dict):
+        return
+    new = cfg.setdefault('lr_control', {})
+    for key in ('seed_lr', 'control_flow_lr'):
+        if key in old:
+            new.setdefault(key, old[key])
+    if isinstance(old.get('ray_calibration'), dict):
+        new.setdefault('ray_calibration', old['ray_calibration'])
+
+    # A CONFIG WHOSE RATES ARE ALL EXPLICIT FLOATS BRACKETS NOTHING, and saying
+    # `mode: bracket` there is not a harmless default -- it is incoherent, and it
+    # fails LATE: the config loads, and `LRBracket` then refuses the (absent)
+    # candidate grid when the controller is constructed at run start.
+    #
+    # `mode: fixed, fixed_scale: 1.0` with no burn-in is the FAITHFUL
+    # translation. Under the retired controller nothing ever moved `peak_scale`
+    # off 1.0 for such a config, so its rate was exactly `base_lr` from the first
+    # step; that is what this says in the vocabulary that now exists. The same
+    # reasoning as `tierc_smoke.pin_auto_lr_without_sensor`.
+    if not any(_is_auto_value(cfg.get(k)) for k in _LR_AUTO_KEYS):
+        new.setdefault('mode', 'fixed')
+        new.setdefault('fixed_scale', 1.0)
+        new.setdefault('burn_in_steps', 0)
+        new.setdefault('burn_in_scale', 1.0)
+    else:
+        new.setdefault('mode', 'bracket')
 
 
 def state_changes() -> tuple[Change, ...]:
