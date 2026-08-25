@@ -68,7 +68,11 @@ lr_control:
   - 0.566
   - 0.8
   trial_steps: 150
-  safety_rungs: 1
+  # 2 (owner 2026-08-25): the 0.566 promotion raised the loss ~15% immediately
+  # -- a selection that worsens the loss on adoption is a bad answer whatever
+  # its stability, and survival-only select() cannot see it. All-survive on
+  # the capped grid now lands on 0.4 (5e-5).
+  safety_rungs: 2
   repeat_every: 8000
   boundary_confirm_repeats: 1
   boundary_densify: true
