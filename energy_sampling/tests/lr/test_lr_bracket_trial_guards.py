@@ -159,3 +159,60 @@ def test_a_disaster_returns_diverged_and_the_rewind_cut_follows():
     c.on_divergence()
     assert c._divergences == 1
     assert c.scale == pytest.approx(before * 0.5)
+
+
+# --------------------------------------------- log Z drift compensation -----
+
+class _WalkingStats:
+    """_last_stats whose log_Z_learned walks with the trainer's step counter."""
+
+    def __init__(self, m, start, per_step):
+        self.m, self.start, self.per_step = m, start, per_step
+        self.t0 = int(m.step_ind)
+
+    def get(self, d, default=None):
+        if d != 'bwd':
+            return default or {}
+        t = int(self.m.step_ind) - self.t0
+        return {'log_Z_learned': self.start + self.per_step * t}
+
+
+def test_drift_compensation_acquits_the_stage_walk():
+    """The fj119r1o failure shape: Z walks down at the STAGE's own rate under
+    every rung. With the root's drift extrapolated into the baseline, a rung
+    that merely rides the walk must survive; frozen-baseline judgment convicted
+    the whole ladder uniformly."""
+    m, d = _armed(trial_settle_steps=0, logz_detour_nats=2.0)
+    d.root_log_z, d.root_log_z_slope = 10.0, -0.1
+    m._last_stats = _WalkingStats(m, 10.0, -0.1)     # exactly the root's drift
+    d.run_trial(_trial(0.05, label='ride'))
+    o = d.bracket._results[-1]
+    assert o.ok, (o.reason, o.steps_to_failure)      # would fail ~step 20 uncompensated
+
+
+def test_rate_driven_detour_is_still_convicted_over_the_drift():
+    m, d = _armed(trial_settle_steps=0, logz_detour_nats=2.0)
+    d.root_log_z, d.root_log_z_slope = 10.0, -0.1
+    m._last_stats = _WalkingStats(m, 10.0, -0.4)     # 4x the stage drift
+    d.run_trial(_trial(0.05, label='detour3x'))
+    o = d.bracket._results[-1]
+    assert not o.ok and 'drift-adjusted' in o.reason, o.reason
+    # detour vs drifting baseline grows 0.3/step; crosses bar 2.0 just after
+    # step 6 -> conviction in the single digits, not at the horizon
+    assert o.steps_to_failure <= 8
+
+
+def test_root_slope_is_estimated_from_the_ema_gap_and_never_positive():
+    """take_root reads (raw - ema)/period: a walking-down Z shows raw below its
+    lagging EMA; an upward walk is NOT compensated (the star is monotone-up,
+    stalling a rise is not a detour)."""
+    m, d = _armed()
+    for s in range(1, 40):
+        m.metric_tracker.update('bwd', {'log_Z_learned': 10.0}, m.step_ind + s)
+    m.step_ind += 40
+    m._last_stats = {'bwd': {'log_Z_learned': 7.5}}   # raw below EMA: downward walk
+    assert d.take_root(m.step_ind) is None
+    assert d.root_log_z_slope < 0
+    m._last_stats = {'bwd': {'log_Z_learned': 12.5}}  # raw above EMA: upward walk
+    assert d.take_root(m.step_ind) is None
+    assert d.root_log_z_slope == 0.0

@@ -470,6 +470,7 @@ class BracketDriver:
         self.trial_states = {}       # label -> TrainerSnapshot for a surviving trial
         self.trial_branch_peaks = {}  # label -> {branch: peak loss over the trial}
         self.root_log_z = None       # the guiding-star baseline; None = guard off
+        self.root_log_z_slope = 0.0  # root Z drift (<=0), extrapolated under trials
         self.last_summary = ''
         self._held_bytes = 0
 
@@ -489,7 +490,32 @@ class BracketDriver:
         # The guiding-star baseline: candidates are judged against the ROOT's
         # log Z (fail on a detour of logz_detour_nats below it). None wherever Z
         # is not being trained/logged, which disables the guard for the stage.
+        #
+        # DRIFT-COMPENSATED (2026-08-25, qm9c_wk_aug25/fj119r1o): at STAGE ENTRY
+        # Z is still walking toward its empirical level, so the root's snapshot
+        # is not a stationarity reference -- the first var_conditioning ladder
+        # failed EVERY rung on a uniform ~0.1 nat/step walk-down that had
+        # nothing to do with the rates (c0, the burn-in rate itself, "detoured"
+        # 2.2 nats; the confirm reproduced it exactly). The baseline therefore
+        # extrapolates the root's own measured drift: an EMA with period tau
+        # lags a linear walk by drift*tau, so (raw - ema)/tau estimates the
+        # slope from state that already exists. Only DOWNWARD drift is
+        # compensated -- the star is monotone-up, and a rung that merely stalls
+        # a rising Z is not a detour. The rate-driven signal survives cleanly:
+        # on the failed ladder, compensation acquits c0/c1 (pure drift) and
+        # still convicts 0.2x and above (3.6+ nats over the drifting baseline).
         self.root_log_z = self._live_log_z()
+        self.root_log_z_slope = 0.0
+        if self.root_log_z is not None:
+            stats = getattr(self.m, '_last_stats', None) or {}
+            tracker = getattr(self.m, 'metric_tracker', None)
+            for d in ('fused', 'fwd', 'bwd', 'replay'):
+                raw = stats.get(d, {}).get('log_Z_learned')
+                ema = tracker.get(d, 'log_Z_learned') if tracker is not None else None
+                if raw is not None and ema is not None and math.isfinite(float(ema)):
+                    tau = float(getattr(tracker, 'period', 100.0) or 100.0)
+                    self.root_log_z_slope = min(0.0, (float(raw) - float(ema)) / tau)
+                    break
         factor, t, key = self.root_bias_correction()
         if self.verbose:
             print(f'lr_bracket: root at step {step}; Adam step counter t={t} on '
@@ -591,8 +617,15 @@ class BracketDriver:
             if reason is None and self.bracket.logz_detour_nats is not None \
                     and done > settle and self.root_log_z is not None:
                 lz = self._live_log_z()
-                if lz is not None and lz < self.root_log_z - self.bracket.logz_detour_nats:
-                    reason = (f'logz_detour_{self.root_log_z - lz:.4g}_nats_below_root'
+                # baseline extrapolates the root's own (downward-only) drift --
+                # see take_root: a walking Z at stage entry is the stage, not
+                # the rung, and judging against a frozen snapshot convicted a
+                # whole ladder uniformly (fj119r1o).
+                baseline = (self.root_log_z
+                            + getattr(self, 'root_log_z_slope', 0.0) * done)
+                if lz is not None and lz < baseline - self.bracket.logz_detour_nats:
+                    reason = (f'logz_detour_{baseline - lz:.4g}_nats_below_'
+                              f'drift-adjusted_root'
                               f'_(bar_{self.bracket.logz_detour_nats:g})')
             if reason is not None and done <= settle and not (
                     reason.startswith('nonfinite') or reason.startswith('exception')):
