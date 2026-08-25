@@ -320,6 +320,16 @@ class TrainerSnapshot:
         '_grad_nonfinite', '_z_cal_report',
         '_recent_step_times', '_recent_step_work',   # the batch sizer's rung median
         'batch_oom_events',
+        # force_refresh and the ray probe tick on this counter; left unrestored,
+        # an OOMed half-attempt (or any early-failing trial) phase-shifted every
+        # later candidate's refresh schedule, so two rungs at the same scale
+        # were not bitwise-comparable on fused stages (audit 2026-08-25)
+        'fused_step_count',
+        # the interspersed z-fill's cadence stamp and its single-use logw stash:
+        # a fill inside one candidate suppressed fills in every later one, and a
+        # stash from a discarded attempt could hard-set log_Z from a batch the
+        # run never kept
+        '_z_fill_last_step', '_z_fill_logw',
     )
 
     def __init__(self, modeller, label: str):
@@ -444,6 +454,26 @@ class TrainerSnapshot:
         m.grad_guard.__dict__.update(copy.deepcopy(self.grad_guard))
         for k, v in self.fields.items():
             setattr(m, k, copy.deepcopy(v))
+        # LAZILY-CREATED FIELDS ARE DELETED, NOT LEFT. Several (fused_step_count,
+        # _z_fill_logw) first appear when a code path runs, so the capture's
+        # hasattr guard can miss them at root time -- and a trial that then
+        # creates one would leak it into every later candidate through a restore
+        # that only writes back what it captured.
+        for k in self.FIELDS:
+            if k not in self.fields and hasattr(m, k):
+                try:
+                    delattr(m, k)
+                except AttributeError:
+                    pass
+        # ACCUMULATED GRADIENTS ARE CLEARED, NOT RESTORED. param.grad is not
+        # captured (it would double the model bytes for state that a fresh
+        # accumulation cycle rebuilds), so an OOMed half-attempt's accumulated
+        # grads would otherwise merge into the retry's first optimizer step.
+        # Cleared for every candidate alike: a root taken mid-accumulation
+        # gives every trial the same slightly-light first cycle, which is
+        # uniform and therefore comparable (audit 2026-08-25).
+        for opt in m.optimizers.values():
+            opt.zero_grad(set_to_none=True)
 
         # The harvest feeding the diagnostic ray sensor is dropped rather than
         # restored -- see the module docstring. Identical for every candidate,

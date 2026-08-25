@@ -56,12 +56,17 @@ lr_control:
   burn_in_scale: 0.05
   min_root_bias_correction: 0.9
   candidate_scales:
+  # GRID CAPPED AT 0.8 (2026-08-25). The 150-step trial horizon cleared 1.13
+  # twice; cruising there detonated fwd at ~500-700 steps (vg_lb 126 -> 2700,
+  # two moderate fires). Sustained-stability boundary sits in (0.566, 1.13];
+  # 0.566 is the only rate with a long clean cruise on record (1,700 steps).
+  # All-survive on this grid selects 0.566 (top rung 0.8 minus safety_rungs).
   - 0.05
   - 0.1
   - 0.2
   - 0.4
+  - 0.566
   - 0.8
-  - 1.6
   trial_steps: 150
   safety_rungs: 1
   repeat_every: 8000

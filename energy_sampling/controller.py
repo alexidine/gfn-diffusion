@@ -549,7 +549,7 @@ class LRController:
             elapsed = step - int(st.get('stage_entry_step', 0))
             if b.burn_in_complete(elapsed) and self._bars_ready():
                 skip = self._open_bracket(step)
-        elif b.phase == CRUISE and b.repeat_due(step) and self._bars_ready():
+        elif b.phase == CRUISE and b.repeat_due(step) and self._bars_ready(full=True):
             # A REPEAT TAKES THE CURRENT MATURE STATE AS THE NEW ROOT and runs
             # the same explicit grid again. No second burn-in: the run has been
             # training at a promoted rate, so the optimizers are at steady state
@@ -586,23 +586,33 @@ class LRController:
         st['scale'] = float(st.get('scale', b.scale_now()))
         return int(skip)
 
-    def _bars_ready(self) -> bool:
+    def _bars_ready(self, full: bool = False) -> bool:
         """Has the root window filled enough to derive a bar that can fire?
 
         A BOUNDED WAIT, not a settling gate: the window fills at exactly one
         observation per training step, so this resolves in at most
-        `hard_failure.min_observations` steps and cannot be held open by
-        anything the rate is itself moving. It exists for the resume case, where
-        burn-in is already complete by step count but this process has seen no
-        losses yet -- and bracketing with no derived bar is bracketing with bars
-        that cannot fire.
+        `hard_failure.min_observations` steps (`root_window` steps with
+        `full=True`) and cannot be held open by anything the rate is itself
+        moving. It exists for the resume case, where burn-in is already
+        complete by step count but this process has seen no losses yet -- and
+        bracketing with no derived bar is bracketing with bars that cannot
+        fire.
+
+        `full` is the REPEAT branch's requirement: a repeat race is not racing
+        against a 3000-step burn-in whose window filled long ago, it is racing
+        against whatever this process has observed since it resumed -- and a
+        span fitted to the minimum 20 observations is a materially noisier bar
+        than the 200-entry window every other race derives from (audit
+        2026-08-25). Waiting the extra ~180 steps is cheap; a bar drawn from a
+        20-step sliver convicts or clears rungs on luck.
         """
         if self.bracket.mode == 'fixed':
             return True
         best = max((len(v) for v in self._loss_history.values()), default=0)
-        return best >= self.bars.min_observations
+        need = self.bars.root_window if full else self.bars.min_observations
+        return best >= need
 
-    def _keep_rate(self):
+    def _keep_rate(self, cap=None):
         """The rate a refusal should fall back to.
 
         On the first cycle nothing has been measured, so it is the burn-in scale
@@ -611,7 +621,13 @@ class LRController:
         and dropping that to the burn-in scale would make a refused re-bracket
         COST the run its operating point for no evidential reason."""
         promoted = self.bracket.promoted_scale
-        return self.bracket.burn_in_scale if promoted is None else float(promoted)
+        kept = self.bracket.burn_in_scale if promoted is None else float(promoted)
+        # Capped at the rate in force when the caller's cycle opened: a fire cut
+        # stands until a MEASUREMENT replaces it, and every _keep_rate caller is
+        # by definition not measuring.
+        if cap is not None:
+            kept = min(kept, float(cap))
+        return kept
 
     def _train_mode(self):
         stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
@@ -785,6 +801,13 @@ class LRController:
         not. Returns promoted steps to skip."""
         self._cancel_pending_refit()
         b = self.bracket
+        # THE RATE IN FORCE WHEN THE RACE OPENED, and the ceiling on every
+        # fallback below. `promoted_scale` alone is NOT that rate: after a fire
+        # cut the run cruises at promoted x fire_cut_factor^k, and a refusal or
+        # abort that fell back to the bare promotion would silently REVERT the
+        # cut -- re-entering the rate whose bars just fired, through the seat
+        # whose whole job is to be the safe answer (audit 2026-08-25).
+        entry_scale = float(self.scale)
         if b.mode == 'fixed':
             # THE DERIVED BARS ARE STILL WORTH HAVING HERE, even though nothing
             # is being bracketed. Fixed mode chooses the rate from outside; it
@@ -816,7 +839,7 @@ class LRController:
             self.set_scale(b.refuse('no managed learning rate this stage steps -- '
                                     'the scale reaches no optimizer that takes a '
                                     'step here (the control arm)',
-                                    scale=self._keep_rate(), step=step),
+                                    scale=self._keep_rate(entry_scale), step=step),
                            why='control_arm')
             print('lr_ctrl: no learning rate this stage steps is bracket-managed, so '
                   'no trials are run. The controller reads and logs while actuating '
@@ -833,7 +856,7 @@ class LRController:
             self.set_scale(b.refuse('the stage exit trigger is armed -- a transition '
                                     'is imminent, so there is no stage left to run a '
                                     'selected rate on',
-                                    scale=self._keep_rate(), step=step),
+                                    scale=self._keep_rate(entry_scale), step=step),
                            why='stage_finished')
             print('lr_ctrl: NOT bracketing -- the stage exit trigger is already armed; '
                   'holding the current rate until the transition re-brackets.')
@@ -867,7 +890,7 @@ class LRController:
             # to the burn-in scale only on the first cycle; on a repeat it holds
             # the previously promoted rate, and a message hardcoding "burn-in
             # scale" reported a 16x rate drop that never happened (qm9c aug25).
-            kept = self._keep_rate()
+            kept = self._keep_rate(entry_scale)
             self.set_scale(b.refuse(refusal, scale=kept, step=step),
                            why='bracket_refused')
             label = ('the burn-in scale' if kept == b.burn_in_scale
@@ -912,6 +935,11 @@ class LRController:
             # the trainer back on the root, and hold the burn-in scale: the safe
             # answer, labelled as one rather than dressed up as a measurement.
             reason = f'{type(e).__name__}: {e}'
+            try:
+                if driver.root is not None:
+                    driver.root.restore()
+            except Exception as restore_error:       # noqa: BLE001
+                reason += f' (and the root would not restore: {restore_error})'
             if is_cuda_oom(e):
                 # THE STAGE'S OWN TRAIN MODE, not a label.
                 # `handle_train_epoch_error` gates the batch cut and the OOM
@@ -921,13 +949,20 @@ class LRController:
                 # passing a descriptive string like 'lr_bracket' silently skipped
                 # both halves of the recovery and left the batch untouched for
                 # the next attempt.
+                #
+                # AFTER THE RESTORE, NEVER BEFORE. batch_size, the OOM ceiling,
+                # the cooldown and the sizer are all in TrainerSnapshot.FIELDS,
+                # so a restore run after the handler wound every one of them
+                # back to the root's values: the run re-entered cruise at the
+                # exact batch that had just OOMed twice, with no ceiling and a
+                # re-armed sizer (audit 2026-08-25). Restore first, then let
+                # the recovery's cut and ceiling stand on the restored state.
                 self.modeller.handle_train_epoch_error(e, self._train_mode())
-            try:
-                if driver.root is not None:
-                    driver.root.restore()
-            except Exception as restore_error:       # noqa: BLE001
-                reason += f' (and the root would not restore: {restore_error})'
-            kept = self._keep_rate()
+                if getattr(driver, 'race_ooms', 0):
+                    # the success path publishes this through driver.report();
+                    # the abort path is precisely the one where it says the most
+                    self._bracket_report = {'lr_bracket/race_ooms': driver.race_ooms}
+            kept = self._keep_rate(entry_scale)
             self.set_scale(b.refuse(f'bracket aborted -- {reason}',
                                     scale=kept, step=step),
                            why='bracket_aborted')

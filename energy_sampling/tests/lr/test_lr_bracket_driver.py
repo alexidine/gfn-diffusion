@@ -152,6 +152,7 @@ class FakeTrainer:
         self.oom_handled = []            # (exception, step_type) the shared path saw
         self.raise_at = None             # (scale, exception) to throw mid-trial
         self.raise_once = False          # clear raise_at after the first throw
+        self.batch_size = 1000           # in FIELDS: the abort-order test's witness
 
         self.args = Namespace(
             lr_policy=base_lr, lr_back=base_lr, lr_replay=base_lr,
@@ -174,8 +175,14 @@ class FakeTrainer:
         pass
 
     def handle_train_epoch_error(self, e, step_type):
-        """The shared OOM recovery path, recorded rather than performed."""
+        """The shared OOM recovery path: recorded, and the batch cut PERFORMED.
+
+        The cut must be real here: batch_size is in TrainerSnapshot.FIELDS, so
+        a restore ordered after the handler winds it back -- a fake whose
+        handler mutated nothing let exactly that ordering bug ship (the abort
+        seat 'performed' a recovery the restore then erased)."""
         self.oom_handled.append((type(e).__name__, step_type))
+        self.batch_size = max(1, self.batch_size // 2)
 
     def train_step(self, step_type):
         if self.raise_at is not None:
@@ -722,6 +729,114 @@ def test_a_second_oom_in_one_race_aborts_the_bracket_without_killing_the_run():
     assert c.driver is None, 'the driver reference outlived the abort'
     # ...and the run can keep training rather than having died.
     assert math.isfinite(m.train_step(m.train_key))
+
+
+def test_the_abort_batch_cut_survives_the_root_restore():
+    """AUDIT 2026-08-25 (HIGH). batch_size, the OOM ceiling, the cooldown and
+    the sizer are all in TrainerSnapshot.FIELDS -- so an abort seat that called
+    handle_train_epoch_error BEFORE root.restore() had its entire recovery
+    wound back: the run re-entered cruise at the exact batch that had just
+    OOMed twice, with no ceiling and a re-armed sizer. Restore first; the cut
+    stands on the restored state."""
+    m = FakeTrainer(lr_control=_control())
+    m.burn_in(m.lr_controller.bracket.burn_in_steps)
+    c = m.lr_controller
+    m.raise_at = (COLD[1], RuntimeError('CUDA out of memory. Tried to allocate 2.00 GiB'))
+
+    c._open_bracket(m.step_ind)
+
+    assert len(m.oom_handled) == 1
+    assert m.batch_size == 500, (
+        f'the abort left batch_size at {m.batch_size}: the root restore erased '
+        f'the recovery cut (restore must run BEFORE handle_train_epoch_error)')
+
+
+def test_a_fire_cut_is_not_reverted_by_an_aborted_re_race():
+    """AUDIT 2026-08-25. A moderate fire cuts the cruise rate in place; the cut
+    stands until a MEASUREMENT replaces it. A refused or aborted re-race is not
+    a measurement -- falling back to the bare promotion would re-enter the rate
+    whose bars just fired, through the seat whose whole job is the safe answer."""
+    m = FakeTrainer(lr_control=_control(repeat_every=20))
+    m.burn_in(m.lr_controller.bracket.burn_in_steps)
+    c = m.lr_controller
+    assert c._open_bracket(m.step_ind) > 0, 'the first race should promote'
+    promoted = c.bracket.promoted_scale
+    # a moderate fire: cut in place, no rewind
+    cut = c.set_scale(promoted * 0.5, why='moderate_fire')
+    # the re-race aborts (two OOMs); the fallback may not exceed the cut rate
+    m.raise_at = (COLD[0], RuntimeError('CUDA out of memory. Tried to allocate 2.00 GiB'))
+    c._open_bracket(m.step_ind)
+    assert c.bracket.refusal and 'aborted' in c.bracket.refusal
+    assert c.scale == cut, (
+        f'the aborted re-race moved the rate from the fire-cut {cut} to '
+        f'{c.scale} -- a refusal is not a measurement and may not undo a cut')
+
+
+def test_restore_clears_accumulated_gradients():
+    """AUDIT 2026-08-25. param.grad is not captured by the snapshot, so an
+    OOMed half-attempt's accumulated gradients would otherwise merge into the
+    retry's first optimizer step (and one candidate's into the next, on any
+    stage that accumulates across steps). restore() clears every optimizer's
+    grads instead: uniform for all candidates, hence comparable."""
+    m, d = _armed()
+    d.run_trial(_trial(0.2, label='a'))
+    # leave a gradient lying around, as an interrupted step would
+    w = m.gfn_model.weight
+    loss = (w ** 2).sum()
+    loss.backward()
+    assert w.grad is not None
+    d.root.restore()
+    assert w.grad is None, (
+        'root.restore() left accumulated gradients on the model -- the next '
+        "candidate's first step would fold a discarded attempt's gradient in")
+
+
+def test_a_repeat_race_waits_for_the_full_root_window():
+    """AUDIT 2026-08-25. The repeat branch used the same minimum-observation
+    gate as burn-in -- but burn-in runs 3000 steps, so its window is full by
+    construction, while a resumed repeat raced as soon as min_observations
+    (20) had trickled in: bars fitted to a 20-step sliver convict rungs on
+    luck. The repeat requires the FULL root_window (fixture: 25 vs min 10)."""
+    m = FakeTrainer(lr_control=_control(burn_in_steps=30, repeat_every=20))
+    c = m.lr_controller
+    c.bracket.phase = CRUISE
+    c.bracket.promoted_scale = COLD[1]
+    c.bracket.promoted_at = 0
+    c.set_scale(COLD[1], why='resume')
+    m.step_ind = 500
+    # fill past min_observations (10) but short of root_window (25)
+    for _ in range(15):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+    assert c.bracket._brackets == 0, (
+        'the repeat raced on a partially-filled window: its bars were fitted '
+        'to fewer observations than every other race gets')
+    for _ in range(15):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+        if c.bracket._brackets:
+            break
+    assert c.bracket._brackets == 1, 'the race never ran once the window filled'
+
+
+def test_a_promotion_clears_the_refusal_latch():
+    """AUDIT 2026-08-25. lr_bracket/refused reported 1.0 for the rest of the
+    stage after a later successful race -- the refusal string was never
+    cleared by promote()."""
+    m = FakeTrainer(lr_control=_control(burn_in_steps=30, repeat_every=20))
+    c = m.lr_controller
+    b = c.bracket
+    b.refuse('window empty after resume', scale=0.05, step=0)
+    assert b.refusal
+    m.burn_in(30)
+    assert c._open_bracket(m.step_ind) > 0
+    assert b.refusal is None, (
+        'the refusal latch survived a successful promotion, so '
+        'lr_bracket/refused reads 1.0 for the rest of the stage')
 
 
 def test_an_abort_on_a_repeat_cycle_keeps_the_promoted_rate():

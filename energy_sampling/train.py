@@ -4284,7 +4284,16 @@ class Modeller:
                 return_exp=True,
                 repeats=self.mode_repeats('fwd'),
                 report_losses=True)
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as e:
+            # INSIDE A BRACKET TRIAL, A CUDA OOM MUST REACH THE RACE OOM POLICY.
+            # Swallowed here it bypasses the retry/abort seat entirely: the trial
+            # carries on with this candidate's z-cal silently skipped (candidates
+            # stop being comparable) and the card stays pressured with nothing
+            # recording the event (audit 2026-08-25). In ordinary training the
+            # swallow stands -- a skipped calibration is the designed response.
+            if is_cuda_oom(e) and getattr(getattr(self, 'lr_controller', None),
+                                          'driver', None) is not None:
+                raise
             self._z_cal_report['z_cal/rollout_errors'] = (
                 self._z_cal_report.get('z_cal/rollout_errors', 0) + 1)
             return False, None

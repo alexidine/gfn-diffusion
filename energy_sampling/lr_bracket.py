@@ -647,6 +647,10 @@ class LRBracket:
         self.phase = CRUISE
         self.promoted_scale = float(scale)
         self.promoted_at = int(step)
+        # a promotion supersedes any earlier refusal; leaving the latch set kept
+        # lr_bracket/refused at 1.0 for the rest of the stage after a later
+        # successful race (audit 2026-08-25)
+        self.refusal = None
         self._queue = []
         return self.promoted_scale
 
