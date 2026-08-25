@@ -322,7 +322,13 @@ protocols:
       hot_lr_sensor:
         channel: fwd/scatter_err
         rows: 11
-        above: 2.0
+        # 0.5 (2026-08-25): 2.0 was calibrated on equilibration detonations
+        # and gave ZERO sensitivity to the qm9c poisoning -- the excursion
+        # grew over ~500 steps, so the 110-step trailing floor chased it and
+        # the within-window log-drawdown peaked at 1.46 (esfo6n1t). Healthy
+        # cruise max is 0.065 over 264 readings (gzle0adi), so 0.5 fires on
+        # the observed failure with 7.7x quiet headroom. Report-only.
+        above: 0.5
       flags:
         update_log_z: true
         buffers_active: true
