@@ -833,6 +833,57 @@ def test_a_resume_into_cruise_re_derives_the_hard_failure_bars():
     assert c.bars.judge(m.train_key, c.bars.loss_bar[m.train_key] * 1.01, None)
 
 
+def test_a_resume_with_a_due_clock_waits_for_the_window_instead_of_refusing():
+    """THE RESUME SEAM THAT COST A RUN ITS RATE (qm9c aug25).
+
+    The loss history is a deque on the controller -- it dies with the process.
+    A resume therefore lands in CRUISE with an ALREADY-DUE repeat clock and an
+    EMPTY window, and the repeat branch (unlike burn-in) did not check
+    `_bars_ready`. So the cycle opened at step ~10, could only refuse ("no
+    channel accumulated 20 finite loss observations"), and `refuse` stamps
+    `promoted_at = step` -- CONSUMING the cycle and pushing the real race a
+    full repeat_every away. Three resumes in a row rode the burn-in scale that
+    way while the run's own ladder showed rungs 16x hotter surviving.
+
+    The cycle must be WAITED for, not spent."""
+    m = FakeTrainer(lr_control=_control(burn_in_steps=30, repeat_every=20))
+    c = m.lr_controller
+    # a resume: CRUISE, a promotion from the previous process, clock long due
+    c.bracket.phase = CRUISE
+    c.bracket.promoted_scale = COLD[1]
+    c.bracket.promoted_at = 0
+    c.set_scale(COLD[1], why='resume')
+    m.step_ind = 500                       # far past promoted_at + repeat_every
+    assert c.bracket.repeat_due(m.step_ind), 'fixture: the clock must be due'
+    assert not c._bars_ready(), 'fixture: the window must start empty'
+
+    # the first few steps cannot support a bar; nothing may be spent on them
+    for _ in range(5):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+    assert c.bracket.refusal is None, (
+        f'the due cycle was spent on a refusal it could never avoid: '
+        f'{c.bracket.refusal}')
+    assert c.bracket.promoted_at == 0, (
+        'the refusal re-stamped promoted_at, so the real race is now a full '
+        'repeat_every away')
+    assert c.scale == COLD[1], 'the resumed rate was dropped'
+
+    # ...and once the window fills, the race actually runs
+    brackets_before = c.bracket._brackets
+    for _ in range(60):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+        if c.bracket._brackets > brackets_before:
+            break
+    assert c.bracket._brackets > brackets_before, (
+        'the clock stayed due but no race ever ran once the window filled')
+
+
 def test_an_impossible_observation_window_is_refused_at_construction():
     """FINDING F. The window is a ring of `root_window` entries, so
     `min_observations` above it can never be met: burn-in never ends, no bracket

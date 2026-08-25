@@ -549,11 +549,24 @@ class LRController:
             elapsed = step - int(st.get('stage_entry_step', 0))
             if b.burn_in_complete(elapsed) and self._bars_ready():
                 skip = self._open_bracket(step)
-        elif b.phase == CRUISE and b.repeat_due(step):
+        elif b.phase == CRUISE and b.repeat_due(step) and self._bars_ready():
             # A REPEAT TAKES THE CURRENT MATURE STATE AS THE NEW ROOT and runs
             # the same explicit grid again. No second burn-in: the run has been
             # training at a promoted rate, so the optimizers are at steady state
             # by construction and the bias-correction check passes trivially.
+            #
+            # `_bars_ready` GATES THIS THE SAME WAY IT GATES BURN-IN, and the
+            # asymmetry was costing resumed runs their operating point. The loss
+            # history is a deque on the controller: it dies with the process, so
+            # a resume lands in CRUISE with an ALREADY-DUE clock and an EMPTY
+            # window. The cycle opened at step ~10, could only refuse ("no
+            # channel accumulated 20 finite loss observations"), and the refusal
+            # stamps `promoted_at = step` -- which CONSUMES the cycle and pushes
+            # the real race a full repeat_every into the future. qm9c aug25 rode
+            # that through three resumes at the burn-in scale 0.05 while its own
+            # ladder showed 0.8 surviving: 16x cold for ~28k steps, read as
+            # "VarGrad has saturated". Waiting instead costs the ~200 steps the
+            # window needs to refill and keeps the clock due.
             print(f'lr_ctrl: re-bracketing -- {step - int(b.promoted_at)} promoted steps '
                   f'since the last selection')
             skip = self._open_bracket(step)
