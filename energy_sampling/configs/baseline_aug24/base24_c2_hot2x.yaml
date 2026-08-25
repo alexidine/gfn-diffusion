@@ -82,7 +82,7 @@ lr_control:
     - 32
     - 64
   trial_settle_steps: 10
-  logz_detour_nats: 2.0
+  logz_detour_nats: null
   fire_cut_factor: 0.5
   fire_cooldown_steps: 100
 profiling:

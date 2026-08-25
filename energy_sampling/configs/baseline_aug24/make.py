@@ -161,6 +161,11 @@ def cond(cfg):
     cfg['progress_gate']['metrics'] = [
         {'key': 'w1r/median', 'target_key': 'w1r/perfect_median', 'bar': 1.5},
     ]
+    # log-Z detour guard OFF on conditional (owner, 2026-08-25): Z(c) is a
+    # SIDECAR -- weak estimate, and it must not influence policy training by
+    # design; its batch mean is also composition-confounded. Unconditional
+    # arms keep the guard (Z in-loop, load-bearing there).
+    cfg['lr_control']['logz_detour_nats'] = None
     return cfg
 
 

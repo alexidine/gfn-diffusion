@@ -43,7 +43,8 @@ progress_gate:
   metrics:
   - key: w1r/median
     target_key: w1r/perfect_median
-    bar: 1.5
+    bar: 20.0   # WORKOUT: deliberately loose -- owner wants the transition NOW
+                # (fit eyeballed good-enough); fires at the first eligible eval
   veto_metrics:
   - key: w1r/worst
     target_key: w1r/perfect_worst
@@ -63,7 +64,7 @@ lr_control:
   - 1.6
   trial_steps: 150
   safety_rungs: 1
-  repeat_every: 20000
+  repeat_every: 1500   # WORKOUT: prompt drift-compensated re-race post-resume
   boundary_confirm_repeats: 1
   boundary_densify: true
   fixed_scale: 0.2
@@ -90,7 +91,15 @@ lr_control:
     - 32
     - 64
   trial_settle_steps: 10
-  logz_detour_nats: 2.0
+  # DISABLED on the conditional route (owner, 2026-08-25): three competing
+  # notions -- (1) falling log Z usually signals fwd deterioration, but (2)
+  # the batch-mean over Z(c) is composition-confounded under high-dim
+  # conditioning, and decisively (3) Z here is a SIDECAR whose estimate is
+  # weak and which must not influence policy training BY DESIGN -- a guard
+  # that picks the LR from it violates that. Off until a better-founded
+  # per-condition form exists. Stays live on the unconditional route, where
+  # Z trains in-loop and is load-bearing.
+  logz_detour_nats: null
   fire_cut_factor: 0.5
   fire_cooldown_steps: 100
 profiling:
