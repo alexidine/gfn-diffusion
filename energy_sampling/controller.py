@@ -618,8 +618,16 @@ class LRController:
         2026-08-25). Waiting the extra ~180 steps is cheap; a bar drawn from a
         20-step sliver convicts or clears rungs on luck.
         """
-        if self.bracket.mode == 'fixed':
-            return True
+        # FIXED MODE WAITS TOO (2026-08-25). The old blanket True existed so
+        # fixed mode could not be held hostage by an underivable window -- but
+        # on a resume with burn-in already elapsed it opened the stage with an
+        # EMPTY window: derive failed, and the asserted rate ran ~450 steps on
+        # the absolute backstops alone (qm9c fixed-0.4). Waiting is safe by
+        # construction -- until the window fills the run holds the burn-in
+        # scale -- and the genuinely-underivable case still falls through to
+        # the "continues on the absolute backstops" path after the wait,
+        # because the wait is on OBSERVATION COUNT, which fills at one per
+        # step regardless of what the values are.
         best = max((len(v) for v in self._loss_history.values()), default=0)
         need = self.bars.root_window if full else self.bars.min_observations
         return best >= need

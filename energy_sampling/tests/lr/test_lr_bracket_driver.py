@@ -894,6 +894,34 @@ def test_trial_drift_is_recorded_and_orders_with_rate():
     assert rows and all('label' in r for r in rows)
 
 
+def test_fixed_mode_on_resume_waits_for_the_window_before_asserting_its_rate():
+    """qm9c fixed-0.4, 2026-08-25: fixed mode blanket-passed _bars_ready, so a
+    resume with burn-in already elapsed opened the stage on an EMPTY window --
+    derive failed and the asserted rate ran ~450 steps guarded by the absolute
+    backstops alone. The wait is safe: until the window fills the run holds
+    the burn-in scale."""
+    m = FakeTrainer(lr_control=_control(mode='fixed', fixed_scale=0.4,
+                                        burn_in_steps=30))
+    c = m.lr_controller
+    # a resume: burn-in elapsed by step count, this process has observed nothing
+    m.step_ind = 500
+    c._state()['stage_entry_step'] = 0
+    for _ in range(10):                      # under root_window (25)
+        m.step_ind += 1
+        c.tick()
+    assert c.scale == c.bracket.burn_in_scale, (
+        'fixed mode asserted its rate before any bar could be derived')
+    assert not c.bars.loss_bar
+    for _ in range(30):                      # window fills at one obs/step
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+    assert c.scale == 0.4, 'fixed mode never asserted its rate after the wait'
+    assert m.train_key in c.bars.loss_bar, (
+        'the wait must buy a real derived bar, not just delay the backstop hold')
+
+
 def test_a_promotion_clears_the_refusal_latch():
     """AUDIT 2026-08-25. lr_bracket/refused reported 1.0 for the rest of the
     stage after a later successful race -- the refusal string was never
