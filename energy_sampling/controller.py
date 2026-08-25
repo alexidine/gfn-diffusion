@@ -547,7 +547,13 @@ class LRController:
 
         if b.phase == BURN_IN:
             elapsed = step - int(st.get('stage_entry_step', 0))
-            if b.burn_in_complete(elapsed) and self._bars_ready():
+            # full=True: on a fresh stage burn-in runs thousands of steps, so
+            # the window is full by construction and this costs nothing. The
+            # case it changes is a RESUME landing with burn-in already elapsed
+            # by step count -- there the window holds only what this process
+            # has seen, and 20 observations is a sliver no other race would
+            # accept (same reasoning as the repeat branch below).
+            if b.burn_in_complete(elapsed) and self._bars_ready(full=True):
                 skip = self._open_bracket(step)
         elif b.phase == CRUISE and b.repeat_due(step) and self._bars_ready(full=True):
             # A REPEAT TAKES THE CURRENT MATURE STATE AS THE NEW ROOT and runs
