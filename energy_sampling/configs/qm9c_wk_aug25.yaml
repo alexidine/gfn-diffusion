@@ -49,10 +49,15 @@ progress_gate:
   - key: w1r/worst
     target_key: w1r/perfect_worst
 lr_control:
-  mode: bracket
+  # FIXED for the 0.4 discrimination run (owner 2026-08-25): the capped grid +
+  # safety_rungs 2 made the selection deterministic, so racing for it is ~25
+  # min of discarded compute. Fixed mode still derives bars from burn-in and
+  # the unified fires (rewind + cut) still guard the rate. burn_in_steps 250:
+  # just enough to fill the 200-observation bar window on the resumed state.
+  mode: fixed
   seed_lr: 0.000125
   control_flow_lr: false
-  burn_in_steps: 3000
+  burn_in_steps: 250
   burn_in_scale: 0.05
   min_root_bias_correction: 0.9
   candidate_scales:
@@ -76,7 +81,7 @@ lr_control:
   repeat_every: 8000
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.2
+  fixed_scale: 0.4
   verbose: true
   hard_failure:
     loss_excursion_k: 10.0
