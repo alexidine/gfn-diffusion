@@ -81,7 +81,7 @@ lr_control:
   repeat_every: 8000
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.4
+  fixed_scale: 0.05
   verbose: true
   hard_failure:
     loss_excursion_k: 10.0

@@ -2955,22 +2955,41 @@ class Modeller:
             # from the run's own loss scale: a too-hot rate detonates in tens of
             # steps, and the same window feeds the bracket's bars.
             #
-            # THE 'BEST' SCORE (owner decision 2026-08-24): fwd/tb_err_worst +
-            # bwd/tb_err_worst, a channel that is not yet logged reading +LARGE.
-            # The old r2-combo was DEGENERATE on the MLE warm start (bwd/r2 runs
-            # negative and declining there), so 'best' froze at the first finite
-            # tracker reading (~step 300) on every route's phase 1 -- toy_wk_aug24
-            # died rewinding into that frozen record. The +LARGE convention is
-            # benign: within any stage the missing-channel set is fixed, so the
-            # constant cancels out of every comparison; when a dark channel comes
-            # alive the combo DROPS by LARGE (a fully-informed state is a fair
-            # new record), and transitions clear the record anyway.
+            # THE 'BEST' SCORE IS PHASE-DEPENDENT (owner decision 2026-08-25,
+            # refining 2026-08-24's global tb_err_worst combo): each stage is
+            # judged by the quantity it is actually optimizing, because a
+            # phase-blind selector is blind to that phase's failure mode --
+            # fwd/tb_err_worst sat FLAT (30-33) through a 20x vg_lb excursion
+            # on var_conditioning, so 'best' kept advancing into poisoned
+            # state. A channel not yet logged reads +LARGE; within any stage
+            # the missing set is fixed so the constant cancels from every
+            # comparison, and transitions clear the record anyway.
             LARGE = 1.0e6
-            current_fwd = self.metric_tracker.get('fwd', 'tb_err_worst')
-            current_bwd = self.metric_tracker.get('bwd', 'tb_err_worst')
-            self.combo_loss_record.append(
-                (LARGE if current_fwd is None else float(current_fwd)) +
-                (LARGE if current_bwd is None else float(current_bwd)))
+            total = 0.0
+            for mode, key in self._best_metric_channels():
+                v = self.metric_tracker.get(mode, key)
+                total += LARGE if v is None else float(v)
+            self.combo_loss_record.append(total)
+
+    def _best_metric_channels(self):
+        """The (mode, key) channels whose sum defines 'best' for the CURRENT
+        stage (owner, 2026-08-25):
+
+          phase 1 / MLE stages (train_mode 'bwd')  ->  bwd/mle, the loss itself
+          var_conditioning                         ->  fwd/logw_std_within (the
+              channel the poisoning actually moved while tb_err stayed flat)
+          everything else (equilibration et al.)   ->  fwd + bwd tb_err_worst
+
+        Keyed on stage properties (train_mode) then the canonical stage name;
+        a stage-config key can replace the name match if a config ever needs
+        to override this."""
+        stage = getattr(getattr(self, 'protocol', None), 'stage', None)
+        if getattr(stage, 'train_mode', None) == 'bwd':
+            return (('bwd', 'mle'),)
+        name = (getattr(stage, 'name', '') or '').lower()
+        if 'conditioning' in name:
+            return (('fwd', 'logw_std_within'),)
+        return (('fwd', 'tb_err_worst'), ('bwd', 'tb_err_worst'))
 
     def _rewind_checkpoint_path(self):
         """Pick fire_loss_spike's rewind target, NEVER reverting to an earlier
@@ -2981,16 +3000,19 @@ class Modeller:
         hung 11k steps fitting a 174k broad buffer a z_match Z was never
         calibrated for).
 
-        LR-DIVERGENCE REWINDS TARGET THE ROLLING CHECKPOINT (owner decision
-        2026-08-24): 'running' is <= 50 steps old and saved before the bar
-        fired, so it is the most recent state known to predate the incident.
-        'best' is a QUALITY record, not a recovery point -- its selector can
-        legitimately lag far behind the present (its old r2 form froze at
-        ~step 300 on every warm start, and rewinding into that near-init state
-        re-tripped the bar every 2 steps until the budget aborted the run,
-        toy_wk_aug24). Order: same-stage 'running'; else this stage's
+        A FRESH SAME-STAGE 'BEST' IS THE PREFERRED TARGET (owner decision
+        2026-08-25, reversing 2026-08-24's rolling-first): 'running' is <= 50
+        steps old but written UNCONDITIONALLY, so during a slow excursion it
+        carries the excursion's onset -- the qm9c fire cascade rewound through
+        three rolling checkpoints and still landed ~70 nats up. 'best' under
+        the phase-dependent selector does NOT advance while its stage's
+        health metric worsens, so a fresh best predates the incident by
+        construction. The old objection (a frozen/near-init best re-tripping
+        the bar, toy_wk_aug24) is handled by the freshness bound: stale past
+        10 x eval_period and 'best' is demoted below 'running' again. Order:
+        same-stage fresh 'best'; same-stage 'running'; this stage's
         'stage_start' turnover point (post-on_enter, healthy by construction);
-        else 'best' so behavior is never worse than having no rule.
+        else bare 'best' so behavior is never worse than having no rule.
         """
         idx = {s.name: s.index for s in self.protocol.stages}
         current = idx.get(self.protocol.stage.name, -1)
@@ -3006,6 +3028,16 @@ class Modeller:
             except Exception:
                 return None, None, path
 
+        best_idx, best_step, best_path = stage_and_step('best')
+        fresh_bar = 10 * int(getattr(self.args, 'eval_period', 500) or 500)
+        if (best_idx is not None and best_idx == current
+                and best_step is not None
+                and 0 <= self.step_ind - int(best_step) <= fresh_bar):
+            print(f"rewind: targeting same-stage 'best' from step {best_step} "
+                  f"({self.step_ind - int(best_step)} steps back) -- the "
+                  f"phase-dependent quality record does not advance into an "
+                  f"excursion, unlike the rolling checkpoint")
+            return best_path
         run_idx, run_step, run_path = stage_and_step('running')
         if run_idx is not None and run_idx >= current:
             return run_path
@@ -3014,7 +3046,6 @@ class Modeller:
             print(f"rewind: no same-stage rolling checkpoint; reverting to this "
                   f"stage's start rather than reversing the phase")
             return start_path
-        best_idx, best_step, best_path = stage_and_step('best')
         if best_idx is not None and best_idx >= current:
             return best_path
         return best_path if os.path.exists(best_path) else None

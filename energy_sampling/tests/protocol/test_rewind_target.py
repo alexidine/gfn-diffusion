@@ -1,13 +1,16 @@
 """
-LR-divergence rewinds target the ROLLING checkpoint (owner decision 2026-08-24).
+LR-divergence rewinds target a FRESH SAME-STAGE 'best' first (owner decision
+2026-08-25, reversing 2026-08-24's rolling-first).
 
-'best' is a QUALITY record, not a recovery point: its selector can legitimately
-lag far behind the present (the old r2 form froze at ~step 300 on every warm
-start, and rewinding into that near-init state re-tripped the excursion bar
-every 2 steps until the budget aborted the run -- toy_wk_aug24). 'running' is
-<= 50 steps old and saved before the bar fired, so it is the most recent state
-known to predate the incident. Cross-stage guards unchanged: never reverse the
-phase (stab_july21c 512x6_T60).
+'running' is <= 50 steps old but written UNCONDITIONALLY, so during a slow
+excursion it carries the excursion's onset -- the qm9c fire cascade rewound
+through three rolling checkpoints and still landed ~70 nats up. The
+phase-dependent 'best' does not advance while its stage's health metric
+worsens, so a fresh best predates the incident by construction. The old
+objection (a frozen near-init best re-tripping the bar every 2 steps,
+toy_wk_aug24) is handled by the freshness bound: stale past 10 x eval_period
+and 'best' demotes below 'running' again. Cross-stage guards unchanged: never
+reverse the phase (stab_july21c 512x6_T60).
 
 `pytest tests/protocol/test_rewind_target.py -q`
 """
@@ -40,11 +43,20 @@ def modeller(tmp_path, step_ind, tags):
     return lambda: Modeller._rewind_checkpoint_path(m)
 
 
-def test_rolling_is_preferred_even_over_a_fresh_best(tmp_path):
-    """THE DOCTRINE: recency wins for LR incidents; quality records are for
-    quality, not recovery."""
+def test_a_fresh_same_stage_best_beats_the_rolling_checkpoint(tmp_path):
+    """THE DOCTRINE: a fresh phase-correct quality record predates the incident
+    by construction; the rolling checkpoint may carry the excursion's onset."""
     pick = modeller(tmp_path, step_ind=5000,
                     tags={'best': ('s1', 4999),
+                          'running': ('s1', 4950)})
+    assert pick().endswith('best.pt')
+
+
+def test_a_stale_best_demotes_below_the_rolling_checkpoint(tmp_path):
+    """Past 10 x eval_period (2500 here) the old objection applies again: a
+    lagging best is a quality record, not a recovery point."""
+    pick = modeller(tmp_path, step_ind=5000,
+                    tags={'best': ('s1', 2000),
                           'running': ('s1', 4950)})
     assert pick().endswith('running.pt')
 
@@ -73,3 +85,19 @@ def test_prior_stage_best_never_reverses_the_phase_silently(tmp_path):
 def test_nothing_on_disk_returns_none(tmp_path):
     pick = modeller(tmp_path, step_ind=5000, tags={})
     assert pick() is None
+
+def test_the_best_selector_is_phase_dependent():
+    """Owner 2026-08-25: each stage's 'best' is judged by what that stage
+    optimizes -- the global tb_err combo sat flat through a 20x vg_lb
+    excursion on var_conditioning, so 'best' advanced into poisoned state."""
+    from train import Modeller
+
+    def channels(train_mode, name):
+        m = SimpleNamespace(protocol=SimpleNamespace(
+            stage=SimpleNamespace(train_mode=train_mode, name=name)))
+        return Modeller._best_metric_channels(m)
+
+    assert channels('bwd', 'train_prior') == (('bwd', 'mle'),)
+    assert channels('fused', 'var_conditioning') == (('fwd', 'logw_std_within'),)
+    assert channels('fused', 'equilibration') == (
+        ('fwd', 'tb_err_worst'), ('bwd', 'tb_err_worst'))
