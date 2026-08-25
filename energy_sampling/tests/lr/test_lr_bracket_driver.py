@@ -886,9 +886,9 @@ def test_trial_drift_is_recorded_and_orders_with_rate():
     dc, dw = d.trial_drift['cold'], d.trial_drift['warm']
     assert dc is not None and dw is not None, 'drift missing'
     assert dc['n'] == 40, 'the survivor must fit its full post-settle window'
-    assert dw['drift'] > dc['drift'], (
+    assert dw['loss_drift'] > dc['loss_drift'], (
         f"the hotter surviving rung must drift upward relative to the cold one "
-        f"(cold {dc['drift']:+.4g}, warm {dw['drift']:+.4g})")
+        f"(cold {dc['loss_drift']:+.4g}, warm {dw['loss_drift']:+.4g})")
     # ...and the race table carries both, so the corpus accumulates
     rows = d.bracket.race_rows()
     assert rows and all('label' in r for r in rows)

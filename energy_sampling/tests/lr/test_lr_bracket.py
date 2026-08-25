@@ -511,3 +511,87 @@ def test_the_report_distinguishes_a_found_boundary_from_an_assumed_one():
     assert found.report()['lr_bracket/status'] != none.report()['lr_bracket/status']
     assert found.report()['lr_bracket/boundary_confirmed'] == 1.0
     assert none.report()['lr_bracket/boundary_confirmed'] == 0.0
+
+
+# ------------------------------------------- slope-first selection ----------
+# Owner 2026-08-25: stability is the CONSTRAINT (eligibility), the post-settle
+# loss_drift is the OBJECTIVE. "Hottest survivor" was falsified twice in one
+# day on var_conditioning (0.566 and 1.13 both survived their horizons and
+# poisoned the run).
+
+def _drift(v, se=0.05):
+    return {'loss_drift': v, 'se': se, 't': (v / se if se else 0.0), 'n': 40}
+
+
+def _run_with_drifts(b, drifts, failing=(), step=1000):
+    """Like _run, attaching a loss_drift record per scale."""
+    b.begin_bracket(step, bias_correction=0.99)
+    while True:
+        t = b.next_trial()
+        if t is None:
+            break
+        fails = t.scale in failing
+        b.record(t, ok=not fails, reason='loss_excursion' if fails else None,
+                 steps_completed=10 if fails else b.trial_steps,
+                 steps_to_failure=10 if fails else None,
+                 loss_drift=drifts.get(t.scale))
+    return b.select()
+
+
+def test_selection_prefers_the_best_downward_slope():
+    """Descending surface: hotter rungs descend faster, so slope-first
+    recovers the old hottest-survivor answer exactly where it was correct."""
+    b = _b(candidate_scales=(0.05, 0.2, 0.8), safety_rungs=0,
+           boundary_confirm_repeats=0, boundary_densify=False)
+    v = _run_with_drifts(b, {0.05: _drift(-1.0), 0.2: _drift(-3.0),
+                             0.8: _drift(-5.0)})
+    assert v['scale'] == 0.8
+    assert v['selection_mode'] == 'loss_drift'
+    assert v['loss_drift'] == -5.0
+
+
+def test_selection_stays_cold_on_a_plateau():
+    """No rung beats the coldest by 2 combined SEs: the no-signal case is a
+    model pathology, not an LR question, and the answer is cold."""
+    b = _b(candidate_scales=(0.05, 0.2, 0.8), safety_rungs=0,
+           boundary_confirm_repeats=0, boundary_densify=False)
+    v = _run_with_drifts(b, {0.05: _drift(0.0), 0.2: _drift(0.01),
+                             0.8: _drift(-0.02)})
+    assert v['scale'] == 0.05, (
+        'a 0.02 drift edge inside a 0.14 noise bar promoted a hotter rung')
+    assert v['selection_mode'] == 'loss_drift'
+
+
+def test_selection_cannot_pick_an_upward_drifting_survivor():
+    """The qm9c shape: the hottest rung survives its horizon while parking the
+    loss above the root. Positive drift can never be argmin."""
+    b = _b(candidate_scales=(0.05, 0.2, 0.8), safety_rungs=0,
+           boundary_confirm_repeats=0, boundary_densify=False)
+    v = _run_with_drifts(b, {0.05: _drift(-0.5), 0.2: _drift(-3.0),
+                             0.8: _drift(+5.0)})
+    assert v['scale'] == 0.2
+    assert v['selection_mode'] == 'loss_drift'
+
+
+def test_selection_falls_back_to_hottest_survivor_without_drift_data():
+    """Short-horizon harnesses (and any misconfigured settle window) fit no
+    drift; selecting on absent data would be worse than the legacy rule."""
+    b = _b(candidate_scales=(0.05, 0.2, 0.8), safety_rungs=0,
+           boundary_confirm_repeats=0, boundary_densify=False)
+    v = _run_with_drifts(b, {})
+    assert v['scale'] == 0.8
+    assert v['selection_mode'] == 'survival_max'
+
+
+def test_slope_selection_still_respects_the_detonation_ceiling():
+    """Eligibility is unchanged: a detonated rung caps selection whatever the
+    drifts say below it."""
+    b = _b(candidate_scales=(0.05, 0.2, 0.8), safety_rungs=1,
+           boundary_confirm_repeats=0, boundary_densify=False)
+    v = _run_with_drifts(b, {0.05: _drift(-1.0), 0.2: _drift(-9.0),
+                             0.8: _drift(-99.0)},
+                         failing={0.8})
+    # 0.8 detonated: its (absurdly good) drift is irrelevant because it is not
+    # ELIGIBLE; slope selection runs over {0.05, 0.2} and picks 0.2
+    assert v['scale'] == 0.2
+    assert v['selection_mode'] == 'loss_drift'

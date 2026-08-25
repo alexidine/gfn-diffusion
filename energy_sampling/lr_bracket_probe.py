@@ -777,10 +777,11 @@ class BracketDriver:
             self.trial_states[trial.label] = TrainerSnapshot(m, trial.label)
             self._held_bytes += self.trial_states[trial.label].held_bytes()
         self.bracket.record(trial, ok, reason, done, fail_at,
-                            decisive=decisive)
+                            decisive=decisive,
+                            loss_drift=self.trial_drift.get(trial.label))
         if self.verbose:
             dr = self.trial_drift.get(trial.label)
-            note = (f' (drift {dr["drift"]:+.4g}, t={dr["t"]:.1f})'
+            note = (f' (loss_drift {dr["loss_drift"]:+.4g}, t={dr["t"]:.1f})'
                     if dr is not None else '')
             print(f'lr_bracket: {trial.label} '
                   + ('SURVIVED all ' + str(done) + ' steps' + note
@@ -803,10 +804,10 @@ class BracketDriver:
         slope = sxy / sxx
         resid2 = sum((y - (ym + slope * (i - xm))) ** 2
                      for i, y in zip(range(n), ys))
-        se = math.sqrt(resid2 / (n - 2) / sxx) if n > 2 and resid2 > 0 else 0.0
+        se_slope = math.sqrt(resid2 / (n - 2) / sxx) if n > 2 and resid2 > 0 else 0.0
         drift = slope * (n - 1)
-        t = slope / se if se > 0 else (0.0 if slope == 0 else float('inf'))
-        return {'drift': drift, 't': t, 'n': n}
+        t = slope / se_slope if se_slope > 0 else (0.0 if slope == 0 else float('inf'))
+        return {'loss_drift': drift, 'se': se_slope * (n - 1), 't': t, 'n': n}
 
     def _live_log_z(self):
         """The last training step's batch-mean log_Z_learned, read from the raw
@@ -875,15 +876,15 @@ class BracketDriver:
             if rows:
                 cols = ['label', 'kind', 'scale', 'seed', 'survived',
                         'steps_to_failure', 'reason', 'decisive',
-                        'drift', 'drift_t',
+                        'loss_drift', 'loss_drift_t',
                         'peak_fwd', 'peak_bwd', 'peak_replay', 'peak_fused']
                 for r in rows:
                     peaks = self.trial_branch_peaks.get(r['label'], {})
                     for d in ('fwd', 'bwd', 'replay', 'fused'):
                         r[f'peak_{d}'] = peaks.get(d)
                     dr = self.trial_drift.get(r['label'])
-                    r['drift'] = None if dr is None else dr['drift']
-                    r['drift_t'] = None if dr is None else dr['t']
+                    r['loss_drift'] = None if dr is None else dr['loss_drift']
+                    r['loss_drift_t'] = None if dr is None else dr['t']
                 wandb.log({f'lr_bracket/race_cycle_{cycle}':
                            wandb.Table(columns=cols,
                                        data=[[r[c] for c in cols] for r in rows])})

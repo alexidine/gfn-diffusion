@@ -127,16 +127,20 @@ class Outcome:
     1.1x-bar graze (wk8 c5). Evidence-scaled confirmation, owner 2026-08-25."""
 
     __slots__ = ('trial', 'ok', 'reason', 'steps_completed', 'steps_to_failure',
-                 'decisive')
+                 'decisive', 'loss_drift')
 
     def __init__(self, trial, ok, reason, steps_completed, steps_to_failure,
-                 decisive=False):
+                 decisive=False, loss_drift=None):
         self.trial = trial
         self.ok = bool(ok)
         self.reason = reason
         self.steps_completed = int(steps_completed)
         self.steps_to_failure = steps_to_failure
         self.decisive = bool(decisive)
+        #: {'loss_drift','se','t','n'} -- the trial's post-settle OLS loss
+        #: drift (total fitted rise) and its standard error, or None when the
+        #: post-settle window was too short to fit. The selection input.
+        self.loss_drift = loss_drift
 
     @property
     def scale(self):
@@ -520,10 +524,10 @@ class LRBracket:
 
     def record(self, trial: Trial, ok: bool, reason=None,
                steps_completed: int = 0, steps_to_failure=None,
-               decisive: bool = False):
+               decisive: bool = False, loss_drift=None):
         """Fold in one finished trial."""
         out = Outcome(trial, ok, reason, steps_completed, steps_to_failure,
-                      decisive)
+                      decisive, loss_drift)
         self._results.append(out)
         self._discarded_steps += int(steps_completed)
         if trial.kind == DENSIFY and not ok:
@@ -592,6 +596,8 @@ class LRBracket:
             'survivors': survivors,
             'ordering': order,
             'margin_rungs': None,
+            'selection_mode': None,
+            'loss_drift': None,
             'selection_ceiling': None,
         }
 
@@ -634,9 +640,42 @@ class LRBracket:
             self._verdict = verdict
             return verdict
 
+        # SLOPE-FIRST SELECTION (owner 2026-08-25). "Hottest survivor" was
+        # falsified repeatedly on var_conditioning: a rung can survive its
+        # horizon while parking the loss ABOVE the root (the 0.566 and 1.13
+        # promotions both poisoned the run), so stability is a CONSTRAINT
+        # (eligibility, above) and PROGRESS is the objective. The rung with
+        # the most-negative post-settle loss_drift wins; it must beat the
+        # coldest eligible rung by 2 combined standard errors, else the
+        # coldest wins -- on a plateau every drift is ~flat, no rung clears
+        # the bar, and the selection correctly stays cold. Degenerate cases
+        # fall back to the legacy hottest-survivor rule: drift is fitted only
+        # when the post-settle window has >= 10 samples, so short-horizon
+        # harnesses (and any misconfigured settle window) keep the old
+        # behavior rather than selecting on absent data.
+        by_scale = {}
+        for o in self._screen_outcomes():
+            if o.ok:                      # last write wins, same as _label_for
+                by_scale[o.scale] = o
+        drifts = {s: by_scale[s].loss_drift for s in eligible
+                  if s in by_scale and by_scale[s].loss_drift is not None}
+        coldest = min(eligible)
+        selection_mode = 'survival_max'
         chosen = max(eligible)
+        if coldest in drifts and len(drifts) >= 2:
+            best = min(drifts, key=lambda s: drifts[s]['loss_drift'])
+            gap = drifts[coldest]['loss_drift'] - drifts[best]['loss_drift']
+            se = math.hypot(drifts[best].get('se') or 0.0,
+                            drifts[coldest].get('se') or 0.0)
+            if best != coldest and gap > 2.0 * se:
+                chosen = best
+            else:
+                chosen = coldest
+            selection_mode = 'loss_drift'
         verdict.update(status=status, scale=chosen, restore=self._label_for(chosen),
-                       margin_rungs=pos - order.index(chosen))
+                       margin_rungs=pos - order.index(chosen),
+                       selection_mode=selection_mode,
+                       loss_drift=(drifts.get(chosen) or {}).get('loss_drift'))
         self._verdict = verdict
         return verdict
 
