@@ -2880,6 +2880,18 @@ class Modeller:
                     self.checkpointer.save_buffers()
                     metrics.update(self.evaluation(override_do_figs=self.stage_ctrl.get('request_eval', False)))
 
+                # A protocol 'stop' on_exit fired inside evaluation()'s
+                # transition: the phase's snapshots are on disk and there is no
+                # next stage -- end the run NOW so the GPU is released (owner
+                # 2026-08-26, phase-1 probe fans). The break lands on the
+                # 'final' save + "Finished Training!" path below.
+                if getattr(self, '_stop_requested', False):
+                    if len(metrics) > 0:
+                        self._log_metrics(metrics)
+                    print(f"protocol stop honored at step {self.step_ind} -- "
+                          f"ending the run")
+                    break
+
                 if len(metrics) > 0:
                     # array-valued metrics ride the eval_period grid only, so their
                     # wandb histogram-over-time panels get a uniform x-spacing --

@@ -113,3 +113,50 @@ def test_modeller_progress_metrics_publishes_the_verdict():
         'progress_metrics computed gates/progress_done but never handed it to '
         'protocol.publish_gate -- the exit trigger cannot see it and the stage '
         'can never exit (toy_wk2_aug24/sl1ebn35)')
+
+
+# ----------------------------------------------- on_exit 'stop' (owner 2026-08-26)
+# Phase-1 probe fans must yield the GPU the moment their phase is done: the
+# stage's exit fires, its snapshots land, and the run ENDS instead of advancing.
+
+def engine_stop(exit_block, on_exit):
+    stages = [{'name': 's0', 'train_mode': 'bwd', 'bwd_sampling_mode': 'dataset',
+               'exit': exit_block, 'on_exit': on_exit}]
+    args = SimpleNamespace(protocol='p', grow_batch_size=False,
+                           protocols=SimpleNamespace(p=SimpleNamespace(stages=stages)))
+    saved = []
+    m = SimpleNamespace(
+        args=args, stage='s0', stage_ctrl=fresh_stage_ctrl(),
+        metric_tracker=MetricTracker(period=25.0), step_ind=0,
+        combo_loss_record=[], batch_sizer=None,
+        batch_size_oom_ceiling=None, batch_size_oom_ceiling_at=None,
+        batch_size_oom_min=None, _runaway_last_cut=None, _runaway_unresponsive_stage=None,
+        _accum_floor_warned_stage=None, batch_size_last_grow=0,
+        fwd_frac=0.0, bwd_frac=1.0, replay_frac=0.0,
+        init_schedulers_optimizers=lambda: None, set_loss_coeffs=lambda: None,
+        lr_controller=SimpleNamespace(on_stage_change=lambda: 0),
+        grad_guard=SimpleNamespace(refresh=lambda reason=None: None),
+        checkpointer=SimpleNamespace(save=lambda tag, with_buffers=False: saved.append(tag)))
+    return StageProtocol(m), m, saved
+
+
+def test_a_single_stage_protocol_with_stop_is_legal_and_ends_the_run():
+    """Before 'stop', a final stage whose exit fired was an IndexError waiting
+    at the successor lookup; with it, the exit runs its snapshots and requests
+    the end of the run without advancing."""
+    p, m, saved = engine_stop(PROGRESS_EXIT,
+                              ['snapshot:phase1_exit', 'stop'])
+    m.step_ind = 2000
+    p.publish_gate('progress_done', 1.0)
+    p.tick()
+    assert p.maybe_advance({})
+    assert m._stop_requested is True
+    assert p.stage.name == 's0', 'stop must not advance the stage'
+    assert 'phase1_exit' in saved, (
+        'the phase snapshot must land BEFORE the stop is honored -- a stop '
+        'that skips it ends the run with nothing to hand to phase 2')
+
+
+def test_stop_is_a_valid_action_name():
+    from protocol import ACTIONS
+    assert 'stop' in ACTIONS

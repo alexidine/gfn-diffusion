@@ -26,7 +26,10 @@ declares:
   balance           the mode-frac controller for fused stages (see below)
   exit              trigger: an AND-list of {metric, above|below, patience}
                     terms; when it fires, the run advances to the next stage.
-                    A stage with no exit is terminal.
+                    A stage with no exit is terminal. An on_exit 'stop'
+                    action ends the RUN when the exit fires (snapshots first),
+                    instead of advancing -- for probe/fan runs that must yield
+                    the GPU the moment their phase is done.
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
                     bootstrap_z, seed_prior_from_anchors,
                     reseed_prior_from_dataset, rebuild_prior_by_churn,
@@ -148,7 +151,7 @@ MLE_GATE_DEFAULTS = {
 }
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
-           'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint')
+           'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint', 'stop')
 SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
@@ -1495,11 +1498,22 @@ class StageProtocol:
         actions (e.g. bootstrap_z, which wants the new coeffs active and the
         fresh eval metrics in hand)."""
         m = self.m
-        old, new = self.stage, self.stages[self.stage.index + 1]
+        old = self.stage
 
         if run_exit_actions:
             for name, arg in old.on_exit:
                 self._run_action(name, arg, eval_metrics)
+
+        # A 'stop' on_exit ENDS THE RUN instead of advancing (owner 2026-08-26:
+        # phase-1 probe fans must yield the GPU the moment their phase is done).
+        # Checked AFTER the exit actions so the phase1_exit/prior snapshots are
+        # on disk first, and BEFORE the successor lookup so a single-stage
+        # protocol with an exit is legal rather than an IndexError.
+        if getattr(m, '_stop_requested', False):
+            print(f"protocol: stage '{old.name}' exit requested STOP -- no next "
+                  f"stage; the host loop ends the run and releases the GPU")
+            return
+        new = self.stages[self.stage.index + 1]
 
         print(f"protocol: stage '{old.name}' -> '{new.name}'")
         m.stage = new.name
@@ -1597,6 +1611,10 @@ class StageProtocol:
             self.m.reseed_prior_from_dataset(flush=(arg == 'flush'))
         elif name == 'rebuild_prior_by_churn':
             self.m.rebuild_prior_by_churn(int(arg) if arg else None)
+        elif name == 'stop':
+            # consumed by advance() and the host loop; a snapshot-less stop is
+            # legal (the config decides what to keep)
+            self.m._stop_requested = True
         elif name == 'set_lr_flow':
             # The flow/Z group is exempt from the bracket's scale
             # (lr_control.control_flow_lr: false), so nothing else will move it
