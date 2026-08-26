@@ -13,3 +13,9 @@ prod26_acr_lr0p1	prod0810_acridine_sg14_zp1_mace
 prod26_acr_lr0p2	prod0810_acridine_sg14_zp1_mace
 prod26_acr_lr0p4	prod0810_acridine_sg14_zp1_mace
 prod26_acr_lr0p8	prod0810_acridine_sg14_zp1_mace
+prod26_mipu_lr0p2	-
+prod26_mipu_lr0p4	-
+prod26_mipu_lr0p8	-
+prod26_nehu_lr0p2	-
+prod26_nehu_lr0p4	-
+prod26_nehu_lr0p8	-

@@ -94,6 +94,33 @@ FAMILIES = {
         'scales': [0.1, 0.2, 0.4, 0.8],
         'max_batch_size': 50000,
     },
+    # UMA on the UPDATED priors (owner uploaded 2026-08-26: *_uma_f047_*, the
+    # energy-corrected files). COLD STARTS, necessarily: a new prior filename
+    # is a new problem identity, so no historical checkpoint can pass the
+    # weights-only guard -- and every old UMA checkpoint is bound to the
+    # erroneous-energy prior anyway, the exact lineage the update severs.
+    # Grid per owner: physical crystals of this type share roughly similar
+    # optima ("direct neighbors on a fat enough grid") -- 3 neighbors around
+    # the expected center, MLIP at-or-below ELJ (owner 2.4). Cold UMA phase 1
+    # is the slow case: these rows ride the 12 h sbatch.
+    'mipu': {
+        'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [2],
+        'warm_src': None,
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'scales': [0.2, 0.4, 0.8],
+        'max_batch_size': 50000,
+    },
+    'nehu': {
+        'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [14],
+        'warm_src': None,
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'scales': [0.2, 0.4, 0.8],
+        'max_batch_size': 50000,
+    },
 }
 
 
@@ -125,9 +152,15 @@ def build():
                 cfg['mlip_path'] = spec['mlip_path']
             if 'max_batch_size' in spec:
                 cfg['max_batch_size'] = spec['max_batch_size']
-            # mk_dev pins a local dev warm start; the fan resolves its own
-            cfg['checkpoint_name'] = PLACEHOLDER
-            cfg['load_weights_only'] = True
+            # mk_dev pins a local dev warm start; the fan resolves its own.
+            # A family with no warm source (the updated-prior UMA lineage
+            # break) cold-starts: no placeholder, nothing to resolve.
+            if spec.get('warm_src'):
+                cfg['checkpoint_name'] = PLACEHOLDER
+                cfg['load_weights_only'] = True
+            else:
+                cfg['checkpoint_name'] = None
+                cfg['load_weights_only'] = False
             cfg['continue_from_checkpoint'] = False
             cfg['prior_model_name'] = None
 
@@ -182,8 +215,11 @@ def check(cfg, fam, s):
     assert cfg['progress_gate']['mode'] == 'level', 'mk_dev must carry the level gate'
     bars = {m['key']: m['bar'] for m in cfg['progress_gate']['metrics']}
     assert bars == {'w1r/median': 5.0, 'w1r/worst': 10.0}
-    assert cfg['load_weights_only'] is True
-    assert cfg['checkpoint_name'] == PLACEHOLDER
+    if FAMILIES[fam].get('warm_src'):
+        assert cfg['load_weights_only'] is True
+        assert cfg['checkpoint_name'] == PLACEHOLDER
+    else:
+        assert cfg['checkpoint_name'] is None and cfg['load_weights_only'] is False
     assert cfg['continue_from_checkpoint'] is False
     assert cfg['grow_batch_size'] is True, 'auto batch sizer is a battery property'
     assert cfg['grad_clip_guard']['enabled'] is True
@@ -194,7 +230,7 @@ def check(cfg, fam, s):
 
 
 SBATCH = """#!/bin/bash
-#SBATCH --time=08:00:00
+#SBATCH --time={time}
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=48G
 #SBATCH --cpus-per-task=8
@@ -229,15 +265,20 @@ if [ ! -f "${{CONFIG}}" ]; then echo "missing config ${{CONFIG}}" >&2; exit 1; f
 # generator does not recompute; resolve by run-name glob, newest first, into a
 # per-job COPY of the config (the repo config keeps its placeholder). LOUD on
 # a miss: a fan arm silently cold-starting would corrupt the whole comparison.
-CK=$(ls -t ${{CKPTS}}/*${{SRC}}*_running.pt 2>/dev/null | head -1)
-if [ -z "${{CK}}" ]; then
-    echo "FATAL: no warm checkpoint matches *${{SRC}}*_running.pt in ${{CKPTS}}" >&2
-    exit 1
-fi
-echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  warm <- $(basename ${{CK}})"
 J=${{LOGS}}/${{ARM}}_${{SLURM_JOB_ID}}
 RESOLVED=${{J}}.yaml
-sed "s|{placeholder}|$(basename ${{CK}})|" ${{CONFIG}} > ${{RESOLVED}}
+if [ "${{SRC}}" = "-" ]; then
+    echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  (cold start)"
+    cp ${{CONFIG}} ${{RESOLVED}}
+else
+    CK=$(ls -t ${{CKPTS}}/*${{SRC}}*_running.pt 2>/dev/null | head -1)
+    if [ -z "${{CK}}" ]; then
+        echo "FATAL: no warm checkpoint matches *${{SRC}}*_running.pt in ${{CKPTS}}" >&2
+        exit 1
+    fi
+    echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  warm <- $(basename ${{CK}})"
+    sed "s|{placeholder}|$(basename ${{CK}})|" ${{CONFIG}} > ${{RESOLVED}}
+fi
 
 {{ nvidia-smi -L
   nvidia-smi --query-gpu=mig.mode.current,uuid,name,memory.total,driver_version --format=csv
@@ -281,10 +322,26 @@ def main():
         f.write('arm\twarm_src\n')
         for name, cfg in arms.items():
             fam = name.split('_')[1]
-            f.write(f"{name}\t{FAMILIES[fam]['warm_src']}\n")
+            f.write(f"{name}\t{FAMILIES[fam].get('warm_src') or '-'}\n")
+    names = list(arms)
+    warm_rows = [i for i, n in enumerate(names)
+                 if FAMILIES[n.split('_')[1]].get('warm_src')]
+    cold_rows = [i for i, n in enumerate(names)
+                 if not FAMILIES[n.split('_')[1]].get('warm_src')]
+    assert warm_rows == list(range(len(warm_rows))), 'warm rows must be contiguous first'
+    assert cold_rows == list(range(len(warm_rows), len(names)))
     with (HERE / 'submit_prod_aug26.sbatch').open('w', encoding='utf-8', newline='\n') as f:
-        f.write(SBATCH.format(last=len(arms) - 1, ckpts=CLUSTER_CKPTS.rstrip('/'),
+        f.write(SBATCH.format(last=len(warm_rows) - 1, time='08:00:00',
+                              ckpts=CLUSTER_CKPTS.rstrip('/'),
                               placeholder=PLACEHOLDER))
+    # the cold UMA rows: same INDEX, their own array range and a 12 h wall
+    with (HERE / 'submit_prod_aug26_uma.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        body = SBATCH.format(last=len(names) - 1, time='12:00:00',
+                             ckpts=CLUSTER_CKPTS.rstrip('/'),
+                             placeholder=PLACEHOLDER)
+        body = body.replace('#SBATCH --array=0-' + str(len(names) - 1),
+                            '#SBATCH --array=' + str(len(warm_rows)) + '-' + str(len(names) - 1))
+        f.write(body)
     print(f'{len(arms)} arms written to {HERE}')
     for name in arms:
         print(' ', name)
