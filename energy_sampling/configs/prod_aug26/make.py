@@ -41,14 +41,15 @@ recompute; the sbatch resolves it on the cluster by run-name glob
 (*<warm_src>*_running.pt, newest first) into a per-job COPY of the config, and
 exits loudly if nothing matches. The repo configs carry the placeholder.
 
-WAVE 2 (not generated here): UMA (mipcas + nehzor) and acridine MACE. Blocked
-on (a) the ELJ winners -- owner 2.4: MLIP optima are the same or slightly
-below ELJ's, so their grids seed from these results -- and (b) the UPDATED UMA
-prior filenames (owner: the old UMA priors carried energy errors; every config
-on record still references the old names).
+WAVE 2 (not generated here): the UMA fans (mipcas + nehzor), blocked on (a)
+the ELJ winners -- owner 2.4: MLIP optima are the same or slightly below
+ELJ's, so their grids seed from these results -- and (b) the UPDATED UMA prior
+filenames (the old UMA priors carried energy errors; every config on record
+still references the old names). Acridine MACE rides WAVE 1 (see FAMILIES).
 
-Scales: [0.2, 0.4, 0.8, 1.2, 1.6] x seed 1.25e-4. 10 arms, one A100 each,
-8 h walls (warm-started phase 1; the battery reached 30k steps in <12 h cold).
+ELJ scales [0.2, 0.4, 0.8, 1.2, 1.6], acridine [0.1, 0.2, 0.4, 0.8], all on
+seed 1.25e-4. 14 arms, one A100 each, 8 h walls (warm-started phase 1; the
+battery reached 30k steps in <12 h cold).
 """
 from pathlib import Path
 
@@ -77,6 +78,22 @@ FAMILIES = {
         'space_groups': [14],
         'warm_src': 'prod0810_nehzor_elj',
     },
+    # acridine rides WAVE 1 after all (owner 2026-08-26: goal #2 is ASAP, and
+    # the seed-from-ELJ-winners leverage cannot apply -- there is no acridine
+    # ELJ task to seed from). MACE phase 1 is still MLE (the energy reaches
+    # buffers and eval, not the loss), so the fan mechanics are identical; the
+    # grid shifts one rung colder per the owner's 2.4 (MLIP optima at or
+    # slightly below ELJ's). Identity fields verbatim from
+    # prod0810_acridine_sg14_zp1_mace (bwd/mle -19.1 @ 5,280).
+    'acr': {
+        'prior_path': f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt',
+        'space_groups': [14],
+        'warm_src': 'prod0810_acridine_sg14_zp1_mace',
+        'energy_function': 'mace',
+        'mlip_path': '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model',
+        'scales': [0.1, 0.2, 0.4, 0.8],
+        'max_batch_size': 50000,
+    },
 }
 
 
@@ -92,7 +109,7 @@ def scale_tag(s):
 def build():
     arms = {}
     for fam, spec in FAMILIES.items():
-        for s in SCALES:
+        for s in spec.get('scales', SCALES):
             cfg = base()
             name = f'prod26_{fam}_lr{scale_tag(s)}'
 
@@ -102,6 +119,12 @@ def build():
             cfg['checkpoints_dir'] = CLUSTER_CKPTS
             cfg['prior_path'] = spec['prior_path']
             cfg['space_groups'] = spec['space_groups']
+            if 'energy_function' in spec:
+                cfg['energy_function'] = spec['energy_function']
+            if 'mlip_path' in spec:
+                cfg['mlip_path'] = spec['mlip_path']
+            if 'max_batch_size' in spec:
+                cfg['max_batch_size'] = spec['max_batch_size']
             # mk_dev pins a local dev warm start; the fan resolves its own
             cfg['checkpoint_name'] = PLACEHOLDER
             cfg['load_weights_only'] = True
@@ -165,6 +188,9 @@ def check(cfg, fam, s):
     assert cfg['grow_batch_size'] is True, 'auto batch sizer is a battery property'
     assert cfg['grad_clip_guard']['enabled'] is True
     assert cfg['prior_path'] == FAMILIES[fam]['prior_path']
+    assert cfg['energy_function'] == FAMILIES[fam].get('energy_function', 'elj')
+    if 'mlip_path' in FAMILIES[fam]:
+        assert cfg['mlip_path'] == FAMILIES[fam]['mlip_path']
 
 
 SBATCH = """#!/bin/bash
