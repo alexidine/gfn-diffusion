@@ -146,11 +146,30 @@ def _column_w1_ratio(samples, reference, periodic, reps: int = 4, cache: dict = 
             'w1r/n_eval': float(n)}
 
 
-#: Default progress-gate spec. Every target is READ FROM ANOTHER METRIC rather than written
-#: here -- w1r/perfect_median is what a real dataset draw scores through the same code, and
-#: E/ref_median is the dataset's own energy -- so these bars carry to another molecule
-#: unchanged. bwd/mle appears only under veto_only because it has no usable target.
+#: Default progress-gate spec (owner decision 2026-08-26): PLAIN LEVEL BARS on the
+#: two w1r headline stats, absolute numbers, nothing fitted. The rate/projection/
+#: veto design below (_PROGRESS_GATE_RATE) is retired as the default after the
+#: baseline_aug24 battery: its energy bars were unreachable on the real route, its
+#: veto held stages open on glacial tails, and no arm ever transitioned in 30k
+#: steps. The owner's calibration scale for the bars:
+#:     median 5 / worst 10   "decent"
+#:     median 2 / worst 5    "incredibly good"
+#: and choices in between per config. The median-smoothed level (level_window)
+#: absorbs eval noise at the boundary; the protocol exit's own patience/streak
+#: supplies hysteresis.
 _PROGRESS_GATE = {
+    'mode': 'level',
+    'level_window': 2500,
+    'min_history': 2000,
+    'metrics': [
+        {'key': 'w1r/median', 'bar': 5.0},
+        {'key': 'w1r/worst', 'bar': 10.0},
+    ],
+}
+
+#: The retired rate-based default, kept importable for configs that opt back in
+#: with mode: 'rate' (the machinery still runs; only the default changed).
+_PROGRESS_GATE_RATE = {
     'horizon': 10000,        # N: project the gain over this many steps. FREE -- it sets the
                              # question, not the estimator, so 1k or 100k are equally valid.
     'window': 20000,         # slope-fit span. Sets BOTH the noise on X and the latency after
@@ -284,6 +303,23 @@ def progress_gate(history, spec, step):
             return None, None
         slope = float(np.polyfit(t[m], np.log(R[m]), 1)[0])
         return float(np.interp(hi, t, R)), float(1.0 - np.exp(slope * horizon))
+
+    # LEVEL MODE (owner 2026-08-26): absolute bars on the configured channels,
+    # judged on the median-smoothed level alone. No targets, no rate fits, no
+    # projections, no veto -- "we just pick a number". A channel with no history
+    # yet blocks the verdict at 0 rather than passing by absence.
+    if str(spec.get('mode', 'rate')) == 'level':
+        out, in_bar = {}, []
+        for m in spec.get('metrics', []):
+            r_now = level(m['key'], 0.0)
+            if r_now is None:
+                return {'gates/progress_done': 0.0, 'progress/reason': 0.0}
+            out[f'progress/{m["key"]}/remaining'] = r_now - float(m['bar'])
+            in_bar.append(r_now <= float(m['bar']))
+        done = bool(in_bar) and all(in_bar)
+        out['gates/progress_done'] = 1.0 if done else 0.0
+        out['progress/reason'] = 1.0 if done else 0.0
+        return out
 
     out, in_bar, stalled, vetoed, degrading = {}, [], [], False, False
     for m in spec.get('metrics', []):

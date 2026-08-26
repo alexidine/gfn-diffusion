@@ -239,3 +239,62 @@ def test_a_metric_moving_backwards_is_reported_as_DEGRADING_not_saturated():
     assert out['progress/degrading'] == 1.0, out
     if out['gates/progress_done'] == 1.0:
         assert out['progress/reason'] == 3.0, 'must not be labelled SATURATED'
+
+
+# ------------------------------------------------- level mode (owner 2026-08-26)
+# The rate design is retired as the default: its energy bars were unreachable on
+# the real route and its veto held stages open on glacial tails (baseline_aug24:
+# no arm transitioned in 30k steps). Level mode is "we just pick a number":
+# absolute bars on the configured channels, median-smoothed, nothing fitted.
+
+LEVEL_SPEC = {
+    'mode': 'level', 'level_window': 2500, 'min_history': 2000,
+    'metrics': [
+        {'key': 'w1r/median', 'bar': 5.0},
+        {'key': 'w1r/worst', 'bar': 10.0},
+    ],
+}
+
+
+def test_level_mode_fires_when_both_bars_are_met():
+    h = {'w1r/median': hist(20.0, 3.1, 3.0),
+         'w1r/worst': hist(40.0, 8.2, 8.0)}
+    out = progress_gate(h, LEVEL_SPEC, step=60000)
+    assert out['gates/progress_done'] == 1.0
+    assert out['progress/w1r/median/remaining'] < 0
+
+
+def test_level_mode_holds_while_the_worst_column_is_out():
+    """median 5 / worst 10 is a PAIR: a good median with a bad tail is not done."""
+    h = {'w1r/median': hist(20.0, 3.1, 3.0),
+         'w1r/worst': hist(40.0, 14.0, 13.0)}
+    out = progress_gate(h, LEVEL_SPEC, step=60000)
+    assert out['gates/progress_done'] == 0.0
+
+
+def test_level_mode_blocks_on_an_absent_channel():
+    """A channel that never logged must BLOCK the verdict, not pass by absence --
+    the baseline_aug24 C arms sat behind a producer that silently declined to
+    run, and a gate that passed on missing data would have transitioned them on
+    nothing."""
+    h = {'w1r/median': hist(20.0, 3.1, 3.0)}
+    out = progress_gate(h, LEVEL_SPEC, step=60000)
+    assert out['gates/progress_done'] == 0.0
+
+
+def test_level_mode_respects_min_history():
+    h = {'w1r/median': hist(20.0, 3.1, 3.0),
+         'w1r/worst': hist(40.0, 8.2, 8.0)}
+    out = progress_gate(h, LEVEL_SPEC, step=1000)
+    assert out['gates/progress_done'] == 0.0
+
+
+def test_level_mode_judges_the_smoothed_level_not_the_last_dip():
+    """One noisy eval dipping under the bar must not end a stage."""
+    h = {'w1r/median': hist(20.0, 6.5, 6.4),   # smoothed level sits ABOVE 5
+         'w1r/worst': hist(40.0, 8.2, 8.0)}
+    # a single final-sample dip below the bar
+    t, _ = h['w1r/median'][-1]
+    h['w1r/median'][-1] = (t, 4.0)
+    out = progress_gate(h, LEVEL_SPEC, step=60000)
+    assert out['gates/progress_done'] == 0.0

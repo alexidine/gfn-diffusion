@@ -26,28 +26,19 @@ min_lr: 1.0e-08
 weight_decay: 0.0001
 use_weight_decay: false
 progress_gate:
-  horizon: 10000
-  rate_bar: 0.02
-  window: 20000
+  # LEVEL GATE (owner 2026-08-26, replacing the rate/veto design): plain
+  # absolute bars on the two w1r headline stats. Calibration scale:
+  # median 5 / worst 10 = decent; median 2 / worst 5 = incredibly good.
+  # No energy terms on the conditional route (owner 2026-08-25: phase 1 trains
+  # the prior unconditionally, so E/sample vs E/ref is structurally unclosable).
+  mode: level
   level_window: 2500
   min_history: 2000
-  veto_rate: 0.05
-  # CONDITIONAL ROUTE: NO ENERGY TERMS (owner, 2026-08-25). Phase 1 trains the
-  # prior UNCONDITIONALLY; samples converge to the pooled marginal {x}, whose
-  # energy under any particular c is structurally garbage, while the dataset
-  # rows are matched {x,c} pairs reading low -- so E/sample vs E/ref can never
-  # close, pooled OR per-condition, and CONVERGED would be unreachable (the
-  # gate would hang to the 20k SATURATED window). Marginal-shape (w1r) + the
-  # MLE slope are the valid phase-1 instruments here; tight prior fit matters
-  # less than coverage on the conditional route anyway.
   metrics:
   - key: w1r/median
-    target_key: w1r/perfect_median
-    bar: 20.0   # WORKOUT: deliberately loose -- owner wants the transition NOW
-                # (fit eyeballed good-enough); fires at the first eligible eval
-  veto_metrics:
+    bar: 5.0
   - key: w1r/worst
-    target_key: w1r/perfect_worst
+    bar: 10.0
 lr_control:
   # FIXED for the 0.4 discrimination run (owner 2026-08-25): the capped grid +
   # safety_rungs 2 made the selection deterministic, so racing for it is ~25
