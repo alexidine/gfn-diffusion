@@ -4945,8 +4945,16 @@ class Modeller:
             # collisions. Phase 3's per-sample TB prefers the broad-coverage
             # independent draws, which block_m = 0 restores automatically.
             blc = self.args.bwd_loss_coeffs
+            # EITHER condition-grouped VG FLAVOUR arms the blocked draw. Testing
+            # vg_lb alone made `vg_lme` silently disable the blocked draw: groups
+            # collapsed to birthday collisions (~1.03 rows/condition), the
+            # cross-terminal signal vanished and the VG term became a near-no-op
+            # -- with no error, exactly the silent-inertness the replay path's
+            # gate (which already tests both) documents. Found 2026-08-26 while
+            # configuring an lme arm.
             block_m = int(getattr(blc, 'condition_block_m', 0) or 0) \
-                if getattr(blc, 'vg_lb', 0) > 0 else 0
+                if (getattr(blc, 'vg_lb', 0) > 0
+                    or getattr(blc, 'vg_lme', 0) > 0) else 0
             # gentle loss-weighted draw when the stage sets weighted_bwd_sampling:
             # tilt a small slice of the batch toward high-residual conditions via
             # the buffer's own ema_loss (the _bwd_retention_priority signal), so a

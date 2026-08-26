@@ -1344,3 +1344,19 @@ def test_a_repeat_bracket_mid_refit_does_not_lose_the_suspended_bars():
     assert c._cruise_bar is None
     assert c.bars.loss_bar == stashed, (
         'a cancelled refit left the tripwire suspended with nothing pending')
+
+
+def test_bwd_blocked_draw_arms_on_either_vg_flavour():
+    """2026-08-26: the bwd blocked-draw gate tested vg_lb ALONE, so switching a
+    stage to the logmeanexp flavour (vg_lme) silently disabled condition-blocked
+    draws -- groups collapsed to birthday collisions (~1.03 rows/condition) and
+    the condition-grouped VarGrad became a near-no-op with no error. The replay
+    path's gate already tested both flavours; this pins the bwd one to match."""
+    import re
+    src = open('train.py', encoding='utf-8').read()
+    i = src.index("blc = self.args.bwd_loss_coeffs")
+    gate = src[i:i + 900]
+    assert "'vg_lme'" in gate, (
+        'the bwd blocked-draw gate ignores vg_lme, so an lme stage runs with '
+        'blocked draws silently off')
+    assert "'vg_lb'" in gate
