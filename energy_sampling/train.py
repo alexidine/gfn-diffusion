@@ -6179,9 +6179,35 @@ class Modeller:
             print(f"hot_lr [{stage_name}]: FIRED at step {self.step_ind} -- "
                   f"{sensor.channel} at {verdict['value']:.6g} against a floor of "
                   f"{verdict['floor']:.6g}, drawdown {verdict['drawdown']:.4g} over "
-                  f"a bar of {sensor.above:g}. REPORT ONLY: no learning rate has "
-                  f"moved, and this says the run is destabilising, not that the LR "
-                  f"caused it.")
+                  f"a bar of {sensor.above:g}."
+                  + (" REPORT ONLY: no learning rate has moved, and this says "
+                     "the run is destabilising, not that the LR caused it."
+                     if sensor.action != 'fire' else ''))
+            # ACTION 'fire' (owner review 2026-08-26): route into the SAME
+            # unified fire response as a bar fire -- rewind to the phase-correct
+            # fresh 'best' + cut, via fire_loss_spike (whose reload seam calls
+            # on_divergence exactly once, post-restore). This is the reviewed
+            # code change the sensor's report-only doctrine required; with
+            # rewinds cheap and best-targeting phase-aware, a false positive
+            # costs ~50 steps. The sensor's window is DROPPED after the rewind
+            # -- its trailing rows describe the excursion the restore just
+            # erased, and re-reading them would re-fire every tick until the
+            # reload budget aborted the run. The controller's fire cooldown is
+            # shared so a bar fire and a sensor fire cannot double-respond to
+            # one incident.
+            if sensor.action == 'fire':
+                c = self.lr_controller
+                if self.step_ind >= int(getattr(c, '_fire_cooldown_until', 0)):
+                    cooldown = int(c._cfg('fire_cooldown_steps', 100))
+                    c._moderate_fires += 1
+                    c._fire_cooldown_until = self.step_ind + cooldown
+                    print(f"hot_lr [{stage_name}]: ACTION fire -- rewinding to "
+                          f"the freshest same-stage checkpoint and cutting the "
+                          f"rate (cooldown {cooldown}).")
+                    out = sensor.report()
+                    sensor.reset()
+                    self.fire_loss_spike()
+                    return out
         return sensor.report()
 
     def _merge_metrics(self, metrics, new, source):

@@ -278,9 +278,14 @@ def test_the_tracker_period_is_asserted_not_assumed():
         HotSensor(EQUILIBRATION, 'equilibration', tracker_period=50)
 
 
-def test_the_only_permitted_action_is_report():
+def test_the_permitted_actions_are_report_and_fire():
+    """'fire' was added by owner review 2026-08-26 -- the actuation the
+    report-only doctrine required a reviewed code change for. The DECISION
+    still lives in this module and the RESPONSE outside it (train.observe_hot_lr
+    routes a fire into the unified rewind+cut), so the module itself still
+    cannot move a rate."""
     from energy_sampling.lr_hot_sensor import ACTIONS
-    assert ACTIONS == ('report',)
+    assert ACTIONS == ('report', 'fire')
 
 
 def test_the_report_distinguishes_never_ran_from_ran_and_clean():

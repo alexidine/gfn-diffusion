@@ -164,8 +164,11 @@ SKIP_CONDITIONS = ('prior_loaded',)
 # config declares either.
 LR_SENSOR_KINDS = ('ray', 'hyper', 'none')
 
-#: `hot_lr_sensor.action`. ONE value, deliberately -- see Stage._parse_hot_lr_sensor.
-HOT_LR_ACTIONS = ('report',)
+#: `hot_lr_sensor.action`. 'report' moves nothing; 'fire' (owner review
+#: 2026-08-26) routes a sensor fire into the SAME unified fire response as a
+#: bar fire -- rewind to the freshest same-stage 'best' + cut, one shared
+#: cooldown. The actuation lives in train.observe_hot_lr, not in the sensor.
+HOT_LR_ACTIONS = ('report', 'fire')
 #: `hot_lr_sensor.form`. `absolute` is required on a channel that crosses zero
 #: (`bwd/mle` runs +9.75 to -33.74); `log` is the log ratio to the floor.
 HOT_LR_FORMS = ('log', 'absolute')

@@ -160,3 +160,13 @@ def test_a_single_stage_protocol_with_stop_is_legal_and_ends_the_run():
 def test_stop_is_a_valid_action_name():
     from protocol import ACTIONS
     assert 'stop' in ACTIONS
+
+
+def test_hot_sensor_fire_action_parses_and_report_stays_default():
+    """The reviewed actuation (owner 2026-08-26): 'fire' is a legal
+    hot_lr_sensor action; 'report' remains the default; anything else is
+    refused at parse."""
+    from protocol import HOT_LR_ACTIONS
+    assert HOT_LR_ACTIONS == ('report', 'fire')
+    p, m = engine([{'metric': 'gates/progress_done', 'above': 0.5, 'patience': 1}])
+    assert p.stages[0].hot_lr_sensor is None  # engine declares none: default off

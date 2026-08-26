@@ -122,8 +122,11 @@ from __future__ import annotations
 
 import math
 
-#: The only permitted response. See the module docstring.
-ACTIONS = ('report',)
+#: Permitted responses. 'report' moves nothing; 'fire' hands the verdict to the
+#: unified fire response (train.observe_hot_lr) -- the reviewed actuation the
+#: module docstring's report-only doctrine required. The DECISION stays here;
+#: the RESPONSE stays outside, so this module still cannot move a rate.
+ACTIONS = ('report', 'fire')
 
 #: How the drawdown is formed. `absolute` is required on a channel that crosses
 #: zero -- `bwd/mle` runs +9.75 to -33.74, where the log ratio is undefined.
