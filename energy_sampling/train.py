@@ -5623,9 +5623,27 @@ class Modeller:
         try:
             spec = getattr(self.args, 'progress_gate', None)
             spec = dict(spec.__dict__) if hasattr(spec, '__dict__') else (spec or _PROGRESS_GATE)
+            # ABSTENTIONS ARE ANNOUNCED, once per stage. These doors closed
+            # silently on every baseline_aug24 C arm for 30k steps: the stage
+            # exit named gates/progress_done, this producer declined to run,
+            # and nothing anywhere said so -- the arms were structurally unable
+            # to transition and the log read as healthy (swallowed-diagnostics
+            # doctrine; owner investigation 2026-08-26).
+            def abstain(why):
+                stage = getattr(getattr(self, 'protocol', None), 'stage', None)
+                key = (getattr(stage, 'name', '?'), why)
+                seen = getattr(self, '_progress_abstained', None)
+                if seen is None:
+                    seen = self._progress_abstained = set()
+                if key not in seen:
+                    seen.add(key)
+                    print(f"progress_metrics ABSTAINS ({why}) -- w1r/E gate "
+                          f"channels will NOT be published this stage; an exit "
+                          f"conditioned on gates/progress_done cannot fire")
+
             pd = getattr(self, 'prior_dataset', None)
             if pd is None or getattr(pd, 'batch', None) is None:
-                return
+                return abstain('no prior_dataset batch')
 
             def host(t):
                 if t is None:
@@ -5635,8 +5653,13 @@ class Modeller:
             smp = host(self._batch_latents(sample_batch))
             ref = host(self._batch_latents(pd.batch))
             per = host(getattr(self.energy_function, 'periodic_dims', None))
-            if smp is None or ref is None or smp.ndim != 2 or ref.shape[1] != smp.shape[1]:
-                return
+            if smp is None or smp.ndim != 2:
+                return abstain('sample latents unavailable or not 2-D')
+            if ref is None:
+                return abstain('reference latents unavailable')
+            if ref.shape[1] != smp.shape[1]:
+                return abstain(f'latent width mismatch: samples {smp.shape[1]} '
+                               f'vs reference {ref.shape[1]}')
             per = (_np.zeros(smp.shape[1], dtype=bool) if per is None
                    else _np.asarray(per).astype(bool))
             if not hasattr(self, '_w1_floor_cache'):
