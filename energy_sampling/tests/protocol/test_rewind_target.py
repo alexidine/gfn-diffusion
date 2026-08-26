@@ -120,6 +120,7 @@ def test_a_metric_change_clears_the_best_record():
         combo_loss_record=[60.0, 58.0],   # old-metric values off a checkpoint
         combo_loss_metric=None,           # what an old checkpoint restores
     )
+    m._best_metric_channels = lambda: Modeller._best_metric_channels(m)
     Modeller.monitor_losses(m, 1.0, 'fused')
     assert m.combo_loss_metric == 'fwd/logw_std_within'
     assert m.combo_loss_record == [26.0], (
