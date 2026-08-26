@@ -170,6 +170,11 @@ def test_the_retired_ray_enabled_flag_is_refused(raw):
     silently ignoring it would leave the author believing they had switched
     something off."""
     cfg = copy.deepcopy(raw)
+    # canonical DELETED the parameter block (owner 2026-08-26: off = absent),
+    # so the fixture reconstructs it -- the claim under test is about the
+    # retired 'enabled' spelling, not about canonical carrying the block
+    cfg['lr_control'].setdefault('ray_calibration',
+                                 {'period': 500, 'n_sub': 8, 'alphas': [0, 1]})
     cfg['lr_control']['ray_calibration']['enabled'] = False
     with pytest.raises(ValueError, match='retired config keys'):
         _load(cfg)
@@ -180,7 +185,8 @@ def test_the_old_top_level_ray_block_is_refused(raw):
     unclaimed, train.py's getattr would fall through to the code defaults --
     which default `enabled` to False and would silently kill the probe."""
     cfg = copy.deepcopy(raw)
-    cfg['ray_calibration'] = cfg['lr_control'].pop('ray_calibration')
+    cfg['ray_calibration'] = cfg['lr_control'].pop(
+        'ray_calibration', {'period': 500, 'n_sub': 8, 'alphas': [0, 1]})
     with pytest.raises(ValueError, match='retired config keys'):
         _load(cfg)
 

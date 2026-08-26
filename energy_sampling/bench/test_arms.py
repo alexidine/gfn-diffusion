@@ -64,6 +64,12 @@ def test_null_does_not_move_its_rate_after_warmup():
 
 # ------------------------------------------------------------------ hyper
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_hyper_moves_the_rate_and_respects_its_own_gain_cap():
     """Per-step moves are bounded by exp(beta) BY CONSTRUCTION -- cos is a
     cosine. Checked past burn-in, where the controller is holding and the only
@@ -80,6 +86,12 @@ def test_hyper_moves_the_rate_and_respects_its_own_gain_cap():
     assert max(jumps) <= 0.02 * (1 + 1e-6), f'exceeded its gain cap: {max(jumps)}'
 
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_hyper_climbs_from_a_cold_start():
     """MK requirement (1): a cold start should ramp up."""
     run = _run(Hyper, steps=1400)
@@ -104,6 +116,12 @@ def test_the_ray_probe_actually_resolves_readings():
         f'sensor arm, it is the null arm wearing a different name.')
 
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_ray_is_distinguishable_from_null():
     """Two arms agreeing to 8 significant figures is how the no-op was found."""
     ray = _run(RayRay, steps=1400)
@@ -113,6 +131,12 @@ def test_ray_is_distinguishable_from_null():
 
 # ------------------------------------------------- hyper step (the operand)
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_hyper_step_is_identical_to_hyper_under_sgd():
     """
     THE FALSIFIABLE CHECK ON THE OPERAND FIX. `hyper step` correlates the
@@ -154,6 +178,12 @@ def test_hyper_step_is_identical_to_hyper_under_sgd():
         f'the operand')
 
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_hyper_step_differs_from_hyper_under_adam():
     """...and under Adam they MUST differ, or the preconditioner is not being
     picked up and the arm is a no-op rename."""
@@ -164,6 +194,12 @@ def test_hyper_step_differs_from_hyper_under_adam():
 
 # --------------------------------------------------------- ramp + plateau
 
+@pytest.mark.skip(reason=(
+    "v8 actuation retired (controller state 10, 2026-08-23): hyper/ray no "
+    "longer reach any learning rate and the ramp is gone, so a bench arm "
+    "driving those knobs through the real controller measurably no-ops BY "
+    "DESIGN -- exactly what this test was written to catch when it was a bug. "
+    "Kept as documentation of the v8 sandbox; retires with bench/arms' v8 arms."))
 def test_ramp_climbs_when_nothing_stops_it():
     run = _run(RampPlateau, steps=1400)
     lrs = _lrs(run)
