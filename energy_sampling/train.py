@@ -2965,8 +2965,26 @@ class Modeller:
             # the missing set is fixed so the constant cancels from every
             # comparison, and transitions clear the record anyway.
             LARGE = 1.0e6
+            channels = self._best_metric_channels()
+            # THE RECORD IS ONLY COMPARABLE UNDER ONE METRIC. A record carried
+            # across a metric change -- a stage transition, a resume from a
+            # checkpoint written under the old global combo -- holds values on
+            # a different scale, and comparing against its min made every new
+            # sample a "record": 'best' then re-linked to 'running' every 50
+            # steps and degenerated into it, which is exactly the checkpoint
+            # the rewind path exists to avoid (qm9c selC, 2026-08-25: three
+            # fires, none restoring a pre-excursion state). The signature is
+            # CHECKPOINTED so a resume detects the mismatch too.
+            sig = '+'.join(f'{m}/{k}' for m, k in channels)
+            if getattr(self, 'combo_loss_metric', None) != sig:
+                if self.combo_loss_record:
+                    print(f"best: metric changed to {sig} -- clearing the "
+                          f"{len(self.combo_loss_record)}-sample record; values "
+                          f"under the old metric are not comparable")
+                self.combo_loss_record = []
+                self.combo_loss_metric = sig
             total = 0.0
-            for mode, key in self._best_metric_channels():
+            for mode, key in channels:
                 v = self.metric_tracker.get(mode, key)
                 total += LARGE if v is None else float(v)
             self.combo_loss_record.append(total)
@@ -3040,6 +3058,12 @@ class Modeller:
             return best_path
         run_idx, run_step, run_path = stage_and_step('running')
         if run_idx is not None and run_idx >= current:
+            # SAY WHICH TARGET WON, every path. On selC three fires rewound in
+            # silence and nothing recorded that each one had fallen through to
+            # 'running' (no best existed yet) -- the excursion-onset state.
+            print(f"rewind: targeting 'running' from step {run_step}"
+                  + ("" if best_path is None or best_idx is None else
+                     f" (best was ineligible: stage_idx {best_idx}, step {best_step})"))
             return run_path
         start_idx, start_step, start_path = stage_and_step('stage_start')
         if start_idx == current:
@@ -3047,8 +3071,12 @@ class Modeller:
                   f"stage's start rather than reversing the phase")
             return start_path
         if best_idx is not None and best_idx >= current:
+            print(f"rewind: last resort -- 'best' from step {best_step}")
             return best_path
-        return best_path if os.path.exists(best_path) else None
+        if os.path.exists(best_path):
+            print(f"rewind: last resort -- a PRIOR-stage 'best' from step {best_step}")
+            return best_path
+        return None
 
     def fire_loss_spike(self):
         """

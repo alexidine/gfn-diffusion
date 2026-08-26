@@ -101,3 +101,30 @@ def test_the_best_selector_is_phase_dependent():
     assert channels('fused', 'var_conditioning') == (('fwd', 'logw_std_within'),)
     assert channels('fused', 'equilibration') == (
         ('fwd', 'tb_err_worst'), ('bwd', 'tb_err_worst'))
+
+def test_a_metric_change_clears_the_best_record():
+    """qm9c selC, 2026-08-25: a record restored from a checkpoint written under
+    the OLD global combo (~60, tb_err scale) made every new-metric sample
+    (~26, logw_std scale) a fresh record -- 'best' re-linked to 'running'
+    every 50 steps and degenerated into it, so three fire rewinds all restored
+    the excursion onset. Values under different metrics are not comparable;
+    the record resets when the signature changes, and the signature is
+    checkpointed (old checkpoints restore None and self-heal)."""
+    from train import Modeller
+
+    m = SimpleNamespace(
+        _nonfinite_pending=False,
+        metric_tracker=SimpleNamespace(get=lambda mode, key: 26.0),
+        protocol=SimpleNamespace(stage=SimpleNamespace(
+            train_mode='fused', name='var_conditioning')),
+        combo_loss_record=[60.0, 58.0],   # old-metric values off a checkpoint
+        combo_loss_metric=None,           # what an old checkpoint restores
+    )
+    Modeller.monitor_losses(m, 1.0, 'fused')
+    assert m.combo_loss_metric == 'fwd/logw_std_within'
+    assert m.combo_loss_record == [26.0], (
+        'the old-metric record survived the switch; every new sample beats its '
+        "min and 'best' degenerates to 'running'")
+    # same metric next tick: the record accumulates normally
+    Modeller.monitor_losses(m, 1.0, 'fused')
+    assert m.combo_loss_record == [26.0, 26.0]

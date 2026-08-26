@@ -73,6 +73,11 @@ MODELLER_STATE_DEFAULTS = {
     'bwd_frac': 1.0,
     'replay_frac': 0.0,
     'combo_loss_record': [],
+    # which metric family produced combo_loss_record. A record compared under a
+    # different metric makes 'best' degenerate to 'running' (or freeze) -- the
+    # default None mismatches every real signature, so old checkpoints clear
+    # the record on their first post-resume tick.
+    'combo_loss_metric': None,
     # LRController state (see controller.py): the live scale, the step this
     # stage's burn-in started at, and the LR bracket's own phase/verdict. A
     # missing/mismatched 'ver' means "not yet attached, or written by a
