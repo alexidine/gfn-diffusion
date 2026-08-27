@@ -94,13 +94,13 @@ def test_the_best_selector_is_phase_dependent():
 
     def channels(train_mode, name):
         m = SimpleNamespace(protocol=SimpleNamespace(
-            stage=SimpleNamespace(train_mode=train_mode, name=name)))
+            stage=SimpleNamespace(train_mode=train_mode, name=name, balance=None)))
         return Modeller._best_metric_channels(m)
 
-    assert channels('bwd', 'train_prior') == (('bwd', 'mle'),)
-    assert channels('fused', 'var_conditioning') == (('fwd', 'logw_std_within'),)
+    assert channels('bwd', 'train_prior') == (('bwd', 'mle', 1.0),)
+    assert channels('fused', 'var_conditioning') == (('fwd', 'logw_std_within', 1.0),)
     assert channels('fused', 'equilibration') == (
-        ('fwd', 'tb_err_worst'), ('bwd', 'tb_err_worst'))
+        ('fwd', 'tb_err_worst', 1.0), ('bwd', 'tb_err_worst', 1.0))
 
 def test_a_metric_change_clears_the_best_record():
     """qm9c selC, 2026-08-25: a record restored from a checkpoint written under
@@ -116,16 +116,73 @@ def test_a_metric_change_clears_the_best_record():
         _nonfinite_pending=False,
         metric_tracker=SimpleNamespace(get=lambda mode, key: 26.0),
         protocol=SimpleNamespace(stage=SimpleNamespace(
-            train_mode='fused', name='var_conditioning')),
+            train_mode='fused', name='var_conditioning', balance=None)),
         combo_loss_record=[60.0, 58.0],   # old-metric values off a checkpoint
         combo_loss_metric=None,           # what an old checkpoint restores
     )
     m._best_metric_channels = lambda: Modeller._best_metric_channels(m)
     Modeller.monitor_losses(m, 1.0, 'fused')
-    assert m.combo_loss_metric == 'fwd/logw_std_within'
+    assert m.combo_loss_metric == '1*fwd/logw_std_within'
     assert m.combo_loss_record == [26.0], (
         'the old-metric record survived the switch; every new sample beats its '
         "min and 'best' degenerates to 'running'")
     # same metric next tick: the record accumulates normally
     Modeller.monitor_losses(m, 1.0, 'fused')
     assert m.combo_loss_record == [26.0, 26.0]
+
+
+def test_a_balance_block_supplies_the_score_weights():
+    """Owner 2026-08-27: where the controller has already declared an exchange
+    rate between branches -- targets {fwd: 5, bwd: 1} says "fwd at 5 is as good
+    as bwd at 1" -- that IS the normalisation that makes two branch metrics
+    commensurable, so 'best' (and with it 'last_ok') scores by sum(metric/target).
+
+    The single-channel var_conditioning selector it replaces was blind to bwd,
+    and fwd/logw_std_within is exactly the metric MODE COLLAPSE improves: a
+    policy narrowing into safe modes lowered fwd spread and advanced 'best'
+    into the collapsed state."""
+    from train import Modeller
+
+    stage = SimpleNamespace(train_mode='fused', name='var_conditioning', balance={
+        'kind': 'proportional',
+        'metrics': {'fwd': 'fwd/logw_std_within', 'bwd': 'bwd/logw_std_within'},
+        'targets': {'fwd': 5.0, 'bwd': 1.0}})
+    m = SimpleNamespace(protocol=SimpleNamespace(stage=stage))
+    assert Modeller._best_metric_channels(m) == (
+        ('bwd', 'logw_std_within', 1.0), ('fwd', 'logw_std_within', 0.2))
+
+    # the incident's real numbers: healthy 17/1.9 vs the peak 117/2
+    score = lambda f, b: f * 0.2 + b * 1.0
+    assert abs(score(17.0, 1.9) - 5.3) < 0.01
+    assert abs(score(117.0, 2.0) - 25.4) < 0.01
+
+    # a ratio-style balance declares a setpoint, not targets -> falls back
+    stage.balance = {'kind': 'ratio', 'metrics': {'replay': 'fwd/over_coverage'},
+                     'setpoint': 5.0}
+    assert Modeller._best_metric_channels(m) == (('fwd', 'logw_std_within', 1.0),)
+
+
+def test_changing_a_balance_target_invalidates_the_record():
+    """A target change rescales the score, so old samples are not comparable --
+    the same hazard as a stage transition (qm9c selC: a record carried across a
+    metric change made every new sample a 'record', so 'best' degenerated into
+    'running'). The weights are therefore part of the signature."""
+    from train import Modeller
+
+    def sig_for(t_fwd):
+        stage = SimpleNamespace(train_mode='fused', name='var_conditioning', balance={
+            'kind': 'proportional',
+            'metrics': {'fwd': 'fwd/logw_std_within', 'bwd': 'bwd/logw_std_within'},
+            'targets': {'fwd': t_fwd, 'bwd': 1.0}})
+        m = SimpleNamespace(
+            _nonfinite_pending=False,
+            metric_tracker=SimpleNamespace(get=lambda mode, key: 20.0),
+            protocol=SimpleNamespace(stage=stage),
+            combo_loss_record=[], combo_loss_metric=None)
+        m._best_metric_channels = lambda: Modeller._best_metric_channels(m)
+        Modeller.monitor_losses(m, 1.0, 'fused')
+        return m.combo_loss_metric
+
+    assert sig_for(1.0) != sig_for(5.0), (
+        'the signature must move with the targets, or a 1:1 -> 5:1 switch '
+        'compares values on two different scales')

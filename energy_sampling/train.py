@@ -3007,7 +3007,12 @@ class Modeller:
             # the rewind path exists to avoid (qm9c selC, 2026-08-25: three
             # fires, none restoring a pre-excursion state). The signature is
             # CHECKPOINTED so a resume detects the mismatch too.
-            sig = '+'.join(f'{m}/{k}' for m, k in channels)
+            # WEIGHTS ARE PART OF THE SIGNATURE: changing a balance target
+            # changes the score's scale, so the old record is not comparable
+            # and must be cleared -- the same reason a stage transition clears
+            # it. Without this, switching targets 1:1 -> 5:1 mid-run would
+            # compare values from two different metrics.
+            sig = '+'.join(f'{w:g}*{m}/{k}' for m, k, w in channels)
             if getattr(self, 'combo_loss_metric', None) != sig:
                 if self.combo_loss_record:
                     print(f"best: metric changed to {sig} -- clearing the "
@@ -3016,30 +3021,67 @@ class Modeller:
                 self.combo_loss_record = []
                 self.combo_loss_metric = sig
             total = 0.0
-            for mode, key in channels:
+            for mode, key, weight in channels:
                 v = self.metric_tracker.get(mode, key)
-                total += LARGE if v is None else float(v)
+                total += LARGE if v is None else weight * float(v)
             self.combo_loss_record.append(total)
 
     def _best_metric_channels(self):
-        """The (mode, key) channels whose sum defines 'best' for the CURRENT
-        stage (owner, 2026-08-25):
+        """The (mode, key, weight) channels whose WEIGHTED SUM defines 'best'
+        -- and therefore also 'last_ok', the rewind target, since both derive
+        from the same record.
+
+        THE CONTROLLER'S OWN WEIGHTING COMES FIRST (owner, 2026-08-27). A stage
+        whose balance block declares `metrics` and `targets` has already stated
+        the exchange rate between its branches: targets {fwd: 5, bwd: 1} says
+        "fwd at 5 is as good as bwd at 1". That is precisely the normalisation
+        needed to make two branch metrics commensurable, so the score is
+        sum(metric_b / target_b) and its minimum means "balanced AND low"
+        rather than "fwd low, bwd unexamined".
+
+        WHY IT MATTERS: the single-channel var_conditioning selector below was
+        blind to bwd entirely -- and fwd/logw_std_within is exactly the metric
+        MODE COLLAPSE improves. A policy narrowing into safe modes lowers fwd
+        spread, which advanced 'best' into the collapsed state while the
+        distribution degraded. With bwd in the sum at a principled weight,
+        collapse has to pay for itself. (Not un-gameable: weighted, fwd/5 ~ 3.4
+        against bwd ~ 1.9, so a fwd drop still outweighs an equal-percentage
+        bwd rise. Much harder to hide, not impossible.)
+
+        Uses the balance block's OWN metric keys, not the loss channels: the
+        targets are calibrated against those metrics (logw_std_within ~17 vs
+        ~1.9), so applying them to vg_lb (~60 vs ~1.8) would normalise by the
+        wrong scale.
+
+        Only `proportional`-style balances declare targets; `ratio` balances
+        (equilibration) declare a setpoint instead and fall through to the
+        per-stage defaults below, which keep their 2026-08-25 behaviour:
 
           phase 1 / MLE stages (train_mode 'bwd')  ->  bwd/mle, the loss itself
           var_conditioning                         ->  fwd/logw_std_within (the
               channel the poisoning actually moved while tb_err stayed flat)
           everything else (equilibration et al.)   ->  fwd + bwd tb_err_worst
-
-        Keyed on stage properties (train_mode) then the canonical stage name;
-        a stage-config key can replace the name match if a config ever needs
-        to override this."""
+        """
         stage = getattr(getattr(self, 'protocol', None), 'stage', None)
+        bal = getattr(stage, 'balance', None) or {}
+        metrics, targets = bal.get('metrics') or {}, bal.get('targets') or {}
+        if metrics and targets:
+            out = []
+            for branch, key in metrics.items():
+                t = float(targets.get(branch, 0.0) or 0.0)
+                if t <= 0.0 or '/' not in str(key):
+                    out = []
+                    break                      # malformed: fall back rather than guess
+                mode, chan = str(key).split('/', 1)
+                out.append((mode, chan, 1.0 / t))
+            if out:
+                return tuple(sorted(out))
         if getattr(stage, 'train_mode', None) == 'bwd':
-            return (('bwd', 'mle'),)
+            return (('bwd', 'mle', 1.0),)
         name = (getattr(stage, 'name', '') or '').lower()
         if 'conditioning' in name:
-            return (('fwd', 'logw_std_within'),)
-        return (('fwd', 'tb_err_worst'), ('bwd', 'tb_err_worst'))
+            return (('fwd', 'logw_std_within', 1.0),)
+        return (('fwd', 'tb_err_worst', 1.0), ('bwd', 'tb_err_worst', 1.0))
 
     def _rewind_checkpoint_path(self):
         """Pick fire_loss_spike's rewind target, NEVER reverting to an earlier
