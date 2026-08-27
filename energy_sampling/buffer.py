@@ -2070,19 +2070,35 @@ class ConditionLogZTracker:
     @torch.no_grad()
     def lookup_fit_error(self, condition_id):
         """
-        Returns (err, mask) with err = z_bias_ema^2 + Var(log w): the per-condition
-        MEAN SQUARED TB residual. The residual log_Z_learned - log w decomposes
-        exactly into a LEVEL term (z_bias_ema, the signed mean residual) and a
-        SPREAD term (within-condition Var(log w)), and the mean square is the sum
-        of the two. Both matter and neither alone is "the fit": bias^2 is what a
-        Z-only forward branch can fix, Var(log w) is what the policy can fix.
+        Returns (err, mask) with err = Var(log w): the per-condition SPREAD of
+        log w, and NOTHING ELSE. Var is shift-invariant, so this priority is
+        INVARIANT TO log Z(c) and to the learned flow head.
 
-        This is cond_tb_err SQUARED (the property above), kept unrooted because a
-        sampling weight only needs a monotone priority and the square keeps the
-        two components additive. Uses z_bias_ema, NOT the clipped z_grad_ema: the
-        Winsorized level would break the exact bias^2 + Var identity and would
-        cap the priority of exactly the worst-fit conditions this is meant to
-        steer toward.
+        WHY THE LEVEL TERM IS GONE (2026-08-26). The mean squared TB residual
+        decomposes exactly into a LEVEL term (z_bias_ema^2, the signed mean
+        residual against log_Z_learned) plus this SPREAD term, and this function
+        used to return the sum. But its ONE caller is
+        Modeller.weighted_condition_sampling, which chooses WHICH CONDITIONS THE
+        FORWARD BATCH CONTAINS -- so including the level term let the learned Z
+        head steer POLICY training by data selection. That is a value-path, not a
+        gradient path, so the gfn._condition_flow detach invariant never saw it,
+        but it violates the same design rule: Z must not influence policy
+        training. The bwd call site already omits log_Z_learned for exactly this
+        reason ("it's the policy model's job to fix those, not the Z model's");
+        the fwd path simply never got the same treatment.
+
+        It is also the RIGHT priority on its own, not merely the safe one. The
+        VarGrad objective IS the per-condition variance of log w, so ranking by
+        Var(log w) makes the sampling weight proportional to each condition's
+        actual contribution to the loss being minimised. Level error is Z's job;
+        spread error is the policy's, and the policy is what this draw feeds.
+        Measured share when it was removed: bias^2 was ~5% of the priority
+        (z_bias_rms ~6 nats vs Var(log w) ~625), halved again by
+        weighted_condition_sampling_uniform_beta, so ~3% effective.
+
+        Kept unrooted (a variance, not a std) because a sampling weight only
+        needs a MONOTONE priority; the square root would change nothing about
+        the ranking.
 
         Deliberately NOT normalized into a per-condition r2. That needs the
         within-condition variance of the target in the denominator, which is noisy
@@ -2098,13 +2114,14 @@ class ConditionLogZTracker:
         callers fill those with a neutral value rather than starving them.
         """
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
-        bias = self.z_bias_ema[condition_id]
         var = self.logw_var[condition_id]
-        err = torch.nan_to_num(bias, nan=0.0) ** 2 + torch.nan_to_num(var, nan=0.0)
-        # z_bias_ema is fed by update_z_residual and ema_logw_sq by update(), which
-        # need not both have run for a given condition -- one live component is
-        # enough to rank on, both missing is not
-        valid = (~torch.isnan(bias)) | (~torch.isnan(var))
+        err = torch.nan_to_num(var, nan=0.0)
+        # Var(log w) is now the ONLY component, so validity is its validity alone.
+        # The old mask admitted a condition with a live z_bias_ema and a NaN
+        # variance; with the level term gone such a row would score err = 0 via
+        # nan_to_num and rank LOWEST -- an uncharacterized condition silently
+        # sorted to the bottom instead of being excluded and neutral-filled.
+        valid = ~torch.isnan(var)
         mask = (self.count[condition_id] >= 1) & valid
         return err, mask
 

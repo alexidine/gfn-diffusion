@@ -773,9 +773,21 @@ class GFN(nn.Module):  # todo add seeding
         and flow_model still trains -- it just can no longer SHAPE the
         conditioner to make itself easier to fit. On this route that costs
         nothing that is used, because tb_z_source is `persistent` (TB reads the
-        condition_log_z tracker) and log_flow[:, 0] is consumed by `emp_z`
-        alone. On a route where TB reads the LEARNED head, the conditioner will
+        condition_log_z tracker) and log_flow[:, 0] enters no policy LOSS term.
+        On a route where TB reads the LEARNED head, the conditioner will
         no longer be tuned by the Z objective -- that is the intended trade.
+
+        ⚠ THIS INVARIANT IS ABOUT GRADIENT, NOT INFLUENCE. An earlier version of
+        this docstring claimed log_flow[:, 0] was "consumed by `emp_z` alone".
+        That was false and it misled a 2026-08-26 investigation: the forward
+        loss also hands log_Z_learned to the tracker as a VALUE
+        (gflownet_losses.py:214-216 -> update_z_residual -> z_bias_ema), and
+        z_bias_ema used to feed lookup_fit_error, which weights WHICH CONDITIONS
+        the forward batch draws. So the head influenced policy training by data
+        selection while carrying no gradient. lookup_fit_error is now Var(log w)
+        only (buffer.py), closing that path -- but treat "no gradient reaches
+        the policy" and "the head cannot affect policy training" as SEPARATE
+        claims, and re-derive the second one before relying on it.
 
         Cutting this path is a CONTRIBUTOR, not a cure: at 5e-4 it moved the
         detonation from step 560 to 976 rather than preventing it (arm

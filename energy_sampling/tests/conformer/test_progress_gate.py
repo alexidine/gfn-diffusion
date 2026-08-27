@@ -298,3 +298,36 @@ def test_level_mode_judges_the_smoothed_level_not_the_last_dip():
     h['w1r/median'][-1] = (t, 4.0)
     out = progress_gate(h, LEVEL_SPEC, step=60000)
     assert out['gates/progress_done'] == 0.0
+
+
+def test_condition_sampling_priority_is_invariant_to_the_learned_z_head():
+    """2026-08-26: lookup_fit_error returned z_bias_ema**2 + Var(log w), and its
+    only caller weights WHICH CONDITIONS the forward batch draws -- so the
+    learned flow head steered policy training by data selection while carrying
+    no gradient (the gfn._condition_flow detach never saw it). The priority must
+    now depend on Var(log w) alone, which is shift-invariant and therefore
+    insensitive to log Z(c) and to the head."""
+    import torch
+    from buffer import ConditionLogZTracker
+
+    t = ConditionLogZTracker(library_size=4)
+    cid = torch.tensor([0, 1, 2, 3])
+    # characterize every condition with identical spread but different levels
+    for _ in range(5):
+        t.update(cid, torch.tensor([0.0, 10.0, 20.0, 30.0]), step=0)
+        t.update(cid, torch.tensor([2.0, 12.0, 22.0, 32.0]), step=0)
+
+    err_before, mask_before = t.lookup_fit_error(cid)
+    assert bool(mask_before.all()), 'all four conditions should be characterized'
+
+    # now drive the LEARNED-HEAD residual wildly apart across conditions
+    t.update_z_residual(cid, torch.tensor([0.0, 10.0, 20.0, 30.0]),
+                        torch.tensor([100.0, -50.0, 0.0, 999.0]), step=0)
+    err_after, _ = t.lookup_fit_error(cid)
+
+    assert torch.allclose(err_before, err_after), (
+        'the condition-sampling priority moved when the learned Z head moved; '
+        'the level term is back in lookup_fit_error')
+    # and identical spreads must rank equal regardless of level
+    assert torch.allclose(err_after, err_after[0].expand_as(err_after), atol=1e-5), (
+        'conditions with equal Var(log w) but different levels ranked differently')
