@@ -154,6 +154,25 @@ FAMILIES = {
         'warm_tag': 'phase1_exit',        # the tagged snapshot, NOT _running
         'scales': [0.1, 0.2, 0.283, 0.4, 0.566],
     },
+    # nehzor ELJ landed in the same place as mipcas: neh_lr0p2 fired the level
+    # gate at the minimum possible step (2510, w1r 3.53/6.15, no fires), so its
+    # phase 1 is done too. Appended AFTER mip2 deliberately -- dict order sets
+    # row numbers and mip2's rows 20-24 are already named by a pushed sbatch.
+    # ⚠ THE GRID IS AN EXTRAPOLATION HERE, not a measurement. The bracket it
+    # comes from (elj_selD_eq) was run on mipcas sg2; nothing has ever
+    # bracketed nehzor sg14 on this stage. It rides the owner's shared-optimum
+    # reasoning (physical crystals of this type sit at roughly similar rates,
+    # "direct neighbors on a fat enough grid"). Read the fan accordingly: a
+    # boundary landing OFF the end of this grid is the extrapolation failing,
+    # not a rung failing.
+    'neh2': {
+        'phase': 2,
+        'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_elj_prior_dataset.pt',
+        'space_groups': [14],
+        'warm_src': 'prod26_neh_lr0p2',
+        'warm_tag': 'phase1_exit',
+        'scales': [0.1, 0.2, 0.283, 0.4, 0.566],
+    },
 }
 
 

@@ -6,7 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=20-24
+#SBATCH --array=20-29
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=prod26p2
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/prod_aug26/joblogs/%x_%A_%a.out
