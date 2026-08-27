@@ -186,3 +186,39 @@ def test_changing_a_balance_target_invalidates_the_record():
     assert sig_for(1.0) != sig_for(5.0), (
         'the signature must move with the targets, or a 1:1 -> 5:1 switch '
         'compares values on two different scales')
+
+
+def test_a_ratio_balance_supplies_weights_too():
+    """Owner 2026-08-27: equilibration's metrics are balanced in a similar way.
+    A ratio balance states the same exchange rate a proportional target does,
+    just differently -- numerator `replay` with setpoint 5 means
+    over_coverage / relative_under_wcen -> 5, i.e. over-coverage at 5 is as
+    good as under-coverage at 1. Scoring on it makes 'best' a two-sided
+    COVERAGE score (the two directions of distributional mismatch) rather than
+    tb_err_worst, a calibration error that sat FLAT through a 20x vg_lb
+    excursion on the neighbouring stage.
+
+    ⚠ These read against the learned head, so they mean what they say only once
+    Z has converged (owner). That does not favour the previous selector:
+    tb_err_worst is Z-dependent too; only logw_std_within is Z-free."""
+    from train import Modeller
+
+    stage = SimpleNamespace(train_mode='fused', name='equilibration', balance={
+        'kind': 'ratio', 'pinned': {'fwd': 0.05},
+        'metrics': {'replay': 'fwd/over_coverage', 'bwd': 'bwd/relative_under_wcen'},
+        'numerator': 'replay', 'setpoint': 5.0})
+    m = SimpleNamespace(protocol=SimpleNamespace(stage=stage))
+    assert Modeller._best_metric_channels(m) == (
+        ('bwd', 'relative_under_wcen', 1.0), ('fwd', 'over_coverage', 0.2))
+
+    # a setpoint of 0/None is malformed -> fall back rather than divide by it
+    stage.balance = dict(stage.balance, setpoint=0.0)
+    assert Modeller._best_metric_channels(m) == (
+        ('fwd', 'tb_err_worst', 1.0), ('bwd', 'tb_err_worst', 1.0))
+
+    # a numerator naming a branch that has no metric -> fall back
+    stage.balance = {'kind': 'ratio',
+                     'metrics': {'replay': 'fwd/over_coverage', 'bwd': 'bwd/x'},
+                     'numerator': 'nope', 'setpoint': 5.0}
+    assert Modeller._best_metric_channels(m) == (
+        ('fwd', 'tb_err_worst', 1.0), ('bwd', 'tb_err_worst', 1.0))

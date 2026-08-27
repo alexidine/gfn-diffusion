@@ -3053,9 +3053,10 @@ class Modeller:
         ~1.9), so applying them to vg_lb (~60 vs ~1.8) would normalise by the
         wrong scale.
 
-        Only `proportional`-style balances declare targets; `ratio` balances
-        (equilibration) declare a setpoint instead and fall through to the
-        per-stage defaults below, which keep their 2026-08-25 behaviour:
+        BOTH balance kinds qualify: `proportional` states the rate as
+        per-branch targets, `ratio` states it as a numerator + setpoint. A
+        stage with no balance at all falls through to the per-stage defaults
+        below, which keep their 2026-08-25 behaviour:
 
           phase 1 / MLE stages (train_mode 'bwd')  ->  bwd/mle, the loss itself
           var_conditioning                         ->  fwd/logw_std_within (the
@@ -3064,16 +3065,45 @@ class Modeller:
         """
         stage = getattr(getattr(self, 'protocol', None), 'stage', None)
         bal = getattr(stage, 'balance', None) or {}
-        metrics, targets = bal.get('metrics') or {}, bal.get('targets') or {}
+        metrics = bal.get('metrics') or {}
+        # BOTH BALANCE KINDS STATE AN EXCHANGE RATE, in different words.
+        #   proportional: targets {fwd: 5, bwd: 1}    -> weight 1/target
+        #   ratio:        numerator + setpoint 5      -> the steered ratio is
+        #                 metrics[numerator] / metrics[other] -> setpoint, i.e.
+        #                 numerator at 5 is as good as the other at 1, so the
+        #                 numerator carries weight 1/setpoint and the other 1.
+        # Equilibration is the ratio case: over_coverage / relative_under_wcen
+        # -> 5 makes the score a two-sided COVERAGE score (the two directions
+        # of distributional mismatch), which is a better statement of that
+        # stage's quality than tb_err_worst -- a calibration error that sat
+        # FLAT through a 20x vg_lb excursion on the neighbouring stage.
+        #
+        # ⚠ Z-DEPENDENCE (owner): these read against the learned head, so they
+        # only mean what they say once Z has converged. That is not a reason to
+        # prefer the previous selector -- tb_err_worst is Z-dependent too
+        # (resid = (log_pf + log_Z) - (log_pb + log_r)); only logw_std_within
+        # is Z-free. The caveat applies equally either way.
+        weights = {}
+        targets = bal.get('targets') or {}
+        setpoint = bal.get('setpoint')
+        numerator = bal.get('numerator')
         if metrics and targets:
+            weights = {b: 1.0 / float(targets.get(b, 0.0) or 0.0)
+                       for b in metrics if float(targets.get(b, 0.0) or 0.0) > 0.0}
+            if len(weights) != len(metrics):
+                weights = {}                   # malformed: fall back, do not guess
+        elif (metrics and numerator in metrics and setpoint
+              and float(setpoint) > 0.0 and len(metrics) == 2):
+            weights = {b: (1.0 / float(setpoint) if b == numerator else 1.0)
+                       for b in metrics}
+        if weights:
             out = []
             for branch, key in metrics.items():
-                t = float(targets.get(branch, 0.0) or 0.0)
-                if t <= 0.0 or '/' not in str(key):
+                if '/' not in str(key):
                     out = []
-                    break                      # malformed: fall back rather than guess
+                    break
                 mode, chan = str(key).split('/', 1)
-                out.append((mode, chan, 1.0 / t))
+                out.append((mode, chan, weights[branch]))
             if out:
                 return tuple(sorted(out))
         if getattr(stage, 'train_mode', None) == 'bwd':
