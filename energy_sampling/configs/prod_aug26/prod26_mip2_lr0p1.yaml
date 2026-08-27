@@ -1,18 +1,18 @@
 project_state_version: 10
-run_name: prod26_nehu_lr0p8
+run_name: prod26_mip2_lr0p1
 tag: prod26
 seed: 12345
 device: cuda
 cuda_memory_fraction: 0.9
 anomaly_detection: false
 continue_from_checkpoint: false
-mlip_path: /scratch/mk8347/models/uma/esen_s.pt
+mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
-checkpoint_name: null
+checkpoint_name: WARM_CHECKPOINT_PLACEHOLDER
 prior_model_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_prior_dataset.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_prior_dataset.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
@@ -53,7 +53,7 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.8
+  fixed_scale: 0.1
   verbose: true
   hard_failure:
     loss_excursion_k: 10.0
@@ -122,11 +122,11 @@ model:
 buffer_device: cuda
 batch_size: 1000
 grow_batch_size: true
-max_batch_size: 50000
+max_batch_size: 20000
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 30000
+epochs: 14500
 eval_period: 500
 figs_period: 1000
 batch_growth_factor: 1.6
@@ -232,7 +232,7 @@ z_calibration:
   se2_floor: 0.25
   holdout_modulus: 8
 conditional_worst_quantile: 0.25
-protocol: prod_mle
+protocol: prod_eq
 protocols:
   unconditional_tb:
     stages:
@@ -400,7 +400,7 @@ protocols:
           bwd: 0.5
         floor: 0.1
         alpha: 0.01
-  prod_mle:
+  prod_eq:
     stages:
     - name: train_prior
       train_mode: bwd
@@ -425,9 +425,70 @@ protocols:
         above: 0.5
         patience: 1
       on_exit:
-      - snapshot:phase1_exit
       - snapshot_prior
-      - stop
+    - name: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      hot_lr_sensor:
+        channel: fwd/scatter_err
+        rows: 11
+        above: 2.0
+        action: fire
+      flags:
+        update_log_z: true
+        buffers_active: true
+        z_calibration: true
+      on_enter:
+      - rebuild_prior_by_churn
+      - bootstrap_z:train_conditioner
+      fracs:
+        fwd: 0.05
+        bwd: 0.93
+        replay: 0.02
+      min_fracs:
+        fwd: 0.02
+        bwd: 0.02
+        replay: 0.02
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        fwd:
+          tb: 1.0
+          freeze_policy: 1.0
+        bwd:
+          tb: 1.0
+          beta: 80
+        replay:
+          tb: 1.0
+          beta: 80
+      balance:
+        kind: ratio
+        pinned:
+          fwd: 0.05
+        metrics:
+          replay: fwd/over_coverage
+          bwd: bwd/relative_under_wcen
+        numerator: replay
+        setpoint: 5.0
+        gain: 0.05
+        max_step: 0.05
+        bounds:
+          replay:
+          - 0.02
+          - 0.93
+          bwd:
+          - 0.02
+          - 0.93
+        converge_floor: 1.0
+      buffer_servo:
+        numerator: replay/ema_loss_mean
+        denominator: replay/birth_loss_mean
+        bar: 0.368
+        release: 0.6
+        scale: 0.15
+        gain: 0.05
+        relax: 0.5
+        max_step: 0.05
+        max_boost: 8.0
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -487,12 +548,12 @@ buffers:
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
-energy_function: uma
+energy_function: elj
 temperature_conditioning: false
 molecule_conditioning: false
 sg_conditioning: false
 space_groups:
-- 14
+- 2
 zp_conditioning: false
 z_primes:
 - 1

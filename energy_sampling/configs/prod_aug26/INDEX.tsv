@@ -1,21 +1,26 @@
-arm	warm_src
-prod26_mip_lr0p2	base24_u2_fixed12
-prod26_mip_lr0p4	base24_u2_fixed12
-prod26_mip_lr0p8	base24_u2_fixed12
-prod26_mip_lr1p2	base24_u2_fixed12
-prod26_mip_lr1p6	base24_u2_fixed12
-prod26_neh_lr0p2	prod0810_nehzor_elj
-prod26_neh_lr0p4	prod0810_nehzor_elj
-prod26_neh_lr0p8	prod0810_nehzor_elj
-prod26_neh_lr1p2	prod0810_nehzor_elj
-prod26_neh_lr1p6	prod0810_nehzor_elj
-prod26_acr_lr0p1	prod0810_acridine_sg14_zp1_mace
-prod26_acr_lr0p2	prod0810_acridine_sg14_zp1_mace
-prod26_acr_lr0p4	prod0810_acridine_sg14_zp1_mace
-prod26_acr_lr0p8	prod0810_acridine_sg14_zp1_mace
-prod26_mipu_lr0p2	-
-prod26_mipu_lr0p4	-
-prod26_mipu_lr0p8	-
-prod26_nehu_lr0p2	-
-prod26_nehu_lr0p4	-
-prod26_nehu_lr0p8	-
+arm	warm_src	warm_tag
+prod26_mip_lr0p2	base24_u2_fixed12	running
+prod26_mip_lr0p4	base24_u2_fixed12	running
+prod26_mip_lr0p8	base24_u2_fixed12	running
+prod26_mip_lr1p2	base24_u2_fixed12	running
+prod26_mip_lr1p6	base24_u2_fixed12	running
+prod26_neh_lr0p2	prod0810_nehzor_elj	running
+prod26_neh_lr0p4	prod0810_nehzor_elj	running
+prod26_neh_lr0p8	prod0810_nehzor_elj	running
+prod26_neh_lr1p2	prod0810_nehzor_elj	running
+prod26_neh_lr1p6	prod0810_nehzor_elj	running
+prod26_acr_lr0p1	prod0810_acridine_sg14_zp1_mace	running
+prod26_acr_lr0p2	prod0810_acridine_sg14_zp1_mace	running
+prod26_acr_lr0p4	prod0810_acridine_sg14_zp1_mace	running
+prod26_acr_lr0p8	prod0810_acridine_sg14_zp1_mace	running
+prod26_mipu_lr0p2	-	running
+prod26_mipu_lr0p4	-	running
+prod26_mipu_lr0p8	-	running
+prod26_nehu_lr0p2	-	running
+prod26_nehu_lr0p4	-	running
+prod26_nehu_lr0p8	-	running
+prod26_mip2_lr0p1	prod26_mip_lr0p2	phase1_exit
+prod26_mip2_lr0p2	prod26_mip_lr0p2	phase1_exit
+prod26_mip2_lr0p283	prod26_mip_lr0p2	phase1_exit
+prod26_mip2_lr0p4	prod26_mip_lr0p2	phase1_exit
+prod26_mip2_lr0p566	prod26_mip_lr0p2	phase1_exit

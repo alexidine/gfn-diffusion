@@ -380,7 +380,7 @@ protocols:
           vg_lb: 1.0
           condition_block_m: 2.0
           repeats: 1.0
-          level_gap: 1
+          level_gap: 0.0
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
