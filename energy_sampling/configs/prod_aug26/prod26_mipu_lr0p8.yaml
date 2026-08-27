@@ -12,7 +12,7 @@ checkpoint_name: null
 prior_model_name: null
 load_weights_only: false
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_uma_f047_prior_dataset.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_uma_f047_prior_dataset.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true

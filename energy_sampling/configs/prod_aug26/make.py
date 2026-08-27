@@ -145,6 +145,12 @@ def build():
             cfg['tag'] = 'prod26'
             cfg['checkpoints_dir'] = CLUSTER_CKPTS
             cfg['prior_path'] = spec['prior_path']
+            # one molecule, unconditional: the condition set IS the prior file.
+            # mk_dev's value is the LOCAL dev path -- left alone it ships a
+            # D:\ path that exists on the dev box (so local preflight passes)
+            # and kills every arm on-cluster at init_mol_dataset. 2026-08-27.
+            cfg['molecules_path'] = spec['prior_path']
+            cfg['test_molecules_path'] = None
             cfg['space_groups'] = spec['space_groups']
             if 'energy_function' in spec:
                 cfg['energy_function'] = spec['energy_function']
@@ -224,9 +230,29 @@ def check(cfg, fam, s):
     assert cfg['grow_batch_size'] is True, 'auto batch sizer is a battery property'
     assert cfg['grad_clip_guard']['enabled'] is True
     assert cfg['prior_path'] == FAMILIES[fam]['prior_path']
+    assert cfg['molecules_path'] == FAMILIES[fam]['prior_path']
+    assert cfg['test_molecules_path'] is None
     assert cfg['energy_function'] == FAMILIES[fam].get('energy_function', 'elj')
     if 'mlip_path' in FAMILIES[fam]:
         assert cfg['mlip_path'] == FAMILIES[fam]['mlip_path']
+    assert_no_local_paths(cfg)
+
+
+def assert_no_local_paths(node, trail='cfg'):
+    """No Windows drive path may survive into a cluster arm. mk_dev is a LOCAL
+    dev config: any path key the generator forgets to override ships a value
+    that exists on the dev box -- so local preflight passes -- and 404s on the
+    cluster. That exact shape killed all 20 prod_aug26 arms in ~10 s on
+    2026-08-27 (molecules_path)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            assert_no_local_paths(v, f'{trail}.{k}')
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            assert_no_local_paths(v, f'{trail}[{i}]')
+    elif isinstance(node, str):
+        assert not (len(node) > 2 and node[1] == ':' and node[2] in '\\/'), \
+            f'local drive path leaked into a cluster arm at {trail}: {node!r}'
 
 
 SBATCH = """#!/bin/bash
