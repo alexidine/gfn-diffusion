@@ -2931,6 +2931,26 @@ class Modeller:
                     if (self.combo_loss_record
                             and self.combo_loss_record[-1] <= np.amin(self.combo_loss_record)):
                         self.checkpointer.link('running', 'best')
+                    # 'last_ok' -- THE REWIND TARGET, which is a different
+                    # question from 'best' (owner, 2026-08-27). 'best' ranks
+                    # QUALITY, and a scalar ranks distributional quality badly:
+                    # a sideways move on the stage metric can be a genuine
+                    # improvement and a dip can be mode collapse. A rewind does
+                    # not need the best state, only a NON-DETONATING one. So
+                    # take the most RECENT sample within a band of the best:
+                    # sideways drift qualifies without anyone claiming to rank
+                    # it, and "most recent healthy" is by construction as fresh
+                    # as a pre-excursion state can be -- which is what the old
+                    # 10*eval_period freshness bar was failing to deliver when
+                    # it demoted a healthy 'best' and fell through to
+                    # 'running' (written UNCONDITIONALLY, so it carries the
+                    # excursion). Band is additive in the metric's own scale so
+                    # it works for negative metrics too (bwd/mle ~ -22).
+                    if self.combo_loss_record:
+                        _bestv = float(np.amin(self.combo_loss_record))
+                        _tol = float(getattr(self.args, 'rewind_tolerance', 0.25) or 0.0)
+                        if self.combo_loss_record[-1] <= _bestv + _tol * abs(_bestv):
+                            self.checkpointer.link('running', 'last_ok')
                     # PERIODIC ARCHIVE. The single-stage protocol fires no
                     # on_exit snapshots, so 'running'/'best' are the only saves
                     # and both are rewritten in place -- a killed run leaves no
@@ -3043,6 +3063,17 @@ class Modeller:
         same-stage fresh 'best'; same-stage 'running'; this stage's
         'stage_start' turnover point (post-on_enter, healthy by construction);
         else bare 'best' so behavior is never worse than having no rule.
+
+        ORDER AS OF 2026-08-27: same-stage 'last_ok' FIRST (the rewind's own
+        target -- see the write site), then the existing chain unchanged.
+        'last_ok' is what makes the stale-'best' question rare: the case that
+        motivated it (qm9c_t20, five rewinds into an excursion because a
+        healthy best at step 18500 sat 3250 steps back, past the
+        10 x eval_period bar) is now caught by last_ok, which is both fresher
+        than that best AND pre-excursion. The 2026-08-25 demotion of a stale
+        'best' below 'running' is therefore LEFT ALONE: it encodes a real
+        failure of its own (a frozen near-init best re-tripping the bar,
+        toy_wk_aug24) that this change does not disprove.
         """
         idx = {s.name: s.index for s in self.protocol.stages}
         current = idx.get(self.protocol.stage.name, -1)
@@ -3058,6 +3089,17 @@ class Modeller:
             except Exception:
                 return None, None, path
 
+        ok_idx, ok_step, ok_path = stage_and_step('last_ok')
+        if ok_idx is not None and ok_idx == current and ok_step is not None:
+            print(f"rewind: targeting same-stage 'last_ok' from step {ok_step} "
+                  f"({self.step_ind - int(ok_step)} steps back) -- most recent "
+                  f"sample within {float(getattr(self.args, 'rewind_tolerance', 0.25)):.0%} "
+                  f"of best, i.e. the freshest state known NOT to be diverging")
+            return ok_path
+        # NO FRESHNESS BAR ON 'last_ok': it is the most recent qualifying state
+        # by construction, so if it IS old the run has been outside the band
+        # that whole time and rewinding to it is still strictly better than
+        # rewinding into the excursion. 'best' keeps its bar as the fallback.
         best_idx, best_step, best_path = stage_and_step('best')
         fresh_bar = 10 * int(getattr(self.args, 'eval_period', 500) or 500)
         if (best_idx is not None and best_idx == current
