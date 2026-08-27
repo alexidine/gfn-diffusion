@@ -122,6 +122,44 @@ def soft_clip(x, cutoff):
     return torch.where(abs_x <= cutoff, x, sign_x * clipped)
 
 
+def combine_branch_terms(losses, loss_clip):
+    """
+    Combine a branch's per-row loss TERMS into one per-row loss.
+
+    SUM, not mean. A coefficient therefore means what it says: a term's
+    contribution to the branch is `coeff * term`, independent of how many OTHER
+    terms happen to be active.
+
+    IT USED TO BE A MEAN (changed 2026-08-26, owner call), and that made every
+    coefficient secretly `coeff / n_active`. `losses` is assembled by
+    coefficient-gated appends (`if loss_coeffs.emp_z > 0: losses.append(...)`),
+    so its LENGTH is a function of which coefficients are nonzero -- and under a
+    mean, setting ANY term to 0 silently AMPLIFIED every surviving term in that
+    branch by n/(n-1). That is how a Z sidecar carrying exactly zero policy
+    gradient (its target is detached and models/gfn.py _condition_flow detaches
+    the conditioner) doubled the forward VarGrad policy gradient merely by being
+    switched off: it acted through its PRESENCE in this list, not through its
+    gradient. Adam does not absorb it either, because the fused step is a
+    WEIGHTED SUM of branch losses, so rescaling one branch changes the fwd:bwd
+    ratio rather than the global scale.
+
+    ⚠ CONSEQUENCE FOR READING OLD RUNS: on a branch with n_active = 2 every
+    coefficient was effectively HALVED before this change. Two-term-both-sides
+    configs are uniformly 2x (Adam-absorbed, weight decay is off); a config whose
+    branches differ in term count -- e.g. fwd {vg_lb, emp_z} against bwd {vg_lb}
+    once level_gap is 0 -- shifts its fwd:bwd RATIO by 2x, which is real.
+    Repo-wide audit at the time of the change: 203 branch-rows had n_active >= 2
+    and every one of them was exactly 2, so 2.0x is the maximum factor.
+
+    soft_clip is elementwise on the [n_terms, B] stack, i.e. it still bounds each
+    TERM individually; the combined row is bounded by n_active x that cutoff.
+    """
+    stacked = torch.stack(losses)
+    if loss_clip != -1:
+        stacked = soft_clip(stacked, loss_clip)
+    return stacked.sum(dim=0)
+
+
 def get_gfn_forward_loss(loss_coeffs,
                          initial_state,
                          gfn,
@@ -314,16 +352,13 @@ def get_gfn_forward_loss(loss_coeffs,
     # on-policy policy gradient. That separation is the point: it isolates
     # "Z tracks each condition" from "the policy samples itself", which are
     # otherwise confounded in any change to fwd's share. Scalar, so expand to
-    # per-row for the shared stack/mean below (the mean recovers it exactly).
+    # per-row for the shared stack/sum below (the final row mean recovers it exactly).
     z_level_coeff = getattr(loss_coeffs, 'z_level', 0)
     if z_level_coeff > 0 and condition_id is not None:
         z_lvl = z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id)
         losses.append(z_lvl.expand(log_pf.shape[0]) * z_level_coeff)
 
-    if loss_coeffs.loss_clip != -1:
-        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
-    else:
-        combined_losses = torch.stack(losses).mean(dim=0)
+    combined_losses = combine_branch_terms(losses, loss_coeffs.loss_clip)
 
     # No finiteness assert here (there never was one on the backward path, and
     # the asymmetry meant forward NaNs crashed the process while backward NaNs
@@ -582,10 +617,7 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         tbc_loss = None
 
-    if loss_coeffs.loss_clip != -1:
-        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
-    else:
-        combined_losses = torch.stack(losses).mean(dim=0)
+    combined_losses = combine_branch_terms(losses, loss_coeffs.loss_clip)
 
     if sample_weights is None:
         loss = combined_losses.mean()

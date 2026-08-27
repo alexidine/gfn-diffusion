@@ -22,7 +22,7 @@ VarGrad, terminal MLE, TBC, and several Z-regression sidecars). Each is switched
 on by a coefficient in the stage's `*_loss_coeffs` block. Both share one
 skeleton: sample or replay a trajectory, compute `log_pf` / `log_pb` / `log_r` /
 `log_Z`, apply the `freeze_policy` / `freeze_z` detach contract at the source,
-accumulate active terms, soft-clip, and average.
+accumulate active terms, soft-clip, and sum.
 
 Paper voice: *a single trajectory-balance objective is trained on three sampling
 distributions — on-policy forward rollouts, backward rollouts from a prior
@@ -95,20 +95,31 @@ tails instead.
 
 ## 4. Findings
 
-**L1 — the combined loss is the MEAN over active terms, not the sum.** *(confirmed)*
+**L1 — the combined loss is the SUM over active terms.** *(changed 2026-08-26; was a MEAN)*
 
-[Line 319](gflownet_losses.py:319): `torch.stack(losses).mean(dim=0)` where
-`losses` is `[n_terms, N]`. The effective weight of term *i* is therefore
-`coeff_i / n_active_terms`, and **turning on a term silently dilutes every other
-one**.
+[`combine_branch_terms`](gflownet_losses.py:125), called from the forward site
+([:361](gflownet_losses.py:361)) and the backward site
+([:620](gflownet_losses.py:620)) — the latter serving both the bwd and replay
+branches. A coefficient now means what it says: term *i* contributes
+`coeff_i * term_i` regardless of what else is active.
 
-Live consequence: `train_prior` runs `mle: 1.0` and `tbc: 1.0`, so each acts at
-0.5. It is not a bug — normalising by term count keeps total gradient magnitude
-stable across configs with different menus, which matters a lot given how sharp
-the LR ceiling is (see `module_lr_controller.md`). But it must be stated,
-because it means **loss coefficients are relative weights, not absolute ones**,
-and comparing a coefficient across two configs with different active-term counts
-is invalid. Worth an explicit note in any config that sets them.
+**It used to be `torch.stack(losses).mean(dim=0)`**, making the effective weight
+`coeff_i / n_active` — so switching any term OFF amplified every survivor by
+`n/(n-1)`. That is not a harmless normalisation: `losses` is built by
+coefficient-gated appends, so a term with *zero policy gradient* still set the
+policy's effective step size by being counted. It was found when a Z sidecar
+(`emp_z`, whose target is detached and whose head is reached only through a
+detached conditioner) doubled the forward VarGrad gradient purely by being set
+to 0. Adam does not absorb it either: the fused step is a weighted SUM of branch
+losses, so rescaling one branch moves the fwd:bwd ratio, not the global scale.
+
+⚠ READING PRE-2026-08-26 RUNS: on a branch with `n_active = 2` every coefficient
+was effectively halved. Configs whose branches are both n=2 are a uniform 2x
+(Adam-absorbed; weight decay is off), but a config whose branches differ in term
+count shifts its fwd:bwd ratio by 2x, which is real. Repo audit at the time: 203
+branch-rows had `n_active >= 2` and every one was exactly 2, so 2.0x bounds the
+factor. Notably `train_prior` ran `mle: 1.0` + `tbc: 1.0` at 0.5 each and now
+runs them at 1.0.
 
 **L2 — `vg_lme`'s unconditional branch normalises by the wrong count.** *(confirmed, latent)*
 
@@ -202,10 +213,12 @@ coefficient is the constant `-beta` for every row, and reward, `log_Z` and
 collapsed to likelihood.
 
 Consequence worth stating, since it combines with L1: phase 1 runs `mle` at
-effective weight 0.5 (two terms, 100%-bwd batch), while a saturated absorption
-stage runs `tb` at `beta × bwd_frac` ≈ 3–5. **The absorption drive is already
-~10× the phase-1 MLE that converges trivially**, so slow buffer absorption is
-not a gain deficit and more gain is the wrong first instrument.
+effective weight **1.0** (post-2026-08-26; it was 0.5 under the old
+mean-over-terms, two terms on a 100%-bwd batch), while a saturated absorption
+stage runs `tb` at `beta × bwd_frac` ≈ 3–5. **The absorption drive is ~5× the
+phase-1 MLE that converges trivially** (it read ~10× before the change), so slow
+buffer absorption is still not a gain deficit and more gain remains the wrong
+first instrument.
 
 **(b) The knee is aggressive, not mild.** Measured on this problem `logw_std ~21`
 against `beta: 10` (see the winsorisation note in §6) — the knee sits at roughly
@@ -282,9 +295,8 @@ weights, and they must not be combined with an active Huber knee.**
 reduction**, so it covers every active term at once, and it is **self-normalised**,
 so turning prioritisation on does not change the overall loss scale — and
 therefore does not move the LR the run is tuned at. That placement is the whole
-design: weighting individual terms would make the effective weight depend on how
-many terms are active (L1), and un-normalised weighting would silently rescale the
-gradient.
+design: weighting individual terms would reintroduce exactly the menu-dependence
+L1 removed, and un-normalised weighting would silently rescale the gradient.
 
 Its one consumer is the prioritised replay draw (`module_buffers.md` B7), which
 supplies `w = (1/n_elig)/p` so the estimator is unbiased for the uniform-buffer

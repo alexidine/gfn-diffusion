@@ -190,9 +190,13 @@ This retires two prescriptions in one stroke: "raise `beta` for stability", and
 latches". Both are gradient-*magnitude* arguments aimed at a
 magnitude-normalising optimiser.
 
-It also promotes the mean-over-terms divisor to a real allocation knob: terms
-combine by mean over the *active* set, so the effective weight of a term is
-`coeff / n_active`. `MECHANISM` (`module_losses.md` L1).
+It also promoted the mean-over-terms divisor to a real allocation knob — but
+that divisor is **gone as of 2026-08-26**: terms now combine by SUM over the
+active set, so a term's effective weight is its own `coeff` and nothing else.
+Before the change the effective weight was `coeff / n_active`, which is how a
+zero-gradient sidecar could set the policy's step size by being counted. Any
+number quoted from a pre-change run on a two-term branch is at half the
+coefficient its config states. `MECHANISM` (`module_losses.md` L1).
 
 ### L5 — The level (Z)
 
