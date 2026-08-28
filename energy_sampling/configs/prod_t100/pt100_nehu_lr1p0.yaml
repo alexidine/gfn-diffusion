@@ -1,18 +1,18 @@
 project_state_version: 10
-run_name: pt100_acr_lr0p5
+run_name: pt100_nehu_lr1p0
 tag: pt100
 seed: 12345
 device: cuda
 cuda_memory_fraction: 0.9
 anomaly_detection: false
-continue_from_checkpoint: true
-mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+continue_from_checkpoint: false
+mlip_path: /scratch/mk8347/models/uma/esen_s.pt
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 checkpoint_name: null
 prior_model_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_prior_dataset.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
@@ -53,7 +53,7 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.5
+  fixed_scale: 1.0
   verbose: true
   hard_failure:
     loss_excursion_k: 60.0
@@ -487,7 +487,7 @@ buffers:
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
-energy_function: mace
+energy_function: uma
 temperature_conditioning: false
 molecule_conditioning: false
 sg_conditioning: false

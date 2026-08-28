@@ -165,6 +165,62 @@ FAMILIES = {
         # already recorded by nehzor's identical death. There is no useful
         # checkpoint to continue from.
         'scales': [0.5, 1.0, 2.0, 4.0],
+        # widened with the UMA families below -- at eval_period 1000 a 2500-step
+        # window holds exactly 3 evals, the bare minimum the gate accepts, so a
+        # single eval row missing a w1r key would silence it with no error.
+        'level_window': 5000,
+    },
+    # ---- UMA, WAVE 3 2026-08-28 ------------------------------------------
+    # These were held out of wave 1 on the grounds that a cold UMA fan was the
+    # most expensive thing in the programme. THAT WAS WRONG, and the owner
+    # caught it: phase 1 is MLE and makes NO energy call at all
+    # (train.py:5386), so the MLIP never enters the training step. Measured:
+    # UMA's train_step_time at T=10 was 0.27-0.31 s against ELJ's 0.14-0.16 s,
+    # i.e. 1.8x, not the order of magnitude the deferral assumed. UMA's real
+    # phase-1 cost was EVAL -- nehu spent 50-57% of wall clock outside the
+    # training step at T=10 -- which the eval knobs below now fix.
+    #
+    # COLD. Six UMA phase-1 exits exist (nehu x3, mipu2 x3, all gated) but every
+    # one is T=10, carrying a policy calibrated to steps 10x too large. Same
+    # reason the ELJ fans went cold rather than warm-starting from T=10.
+    #
+    # NARROW GRID, which is the one part of the deferral that paid off: ELJ at
+    # T=100 puts the phase-1 optimum at scale 2-4, and the owner's standing
+    # reasoning is that MLIP optima sit at or slightly below ELJ's. The T=10 UMA
+    # runs agree on direction -- higher was better in both families (nehu gated
+    # at 5510 steps at effective 0.4 vs 9510 at 0.2; mipu2 gated at 6510 for
+    # both 0.8 and 1.6 vs 18010 for 0.4). So 3 rungs bracketing 2, not the 5
+    # the ELJ fans needed with no prior at all.
+    'mipu': {
+        'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [2],
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'max_batch_size': 50000,
+        'eval_num_samples': 2500,
+        'eval_period': 1000,
+        'batch_util_target': 0.95,
+        'excursion_k': 60.0,
+        'level_window': 5000,
+        'scales': [1.0, 2.0, 4.0],
+    },
+    # nehzor UMA is the one that NEEDS the eval cut, not just benefits from it:
+    # at T=10 it spent 50-57% of wall clock outside the training step against
+    # mipcas UMA's 16%, on the same energy function -- sg14 has more atoms per
+    # cell, so each MLIP call costs more. Eval cost here is molecule-dependent,
+    # not energy-function-dependent.
+    'nehu': {
+        'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [14],
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'max_batch_size': 50000,
+        'eval_num_samples': 2500,
+        'eval_period': 1000,
+        'batch_util_target': 0.95,
+        'excursion_k': 60.0,
+        'level_window': 5000,
+        'scales': [1.0, 2.0, 4.0],
     },
 }
 
@@ -212,6 +268,12 @@ def build():
                 cfg['eval_num_samples'] = spec['eval_num_samples']
             if 'batch_util_target' in spec:
                 cfg['batch_util_target'] = spec['batch_util_target']
+            # w1r noise is INDEPENDENT eval-to-eval (lag-1 autocorrelation
+            # -0.39..+0.14 across ten series, i.e. measurement not model drift),
+            # so the gate's trailing median is the only thing absorbing it and
+            # more evals in the window is the one free way to reduce it.
+            if 'level_window' in spec:
+                cfg['progress_gate']['level_window'] = spec['level_window']
 
             # -- COLD, or RESUMED ---------------------------------------------
             # A resumed arm keeps its run_name, so `continue_from_checkpoint`
@@ -318,6 +380,7 @@ def check(cfg, fam, s):
     # a COMPUTE knob and the MLIP families may halve their eval count.
     assert cfg['figs_period'] == 1000
     assert cfg['eval_period'] == int(spec.get('eval_period', 500))
+    assert cfg['progress_gate']['level_window'] == spec.get('level_window', 2500)
     assert cfg['figs_period'] % cfg['eval_period'] == 0, \
         'figs_period must be a multiple of eval_period or figures never fire'
 
@@ -453,7 +516,11 @@ srun singularity exec --nv \\
 #: the slow case (mipu never gated in 30k at T=10), and the level gate + `stop`
 #: yields the GPU the moment an arm converges -- so a generous wall costs
 #: nothing while a short one loses the arm.
-WAVES = {'mip': '1-00:00:00', 'neh': '1-00:00:00', 'acr': '1-00:00:00'}
+WAVES = {'mip': '1-00:00:00', 'neh': '1-00:00:00', 'acr': '1-00:00:00',
+         # cold UMA is the slow case to CONVERGE, not to step: mipu never gated
+         # in 30k at T=10, so budget the full wall even though the step itself
+         # is only ~1.8x ELJ's.
+         'mipu': '1-00:00:00', 'nehu': '1-00:00:00'}
 
 
 def main():

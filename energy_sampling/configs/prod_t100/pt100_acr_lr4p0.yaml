@@ -27,7 +27,7 @@ weight_decay: 0.0001
 use_weight_decay: false
 progress_gate:
   mode: level
-  level_window: 2500
+  level_window: 5000
   min_history: 2000
   metrics:
   - key: w1r/median

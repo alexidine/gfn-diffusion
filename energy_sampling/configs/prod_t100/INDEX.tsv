@@ -13,3 +13,9 @@ pt100_acr_lr0p5	acr	0.5	resume
 pt100_acr_lr1p0	acr	1.0	resume
 pt100_acr_lr2p0	acr	2.0	resume
 pt100_acr_lr4p0	acr	4.0	resume
+pt100_mipu_lr1p0	mipu	1.0	cold
+pt100_mipu_lr2p0	mipu	2.0	cold
+pt100_mipu_lr4p0	mipu	4.0	cold
+pt100_nehu_lr1p0	nehu	1.0	cold
+pt100_nehu_lr2p0	nehu	2.0	cold
+pt100_nehu_lr4p0	nehu	4.0	cold
