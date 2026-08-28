@@ -1,0 +1,8 @@
+arm	warm_src	wave
+prod28_acr2_lr0p8	prod0810_acridine_sg14_zp1_mace	acr2
+prod28_acr2_lr1p2	prod0810_acridine_sg14_zp1_mace	acr2
+prod28_acr2_lr1p6	prod0810_acridine_sg14_zp1_mace	acr2
+prod28_acr2_lr2p4	prod0810_acridine_sg14_zp1_mace	acr2
+prod28_mipu2_lr0p4	prod26_mipu_lr0p8	mipu2
+prod28_mipu2_lr0p8	prod26_mipu_lr0p8	mipu2
+prod28_mipu2_lr1p6	prod26_mipu_lr0p8	mipu2
