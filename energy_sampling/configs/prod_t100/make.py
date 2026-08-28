@@ -134,6 +134,14 @@ FAMILIES = {
         # eval_period/figs_period stay 500/1000 -- those are the wandb storage
         # billing knobs, and the cost here is COMPUTE per eval, not artifacts.
         'eval_num_samples': 2500,
+        # ...and HALVE the eval count on top of shrinking each one (owner,
+        # 2026-08-28). figs_period STAYS 1000, which is still a multiple, so
+        # figures keep firing every 1000 steps exactly as before -- the wandb
+        # STORAGE bill is untouched and only eval COMPUTE halves. Together with
+        # the sample cut this is ~8x less eval per 1000 steps: acridine goes
+        # from 1500 s train + 2x700 s eval to 1500 s train + 1x175 s, i.e. the
+        # outside-the-step fraction falls 48% -> ~10%, which is ELJ territory.
+        'eval_period': 1000,
         # The batch never grew: "64.0% at 1000 clears the 60% target; holding
         # the base batch", on every arm of every family. NOT a VRAM wall --
         # zero OOM anywhere, 73 GB cap untouched, and the ladder only ever
@@ -226,7 +234,7 @@ def build():
 
             # -- run shape ----------------------------------------------------
             cfg['epochs'] = 30000
-            cfg['eval_period'] = 500
+            cfg['eval_period'] = int(spec.get('eval_period', 500))
             cfg['figs_period'] = 1000
 
             # -- the fixed rate under test ------------------------------------
@@ -305,10 +313,29 @@ def check(cfg, fam, s):
         assert cfg['eval_num_samples'] == spec['eval_num_samples']
         assert cfg['energy_function'] != 'elj', \
             'the eval-cost cut is for MLIP routes; ELJ eval is already 6-10%'
-    # the billing knobs are NOT the lever and must not drift
-    assert cfg['eval_period'] == 500 and cfg['figs_period'] == 1000
+    # figs_period is the wandb STORAGE knob and stays 1000 for every arm, so
+    # the figure count per step is identical across the battery. eval_period is
+    # a COMPUTE knob and the MLIP families may halve their eval count.
+    assert cfg['figs_period'] == 1000
+    assert cfg['eval_period'] == int(spec.get('eval_period', 500))
     assert cfg['figs_period'] % cfg['eval_period'] == 0, \
         'figs_period must be a multiple of eval_period or figures never fire'
+
+    # A LONGER EVAL PERIOD CAN SILENTLY DISABLE THE EXIT GATE, so prove it
+    # cannot here rather than discovering it as an arm that never converges.
+    # progress_gate needs BOTH: >= 6 history points before `level` is computed
+    # at all, and >= 3 evals inside the trailing level_window, or it returns
+    # gates/progress_done 0.0 forever with no error.
+    pg = cfg['progress_gate']
+    ep = cfg['eval_period']
+    evals_in_window = pg['level_window'] // ep + 1
+    assert evals_in_window >= 3, (
+        f"eval_period {ep} puts only {evals_in_window} evals in the "
+        f"{pg['level_window']}-step level_window; the gate needs 3 and would "
+        f"never fire. Widen level_window or shorten eval_period.")
+    earliest = max(6 * ep, pg['min_history'])
+    assert earliest < cfg['epochs'], \
+        f'gate cannot fire before step {earliest}, past the {cfg["epochs"]} cap'
 
     assert cfg['progress_gate']['mode'] == 'level'
     bars = {m['key']: m['bar'] for m in cfg['progress_gate']['metrics']}
