@@ -117,6 +117,46 @@ FAMILIES = {
         'energy_function': 'mace',
         'mlip_path': '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model',
         'max_batch_size': 50000,
+        # ---- WAVE 2, 2026-08-28: RESUMED with the occupancy fixes -----------
+        # All four surviving arms were CANCELLED together at ~2.47 h with
+        # external GPU 46-50%. Measured cause, and it is NOT the energy
+        # function reaching the loss (MLE never reads it -- train_step_time is
+        # 1.50/1.66 s here against 1.41/1.51 s on the ELJ families, i.e. the
+        # training step is molecule-independent, exactly as expected):
+        #
+        #   wall-clock OUTSIDE the training step   acr 47-48%   elj 6-9%
+        #   fraction of util samples under 40%     acr 36%      elj 3-5%
+        #
+        # That is eval, and only eval: 10000 samples rolled out at T=100 and
+        # scored with MACE every 500 steps, at near-zero occupancy. It drags
+        # the MEDIAN to 45% (mipcas 55%) while barely moving the mean, which
+        # is what put acridine in the cancellation band and left ELJ out of it.
+        # eval_period/figs_period stay 500/1000 -- those are the wandb storage
+        # billing knobs, and the cost here is COMPUTE per eval, not artifacts.
+        'eval_num_samples': 2500,
+        # The batch never grew: "64.0% at 1000 clears the 60% target; holding
+        # the base batch", on every arm of every family. NOT a VRAM wall --
+        # zero OOM anywhere, 73 GB cap untouched, and the ladder only ever
+        # tried rungs 1000/1600. So `traj_checkpoint` is NOT needed in phase 1
+        # and the owner's phase > 1 rule stands; the target is what stalls it.
+        'batch_util_target': 0.95,
+        # mip_lr1p0 false-fired at step 503 on an excursion of 41.9 band widths
+        # against a bar set at exactly 40. The T=100 promotion transient is
+        # bigger than the T=10 one this was calibrated on (10x the integrator
+        # steps compounding into it). The two scale-8 fires were genuine at 463
+        # and 1257 widths, so 60 still separates them by an order of magnitude.
+        'excursion_k': 60.0,
+        # RESUME the four survivors from their own _running.pt rather than
+        # re-paying ~3000 steps. Same run_name + continue_from_checkpoint is a
+        # FULL resume (load_weights_only is read only on the checkpoint_name
+        # branch; the auto-resume path always calls load_full), so optimizers,
+        # step count and buffers all carry.
+        'resume': True,
+        # 8.0 is DROPPED, not resumed: it detonated unrecoverably at step 670
+        # (FrozenTrainingState, 4 rewinds) and the ceiling it establishes is
+        # already recorded by nehzor's identical death. There is no useful
+        # checkpoint to continue from.
+        'scales': [0.5, 1.0, 2.0, 4.0],
     },
 }
 
@@ -138,7 +178,7 @@ def scale_tag(s):
 def build():
     arms = {}
     for fam, spec in FAMILIES.items():
-        for s in SCALES:
+        for s in spec.get('scales', SCALES):
             cfg = base()
             name = f'pt100_{fam}_lr{scale_tag(s)}'
 
@@ -157,11 +197,22 @@ def build():
             cfg['energy_function'] = spec['energy_function']
             cfg['mlip_path'] = spec['mlip_path']
             cfg['max_batch_size'] = spec['max_batch_size']
+            # MLIP eval cost is per-SAMPLE, so this is the knob -- NOT
+            # eval_period/figs_period, which stay 500/1000 because they are the
+            # wandb storage billing knobs and the cost here is compute.
+            if 'eval_num_samples' in spec:
+                cfg['eval_num_samples'] = spec['eval_num_samples']
+            if 'batch_util_target' in spec:
+                cfg['batch_util_target'] = spec['batch_util_target']
 
-            # -- COLD ---------------------------------------------------------
+            # -- COLD, or RESUMED ---------------------------------------------
+            # A resumed arm keeps its run_name, so `continue_from_checkpoint`
+            # picks up its OWN {tag}_{run_name}_{problem}_running.pt. That path
+            # always calls load_full -- load_weights_only is read only on the
+            # checkpoint_name branch -- so optimizers, step and buffers carry.
             cfg['checkpoint_name'] = None
             cfg['load_weights_only'] = False
-            cfg['continue_from_checkpoint'] = False
+            cfg['continue_from_checkpoint'] = bool(spec.get('resume', False))
             cfg['prior_model_name'] = None
 
             # -- THE SHIP LENGTH ----------------------------------------------
@@ -185,7 +236,8 @@ def build():
             lc['burn_in_steps'] = 500
             lc['burn_in_scale'] = 0.05
             lc['repeat_every'] = 0
-            lc['hard_failure']['loss_excursion_k'] = EXCURSION_K
+            lc['hard_failure']['loss_excursion_k'] = float(
+                spec.get('excursion_k', EXCURSION_K))
 
             # -- MLE only: single stage, level-gated, STOPS -------------------
             cfg['protocol'] = 'prod_mle'
@@ -220,7 +272,8 @@ def check(cfg, fam, s):
     assert lc['mode'] == 'fixed' and lc['fixed_scale'] == float(s)
     assert lc['repeat_every'] == 0
     assert lc['burn_in_steps'] == 500 and lc['burn_in_scale'] == 0.05
-    assert lc['hard_failure']['loss_excursion_k'] == EXCURSION_K
+    assert lc['hard_failure']['loss_excursion_k'] == float(
+        spec.get('excursion_k', EXCURSION_K))
     # the guards that must SURVIVE loosening the relative bar
     assert lc['hard_failure']['loss_abs'] >= 1e6
     assert lc['hard_failure']['grad_abs'] >= 1e6
@@ -237,12 +290,25 @@ def check(cfg, fam, s):
     assert st['hot_lr_sensor']['action'] == 'fire', \
         'the hot sensor is what still guards a detonation once k is loosened'
 
-    # COLD -- no warm source may leak in, or the fan re-creates the prod_aug26
-    # confound (arms that start converged measure perturbation, not rate)
-    assert cfg['checkpoint_name'] is None
+    # No WARM SOURCE may ever leak in, or the fan re-creates the prod_aug26
+    # confound (arms that start converged measure perturbation, not rate).
+    # A RESUMED arm is a different thing: it continues its OWN history at the
+    # same rate, so it adds steps to a measurement rather than contaminating it.
+    assert cfg['checkpoint_name'] is None, 'no cross-run warm start in this fan'
     assert cfg['load_weights_only'] is False
-    assert cfg['continue_from_checkpoint'] is False
     assert cfg['prior_model_name'] is None
+    assert cfg['continue_from_checkpoint'] is bool(spec.get('resume', False))
+
+    # eval cost is the MLIP failure mode: acridine spent 47-48% of wall clock
+    # outside the training step (ELJ: 6-10%) purely on scoring eval draws
+    if spec.get('eval_num_samples'):
+        assert cfg['eval_num_samples'] == spec['eval_num_samples']
+        assert cfg['energy_function'] != 'elj', \
+            'the eval-cost cut is for MLIP routes; ELJ eval is already 6-10%'
+    # the billing knobs are NOT the lever and must not drift
+    assert cfg['eval_period'] == 500 and cfg['figs_period'] == 1000
+    assert cfg['figs_period'] % cfg['eval_period'] == 0, \
+        'figs_period must be a multiple of eval_period or figures never fire'
 
     assert cfg['progress_gate']['mode'] == 'level'
     bars = {m['key']: m['bar'] for m in cfg['progress_gate']['metrics']}
@@ -296,20 +362,34 @@ PROJECT_ROOT=/scratch/mk8347/projects/gfn_cond
 WORKDIR=${{PROJECT_ROOT}}/gfn-diffusion/energy_sampling
 ARMS=${{WORKDIR}}/configs/prod_t100
 LOGS=${{ARMS}}/joblogs
+CKPTS={ckpts}
 mkdir -p ${{LOGS}}
 
 ARM=$(awk -F'\\t' -v n=$((SLURM_ARRAY_TASK_ID + 2)) 'NR==n {{print $1}}' ${{ARMS}}/INDEX.tsv)
+RESUME=$(awk -F'\\t' -v n=$((SLURM_ARRAY_TASK_ID + 2)) 'NR==n {{print $4}}' ${{ARMS}}/INDEX.tsv)
 if [ -z "${{ARM}}" ]; then echo "no arm at row ${{SLURM_ARRAY_TASK_ID}}" >&2; exit 1; fi
 CONFIG=${{ARMS}}/${{ARM}}.yaml
 if [ ! -f "${{CONFIG}}" ]; then echo "missing config ${{CONFIG}}" >&2; exit 1; fi
 
-# COLD BATTERY -- nothing to resolve. The config is used verbatim; a per-job
-# copy is still taken so the joblog directory carries the exact config the arm
-# ran, the way the warm batteries do.
+# The config is used verbatim -- there is no cross-run warm start to resolve.
+# A per-job copy is still taken so the joblog carries the exact config the arm
+# ran. A RESUMED arm continues its OWN _running.pt via run_name, so nothing is
+# substituted; but the file MUST exist, because `continue_from_checkpoint` with
+# nothing to continue silently COLD-STARTS -- which would look like a resumed
+# arm and quietly throw away the steps this wave exists to keep.
 J=${{LOGS}}/${{ARM}}_${{SLURM_JOB_ID}}
 RESOLVED=${{J}}.yaml
 cp ${{CONFIG}} ${{RESOLVED}}
-echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  (cold, T=100)"
+if [ "${{RESUME}}" = "resume" ]; then
+    N=$(ls ${{CKPTS}}/*${{ARM}}*_running.pt 2>/dev/null | wc -l)
+    if [ "${{N}}" -eq 0 ]; then
+        echo "FATAL: arm ${{ARM}} is marked resume but no *${{ARM}}*_running.pt exists in ${{CKPTS}}" >&2
+        exit 1
+    fi
+    echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  RESUME <- $(ls -t ${{CKPTS}}/*${{ARM}}*_running.pt | head -1 | xargs basename)"
+else
+    echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  (cold, T=100)"
+fi
 
 {{ nvidia-smi -L
   nvidia-smi --query-gpu=mig.mode.current,uuid,name,memory.total,driver_version --format=csv
@@ -359,10 +439,13 @@ def main():
     names = list(arms)
     fam_of = lambda n: n.split('_')[1]
     with (HERE / 'INDEX.tsv').open('w', encoding='utf-8', newline='\n') as f:
-        f.write('arm\tfamily\tscale\n')
+        # column 4 is APPENDED: the mip/neh sbatch already on the cluster reads
+        # $1 only, so widening the file cannot disturb a live array.
+        f.write('arm\tfamily\tscale\tmode\n')
         for name in names:
+            mode = 'resume' if FAMILIES[fam_of(name)].get('resume') else 'cold'
             f.write(f"{name}\t{fam_of(name)}"
-                    f"\t{arms[name]['lr_control']['fixed_scale']}\n")
+                    f"\t{arms[name]['lr_control']['fixed_scale']}\t{mode}\n")
 
     for fam, wall in WAVES.items():
         rows = [i for i, n in enumerate(names) if fam_of(n) == fam]
@@ -371,8 +454,14 @@ def main():
         fname = f'submit_prod_t100_{fam}.sbatch'
         with (HERE / fname).open('w', encoding='utf-8', newline='\n') as f:
             f.write(SBATCH.format(first=rows[0], last=rows[-1], time=wall,
-                                  wave=fam))
+                                  wave=fam, ckpts=CLUSTER_CKPTS.rstrip('/')))
         print(f'{fname}: rows {rows[0]}-{rows[-1]}  wall {wall}')
+    # THE LIVE ROWS ARE FROZEN. mip (0-4) and neh (5-9) are running on the
+    # cluster right now and their sbatch maps array index -> INDEX row, so any
+    # renumbering would repoint a live array at different arms.
+    assert names[:10] == [f'pt100_{f}_lr{scale_tag(s)}'
+                          for f in ('mip', 'neh') for s in SCALES], \
+        'rows 0-9 moved -- mip/neh arrays are LIVE, do not regenerate'
 
     print(f'\n{len(arms)} arms written to {HERE}')
     for name in names:

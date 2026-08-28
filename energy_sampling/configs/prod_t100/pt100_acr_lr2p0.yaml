@@ -5,7 +5,7 @@ seed: 12345
 device: cuda
 cuda_memory_fraction: 0.9
 anomaly_detection: false
-continue_from_checkpoint: false
+continue_from_checkpoint: true
 mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 checkpoint_name: null
@@ -56,7 +56,7 @@ lr_control:
   fixed_scale: 2.0
   verbose: true
   hard_failure:
-    loss_excursion_k: 40.0
+    loss_excursion_k: 60.0
     grad_excursion_x: 100.0
     loss_abs: 1000000.0
     grad_abs: 1000000.0
@@ -123,7 +123,7 @@ buffer_device: cuda
 batch_size: 1000
 grow_batch_size: true
 max_batch_size: 50000
-eval_num_samples: 10000
+eval_num_samples: 2500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
 epochs: 30000
@@ -132,7 +132,7 @@ figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50
-batch_util_target: 0.6
+batch_util_target: 0.95
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 60
 gpu_util_policy_window_s: 7200

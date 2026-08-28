@@ -1,16 +1,15 @@
-arm	family	scale
-pt100_mip_lr0p5	mip	0.5
-pt100_mip_lr1p0	mip	1.0
-pt100_mip_lr2p0	mip	2.0
-pt100_mip_lr4p0	mip	4.0
-pt100_mip_lr8p0	mip	8.0
-pt100_neh_lr0p5	neh	0.5
-pt100_neh_lr1p0	neh	1.0
-pt100_neh_lr2p0	neh	2.0
-pt100_neh_lr4p0	neh	4.0
-pt100_neh_lr8p0	neh	8.0
-pt100_acr_lr0p5	acr	0.5
-pt100_acr_lr1p0	acr	1.0
-pt100_acr_lr2p0	acr	2.0
-pt100_acr_lr4p0	acr	4.0
-pt100_acr_lr8p0	acr	8.0
+arm	family	scale	mode
+pt100_mip_lr0p5	mip	0.5	cold
+pt100_mip_lr1p0	mip	1.0	cold
+pt100_mip_lr2p0	mip	2.0	cold
+pt100_mip_lr4p0	mip	4.0	cold
+pt100_mip_lr8p0	mip	8.0	cold
+pt100_neh_lr0p5	neh	0.5	cold
+pt100_neh_lr1p0	neh	1.0	cold
+pt100_neh_lr2p0	neh	2.0	cold
+pt100_neh_lr4p0	neh	4.0	cold
+pt100_neh_lr8p0	neh	8.0	cold
+pt100_acr_lr0p5	acr	0.5	resume
+pt100_acr_lr1p0	acr	1.0	resume
+pt100_acr_lr2p0	acr	2.0	resume
+pt100_acr_lr4p0	acr	4.0	resume

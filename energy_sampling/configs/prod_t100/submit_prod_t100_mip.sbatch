@@ -21,20 +21,34 @@ PROJECT_ROOT=/scratch/mk8347/projects/gfn_cond
 WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
 ARMS=${WORKDIR}/configs/prod_t100
 LOGS=${ARMS}/joblogs
+CKPTS=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints
 mkdir -p ${LOGS}
 
 ARM=$(awk -F'\t' -v n=$((SLURM_ARRAY_TASK_ID + 2)) 'NR==n {print $1}' ${ARMS}/INDEX.tsv)
+RESUME=$(awk -F'\t' -v n=$((SLURM_ARRAY_TASK_ID + 2)) 'NR==n {print $4}' ${ARMS}/INDEX.tsv)
 if [ -z "${ARM}" ]; then echo "no arm at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 CONFIG=${ARMS}/${ARM}.yaml
 if [ ! -f "${CONFIG}" ]; then echo "missing config ${CONFIG}" >&2; exit 1; fi
 
-# COLD BATTERY -- nothing to resolve. The config is used verbatim; a per-job
-# copy is still taken so the joblog directory carries the exact config the arm
-# ran, the way the warm batteries do.
+# The config is used verbatim -- there is no cross-run warm start to resolve.
+# A per-job copy is still taken so the joblog carries the exact config the arm
+# ran. A RESUMED arm continues its OWN _running.pt via run_name, so nothing is
+# substituted; but the file MUST exist, because `continue_from_checkpoint` with
+# nothing to continue silently COLD-STARTS -- which would look like a resumed
+# arm and quietly throw away the steps this wave exists to keep.
 J=${LOGS}/${ARM}_${SLURM_JOB_ID}
 RESOLVED=${J}.yaml
 cp ${CONFIG} ${RESOLVED}
-echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  (cold, T=100)"
+if [ "${RESUME}" = "resume" ]; then
+    N=$(ls ${CKPTS}/*${ARM}*_running.pt 2>/dev/null | wc -l)
+    if [ "${N}" -eq 0 ]; then
+        echo "FATAL: arm ${ARM} is marked resume but no *${ARM}*_running.pt exists in ${CKPTS}" >&2
+        exit 1
+    fi
+    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  RESUME <- $(ls -t ${CKPTS}/*${ARM}*_running.pt | head -1 | xargs basename)"
+else
+    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  (cold, T=100)"
+fi
 
 { nvidia-smi -L
   nvidia-smi --query-gpu=mig.mode.current,uuid,name,memory.total,driver_version --format=csv
