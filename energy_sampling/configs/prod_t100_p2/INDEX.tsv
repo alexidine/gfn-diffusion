@@ -1,9 +1,9 @@
 arm	warm_src	scale
-pt100mip2_lr0p25	pt100_mip_lr2p0	0.25
-pt100mip2_lr0p5	pt100_mip_lr2p0	0.5
-pt100mip2_lr1p0	pt100_mip_lr2p0	1.0
-pt100mip2_lr2p0	pt100_mip_lr2p0	2.0
-pt100neh2_lr0p25	pt100_neh_lr1p0	0.25
-pt100neh2_lr0p5	pt100_neh_lr1p0	0.5
-pt100neh2_lr1p0	pt100_neh_lr1p0	1.0
-pt100neh2_lr2p0	pt100_neh_lr1p0	2.0
+pt100mip2_lr0p25	pt100_mip_lr4p0	0.25
+pt100mip2_lr0p5	pt100_mip_lr4p0	0.5
+pt100mip2_lr1p0	pt100_mip_lr4p0	1.0
+pt100mip2_lr2p0	pt100_mip_lr4p0	2.0
+pt100neh2_lr0p25	pt100_neh_lr4p0	0.25
+pt100neh2_lr0p5	pt100_neh_lr4p0	0.5
+pt100neh2_lr1p0	pt100_neh_lr4p0	1.0
+pt100neh2_lr2p0	pt100_neh_lr4p0	2.0

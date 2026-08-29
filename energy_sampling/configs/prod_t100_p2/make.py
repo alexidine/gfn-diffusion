@@ -4,19 +4,23 @@
 
 SEEDS -- the best GATED phase-1 exit per family, from prod_t100:
 
-  mipcas elj  <- pt100_mip_lr2p0   mle -23.20, w1r 4.11/7.68, clean scale 2
-  nehzor elj  <- pt100_neh_lr1p0   mle -10.02, w1r 3.32/11.30, clean scale 1
+  mipcas elj  <- pt100_mip_lr4p0   mle -26.87, w1r 3.99/10.60, gated @ 19010
+  nehzor elj  <- pt100_neh_lr4p0   mle -15.81, w1r 4.18/12.36, gated @ 14010
 
-NOT the best mle. mip_lr4p0 reached -24.72 and neh_lr4p0 -14.40, but neither
-GATED, so neither wrote a phase1_exit -- and the phase-2 stub depends on the
-restored exit streak to pass through on the first post-resume eval. Seeding it
-from a non-gated _running.pt strands the arm in train_prior re-running MLE while
-reporting healthily; the tell is `phase` never leaving 1.
+REVISED 2026-08-28, before submission. The first version of this file seeded
+from mip_lr2p0 (-23.19) and neh_lr1p0 (-10.02) because the scale-4 arms had the
+best mle but had NOT yet gated, and a phase-2 stub seeded from a non-gated
+_running.pt strands the arm in train_prior -- the restored exit streak is what
+carries it through on the first post-resume eval, and without one the tell is
+`phase` never leaving 1. Both scale-4 arms subsequently gated (mipcas at step
+19010, nehzor at 14010), so that objection is gone and the seeds move to them:
+3.7 and 5.8 nats better respectively, and for mipcas better on BOTH w1r stats
+as well (3.99/10.60 against 5.58/10.88).
 
-mip_lr8p0 also gated with a marginally better mle (-23.74) but its label is void
--- it fired at step 502 and ran at effective scale 4 -- and its w1r is worse on
-both stats (4.96/9.13 vs 4.11/7.68). Phase 2 SAMPLES from this policy, so the
-cleaner marginals win over 0.5 nats of likelihood.
+The lesson worth keeping: "best gated" is a MOVING TARGET while phase 1 is
+still running. Re-read it immediately before submitting rather than trusting a
+seed chosen hours earlier -- mip_lr4p0 needed 19010 steps to gate against
+mip_lr0p5's 14510, so the best arm was also the slowest to qualify.
 
 THE GRID, 0.25/0.5/1.0/2.0 at 2x spacing. Phase-2 rates are a separate
 measurement from phase-1 rates -- the loss is different (fused TB reads the
@@ -80,12 +84,12 @@ FAMILIES = {
     'mip2': {
         'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_elj_prior_dataset.pt',
         'space_groups': [2],
-        'warm_src': 'pt100_mip_lr2p0',
+        'warm_src': 'pt100_mip_lr4p0',
     },
     'neh2': {
         'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_elj_prior_dataset.pt',
         'space_groups': [14],
-        'warm_src': 'pt100_neh_lr1p0',
+        'warm_src': 'pt100_neh_lr4p0',
     },
 }
 
