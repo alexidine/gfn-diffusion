@@ -96,6 +96,21 @@ PHASE2_STEPS = 12000
 #: Raising eval_num_samples and switching to a p90 bar were both ruled out.
 LEVEL_WINDOW = 5000
 
+#: BATCH CEILING, cut 2026-08-29 after the first phase-2 wave. Two measured
+#: reasons, and they point the same way:
+#:   SPEED  mip2 pinned at the old 8000 cap ran 12.9 s/step, so its 12000-step
+#:          budget was ~43 h -- two requeues -- at 72-80% external occupancy.
+#:          That is well clear of the 38-49% cancellation band, so there is
+#:          room to trade occupancy for throughput.
+#:   CRASH  the MLIP families inherited max_batch_size 50000 from phase 1,
+#:          where it was harmless because batch_util_target 0.6 kept the ladder
+#:          pinned at 1000. Phase 2 raises the target to 0.95, so the ladder
+#:          CLIMBS -- and acr2_lr0p25 died ~60 steps after entering fused
+#:          equilibration, which is exactly where the allocation jumps and
+#:          where an OOM is FATAL rather than recoverable. A 50000 ceiling on
+#:          MACE fused at T=100 is not survivable.
+#: 4000 for every family: same cap, so the fans stay comparable across routes.
+#:
 #: MLIP families take the eval settings established on acridine in phase 1:
 #: eval cost there is per-SAMPLE and molecule-dependent (nehzor UMA spent 50-57%
 #: of wall clock outside the training step at T=10 against mipcas UMA's 16%, on
@@ -112,7 +127,7 @@ FAMILIES = {
         'exit_step': 19010,
         'energy_function': 'elj',
         'mlip_path': None,
-        'max_batch_size': 8000,
+        'max_batch_size': 4000,
     },
     'neh2': {
         'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_elj_prior_dataset.pt',
@@ -121,7 +136,7 @@ FAMILIES = {
         'exit_step': 14010,
         'energy_function': 'elj',
         'mlip_path': None,
-        'max_batch_size': 8000,
+        'max_batch_size': 4000,
     },
     # ---- MLIP families, added 2026-08-28 once their phase 1 gated -----------
     # acridine's phase-1 exit is the CLEANEST in the whole battery: w1r
@@ -135,7 +150,7 @@ FAMILIES = {
         'exit_step': 9010,
         'energy_function': 'mace',
         'mlip_path': '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model',
-        'max_batch_size': 50000,
+        'max_batch_size': 4000,
         **MLIP_EVAL,
     },
     'mipu2': {
@@ -145,7 +160,7 @@ FAMILIES = {
         'exit_step': 5010,
         'energy_function': 'uma',
         'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
-        'max_batch_size': 50000,
+        'max_batch_size': 4000,
         **MLIP_EVAL,
     },
     # NEHZOR UMA IS THE ONE THAT MAY REFUSE AT SUBMIT TIME, deliberately.
@@ -167,7 +182,7 @@ FAMILIES = {
         'exit_step': 5010,
         'energy_function': 'uma',
         'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
-        'max_batch_size': 50000,
+        'max_batch_size': 4000,
         **MLIP_EVAL,
     },
 }

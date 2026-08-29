@@ -122,7 +122,7 @@ model:
 buffer_device: cuda
 batch_size: 1000
 grow_batch_size: true
-max_batch_size: 8000
+max_batch_size: 4000
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
