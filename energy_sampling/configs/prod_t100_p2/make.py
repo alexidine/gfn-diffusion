@@ -80,16 +80,74 @@ SCALES = [0.25, 0.5, 1.0, 2.0]
 #: Raising eval_num_samples and switching to a p90 bar were both ruled out.
 LEVEL_WINDOW = 5000
 
+#: MLIP families take the eval settings established on acridine in phase 1:
+#: eval cost there is per-SAMPLE and molecule-dependent (nehzor UMA spent 50-57%
+#: of wall clock outside the training step at T=10 against mipcas UMA's 16%, on
+#: the same energy function), and it is what got the acridine phase-1 wave
+#: cancelled for low occupancy. figs_period stays 1000 for every arm, so the
+#: wandb storage bill is identical across the battery.
+MLIP_EVAL = {'eval_num_samples': 2500, 'eval_period': 1000}
+
 FAMILIES = {
     'mip2': {
         'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_elj_prior_dataset.pt',
         'space_groups': [2],
         'warm_src': 'pt100_mip_lr4p0',
+        'energy_function': 'elj',
+        'mlip_path': None,
+        'max_batch_size': 8000,
     },
     'neh2': {
         'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_elj_prior_dataset.pt',
         'space_groups': [14],
         'warm_src': 'pt100_neh_lr4p0',
+        'energy_function': 'elj',
+        'mlip_path': None,
+        'max_batch_size': 8000,
+    },
+    # ---- MLIP families, added 2026-08-28 once their phase 1 gated -----------
+    # acridine's phase-1 exit is the CLEANEST in the whole battery: w1r
+    # 1.94/4.68 against bars of 5.0/10.0, where the ELJ families exit at
+    # 4.0-4.2 / 10.6-12.4. Its arms also gated fastest (9010 steps) once the
+    # eval cost was cut.
+    'acr2': {
+        'prior_path': f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt',
+        'space_groups': [14],
+        'warm_src': 'pt100_acr_lr4p0',
+        'energy_function': 'mace',
+        'mlip_path': '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model',
+        'max_batch_size': 50000,
+        **MLIP_EVAL,
+    },
+    'mipu2': {
+        'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [2],
+        'warm_src': 'pt100_mipu_lr4p0',
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'max_batch_size': 50000,
+        **MLIP_EVAL,
+    },
+    # NEHZOR UMA IS THE ONE THAT MAY REFUSE AT SUBMIT TIME, deliberately.
+    # nehu_lr4p0 was still RUNNING when this was written -- best of its batch on
+    # mle (-16.34) with both w1r stats already inside the bars (3.24/8.61), so
+    # it is the right seed, but it had not yet written a phase1_exit. Seeding a
+    # fan from a LIVE _running.pt is the failure this battery's sbatch exists to
+    # prevent: four array tasks start at different times and would glob the file
+    # at different steps, so the fan stops being a comparison. Worse, a tagged
+    # snapshot gets its own FROZEN buffer sidecar and the rolling _running one
+    # does not, so phase 2 could come up without the buffers it needs.
+    # The sbatch therefore refuses loudly ("no phase-1 exit matches ...") until
+    # the arm gates. That is the intended behaviour, not a bug -- resubmit once
+    # it does. It was ~2000 steps from the earliest gate step when written.
+    'nehu2': {
+        'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_uma_f047_prior_dataset.pt',
+        'space_groups': [14],
+        'warm_src': 'pt100_nehu_lr4p0',
+        'energy_function': 'uma',
+        'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
+        'max_batch_size': 50000,
+        **MLIP_EVAL,
     },
 }
 
@@ -120,8 +178,8 @@ def build():
             cfg['molecules_path'] = spec['prior_path']
             cfg['test_molecules_path'] = None
             cfg['space_groups'] = spec['space_groups']
-            cfg['energy_function'] = 'elj'
-            cfg['mlip_path'] = None
+            cfg['energy_function'] = spec['energy_function']
+            cfg['mlip_path'] = spec['mlip_path']
 
             # FULL resume of the phase-1 exit: phase 2 needs the stage_ctrl
             # (its restored exit streak carries it through the train_prior stub)
@@ -138,10 +196,14 @@ def build():
             cfg['traj_checkpoint'] = True
 
             cfg['epochs'] = 14500
-            cfg['eval_period'] = 500        # ELJ eval is 6-10% of wall clock
+            # ELJ eval is 6-10% of wall clock and stays at 500; the MLIP
+            # families take the cut that rescued acridine's phase 1.
+            cfg['eval_period'] = int(spec.get('eval_period', 500))
+            if 'eval_num_samples' in spec:
+                cfg['eval_num_samples'] = spec['eval_num_samples']
             cfg['figs_period'] = 1000
             cfg['batch_util_target'] = 0.95
-            cfg['max_batch_size'] = 8000
+            cfg['max_batch_size'] = spec['max_batch_size']
             cfg['progress_gate']['level_window'] = LEVEL_WINDOW
 
             lc = cfg['lr_control']
@@ -292,7 +354,15 @@ def check(cfg, fam, s):
     assert cfg['prior_path'] == spec['prior_path']
     assert cfg['molecules_path'] == spec['prior_path']
     assert cfg['test_molecules_path'] is None
-    assert cfg['energy_function'] == 'elj'
+    assert cfg['energy_function'] == spec['energy_function']
+    assert cfg['mlip_path'] == spec['mlip_path']
+    assert cfg['eval_period'] == int(spec.get('eval_period', 500))
+    if 'eval_num_samples' in spec:
+        assert cfg['eval_num_samples'] == spec['eval_num_samples']
+    assert cfg['max_batch_size'] == spec['max_batch_size']
+    # traj_checkpoint is ON for every family here. For the MLIPs that IS the
+    # owner's rule (phase > 1); for ELJ it extends it, because the fatal case
+    # is a transition OOM the bwd-only stub cannot pre-discover.
     assert_no_local_paths(cfg)
 
 
