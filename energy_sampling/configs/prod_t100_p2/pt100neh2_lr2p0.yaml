@@ -421,8 +421,8 @@ protocols:
           repeats: 1.0
           tb_z_source: persistent
       exit:
-      - metric: gates/progress_done
-        above: 0.5
+      - metric: bwd/mle
+        above: -1000000000.0
         patience: 1
       on_exit:
       - snapshot_prior

@@ -269,13 +269,43 @@ def build():
                                       'rows': 31, 'above': 5.0, 'action': 'fire'},
                     'loss_coeffs': {'bwd': {'mle': 1.0, 'tbc': 0.0, 'repeats': 1.0,
                                             'tb_z_source': 'persistent'}},
-                    # EXACTLY ONE TERM AT INDEX 0, patience 1, verbatim from the
-                    # phase-1 arm. Exit streaks restore BY INDEX, and at the
-                    # first post-resume eval maybe_advance only re-judges eval/*
-                    # terms, so the restored streak is what carries the arm
-                    # through. A second term would have no restored streak and
-                    # would strand the arm in the stub.
-                    'exit': [{'metric': 'gates/progress_done', 'above': 0.5,
+                    # THE STUB EXITS ON A TICK METRIC, NOT ON THE GATE, and the
+                    # gate version is why nehzor sat in train_prior for
+                    # thousands of steps (2026-08-29).
+                    #
+                    # `_progress_history` (train.py:5921) is a plain in-memory
+                    # dict that is NOT checkpointed, so after a resume the gate
+                    # has no history and progress_gate publishes 0 until it
+                    # rebuilds SIX evals. `_advance_term` resets a streak to 0
+                    # the moment its metric is freshly written and fails -- so
+                    # that first published 0 WIPES the streak restored from the
+                    # phase-1 exit. Whether an arm escapes is then a race
+                    # inside one evaluation(): the gate is published, then
+                    # maybe_advance reads the streak. mip2/acr2/mipu2 won that
+                    # race and reached equilibration in ~10 steps; all four
+                    # nehzor arms lost it and were left grinding MLE at ~37%
+                    # occupancy -- inside the cancellation band.
+                    #
+                    # Keying on bwd/mle removes the race entirely. It resolves
+                    # through metric_tracker.written_step, which is written
+                    # every training tick, and -1e9 passes for any finite loss,
+                    # so the streak reaches patience on the FIRST tick after
+                    # resume, arms, pulls an eval forward and advances.
+                    #
+                    # This is CORRECT rather than merely expedient: the seed is
+                    # already a GATED phase-1 exit, so re-judging convergence
+                    # here is redundant -- and cannot be done honestly anyway,
+                    # because the history it would need does not survive the
+                    # process. The stub's real job is only to exist so the
+                    # checkpoint's stage name resolves and so equilibration is
+                    # stage[1] and its on_enter fires.
+                    #
+                    # THE COST, stated plainly: an arm seeded from a NON-gated
+                    # checkpoint would now walk straight into equilibration on
+                    # an unconverged prior. The sbatch refuses to seed from
+                    # anything but *_phase1_exit.pt, which is what keeps that
+                    # from happening.
+                    'exit': [{'metric': 'bwd/mle', 'above': -1e9,
                               'patience': 1}],
                     # NO 'stop' -- with it every arm ends ~10 steps after resume
                     # as a FINISHED run having done no phase-2 work. NO
@@ -353,8 +383,10 @@ def check(cfg, fam, s):
     assert st['on_exit'] == ['snapshot_prior'], \
         'snapshot_prior is mandatory (prior_model is not in the checkpoint)'
     assert len(st['exit']) == 1 and st['exit'][0] == {
-        'metric': 'gates/progress_done', 'above': 0.5, 'patience': 1}, \
-        'exit streaks restore BY INDEX -- one term at index 0, verbatim'
+        'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}, (
+        'the stub must exit on a TICK metric, not the gate: _progress_history '
+        'does not survive a resume, so a gate-keyed exit publishes 0 at the '
+        'first eval and wipes the streak restored from the phase-1 exit')
     assert eq['name'] == 'equilibration'
     assert eq.get('exit') is None, 'equilibration is terminal by design'
     assert eq['on_enter'] == ['rebuild_prior_by_churn', 'bootstrap_z:train_conditioner']
