@@ -72,6 +72,22 @@ PLACEHOLDER = 'WARM_CHECKPOINT_PLACEHOLDER'
 SHIP_T = 100
 EXCURSION_K = 60.0
 SCALES = [0.25, 0.5, 1.0, 2.0]
+#: Steps of EQUILIBRATION each arm gets. `epochs` is an ABSOLUTE bound --
+#: train.py runs `trange(init_step, args.epochs + 1)` and a phase-2 arm resumes
+#: at its phase-1 exit step -- so epochs must be derived per family as
+#: exit_step + this, NOT written as a constant.
+#:
+#: THIS WAS A REAL FAILURE, 2026-08-29. The first submission carried
+#: `epochs: 14500` over from the T=10 battery, where phase-1 exits landed at
+#: ~2510 and 14500 therefore left ~12000 steps of equilibration. At T=100 the
+#: exits are 5010-19010, so the headroom collapsed or went NEGATIVE:
+#:   mip2  seed exits 19010 > cap 14500 -> ZERO iterations, "0it [00:00]",
+#:                                         four arms finished in 36 seconds
+#:   neh2  seed exits 14010, cap 14500  -> 490 steps, never left the stub
+#:   acr2  seed exits  9010, cap 14500  -> 5490 steps, the only one that ran
+#: The lesson: any absolute-step budget has to be re-derived when the thing it
+#: is measured from moves, and phase-1 exit steps moved 4-8x with T.
+PHASE2_STEPS = 12000
 #: widened from 2500 (owner, 2026-08-28). The gate's trailing median is what
 #: absorbs w1r noise, and that noise is INDEPENDENT eval-to-eval (lag-1
 #: autocorrelation -0.39..+0.14 across ten series, i.e. measurement not drift),
@@ -93,6 +109,7 @@ FAMILIES = {
         'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_elj_prior_dataset.pt',
         'space_groups': [2],
         'warm_src': 'pt100_mip_lr4p0',
+        'exit_step': 19010,
         'energy_function': 'elj',
         'mlip_path': None,
         'max_batch_size': 8000,
@@ -101,6 +118,7 @@ FAMILIES = {
         'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_elj_prior_dataset.pt',
         'space_groups': [14],
         'warm_src': 'pt100_neh_lr4p0',
+        'exit_step': 14010,
         'energy_function': 'elj',
         'mlip_path': None,
         'max_batch_size': 8000,
@@ -114,6 +132,7 @@ FAMILIES = {
         'prior_path': f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt',
         'space_groups': [14],
         'warm_src': 'pt100_acr_lr4p0',
+        'exit_step': 9010,
         'energy_function': 'mace',
         'mlip_path': '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model',
         'max_batch_size': 50000,
@@ -123,6 +142,7 @@ FAMILIES = {
         'prior_path': f'{CLUSTER_DATA}/mipcas_sg2_zp1_uma_f047_prior_dataset.pt',
         'space_groups': [2],
         'warm_src': 'pt100_mipu_lr4p0',
+        'exit_step': 5010,
         'energy_function': 'uma',
         'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
         'max_batch_size': 50000,
@@ -144,6 +164,7 @@ FAMILIES = {
         'prior_path': f'{CLUSTER_DATA}/nehzor_sg14_zp1_uma_f047_prior_dataset.pt',
         'space_groups': [14],
         'warm_src': 'pt100_nehu_lr4p0',
+        'exit_step': 5010,
         'energy_function': 'uma',
         'mlip_path': '/scratch/mk8347/models/uma/esen_s.pt',
         'max_batch_size': 50000,
@@ -195,7 +216,9 @@ def build():
             # ELJ phase 2, because the fatal case is a transition OOM
             cfg['traj_checkpoint'] = True
 
-            cfg['epochs'] = 14500
+            # ABSOLUTE bound, so it must clear the resume step -- see
+            # PHASE2_STEPS. Asserted in check() against the recorded exit.
+            cfg['epochs'] = spec['exit_step'] + PHASE2_STEPS
             # ELJ eval is 6-10% of wall clock and stays at 500; the MLIP
             # families take the cut that rescued acridine's phase 1.
             cfg['eval_period'] = int(spec.get('eval_period', 500))
@@ -340,6 +363,11 @@ def check(cfg, fam, s):
     assert cfg['continue_from_checkpoint'] is False
     assert cfg['prior_model_name'] is None
 
+    assert cfg['epochs'] == spec['exit_step'] + PHASE2_STEPS
+    assert cfg['epochs'] > spec['exit_step'] + 1000, (
+        f"epochs {cfg['epochs']} leaves no room past the resume step "
+        f"{spec['exit_step']}; train.py runs trange(init_step, epochs+1) so "
+        f"the arm would do (almost) nothing")
     assert cfg['progress_gate']['mode'] == 'level'
     assert cfg['progress_gate']['level_window'] == LEVEL_WINDOW
     bars = {m['key']: m['bar'] for m in cfg['progress_gate']['metrics']}
