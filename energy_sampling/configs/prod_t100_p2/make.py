@@ -117,7 +117,40 @@ LEVEL_WINDOW = 5000
 #: the same energy function), and it is what got the acridine phase-1 wave
 #: cancelled for low occupancy. figs_period stays 1000 for every arm, so the
 #: wandb storage bill is identical across the battery.
-MLIP_EVAL = {'eval_num_samples': 2500, 'eval_period': 1000}
+MLIP_EVAL = {'eval_num_samples': 2500, 'eval_period': 1000,
+             # THE MLIP MUST NOT SET THE TRAINING BATCH. With
+             # internal_oom_recovery FALSE, batched_analyze_crystal_batch makes
+             # ONE call on the whole rollout batch, so an energy that cannot
+             # hold that batch OOMs the entire step and the global sizer
+             # ratchets the TRAINING batch down to whatever the MLIP can take.
+             # Measured end state on acridine: batch 4000 -> 240, GPU 41-43%,
+             # cancelled by the scheduler at 2.5 h with all four arms dead.
+             # This exact failure is on record from prod0810 v2's uma arm on
+             # 2026-08-12 (batch 1000 -> 500 -> 250, 48% util, cancelled at
+             # 5.2 h) -- the cost of `false` was documented before we paid it
+             # again.
+             #
+             # TRUE restores the energy's own chunking (sticky size, +1%/chunk
+             # growth, x0.65 on OOM), so the MLIP absorbs its own memory limit
+             # and the training batch is set by the ROLLOUT, which
+             # traj_checkpoint already makes ~O(1) in T.
+             #
+             # NOT the prescribed fix, and worth saying why the prescribed one
+             # failed: the standing advice for `false` was traj_checkpoint on
+             # MLIP arms. We had it on. It buys back ROLLOUT activation memory,
+             # and the binding constraint here is not rollout activations --
+             # the MACE fused batch ceiling measures the SAME (~155-250) at
+             # T=10 and at T=100, so it is T-independent, i.e. the MLIP's own
+             # per-sample cost. traj_checkpoint was aimed at the wrong pool.
+             #
+             # Safe to flip mid-battery: internal_oom_recovery is in
+             # _NON_IDENTITY_ENERGY_CONFIG_KEYS, so the problem slug does not
+             # re-hash and these arms still resume from the same phase1_exit.
+             'internal_oom_recovery': True,
+             # with the MLIP no longer capping it, let the sizer find the
+             # rollout ceiling. Phase-1 acridine held batch 8560 at 87% util at
+             # T=100 with traj_checkpoint OFF; phase 2 has it ON.
+             'mlip_max_batch': 8000}
 
 FAMILIES = {
     'mip2': {
@@ -239,9 +272,16 @@ def build():
             cfg['eval_period'] = int(spec.get('eval_period', 500))
             if 'eval_num_samples' in spec:
                 cfg['eval_num_samples'] = spec['eval_num_samples']
+            if 'internal_oom_recovery' in spec:
+                cfg['energy_config']['internal_oom_recovery'] = \
+                    spec['internal_oom_recovery']
             cfg['figs_period'] = 1000
             cfg['batch_util_target'] = 0.95
-            cfg['max_batch_size'] = spec['max_batch_size']
+            # mlip_max_batch wins where present: once the energy chunks itself,
+            # the ceiling is the ROLLOUT's, not the MLIP's, so the MLIP families
+            # get more headroom than the ELJ ones rather than less.
+            cfg['max_batch_size'] = spec.get('mlip_max_batch',
+                                             spec['max_batch_size'])
             cfg['progress_gate']['level_window'] = LEVEL_WINDOW
 
             lc = cfg['lr_control']
@@ -434,7 +474,15 @@ def check(cfg, fam, s):
     assert cfg['eval_period'] == int(spec.get('eval_period', 500))
     if 'eval_num_samples' in spec:
         assert cfg['eval_num_samples'] == spec['eval_num_samples']
-    assert cfg['max_batch_size'] == spec['max_batch_size']
+    want_batch = spec.get('mlip_max_batch', spec['max_batch_size'])
+    assert cfg['max_batch_size'] == want_batch
+    # ELJ is inert here (chunk 12075 vs batch 4000 = one chunk, never grows), so
+    # this is a MACE/UMA-only switch and must not drift onto the ELJ families
+    want_oom = spec.get('internal_oom_recovery', False)
+    assert cfg['energy_config']['internal_oom_recovery'] is want_oom
+    if want_oom:
+        assert spec['energy_function'] != 'elj',             'internal_oom_recovery is a MACE/UMA concern; ELJ never OOMs'
+        assert cfg['traj_checkpoint'] is True,             'with the MLIP chunking itself the rollout sets the batch, so the '            'trajectory memory saving is now load-bearing'
     # traj_checkpoint is ON for every family here. For the MLIPs that IS the
     # owner's rule (phase > 1); for ELJ it extends it, because the fatal case
     # is a transition OOM the bwd-only stub cannot pre-discover.

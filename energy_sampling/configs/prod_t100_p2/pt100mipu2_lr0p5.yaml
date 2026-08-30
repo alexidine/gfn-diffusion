@@ -122,7 +122,7 @@ model:
 buffer_device: cuda
 batch_size: 1000
 grow_batch_size: true
-max_batch_size: 4000
+max_batch_size: 8000
 eval_num_samples: 2500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
@@ -562,7 +562,7 @@ vector_conditioning_dim: 3
 embedding_conditioning: false
 embedding_conditioning_dim: 192
 energy_config:
-  internal_oom_recovery: false
+  internal_oom_recovery: true
   temperature: 2.5
   log_temperature_range:
   - 0

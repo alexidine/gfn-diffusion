@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from energy_sampling.energies.base_set import BaseSet
+from energy_sampling.energies.prior_knn import PriorKNN
 from mxtaltools.common.geometry_utils import lat2sph_rotvec
 from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
@@ -86,6 +87,9 @@ class MolecularCrystal(BaseSet):
                  analyze_kwargs: Optional[dict] = None,  # extra kwargs passed through to crystal_batch.analyze()
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
+                 prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
+                 prior_knn_k: Optional[int] = None,  # overrides the k stored in the reference file; a smoothing knob on a fixed draw, so sweeping it needs no rebuild
+                 prior_knn_min_radius: Optional[float] = None,  # floor on r_k, in latent units
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -186,10 +190,39 @@ class MolecularCrystal(BaseSet):
         # toy measure the dead-row machinery against a CLOSED-FORM log Z, which no
         # physical energy can provide. latent_harmonic/latent_multiharmonic keep
         # is_crystal False exactly as before, so every existing toy config is untouched.
+        #
+        # `latent_knn` joins latent_gaussian on the is_crystal / latent_energy diagonal
+        # for the same reason: it is a density fitted to the prior's own draws IN the
+        # gauge-fixed latent space, so there is no measure to correct and no physical
+        # term to read. Fitting in latent space is not incidental -- the prior's samples
+        # already carry the jacobian of whatever physical target trained them, so
+        # re-applying it here would score the prior against a distribution the prior
+        # was never at, and the lambda=0 null test would fail for a reason having
+        # nothing to do with the sampler.
         self.latent_energy = self.energy_function in ['latent_harmonic',
                                                       'latent_multiharmonic',
-                                                      'latent_gaussian']
+                                                      'latent_gaussian',
+                                                      'latent_knn']
         self.is_crystal = is_crystal_energy(self.energy_function)  # not a toy model
+
+        self.prior_knn = None
+        if self.energy_function == 'latent_knn':
+            if prior_knn_path is None:
+                raise ValueError(
+                    "energy_function 'latent_knn' requires energy_config.prior_knn_path -- "
+                    "the frozen prior draw it scores against. Without one there is no "
+                    "density and the term would have to invent a default, which is exactly "
+                    "the silent no-op this energy exists to rule out.")
+            self.prior_knn = PriorKNN.load(prior_knn_path,
+                                           device=self.device,
+                                           k=prior_knn_k,
+                                           min_radius=prior_knn_min_radius)
+            if self.prior_knn.data_ndim != self.data_ndim:
+                raise ValueError(
+                    f"prior_knn reference is {self.prior_knn.data_ndim}-dimensional but this "
+                    f"problem's state is {self.data_ndim}-dimensional (max_z_prime="
+                    f"{self.max_z_prime}); the reference was built for a different layout")
+            print(f'prior_knn: {self.prior_knn.describe()}')
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
@@ -198,7 +231,11 @@ class MolecularCrystal(BaseSet):
             self.sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
 
         self.computes = ['reduction_en']
-        self.computes.append(self.energy_function)
+        # latent_knn is scored from the latent vector directly, so unlike every other
+        # energy here there is no same-named crystal_batch attribute for analyze() to
+        # produce -- asking for one raises inside mxtaltools.
+        if self.energy_function != 'latent_knn':
+            self.computes.append(self.energy_function)
         self.computes_require_cluster = any(COMPUTES_REQUIRE_CLUSTER.get(k, False) for k in self.computes)
 
         self._init_condition_library()
@@ -548,6 +585,13 @@ class MolecularCrystal(BaseSet):
             # for free: their contribution is exactly ((0 - 0)/w)^2 = 0.
             crystal_energy = getattr(crystal_batch, 'latent_gaussian')
 
+        elif self.energy_function == 'latent_knn':
+            # `latents`, not raw_latents: the reference draw was extracted through the
+            # same latent_params(gauge_fix_free_axes=is_crystal) call above, and the two
+            # must share a gauge or every distance is wrong by a free-axis translation
+            # that nothing downstream would flag.
+            crystal_energy = self.prior_knn.energy(latents)
+
         elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
@@ -819,7 +863,17 @@ class MolecularCrystal(BaseSet):
                     if self.batch_size == 1:
                         assert False, "Cascading OOM failure in molecule energy evaluation"
                     self.batch_size = max(int(self.batch_size * 0.65), 1)
-                    # print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    # UNSILENCED 2026-08-29. This print was commented out, which made
+                    # an energy-side OOM cascade completely invisible: the chunk
+                    # ratchets down inside this loop, the global batch controller
+                    # never learns, and the only external symptom is the run getting
+                    # slower. That is the swallowed-diagnostic shape this project
+                    # keeps paying for -- and it matters much more now that the MLIP
+                    # phase-2 arms run with internal_oom_recovery TRUE, where this
+                    # loop is the ONLY thing standing between the MLIP's memory
+                    # ceiling and the training batch.
+                    print(f"OOM in energy evaluation: dropping chunk size to "
+                          f"{self.batch_size} (n_samples={n_samples})")
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
