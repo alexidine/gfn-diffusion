@@ -11,33 +11,40 @@
 
 All five seed from the same frozen `pt100_acr_lr4p0` phase-1 exit (step 9010).
 
------------------------------------------------- WHY 1000: OCCUPANCY IS NOT BINDING
+--------------------------------------- WHY 1000: OCCUPANCY DOES NOT PICK THE BATCH
 
 `internal_oom_recovery: True` (3cf6b95) was dispositive for acridine -- batch 240
 -> 8000 -- because MACE had been evaluating the whole rollout in ONE call, so the
 MLIP's per-call memory was setting the TRAINING batch (64 GiB allocations at
 batch 243, occupancy 32-38%, every arm cancelled).
 
-That same chunking is why occupancy then stops being a constraint at all.
-MEASURED on the first wave of this battery, wandb's out-of-process sampler:
+Once the MLIP chunks itself, occupancy stops being the thing that selects a size.
+MEASURED, from the nvidia-smi sidecar (out-of-process, 10 s cadence, the number
+the scheduler cancels on):
 
-  batch    ours    EXTERNAL    step_s   steps/s
-   1500    47.7      85-100      13.6     0.074
-   2560    64-68     85-100      17.8     0.056
+  batch    ours    EXTERNAL   offset   step_s   steps/s
+   1000    42-50     ~71-79      +29     10.6     0.094   (inferred from 1500)
+   1500     47.7       76.8      +29     13.6     0.074
+   2560    64-68    89.0-90.5    +23     17.8     0.056
+   8000     91.0    93.9-97.1     +4     54.6     0.018
 
-The chunk loop keeps a dense MACE kernel resident essentially all the time, and
-`utilization.gpu` measures the FRACTION OF TIME A KERNEL IS RUNNING, not how much
-of the card is used. Smaller batch means fewer loop iterations, not more idle. So
-external occupancy saturates near the top at every size we can run, sits far above
-the measured survival bracket (a100_stab_aug16: cancelled <=40%, survived >=49.4%),
-and carries no information about batch.
+Every size we can run sits far above the measured survival bracket
+(a100_stab_aug16: cancelled <=40%, survived >=49.4%), so occupancy is satisfied
+everywhere and cannot discriminate. It is a floor to clear, not an objective.
 
-THE INSTRUMENT LESSON, because it cost this battery a submit cycle. The in-process
-sensor reads LOW here by +3-6 points at batch 8000, +35 at 2560, and +52 at 1500.
-That is not a smooth offset to calibrate against -- the first version of this file
-extrapolated the batch-8000 point downward and concluded external ~64-75 at 2560,
-when it is ~100. Do not infer external occupancy from `gpu/util_recent` on a
-chunked-MLIP route; read the smi sidecar or wandb system metrics.
+TWO INSTRUMENT ERRORS, both of which cost this battery a submit cycle -- keep
+them straight, because they have opposite fixes.
+
+  1. DO NOT EXTRAPOLATE THE OFFSET. The in-process sensor reads LOW here, and by
+     an amount that shrinks with batch (+29 / +23 / +4 above). An earlier version
+     of this file calibrated at the single batch-8000 point (+4) and extrapolated
+     downward to conclude external ~64-75 at 2560; it is 89-90.5. Measure the
+     offset at the size you intend to run.
+  2. DO NOT USE WANDB'S EVENTS STREAM FOR THIS. Its `system.gpu.0.gpu` median
+     reported 100.0 at both 1500 and 2560, which is what produced the (wrong)
+     claim that occupancy saturates regardless of batch. The smi sidecar shows a
+     real, monotone batch dependence -- 76.8 -> 89-90.5 -> 94-97. The sidecar is
+     authoritative; that stream is not.
 
 With the occupancy constraint unbinding, mk_dev's decided objective is the whole
 answer: "occupancy constraint first, then optimizer-step throughput -- whose
