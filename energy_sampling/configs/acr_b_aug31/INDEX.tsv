@@ -1,0 +1,7 @@
+arm	warm_src	batch	scale
+acrb_lr0p25	pt100_acr_lr4p0	2560	0.25
+acrb_lr0p5	pt100_acr_lr4p0	2560	0.5
+acrb_lr1p0	pt100_acr_lr4p0	2560	1.0
+acrb_lr2p0	pt100_acr_lr4p0	2560	2.0
+acrb_b1500	pt100_acr_lr4p0	1500	0.5
+acrb_b2000	pt100_acr_lr4p0	2000	0.5
