@@ -86,6 +86,7 @@ NOT AN EDIT TO prod_t100_p2, deliberately: that make.py writes all 20 of its
 YAMLs and its nehu2 arms have been hand-edited on the cluster, so regenerating
 would silently overwrite them.
 """
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -106,6 +107,7 @@ PHASE2_STEPS = 12000
 WARM_SRC = 'pt100_acr_lr4p0'
 EXIT_STEP = 9010
 PRIOR = f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt'
+DROPPED = []
 MLIP = '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model'
 FAN_BATCH = 1000
 
@@ -130,10 +132,47 @@ def base():
         return yaml.safe_load(f)
 
 
+def committed_energy_config():
+    """`energy_config` as COMMITTED, or None if git cannot answer.
+
+    A generator that snapshots the WORKING-TREE mk_dev bakes in whatever keys
+    are mid-development there. Most are harmless -- they land on a Namespace and
+    nothing reads them. `energy_config` is not: train.py does
+    `MolecularCrystal(**energy_config)`, so a key whose handler is uncommitted is
+    a TypeError at startup on every arm. That is how acr_b_aug31's first wave
+    died on `prior_flow_path` (2026-08-31), with `lambda_mix` queued behind it.
+    """
+    out = subprocess.run(
+        ['git', 'show', 'HEAD:energy_sampling/configs/mk_dev.yaml'],
+        capture_output=True, text=True, cwd=str(CONFIGS.parent))
+    if out.returncode != 0:
+        return None
+    return (yaml.safe_load(out.stdout) or {}).get('energy_config')
+
+
+def drop_uncommitted_energy_keys(cfg, ref):
+    """Strip energy_config keys absent from the COMMITTED mk_dev, loudly.
+
+    SELF-HEALING BY DESIGN: the moment the handler and the mk_dev key are both
+    committed, `ref` contains the key and nothing is stripped. So this does not
+    have to be revisited when prior_flow lands -- it just stops firing.
+    """
+    if ref is None:
+        raise SystemExit('cannot read committed mk_dev; refusing to generate '
+                         'cluster configs against an unverifiable base')
+    dropped = [k for k in list(cfg['energy_config']) if k not in ref]
+    for k in dropped:
+        cfg['energy_config'].pop(k)
+    return dropped
+
+
 def build():
     arms = {}
+    ref = committed_energy_config()
+    global DROPPED
     for name, batch, scale in ARMS:
         cfg = base()
+        DROPPED = drop_uncommitted_energy_keys(cfg, ref)
         run = f'acrb1k_{name}'
 
         cfg['run_name'] = run
