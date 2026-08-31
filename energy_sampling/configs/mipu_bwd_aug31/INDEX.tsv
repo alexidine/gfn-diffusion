@@ -1,0 +1,9 @@
+arm	warm_src	scale	lr	bwd_floor
+mb31_bwd02_lr1p56	pt100_mipu_lr4p0	0.125	1.563e-05	0.02
+mb31_bwd02_lr0p78	pt100_mipu_lr4p0	0.0625	7.813e-06	0.02
+mb31_bwd25_lr1p56	pt100_mipu_lr4p0	0.125	1.563e-05	0.25
+mb31_bwd25_lr0p78	pt100_mipu_lr4p0	0.0625	7.813e-06	0.25
+mb31_bwd50_lr1p56	pt100_mipu_lr4p0	0.125	1.563e-05	0.5
+mb31_bwd50_lr0p78	pt100_mipu_lr4p0	0.0625	7.813e-06	0.5
+mb31_bwd75_lr1p56	pt100_mipu_lr4p0	0.125	1.563e-05	0.75
+mb31_bwd75_lr0p78	pt100_mipu_lr4p0	0.0625	7.813e-06	0.75
