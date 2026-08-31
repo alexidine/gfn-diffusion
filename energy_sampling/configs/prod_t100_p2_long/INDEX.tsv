@@ -1,0 +1,3 @@
+arm	continues	scale	epochs
+pt100mip2_lr1p0	prod_t100_p2/pt100mip2_lr1p0	1.0	90000
+pt100neh2_lr1p0	prod_t100_p2/pt100neh2_lr1p0	1.0	90000
