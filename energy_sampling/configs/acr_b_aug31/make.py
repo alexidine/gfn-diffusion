@@ -1,90 +1,90 @@
-"""acr_b_aug31: acridine phase-2 LR scan at a PINNED, MEASURED batch, plus two batch probes.
+"""acr_b_aug31: acridine phase-2 LR scan at batch 1000, plus a 1500 control.
 
     python configs/acr_b_aug31/make.py
 
-Six arms, all seeded from the same frozen `pt100_acr_lr4p0` phase-1 exit (9010):
+  arm         batch   scale   purpose
+  lr0p125      1000   0.125   LR scan
+  lr0p25       1000   0.25    LR scan
+  lr0p5        1000   0.5     LR scan
+  lr1p0        1000   1.0     LR scan
+  b1500        1500   0.5     throughput / stability control
 
-  arm        batch   scale   purpose
-  lr0p25      2560    0.25   LR scan
-  lr0p5       2560    0.5    LR scan
-  lr1p0       2560    1.0    LR scan
-  lr2p0       2560    2.0    LR scan
-  b1500       1500    0.5    batch probe
-  b2000       2000    0.5    batch probe
+All five seed from the same frozen `pt100_acr_lr4p0` phase-1 exit (step 9010).
 
-WHY THIS EXISTS RATHER THAN AN EDIT TO prod_t100_p2. Two reasons, both about not
-destroying live state: `prod_t100_p2/make.py` writes all 20 of that battery's
-YAMLs, and the nehu2 arms there have been hand-edited on the cluster to a fixed
-batch -- regenerating would silently overwrite that. And the acr2 arms there are
-LIVE, so a new fan cannot seed from their `_running.pt` files: four array tasks
-start at different times and would glob the same file at different steps, which
-is the failure the sbatch's phase1_exit-only rule exists to prevent. Seeding all
-six from the frozen phase-1 exit instead costs ~2400 equilibration steps, ~1400
-of which were run at batch 8000 -- a size this battery exists to abandon.
+------------------------------------------------ WHY 1000: OCCUPANCY IS NOT BINDING
 
-------------------------------------------------------- WHY BATCH 2560, MEASURED
+`internal_oom_recovery: True` (3cf6b95) was dispositive for acridine -- batch 240
+-> 8000 -- because MACE had been evaluating the whole rollout in ONE call, so the
+MLIP's per-call memory was setting the TRAINING batch (64 GiB allocations at
+batch 243, occupancy 32-38%, every arm cancelled).
 
-`internal_oom_recovery: True` (shipped 3cf6b95) was dispositive for acridine: it
-took the batch from 240 to 8000 by handing the ceiling back to the ROLLOUT, which
-`traj_checkpoint` already makes ~O(1) in T. Before it, MACE evaluated the whole
-rollout in ONE call, so the MLIP's per-call memory set the TRAINING batch -- 64
-GiB allocations at batch 243, occupancy 32-38%, and every arm cancelled.
+That same chunking is why occupancy then stops being a constraint at all.
+MEASURED on the first wave of this battery, wandb's out-of-process sampler:
 
-But 8000 is far past the useful point. The ladder walked 11 rungs on four
-independent arms, 20 occupancy samples each, and they agree:
+  batch    ours    EXTERNAL    step_s   steps/s
+   1500    47.7      85-100      13.6     0.074
+   2560    64-68     85-100      17.8     0.056
 
-  batch   step_s   samples/s   steps/s   util(ours)   energy frac
-   1000     10.7          93     0.093         38.2          0.46
-   1600     13.7         117     0.073         49.0          0.58
-   2560     18.9         135     0.053         64.5          0.67
-   3560     25.7         138     0.039         78.3          0.70
-   4560     30.2         151     0.033         84.5          0.73
-   8000     54.6         146     0.018         91.0          0.76
+The chunk loop keeps a dense MACE kernel resident essentially all the time, and
+`utilization.gpu` measures the FRACTION OF TIME A KERNEL IS RUNNING, not how much
+of the card is used. Smaller batch means fewer loop iterations, not more idle. So
+external occupancy saturates near the top at every size we can run, sits far above
+the measured survival bracket (a100_stab_aug16: cancelled <=40%, survived >=49.4%),
+and carries no information about batch.
 
-Sample throughput SATURATES by ~4560 and never improves. Optimizer updates --
-the decided objective (mk_dev.yaml: "occupancy constraint first, then
-optimizer-step throughput, whose answer is the CONSTANT batch_size =
-fused_grad_accum_min_samples") -- fall monotonically. 2560 buys 2.9x the updates
-of 8000 for 8% less sample throughput.
+THE INSTRUMENT LESSON, because it cost this battery a submit cycle. The in-process
+sensor reads LOW here by +3-6 points at batch 8000, +35 at 2560, and +52 at 1500.
+That is not a smooth offset to calibrate against -- the first version of this file
+extrapolated the batch-8000 point downward and concluded external ~64-75 at 2560,
+when it is ~100. Do not infer external occupancy from `gpu/util_recent` on a
+chunked-MLIP route; read the smi sidecar or wandb system metrics.
 
-Occupancy at 2560 is defensible against the only bracket that has been measured
-(a100_stab_aug16: cancelled at <=40% external, survived at >=49.4%; qm9anchor_aug14
-ran 34-48 h uncancelled at 57-68%). Our in-process sensor reads 64.5 there, and
-the out-of-process smi sidecar calibrates it at batch 8000 as ours 91.0 against
-external 93.9-97.1 -- i.e. ours runs 3-6 points LOW on this route, the OPPOSITE
-of the ELJ table, because `energy/frac_of_step` is 0.76 here and the step is
-dense MLIP work rather than dispatch-bound. That maps 2560 to external ~64-75.
-OPEN: the offset is measured only at 8000; at 2560 the energy fraction is 0.67,
-so re-run the smi check once these are up.
+With the occupancy constraint unbinding, mk_dev's decided objective is the whole
+answer: "occupancy constraint first, then optimizer-step throughput -- whose
+answer is the CONSTANT batch_size = fused_grad_accum_min_samples", which is 1000.
+Below it `fused_grad_accum_min_samples` accumulates micro-steps to 1000 samples
+anyway, so a smaller batch buys no extra updates and pays more overhead per
+update. The measured ladder agrees it is near the practical floor: step time at
+batch 240 and 385 is IDENTICAL (7.4 s), i.e. a ~7 s fixed per-step cost that
+dominates below ~1000.
 
--------------------------------------------------- WHY PINNED AND NOT SERVO'D
+  batch   step_s   samples/s   steps/s
+   1000     10.7          93     0.093     <- 1.66x the updates of 2560
+   1600     13.7         117     0.073
+   2560     18.9         135     0.053
+   8000     54.6         146     0.018
 
-`batch_util_target` cannot pick between adjacent rungs here. Per-arm occupancy at
-2560 is 60.0 / 65.9 / 60.9 / 69.0 -- so a target of 0.65 holds 2560 on two arms
-and pushes the other two to 3560, and an LR fan split across two batch sizes is
-confounded (batch moves the stable LR). The window that selects 2560 for ALL arms
-is (52.4, 60.0], 7.6 points wide, against 9 points of arm-to-arm spread at a
-single rung. The threshold is narrower than the noise it must discriminate.
+Sample throughput saturates by ~4560 and never improves; optimizer updates fall
+monotonically. `b1500` is retained as the control: the one other size with live
+external data, at a scale the fan also runs, so it confirms the 1.66x in situ and
+is the fallback if 1000 destabilises.
 
-So the batch is a DECISION: base and ceiling equal, target 0 -- the shipping
-"hold the base, no probe" path. `grow_batch_size` stays true so select_batch_size
-still RESTORES the base after an OOM cut; nothing else can move the size.
+--------------------------------------------------- PINNED, AND THE GRID SHIFTED
 
-The two probes exist because the 1600 and 2560 readings above came from 50-step
-ladder dwells mid-climb. A pinned run gives thousands of steps and a real
-out-of-process number at each size. Expect 1500 to land near the measured 1600
-rung (ours ~49 -> external ~53): above the survival bracket, but only ~4 points
-clear of it, on 24 h jobs.
+The batch is a DECISION: base == ceiling, `batch_util_target: 0` (the shipping
+"hold the base, no probe" path). `grow_batch_size` stays true only so
+select_batch_size still RESTORES the base after an OOM cut. A live target cannot
+pick between adjacent rungs anyway -- per-arm occupancy at 2560 measured 60.0 /
+65.9 / 60.9 / 69.0, so a 0.65 target would hold 2560 on two arms and push two to
+3560, and an LR fan split across two batch sizes is confounded.
 
-Both probes run scale 0.5 so the three batch points share a rate. 0.5 sits inside
-the predicted phase-2 optimum (0.55-1.1 of seed) and is the safer central pick:
-a smaller batch is noisier, which LOWERS the stable LR, so the probes are the
-arms most exposed to detonation.
+THE GRID IS SHIFTED DOWN ONE RUNG from the 2560 version (0.25-2.0 -> 0.125-1.0).
+Batch 2560 -> 1000 is 2.6x fewer samples, so gradient noise rises ~1.6x and the
+stable rate falls with it. Carrying the old grid across would repeat
+uma_stab_aug30, whose arms ran 2-8x too hot and improved on nothing.
+
+RUN PREFIX IS `acrb1k_`, NOT `acrb_`. An arm reusing an old name would glob the
+previous wave's `_running.pt` and resume it -- and in fixed mode a mid-cruise
+resume keeps the CHECKPOINTED scale, silently ignoring this config's
+fixed_scale, so the fan would not run the rates it names.
 
 READ `lr_ctrl/scale`, NOT THE ARM NAME. `hot_lr_sensor.action` is 'fire' here,
-matching prod_t100_p2 so this stays comparable with the mip2/neh2 families, and a
-fire both rewinds AND halves the rate permanently (fixed mode never re-races).
-Any arm that fires stops naming its own rate.
+matching prod_t100_p2 for comparability with mip2/neh2, and a fire both rewinds
+AND permanently halves the rate (fixed mode never re-races).
+
+NOT AN EDIT TO prod_t100_p2, deliberately: that make.py writes all 20 of its
+YAMLs and its nehu2 arms have been hand-edited on the cluster, so regenerating
+would silently overwrite them.
 """
 from pathlib import Path
 
@@ -107,16 +107,21 @@ WARM_SRC = 'pt100_acr_lr4p0'
 EXIT_STEP = 9010
 PRIOR = f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt'
 MLIP = '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model'
-FAN_BATCH = 2560
+FAN_BATCH = 1000
 
-#: (name, batch, fixed_scale)
+#: (name, batch, fixed_scale). The grid is shifted DOWN one rung from the 2560
+#: version: batch 2560 -> 1000 is 2.6x fewer samples, so gradient noise rises
+#: ~1.6x and the stable rate falls with it. Carrying 0.25-2.0 across would be
+#: the same mistake uma_stab_aug30 made (arms 2-8x too hot, nothing improved).
 ARMS = [
-    ('lr0p25', FAN_BATCH, 0.25),
-    ('lr0p5',  FAN_BATCH, 0.5),
-    ('lr1p0',  FAN_BATCH, 1.0),
-    ('lr2p0',  FAN_BATCH, 2.0),
-    ('b1500',  1500,      0.5),
-    ('b2000',  2000,      0.5),
+    ('lr0p125', FAN_BATCH, 0.125),
+    ('lr0p25',  FAN_BATCH, 0.25),
+    ('lr0p5',   FAN_BATCH, 0.5),
+    ('lr1p0',   FAN_BATCH, 1.0),
+    # throughput/stability control: the one batch we have live external data
+    # for, at a scale the fan also runs. Confirms the 1.66x in situ and is the
+    # fallback if 1000 destabilises.
+    ('b1500',   1500,      0.5),
 ]
 
 
@@ -129,7 +134,7 @@ def build():
     arms = {}
     for name, batch, scale in ARMS:
         cfg = base()
-        run = f'acrb_{name}'
+        run = f'acrb1k_{name}'
 
         cfg['run_name'] = run
         cfg['tag'] = 'acrb31'
@@ -441,7 +446,16 @@ def main():
     with (HERE / 'INDEX.tsv').open('w', encoding='utf-8', newline='\n') as f:
         f.write('arm\twarm_src\tbatch\tscale\n')
         for (nm, batch, scale) in ARMS:
-            f.write(f'acrb_{nm}\t{WARM_SRC}\t{batch}\t{scale}\n')
+            f.write(f'acrb1k_{nm}\t{WARM_SRC}\t{batch}\t{scale}\n')
+
+    # THE INDEX IS WHAT THE SBATCH RESOLVES `${ARM}.yaml` FROM. A prefix that
+    # drifts from the generated filenames does not fail here -- it fails on
+    # the cluster as "missing config" for every arm (caught 2026-08-31).
+    idx = [l.split('	')[0] for l in
+           (HERE / 'INDEX.tsv').read_text(encoding='utf-8').splitlines()[1:] if l]
+    missing = [a for a in idx if not (HERE / f'{a}.yaml').exists()]
+    assert not missing, f'INDEX names with no matching yaml: {missing}'
+    assert idx == list(arms), f'INDEX order != arm order: {idx} vs {list(arms)}'
 
     with (HERE / 'submit_acr_b_aug31.sbatch').open(
             'w', encoding='utf-8', newline='\n') as f:
@@ -452,7 +466,7 @@ def main():
     print(f'{len(arms)} arms written to {HERE}\n')
     print(f"  {'arm':<16}{'batch':>7}{'scale':>7}")
     for (nm, batch, scale) in ARMS:
-        print(f'  acrb_{nm:<11}{batch:>7}{scale:>7}')
+        print(f'  acrb1k_{nm:<11}{batch:>7}{scale:>7}')
     print(f'\n  all seed <- {WARM_SRC}_*_phase1_exit.pt  (step {EXIT_STEP})')
     print(f'  epochs {EXIT_STEP + PHASE2_STEPS}, array 0-{len(ARMS) - 1}')
 
