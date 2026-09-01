@@ -1,0 +1,4 @@
+SLURM cannot create the --output directory: if joblogs/ is absent the job
+dies at launch, before python, before wandb -- a few-second failure with no run.
+git will not track an empty directory, so a brand-new battery ships without it.
+This file exists only so the directory reaches the cluster with the config.

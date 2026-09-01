@@ -464,7 +464,17 @@ srun singularity exec --nv \\
 
 def main():
     arms = build()
-    (HERE / 'joblogs').mkdir(exist_ok=True)
+    # joblogs must reach the CLUSTER, not just exist locally: SLURM cannot
+    # create the --output directory, so a missing one kills the job at launch
+    # -- before python, before wandb, a few seconds with no run to inspect.
+    # git does not track empty directories, so a brand-new battery ships
+    # without it unless something inside is committed.
+    logs = HERE / 'joblogs'
+    logs.mkdir(exist_ok=True)
+    keep = logs / '.gitkeep'
+    if not keep.exists():
+        keep.write_text('ships this directory to the cluster; see make.py\n',
+                        encoding='utf-8')
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
