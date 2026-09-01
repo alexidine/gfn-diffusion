@@ -121,8 +121,46 @@ def base():
         return yaml.safe_load(f)
 
 
+def committed_energy_kwargs():
+    """Which `energy_config` keys `MolecularCrystal.__init__` accepts IN THE
+    COMMITTED TREE -- i.e. in the code the cluster will actually pull.
+
+    `mk_dev.yaml` is live and tracks whatever the owner is working on, so it
+    carries keys whose consumer may still be an uncommitted edit. Generating
+    from it therefore ships a config the cluster's code cannot construct:
+    train.py does `MolecularCrystal(**energy_config)` and dies with
+    `TypeError: unexpected keyword argument`, at startup, before wandb.
+
+    Returns None (check skipped, loudly) if git is unavailable.
+    """
+    import ast
+    import subprocess
+    for path in ('energy_sampling/energies/molecular_crystal.py',
+                 'energies/molecular_crystal.py'):
+        try:
+            src = subprocess.run(['git', 'show', f'HEAD:{path}'],
+                                 capture_output=True, text=True, check=True,
+                                 cwd=str(CONFIGS.parent)).stdout
+        except Exception:
+            continue
+        if not src.strip():
+            continue
+        for node in ast.walk(ast.parse(src)):
+            if (isinstance(node, ast.ClassDef)
+                    and node.name == 'MolecularCrystal'):
+                for fn in node.body:
+                    if (isinstance(fn, ast.FunctionDef)
+                            and fn.name == '__init__'):
+                        return {a.arg for a in fn.args.args} - {'self'}
+    return None
+
+
 def build():
     arms = {}
+    accepted = committed_energy_kwargs()
+    if accepted is None:
+        print('WARNING: could not read the committed MolecularCrystal signature; '
+              'energy_config keys are UNCHECKED and may not exist on the cluster')
     for ftag, bwd_lo in FLOORS:
         for rtag, scale in RATES:
             cfg = base()
@@ -257,18 +295,45 @@ def build():
                 },
             ]}
 
-            check(cfg, name, scale, bwd_lo)
+            # DROP energy_config keys the COMMITTED code cannot construct.
+            # mk_dev currently ships `prior_flow_path: None` and
+            # `lambda_mix: 1.0` for the prior-flow work, whose consumer in
+            # molecular_crystal.py is still an uncommitted edit -- so the
+            # cluster raises TypeError at init. Both are inert here
+            # (prior_flow_path None = the flow is off), and neither is in
+            # problem_def: mb31 and prod_t100_p2/pt100mipu2 hash IDENTICALLY
+            # to 587e6c with and without them, so dropping cannot orphan the
+            # phase-1 exit this battery resumes from.
+            if accepted is not None:
+                dropped = sorted(set(cfg['energy_config']) - accepted)
+                for k in dropped:
+                    del cfg['energy_config'][k]
+                if dropped and not arms:
+                    print(f'energy_config: dropped {dropped} -- not accepted by '
+                          f'the COMMITTED MolecularCrystal.__init__')
+
+            check(cfg, name, scale, bwd_lo, accepted)
             arms[run] = cfg
     return arms
 
 
-def check(cfg, name, scale, bwd_lo):
+def check(cfg, name, scale, bwd_lo, accepted=None):
     assert cfg['integrator']['T'] == SHIP_T
     assert cfg['eval_T'] == cfg['integrator']['T'], \
         'utils hard-fails on eval_T != integrator.T at load'
     assert cfg['traj_checkpoint'] is True
     assert cfg['energy_config']['internal_oom_recovery'] is True, \
         'UMA sets its own ceiling through the chunk loop; the rollout sets the batch'
+    # EVERY energy_config key must exist in the code the CLUSTER pulls. train.py
+    # does MolecularCrystal(**energy_config), so one key that only the working
+    # tree understands is a TypeError at startup, before wandb -- which is how
+    # this battery died on its first submit (prior_flow_path, from mk_dev).
+    if accepted is not None:
+        unknown = sorted(set(cfg['energy_config']) - accepted)
+        assert not unknown, (
+            f'{name}: energy_config carries {unknown}, which the COMMITTED '
+            f'MolecularCrystal.__init__ does not accept. Commit the code that '
+            f'consumes them, or drop them from the arm.')
     assert cfg['energy_function'] == 'uma' and cfg['mlip_path'] == MLIP
     assert cfg['prior_path'] == PRIOR and cfg['molecules_path'] == PRIOR
     assert cfg['test_molecules_path'] is None

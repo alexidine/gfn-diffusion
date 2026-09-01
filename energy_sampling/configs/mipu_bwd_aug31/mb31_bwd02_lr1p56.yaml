@@ -587,5 +587,3 @@ energy_config:
   lj_coeff: 1.0
   reward_range: 250
   analyze_kwargs: {}
-  prior_flow_path: null
-  lambda_mix: 1.0
