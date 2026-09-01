@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: acrb1k_lr0p125
+run_name: acrb2_b1500
 tag: acrb31
 seed: 12345
 device: cuda
@@ -53,7 +53,7 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.125
+  fixed_scale: 0.5
   verbose: true
   hard_failure:
     loss_excursion_k: 60.0
@@ -120,9 +120,9 @@ model:
   dplr_mask_angular: true
   pb_exact_reversal: true
 buffer_device: cuda
-batch_size: 1000
+batch_size: 1500
 grow_batch_size: true
-max_batch_size: 1000
+max_batch_size: 1500
 eval_num_samples: 2500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
@@ -461,7 +461,7 @@ protocols:
         replay: 0.02
       min_fracs:
         fwd: 0.02
-        bwd: 0.02
+        bwd: 0.25
         replay: 0.02
       deactivate_threshold: 0.01
       loss_coeffs:
@@ -490,7 +490,7 @@ protocols:
           - 0.02
           - 0.93
           bwd:
-          - 0.02
+          - 0.25
           - 0.93
         converge_floor: 1.0
       buffer_servo:

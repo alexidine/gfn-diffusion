@@ -66,6 +66,43 @@ monotonically. `b1500` is retained as the control: the one other size with live
 external data, at a scale the fan also runs, so it confirms the 1.66x in situ and
 is the fallback if 1000 destabilises.
 
+------------------------------------------- THE BWD FLOOR, AND WHY IT IS MANDATORY
+
+`balance.bounds.bwd` is floored at 0.25 (BWD_FLOOR). Without it the ratio
+controller starves the backward branch and the forward policy's spread runs away.
+MEASURED on the acrb1k wave, both live arms, within a few hundred equilibration
+steps:
+
+  Bwd Frac    0.88 -> 0.44 -> 0.06 -> 0.02 -> 0.02 -> 0.02   (its 0.02 floor)
+  Replay                                          -> 0.93
+  fwd/logw_std_within                          778 and 2571
+
+2571 is past the 1270 the pt100p2 arms reached when they detonated. Box violation
+was still small (6.5e-5, 3.2e-4), so this is the spread inflation that PRECEDES
+wall contact, not the wall contact itself.
+
+This reproduces stab_july21c exactly: "nothing anchors spread in buildout because
+Bwd Frac sat at its 0.001 min_frac the whole stage -- bwd owns SPREAD, and spread
+was unowned. Once tails hit the box wall, on-policy feedback accelerates it to
+collapse." Its fix list opens with "raise buildout bwd min_frac to 0.1-0.3", and
+replay_july26's `bwd03_norep` (bwd pinned 0.3) was the best arm in that battery,
+holding EffDim at 5.40 while every other arm collapsed to ~1.26. 0.25 sits in that
+band and matches what uma_stab_aug31 uses.
+
+The controller closes a positive feedback loop on its own: forward spreads ->
+fwd/over_coverage rises -> the ratio controller shifts mass to replay -> bwd
+starves -> spread is unowned -> forward spreads further. The floor is what breaks
+it. Note the ELJ families never needed it -- their Bwd Frac sits at 0.93 untouched
+for the whole stage; this is an MLIP-route pathology.
+
+SEEDED CLEAN, NOT RESUMED, and the prefix moved acrb1k_ -> acrb2_ to force it.
+The acrb1k arms had ~3200 equilibration steps but reached them in the collapsed
+state -- bwd pinned at floor, replay at 0.93, logw_std past detonation level. The
+buildout finding is that a fresh replay buffer ALONE produced total stability,
+i.e. the corrupted buffer is the dominant SUSTAINING term. Resuming would carry
+that buffer forward and the arms would be testing whether the floor RESCUES a
+collapse; seeding fresh tests whether it PREVENTS one, which is the question.
+
 --------------------------------------------------- PINNED, AND THE GRID SHIFTED
 
 The batch is a DECISION: base == ceiling, `batch_util_target: 0` (the shipping
@@ -117,6 +154,9 @@ PRIOR = f'{CLUSTER_DATA}/acridine_sg14_zp1_mace_prior_dataset.pt'
 DROPPED = []
 MLIP = '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model'
 FAN_BATCH = 1000
+#: Floor on the BACKWARD share. Must land on balance.bounds --
+#: min_fracs is INERT under kind: ratio. See the docstring.
+BWD_FLOOR = 0.25
 
 #: (name, batch, fixed_scale). The grid is shifted DOWN one rung from the 2560
 #: version: batch 2560 -> 1000 is 2.6x fewer samples, so gradient noise rises
@@ -180,7 +220,7 @@ def build():
     for name, batch, scale in ARMS:
         cfg = base()
         DROPPED = drop_uncommitted_energy_keys(cfg, ref)
-        run = f'acrb1k_{name}'
+        run = f'acrb2_{name}'
 
         cfg['run_name'] = run
         cfg['tag'] = 'acrb31'
@@ -269,7 +309,7 @@ def build():
                 'on_enter': ['rebuild_prior_by_churn',
                              'bootstrap_z:train_conditioner'],
                 'fracs': {'fwd': 0.05, 'bwd': 0.93, 'replay': 0.02},
-                'min_fracs': {'fwd': 0.02, 'bwd': 0.02, 'replay': 0.02},
+                'min_fracs': {'fwd': 0.02, 'bwd': BWD_FLOOR, 'replay': 0.02},
                 'deactivate_threshold': 0.01,
                 'loss_coeffs': {
                     'fwd': {'tb': 1.0, 'freeze_policy': 1.0},
@@ -282,7 +322,13 @@ def build():
                                 'bwd': 'bwd/relative_under_wcen'},
                     'numerator': 'replay', 'setpoint': 5.0, 'gain': 0.05,
                     'max_step': 0.05,
-                    'bounds': {'replay': [0.02, 0.93], 'bwd': [0.02, 0.93]},
+                    # THE OPERATIVE FLOOR. `_ratio_tick` reads
+                    # _share_interval(bounds) and never calls
+                    # _nudge_mode_fracs, so min_fracs above is inert here and
+                    # matches only so the two cannot read as disagreeing. fwd
+                    # is pinned at 0.05, so this implies a replay ceiling of 0.70.
+                    'bounds': {'replay': [0.02, 0.93],
+                               'bwd': [BWD_FLOOR, 0.93]},
                     'converge_floor': 1.0,
                 },
                 'buffer_servo': {
@@ -337,6 +383,12 @@ def check(cfg, name, batch, scale):
     assert eq['name'] == 'equilibration'
     assert eq.get('exit') is None, 'equilibration is terminal by design'
     assert eq['balance']['pinned']['fwd'] == eq['fracs']['fwd']
+    assert eq['balance']['bounds']['bwd'][0] == BWD_FLOOR, (
+        'the bwd floor MUST land on balance.bounds -- kind: ratio reads '
+        '_share_interval(bounds) and never touches min_fracs')
+    assert eq['min_fracs']['bwd'] == BWD_FLOOR, (
+        'inert under kind: ratio, but it must not read as a different number')
+    assert BWD_FLOOR + eq['fracs']['fwd'] + eq['min_fracs']['replay'] < 1.0
     assert eq['hot_lr_sensor']['channel'] == 'fwd/scatter_err', \
         "sensor bars are PER-STAGE; the stub's bwd/mle bar watches a channel " \
         'this stage does not live on'
@@ -492,7 +544,7 @@ def main():
     with (HERE / 'INDEX.tsv').open('w', encoding='utf-8', newline='\n') as f:
         f.write('arm\twarm_src\tbatch\tscale\n')
         for (nm, batch, scale) in ARMS:
-            f.write(f'acrb1k_{nm}\t{WARM_SRC}\t{batch}\t{scale}\n')
+            f.write(f'acrb2_{nm}\t{WARM_SRC}\t{batch}\t{scale}\n')
 
     # THE INDEX IS WHAT THE SBATCH RESOLVES `${ARM}.yaml` FROM. A prefix that
     # drifts from the generated filenames does not fail here -- it fails on
@@ -512,7 +564,7 @@ def main():
     print(f'{len(arms)} arms written to {HERE}\n')
     print(f"  {'arm':<16}{'batch':>7}{'scale':>7}")
     for (nm, batch, scale) in ARMS:
-        print(f'  acrb1k_{nm:<11}{batch:>7}{scale:>7}')
+        print(f'  acrb2_{nm:<11}{batch:>7}{scale:>7}')
     print(f'\n  all seed <- {WARM_SRC}_*_phase1_exit.pt  (step {EXIT_STEP})')
     print(f'  epochs {EXIT_STEP + PHASE2_STEPS}, array 0-{len(ARMS) - 1}')
 
