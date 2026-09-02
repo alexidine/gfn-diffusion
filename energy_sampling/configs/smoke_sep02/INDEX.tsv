@@ -1,0 +1,5 @@
+arm	warm_src	scale	base
+smk_mip	pt100_mip_lr4p0	1.0	prod_t100_p2/pt100mip2_lr1p0.yaml
+smk_mipu	pt100_mipu_lr4p0	0.0625	mipu_bwd_aug31/mb31_bwd25_lr1p56.yaml
+smk_nehu	pt100_nehu_lr4p0	0.5	uma_stab_aug30/us30_b_lr0p5.yaml
+smk_acr	pt100_acr_lr4p0	0.025	acr_c_aug31/acrb3_b50_lr0p025.yaml
