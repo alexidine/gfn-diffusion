@@ -1,0 +1,611 @@
+{
+  "results": [
+    {
+      "arm": "mp",
+      "seed": 0,
+      "steps": 3000,
+      "encoding": "none",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8718116283416748,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.8290519587634171,
+        "formula": 0.8597645974674659,
+        "degree_hist": 0.8980565836249956,
+        "cycle_rank": 0.9749677650319521,
+        "spectral_moments": 0.8182567718152282,
+        "ring_member": 1.0,
+        "smallest_ring": 0.969470383893766,
+        "eccentricity": 0.6282342112372563,
+        "spd_to_root": 0.24085714461492935,
+        "diameter": 0.7994337345099074,
+        "wiener": 0.7546922591409417,
+        "orbit_size": 0.45686567119219545
+      }
+    },
+    {
+      "arm": "mp",
+      "seed": 1,
+      "steps": 3000,
+      "encoding": "none",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8765126466751099,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.7128028241306333,
+        "formula": 0.7954976774337602,
+        "degree_hist": 0.8070834392771161,
+        "cycle_rank": 0.9088727433620023,
+        "spectral_moments": 0.7183340471813651,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9725587717715212,
+        "eccentricity": 0.51267420734739,
+        "spd_to_root": 0.2181195161120898,
+        "diameter": 0.6406505535961577,
+        "wiener": 0.5830109579283246,
+        "orbit_size": 0.1389075762720392
+      }
+    },
+    {
+      "arm": "mp",
+      "seed": 2,
+      "steps": 3000,
+      "encoding": "none",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8778044581413269,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.7431976485703444,
+        "formula": 0.845973553981793,
+        "degree_hist": 0.8325134738952563,
+        "cycle_rank": 0.9636706165436275,
+        "spectral_moments": 0.6724419120652647,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9869775349114804,
+        "eccentricity": 0.5519263655374826,
+        "spd_to_root": 0.24513223650149463,
+        "diameter": 0.695217759688185,
+        "wiener": 0.5342768652762875,
+        "orbit_size": 0.42348095733858326
+      }
+    },
+    {
+      "arm": "mp+rwse",
+      "seed": 0,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.866581380367279,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.8470567756008279,
+        "formula": 0.881996681391848,
+        "degree_hist": 0.8923339541553076,
+        "cycle_rank": 0.9721765320517705,
+        "spectral_moments": 0.8170877892909371,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9911934065010809,
+        "eccentricity": 0.5921720197842645,
+        "spd_to_root": 0.23884588469954093,
+        "diameter": 0.7794409129895721,
+        "wiener": 0.7089450376618827,
+        "orbit_size": 0.38842759744112554
+      }
+    },
+    {
+      "arm": "mp+rwse",
+      "seed": 1,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8706355690956116,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.847571416775868,
+        "formula": 0.9101037177779688,
+        "degree_hist": 0.8972603207613953,
+        "cycle_rank": 0.9683808659529995,
+        "spectral_moments": 0.8749552500140514,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9753153658191371,
+        "eccentricity": 0.6340584794759203,
+        "spd_to_root": 0.2605236323208222,
+        "diameter": 0.7814698257037525,
+        "wiener": 0.7990098021603528,
+        "orbit_size": 0.3142703862978574
+      }
+    },
+    {
+      "arm": "mp+rwse",
+      "seed": 2,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8703318238258362,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.6999438839743393,
+        "formula": 0.8359845328231824,
+        "degree_hist": 0.8238782952927377,
+        "cycle_rank": 0.9601429129216213,
+        "spectral_moments": 0.6725719610899683,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9755785811218771,
+        "eccentricity": 0.4698486909473134,
+        "spd_to_root": 0.21314994058420156,
+        "diameter": 0.597464926159677,
+        "wiener": 0.6355291588784658,
+        "orbit_size": 0.3496291316033697
+      }
+    },
+    {
+      "arm": "mp+lap",
+      "seed": 0,
+      "steps": 3000,
+      "encoding": "lap",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8586498498916626,
+      "determinism_gate": false,
+      "scores": {
+        "n_atoms": 0.7926696320586092,
+        "formula": 0.8780848131375159,
+        "degree_hist": 0.881228878825934,
+        "cycle_rank": 0.9413171908679218,
+        "spectral_moments": 0.8152838567655548,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9590013767602992,
+        "eccentricity": 0.5900532148703848,
+        "spd_to_root": 0.2257278909900391,
+        "diameter": 0.7111992108534226,
+        "wiener": 0.6841772759526737,
+        "orbit_size": 0.5473047232252377
+      }
+    },
+    {
+      "arm": "mp+lap",
+      "seed": 1,
+      "steps": 3000,
+      "encoding": "lap",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8587538599967957,
+      "determinism_gate": false,
+      "scores": {
+        "n_atoms": 0.8436231281537705,
+        "formula": 0.8734672921951192,
+        "degree_hist": 0.9047826585869966,
+        "cycle_rank": 0.925533403064579,
+        "spectral_moments": 0.8101280146537776,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9734649121789508,
+        "eccentricity": 0.642397774415099,
+        "spd_to_root": 0.2664450049831081,
+        "diameter": 0.7731056656873262,
+        "wiener": 0.7036809673218818,
+        "orbit_size": 0.4619895903866027
+      }
+    },
+    {
+      "arm": "mp+lap",
+      "seed": 2,
+      "steps": 3000,
+      "encoding": "lap",
+      "attention": false,
+      "hidden": 68,
+      "layers": 4,
+      "n_params": 212327,
+      "train_loss": 0.8557270169258118,
+      "determinism_gate": false,
+      "scores": {
+        "n_atoms": 0.8426294596660937,
+        "formula": 0.8690369720155555,
+        "degree_hist": 0.8633376626893466,
+        "cycle_rank": 0.9086484313502375,
+        "spectral_moments": 0.8094899577412665,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9783763595982987,
+        "eccentricity": 0.5024713627892685,
+        "spd_to_root": 0.21938078368106506,
+        "diameter": 0.6694192238921957,
+        "wiener": 0.681440390702164,
+        "orbit_size": 0.5306884260658888
+      }
+    },
+    {
+      "arm": "mp+rwse+attn",
+      "seed": 0,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": true,
+      "hidden": 64,
+      "layers": 4,
+      "n_params": 222011,
+      "train_loss": 0.32502973079681396,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.8166697392823816,
+        "formula": 0.8914383114151943,
+        "degree_hist": 0.8898092791854001,
+        "cycle_rank": 0.991181367900682,
+        "spectral_moments": 0.798319655000876,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9949578042362142,
+        "eccentricity": 0.8053213654965871,
+        "spd_to_root": 0.4978017703181602,
+        "diameter": 0.8320537229956446,
+        "wiener": 0.6628605566400169,
+        "orbit_size": 0.9475136481690964
+      }
+    },
+    {
+      "arm": "mp+rwse+attn",
+      "seed": 1,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": true,
+      "hidden": 64,
+      "layers": 4,
+      "n_params": 222011,
+      "train_loss": 0.3263513445854187,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.5672725901725905,
+        "formula": 0.6773559258491126,
+        "degree_hist": 0.7559402763531817,
+        "cycle_rank": 0.8739741031817261,
+        "spectral_moments": 0.5535762923136601,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9846644391728321,
+        "eccentricity": 0.7390785265615448,
+        "spd_to_root": 0.48395089536066227,
+        "diameter": 0.7522875141466397,
+        "wiener": 0.4611716896053848,
+        "orbit_size": 0.8468871053031459
+      }
+    },
+    {
+      "arm": "mp+rwse+attn",
+      "seed": 2,
+      "steps": 3000,
+      "encoding": "rwse",
+      "attention": true,
+      "hidden": 64,
+      "layers": 4,
+      "n_params": 222011,
+      "train_loss": 0.33039581775665283,
+      "determinism_gate": true,
+      "scores": {
+        "n_atoms": 0.5796420318055754,
+        "formula": 0.7538771557472466,
+        "degree_hist": 0.7973343393521123,
+        "cycle_rank": 0.8858403774366312,
+        "spectral_moments": 0.6092860305391552,
+        "ring_member": 1.0,
+        "smallest_ring": 0.9384062521755854,
+        "eccentricity": 0.8048549282199714,
+        "spd_to_root": 0.46900734353850737,
+        "diameter": 0.7848363558786963,
+        "wiener": 0.3971446556108382,
+        "orbit_size": 0.697931291291856
+      }
+    }
+  ],
+  "aggregate": {
+    "mp": {
+      "scores": {
+        "n_atoms": [
+          0.7616841438214649,
+          0.05812456731639187
+        ],
+        "formula": [
+          0.8337452762943398,
+          0.032133460016852855
+        ],
+        "degree_hist": [
+          0.8458844989324561,
+          0.045486572173939754
+        ],
+        "cycle_rank": [
+          0.949170374979194,
+          0.033047510834974925
+        ],
+        "spectral_moments": [
+          0.7363442436872859,
+          0.07290742987498172
+        ],
+        "ring_member": [
+          1.0,
+          0.0
+        ],
+        "smallest_ring": [
+          0.9763355635255891,
+          0.008753575508857192
+        ],
+        "eccentricity": [
+          0.564278261374043,
+          0.05778000194493316
+        ],
+        "spd_to_root": [
+          0.23470296574283792,
+          0.013506360194702416
+        ],
+        "diameter": [
+          0.71176734926475,
+          0.07939159045687483
+        ],
+        "wiener": [
+          0.6239933607818513,
+          0.11020769693232713
+        ],
+        "orbit_size": [
+          0.3397514016009393,
+          0.15897904746007813
+        ]
+      },
+      "meta": {
+        "encoding": "none",
+        "attention": false,
+        "hidden": 68,
+        "n_params": 212327,
+        "determinism": true
+      }
+    },
+    "mp+rwse": {
+      "scores": {
+        "n_atoms": [
+          0.7981906921170117,
+          0.07381376640076437
+        ],
+        "formula": [
+          0.8760283106643331,
+          0.03705959247739321
+        ],
+        "degree_hist": [
+          0.8711575234031468,
+          0.03669101273432879
+        ],
+        "cycle_rank": [
+          0.9669001036421304,
+          0.0060168095650745546
+        ],
+        "spectral_moments": [
+          0.7882050001316522,
+          0.10119164446204154
+        ],
+        "ring_member": [
+          1.0,
+          0.0
+        ],
+        "smallest_ring": [
+          0.9806957844806984,
+          0.00793902034097188
+        ],
+        "eccentricity": [
+          0.5653597300691661,
+          0.08210489426430345
+        ],
+        "spd_to_root": [
+          0.23750648586818823,
+          0.023686845868310324
+        ],
+        "diameter": [
+          0.7194585549510005,
+          0.09200244977203775
+        ],
+        "wiener": [
+          0.7144946662335672,
+          0.08174032164094347
+        ],
+        "orbit_size": [
+          0.35077570511411754,
+          0.03707860557163406
+        ]
+      },
+      "meta": {
+        "encoding": "rwse",
+        "attention": false,
+        "hidden": 68,
+        "n_params": 212327,
+        "determinism": true
+      }
+    },
+    "mp+lap": {
+      "scores": {
+        "n_atoms": [
+          0.8263074066261579,
+          0.025476748047580655
+        ],
+        "formula": [
+          0.8735296924493969,
+          0.004523920560980166
+        ],
+        "degree_hist": [
+          0.8831164000340924,
+          0.02072249794882497
+        ],
+        "cycle_rank": [
+          0.9251663417609128,
+          0.01633437975884211
+        ],
+        "spectral_moments": [
+          0.811633943053533,
+          0.0028969495121441424
+        ],
+        "ring_member": [
+          1.0,
+          0.0
+        ],
+        "smallest_ring": [
+          0.9702808828458496,
+          0.009687491418999772
+        ],
+        "eccentricity": [
+          0.5783074506915841,
+          0.06996320581291526
+        ],
+        "spd_to_root": [
+          0.2371845598847374,
+          0.02353211065102151
+        ],
+        "diameter": [
+          0.7179080334776481,
+          0.05184322089756527
+        ],
+        "wiener": [
+          0.6897662113255733,
+          0.011120288309858894
+        ],
+        "orbit_size": [
+          0.5133275798925764,
+          0.042657566419317505
+        ]
+      },
+      "meta": {
+        "encoding": "lap",
+        "attention": false,
+        "hidden": 68,
+        "n_params": 212327,
+        "determinism": false
+      }
+    },
+    "mp+rwse+attn": {
+      "scores": {
+        "n_atoms": [
+          0.6545281204201824,
+          0.12469857455489558
+        ],
+        "formula": [
+          0.7742237976705179,
+          0.1070411927830408
+        ],
+        "degree_hist": [
+          0.8143612982968981,
+          0.06693450141610918
+        ],
+        "cycle_rank": [
+          0.9169986161730131,
+          0.058603632359477964
+        ],
+        "spectral_moments": [
+          0.6537273259512304,
+          0.12237168134360793
+        ],
+        "ring_member": [
+          1.0,
+          0.0
+        ],
+        "smallest_ring": [
+          0.9726761651948772,
+          0.028275776030314392
+        ],
+        "eccentricity": [
+          0.7830849400927011,
+          0.03312141946752112
+        ],
+        "spd_to_root": [
+          0.48358666973910996,
+          0.014397213389826413
+        ],
+        "diameter": [
+          0.7897258643403268,
+          0.039883104424502436
+        ],
+        "wiener": [
+          0.5070589672854132,
+          0.13285795051458932
+        ],
+        "orbit_size": [
+          0.8307773482546995,
+          0.1247911784386202
+        ]
+      },
+      "meta": {
+        "encoding": "rwse",
+        "attention": true,
+        "hidden": 64,
+        "n_params": 222011,
+        "determinism": true
+      }
+    }
+  },
+  "size_only": {
+    "n_atoms": 1.0,
+    "formula": 0.4445657302628193,
+    "degree_hist": 0.4784646819210535,
+    "cycle_rank": -0.6084550849689137,
+    "spectral_moments": 0.9772195567267719,
+    "smallest_ring": -0.0837062766489245,
+    "eccentricity": 0.5511543004471822,
+    "spd_to_root": 0.20262117354993714,
+    "diameter": 0.6627200447838053,
+    "wiener": 0.8665001963606439,
+    "orbit_size": 0.030035097673493993
+  },
+  "orbit_ceiling": 0.4782608695652174,
+  "meta": {
+    "steps": 3000,
+    "seeds": 3,
+    "k": 16,
+    "matched": true,
+    "n_train": 21,
+    "n_test": 5
+  },
+  "molecules": [
+    "CCO",
+    "CCCC",
+    "CCCCCC",
+    "CCCCCCCC",
+    "CCCCCCCCCC",
+    "OCCCCO",
+    "OCCCCCCCCCCO",
+    "CC(C)C",
+    "CC(C)(C)C",
+    "CC(C)CC(C)C",
+    "c1ccccc1",
+    "Cc1ccccc1",
+    "c1ccc2ccccc2c1",
+    "C1CCCCC1",
+    "C1CCCC1",
+    "C1CCCCCC1",
+    "C1CCC(CO1)c1ccccc1",
+    "CC(=O)NC",
+    "NCC(=O)NCC(=O)O",
+    "NCC(=O)NCC(=O)NCC(=O)O",
+    "NCC(=O)NCC(=O)NCC(=O)NCC(=O)O",
+    "C[C@H](N)C(=O)O",
+    "C[C@@H](N)C(=O)O",
+    "OCC(O)CO",
+    "CC(C)Cc1ccc(cc1)C(C)C(=O)O",
+    "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"
+  ],
+  "holdout": [
+    "NCC(=O)NCC(=O)NCC(=O)NCC(=O)O",
+    "c1ccc2ccccc2c1",
+    "CC(C)CC(C)C",
+    "OCCCCCCCCCCO",
+    "CCO"
+  ]
+}

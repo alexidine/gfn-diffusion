@@ -619,8 +619,41 @@ class GFN(nn.Module):  # todo add seeding
         d, V = self.get_dplr_cov(logvar, rho_logit, u_raw)
         return pf_mean, logvar, d, V
 
-    def predict_next_state(self, s_emb, t_emb):
-        s_new = self.forward_policy(s_emb, t_emb)
+    def predict_next_state(self, s_emb, t_emb, state=None):
+        """Run the forward policy. ``state`` is the RAW pre-expansion latent [B, dim].
+
+        The flat ``PolicyModel`` consumes the ENCODED state ``s_emb`` and never looks at
+        ``state``, which is why the argument is optional and why every existing caller is
+        unchanged -- including the two in ``tests/crystal/test_dead_latent_rows.py`` that
+        call this positionally with two arguments.
+
+        A SET policy over per-coordinate tokens cannot use ``s_emb``: ``StateEncoding``
+        has already mixed the coordinates, so the per-token structure it needs is gone by
+        the time this is called. Such a policy declares ``wants_raw_state`` and receives
+        ``state`` instead. Duck-typed on the attribute rather than on a GFN flag so that
+        nothing about the crystal construction path changes.
+        """
+        if getattr(self.forward_policy, 'wants_raw_state', False):
+            if state is None:
+                raise ValueError(
+                    'forward_policy declares wants_raw_state but predict_next_state was '
+                    'called without `state`. s_emb cannot substitute -- the per-coordinate '
+                    'structure a set policy tokenises is gone once StateEncoding has run.')
+            if self.dplr_rank > 0:
+                # NOT a capability gap dressed as an error: the layouts genuinely disagree.
+                # SetPolicy._to_blocks emits K contiguous blocks of width dim, so the
+                # low-rank segment is rank-major; split_params does .view(-1, dim, rank),
+                # which reads it dim-major. The result is a silent transpose of u_raw --
+                # finite, plausible, and wrong. Refuse until the policy emits DPLR order.
+                raise NotImplementedError(
+                    f'forward_policy wants the raw state but dplr_rank is '
+                    f'{self.dplr_rank}; a set policy emits the low-rank factor as '
+                    f'rank-major blocks while split_params views it as [dim, rank], so '
+                    f'u_raw would be silently transposed. Set dplr_rank: 0 for this run, '
+                    f'or teach the policy the DPLR block order first.')
+            s_new = self.forward_policy(state, t_emb)
+        else:
+            s_new = self.forward_policy(s_emb, t_emb)
 
         if self.clipping:
             s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
@@ -643,7 +676,7 @@ class GFN(nn.Module):  # todo add seeding
         expanded_state = self.expand_state_for_policy(state)
         s_emb = self.s_model(expanded_state, condition_embedding)
         t_emb = self.t_model(t)
-        state_update = self.predict_next_state(s_emb, t_emb)
+        state_update = self.predict_next_state(s_emb, t_emb, state)
         pf_mean, logvar, d, V = self.eval_forward_head(
             state_update, self.var_log_rate(t, t_next, dts))
         return pf_mean, logvar, d, V, s_emb, t_emb

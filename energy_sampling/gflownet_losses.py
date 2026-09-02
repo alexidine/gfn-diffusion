@@ -254,6 +254,20 @@ def get_gfn_forward_loss(loss_coeffs,
         log_Z_learned=log_Z_learned, mode_level_stream='fwd')
     update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor)
 
+    # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
+    # branches' log-weights in one scope. Stashed on the model rather than
+    # returned because loss_dict is built only under report_losses and its
+    # copies are detached; consumed and CLEARED by fused_train_step each step,
+    # so a stale pair can never be read (pooled_condition_vargrad).
+    # OFF unless the cross-branch term is actually armed -- see the gate in
+    # init_train_constants. These tensors carry grad_fn and the model is an
+    # nn.Module, so while they are parked here anything that walks the module
+    # (deepcopy, in particular _snapshot_prior) hits a non-leaf tensor and
+    # raises. Not worth carrying that on every run for a term that is off.
+    if getattr(gfn, '_stash_live_branches', False):
+        gfn._live_fwd = {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
+                         'condition_id': condition_id}
+
     losses = []
     """VarGrad losses + empirical-Z regression"""
     vg_by_condition = getattr(loss_coeffs, 'vg_by_condition', 0) > 0.5
@@ -358,7 +372,13 @@ def get_gfn_forward_loss(loss_coeffs,
         z_lvl = z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id)
         losses.append(z_lvl.expand(log_pf.shape[0]) * z_level_coeff)
 
-    combined_losses = combine_branch_terms(losses, loss_coeffs.loss_clip)
+    # A branch may legitimately carry NO terms of its own -- e.g. under a
+    # cross-branch pooled objective, where the branch exists only to supply
+    # rows and every within-branch coefficient is 0. torch.stack cannot
+    # reduce an empty list, so hand back an explicit zero row-vector rather
+    # than requiring a token term nobody wants in the loss.
+    combined_losses = (combine_branch_terms(losses, loss_coeffs.loss_clip)
+                       if losses else torch.zeros_like(log_pf))
 
     # No finiteness assert here (there never was one on the backward path, and
     # the asymmetry meant forward NaNs crashed the process while backward NaNs
@@ -375,6 +395,14 @@ def get_gfn_forward_loss(loss_coeffs,
                      'log_Z': log_Z_learned.detach(),
                      'log_r': log_r.detach(),
                      'flow_states': states.detach()}
+        # log w = log_r + log_pb - log_pf, logged component-wise so the fwd/bwd
+        # LEVEL GAP can be attributed. Without the split, a gap that closes
+        # because log_pb moved (the P_B trajectory-KL channel, which moves no
+        # terminal mass) is indistinguishable from one that closes because
+        # log_pf moved on the buffer, which is the only channel that does.
+        loss_dict['logr_mean'] = log_r.detach().mean()
+        loss_dict['logpb_mean'] = log_pb.detach().mean()
+        loss_dict['logpf_mean'] = log_pf.detach().mean()
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
             loss_dict.update(condition_group_stats(condition_id))
@@ -475,6 +503,20 @@ def get_gfn_backward_loss(loss_coeffs,
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
         do_update=update_log_z, mode_level_stream=mode_level_stream)
 
+    # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
+    # branches' log-weights in one scope. Stashed on the model rather than
+    # returned because loss_dict is built only under report_losses and its
+    # copies are detached; consumed and CLEARED by fused_train_step each step,
+    # so a stale pair can never be read (pooled_condition_vargrad).
+    # Same gate as the forward site, and it MUST be the same flag rather than a
+    # local read of this branch's coefficients: `pooled_vg` lives on
+    # fwd_loss_coeffs and arms BOTH branches, so a backward-local test would
+    # read 0 on a pooled-only arm and silently leave the term half-fed. That
+    # exact omission has shipped twice (see _runs_grouped_vargrad).
+    if getattr(gfn, '_stash_live_branches', False):
+        gfn._live_bwd = {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
+                         'condition_id': condition_id}
+
     losses = []
     """VarGrad losses"""
     vg_by_condition = getattr(loss_coeffs, 'vg_by_condition', 0) > 0.5
@@ -558,7 +600,19 @@ def get_gfn_backward_loss(loss_coeffs,
         gap, gap_mask = condition_log_z.lookup_delta(condition_id)
         gap = gap.to(gfn.device).clamp(-level_gap_clamp, level_gap_clamp) \
               * gap_mask.to(gfn.device).float()
-        level_gap_loss = gap * (log_r + log_pb - log_pf)
+        # PF-ONLY (default). The term multiplies -log_pf alone, which makes it a
+        # gap-weighted ELBO on the buffer's terminals: maximising it raises
+        # E_q[log p_F(x)], the terminal-MASS component of the gap, with slack
+        # E_q KL(P_B||P_F|x). Dropping the other two factors costs no expected
+        # force -- log_r carries no gradient at all here (buffer terminals are
+        # stored, not sampled), and the explicit log_pb factor is a score under
+        # tau ~ P_B weighted by a DETACHED per-condition gap, so its expectation
+        # is exactly zero -- while removing their variance. NB it does not make
+        # the term P_F-only in the parameters: with traj_grads 1 the sampled tau
+        # is reparameterised, so P_B still reaches this term through log_pf(tau).
+        # Set 0 to recover the whole log w.
+        pf_only = getattr(loss_coeffs, 'level_gap_pf_only', 1.0) > 0.5
+        level_gap_loss = gap * (-log_pf if pf_only else (log_r + log_pb - log_pf))
         losses.append(level_gap_loss * level_gap_coeff)
     else:
         level_gap_loss = None
@@ -617,7 +671,13 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         tbc_loss = None
 
-    combined_losses = combine_branch_terms(losses, loss_coeffs.loss_clip)
+    # A branch may legitimately carry NO terms of its own -- e.g. under a
+    # cross-branch pooled objective, where the branch exists only to supply
+    # rows and every within-branch coefficient is 0. torch.stack cannot
+    # reduce an empty list, so hand back an explicit zero row-vector rather
+    # than requiring a token term nobody wants in the loss.
+    combined_losses = (combine_branch_terms(losses, loss_coeffs.loss_clip)
+                       if losses else torch.zeros_like(log_pf))
 
     if sample_weights is None:
         loss = combined_losses.mean()
@@ -650,6 +710,12 @@ def get_gfn_backward_loss(loss_coeffs,
                      'log_Z': log_Z_learned.detach(), 'log_r': log_r.detach(),
                      'flow_states': states.detach(),
                      'resid': ((log_pf - log_pb) - (log_r - log_Z_learned)).detach()}
+        # component split of log w -- see the note on the forward branch. The
+        # backward means are the load-bearing pair: bwd logpb_mean rising while
+        # logpf_mean holds is the P_B-widening degenerate route.
+        loss_dict['logr_mean'] = log_r.detach().mean()
+        loss_dict['logpb_mean'] = log_pb.detach().mean()
+        loss_dict['logpf_mean'] = log_pf.detach().mean()
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
             loss_dict.update(condition_group_stats(condition_id))
@@ -1035,6 +1101,182 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
     return {'vg_n_groups': per_row.new_tensor(float(uniq.numel())),
             'vg_group_size_mean': per_row.mean().detach(),
             'vg_live_frac': (per_row >= min_group_count).float().mean().detach()}
+
+
+def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
+                             min_group_count: int = 2, ratio=None,
+                             bridge_only: bool = False):
+    """
+    CROSS-BRANCH VarGrad: one per-condition group spanning BOTH the forward
+    rollouts and the backward/buffer draws.
+
+    WHY IT EXISTS. Each branch's own condition-grouped term centres on its own
+    rows, so a uniform shift of log w across one branch's support is exactly a
+    flat direction of that term and the fwd/bwd LEVEL OFFSET goes unpenalised.
+    Every level term that acts on the backward branch alone is then a pure LIFT
+    with no negative half, and the policy satisfies a lift by raising log P_F
+    everywhere -- measured 2026-08-28 across four gains: bwd and fwd logpf_mean
+    climb in lockstep and the differential settles at zero, while the gap grows.
+    Pooling supplies the negative half STRUCTURALLY: the per-row coefficients
+    psi_bar - psi(d_j) sum to EXACTLY zero over the pooled group, so every nat
+    raised on a buffer row is paid for by the forward rows. A mass TRANSFER, not
+    a lift.
+
+    BETA IS ITS OWN KNEE and must not inherit a branch's. With buffer row
+    fraction lambda_b and gap Delta, forward rows sit lambda_b*Delta from the
+    pooled centre and buffer rows (1-lambda_b)*Delta the other side. Keeping the
+    forward SHAPE signal needs beta >~ lambda_b*Delta; leaving buffer rows
+    saturated needs beta << (1-lambda_b)*Delta -- and saturated is what we want
+    for them, because they are here to supply a constant raise, not shape (their
+    own branch term already carries their shape). At the measured Delta ~ 63 and
+    lambda_b ~ 1/3 the usable window is roughly 21 < beta < 42.
+
+    Returns (loss_rows, stats). `pooled_mixed_frac` is the load-bearing health
+    check: a condition present in only one branch's batch forms a single-source
+    group, where this term degenerates to that branch's own and its whole point
+    is silently absent. Without aligned draws that fraction is ~0.19.
+    """
+    need = ('log_r', 'log_pb', 'log_pf', 'condition_id')
+    if not live_fwd or not live_bwd:
+        return None, {}
+    if any(live_fwd.get(k) is None or live_bwd.get(k) is None for k in need):
+        return None, {}
+
+    dev = live_fwd['log_pf'].device
+
+    # ADMIXTURE. lambda_b is set here rather than left to fall out of the two
+    # batch sizes, because it is the knob the design turns on and the batch
+    # sizes are chosen for other reasons entirely. Whichever side is
+    # over-represented for the target is subsampled (rows, not weights -- the
+    # weighted spelling preserves the same zero-sum property but needs a
+    # weighted centre, which is a change to a shared estimator).
+    n_f_all = live_fwd['log_pf'].shape[0]
+    n_b_all = live_bwd['log_pf'].shape[0]
+
+    # BRIDGE-ONLY DRAW. Uniform row subsampling is what strands the buffer rows:
+    # a kept row whose condition is absent from the forward batch forms a
+    # SINGLE-SOURCE group, where this term degenerates to the backward branch's
+    # own and contributes no bridge. The signature is mixed_frac <= lambda_b,
+    # which is impossible when every buffer row pairs (measured 0.042 at
+    # lambda_b=0.05, 0.128 at 0.15). Restricting the draw to rows the forward
+    # batch can actually pair with makes lambda_b buy bridge instead of dilution.
+    # `pooled_pairable_frac` reports the ceiling: buffer rows are only pairable
+    # where the buffer HOLDS the forward batch's conditions, which the aligned
+    # draw can order first but cannot conjure.
+    fc_u = torch.unique(live_fwd['condition_id'].to(dev).ravel())
+    pairable = torch.isin(live_bwd['condition_id'].to(dev).ravel(), fc_u)
+    n_pairable = int(pairable.sum())
+    cand_b = (torch.nonzero(pairable, as_tuple=False).ravel()
+              if (bridge_only and n_pairable > 0)
+              else torch.arange(n_b_all, device=dev))
+    n_b_pool = cand_b.numel()
+
+    keep_f, keep_b = None, None
+    if bridge_only:
+        keep_b = cand_b
+    if ratio is not None and 0.0 < ratio < 1.0:
+        # want n_b / (n_f + n_b) == ratio, keeping as many rows as possible
+        want_b = int(round(n_f_all * ratio / (1.0 - ratio)))
+        if want_b <= n_b_pool:
+            keep_b = cand_b[torch.randperm(n_b_pool, device=dev)[:max(want_b, 1)]]
+        else:
+            # not enough admissible buffer rows for the target: take them all and
+            # thin the forward side instead, so the RATIO is honoured rather than
+            # silently under-delivered. Achieved value is logged as
+            # `pooled_lambda_b` -- read it, do not assume the request was met.
+            keep_b = cand_b
+            want_f = int(round(n_b_pool * (1.0 - ratio) / ratio))
+            if want_f < n_f_all:
+                keep_f = torch.randperm(n_f_all, device=dev)[:max(want_f, 1)]
+
+    def take(d, idx):
+        return {k: (v if idx is None else v[idx]) for k, v in d.items()}
+    lf, lb = take(live_fwd, keep_f), take(live_bwd, keep_b)
+
+    cat = lambda k: torch.cat([lf[k].to(dev), lb[k].to(dev)])
+    log_r, log_pb, log_pf, cid = (cat(k) for k in need)
+    n_f = lf['log_pf'].shape[0]
+
+    _, _, vg = condition_grouped_empirical_z(
+        log_pb, log_pf, log_r, cid, lme=False, beta=beta,
+        min_group_count=min_group_count, detach_center=False)
+
+    counts_all = None  # set below
+    is_bwd = torch.zeros(cid.shape[0], dtype=torch.float32, device=dev)
+    is_bwd[n_f:] = 1.0
+    uniq, inv = torch.unique(cid, return_inverse=True)
+    k = uniq.numel()
+    nb = torch.zeros(k, device=dev).scatter_add_(0, inv, is_bwd)
+    nf = torch.zeros(k, device=dev).scatter_add_(0, inv, 1.0 - is_bwd)
+    counts_all = nf + nb
+    mixed = ((nb > 0) & (nf > 0)).float()[inv]
+
+    # DECOMPOSITION. By the law of total variance the pooled objective is
+    #     Var_pool = (1-lam_b) V_f + lam_b V_b + lam_b(1-lam_b) Delta^2
+    # and only the third term is new -- the first two duplicate what the branch
+    # VarGrad terms compute. Reported separately because the branch `vg_lb`
+    # readouts are coefficient-gated and therefore VANISH the moment those terms
+    # are switched off, which is exactly when the pooled term is carrying the
+    # load.
+    #
+    # ⚠ UNITS AND SCOPE, because the obvious misreading is expensive. All three
+    # components are MEAN SQUARES in nats^2 and `pooled_bridge_frac` is their
+    # dimensionless ratio, so this is an exact law-of-total-variance split of the
+    # pooled group's SPREAD -- a property of the distribution. It is NOT the
+    # bridge's share of the LOSS, and must not be read as one: the loss is
+    # `beta * smooth_l1(center, u, beta=beta)`, which equals the quadratic only
+    # INSIDE the knee and saturates the influence weight at +-beta outside it.
+    # The two agree while |u - center| << beta and come apart as the fwd/bwd gap
+    # approaches beta -- measured 2026-08-28, this ratio read a CONSTANT 0.1371
+    # across three betas while the true loss share moved, which is the signature:
+    # a statistic computed without the huber cannot respond to beta at all.
+    # At the 2026-08-31 operating point (gap ~1.3 against pooled_beta 40) every
+    # row is far inside the knee, so the split is faithful; it stops being so if
+    # beta is left fixed while lambda_mix advances and the gap grows.
+    # A loss-share readout would be a SEPARATE key computed on psi_beta(d), not a
+    # correction to this one -- they answer different questions.
+    with torch.no_grad():
+        u = log_ratio_detached = (log_r + log_pb - log_pf).detach()
+        gsum = torch.zeros(k, device=dev).scatter_add_(0, inv, u)
+        gmean = gsum / counts_all.clamp(min=1)
+        fsum = torch.zeros(k, device=dev).scatter_add_(0, inv, u * (1 - is_bwd))
+        bsum = torch.zeros(k, device=dev).scatter_add_(0, inv, u * is_bwd)
+        fmean = fsum / nf.clamp(min=1)
+        bmean = bsum / nb.clamp(min=1)
+        both = (nb > 0) & (nf > 0)
+        # within: mean squared deviation from each source's OWN group mean
+        wf = torch.zeros(k, device=dev).scatter_add_(
+            0, inv, ((u - fmean[inv]) ** 2) * (1 - is_bwd)) / nf.clamp(min=1)
+        wb = torch.zeros(k, device=dev).scatter_add_(
+            0, inv, ((u - bmean[inv]) ** 2) * is_bwd) / nb.clamp(min=1)
+        lam = (nb / counts_all.clamp(min=1))
+        bridge = lam * (1 - lam) * (fmean - bmean) ** 2
+        m = both.float()
+        denom = m.sum().clamp(min=1)
+        within_f = ((1 - lam) * wf * m).sum() / denom
+        within_b = (lam * wb * m).sum() / denom
+        bridge_m = (bridge * m).sum() / denom
+        total = (within_f + within_b + bridge_m).clamp(min=1e-9)
+
+    # THE POOLED ANALOGUE OF `vg_live_frac`. A group below min_group_count
+    # yields exactly zero through smooth_l1(x, x), so rows in one are paid for
+    # and contribute nothing. The branch terms have had this readout for a
+    # while; the pooled path shipped without it, which is why singleton backward
+    # groups went unnoticed (bwd/vg_group_size_mean 1.30 against the control's
+    # 1.99, 2026-08-28).
+    live = (counts_all >= min_group_count).float()[inv]
+    stats = {'pooled_live_frac': live.mean().detach(),
+             'pooled_group_size_mean': counts_all.mean().detach(),
+             'pooled_mixed_frac': mixed.mean().detach(),
+             'pooled_pairable_frac': torch.tensor(
+                 n_pairable / max(n_b_all, 1), device=dev),
+             'pooled_n_groups': torch.tensor(float(k), device=dev),
+             'pooled_lambda_b': (is_bwd.sum() / is_bwd.numel()).detach(),
+             'pooled_within_f': within_f,
+             'pooled_within_b': within_b,
+             'pooled_bridge': bridge_m,
+             'pooled_bridge_frac': bridge_m / total}
+    return vg, stats
 
 
 def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,

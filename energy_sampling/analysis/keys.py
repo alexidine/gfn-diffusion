@@ -247,8 +247,14 @@ def detect_route(config: dict, stage_index: Optional[int] = None) -> Route:
     coeffs = effective_loss_coeffs(config, stage_index)
     live = active_modes(config, stage_index)
 
+    # pooled_vg counts: it is a grouped-variance objective like the other two,
+    # and it lives on fwd_loss_coeffs while arming BOTH branches. Missing it
+    # routed pooled-only runs to TB_UNCONDITIONAL, so reports presented
+    # `log_Z_learned` and `tb_err*` as meaningful on a run that never optimises
+    # TB. Same omission as train.py's blocked-draw gate (2026-08-28).
     any_vg = any(_num(coeffs[m].get('vg_lb')) > 0 or _num(coeffs[m].get('vg_lme')) > 0
                  for m in live)
+    any_vg = any_vg or _num((coeffs.get('fwd') or {}).get('pooled_vg')) > 0
     any_tb = any(_num(coeffs[m].get('tb')) > 0 for m in live)
     any_mle = ('bwd' in live
                and (_num(coeffs['bwd'].get('mle')) > 0

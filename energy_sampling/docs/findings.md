@@ -13,6 +13,328 @@ Newest first.
 
 ---
 
+## F-057 · Neither MLIP route carries a systematic bias; MACE's apparent heavy tail is the ENERGY-MAGNITUDE distribution, not an accuracy tail · `REPLICATED`
+
+*2026-08-30. CPU, n=1 per call, both backends. `scratchpad/bias_measurement_cpu.py`.
+Filed because the owner's stated concerns are, in order: large single-point errors,
+systematic bias, and only then noise magnitude — and every assertion in the L1 gates
+takes `.abs()` before computing any statistic, so none of them could separate bias
+from noise.*
+
+**CPU is the better instrument here, not a fallback.** Reruns are bit-identical
+(control exactly 0.0), so any nonzero signed mean is signal rather than something to
+be separated from float noise; there is no tf32, removing UMA's dominant confound; and
+there is no WDDM watchdog, so n is limited by the fixture rather than by the 4-graph
+BSOD ceiling. UMA went from n=8 on the GPU to **n=95**.
+
+| | UMA (n=95) | MACE (n=21) |
+|---|---|---|
+| BIAS, signed mean | **+0.00000** kJ/mol/molecule (bias/SE **0.03**) | -0.039 (bias/SE **-0.91**, not significant) |
+| NOISE, std | 0.00028 | 0.198 raw / 0.020 excluding top 3 |
+| worst single point | 0.00092 | 0.848 |
+| corr with energy / natoms / volume | -0.11 / +0.09 / +0.12 | see below |
+
+**NO SYSTEMATIC BIAS IN EITHER, and no landscape tilt.** UMA's bias is zero to 3% of
+one standard error over 95 crystals, with every structural correlation under 0.12.
+MACE's is under one standard error.
+
+**⚠ A Pearson correlation of -0.923 on MACE was ENTIRELY one leverage point.** Spearman
+on the same data is -0.298, and dropping the single largest-|delta| crystal moves
+Pearson to **-0.006** (bias +0.001, std 0.198 -> 0.070). Do not read a Pearson r at
+n~20 on a heavy-tailed quantity without an outlier-resistant cross-check; it reads as
+exactly the structure-correlated bias one is looking for.
+
+**⚑ THE MACE "TAIL" IS NOT AN ACCURACY TAIL.** Split by whether the total energy is
+physical:
+
+| | n | median \|delta\| | worst |
+|---|---:|---:|---:|
+| E < 0 (physical) | 17 | **0.0015** | **0.036** |
+| E >= 0 (positive total energy, clashing) | 4 | 0.203 | 0.848 |
+
+`corr(|delta_kJ|, |E|) = +0.949`. The RELATIVE error is flat: median 3.4e-7, max
+4.5e-6, min 6.3e-8 against a float32 epsilon of 1.2e-7 — spanning 72x while the
+kJ/mol figure spans 1152x. A near-constant relative error produces a large absolute
+number exactly where the energy is already absurd. **On structures that can actually
+be sampled, MACE agrees to 0.0015 kJ/mol/molecule median and 0.036 worst**, below the
+~0.1 kJ/mol tf32 reward-noise floor.
+
+**Units, since the headline number invites misreading.** kJ/mol PER MOLECULE: the
+crystal-leg delta in eV, x96.485, / (sym_mult * z_prime). The 0.848 figure is 0.035 eV
+of error on a 27,848 eV unit cell over 4 molecules — 0.34 kT.
+
+**Scope.** CPU and n=1, so this does NOT cover the batched GPU path, where tf32
+reappears and per-crystal errors could correlate differently. MACE's n is capped at 21
+by its {H, C, N} element table across all four mini fixtures, not by compute.
+Crystal leg only.
+
+---
+
+## F-056 · Two corrections to the same-day validation entries: F-053's title carries pre-tightening numbers, and F-055's edge-flip mechanism is refuted by our own source · `MECHANISM`
+
+*2026-08-30, filed after an independent multi-lens review of `mlip_validation.md` and
+`design/dependency_validation_protocol.md`. Supersedes the named parts of F-053 and
+F-055; the rest of both entries stands.*
+
+**1 · F-053's TITLE is superseded; its body and table are not.** The title says the
+UMA route reproduces stock fairchem "to 1.25x its own nondeterminism" with a
+production gap "~250x larger". Both figures come from a single run taken BEFORE the
+bars were tightened (control 6.1e-5, cross-stack 7.6e-5 eV). The three replicated
+runs recorded in F-053's own table give cross-stack **2.3-3.8e-5** against a control
+of **4.6-7.6e-5** — i.e. cross-stack sits BELOW the control, the opposite ordering —
+and a production ratio of **>400x**, not 250x. The write-up's derived "8e-8 relative"
+had the same origin and is corrected to 4.0e-8.
+
+**The gate itself was never mis-set, and that is worth stating plainly.**
+`bar = max(control*4, 1e-6*scale)` is pinned at 9.5e-4 eV by the scale term for any
+control below 2.4e-4, so both readings give an identical bar. Only the claimed
+headroom changes (~12x becomes ~25x). This is a reporting error, not a tolerance
+error.
+
+**2 · F-055's MECHANISM is refuted; its attribution is not.** F-055 said the 1.9e-6 Å
+fractional round-trip flips edges at MACE's neighbour cutoff. **False for our side by
+construction.** `AL_mace_utils.py` builds the neighbour list from the RAW positions
+(`pos_all = batch.unit_cell_pos`, then `batched_pbc_neighbour_list(pos_all, ...)`),
+and `compute_crystal_mace_on_mxt_batch` only afterwards overwrites
+`input_data['positions']` with the round-tripped coordinates. `edge_index` and
+`unit_shifts` are consumed unchanged. Our edge set is fixed before the perturbation
+exists and cannot flip.
+
+What survives is the ATTRIBUTION, which was established by intervention and is
+unaffected: feeding the stock calculator the same round-tripped positions collapses
+the disagreement 4-12x. The correct statement is that our path **evaluates the model
+at positions that differ from the ones its own graph was built for**, and that HOW a
+1.9e-6 Å shift yields ~1e-3 eV is not established. The position-matched remainder
+(3.7-4.3e-4 eV) is likewise unattributed and is now recorded as such.
+
+**Why this happened, since it generalises.** An intervention is strong evidence of
+CAUSE and no evidence of MECHANISM. A plausible mechanism rode along on a real
+result and was not checked against the source. The method doc now separates the two
+(element 8a) and the checklist requires any mechanism to be verified against code.
+
+**Also corrected in the same pass, without needing a superseding claim:** the MACE
+cell-convention pin depended on the model fixture and so required a GPU and
+checkpoint despite being pure CPU arithmetic — fixed with an `any_crystals` fixture,
+now verified as `4 passed, 9 skipped` with no GPU and no checkpoints. And both test
+docstrings claimed every prior gate was internal parity; `test_pbc_neighbours.py`
+already checked our production neighbour list against matscipy on exact edge sets,
+so the GRAPH was externally validated before either L1 gate existed. What was new is
+the end-to-end energy.
+
+**3 · F-055's measured RANGE is superseded too, and its gate is tighter than it
+reads.** F-055 quotes "1.8-4.8e-3 eV". The 1.8e-3 end came from an ad-hoc diagnostic
+script that ran our side BEFORE constructing `MACECalculator`, whose constructor calls
+`torch.set_default_dtype` — different global state, not another run of the same thing.
+The three measurements from the test harness itself cluster tightly: **4.52, 4.76,
+4.88e-3 eV**. Against the gate's bar of 5.98e-3 that is **76-82% of the threshold**,
+so the MACE gate sits within ~20% of firing. For comparison the UMA production gate
+runs at 39-40% of its bar and the matched-precision gate at 2.4-4.0%.
+
+⚠ And the MACE bar has no defect-scale anchor: `1e-5 * scale` was chosen by analogy
+with the UMA gate before any MACE measurement existed. UMA's bar can be justified
+against a known defect size (F-047, 0.243 eV); no MACE equivalent exists, so nothing
+establishes that 5.98e-3 eV sits usefully below a real bug. The margin is a known
+weakness of the gate, not a property of the code, and widening the bar to buy comfort
+would be unjustified for the same reason.
+
+**Open, and NOT covered by either gate:** the symmetry expansion's ORDERING is
+common-mode. Both stacks consume `unit_cell_pos` and re-derive the same image-major
+tiling, so a layout inversion in `build_unit_cell` would pair every position with the
+wrong element identically on both sides, cancel exactly, and leave all tests green on
+a chemically nonsensical structure. `crystal_rebuild_checks` covers the operators and
+`sym_mult` against CCDC's expansion, but its element-matching line is commented out,
+so ordering is covered by neither. Recorded in the write-up's scope section.
+
+---
+
+## F-055 · Our MACE route matches a stock MACECalculator, and the residual is OUR fractional round-trip flipping edges at the model cutoff, not a construction error · `MECHANISM`
+
+*2026-08-30, local RTX 5080, `acr_112025_mh1_stagetwo.model`, 4 crystals (the
+inherited MAX_GRAPHS ceiling), 597.5 eV mean per-crystal scale.
+`tests/test_mace_vs_stock.py`. Method: `design/dependency_validation_protocol.md`.*
+
+**What was compared.** `compute_crystal_mace_on_mxt_batch` — hoisted/device-built
+batch, batched neighbour list — against `mace.calculators.MACECalculator`
+constructed from the checkpoint PATH so it performs its own load, builds its own
+`get_neighborhood`, and does its own collation. The `ase.Atoms` are built from
+`unit_cell_pos` and `T_fc` directly, not through our MACE converter, so a converter
+bug cannot cancel. Unlike the UMA comparison (F-053) no wrapping is involved:
+`get_neighborhood` handles unwrapped positions directly, so both stacks see the
+same coordinates.
+
+**Measured.** Ours vs stock **1.8-4.8e-3 eV** (0.09-0.24 kJ/mol per molecule)
+against a same-stack control of 0.0-7.6e-5 eV — MACE repeats itself almost
+exactly, so its control is near zero and a bar must not be written to depend on it.
+
+**THE RESIDUAL IS ATTRIBUTED, NOT TOLERATED, AND IT IS OURS.** `AL_mace_utils.py`
+does not hand the model `unit_cell_pos`: it round-trips through fractional
+coordinates (`T_cf` then `T_fc`) first, moving atoms by max **1.9e-6 A** (mean
+3.1e-7). Too small to matter through the forces — but MACE has a hard neighbour
+cutoff, and an edge sitting exactly at it flips in or out under a perturbation that
+size, a discontinuous change worth ~1e-3 eV.
+
+Demonstrated by intervention rather than argued: feeding the STOCK calculator the
+same round-tripped positions collapses the disagreement to **3.7-4.3e-4 eV** (a
+4-12x reduction), and the stock calculator's own sensitivity to that perturbation
+is **2.1-4.9e-3 eV** — larger than our entire disagreement with it. So the residual
+is a property of MACE at its cutoff, not an error in our construction.
+`test_the_residual_is_the_fractional_round_trip_not_our_code` asserts both
+directions, so the attribution fails loudly if it ever stops holding.
+
+**Scope.** Crystal leg only; the two-leg lattice energy is NOT covered, and
+`compute_lattice_mace` separately carries a constant per-molecule E0 offset that
+cancels in differences. 4 crystals is a hard ceiling, not a knob: the model OOMs
+above ~5 and the forward is near-fixed at ~425 ms per call, which puts 16 graphs
+across the 2 s WDDM watchdog that has BSOD'd this box. Restricted element table, so
+the fixture keeps only crystals the model covers. Establishes that we drive MACE the
+way its authors do — not that MACE is right about chemistry.
+
+**Open.** Whether the fractional round-trip should exist at all. It is a no-op in
+exact arithmetic and is not wrong, but it is measurably not free, and removing it
+would move these numbers in the improving direction.
+
+---
+
+## F-054 · Three CPU-only test modules silently disarmed every MLIP GPU gate in the same pytest session, and the pass count ROSE as coverage fell · `MECHANISM`
+
+*2026-08-30, local RTX 5080. Mechanism read directly from the test modules and
+`tests/conftest.py`; effect measured by adding and removing one file from a
+selection.*
+
+**Mechanism.** `test_uma_atomicdata_vectorisation.py`, `test_pbc_neighbours.py` and
+`test_mace_atomicdata_vectorisation.py` each ran
+`os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')` at **module scope**. pytest
+imports every collected module before running any test, so collecting any one of
+them blinded the whole session: `conftest.gpu_preflight` then reads
+`torch.cuda.is_available() == False` and skips with `no GPU`.
+
+**Measured.** Two GPU files alone: **16 passed, 1 skipped**. The same two plus one
+CPU-only file: **23 passed, 9 skipped** — the total rose by 7 while nine GPU tests
+stopped running. A full `pytest mxtaltools/tests/` run therefore executed ZERO MLIP
+GPU gates. The same env var also permanently dead-ended
+`test_mace_atomicdata_vectorisation`'s own device-residency check, which sat behind
+an `is_available()` guard its own module had falsified.
+
+**What shipped.** The three lines removed, each replaced by a comment recording this
+measurement. These modules are CPU-only because they build CPU tensors and never call
+a predictor — a property of the code, not something an env var should assert
+process-wide. Full suite before (CUDA hidden): 1 failed, 293 passed, **45 skipped**.
+After: 1 failed, 316 passed, **22 skipped** — 23 skips converted to passes, no
+behaviour change. The single failure (`test_model_training.py::test_all_models`,
+`Rotation must be standard or random`) is PRE-EXISTING: it reproduces standalone and
+under the pre-change environment, in unmodified committed code.
+
+**Consequence.** Same disease as the `set_default_dtype` leak: read the SKIP COUNT,
+never the pass count. The remaining full-suite gap is different and not addressed
+here — module-scoped predictor fixtures hold VRAM, so later GPU modules skip with
+`only 0 MB free`. That is the co-tenancy guard working correctly against the session's
+own earlier allocations.
+
+---
+
+## F-053 · Our UMA route reproduces a stock fairchem ASE workflow to 1.25x its own nondeterminism; the production gap is ~250x larger and is ALL tf32 · `REPLICATED`
+
+*2026-08-30, local RTX 5080, `esen_s.pt`, 8 buildable `mini_new_csd` crystals,
+948.4 eV mean per-crystal scale. Three consecutive runs, two precision conditions.
+`tests/test_uma_vs_stock_fairchem.py`.*
+
+**What was compared, and why it is not a tautology.** Every pre-existing UMA gate is
+INTERNAL parity — two of our own routes judged against a same-run nondeterminism
+control — so a bug moving both equally is invisible to all of them. This scores the
+same crystals through a stock fairchem stack (`load_predict_unit` with fairchem's own
+`'default'` settings, no overrides, no task-head surgery, `FAIRChemCalculator`,
+`ase.Atoms`) and compares against the production path's own return value.
+
+The two stacks are handed DIFFERENT coordinates by design. Ours passes UNWRAPPED
+`unit_cell_pos` with an externally built neighbour list; `AtomicData.from_ase` calls
+`wrap_positions(...)` before building anything, so the ASE route always sees wrapped
+atoms — the regime fairchem's internal `radius_graph_pbc_v2` is correct for. Wrapping
+is a lattice symmetry, so agreement is required, and an F-047-class regression would
+read ~0.24 eV out. Measured on this fixture, `unit_cell_pos` spans 1.5 cell widths and
+wrapping displaces atoms by up to 14.4 A, so the difference is real, not nominal.
+
+| condition | delta |
+|---|---|
+| production (tf32) vs stock | 1.55-1.64e-2 eV; **0.119-0.141 mean / 0.389-0.396 max kJ/mol per molecule** |
+| matched precision (fp32) vs stock | **2.3-3.8e-5 eV**, against a same-stack control of 4.6-7.6e-5 |
+
+**The fp32 result is the correctness claim.** Cross-stack delta sits consistently
+BELOW the same-stack control across all three runs: two wholly independent stacks
+agree with each other better than one stack agrees with itself across reruns, i.e.
+8e-8 relative. Our batch construction, external neighbour list, predictor overrides,
+task-head surgery and `T_fc`->cell convention are together correct to the noise floor.
+The `T_fc.T` cell convention is separately pinned on CPU against ASE's `cellpar` to
+~1e-6.
+
+**The production gap is a precision choice, not a defect.** It is ~250x the fp32
+residual and is attributable to `crystal_inference_settings` setting `tf32=True`
+against fairchem's `tf32=False` default. It independently corroborates the ~0.1 kJ/mol
+reward noise floor recorded for tf32.
+
+**Scope and limits.** Physical cells only — fairchem's internal graph truncates at
+`max_neighbors=300`, which physical cells (~141) never reach and degenerate cells
+(~2710) do, so trash cells would measure their neighbour cap rather than our code. A
+negative control (0.3 A cell perturbation) confirms the bars can reject a change far
+smaller than an F-047-class bug. This validates our route against fairchem's OWN
+stack; it is not a check against DFT or a published reference. That second level
+exists as a mechanism only (`$UMA_REFERENCE_JSON`), with no data committed.
+
+---
+
+## F-052 · F-047 at population scale: ~7% of prior rows moved by more than a kT, and the sign bias is NOT systematic · `REPLICATED`
+
+*2026-08-19/20. Re-scoring of every stored UMA search chunk through the corrected
+graph: nehzor_4_uma 40,082 rows and mipcas_uma 82,303 rows, 122,385 total.
+Supersedes F-047's "this shift is systematic, not noise".*
+
+**Units first, because F-047's headline is in different ones.** `batch.uma` is
+`compute_lattice_uma` -- LATTICE ENERGY PER MOLECULE IN kJ/mol, already converted,
+not the raw eV potential F-047 quotes. kT = 2.5 kJ/mol, which is the ruler that
+decides whether a delta matters.
+
+| old minus corrected | nehzor (40k) | mipcas (82k) |
+|---|---:|---:|
+| median signed | +0.0002 | -0.005 |
+| mean absolute | **3.35 kJ/mol = 1.34 kT** | **1.76 kJ/mol = 0.70 kT** |
+| rows off by > 1 kT | 6.96% | 5.47% |
+| rows off by > 10 kT | 1.64% | 1.40% |
+| worst row | 968 kJ/mol | 441 kJ/mol |
+
+**THE CORRECTION.** F-047 read 19 of 24 CSD crystals as negative and concluded the
+error was directional -- that broken-graph geometries score too low, giving a
+sampler an incentive pointing at the bug. At scale that does not hold: 49.8%
+(nehzor) and 54.7% (mipcas) negative. It is **noise of order 1 kT injected into the
+reward**, not a directional pull. Less insidious than F-047 claimed, but 1 kT of
+noise on the quantity that sets Boltzmann weights is not small.
+
+**Prevalence is far higher than the curated sample implied** -- 4 of 24 CSD crystals
+were meaningfully wrong, against ~7% of *every* row here, because search output
+visits geometries a curated set never contains. Prior datasets are built from search
+output, so this is the population that mattered.
+
+**Consequence, and it is SELECTION not labelling.** Prior thinning cuts at
+`e_min + 6kT`, so wrong energies changed which structures were kept. Rebuilt on
+corrected chunks the anchor counts move in OPPOSITE directions -- nehzor 5,726 ->
+5,990 (+4.6%), mipcas 9,237 -> 9,173 (-0.7%) -- which is the signature of a
+selection change rather than an energy-scale shift. Stored per-row energies never
+mattered: `init_prior_dataset` re-scores every row at startup unconditionally.
+
+**What the ELJ route escaped.** `calibrate_energy_function_vs_uma` reads stored UMA
+energies and does NOT recompute them, so it was the one genuinely contaminated
+consumer. Measured: the bottom-decile mean it consumes moves +0.20% (nehzor) and
+-0.02% (mipcas), and the global minima are unchanged to two decimals. The deep-basin
+structures were physically sensible, so their graphs were fine -- the damage sits in
+high-energy junk. No ELJ rebuild was needed.
+
+**What shipped.** `data_processing/rescore_uma_f047.py` (corrected chunks beside the
+originals, stamped `uma_energy_state: 2`); `load_search_chunks` prefers corrected
+chunks and REFUSES unstamped ones on the uma route; `collate_prior --dataset-suffix`
+(the resume branch reuses any file of the target name, which silently no-op'd a
+mipcas rebuild and exited 0); `promote_prior.py` for the `prior_batch -> prior`,
+`noised_batch -> equalized_prior` rename, refusing any prior whose stamp is stale.
+
+---
+
 ## F-051 · Warm-starting from a phase-1 exit archive does NOT skip phase 1 · `MECHANISM`
 
 *2026-08-19, local. QM9-conditional resumed full-state from its own

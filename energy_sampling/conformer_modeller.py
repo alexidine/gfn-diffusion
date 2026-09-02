@@ -448,7 +448,79 @@ class ConformerModeller(Modeller):
         """
         cfg = super()._build_gfn_config()
         cfg['angular_mask'] = self.energy_function.periodic_dims
+        # POPPED, not passed. The base builder splats **vars(args.model) straight into GFN,
+        # whose signature is explicit -- an unrecognised key is a TypeError at construction.
+        self._policy_spec = {k: cfg.pop(k) for k in self._SET_POLICY_KEYS if k in cfg}
         return cfg
+
+    #: `model:` keys selecting and sizing the SET policy over per-coordinate tokens. Kept
+    #: out of gfn_config on purpose (see above), which also means they are NOT stored in the
+    #: checkpoint -- see the resume refusal in _install_set_policy.
+    #: NAMES ARE PREFIXED DELIBERATELY. `policy_layers` and `policy_hidden_dim` already
+    #: exist in the model block as the FLAT policy's own GFN arguments; popping either
+    #: would silently unbuild the flat path.
+    _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers')
+
+    def init_gfn(self):
+        """Base build, then swap the flat policy for the set policy if asked."""
+        super().init_gfn()
+        self._install_set_policy()
+
+    def _install_set_policy(self):
+        """`model.policy_kind: set` -> swap the flat scalarMLP for a per-coordinate set head.
+
+        WHY A POST-CONSTRUCTION SWAP rather than a GFN constructor argument. `models/gfn.py`
+        is shared with crystal and, per the owner decision of 2026-08-19, takes no changes
+        beyond the raw-state passthrough without a further decision. The cost is recorded
+        honestly in the resume refusal below rather than hidden.
+
+        THREE THINGS HAVE TO HAPPEN IN THIS ORDER and the last is the one that bites: the
+        base `init_gfn` has already deep-copied the EMA model and already built the
+        optimizers over the OLD policy's parameters. Swapping without rebuilding both leaves
+        a run that trains nothing in the new head and reports a perfectly plausible loss.
+        """
+        spec = getattr(self, '_policy_spec', {})
+        kind = str(spec.get('policy_kind', 'flat')).lower()
+        if kind == 'flat':
+            return
+        if kind != 'set':
+            raise ValueError(
+                f"model.policy_kind must be 'flat' or 'set', got "
+                f"{spec.get('policy_kind')!r}")
+
+        if (self.args.checkpoint_name is not None
+                or getattr(self.args, 'continue_from_checkpoint', False)):
+            raise NotImplementedError(
+                "model.policy_kind: set cannot be resumed. The policy choice lives in the "
+                "modeller rather than in gfn_config, so the checkpointer rebuilds a FLAT "
+                "GFN and its strict load_state_dict would fail on the set head's weights. "
+                "Run the parity comparison fresh; making this resumable means putting the "
+                "key in gfn_config, which is a shared-file change and its own decision.")
+
+        rank = int(self.gfn_config.get('dplr_rank', 0) or 0)
+        if rank > 0:
+            raise NotImplementedError(
+                f"model.policy_kind: set with dplr_rank {rank} is refused. SetPolicy._to_blocks "
+                f"emits the low-rank factor as rank-major blocks while GFN.split_params "
+                f"reads it .view(-1, dim, rank), i.e. dim-major, so u_raw would be silently "
+                f"TRANSPOSED -- finite, plausible and wrong. Set dplr_rank: 0 for this run.")
+
+        from copy import deepcopy
+        from models.set_policy import set_policy_for
+
+        policy = set_policy_for(
+            self.energy_function, int(self.gfn_config['t_dim']),
+            hidden_dim=int(spec.get('set_policy_hidden', 64)),
+            layers=int(spec.get('set_policy_layers', 4)),
+            out_per_token=2).to(self.device)
+        self.gfn_model.forward_policy = policy
+        self.ema_model = deepcopy(self.gfn_model)
+        self.init_schedulers_optimizers()
+
+        n_new = sum(p.numel() for p in policy.parameters())
+        print(f"policy: SET over {policy.dim} coordinate tokens, {n_new:,} params, "
+              f"width independent of dim; the flat scalarMLP is replaced and the "
+              f"optimizers were rebuilt over it")
 
     def _resolve_periodic_centroid_axes(self):
         """No cell, so no centroids to wrap. config_invariants refuses the flag outright."""

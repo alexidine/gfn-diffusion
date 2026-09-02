@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from energy_sampling.energies.base_set import BaseSet
+from energy_sampling.energies.prior_flow import PriorFlow
 from energy_sampling.energies.prior_knn import PriorKNN
 from mxtaltools.common.geometry_utils import lat2sph_rotvec
 from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
@@ -90,6 +91,8 @@ class MolecularCrystal(BaseSet):
                  prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
                  prior_knn_k: Optional[int] = None,  # overrides the k stored in the reference file; a smoothing knob on a fixed draw, so sweeping it needs no rebuild
                  prior_knn_min_radius: Optional[float] = None,  # floor on r_k, in latent units
+                 prior_flow_path: Optional[str] = None,  # density proxy for the PRIOR POLICY, written by build_prior_flow.py
+                 lambda_mix: float = 1.0,  # 1 = pure physical target; 0 = pure prior-flow target (the null test). Schedulable via balance.anneal_coeffs.
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -204,6 +207,31 @@ class MolecularCrystal(BaseSet):
                                                       'latent_gaussian',
                                                       'latent_knn']
         self.is_crystal = is_crystal_energy(self.energy_function)  # not a toy model
+
+        # LAMBDA MIX. The target is a geometric path between the prior's own
+        # implied density and the physical energy:
+        #     p_lambda  ~  q_flow^(1-lambda) * exp(-lambda * E_phys / T)
+        # At lambda=0 the fixed point is EXACTLY the fitted prior density, which
+        # is what makes a null test interpretable: the policy should converge to
+        # the flow and stop. Reaching that endpoint exactly requires the jacobian
+        # and the reduction penalty to scale with lambda too -- both belong to the
+        # physical target, and either one left on would contaminate the lambda=0
+        # fixed point with a term the flow never modelled.
+        self.prior_flow = None
+        self.lambda_mix = float(lambda_mix)
+        if prior_flow_path is not None:
+            self.prior_flow = PriorFlow.load(prior_flow_path, device=self.device)
+            if len(self.prior_flow.wrap_mask) != self.data_ndim:
+                raise ValueError(
+                    f"prior_flow is {len(self.prior_flow.wrap_mask)}-dimensional but this "
+                    f"problem's state is {self.data_ndim}-dimensional")
+            print(f'prior_flow: {self.prior_flow.describe()}  lambda_mix={self.lambda_mix}')
+        elif abs(self.lambda_mix - 1.0) > 1e-9:
+            raise ValueError(
+                f"lambda_mix={self.lambda_mix} but no energy_config.prior_flow_path was "
+                f"given. Without a prior density there is nothing to mix toward, so the "
+                f"setting would be silently inert -- exactly the failure this check exists "
+                f"to prevent. Supply a flow, or leave lambda_mix at 1.0.")
 
         self.prior_knn = None
         if self.energy_function == 'latent_knn':
@@ -401,6 +429,23 @@ class MolecularCrystal(BaseSet):
             fn = (sub.compute_lattice_gas_phase_uma if self.energy_function == 'uma'
                   else sub.compute_lattice_gas_phase_mace)
             vals = fn(self.predictor).detach()
+            # RAISE RATHER THAN CACHE. Everywhere else a failed MLIP forward costs
+            # the affected rows, because NaN is filtered downstream. Here it would
+            # cost the whole RUN: this value is computed once per molecule and then
+            # reused for every future sample of it, so caching a bad one silently
+            # offsets that molecule's lattice energy by the entire gas leg (~20,000
+            # kJ/mol) until the process exits. There is no per-row salvage at cache
+            # time and no later opportunity to notice, so stopping is the only
+            # honest option.
+            if not torch.isfinite(vals).all():
+                bad = [m for slot, m in enumerate(missing) if not torch.isfinite(vals[slot])]
+                raise RuntimeError(
+                    f'gas-phase reference for mol_id(s) {bad} came back non-finite '
+                    f'({self.energy_function}). This is cached for the whole run, so '
+                    f'it is refused rather than stored. Check the run log for "UMA '
+                    f'error" and energy/uma_crash_calls; re-run once the MLIP is '
+                    f'healthy, or set host_gas_phase_reference=False to compute the '
+                    f'leg per call at roughly double the energy cost.')
             for slot, mid in enumerate(missing):
                 cache[mid] = float(vals[slot])
             print(f"gas reference: cached {len(missing)} molecule(s) "
@@ -439,9 +484,84 @@ class MolecularCrystal(BaseSet):
                 'gas_ref/drift_absmax_kj': float(drift.abs().max()),
                 'gas_ref/drift_std_kj': float(drift.std()) if drift.numel() > 1 else 0.0}
 
+    def stamp_lj_coeff(self, crystal_batch):
+        """Write this run's `lj_coeff` onto the batch as a per-graph attribute.
+
+        THE COEFFICIENT RIDES WITH THE DATA. `compute_eLJ_energy` reads it and
+        scales its own output, so `.elj` is calibrated the moment it is written
+        and every consumer of that attribute -- buffer y, the energy marginal,
+        the prior gates -- sees one quantity instead of a raw sum that each
+        caller had to remember to scale. Nothing downstream multiplies again;
+        `generator_energy` consumes `mol_energy` unscaled for exactly that
+        reason.
+
+        Stamped HERE because `instantiate_crystals` is the single point every
+        freshly-built crystal passes through on its way to `analyze`. Rows that
+        were STORED before this existed carry a raw `.elj` and no attribute, and
+        `generator_energy` reads the stored value rather than recomputing it --
+        so those need migrating (stamp + rescale the column), not just stamping.
+        The absent attribute is what identifies them.
+        """
+        n = crystal_batch.num_graphs
+        crystal_batch.lj_coeff = torch.full((n,), float(self.lj_coeff),
+                                            device=crystal_batch.device,
+                                            dtype=torch.float32)
+
+    #: how far a batch's stamped lj_coeff may sit from the run's before it is a
+    #: different calibration rather than a float round-trip through a .pt
+    LJ_COEFF_RTOL = 1e-6
+
+    def assert_lj_coeff_stamped(self, crystal_batch):
+        """Refuse a batch whose `.elj` is in an unknown currency.
+
+        `.elj` is read off the row here, never recomputed, so a row stored before
+        the coefficient rode with the data carries a RAW sum -- and since
+        `crystal_energy` no longer multiplies, its composite comes out inflated by
+        1/lj_coeff (2.62x on mipcas, measured). Finite, plausible, and wrong on
+        every backward and replay draw. There is nothing in the value itself to
+        tell the two apart, so the ABSENCE of the stamp is the only signal, and it
+        has to be fatal rather than defaulted.
+
+        Presence is not sufficient either: two sources can both be stamped and
+        DISAGREE -- a prior calibrated at 0.3636 mixed with an anchor set built at
+        1.0 would pass an existence check and silently blend currencies. So the
+        value is compared too.
+
+        `latent_energy` routes never read `.elj` and never reach this.
+        """
+        coeff = getattr(crystal_batch, 'lj_coeff', None)
+        if coeff is None:
+            raise AttributeError(
+                "crystal_batch carries no `lj_coeff`, so its `%s` is in an unknown "
+                "currency. Freshly built crystals are stamped by "
+                "analyze_crystal_batch; a batch reaching here without one was "
+                "STORED before the coefficient rode with the data (a buffer "
+                "sidecar, a prior .pt). Migrate it -- stamp the run's coefficient "
+                "and multiply the stored `%s` column by it -- rather than letting "
+                "its %s term score %.3gx too large (the composite less, since the "
+                "other terms do not scale: 2.62x on mipcas against 2.75x here)."
+                % (self.energy_function, self.energy_function, self.energy_function,
+                   1.0 / float(self.lj_coeff) if self.lj_coeff else float('inf')))
+        # EVERY ROW, not row 0. The case this exists to catch is a MIXED batch --
+        # prior rows at 0.3636 collated with anchor rows at 1.0 -- and a
+        # single-element read passes that whenever row 0 happens to match the
+        # run. The mixture is precisely what a row-0 check cannot see.
+        vals = torch.as_tensor(coeff).flatten().to(torch.float64)
+        want = float(self.lj_coeff)
+        bad = (vals - want).abs() > self.LJ_COEFF_RTOL * max(abs(want), 1.0)
+        if bool(bad.any()):
+            uniq = torch.unique(vals).tolist()
+            raise ValueError(
+                f'crystal_batch carries lj_coeff values {uniq[:8]}'
+                f'{" ..." if len(uniq) > 8 else ""} but this run uses {want!r} '
+                f'({int(bad.sum())} of {vals.numel()} rows disagree). Both sides '
+                f'are stamped, so this is two energy currencies mixed in one '
+                f'batch, not a missing migration.')
+
     def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
+        self.stamp_lj_coeff(crystal_batch)
         self.attach_gas_phase_reference(crystal_batch)
 
         analyze_kwargs = dict(cutoff=10,
@@ -479,9 +599,13 @@ class MolecularCrystal(BaseSet):
 
         crystal_batch.add_graph_attr(crystal_energy, 'gfn_energy')
 
-        if torch.any(torch.isinf(crystal_energy)) or torch.any(torch.isnan(crystal_energy)):
-            crystal_energy[torch.isinf(crystal_energy)] = 0  # just patch it for now
-            crystal_energy[torch.isnan(crystal_energy)] = 0
+        # A "just patch it for now" pass used to sit here, zeroing any inf/nan in
+        # crystal_energy. It is REMOVED, not moved: generator_energy now raises on
+        # a non-finite energy, so this was unreachable, and an unreachable repair
+        # reads as a safety net that is holding. It was also the worse of the two
+        # behaviours -- energy 0 is a plausible MIDDLING reward, so a clash became
+        # an ordinary-looking sample that a buffer would happily admit, rather
+        # than something anything downstream could notice.
 
         for key in ens_dict.keys():
             setattr(crystal_batch, key, ens_dict[key].cpu().detach())
@@ -535,6 +659,7 @@ class MolecularCrystal(BaseSet):
         # second clause it would walk straight into density_penalty(packing_coeff).
         if self.is_crystal and not self.latent_energy:
             density_energy = density_penalty(crystal_batch.packing_coeff)
+            self.assert_lj_coeff_stamped(crystal_batch)
             mol_energy = getattr(crystal_batch, self.energy_function)
             if self.energy_function not in ['uma', 'mace']:
                 mol_energy = mol_energy / crystal_batch.z_prime
@@ -593,7 +718,13 @@ class MolecularCrystal(BaseSet):
             crystal_energy = self.prior_knn.energy(latents)
 
         elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
-            crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
+            # NO `self.lj_coeff *` HERE ANY MORE: `.elj` arrives already scaled,
+            # because compute_eLJ_energy multiplies by the batch's own lj_coeff
+            # (stamp_lj_coeff writes it). Multiplying again would square the
+            # calibration -- 0.132 instead of 0.364 on mipcas -- and stay finite
+            # and plausible the whole way. The composite total is unchanged: the
+            # same product, formed one step earlier.
+            crystal_energy = mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
@@ -614,21 +745,198 @@ class MolecularCrystal(BaseSet):
             jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)
             ens_dict.update(jacobian_components)
 
-        if self.energy_clip is not None:
+        # THE PATH'S TWO LEGS. The mix is EXACTLY LINEAR in them:
+        #
+        #     total_lam = (1 - lam) * flow_energy + lam * physical_energy
+        #                 + bounding_energy * bounding_coeff
+        #
+        # so a stored pair re-mixes to any lambda by a plain weighted sum, with no
+        # rescore and no correction term. Delta = physical_energy - flow_energy is
+        # the path's sufficient statistic.
+        #
+        # `flow_energy` IS the lambda=0 leg -- there is no separate key for it. An
+        # `energy_at_lambda0` briefly existed and was deleted: once bounding moved
+        # out to the total it was byte-for-byte `flow_energy`, i.e. a second name
+        # for one tensor, which is the collision that has cost this codebase real
+        # bugs. `physical_energy` needs its own key because it is
+        # crystal + reduction*rc + jacobian and matches no single existing attribute.
+        # ⚠ Neither leg is the total at its endpoint -- bounding is added outside
+        # both -- which is exactly what makes them valid for a STORED row, whose
+        # live re-score carries no bounding at all.
+        lam = float(self.lambda_mix)
+        flow_energy = None
+        if self.prior_flow is not None:
+            if self.energy_clip is not None:
+                raise ValueError(
+                    "lambda mixing and reward_range/energy_clip cannot both be active: the "
+                    "clip is a nonlinear rescale of the PHYSICAL energy, so applying it to a "
+                    "mixture would make the lambda=0 endpoint something other than the flow. "
+                    "Set reward_range: null for null-test and annealing runs.")
+            # * temperature so energy()'s later division by it cancels: the flow is a
+            # log-density, not a Boltzmann energy, and must not be tempered. The
+            # physical leg keeps its temperature dependence.
+            flow_energy = self.prior_flow.energy(latents) * temperature
+            ens_dict['flow_energy'] = flow_energy
+            ens_dict['lambda_mix'] = torch.full_like(flow_energy, lam)
 
-            total_energy = (log_rescale_positive(crystal_energy, self.energy_clip) +
-                            bounding_energy * self.bounding_coeff +
-                            reduction_energy * self.reduction_coeff)
-            return (
-                log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)) + jacobian_energy,
-                # to prevent total saturation by the energy function, add a buffer over the clip
-                ens_dict)
+        # ⚠ THE LEGS EXCLUDE `bounding_energy`, DELIBERATELY, and it is added to the
+        # total instead. Two reasons, and the second is the load-bearing one:
+        #
+        # 1. SEMANTICS. Bounding is the only term computed from `raw_latents` -- a
+        #    penalty on what the POLICY EMITTED, not a property of the structure.
+        # 2. STORED ROWS. A buffer row re-scored through prebuilt_sample_to_reward
+        #    passes no raw_latents, so its live training energy has bounding == 0.
+        #    A leg carrying an ADMISSION-TIME bounding term would therefore be
+        #    permanently wrong for every stored row, and -- since it enters the mix
+        #    with total weight (1-lam) + lam = 1 -- recomposing at the current
+        #    lambda would NOT remove it. Excluding it is what makes a stored pair
+        #    of legs re-mixable into exactly the row's live energy by a plain
+        #    weighted sum, with no correction term.
+        #
+        # The total is algebraically unchanged either way (bounding carried weight
+        # 1 before and carries weight 1 now), so lambda-free runs stay bit-identical.
+        bounding_total = bounding_energy * self.bounding_coeff
+        if self.energy_clip is not None:
+            # the clip and the flow are mutually exclusive (raised above), so
+            # there is no lambda=0 endpoint here and this IS the physical leg.
+            # The clip is nonlinear and brackets bounding, so it cannot be pulled
+            # back out -- this branch keeps bounding inside the leg and adds no
+            # second copy below.
+            clipped = (log_rescale_positive(crystal_energy, self.energy_clip) +
+                       bounding_total +
+                       reduction_energy * self.reduction_coeff)
+            # to prevent total saturation by the energy function, add a buffer over the clip
+            physical_energy = (
+                log_rescale_positive(clipped, self.energy_clip + 0.1 * np.abs(self.energy_clip))
+                + jacobian_energy)
+            bounding_total = torch.zeros_like(bounding_total)
         else:
-            total_energy = (crystal_energy +
-                            bounding_energy * self.bounding_coeff +
-                            reduction_energy * self.reduction_coeff +
-                            jacobian_energy)
-            return total_energy, ens_dict
+            physical_energy = (crystal_energy +
+                                 reduction_energy * self.reduction_coeff +
+                                 jacobian_energy)
+
+        # WHETHER THE CLIP ACTUALLY FIRED, as a number. Deliberately OUTSIDE the
+        # branch above -- that block is frozen by owner decision and this reads
+        # from it without altering it.
+        #
+        # Without this, "the clip is armed" is unfalsifiable from a run's logs:
+        # energy_clip appears once in the config panel and nothing reports
+        # whether a single sample was ever compressed. On mipcas the clip lands
+        # ~620 units above the working range and fires on NOTHING, so a run can
+        # look clip-protected while the branch has never executed. That is
+        # exactly the shape of failure this codebase keeps producing -- a channel
+        # that returns plausible numbers while doing nothing.
+        if self.energy_clip is not None:
+            # NAME MUST CONTAIN 'energy'. log_thermo_properties logs ens_dict
+            # keys via `if ('energy' in key or 'pot' in key)` -- an explicit
+            # filter, not a loop over everything -- so a key named
+            # `clip_active_frac` is silently dropped and never reaches wandb.
+            # Caught only because the tight-clip run logged no such metric.
+            ens_dict['energy_clip_active_frac'] = torch.full_like(
+                crystal_energy,
+                float((crystal_energy > self.energy_clip).float().mean()))
+
+        if flow_energy is None:
+            mixed = physical_energy
+        elif lam == 0.0:
+            # ⚠ NOT `(1-lam)*E0 + lam*E1`: 0 * inf is NaN, so a non-finite
+            # PHYSICAL leg would poison a lambda=0 total even though the physical
+            # energy carries zero weight there. That is the one run where the
+            # physical energy is definitionally irrelevant -- the null test --
+            # and it would die on the first clashing sample. Endpoints are taken
+            # exactly rather than arithmetically, which also makes lambda=1
+            # bitwise E1 by construction instead of by floating-point luck.
+            mixed = flow_energy
+        elif lam == 1.0:
+            mixed = physical_energy
+        else:
+            mixed = (1.0 - lam) * flow_energy + lam * physical_energy
+        # bounding is added ONCE, outside the mix -- see the note above. Zeroed on
+        # the energy_clip branch, where it is already sealed inside the leg.
+        total_energy = mixed + bounding_total
+        ens_dict['physical_energy'] = physical_energy
+
+        self._assert_finite_energy(total_energy, ens_dict, crystal_batch)
+        return total_energy, ens_dict
+
+    #: Energy functions whose non-finite outputs are EXPECTED and already
+    #: contained, so `_assert_finite_energy` must not fire on them. A failed MLIP
+    #: forward substitutes NaN deliberately (uma_utils._crashed_energy) and the
+    #: design absorbs it: isfinite filters in update_best_energy, the prior-seed
+    #: path, and the eval pooled-Z reduction, a non-finite-gradient step skip, and
+    #: a MAX_CONSECUTIVE_CRASHES streak tripwire whose stated policy is "tolerate a
+    #: blip; refuse to limp". Raising here would sit UPSTREAM of all five and turn
+    #: a single transient fault -- below the threshold the retry logic exists to
+    #: defer to -- into a dead job.
+    _TOLERATES_NONFINITE = ('uma', 'mace')
+
+    def _assert_finite_energy(self, total_energy, ens_dict, crystal_batch):
+        """A non-finite energy is a BUG *on the routes that cannot produce one*,
+        so raise rather than pass it downstream -- except where it is contained.
+
+        This is the single funnel -- `analyze_crystal_batch` (the live rollout) and
+        `prebuilt_sample_to_reward` (the buffer/anchor path) both land here -- so one
+        check covers every energy the run produces. It is deliberately a raise and not
+        a filter: `log_reward` is `-energy/T`, so a +inf energy becomes a -inf reward,
+        and NOTHING downstream rejects one. `AnchorBuffer.admit` tests no finiteness at
+        all and sorts candidates by ascending energy, so a -inf row would be admitted
+        AS THE BEST ANCHOR for its condition and then persist; a single such row also
+        NaNs the whole fused loss, since train.py adds `pooled_coeff * pooled_rows.mean()`
+        unguarded.
+
+        WHY THIS IS SCOPED. On ELJ the pair potential is wrapped in nan_to_num and
+        the core term is a bounded exponential, so a non-finite total genuinely
+        cannot arise from the physics and means something is broken. On an MLIP
+        route it CAN and is already handled -- see _TOLERATES_NONFINITE. There is no
+        universal answer here, only a per-route one.
+
+        ⚠ AN EARLIER VERSION OF THIS DOCSTRING CLAIMED `reward_range`/`energy_clip`
+        used to absorb +inf via `.clip(max=clip)`, and that lambda runs removed that
+        protection. BOTH HALVES WERE FALSE. `log_rescale_positive` is
+        `where(y > cutoff, cutoff + log1p(y - cutoff), y)`, not a clamp -- +inf
+        passes through both of its stages unchanged. The thing that actually
+        absorbed non-finites was the `crystal_energy[isinf] = 0` patch in
+        analyze_crystal_batch, which this change removed. Kept as a note because
+        the false version read as a risk assessment that had been done.
+
+        ⚠ THE SECOND HALF NOW MATTERS MORE, NOT LESS. `set_reward_clip` used to
+        have no callers, so `energy_clip` was None on every real crystal run and
+        the point was academic. It is armed at init_prior_dataset as of
+        2026-09-02, which makes it tempting to read the clip as a non-finite
+        guard. IT IS NOT ONE. The clip bounds how far a FINITE energy can climb;
+        +inf and NaN reach this raise exactly as before, and this raise is still
+        the only thing that stops them.
+
+        The per-component report is the point: it says WHICH term went non-finite, so
+        the bug is localised at the raise instead of being inferred from a NaN loss
+        thousands of steps later.
+        """
+        if self.energy_function in self._TOLERATES_NONFINITE:
+            return
+        bad = ~torch.isfinite(total_energy)
+        n_bad = int(bad.sum())
+        if n_bad == 0:
+            return
+        parts = []
+        for k, v in ens_dict.items():
+            if torch.is_tensor(v) and v.shape[:1] == total_energy.shape[:1]:
+                n = int((~torch.isfinite(v)).sum())
+                if n:
+                    parts.append(f'{k}={n}')
+        ids = getattr(crystal_batch, 'identifier', None)
+        rows = torch.nonzero(bad, as_tuple=False).flatten()[:5].tolist()
+        named = ''
+        if isinstance(ids, (list, tuple)) and len(ids) == total_energy.shape[0]:
+            named = f'  first offenders: {[ids[i] for i in rows]}'
+        raise FloatingPointError(
+            f'non-finite energy on {n_bad}/{total_energy.shape[0]} samples '
+            f'(energy_function={self.energy_function}, lambda_mix={self.lambda_mix}, '
+            f'energy_clip={self.energy_clip}). '
+            f'Non-finite components: {", ".join(parts) or "none -- the total alone"}. '
+            f'Row indices {rows}.{named} '
+            f'This is a bug in the energy, not a bad sample to be filtered: a +inf '
+            f'energy becomes a -inf reward, and AnchorBuffer.admit would take it as '
+            f'the BEST anchor for its condition.')
 
     def compute_jacobian(self, crystal_batch, temperature):
         """jacobian correction for aunit positions and orientation angles only"""

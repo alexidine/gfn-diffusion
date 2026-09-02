@@ -60,6 +60,11 @@ class SetPolicy(nn.Module):
     module to whatever device the trajectory runs on.
     """
 
+    #: Read by ``GFN.predict_next_state``. The flat ``PolicyModel`` has no such attribute,
+    #: so the branch is invisible to the crystal route. This policy takes the RAW state
+    #: because the per-coordinate structure it tokenises is destroyed by ``StateEncoding``.
+    wants_raw_state = True
+
     def __init__(self,
                  static_features,
                  angular_mask: Sequence[bool],

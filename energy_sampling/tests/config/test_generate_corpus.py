@@ -146,6 +146,14 @@ _BSZ_COMMON = {
     'condition_log_z.half_life_visits': 7.0,
     'lr_policy': 1.25e-4, 'lr_back': 1.25e-4,
     'lr_replay': 1.25e-4, 'lr_fused': 1.25e-4,
+    # THE ANCHOR-BUFFER DEFAULTS MOVED after these arms were recorded. mk_dev now
+    # ships the frozen-anchor shape -- membership fixed, the surprise sweep off,
+    # and an unweighted draw -- so reaching this battery's behaviour now means
+    # asking for the old churning one explicitly. Same situation, and same
+    # remedy, as the var_conditioning block in _spec_qm9_conditional.
+    'buffers.anchor_buffer.thin_every_n_evals': 5,
+    'buffers.anchor_buffer.refresh_every_n_evals': 3,
+    'buffers.anchor_buffer.replay_beta': 0.5,
 }
 
 
@@ -193,7 +201,36 @@ def _spec_qm9_conditional():
         # The battery tuned the MLE exit gate for a 3k-step warm start.
         **{'protocols.conditional_vargrad.stages[0].mle_gate.slope_t': 1.0,
            'protocols.conditional_vargrad.stages[0].mle_gate.min_rate': 5.0,
-           'protocols.conditional_vargrad.stages[0].mle_gate.window': 100})
+           'protocols.conditional_vargrad.stages[0].mle_gate.window': 100,
+           # var_conditioning's DEFAULT SHAPE MOVED after this arm was recorded:
+           # the stage now runs pooled cross-branch VarGrad only, and its balance
+           # is lexicographic so that anneal_coeffs can ramp lambda_mix off the
+           # all-rules-clean streak. This arm predates all of it and ran branch
+           # VarGrad on both sides under a proportional split, so reaching it now
+           # means asking for the old shape. `balance` is replaced WHOLE rather
+           # than by `.kind`: a proportional block needs `metrics`, and carrying
+           # the lexicographic block's `rules`/`anneal_coeffs` across would fail
+           # to parse. The fracs need no override -- this arm was already 50:50,
+           # which is where the new default puts them.
+           'protocols.conditional_vargrad.stages[1].balance': {
+               'kind': 'proportional',
+               'pinned': {'replay': 0.0},
+               'metrics': {'fwd': 'fwd/logw_std_within', 'bwd': 'bwd/logw_std_within'},
+               'drive': 'relative',
+               'targets': {'fwd': 1.0, 'bwd': 1.0},
+               'default_boost': {'fwd': 0.5, 'bwd': 0.5},
+               'floor': 0.1, 'alpha': 0.01},
+           'protocols.conditional_vargrad.stages[1].loss_coeffs.fwd.vg_lb': 1.0,
+           'protocols.conditional_vargrad.stages[1].loss_coeffs.bwd.vg_lb': 1.0,
+           # not needed to make the comparison pass (the historical file has no
+           # such key, so it lands in `added`, which this test does not assert
+           # on) -- but leaving it at the new default would silently give the
+           # reproduction a cross-branch term the original never ran.
+           'protocols.conditional_vargrad.stages[1].loss_coeffs.fwd.pooled_vg': 0.0,
+           # the anchor-buffer default move, as in _BSZ_COMMON
+           'buffers.anchor_buffer.thin_every_n_evals': 5,
+           'buffers.anchor_buffer.refresh_every_n_evals': 3,
+           'buffers.anchor_buffer.replay_beta': 0.5})
 
 
 CORPUS = {'bsz_b1000': _spec_elj_b1000, 'bsz_b500': _spec_elj_b500,

@@ -12,6 +12,9 @@ Do not load this directory wholesale. Most files are evidence, snapshots, propos
 - [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md) — the current operating procedure for authority, proof, evidence, decisions, assumptions, and freshness.
 - [`current_decisions.md`](current_decisions.md) — accepted owner choices that cannot live more clearly in executable sources; read only when the task implicates one.
 - [`design/infrastructure_stabilization.md`](design/infrastructure_stabilization.md) — the active infrastructure plan adopted by decision D-002; use for sequencing and remaining-work status, not as proof of executable behavior.
+- [`mlip_validation.md`](mlip_validation.md) — what our UMA and MACE routes are
+  proven to reproduce, and what that proof does not cover; read before trusting or
+  changing an MLIP energy number.
 - Root `AGENTS.md` — the repository constitution and higher authority.
 - `configs/mk_dev.yaml` — the integrated operational control surface for current crystal runs; outside this docs directory.
 
@@ -22,6 +25,8 @@ Do not load this directory wholesale. Most files are evidence, snapshots, propos
 | `EPISTEMIC_PROTOCOL.md` | **ACTIVE** | Follow for institutional/epistemic work |
 | `current_decisions.md` | **ACTIVE DECISION RECORD** | Accepted non-executable choices; not a work queue or general log |
 | `design/infrastructure_stabilization.md` | **ACTIVE PLAN** | Remaining infrastructure sequence and completion criteria; subordinate to executable proof |
+| `mlip_validation.md` | **ACTIVE** | Scope and results of the UMA/MACE ground-truth validation; cites F-053/F-055 |
+| `design/dependency_validation_protocol.md` | **ACTIVE METHOD** | Reusable procedure for validating a reimplemented third-party computation |
 | `PROTOCOL.md` | **LEGACY** | Historical predecessor; do not follow |
 | `findings.md` | **EVIDENCE LEDGER** | Read cited entries only; scoped observations/mechanisms, not policy |
 | `decisions.md` | **LEGACY MIXED LEDGER** | Investigate specific historical rulings; do not append or treat the file as current policy |
@@ -29,6 +34,10 @@ Do not load this directory wholesale. Most files are evidence, snapshots, propos
 | `synthesis.md`, `module_*.md`, `lr_control_summary.md` | **SNAPSHOTS** until individually reverified | Explanatory navigation; verify every material claim against current proof |
 | other `design/*.md`, `to_do_rebuild.md`, `analysis_package_spec.md` | **ARGUMENT / PROPOSAL / PLAN by default** | Rationale and candidate work; not accepted policy unless individually promoted here by an active decision |
 | `reading_runs.md`, `audit_*.md`, completed handoffs/audits | **EVIDENCE / HISTORY** | Read only for the named investigation |
+
+`design/dependency_validation_protocol.md` is a reusable method, not a record: apply
+it when reimplementing or accelerating a third-party computation we then depend on.
+`mlip_validation.md` is its first worked instance.
 
 The method in `design/comment_audit.md` is reusable for proof-based freshness audits. Its particular findings describe a completed audit and are not a permanent current-state document.
 

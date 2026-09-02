@@ -1,0 +1,4 @@
+# intermediates and the rendered document -- all regenerate, see README
+*.json
+*.html
+!README.md

@@ -867,6 +867,15 @@ because a half-built thing recorded as done is how this list would stop working.
       `functional-change`, covered by root change discipline and bounded test
       routing rather than a script; documentation-refresh and standard launch,
       already deferred in §5 and never live outcomes.
+
+      **Working assumption / capability candidate (owner note, 2026-08-28):**
+      Iterative experimental judgment is an important part of this workflow:
+      choosing the next informative run, determining how long it must run before
+      it can answer its question, and stopping it once the answer or failure is
+      clear. `reading_runs.md` §6 and §8 capture current practice, but this remains
+      difficult to teach or automate reliably. Revisit which parts should become
+      a skill, script, or clearer guidance when this workflow is specified, or
+      after repeated use exposes a concrete recurring failure.
 - [x] representative training modes have current end-to-end profiles —
       `a100_stab_aug16` ran 2026-08-16→18; the accepted record is
       `docs/design/phase6_handoff.md` (rollout cost model to ±3%, MACE/UMA energy

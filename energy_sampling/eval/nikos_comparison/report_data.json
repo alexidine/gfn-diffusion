@@ -1,0 +1,608 @@
+{
+ "levels": {
+  "L0": "as delivered (his conformer)",
+  "L1": "reprojected onto our reference conformer, cell and pose unchanged",
+  "L2": "L1 rigid-body relaxed on our MACE surface (cell + pose, molecule rigid)"
+ },
+ "energy_offset": 11836.127,
+ "conformer_audit": [
+  "reference conformer: D:\\crystal_datasets\\acridine\\opt_acridine_conformer.pt",
+  "  14 heavy atoms, 91 pairwise distances, sha1 479c9b848932",
+  "source                                     n  max dev vs ref  bond mean       bond range",
+  "--------------------------------------------------------------------------------------------",
+  "opt_acridine_conformer (REFERENCE)        29        0.000000     1.4027  1.3468-1.4500",
+  "acridine_conformer (OLD)                  29        0.199114     1.3668  1.3002-1.3813  <- DIFFERENT CONFORMER",
+  "std_opt_acridine_polymorphs                7        0.000000     1.4027  1.3468-1.4500",
+  "std_acridine_polymorphs                    7        0.199114     1.3668  1.3002-1.3813  <- DIFFERENT CONFORMER",
+  "polymorphs_l2 (relaxed refs)               7        0.000000     1.4027  1.3468-1.4500",
+  "may_acridine_sg14_zp1_prior            13925        0.000000     1.4027  1.3468-1.4500",
+  "may_acridine_sg14_zp2_prior            12624        0.000000     1.4027  1.3468-1.4500",
+  "may_acridine_sg9_zp2_prior             17925        0.000000     1.4027  1.3468-1.4500",
+  "nikos l0                                  13        0.199118     1.3668  1.3002-1.3813  <- DIFFERENT CONFORMER",
+  "nikos l1                                  13        0.000000     1.4027  1.3468-1.4500",
+  "nikos l2                                  13        0.000000     1.4027  1.3468-1.4500",
+  "8 of 11 sources carry the reference conformer to < 1e-4 A on every intramolecular distance.",
+  "nikos L0 vs our OLD conformer: max deviation 0.000012 A -- SAME molecule"
+ ],
+ "polymorphs": [
+  {
+   "name": "ACRDIN04",
+   "sg": 14,
+   "zp": 1,
+   "e_exp": -60.068,
+   "e_rel": -60.884,
+   "de": -0.815,
+   "moved": 0.0653
+  },
+  {
+   "name": "ACRDIN07",
+   "sg": 14,
+   "zp": 2,
+   "e_exp": -59.711,
+   "e_rel": -60.364,
+   "de": -0.653,
+   "moved": 0.05
+  },
+  {
+   "name": "ACRDIN08",
+   "sg": 19,
+   "zp": 3,
+   "e_exp": -16.91,
+   "e_rel": -35.113,
+   "de": -18.203,
+   "moved": 0.2066
+  },
+  {
+   "name": "ACRDIN12",
+   "sg": 14,
+   "zp": 1,
+   "e_exp": -58.634,
+   "e_rel": -60.094,
+   "de": -1.46,
+   "moved": 0.1042
+  },
+  {
+   "name": "ACRDIN05",
+   "sg": 9,
+   "zp": 2,
+   "e_exp": -55.534,
+   "e_rel": -56.715,
+   "de": -1.181,
+   "moved": 0.0594
+  },
+  {
+   "name": "ACRDIN06",
+   "sg": 14,
+   "zp": 2,
+   "e_exp": -58.34,
+   "e_rel": -59.157,
+   "de": -0.817,
+   "moved": 0.0457
+  },
+  {
+   "name": "ACRIDIN_VIII",
+   "sg": 9,
+   "zp": 2,
+   "e_exp": -54.984,
+   "e_rel": -58.499,
+   "de": -3.515,
+   "moved": 0.0899
+  }
+ ],
+ "polymorph_compack": {
+  "l2": {
+   "ACRDIN04": {
+    "best": 20,
+    "rmsd": 0.1254,
+    "which": "nik00002",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   },
+   "ACRDIN07": {
+    "best": 20,
+    "rmsd": 0.0427,
+    "which": "nik00011",
+    "n15": 2,
+    "n20": 2,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   },
+   "ACRDIN08": {
+    "best": 5,
+    "rmsd": 1.1378,
+    "which": "nik00007",
+    "n15": 0,
+    "n20": 0,
+    "verdict": "NOT PRESENT",
+    "refs": "RELAXED"
+   },
+   "ACRDIN12": {
+    "best": 20,
+    "rmsd": 0.0105,
+    "which": "nik00000",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   },
+   "ACRDIN05": {
+    "best": 20,
+    "rmsd": 0.0086,
+    "which": "nik00007",
+    "n15": 2,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   },
+   "ACRDIN06": {
+    "best": 20,
+    "rmsd": 0.0036,
+    "which": "nik00012",
+    "n15": 2,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   },
+   "ACRIDIN_VIII": {
+    "best": 20,
+    "rmsd": 0.0211,
+    "which": "nik00004",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "RELAXED"
+   }
+  },
+  "l1": {
+   "ACRDIN04": {
+    "best": 20,
+    "rmsd": 0.2575,
+    "which": "nik00002",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN07": {
+    "best": 20,
+    "rmsd": 0.1978,
+    "which": "nik00011",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN08": {
+    "best": 8,
+    "rmsd": 0.7996,
+    "which": "nik00010",
+    "n15": 0,
+    "n20": 0,
+    "verdict": "NOT PRESENT",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN12": {
+    "best": 20,
+    "rmsd": 0.305,
+    "which": "nik00000",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN05": {
+    "best": 20,
+    "rmsd": 0.1558,
+    "which": "nik00007",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN06": {
+    "best": 20,
+    "rmsd": 0.1492,
+    "which": "nik00012",
+    "n15": 2,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRIDIN_VIII": {
+    "best": 20,
+    "rmsd": 0.1374,
+    "which": "nik00004",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   }
+  },
+  "l0": {
+   "ACRDIN04": {
+    "best": 20,
+    "rmsd": 0.2691,
+    "which": "nik00002",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN07": {
+    "best": 20,
+    "rmsd": 0.2129,
+    "which": "nik00011",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN08": {
+    "best": 8,
+    "rmsd": 0.7919,
+    "which": "nik00012",
+    "n15": 0,
+    "n20": 0,
+    "verdict": "NOT PRESENT",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN12": {
+    "best": 20,
+    "rmsd": 0.3144,
+    "which": "nik00000",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN05": {
+    "best": 20,
+    "rmsd": 0.1744,
+    "which": "nik00007",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRDIN06": {
+    "best": 20,
+    "rmsd": 0.1686,
+    "which": "nik00012",
+    "n15": 2,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   },
+   "ACRIDIN_VIII": {
+    "best": 20,
+    "rmsd": 0.1582,
+    "which": "nik00004",
+    "n15": 1,
+    "n20": 1,
+    "verdict": "MATCHED",
+    "refs": "experimental (unrelaxed)"
+   }
+  }
+ },
+ "nikos": [
+  {
+   "key": "nik00000",
+   "sg_label": "P21n",
+   "sg": 14,
+   "zp": 1,
+   "landscape": "sg14_zp1",
+   "e0": 11.583,
+   "e1": -47.665,
+   "e2": -60.091,
+   "moved": 0.1651,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.4768,
+    "rdf": 0.16453,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0009,
+    "rdf": 0.00035,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00001",
+   "sg_label": "P21n",
+   "sg": 14,
+   "zp": 1,
+   "landscape": "sg14_zp1",
+   "e0": 53.133,
+   "e1": -4.671,
+   "e2": -43.907,
+   "moved": 0.3685,
+   "land_l1": {
+    "n": 2,
+    "rmsd": 0.8138,
+    "rdf": 0.32466,
+    "within": false
+   },
+   "land_l2": {
+    "n": 3,
+    "rmsd": 0.4526,
+    "rdf": 0.21678,
+    "within": false
+   }
+  },
+  {
+   "key": "nik00002",
+   "sg_label": "P21n",
+   "sg": 14,
+   "zp": 1,
+   "landscape": "sg14_zp1",
+   "e0": 7.246,
+   "e1": -53.929,
+   "e2": -60.115,
+   "moved": 0.1172,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.2754,
+    "rdf": 0.11713,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0055,
+    "rdf": 0.004,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00004",
+   "sg_label": "Cc",
+   "sg": 9,
+   "zp": 2,
+   "landscape": "sg9_zp2",
+   "e0": 7.747,
+   "e1": -50.878,
+   "e2": -58.505,
+   "moved": 0.1185,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.2659,
+    "rdf": 0.11783,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0116,
+    "rdf": 0.00361,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00005",
+   "sg_label": "Cc",
+   "sg": 9,
+   "zp": 2,
+   "landscape": "sg9_zp2",
+   "e0": 15.683,
+   "e1": -44.968,
+   "e2": -54.655,
+   "moved": 0.1927,
+   "land_l1": {
+    "n": 16,
+    "rmsd": 0.5836,
+    "rdf": 0.19167,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0104,
+    "rdf": 0.00446,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00006",
+   "sg_label": "Cc",
+   "sg": 9,
+   "zp": 2,
+   "landscape": "sg9_zp2",
+   "e0": 22.239,
+   "e1": -41.916,
+   "e2": -48.926,
+   "moved": 0.121,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.3839,
+    "rdf": 0.11942,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0252,
+    "rdf": 0.00721,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00007",
+   "sg_label": "Cc",
+   "sg": 9,
+   "zp": 2,
+   "landscape": "sg9_zp2",
+   "e0": 11.355,
+   "e1": -54.662,
+   "e2": -56.662,
+   "moved": 0.0571,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.1656,
+    "rdf": 0.05783,
+    "within": true
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0081,
+    "rdf": 0.00437,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00008",
+   "sg_label": "Cc",
+   "sg": 9,
+   "zp": 2,
+   "landscape": "sg9_zp2",
+   "e0": 22.069,
+   "e1": -42.947,
+   "e2": -49.468,
+   "moved": 0.1204,
+   "land_l1": {
+    "n": 20,
+    "rmsd": 0.4479,
+    "rdf": 0.12063,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.0081,
+    "rdf": 0.00238,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00009",
+   "sg_label": "P21c",
+   "sg": 14,
+   "zp": 2,
+   "landscape": "sg14_zp2",
+   "e0": 21.059,
+   "e1": -43.016,
+   "e2": -51.312,
+   "moved": 0.1569,
+   "land_l1": {
+    "n": 13,
+    "rmsd": 0.5444,
+    "rdf": 0.15596,
+    "within": false
+   },
+   "land_l2": {
+    "n": 20,
+    "rmsd": 0.028,
+    "rdf": 0.00688,
+    "within": true
+   }
+  },
+  {
+   "key": "nik00010",
+   "sg_label": "P21c",
+   "sg": 14,
+   "zp": 2,
+   "landscape": "sg14_zp2",
+   "e0": 21.866,
+   "e1": -43.737,
+   "e2": -51.322,
+   "moved": 0.1617,
+   "land_l1": {
+    "n": 4,
+    "rmsd": 0.3969,
+    "rdf": 0.18428,
+    "within": false
+   },
+   "land_l2": {
+    "n": 5,
+    "rmsd": 0.8021,
+    "rdf": 0.2114,
+    "within": false
+   }
+  },
+  {
+   "key": "nik00011",
+   "sg_label": "P21c",
+   "sg": 14,
+   "zp": 2,
+   "landscape": "sg14_zp2",
+   "e0": 7.65,
+   "e1": -56.281,
+   "e2": -60.34,
+   "moved": 0.0822,
+   "land_l1": {
+    "n": 9,
+    "rmsd": 0.4165,
+    "rdf": 0.14725,
+    "within": false
+   },
+   "land_l2": {
+    "n": 9,
+    "rmsd": 0.4163,
+    "rdf": 0.14068,
+    "within": false
+   }
+  },
+  {
+   "key": "nik00012",
+   "sg_label": "P21n",
+   "sg": 14,
+   "zp": 2,
+   "landscape": "sg14_zp2",
+   "e0": 9.428,
+   "e1": -54.843,
+   "e2": -59.156,
+   "moved": 0.0774,
+   "land_l1": {
+    "n": 9,
+    "rmsd": 0.4833,
+    "rdf": 0.13963,
+    "within": false
+   },
+   "land_l2": {
+    "n": 5,
+    "rmsd": 0.4814,
+    "rdf": 0.14173,
+    "within": false
+   }
+  },
+  {
+   "key": "nik00013",
+   "sg_label": "P21n",
+   "sg": 14,
+   "zp": 2,
+   "landscape": "sg14_zp2",
+   "e0": 31.753,
+   "e1": -34.288,
+   "e2": -56.652,
+   "moved": 0.2223,
+   "land_l1": {
+    "n": 11,
+    "rmsd": 0.513,
+    "rdf": 0.20504,
+    "within": false
+   },
+   "land_l2": {
+    "n": 10,
+    "rmsd": 0.3309,
+    "rdf": 0.14916,
+    "within": false
+   }
+  }
+ ],
+ "duplicates": [
+  {
+   "a": "nik00011",
+   "b": "nik00013",
+   "rdf_l2": 0.0854,
+   "note": "P2_1/c and P2_1/n settings of the SAME space group (14); converge inside the 0.10 cut only after relaxation"
+  }
+ ],
+ "excluded": [
+  {
+   "key": "nik00003",
+   "sg": "C2"
+  },
+  {
+   "key": "nik00014",
+   "sg": "P2_1 2_1 2_1"
+  }
+ ]
+}

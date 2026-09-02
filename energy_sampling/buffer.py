@@ -276,7 +276,8 @@ class CrystalBuffer:
     def __len__(self):
         return self.batch.num_graphs
 
-    def _sample_condition_blocked_indices(self, batch_size: int, m: int):
+    def _sample_condition_blocked_indices(self, batch_size: int, m: int,
+                                          target_cids=None):
         """
         Condition-blocked draw: sample conditions, then up to m DISTINCT rows
         (different terminals) within each, until batch_size rows are
@@ -302,10 +303,31 @@ class CrystalBuffer:
         counts = np.diff(np.r_[boundaries, sorted_cid.size])
 
         eligible = np.flatnonzero(counts >= 2)
+
+        # ALIGNMENT for the cross-branch pooled VarGrad: serve the conditions the
+        # FORWARD batch just drew before any others, so the pooled group is
+        # actually mixed. Independent draws share only Gf*Gb/K conditions -- 212
+        # of 5265 at the shipped sizes, i.e. ~19% of rows -- and on the rest the
+        # pooled term silently degenerates to each branch's own.
+        # ORDERING, not filtering: non-target conditions still fill any remaining
+        # budget, so a buffer that cannot cover the request degrades to the old
+        # behaviour instead of under-filling, matching this function's contract.
+        if target_cids is not None and eligible.size:
+            tgt = np.asarray(target_cids).ravel()
+            if tgt.size:
+                want = np.isin(sorted_cid[boundaries[eligible]], tgt)
+                order_eligible = np.concatenate([
+                    np.random.permutation(eligible[want]),
+                    np.random.permutation(eligible[~want])])
+            else:
+                order_eligible = np.random.permutation(eligible)
+        else:
+            order_eligible = np.random.permutation(eligible)
+
         budget = min(batch_size, n)
         chosen = []
         n_chosen = 0
-        for g in np.random.permutation(eligible):
+        for g in order_eligible:
             take = min(m, int(counts[g]), budget - n_chosen)
             if take <= 0:
                 break
@@ -319,6 +341,38 @@ class CrystalBuffer:
             inds = np.concatenate([inds, extra])
         return inds.astype(np.int64)
 
+    def _target_row_pool(self, target_cids):
+        """Row indices whose condition the caller asked to be served FIRST.
+
+        None when nothing was requested, or when the request matches no stored
+        row -- both mean "draw as usual", never "draw nothing".
+        """
+        if target_cids is None or not hasattr(self.batch, 'condition_id'):
+            return None
+        tgt = np.asarray(target_cids).ravel()
+        if tgt.size == 0:
+            return None
+        cid = np.asarray(self.batch.condition_id.detach().cpu().flatten())
+        rows = np.flatnonzero(np.isin(cid, tgt))
+        return rows if rows.size else None
+
+    def _draw_aligned(self, n, k, target_rows):
+        """`k` rows, preferring the requested conditions, topping up from the rest.
+
+        ORDER, DON'T FILTER: a request the buffer cannot fill degrades to the old
+        broad draw rather than under-filling the batch, matching
+        _sample_condition_blocked_indices' contract.
+        """
+        if k <= 0:
+            return np.empty(0, dtype=np.int64)
+        if target_rows is None:
+            return np.random.choice(n, size=k, replace=k > n)
+        take = min(k, target_rows.size)
+        out = np.random.choice(target_rows, size=take, replace=take > target_rows.size)
+        if take < k:
+            out = np.concatenate([out, np.random.choice(n, size=k - take, replace=k - take > n)])
+        return out.astype(np.int64)
+
     def _sample_indices(
             self,
             batch_size: int,
@@ -327,16 +381,40 @@ class CrystalBuffer:
             p: Optional[np.ndarray] = None,
             beta: float = 0.0,  # fraction drawn uniformly
             condition_block_m: int = 0,
+            target_cids=None,
     ):
         n = len(self)
 
         if n == 0:
             raise ValueError("Cannot sample from an empty SimpleDataset.")
 
+        # AN EMPTY REQUEST IS AN EMPTY DRAW, not a negative dimension. The
+        # prioritised path computes `n_uniform = max(1, int(batch_size * beta))`
+        # and then `n_weighted = batch_size - n_uniform`, so batch_size 0 with
+        # any beta > 0 asks numpy for -1 samples and dies inside
+        # np.random.choice with "negative dimensions are not allowed" -- a
+        # message that names neither the buffer nor the caller. Callers that
+        # legitimately ask for nothing (a top-up whose configured size is 0, a
+        # shortfall that came out empty) must get an empty result.
+        if batch_size <= 0:
+            return np.empty(0, dtype=np.int64)
+
+        # ALIGNMENT IS CONDITION SELECTION, AND IT APPLIES ON EVERY PATH.
+        # It used to live only inside _sample_condition_blocked_indices, which
+        # made it contingent on condition_block_m >= 2: a stage that asked for
+        # aligned draws but did not also set block_m got no alignment and no
+        # error. The two are independent axes --
+        #     WHICH CONDITIONS to serve   -> target_cids (here)
+        #     WHICH/HOW MANY ROWS in each -> condition_block_m, p, beta
+        # -- so they compose instead of one silently cancelling the other.
+        target_rows = self._target_row_pool(target_cids)
+
         if condition_block_m >= 2:
-            # blocked draws bypass the weighted/p machinery (bwd training draws
-            # pass weighted=False anyway) -- see _sample_condition_blocked_indices
-            inds = self._sample_condition_blocked_indices(batch_size, condition_block_m)
+            # the blocked path expresses alignment as an ORDERING over whole
+            # conditions (targets first), which is stronger than a row mask
+            # because it also decides how many rows each condition contributes.
+            inds = self._sample_condition_blocked_indices(batch_size, condition_block_m,
+                                                          target_cids=target_cids)
             if repeats > 1:
                 inds = np.repeat(inds, repeats)
             return inds
@@ -345,9 +423,18 @@ class CrystalBuffer:
             n_uniform = max(1, int(batch_size * beta))
             n_weighted = batch_size - n_uniform
 
+            # ALIGNMENT TOUCHES ONLY THE UNIFORM SLICE. `p` is a DESIGN MEASURE
+            # and a caller may be dividing by it (the replay path's IS weights);
+            # restricting the pool underneath it would leave the weights
+            # correcting for a measure the draw no longer used -- the same
+            # inverse-measure error the prioritise-plus-blocked exclusion in
+            # train.py exists to prevent. The uniform slice carries no such
+            # correction, so it can be aligned freely.
             weighted_inds = np.random.choice(n, size=n_weighted, replace=True, p=p)
-            uniform_inds = np.random.choice(n, size=n_uniform, replace=n_uniform > n)
+            uniform_inds = self._draw_aligned(n, n_uniform, target_rows)
             inds = np.concatenate([weighted_inds, uniform_inds])
+        elif p is None and target_rows is not None:
+            inds = self._draw_aligned(n, batch_size, target_rows)
         else:
             if replace is None:
                 # A supplied `p` is a DESIGN MEASURE, and importance-sampling
@@ -434,6 +521,7 @@ class CrystalBuffer:
             return_traj: bool = False,
             p: Optional[np.ndarray] = None,
             condition_block_m: int = 0,
+            target_cids=None,
     ):
         # p, if given, overrides the built-in loss-weighted distribution entirely
         # (e.g. an externally-computed per-condition z_gap weighting) -- weighted/
@@ -441,7 +529,8 @@ class CrystalBuffer:
         if p is None:
             p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta,
-                                    condition_block_m=condition_block_m)
+                                    condition_block_m=condition_block_m,
+                                    target_cids=target_cids)
         self._bump_counts(inds)
 
         # No data_list round trip. Storage is std-oriented at admission
@@ -469,6 +558,7 @@ class CrystalBuffer:
             return_traj: bool = False,
             p: Optional[np.ndarray] = None,
             condition_block_m: int = 0,
+            target_cids=None,
     ):
         """
         Infinite random-batch generator. Use next() on it.
@@ -502,7 +592,8 @@ class CrystalBuffer:
                 graphs, inds, traj = self.sample_graphs(batch_size,
                                                         repeats=repeats, weighted=weighted, temperature=temperature,
                                                         beta=beta, return_traj=return_traj, p=p,
-                                                        condition_block_m=condition_block_m)
+                                                        condition_block_m=condition_block_m,
+                                                        target_cids=target_cids)
                 result = (graphs,)
                 if return_traj:
                     result = result + (traj,)
@@ -1262,6 +1353,23 @@ class ConditionLogZTracker:
         # steps rather than elapsed update() calls.
         self.last_update_step = torch.full((library_size,), -1, dtype=torch.long)
         self.best_energy = torch.full((library_size,), float("inf"), dtype=torch.float32)
+        # the same minimum at lambda=1. Identical to best_energy on every
+        # lambda-free run; see update_best_energy for why both are needed.
+        self.best_energy_phys = torch.full((library_size,), float("inf"), dtype=torch.float32)
+        # True until some caller supplies an explicit energy_phys. While it holds,
+        # best_energy_phys is a bit-for-bit ALIAS of best_energy.
+        #
+        # ⚠ THE FLAG ALONE CANNOT TELL YOU WHETHER THE ALIAS IS CORRECT. Its
+        # literal meaning is "no caller passed energy_phys", and that is only the
+        # same as "the alias is right" on a LAMBDA-FREE run. On a mixing run an
+        # unwired caller would produce alias=True over MIXED energies -- the exact
+        # falsehood this flag exists to prevent. `requires_phys_energy` is what
+        # closes that: the trainer sets it whenever the energy function carries a
+        # prior_flow, and update_best_energy then REFUSES to accept an implicit
+        # alias. So alias=True is trustworthy precisely because a mixing run
+        # cannot reach it.
+        self.phys_is_alias = True
+        self.requires_phys_energy = False
         # per-condition EMA of the CLIPPED signed residual mean(clamp(logw -
         # log_Z_learned, +-clip_beta)) -- the per-condition dL/dZ ruler, the
         # persistent analog of quick_tb_stats' pooled 'tb_resid_clipped'. Clip,
@@ -1318,6 +1426,10 @@ class ConditionLogZTracker:
         # nothing here feeds back into training. See pop_discovery_stats.
         self.minima_improved_total = 0
         self.minima_depth_total = 0.0
+        # rows update_best_energy refused because they were not finite -- a failed
+        # MLIP forward is the expected source. Cumulative, never drained: a nonzero
+        # value means some reward this run was fabricated, which stays true later.
+        self.nonfinite_energies_seen = 0
         self._window_improved = 0
         self._window_depth = 0.0
         self._window_first_visits = 0
@@ -1924,8 +2036,14 @@ class ConditionLogZTracker:
     def var_z_bias(self, min_visits: Optional[float] = None):
         """
         VARIANCE across trusted conditions of the unclipped per-condition level
-        error -- the dispersion the z_var loss term penalizes, reported so the
-        loss has a matching diagnostic.
+        error.
+
+        NB this is a DIAGNOSTIC ONLY, with no loss behind it. It claimed to
+        mirror "the z_var loss term" until 2026-08-31; there is no such term.
+        `z_var` survives only as a coefficient key that train.py's Z-calibration
+        paths setattr to 0.0, and nothing in gflownet_losses reads it. Level
+        dispersion is therefore measured here and penalized nowhere -- contrast
+        `z_level`, which is a real term (see z_level_loss).
 
         Variance, not RMS, deliberately: a UNIFORM offset in z_bias is
         harmless (it is a global Z shift, and TB's own gradient owns the
@@ -1969,7 +2087,6 @@ class ConditionLogZTracker:
             return float('inf')
         return torch.sqrt(var[mask].clamp(min=0.0).mean()).item()
 
-    @torch.no_grad()
     @torch.no_grad()
     def calibration_targets(self, condition_id, step: int,
                             min_visits: Optional[int] = None,
@@ -2126,7 +2243,7 @@ class ConditionLogZTracker:
         return err, mask
 
     @torch.no_grad()
-    def update_best_energy(self, condition_id, energy):
+    def update_best_energy(self, condition_id, energy, energy_phys=None):
         """
         Per-condition running minimum energy. Unlike update()'s EMA math,
         this needs no torch.unique/inverse pass: torch.scatter_reduce_
@@ -2142,9 +2259,59 @@ class ConditionLogZTracker:
         depth (old - new, only defined where the old minimum was finite),
         and first visits (inf -> finite). These accumulate into the
         _window_* scalars for pop_discovery_stats to drain.
+
+        `energy_phys` is the SAME quantity evaluated at lambda=1 -- the physical
+        leg -- tracked in parallel as `best_energy_phys`. Two minima are needed
+        because the two consumers want different things and only one of them can
+        be satisfied by a single tensor:
+
+          best_energy       the mixture actually being sampled. What coverage and
+                            the ramp are questions about.
+          best_energy_phys  lambda-INVARIANT, and therefore the only one whose
+                            running minimum is genuinely monotone. Anchor
+                            filtering must use it, because an anchor trim on mixed
+                            energy would evict good structures irreversibly (see
+                            AnchorBuffer.thin: "can never re-qualify").
+
+        ⚠ WHY, precisely -- an earlier version of this note had the reason wrong in
+        a way that would mislead someone into applying it to the prior buffer too.
+        It is NOT that a physically-good structure is generally rare under the
+        prior: the flow is fitted to the trained prior policy's own draws, and that
+        policy approximates the physical target, so E_flow and E_phys are
+        POSITIVELY correlated over a generic population. The premise holds on the
+        ANCHOR population specifically, and only because anchor selection induces
+        it: candidates are screened on `surprise = log_Z(c) + log_pf - log_r < cut`,
+        which selects states the policy UNDER-samples, i.e. low log_pf, i.e. the
+        high-flow-energy tail. So anchors are by construction the rows whose mixed
+        energy misrepresents them worst at small lambda. That argument does not
+        transfer to the prior buffer, which is meant to BE a sample of the current
+        target and should be judged in the mixture.
+
+        Pass None on a lambda-free run: the mixture IS the physical energy there,
+        so the two tensors stay bit-identical and nothing changes.
         """
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
+        if energy_phys is None:
+            if self.requires_phys_energy:
+                raise ValueError(
+                    "update_best_energy was called without energy_phys on a run whose "
+                    "energy function carries a prior_flow, so the mixture and the "
+                    "physical leg are DIFFERENT quantities. Aliasing them would write "
+                    "mixed energies into best_energy_phys and then stamp "
+                    "phys_is_alias=True, which is precisely the claim that flag exists "
+                    "to make false. Pass the physical leg (ens_dict['physical_energy'], "
+                    "carried on the scored batch) alongside the mixture.")
+            energy_phys = energy
+        else:
+            self.phys_is_alias = False
+            energy_phys = torch.as_tensor(
+                energy_phys, dtype=torch.float32).detach().cpu().flatten()
+            if energy_phys.shape != energy.shape:
+                raise ValueError(
+                    f"energy_phys has shape {tuple(energy_phys.shape)} but energy has "
+                    f"{tuple(energy.shape)}; they must be the same per-sample quantity "
+                    f"at two lambdas, not two different batches")
 
         if condition_id.numel() == 0:
             return
@@ -2155,10 +2322,41 @@ class ConditionLogZTracker:
                 f"{condition_id.shape[0]} and {energy.shape[0]}."
             )
 
+        # NON-FINITE ROWS ARE DROPPED AT THE DOOR, and this is load-bearing rather
+        # than defensive tidiness. best_energy is a PERSISTENT running minimum and
+        # scatter_reduce_'s amin propagates NaN, so a single NaN entry pins that
+        # condition's minimum at NaN for the rest of the run -- no later real energy
+        # can improve on it, because every comparison against NaN is False. A failed
+        # MLIP forward substitutes NaN precisely so consumers can reject it
+        # (uma_utils._crashed_energy); this is the consumer that has to.
+        # BOTH legs must be finite, not just the mixture: a NaN reaching either
+        # persistent minimum pins that condition forever (amin propagates NaN and
+        # every later comparison against it is False). Identical to the old mask
+        # on a lambda-free run, where energy_phys IS energy.
+        #
+        # THE `&` IS LOAD-BEARING, not conservatism: it makes the two tensors'
+        # VISITED SETS IDENTICAL BY CONSTRUCTION. lookup_best_energy derives its
+        # `mask` from whichever tensor it returns, and the discovery telemetry is
+        # computed from best_energy alone -- per-leg masks would let the sets
+        # diverge, invalidating _window_first_visits for the physical stream and
+        # making any mask-from-one / value-from-the-other pairing unsound.
+        finite = torch.isfinite(energy) & torch.isfinite(energy_phys)
+        if not finite.all():
+            self.nonfinite_energies_seen += int((~finite).sum())
+            condition_id = condition_id[finite]
+            energy = energy[finite]
+            energy_phys = energy_phys[finite]
+            if condition_id.numel() == 0:
+                return
+
         unique_ids = torch.unique(condition_id)
         old_best = self.best_energy[unique_ids]
 
         self.best_energy.scatter_reduce_(0, condition_id, energy, reduce="amin", include_self=True)
+        self.best_energy_phys.scatter_reduce_(
+            0, condition_id, energy_phys, reduce="amin", include_self=True)
+        # The discovery telemetry computed below reads the MIXTURE's minimum only:
+        # it reports progress against the target actually being sampled.
 
         new_best = self.best_energy[unique_ids]
         had_min = torch.isfinite(old_best)
@@ -2234,7 +2432,7 @@ class ConditionLogZTracker:
         }
 
     @torch.no_grad()
-    def lookup_best_energy(self, condition_id):
+    def lookup_best_energy(self, condition_id, physical: bool = False):
         """
         Returns (best_energy, mask) where mask is True for entries that
         have been visited at least once -- no min_visits threshold here,
@@ -2242,9 +2440,27 @@ class ConditionLogZTracker:
         noisy estimate needing warm-up. best_energy is 0 (not inf) wherever
         mask is False, so it's always safe to use directly without a
         separate inf-guard.
+
+        `physical=True` returns the lambda=1 minimum instead. Ask for it wherever
+        the answer must not move when lambda does -- anchor admission and trim
+        above all, since those are irreversible. The default is the mixture, so
+        every existing caller keeps the behaviour it was written against.
+
+        REFUSES while the physical stream is still an alias, rather than handing
+        back the mixture under a name that promises otherwise. On a lambda-free
+        run the two ARE the same number, so ask for the default there; a caller
+        that specifically wants a lambda-invariant minimum is asking a question
+        that only means something once the stream is real.
         """
+        if physical and self.phys_is_alias:
+            raise ValueError(
+                "lookup_best_energy(physical=True) on a tracker whose best_energy_phys "
+                "is still an ALIAS of best_energy -- no caller has supplied energy_phys, "
+                "so this would silently return the mixture. Either wire the physical leg "
+                "into update_best_energy, or read best_energy directly if the mixture is "
+                "what you actually want.")
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
-        best = self.best_energy[condition_id]
+        best = (self.best_energy_phys if physical else self.best_energy)[condition_id]
         mask = torch.isfinite(best)
         best = torch.where(mask, best, torch.zeros_like(best))
         return best, mask
@@ -2264,6 +2480,10 @@ class ConditionLogZTracker:
             "effective_count": self.effective_count.cpu(),
             "last_update_step": self.last_update_step.cpu(),
             "best_energy": self.best_energy.cpu(),
+            "best_energy_phys": self.best_energy_phys.cpu(),
+            # must survive a resume: rebuilt as True, a reloaded mixing run would
+            # claim its physical minimum is an alias when it is a real stream
+            "phys_is_alias": bool(self.phys_is_alias),
             "z_grad_ema": self.z_grad_ema.cpu(),
             "z_bias_ema": self.z_bias_ema.cpu(),
             "z_resid_effective_count": self.z_resid_effective_count.cpu(),
@@ -2280,6 +2500,7 @@ class ConditionLogZTracker:
             "discovery_half_life_steps": self.discovery_half_life_steps,
             "minima_improved_total": self.minima_improved_total,
             "minima_depth_total": self.minima_depth_total,
+            "nonfinite_energies_seen": self.nonfinite_energies_seen,
             "window_improved": self._window_improved,
             "window_depth": self._window_depth,
             "window_first_visits": self._window_first_visits,
@@ -2333,6 +2554,21 @@ class ConditionLogZTracker:
         # only honest fallback; there's no lifetime stat to reconstruct it from
         obj.best_energy = state.get(
             "best_energy", torch.full_like(obj.count, float("inf"), dtype=torch.float32)).cpu()
+        # ⚠ CLONING IS EXACT ONLY IF THE CHECKPOINT CAME FROM A LAMBDA-FREE RUN,
+        # and this loader cannot tell. Lambda mixing predates this tensor: the
+        # 2026-08-30 qm9c_lam* checkpoints carry a MIXED minimum under the name
+        # `best_energy`, so cloning it here produces a physical stream that is
+        # nothing of the sort. Those are not resumable into this design.
+        # What makes that safe rather than merely documented: the trainer sets
+        # `requires_phys_energy` after every load (train.py's resume path), so a
+        # mixing run raises on its first update_best_energy instead of quietly
+        # inheriting a mislabelled minimum.
+        obj.best_energy_phys = state.get("best_energy_phys", obj.best_energy.clone()).cpu()
+        # absent => the checkpoint predates the physical stream => it is an alias
+        obj.phys_is_alias = bool(state.get("phys_is_alias", True))
+        # NOT restored from state: it is a fact about the live run's energy
+        # function, and the trainer re-asserts it after this returns.
+        obj.requires_phys_energy = False
         # NaN/0/current_step (never-updated sentinels) are the only honest
         # fallback for a stream a checkpoint doesn't carry, same reasoning as above:
         # update_z_residual's nan masks warm it from the first post-reload batch
@@ -2380,6 +2616,7 @@ class ConditionLogZTracker:
         obj.discovery_half_life_steps = state.get("discovery_half_life_steps", 200.0)
         obj.minima_improved_total = state.get("minima_improved_total", 0)
         obj.minima_depth_total = state.get("minima_depth_total", 0.0)
+        obj.nonfinite_energies_seen = state.get("nonfinite_energies_seen", 0)
         obj._window_improved = state.get("window_improved", 0)
         obj._window_depth = state.get("window_depth", 0.0)
         obj._window_first_visits = state.get("window_first_visits", 0)
@@ -2394,10 +2631,16 @@ def _per_condition_min(ids: torch.Tensor, values: torch.Tensor, query_ids: torch
     Per-condition minimum of `values` grouped by `ids`, evaluated at each of
     `query_ids`; +inf wherever a query id has no representative in `ids`.
 
-    Shared by AnchorBuffer.admit's per-condition admission gate and thin's
-    per-condition max_size protection, so a single dominant condition's
-    energy scale can never be used (via a buffer-wide scalar) to gate or
-    evict anchors belonging to some other condition.
+    The point is that a single dominant condition's energy scale can never be
+    used (via a buffer-wide scalar) to gate or evict anchors belonging to some
+    other condition.
+
+    NB this is currently reachable from ONE caller only: train.py's anchor
+    metrics block. It is also called from AnchorBuffer.admit, but only inside
+    the admit_range branch, which is dead -- both admit() call sites pass
+    admit_range=None. thin() has never called this at all; it takes a
+    caller-supplied per-condition minimum instead. (The docstring claimed both
+    of those as live users until 2026-08-31.)
     """
     out = torch.full((query_ids.numel(),), float('inf'), dtype=torch.float32)
     if ids.numel() == 0:
@@ -2434,42 +2677,6 @@ def _per_condition_max(ids: torch.Tensor, values: torch.Tensor, query_ids: torch
     return out
 
 
-def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
-    """
-    Greedily keep the lowest-e point in each d_cut neighborhood: sort by e
-    ascending, accept a point if it isn't already blocked by an accepted
-    neighbor, then block everything within d_cut of it. Standalone (not a
-    buffer method) so it can be reused without depending on the legacy
-    CrystalReplayBuffer this pattern originated in.
-    """
-    sort_inds = torch.argsort(e.to(device))
-    xx_sorted = xx.to(device)[sort_inds]
-    e_sorted = e.to(device)[sort_inds]
-    mask = e_sorted < e_cut
-
-    blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
-    keep = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
-    d_cut_squared = d_cut * d_cut
-    for i in range(len(xx_sorted)):
-        if not mask[i]:
-            break
-
-        if blocked[i]:
-            continue
-
-        keep[i] = True
-        if torch.sum(keep) == max_new_samples:
-            break
-
-        drow = ((xx_sorted - xx_sorted[i, None, :]) ** 2).sum(-1)  # faster, skips sqrt
-        nearby = drow < d_cut_squared
-        blocked |= nearby
-
-    keep_inds = sort_inds[keep]
-
-    return keep_inds.cpu()
-
-
 class AnchorBuffer(CrystalBuffer):
     """
     Permanent archive of surprising, high-quality samples: states the
@@ -2485,9 +2692,10 @@ class AnchorBuffer(CrystalBuffer):
     and then samples anchors for replay weighted by that EMA (with a random
     floor via sample_graphs(weighted=True, beta=...)) -- a well-learned
     anchor draws little replay; one the policy is drifting off draws more,
-    automatically. purge()/purge_lowest() are still meaningless here (no
-    "training loss" is ever computed against an anchor) and should not be
-    called on an AnchorBuffer.
+    automatically. The inherited purge_lowest() is still meaningless here (no
+    "training loss" is ever computed against an anchor) and must not be called
+    on an AnchorBuffer -- use thin() or purge_by_index(). There is no purge()
+    on CrystalBuffer; the docstring named one until 2026-08-31.
 
     Reward is stored explicitly per entry (self.reward) rather than derived
     on demand from the resident batch, because temperature isn't persisted
@@ -2717,9 +2925,13 @@ class AnchorBuffer(CrystalBuffer):
         candidate_batch/reward/energy are expected to already be the
         confirmed-surprising set (see train.py's screen_and_admit_anchors) --
         surprise, not distance or energy proximity, is the novelty gate.
-        admit_range is kept only for the legacy/bootstrap fallback path (see
-        train.py's manage_anchor_buffer bootstrap branch); pass None to admit
-        every candidate handed in, which is the normal case now.
+        admit_range is DEAD: both call sites (train.py's
+        top_up_prior_from_anchors and screen_and_admit_anchors) pass None, so
+        every candidate handed in is admitted, and the energy-proximity branch
+        below never runs. It was kept for a legacy bootstrap path in a
+        `manage_anchor_buffer` that no longer exists anywhere in the repo --
+        the docstring pointed at that function until 2026-08-31. Delete the
+        parameter and its branch when the anchor rework lands.
 
         Greedily admit survivors -- processed best-energy-first -- against a
         reference set seeded with the current anchors and grown as
@@ -2744,7 +2956,23 @@ class AnchorBuffer(CrystalBuffer):
         docstring for why it's stored frozen rather than updated later.
 
         Returns the number of anchors admitted or replaced.
+
+        FROZEN SHORT-CIRCUITS THIS ENTIRE METHOD. `frozen` is checked here, at
+        the primitive, rather than at the five call sites -- train.py's
+        screen_and_admit_anchors (admit + overflow thin) and
+        top_up_prior_from_anchors' record-breaker block (admit + overflow thin),
+        plus evaluation()'s cadence thin. Guarding callers would leave any
+        future one live; guarding here cannot. Seeding is unaffected: both
+        constructors (init_anchor_buffer_seed, and screen_and_admit_anchors'
+        lazy bootstrap) build the buffer directly and never route through admit.
+
+        NB admit EVICTS as well as adds -- the replace path purges the displaced
+        slot -- and the replacement is 1-for-1, so `anchor_buffer_length` does
+        NOT move when it fires. Membership churn is invisible in that metric;
+        judge a freeze on content, not on length.
         """
+        if getattr(self, 'frozen', False):
+            return 0
         reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
         energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
         if reward.numel() == 0:
@@ -2886,7 +3114,15 @@ class AnchorBuffer(CrystalBuffer):
         is the one non-adaptive, explicitly irreversible eviction path -- see
         AnchorBuffer's docstring. If this fires regularly, energy_window is too
         wide; that's the diagnostic, not a reason for a smarter eviction rule.
+
+        FROZEN SHORT-CIRCUITS THIS ENTIRE METHOD -- see admit(). Note this
+        one drops rows on `energy_window` against a per-condition minimum that
+        RATCHETS DOWN all run, so it evicts steadily even when the buffer is far
+        under max_size, and it runs on the eval cadence in every stage (its
+        block is gated on the buffer existing, not on buffers_active).
         """
+        if getattr(self, 'frozen', False):
+            return
         n = len(self)
         if n == 0:
             return

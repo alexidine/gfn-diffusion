@@ -1346,17 +1346,28 @@ def test_a_repeat_bracket_mid_refit_does_not_lose_the_suspended_bars():
         'a cancelled refit left the tripwire suspended with nothing pending')
 
 
-def test_bwd_blocked_draw_arms_on_either_vg_flavour():
-    """2026-08-26: the bwd blocked-draw gate tested vg_lb ALONE, so switching a
-    stage to the logmeanexp flavour (vg_lme) silently disabled condition-blocked
-    draws -- groups collapsed to birthday collisions (~1.03 rows/condition) and
-    the condition-grouped VarGrad became a near-no-op with no error. The replay
-    path's gate already tested both flavours; this pins the bwd one to match."""
+def test_bwd_blocked_draw_gate_does_not_reopen_the_coefficient_list():
+    """The bwd blocked-draw gate must ASK, not re-list.
+
+    History: the gate tested `vg_lb` alone until 2026-08-26, when `vg_lme`
+    silently disabled condition-blocked draws; it was fixed by adding one
+    disjunct. On 2026-08-28 the same omission recurred for `pooled_vg` -- a
+    pooled-only arm ran with blocked draws off, backward groups collapsed to
+    1.30 rows/condition against the control's 1.99, and three quarters of
+    backward rows contributed exactly zero. Adding a disjunct did not prevent
+    the recurrence; removing the list from the call site does.
+
+    This test therefore asserts the INVERSE of its predecessor: the gate must
+    name no coefficients at all.
+    """
     import re
     src = open('train.py', encoding='utf-8').read()
     i = src.index("blc = self.args.bwd_loss_coeffs")
     gate = src[i:i + 900]
-    assert "'vg_lme'" in gate, (
-        'the bwd blocked-draw gate ignores vg_lme, so an lme stage runs with '
-        'blocked draws silently off')
-    assert "'vg_lb'" in gate
+    assert '_runs_grouped_vargrad' in gate, (
+        'the bwd blocked-draw gate no longer routes through the shared '
+        'predicate; it will drift out of sync with config_invariants again')
+    for name in ("'vg_lb'", "'vg_lme'", "'pooled_vg'"):
+        assert name not in gate.split('block_m =')[1][:300], (
+            f'the gate re-opens the coefficient list ({name}); add it to '
+            'config_invariants.BRANCH_VARGRAD_COEFFS instead')

@@ -206,6 +206,9 @@ def batch_ceiling_above_floor(cfg: dict) -> list[Violation]:
 _ANGULAR_ENERGY_FUNCTIONS = frozenset({
     'elj', 'lj', 'qlj', 'uma', 'mace', 'combo', 'silu', 'silu_energy',
     'simple_density', 'ellipsoid_overlap', 'crystal_harmonic', 'crystal_multiharmonic',
+    # latent_knn scores a REAL crystal parameterization (is_crystal True), so it
+    # carries cell angles despite being scored in latent space.
+    'latent_knn',
 })
 
 
@@ -846,9 +849,44 @@ def _coeff(cfg: dict, stage: dict, mode: str, key: str):
     return _num(_get(cfg, f'{mode}_loss_coeffs.{key}'))
 
 
+# THE COEFFICIENTS THAT ARM CONDITION GROUPING, named in ONE place.
+#
+# Three of them now mean "a grouped variance objective reads this branch's
+# condition groups", and they are NOT all on the branch they arm:
+#   vg_lb / vg_lme  branch-local VarGrad flavours, read off that branch's block
+#   pooled_vg       the CROSS-BRANCH term: it concatenates the forward and
+#                   backward rows into ONE set of condition groups, so it arms
+#                   grouping on BOTH branches while living on fwd_loss_coeffs
+#                   alone. A gate that only widens its test on `blc` therefore
+#                   still reads 0 for a pooled-only arm and still looks right.
+#
+# This list has now been wrong TWICE for the same reason -- vg_lme (2026-08-26)
+# and pooled_vg (2026-08-28) -- each time because a caller open-coded the test
+# instead of asking here, and each time the failure was silent: the blocked draw
+# switched off, groups collapsed to singletons, and the term became a near-no-op
+# with no error. `runs_grouped_vargrad` is the ONLY place that names them;
+# tests/test_grouped_vargrad_predicate.py fails if a caller re-opens the list.
+BRANCH_VARGRAD_COEFFS = ('vg_lb', 'vg_lme')
+CROSS_BRANCH_VARGRAD_COEFF = 'pooled_vg'   # on fwd_loss_coeffs; arms BOTH branches
+
+
+def runs_grouped_vargrad(branch_get, fwd_get) -> bool:
+    """Does a grouped-variance objective read this branch's condition groups?
+
+    Written over GETTERS rather than a config dict so the raw-YAML rules here and
+    train.py's resolved-Namespace gates share one implementation instead of two
+    copies that drift. Each getter takes a coefficient name and returns a number
+    or None.
+    """
+    if any((branch_get(k) or 0.0) > 0 for k in BRANCH_VARGRAD_COEFFS):
+        return True
+    return (fwd_get(CROSS_BRANCH_VARGRAD_COEFF) or 0.0) > 0
+
+
 def _runs_vargrad(cfg: dict, stage: dict, mode: str) -> bool:
-    return bool((_coeff(cfg, stage, mode, 'vg_lb') or 0.0) > 0
-                or (_coeff(cfg, stage, mode, 'vg_lme') or 0.0) > 0)
+    return runs_grouped_vargrad(
+        lambda k: _coeff(cfg, stage, mode, k),
+        lambda k: _coeff(cfg, stage, 'fwd', k))
 
 
 def vargrad_needs_groups(cfg: dict) -> list[Violation]:

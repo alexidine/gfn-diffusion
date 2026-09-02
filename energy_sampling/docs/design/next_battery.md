@@ -732,7 +732,7 @@ losses, buffer churn — is not, and paying UMA rates to answer it is waste.
 Throughput used for costing, from the measured phase-2 rates: `nehzor_uma` 188
 steps/h, `mipcas_uma` ~440, `nehzor_elj` 693, `mipcas_elj` 1,141.
 
-#### Tier A — gates the production runs. 10 runs, 89 GPU-h (~3.7 days), protects ~35.
+#### Tier A — gates the production runs. 11 runs, 100 GPU-h (~4.2 days), protects ~35.
 
 **A1–A5 · The handoff** (UMA, reloaded from `ur4bodzn`'s `phase1_exit`, ~2,000 steps
 past re-entry so the dive and its recovery both land; ~10.6 h/arm).
@@ -923,7 +923,7 @@ At the measured phase-2 rate a 7-day UMA run is roughly **10 h of phase 1 plus
 22,500 steps against the ELJ arms' 5–9, so 30,000 is not obviously enough even
 without incident. And the handoff cost it ~1,300 steps of excursion plus a recovery
 that had not finished 5,500 steps later — **on the order of a day of the seven,
-spent undoing a transition.** Tier A costs 89 GPU-h (~3.7 days) and is aimed
+spent undoing a transition.** Tier A costs 100 GPU-h (~4.2 days) and is aimed
 squarely at that.
 
 Two further production settings that are not arms but should be decided:

@@ -822,6 +822,17 @@ def _to_plain(obj):
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
                                     'reward_range', 'internal_oom_recovery',
                                     'host_gas_phase_reference',
+                                    # lambda_mix is SCHEDULABLE -- balance.anneal_coeffs moves it
+                                    # during a run -- so it cannot be part of a static problem hash
+                                    # without a run re-hashing its own problem mid-flight. The flow
+                                    # and knn paths name auxiliary artifacts, like mlip_path.
+                                    # THE COST, stated: at lambda=0 the target really is a different
+                                    # distribution (the prior's own density, not the physical
+                                    # landscape), so a lambda=0 and a lambda=1 checkpoint look
+                                    # interchangeable here and are not. Read lambda_mix off the run
+                                    # before comparing two checkpoints; the hash will not tell you.
+                                    'prior_flow_path', 'lambda_mix',
+                                    'prior_knn_path', 'prior_knn_k', 'prior_knn_min_radius',
                                     # the conformer analogue of reward_range, and exempt
                                     # for the same reason: a soft clip reshapes the reward
                                     # TAIL without changing which landscape is being

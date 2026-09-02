@@ -1,4 +1,4 @@
-# The live config-schema state this operational surface is written against.
+ # The live config-schema state this operational surface is written against.
 # Generated runs record the state they were spawned from so a mismatch fails
 # visibly. This is not a promise to migrate historical configs: add a transition
 # only when an explicitly active config or checkpoint still needs one.
@@ -26,7 +26,7 @@ load_weights_only: false     # true = take only model weights from checkpoint_na
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # seeds the prior buffer, and the anchor buffer on molecule routes
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
 test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent
-archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O
+archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O  # todo on MLIP models set this to 1k
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
 override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR bracket re-stamps every rate on its next tick anyway
 
@@ -69,15 +69,12 @@ use_weight_decay: false
 #
 # LEVEL GATE (owner 2026-08-26): plain absolute bars on the two w1r headline
 # stats, judged on a short trailing median -- "we just pick a number". The
-# rate/projection/veto design is retired as the default (baseline_aug24: its
-# energy bars were unreachable on the real route, its SATURATED veto held
-# stages open on glacial tails, and no arm transitioned in 30k steps); it
-# remains reachable via mode: 'rate' and _PROGRESS_GATE_RATE.
+# rate/projection/veto design is no longer the default; it remains reachable
+# via mode: 'rate' and _PROGRESS_GATE_RATE.
 # CALIBRATION SCALE (owner): median 5 / worst 10 = decent;
 #                            median 2 / worst 5  = incredibly good.
 # An absent channel BLOCKS the verdict, never passes by absence -- and
-# progress_metrics ABSTAINS loudly when it cannot run at all (the
-# baseline_aug24 C arms sat 30k steps behind a silent producer).
+# progress_metrics ABSTAINS loudly when it cannot run at all.
 progress_gate:
   mode: level
   level_window: 2500       # trailing-median smoothing: one noisy eval dipping
@@ -111,6 +108,30 @@ lr_control:
   mode: bracket              # bracket | fixed. `fixed` performs burn-in, then holds fixed_scale and runs no trials -- for batteries of related runs where the rate is already known
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to. THE CANDIDATE SCALES ARE MULTIPLIERS ON THIS, so a seed that is wrong by 10x moves the whole grid off the interesting region and the bracket reports unbracketed_high or all_failed rather than a boundary
   control_flow_lr: false     # true = the flow/Z groups also take the bracket's scale
+
+  # ---- DIVERGENCE RESPONSE -----------------------------------------------
+  # A fire ALWAYS rewinds (weights, EMA, optimizer moments) to the freshest
+  # non-diverging checkpoint, and the max_reloads_per_1k_steps budget still
+  # aborts a run that keeps re-detonating. This knob controls only whether the
+  # RATE moves afterwards.
+  #
+  # 1.0 = the rate never moves, which is what makes an LR fan readable: with no
+  # cut ever applied, the scale recorded in every checkpoint IS the nominal
+  # scale, so fire_loss_spike's set_state_dict restore is a no-op and the rate
+  # is pinned at nominal by induction. Under `mode: fixed` with repeat_every 0
+  # the fire response is the ONLY thing that can move the scale, so 1.0 makes it
+  # immutable for the stage and every arm keeps naming its own rate.
+  #
+  # The cost is deliberate: a genuinely too-hot arm re-detonates instead of
+  # descending, burns the reload budget and dies. That death IS the measurement
+  # -- "this rate does not hold, first fired at step N" -- where a descending
+  # arm yields a rate nobody chose and a trajectory that is half one rate and
+  # half another (measured: acr_b_aug31's only improving arm ran 20x below its
+  # label, having cut twice during burn-in).
+  #
+  # Set below 1.0 only for a run whose goal is a good model rather than a clean
+  # rate measurement, and expect to read lr_ctrl/scale rather than the arm name.
+  fire_cut_factor: 1.0
 
   # ---- 1. BURN-IN --------------------------------------------------------
   # Exactly burn_in_steps at burn_in_scale, then the root checkpoint. Step count
@@ -357,7 +378,7 @@ figs_period: 500             # how often to log custom figures EXPENSIVE # must 
 batch_growth_factor: 1.6       # ladder rung spacing below the cap (torch.compile treats each distinct size as a recompile, so rungs are few)
 batch_growth_cap: 1000          # rung step ceiling in samples: grow geometrically until batch*(factor-1) reaches this, then climb linearly at it. Bounds the held rung's overshoot past the true occupancy crossing to one accum quantum -- at large batch a factor-f overshoot costs up to ~40% of update rate, a 1000-sample one <=10%. The price is more compile shapes on a high climb. 0 = uncapped geometric
 batch_growth_interval: 50       # minimum per-rung calibration dwell, in steps. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
-batch_util_target: 0.6          # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
+batch_util_target: 0.65          # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
 gpu_util_window_s: 900  # trailing WALL-CLOCK SECONDS averaged into gpu/util_recent
 gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
 gpu_util_policy_window_s: 7200  # trailing wall-clock seconds averaged into gpu/util_policy, matching the window the cluster averages over when deciding to cancel. The scheduler judges its own out-of-process sampler, not this reading (docs/design/phase6_handoff.md section 2)
@@ -464,6 +485,16 @@ fwd_loss_coeffs:
   repeats: 1.0            # fwd tiles share a condition and land on DISTINCT terminals -- the cross-terminal group VarGrad needs
   loss_clip: 1.0E+9
   beta: 10.0
+  # CROSS-BRANCH VarGrad. One condition group spanning fwd rollouts AND buffer
+  # draws, so the fwd/bwd level offset is penalised structurally instead of
+  # being a flat direction of each branch's own term. Lives on fwd_loss_coeffs
+  # but arms the BACKWARD blocked draw (config_invariants.runs_grouped_vargrad).
+  # HELD AT 0 HERE ON PURPOSE: that predicate is unscoped by train_mode, so a
+  # nonzero base value would flip condition_block_m 0 -> 2 in every bwd stage,
+  # train_prior included. Turn it on in the STAGE that runs it (var_conditioning).
+  pooled_vg: 0.0
+  pooled_beta: 40.0       # its OWN knee, not the branch's: fwd/bwd rows sit ~lambda_b*Delta from the pooled centre. Scale with the measured zmatch/delta_mean, not once
+  pooled_ratio: 0.5       # buffer share of the pooled group. 0.5 = the 50:50 design point
 bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
@@ -515,7 +546,7 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
 # or a controller here -- it becomes load-bearing on the conditional route.
 condition_log_z:
   min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
-  half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps. A "visit" is one update() call and a FUSED stage runs its branches together, so a two-branch stage burns two per train step -- 200 visits is ~100 steps there, ~200 on a single-branch unconditional run. Was 7.0, which made ema_logw essentially the last few batches; that is too short to be right anywhere, and on the conditional route it detonated var_conditioning at step 1560 at a pinned 2e-4 where 28 ran clean (hyperslope_aug17, 2026-08-17). Matches buffer.DEFAULT_HALF_LIFE_VISITS
+  half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps. A "visit" is one update() call and a FUSED stage runs its branches together, so a two-branch stage burns two per train step -- 200 visits is ~100 steps there, ~200 on a single-branch unconditional run. A short half-life makes ema_logw little more than the last few batches, which destabilises the conditional route. Matches buffer.DEFAULT_HALF_LIFE_VISITS
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
@@ -753,35 +784,24 @@ protocols:
   #
   #    train_prior is deliberately IDENTICAL to the unconditional one: the warm
   #    start does not differ by route, and duplicating it is what lets the switch
-  #    be one word. The stages below are lifted from the qm9anchor_aug14 battery
-  #    -- a real, run configuration rather than an invented one -- so treat the
-  #    numbers as that battery's, not as settled defaults.
+  #    be one word. ⚠ The numbers in the stages below are one battery's operating
+  #    point, not settled defaults.
   conditional_vargrad:
     stages:
       - name: train_prior
         train_mode: bwd
         bwd_sampling_mode: dataset
         skip_if: prior_loaded
-        # "The LR is hot" sensor -- REPORT-ONLY, moves nothing. It fills a
-        # measured gap: `lr_ctrl/divergences` was 0 across all 97 stage segments
-        # swept, INCLUDING all 19 failures, so the hard tripwire does not fire on
-        # this failure mode at all. It compares the channel's current level
-        # against the 10th percentile of a short trailing window and fires on a
-        # single row -- no dwell, because a bad raw batch is smeared by the
-        # metric EMA into a ~10-row bump, so a confirmation count would only
-        # DELAY the same false fire while costing a real detection. Headroom is
-        # the defence instead.
-        #
-        # THE THRESHOLDS ARE CALIBRATION DATA, like the grad-clip quantile: fitted
-        # on the EMA-smoothed LOGGED channel, per stage, and not transferable
-        # between stages or derivable at runtime. They also inherit their noise
-        # margin from MetricTracker(period=100) -- change that period or the
-        # 10-step logging cadence and every bar here is silently rescaled, which
-        # is why lr_hot_sensor asserts the period rather than trusting a comment.
-        # `absolute` because bwd/mle crosses zero (+9.75 to -33.74), where a log
-        # ratio is undefined. 31 rows = 300 steps.
-        # ⚠ WEAKEST OF THE THREE: this bar rests on ONE deliberate ~16x seed-LR
-        # overshoot, so it stays report-only until 2x and 4x calibration arms run.
+        # Drawdown sensor. Fires when the channel's current level sits `above`
+        # the 10th percentile of its trailing window; `action` defaults to
+        # report, which moves nothing. `form: absolute` is required because
+        # bwd/mle crosses zero, where the log ratio is undefined. `rows` is the
+        # window in samples, at one sample per 10 steps.
+        # ⚠ A BAR IS CALIBRATION DATA: fitted per stage on the EMA-smoothed
+        # logged channel, and not transferable to another stage or channel. It
+        # also inherits its noise margin from the metric tracker's period, which
+        # lr_hot_sensor asserts at construction.
+        # ⚠ WEAKEST OF THE THREE BARS -- keep it report-only.
         hot_lr_sensor: { channel: bwd/mle, form: absolute, rows: 31, above: 5.0 }
         flags:
           update_log_z: true
@@ -805,84 +825,104 @@ protocols:
       - name: var_conditioning
         train_mode: fused
         bwd_sampling_mode: prior
-        # "The LR is hot" sensor -- REPORT-ONLY, moves nothing. It fills a
-        # measured gap: `lr_ctrl/divergences` was 0 across all 97 stage segments
-        # swept, INCLUDING all 19 failures, so the hard tripwire does not fire on
-        # this failure mode at all. It compares the channel's current level
-        # against the 10th percentile of a short trailing window and fires on a
-        # single row -- no dwell, because a bad raw batch is smeared by the
-        # metric EMA into a ~10-row bump, so a confirmation count would only
-        # DELAY the same false fire while costing a real detection. Headroom is
-        # the defence instead.
-        #
-        # THE THRESHOLDS ARE CALIBRATION DATA, like the grad-clip quantile: fitted
-        # on the EMA-smoothed LOGGED channel, per stage, and not transferable
-        # between stages or derivable at runtime. They also inherit their noise
-        # margin from MetricTracker(period=100) -- change that period or the
-        # 10-step logging cadence and every bar here is silently rescaled, which
-        # is why lr_hot_sensor asserts the period rather than trusting a comment.
-        # FORWARD branch, and that is load-bearing: bwd/vg_lb has no clean band
-        # under any statistic tested, so a config generalising "vg_lb" across
-        # branches is a bug. vg_lb IS the objective on this route, so it reads
-        # the diverging quantity directly. Detection 11/11, false positives 0/19.
-        hot_lr_sensor: { channel: fwd/vg_lb, rows: 11, above: 3.0 }
-        # cos_target is hyper's analogue of calibration.alpha_target: the update's
-        # fixed point is cos == this, so 0 parks the rate at the ONE-STEP optimum,
-        # which alpha_target's own comment calls a rate a run does not survive. ray
-        # carries that margin as 4.0; hyper has none, and that residual is accepted
-        # rather than solved -- an absolute setpoint is not the way to buy it back.
-        # Swept over six cells, 0 is the best worst case (0.41 nats against 1.56 at
-        # 0.1 and 2.34 at 0.2): raising it repairs Adam and destroys SGD, because
-        # the cos->rate map is optimizer-dependent. It also cannot hold still, since
-        # the achievable cos DRIFTS DOWN as the model trains, so any fixed value
-        # eventually sits above the whole attainable range and rails the peak to its
-        # floor. A margin relative to the observed cos scale would be the durable
-        # form; until one exists, no setpoint.
+        # Drawdown sensor, as on train_prior above. `form` defaults to log, so
+        # the bar is a RATIO against the window's 10th percentile and survives a
+        # change of scale in the channel.
+        # THE CHANNEL MUST BE ONE THIS STAGE ACTUALLY WRITES. A `vg_lb` channel
+        # is written only while its own coefficient is positive, and both branch
+        # vg_lb coefficients are 0 below -- so it would report an empty window
+        # for the whole stage, which reads as quiet rather than blind.
+        # fwd/logw_std_within is written unconditionally by quick_tb_stats.
+        # (`channel` must name a real branch, so the pooled loss is not eligible.)
+        # ⚠ THIS BAR IS TRANSPLANTED FROM ANOTHER CHANNEL, NOT CALIBRATED HERE.
+        # Keep it report-only until it is fitted on this one.
+        hot_lr_sensor: { channel: fwd/logw_std_within, rows: 11, above: 3.0 }
         flags:
           update_log_z: true
           buffers_active: true
           weighted_bwd_sampling: true
           weighted_condition_sampling: true
-        # set_lr_flow: the flow head is a per-condition NETWORK on this route, not
-        # the unconditional LearnableScalar, and emp_z below is the only thing that
-        # trains it. At the canonical lr_flow 0.1 that network diverges -- and the
-        # divergence guard cannot rescue it, because peak_scale never reaches the
-        # flow group while control_flow_lr is false.
+        # set_lr_flow: the flow head is a per-condition NETWORK on this route,
+        # not the unconditional LearnableScalar, and emp_z below is the only
+        # thing that trains it. It needs a rate far below the canonical lr_flow,
+        # set here rather than guarded: the divergence guard cannot rescue this
+        # group, because peak_scale never reaches it while control_flow_lr is
+        # false.
         on_enter: [ 'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4' ]
-        # ENTRY POINT ONLY: `balance` below seeds its integrator from these and
-        # walks the split from here. Its `default_boost` is the mix the split
-        # relaxes back toward, so that -- not this -- is the settled allocation.
-        # bwd is at the ceiling `floor` allows (1 - floor).
-        fracs: { fwd: 0.1, bwd: 0.9, replay: 0.0 }
+        # 50:50 AND HELD THERE. `balance` below is lexicographic with every boost
+        # set to the same 0.5/0.5 mix, so the nudge target never moves and the
+        # split stays where it starts. The controller is retained, but its only
+        # live job here is gating the lambda anneal.
+        fracs: { fwd: 0.5, bwd: 0.5, replay: 0.0 }
         deactivate_threshold: 0.01
         loss_coeffs:
-          # tb_z_source: persistent is the conditional regime, declared HERE so
-          # selecting this protocol adopts it -- it used to be three global keys
-          # a mode switch had to remember to change.
-          fwd: { vg_lb: 1.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0, tb_z_source: persistent }
-          # level_gap 1: the Z-LEVEL TETHER, and it is a stability term here, not a
-          # fit term. `gap * (log_r + log_pb - log_pf)` with gap the per-condition
-          # discrepancy against the empirical level stream, clamped by
-          # level_gap_clamp -- the only restoring force on the per-condition Z
-          # level. At 0 a local 20-min arm blew up: fwd/vg_lb ran 49 of 108
-          # reports above 10x its median from step ~600 of the stage (peak 43868
-          # vs 479) while log_Z drifted up. Same config with this at 1: zero
-          # excursion, and the fwd medians improved too. NB it enters SATURATED
-          # -- level_gap_coeff_rms sits at the clamp for the whole window, so it
-          # acts as a constant force on the way in rather than the proportional
-          # controller it becomes once the levels close. Cost: bwd VarGrad losses
-          # run higher, and the LR settles lower.
-          bwd: { vg_lb: 1.0, condition_block_m: 2.0, repeats: 1.0, level_gap: 1, tb_z_source: persistent }
+          # POOLED VarGrad, plus the Z sidecar. A branch vg_lb term centres on
+          # its own rows, so the fwd/bwd level offset is an exact flat direction
+          # of it; pooled_vg is the only term whose per-row coefficients sum to
+          # zero ACROSS the branches -- a mass transfer rather than a lift.
+          # ⚠ pooled_vg also ARMS the condition-blocked BACKWARD draw
+          # (config_invariants.runs_grouped_vargrad reads it off the fwd block),
+          # and with both branch vg_lb at 0 it is the only thing doing so.
+          # Confirm `bwd/vg_group_size_mean` matches fwd repeats and check
+          # `pooled/pooled_mixed_frac` before reading any result from this
+          # stage: a silent fall to singleton groups voids the VarGrad signal
+          # without failing anything.
+          # emp_z is the Z SIDECAR: it fits the flow head to log Z of the
+          # LAMBDA-MIXED target (log_r is -energy/T, and the mix happens inside
+          # generator_energy), so it tracks the target the anneal is moving.
+          # tb_z_source: persistent is the conditional Z regime, declared HERE
+          # so that selecting this protocol adopts it.
+          fwd: { vg_lb: 0.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0,
+                 pooled_vg: 1.0, pooled_beta: 40.0, pooled_ratio: 0.5,
+                 tb_z_source: persistent }
+          # level_gap is the Z-LEVEL TETHER: a stability term, not a fit term.
+          # `gap * (log_r + log_pb - log_pf)`, with gap the per-condition
+          # discrepancy against the empirical level stream and level_gap_clamp
+          # bounding the per-row force. It is the ONLY restoring force on the
+          # per-condition Z level; at 0 that level is free to drift.
+          # NB it enters SATURATED -- level_gap_coeff_rms sits at the clamp until
+          # the levels close, so on the way in it acts as a constant force rather
+          # than the proportional controller it becomes later. It costs higher
+          # bwd VarGrad losses and a lower settled LR.
+          bwd: { vg_lb: 0.0, condition_block_m: 2.0, repeats: 1.0, level_gap: 0.0, tb_z_source: persistent }
           replay: { tb_z_source: persistent }
         balance:
-          kind: proportional
-          pinned: { replay: 0.0 }
-          metrics: { fwd: fwd/logw_std_within, bwd: bwd/logw_std_within }
-          drive: relative
-          targets: { fwd: 1.0, bwd: 1.0 }
+          # LEXICOGRAPHIC, but not to arbitrate the split -- every boost below is
+          # the same 0.5/0.5 mix, so _nudge_mode_fracs is a fixed point and the
+          # fracs never move. The kind is lexicographic because that is the only
+          # one anneal_coeffs fires off (it rides the all-rules-clean streak).
+          # So the rules read as: "advance lambda only while the sampler is
+          # keeping up", which is exactly the pacing an anneal needs.
+          kind: lexicographic
           default_boost: { fwd: 0.5, bwd: 0.5 }
-          floor: 0.1
-          alpha: 0.01
+          rules:
+            # PACING GATE, relative rather than absolute on purpose: the settled
+            # pooled loss RISES as lambda advances, because the target gets
+            # harder, so a fixed bar would stop the anneal permanently the first
+            # time it moved. `relative: best` compares against a running best
+            # that itself drifts up at `drift` per tick, so the gate tracks the
+            # moving level. `margin` must clear the settled scatter of the metric
+            # without admitting a real degradation.
+            - { metric: pooled/pooled_vg, relative: best, margin: 1.25, drift: 0.01,
+                if_missing: violated, boost: { fwd: 0.5, bwd: 0.5 } }
+            # HUBER-KNEE SAFETY BAR, and the one absolute number here. At
+            # pooled_ratio 0.5 both branches sit ~delta/2 from the pooled centre,
+            # so the within-group shape signal survives only while delta/2 stays
+            # inside pooled_beta -- an upper limit of 2*pooled_beta on delta.
+            # The bar is set far tighter: a fwd/bwd gap of this size is already a
+            # different regime, well before the knee makes it unreadable.
+            - { metric: zmatch/delta_mean, above: 20.0, if_missing: violated,
+                boost: { fwd: 0.5, bwd: 0.5 } }
+          # THE ANNEAL. Fires once every rule above has been clean for
+          # controller.anneal_patience ticks, and is strictly lower priority than
+          # all of them. Geometric: val <- min(val / rate, target).
+          # ⚠ IT CANNOT LEAVE EXACTLY 0 -- a lambda run must start at a small
+          # POSITIVE lambda_mix, and low enough that the physical leg is a small
+          # fraction of the flow leg's spread, or the early rungs buy nothing.
+          # `rate` is only the GRANULARITY of one event (x1/rate, so ~63 events
+          # from 0.01 to 1.0); the rules above supply the actual pacing.
+          anneal_coeffs:
+            lambda_mix: { target: 1.0, rate: 0.93 }
 #        exit: # no exit condition, this is the terminal phase
 #          - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
 #          - { metric: bwd/logw_std_within, below: 3.0, patience: 5 }
@@ -930,7 +970,7 @@ buffers:
     # above each condition's best known energy. ramp_floor doubles as manage_prior_buffer's
     # admission/reach-trigger margin (equivalence holds only at temperature==1.0; elj runs
     # hotter -- revisit if the ramp and admission margins need separating)
-    ramp_floor: 100
+    ramp_floor: 100  # put a comment with the units here (reward, physical energy, what)
     ramp_width: 50
 
   # FAST store: full forward trajectories of the policy's own samples, kept so
@@ -961,6 +1001,20 @@ buffers:
   # through admission, and tops up prior_buffer via noising + rescoring whenever a
   # prior-sampling churn cycle comes up short
   anchor_buffer:
+    # --- anchor churn toggles. All three are independent; absence = today's behaviour ---
+    frozen: true              # true = anchor MEMBERSHIP is fixed after seeding. Guards AnchorBuffer.admit/thin
+      # at the primitives, so all five mutation call sites are covered (eval-cadence thin,
+      # screen_and_admit's admit+overflow thin, and top_up_prior_from_anchors' record-breaker
+      # admit+overflow thin). Both constructors bypass them, so seeding still works.
+    # NB admit() REPLACES 1-for-1, so anchor_buffer_length does not move when membership
+    # churns -- judge a freeze on content, never on length
+    online_loss_flow: false    # per-draw priority update. NOT IMPLEMENTED (raises if true): the version that existed
+    # was removed as a biased partial refresh, and measurement agrees -- ~3/4 of anchors are
+    # never drawn in a run, so an online-only update leaves them permanently unmeasured
+    thin_every_n_evals: 0      # cadence (eval cycles) for the energy-window thin/hard-cap pass. 0/null = DISABLED
+    refresh_every_n_evals: 0   # cadence (eval cycles) for refresh_anchor_buffer_surprise's full sweep. 0/null = DISABLED.
+    # This is the ONLY writer of anchor ema_loss. With it off, ema_loss is blanked to all-NaN
+    # at every construction and restore, and the anchor draw falls through to UNIFORM --
     seed_source: 'prior_dataset'   # domain rule (configs/problems.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
     max_size: 200000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates. Latents live in a unit box, so this is 5% of an axis
@@ -990,14 +1044,12 @@ buffers:
     health_gate_floor: null
     health_gate_ceiling_metric: tb_resid_clipped  # signed pooled TB residual, clipped at beta. 0.5 is the Z-currency bar z_calibration holds
     health_gate_ceiling: 0.5
-    replay_beta: 0.5           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors
-    thin_every_n_evals: 5     # cadence (eval cycles) for the energy-window thin/hard-cap pass
-    refresh_every_n_evals: 3   # cadence (eval cycles) for refresh_anchor_buffer_surprise's full sweep
+    replay_beta: 1.0           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors
     noise_log_range: [ -2.5, -1.5 ]  # log10-uniform isotropic latent noise magnitude for prior top-ups
     topup_admit_record_breakers: true  # noised children that STRICTLY lower their condition's Emin(c) stand for anchor admission
     reach_quantile: 0.9        # prior_buffer quantile (energy above own condition's best) checked against ramp_floor
     reach_threshold: 0.75      # trigger a purge-and-replace top-up if that quantile covers less than this fraction of ramp_floor
-    reach_topup_size: 1000     # samples purged from prior_buffer's worst and replaced from anchors when the trigger fires
+    reach_topup_size: 1000     # samples purged from prior_buffer's worst and replaced from anchors when the trigger fires  # todo where are the toggles to turn off anchor buffer churn altogether? Or are they not added yet?
 
 # energy function settings
 ################################################################
@@ -1018,7 +1070,7 @@ vector_conditioning_dim: 3  # inert while vector_conditioning is false
 embedding_conditioning: false      # QM9 / molecule-conditional route: true
 embedding_conditioning_dim: 192    # 3 x Mo3ENet's 64-d bottleneck, flattened. Inert while embedding_conditioning is false
 energy_config:
-  internal_oom_recovery: false  # false = energy is scored on the SDE rollout's own batch in one call, and an OOM propagates up to train.py's global batch reduction. true made the energy chunk on a sticky internal size set by the init-time prior re-analysis (prod0810 uma: 2150 vs a 2722 rollout) and swallowed OOMs the batch controller needed to see. The two init passes override it back to true for their one-off whole-dataset scans. Not part of the problem identity, so flipping it does not orphan checkpoints
+  internal_oom_recovery: false  # false = energy is scored on the SDE rollout's own batch in one call, and an OOM propagates up to train.py's global batch reduction. true made the energy chunk on a sticky internal size set by the init-time prior re-analysis -- which can sit below the rollout batch -- and swallowed OOMs the batch controller needed to see. The two init passes override it back to true for their one-off whole-dataset scans. Not part of the problem identity, so flipping it does not orphan checkpoints
   temperature: 2.5 # room temperature kT in kJ/mol (1.0 for toys)
   log_temperature_range: [ 0, 0.693147 ]
   # loss coefficients
@@ -1028,3 +1080,13 @@ energy_config:
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   analyze_kwargs: { }  # elj: none
+  # LAMBDA PATH between the prior's own implied density and the physical energy:
+  #     -log p_lambda = (1-lambda)*(-log q_flow) + lambda*E_phys/T
+  # exactly linear in lambda, so Delta = (E_phys - (-log q))/T is the path's
+  # sufficient statistic and lambda=0 has the fitted flow as its exact fixed point.
+  # prior_flow_path is the density proxy for THIS run's phase-1 exit policy, fitted
+  # by build_prior_flow.py; it is tied to the wrap mask, the dead rows AND to T.
+  prior_flow_path: null   # null + lambda_mix 1.0 = the pre-existing physical target, untouched
+  lambda_mix: 1.0         # 1 = pure physical. An anneal run sets this to its START value and lets
+                          # var_conditioning's balance.anneal_coeffs ramp it. NB the ramp is
+                          # MULTIPLICATIVE (val <- val/rate), so it cannot leave exactly 0.

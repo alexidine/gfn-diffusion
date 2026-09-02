@@ -534,7 +534,8 @@ class LRController:
         b = self.bracket
         skip = 0
 
-        if (b.phase == CRUISE and not self.bars.loss_bar and self._bars_ready()
+        if (b.phase == CRUISE and not self.bars.loss_bar
+                and self._bars_ready(full=True)
                 and self._cruise_bar is None):
             # (a pending refit that SUSPENDED the bars leaves loss_bar empty on
             # purpose; `_cruise_bar` is what tells the two states apart)
@@ -545,6 +546,17 @@ class LRController:
             # route, so without this the whole remaining stage trains on the
             # absolute backstops alone: exactly the 1e9 situation this design
             # replaced, arriving through the resume path instead of the config.
+            #
+            # `full=True` FOR THE SAME REASON THE OTHER TWO CALLERS USE IT. This
+            # branch took the 20-observation minimum, so a resumed leg armed its
+            # tripwire from a sliver: measured on localprod_lp02_resume the bar
+            # came out at 2054 against the 7662 the same stage carried when
+            # fitted cold, i.e. ~3.7x tighter, and a too-tight bar fires on
+            # ordinary training and costs a rewind. A chained multi-day run
+            # crosses this seat at every leg boundary, so it is the common case
+            # here, not the rare one. The ~200 steps spent on the absolute
+            # backstops meanwhile is the cost the burn-in and repeat branches
+            # already accept.
             why = self.bars.derive(self._loss_history, self._grad_history)
             print('lr_ctrl: resumed into cruise -- hard-failure bars re-derived '
                   'from the post-resume window: '

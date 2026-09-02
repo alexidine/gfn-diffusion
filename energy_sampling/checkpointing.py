@@ -377,6 +377,11 @@ class Checkpointer:
             m.replay_buffer = buf_cls.from_state_dict(state['replay_buffer'], device=m.buffer_device)
         if state.get('anchor_buffer') is not None:
             m.anchor_buffer = anchor_cls.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
+            # CONFIG OWNS THE ANCHOR POLICY, the sidecar does not. from_state_dict
+            # restores ema_loss verbatim, so without this a chained run silently
+            # comes back with priorities no enabled writer can ever refresh.
+            if hasattr(m, 'apply_anchor_buffer_policy'):
+                m.apply_anchor_buffer_policy('sidecar restore')
 
     def load_buffers_for(self, checkpoint_path: str) -> bool:
         """
