@@ -1,0 +1,5 @@
+arm	warm_src	scale	lr
+p02_mip_lr1	pt100_mip_lr4p0	1	0.000125
+p02_neh_lr0p5	pt100_neh_lr4p0	0.5	6.25e-05
+p02_mipu_lr0p0625	pt100_mipu_lr4p0	0.0625	7.813e-06
+p02_nehu_lr0p125	pt100_nehu_lr4p0	0.125	1.563e-05
