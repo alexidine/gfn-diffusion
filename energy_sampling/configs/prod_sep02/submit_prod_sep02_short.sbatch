@@ -86,6 +86,22 @@ sed -e "s|WARM_CHECKPOINT_PLACEHOLDER|$(basename ${CK})|" \
   echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"
 } > ${J}.info 2>&1
 
+# THE OCCUPANCY RECORD THAT MATTERS. The in-process sensor disagrees with this
+# by a batch-dependent, sign-flipping error, and THIS is the number the scheduler
+# cancels on -- 16795765_0 was killed mid-run at 15.19 s/it on 2026-09-02 with no
+# way to tell whether it had fallen into the 38-49% band, because this sidecar
+# was missing. Read it with:
+#   tail -n 400 <arm>_smi.csv | awk -F, '$3+0==$3 {s+=$3;n++} END {print s/n}'
+stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,clocks_throttle_reasons.active,power.draw,temperature.gpu \
+    --format=csv,nounits -l 10 > ${J}_smi.csv &
+SMI_PID=$!
+smi_epilogue() {
+    kill ${SMI_PID} 2>/dev/null
+    sacct -j ${SLURM_JOB_ID} --format=JobID,State,ExitCode,Elapsed,NodeList,Reason,Comment%64 \
+        > ${J}_sacct.txt 2>&1
+}
+trap smi_epilogue EXIT TERM
+
 srun singularity exec --nv \
     --overlay ${OVERLAY}:ro \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
