@@ -7,7 +7,8 @@ from typing import Optional
 
 import torch
 
-from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker
+from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, \
+    BufferCurrencyError
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, normalize_problem_def
 from models import GFN
@@ -94,6 +95,12 @@ MODELLER_STATE_DEFAULTS = {
 # cadence, so a resume restores buffers up to eval_period steps stale --
 # acceptable because the anchor buffer's ema_loss priorities are already
 # refreshed on that same cadence (buffers.anchor_buffer.refresh_every_n_evals).
+#
+# Each buffer dict inside the sidecar carries buffer.BUFFER_FORMAT_VERSION and the
+# energy currency its rows are stored in (the per-row `lj_coeff` stamp). A sidecar
+# written before that existed is REFUSED at restore, never silently re-stamped --
+# migrate_buffer_sidecar.py is the one sanctioned path. See
+# CrystalBuffer._refuse_unknown_currency for the failure this closes.
 BUFFER_SUFFIX = '_buffers.pt'
 
 # Every tag save() writes, used to strip a checkpoint's tag back to the
@@ -382,6 +389,43 @@ class Checkpointer:
             # comes back with priorities no enabled writer can ever refresh.
             if hasattr(m, 'apply_anchor_buffer_policy'):
                 m.apply_anchor_buffer_policy('sidecar restore')
+
+    #: the resident stores whose rows are scored by reading a stored energy off
+    #: the row (prebuilt_sample_to_reward), i.e. the ones whose currency matters
+    CURRENCY_CHECKED_BUFFERS = ('prior_buffer', 'replay_buffer', 'anchor_buffer')
+
+    def assert_buffer_currency(self, context: str = 'startup'):
+        """Every resident crystal store must be stamped with THIS run's lj_coeff.
+
+        The structural half (rows carry a stamp at all) is enforced by
+        CrystalBuffer.from_state_dict the moment a sidecar is read. This is the
+        VALUE half, and it cannot live there: the run's coefficient is only
+        known after init_prior_dataset reads the prior's thermal_scaling_factor,
+        which happens AFTER init_gfn has restored the sidecar. So train.py calls
+        this once the buffers are seeded/restored and the coefficient is final.
+
+        Delegates to MolecularCrystal.assert_lj_coeff_stamped, the same check
+        every draw runs, so a sidecar from a differently calibrated run (an
+        anchor set built at 1.0 restored into a 0.3636 run) is refused at
+        startup rather than at the first backward draw. Skipped on routes that
+        never read `.elj` (latent toys, conformers), mirroring generator_energy.
+        """
+        m = self.modeller
+        ef = getattr(m, 'energy_function', None)
+        check = getattr(ef, 'assert_lj_coeff_stamped', None)
+        if check is None or not getattr(ef, 'is_crystal', False) \
+                or getattr(ef, 'latent_energy', False):
+            return
+        for name in self.CURRENCY_CHECKED_BUFFERS:
+            buf = getattr(m, name, None)
+            if buf is None or len(buf) == 0:
+                continue
+            try:
+                check(buf.batch)
+            except (AttributeError, ValueError) as e:
+                raise BufferCurrencyError(
+                    f'{name} ({len(buf)} rows) is not in this run\'s energy currency '
+                    f'(lj_coeff={float(ef.lj_coeff)!r}) at {context}: {e}') from e
 
     def load_buffers_for(self, checkpoint_path: str) -> bool:
         """

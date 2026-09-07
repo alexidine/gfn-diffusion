@@ -56,6 +56,160 @@ def strip_lazy_sg_caches(batch):
     return batch
 
 
+#: Version of the dict CrystalBuffer.state_dict writes. Bumped to 2 on 2026-09-07
+#: when the buffer began RECORDING ITS ENERGY CURRENCY: every crystal row carries
+#: a per-graph `lj_coeff` (stamped by MolecularCrystal.stamp_lj_coeff at build,
+#: applied inside compute_eLJ_energy, so a stored `.elj` is already calibrated),
+#: and the dict names the coefficient alongside the rows. A version-1 dict is
+#: one of two things, and the two need OPPOSITE treatment, which is why the
+#: version exists at all:
+#:   - written BEFORE the coefficient rode on the data (pre-2026-09-02): rows
+#:     carry a RAW `.elj` and no stamp -> migrate (stamp + rescale), see
+#:     migrate_legacy_lj_coeff / migrate_buffer_sidecar.py;
+#:   - written between the relocation and this version (e.g. the local lp02
+#:     rig, the prod_sep02 arms' rolling sidecars): rows ARE stamped, nothing
+#:     to rescale, loads as-is and is re-saved as version 2.
+#: A version-2 dict whose rows are unstamped is neither: it is a producer bug
+#: (some construction path skipped the stamp) and must NOT be migrated.
+BUFFER_FORMAT_VERSION = 2
+
+
+class BufferCurrencyError(RuntimeError):
+    """A crystal buffer whose stored energies are in an unknown or mixed currency.
+
+    Raised on RESTORE (a sidecar whose rows carry no `lj_coeff`), on ADMISSION
+    (stamped rows merged into an unstamped store or vice versa -- append_batch
+    with validate=False would otherwise drop the key and blend two currencies
+    into one attribute-less batch) and on MIGRATION of a dict that does not need
+    it. Deliberately fatal: the value of a stored `.elj` does not say which
+    currency it is in, so the only honest failure is a loud one."""
+
+
+def _is_crystal_batch(batch) -> bool:
+    """Crystal rows are the ones a lattice-energy coefficient governs.
+
+    Conformer stores (ConformerBuffer / ConformerAnchorBuffer) hold MolData
+    graphs with no cell and no `.elj`, and their batches never carry a stamp.
+    Class-name test rather than an attribute test, because the attribute
+    (the stamp) is exactly what may be missing."""
+    return 'crystal' in type(batch).__name__.lower()
+
+
+def row_lj_coeff(batch):
+    """The per-graph `lj_coeff` stamp, or None when the batch has none."""
+    coeff = getattr(batch, 'lj_coeff', None)
+    if coeff is None:
+        return None
+    return torch.as_tensor(coeff).flatten()
+
+
+def _uniform_lj_coeff(batch, context: str):
+    """The single coefficient every row of `batch` is stamped with.
+
+    None for an unstamped batch (the caller decides whether that is legal);
+    raises when rows disagree with each other or the stamp is malformed -- a
+    buffer holding two currencies is corrupt however it got that way."""
+    n = int(batch.num_graphs)
+    coeff = row_lj_coeff(batch)
+    if coeff is None:
+        return None
+    if coeff.numel() != n:
+        raise BufferCurrencyError(
+            f'{context}: lj_coeff has {coeff.numel()} entries for {n} rows -- the '
+            f'stamp must be one value per graph')
+    if n == 0:
+        return None
+    vals = coeff.to(torch.float64)
+    lo, hi = float(vals.min()), float(vals.max())
+    if hi - lo > 1e-6 * max(abs(hi), 1.0):
+        raise BufferCurrencyError(
+            f'{context}: rows are stamped with {torch.unique(vals).tolist()[:8]} -- '
+            f'more than one energy currency in a single store')
+    return lo
+
+
+def migrate_legacy_lj_coeff(state: dict, lj_coeff: float, energy_key: str) -> dict:
+    """Bring a version-1 buffer dict up to BUFFER_FORMAT_VERSION.
+
+    THE ONLY PLACE A STAMP IS EVER WRITTEN ONTO STORED ROWS. Runtime restore
+    refuses unstamped rows instead of defaulting them, because the obvious
+    default -- stamp the run's coefficient -- is exactly wrong for a
+    pre-relocation row: its `.elj` is a RAW lattice sum, so stamping it as
+    calibrated leaves the composite 2.62x off on mipcas with nothing left to
+    detect it. Migration therefore does BOTH halves together: stamp the rows
+    AND multiply the raw `.elj` column (and `y`, which mirrors it) by the
+    coefficient, so the stored value and its label agree. Anchor `reward` /
+    `energy` are composite totals the old consumer had already scaled and are
+    left alone.
+
+    Off the eLJ route the coefficient is definitionally 1 (train.py refuses a
+    prior carrying anything else on uma/mace), so those rows are stamped 1.0
+    with no rescale -- on UMA the migration is a pure relabel, numerically
+    invisible, which is why the eLJ case is the one the tests lean on.
+
+    Three shapes of input, three answers:
+      version >= 2                      -> refuse: already carries its currency
+      version 1, rows already stamped   -> verify the stamp equals lj_coeff,
+                                           mark version 2, rescale NOTHING
+      version 1, rows unstamped         -> stamp + rescale (eLJ) / stamp (else)
+    Partially stamped rows are refused as mixed.
+
+    Returns a NEW dict; the input is not mutated (the batch is shallow-copied
+    and only the rewritten columns are replaced).
+    """
+    fmt = int(state.get('format_version', 1) or 1)
+    if fmt >= BUFFER_FORMAT_VERSION:
+        raise BufferCurrencyError(
+            f'buffer dict is already format version {fmt}: it records its own '
+            f'currency, so a migration would rescale calibrated rows a second time')
+    lj_coeff = float(lj_coeff)
+    if energy_key != 'elj' and abs(lj_coeff - 1.0) > 1e-9:
+        raise ValueError(
+            f'lj_coeff={lj_coeff!r} on the {energy_key!r} route: the coefficient is '
+            f'applied inside compute_eLJ_energy and reaches no other route, so a '
+            f'non-unit value here is a malformed request, not a migration')
+    batch = state['batch']
+    n = int(batch.num_graphs)
+    out = dict(state)
+    existing = _uniform_lj_coeff(batch, 'migrate_legacy_lj_coeff')
+    if existing is not None:
+        if abs(existing - lj_coeff) > 1e-6 * max(abs(lj_coeff), 1.0):
+            raise BufferCurrencyError(
+                f'rows are already stamped at {existing!r} but the migration asks for '
+                f'{lj_coeff!r}: this sidecar belongs to a differently calibrated run')
+        out['format_version'] = BUFFER_FORMAT_VERSION
+        out['lj_coeff'] = lj_coeff
+        out['lj_migration'] = 'stamped rows, marked only'
+        return out
+    if n > 0 and row_lj_coeff(batch) is not None:
+        raise BufferCurrencyError('rows carry a malformed stamp; refusing to guess')
+
+    batch = copy.copy(batch)
+    if energy_key == 'elj':
+        if getattr(batch, 'elj', None) is None:
+            raise BufferCurrencyError(
+                'eLJ migration needs the stored `.elj` column to rescale, and the '
+                'batch has none')
+        batch.elj = batch.elj * lj_coeff
+        y = state.get('y')
+        if y is not None:
+            y_fn = state.get('y_fn')
+            if y_fn == 'elj':
+                out['y'] = y * lj_coeff
+            elif y_fn is not None:
+                raise BufferCurrencyError(
+                    f'y_fn={y_fn!r}: cannot tell whether the cached `y` column is in '
+                    f'eLJ currency, refusing to guess')
+    batch.lj_coeff = torch.full((n,), lj_coeff, dtype=torch.float32,
+                                device=batch.device if n else 'cpu')
+    out['batch'] = batch
+    out['format_version'] = BUFFER_FORMAT_VERSION
+    out['lj_coeff'] = lj_coeff
+    out['lj_migration'] = ('stamped + rescaled .elj/y' if energy_key == 'elj'
+                           else 'stamped 1.0, nothing rescaled')
+    return out
+
+
 def toy_latent_params(batch):
     """Gauge-FREE latent read, the buffers' x_fn on NON-CRYSTAL (toy) routes.
 
@@ -159,6 +313,12 @@ class CrystalBuffer:
         # shallow copy gives .cpu() its own store to rewrite; tensor-level
         # .cpu() is non-mutating, so the live tensors are untouched.
         return {
+            'format_version': BUFFER_FORMAT_VERSION,
+            # the currency the rows below are stored in: the uniform per-row
+            # stamp, or None for an unstamped store (a conformer store, an
+            # empty one, or -- never legitimately -- a crystal store some
+            # construction path forgot to stamp; from_state_dict refuses that)
+            'lj_coeff': self.stored_lj_coeff('state_dict'),
             'batch': copy.copy(self.batch).cpu(),
             'max_z_prime': self.max_z_prime,
             'x_fn': self.x_fn,
@@ -208,7 +368,66 @@ class CrystalBuffer:
         obj.ema_logw_sq = state['ema_logw_sq'].cpu()
         obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
         obj.traj = state['traj'].to(device) if state['traj'] is not None else None
+        obj._refuse_unknown_currency(state)
         return obj
+
+    def stored_lj_coeff(self, context: str = 'buffer'):
+        """The one coefficient every resident crystal row is stamped with, or
+        None when the store is empty, non-crystal, or unstamped. Raises on a
+        store holding more than one value."""
+        if not _is_crystal_batch(self.batch):
+            return None
+        return _uniform_lj_coeff(self.batch, context)
+
+    def _refuse_unknown_currency(self, state: dict):
+        """Restore-time half of the lj_coeff contract: rows come back stamped or
+        they do not come back.
+
+        The bug this closes (2026-09-02, cluster arm p02_mipu_lr0p015625): a
+        leg launched from a phase-1 exit restored that run's PRE-RELOCATION
+        sidecar, the launch-time eval wrote those unstamped rows straight back
+        out as the arm's own rolling sidecar, and the resubmission restored
+        them into a prior-mode stage -- first backward draw, AttributeError,
+        hours of GPU gone. Before this method the rows loaded silently and the
+        failure surfaced wherever the first draw happened to be; now it
+        surfaces HERE, at restore, naming the migration.
+
+        Refuses rather than stamps: see migrate_legacy_lj_coeff for why the
+        obvious default is the dangerous one.
+        """
+        batch = self.batch
+        if not _is_crystal_batch(batch) or int(batch.num_graphs) == 0:
+            return
+        fmt = int(state.get('format_version', 1) or 1)
+        coeff = _uniform_lj_coeff(batch, f'{type(self).__name__}.from_state_dict')
+        if coeff is not None:
+            recorded = state.get('lj_coeff')
+            if fmt >= BUFFER_FORMAT_VERSION and recorded is not None \
+                    and abs(float(recorded) - coeff) > 1e-6 * max(abs(coeff), 1.0):
+                raise BufferCurrencyError(
+                    f'{type(self).__name__}: rows are stamped {coeff!r} but the dict '
+                    f'records lj_coeff={recorded!r} -- the sidecar is internally '
+                    f'inconsistent')
+            return
+        if fmt >= BUFFER_FORMAT_VERSION:
+            raise BufferCurrencyError(
+                f'{type(self).__name__}: {int(batch.num_graphs)} crystal rows carry no '
+                f'`lj_coeff` in a format-version-{fmt} dict. This is NOT a legacy '
+                f'sidecar -- it was written by code that records its currency, so '
+                f'some construction path admitted rows without '
+                f'MolecularCrystal.stamp_lj_coeff. Do not migrate it; fix the '
+                f'producer.')
+        raise BufferCurrencyError(
+            f'{type(self).__name__}: {int(batch.num_graphs)} crystal rows carry no '
+            f'`lj_coeff` (format version {fmt}, written before the buffer recorded '
+            f'its energy currency). Their stored `.elj` is a RAW lattice sum, so '
+            f'stamping them as calibrated would leave every backward and replay '
+            f'draw silently scaled by 1/lj_coeff (2.62x on mipcas). Refusing to '
+            f'load. Migrate the sidecar once, then resume:\n'
+            f'    python migrate_buffer_sidecar.py <run>_buffers.pt --lj-coeff <coeff>\n'
+            f'(--lj-coeff is the prior .pt thermal_scaling_factor on the elj route '
+            f'-- mipcas 0.3635836825, nehzor 0.1555787474 -- and 1.0 on uma/mace; '
+            f'omit it to read it from the sidecar problem_def prior_path).')
 
     # ---------------------------------------------------------------------
     # Internals
@@ -475,6 +694,30 @@ class CrystalBuffer:
 
         return batch
 
+    def _assert_stamp_parity(self, new_batch):
+        """Admission-time half of the lj_coeff contract.
+
+        The merge below is append_batch(validate=False), which DROPS any key
+        present on only one side. Stamped rows admitted into an unstamped store
+        (or the reverse) would therefore come out as one attribute-less batch
+        holding two currencies -- the exact state the restore-time refusal
+        exists to keep off disk, manufactured in memory. Both sides must agree
+        on whether they carry the stamp; value agreement is the energy
+        function's assert_lj_coeff_stamped's job at draw time.
+        """
+        if not _is_crystal_batch(new_batch) or int(self.batch.num_graphs) == 0:
+            return
+        have = row_lj_coeff(self.batch) is not None
+        new = row_lj_coeff(new_batch) is not None
+        if have != new:
+            raise BufferCurrencyError(
+                f'{type(self).__name__}.add: resident rows are '
+                f'{"stamped" if have else "UNSTAMPED"} but the incoming batch is '
+                f'{"stamped" if new else "UNSTAMPED"}; append_batch(validate=False) '
+                f'would drop `lj_coeff` and blend two energy currencies into one '
+                f'store. An unstamped resident store came from an unmigrated '
+                f'sidecar or a construction path that skipped stamp_lj_coeff.')
+
     # ---------------------------------------------------------------------
     # Sampling
     # ---------------------------------------------------------------------
@@ -733,6 +976,7 @@ class CrystalBuffer:
         self._drop_keys(new_batch, getattr(self, 'exclude_keys', ()))
         self._orient_stored_batch(new_batch)
         new_x, new_y = self._compute_xy(new_batch)
+        self._assert_stamp_parity(new_batch)
 
         # _compute_xy's latent transform lazily builds the space-group caches on
         # new_batch; strip both sides so append_batch never sees one batch with
