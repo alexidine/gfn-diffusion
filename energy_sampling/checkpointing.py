@@ -15,6 +15,12 @@ from models import GFN
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
+    # z_level_fill's absorber (z_calibration.fill_mode: absorb): the running
+    # uncertainty of log Z and the step of the last applied measurement. They
+    # ride in the checkpoint so a resume or a rewind does not re-snap to the
+    # first batch it sees as if nothing were known.
+    '_z_fill_P': None,
+    '_z_fill_last_applied': None,
     # the run's position in the config's protocol.stages list, BY NAME --
     # checkpoints carry position only; behavior (coeffs, balance rules, exit
     # thresholds) is always re-derived from the current config, so editing the

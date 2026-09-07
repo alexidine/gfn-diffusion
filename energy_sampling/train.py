@@ -5175,10 +5175,19 @@ class Modeller:
             self._z_fill_logw = (loss_dict['log_pb'] + loss_dict['log_r']
                                  - loss_dict['log_pf']).detach().reshape(-1)
 
-    def z_level_fill(self):
+    def z_level_fill(self, logw=None, source='train', apply=True):
         """
         Set log_Z directly to this batch's TB fixed point, for gaps the
         frequency-modulated servo cannot close.
+
+        `logw` None consumes the single-use training stash; an explicit tensor
+        (the eval rollout, via _eval_z_fill) leaves the stash alone. `source`
+        prefixes the report keys ('' for train, 'eval_' otherwise); apply=False
+        reports the measurement and moves nothing -- not Z, not the absorber's
+        belief, not the cooldown clock.
+
+        fill_mode 'snap' (default) is the gated overwrite described below;
+        'absorb' is a one-dimensional Kalman filter on log Z (see the branch).
 
         WHY A FILL RATHER THAN MORE STEPS. The sidecar's step size is
         magnitude-blind twice over: the Huber clips dL/dZ at beta, so a batch
@@ -5218,64 +5227,149 @@ class Modeller:
         pre-fill gradient that no longer points anywhere useful -- the same
         reason bootstrap_log_z fits through a fresh local Adam.
         """
-        logw = getattr(self, '_z_fill_logw', None)
-        self._z_fill_logw = None  # single-use: never fill twice off one batch
+        if logw is None:
+            logw = getattr(self, '_z_fill_logw', None)
+            self._z_fill_logw = None  # single-use: never fill twice off one batch
         cfg = getattr(self.args, 'z_calibration', None)
         if logw is None or cfg is None:
             return
         threshold = float(getattr(cfg, 'fill_threshold', 0.0) or 0.0)
         if threshold <= 0:
             return  # the fill is off by configuration, not by accident
+
+        # created here, not in z_calibration_tick: the fill runs BEFORE the tick,
+        # so on the first fused step of a run the dict does not exist yet
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
+        pfx = '' if source == 'train' else f'{source}_'
+        beta = float(self.args.fwd_loss_coeffs.beta)
+        try:
+            root, se, frac = winsorized_z_root(logw, beta)
+        except ValueError:
+            rep[f'z_fill/{pfx}bad_batch'] = rep.get(f'z_fill/{pfx}bad_batch', 0) + 1
+            return
+
+        current = float(self.gfn_model.flow_model.scalar.detach())
+        gap = root - current
+        rep[f'z_fill/{pfx}gap'] = gap
+        rep[f'z_fill/{pfx}se'] = se
+        rep[f'z_fill/{pfx}frac_unclipped'] = frac
+        rep[f'z_fill/{pfx}n'] = float(logw.numel())
+        if not apply:
+            return
         cooldown = int(getattr(cfg, 'fill_cooldown_steps', 0) or 0)
         last = getattr(self, '_z_fill_last_step', None)
         if last is not None and (self.step_ind - last) < cooldown:
             return
 
-        # created here, not in z_calibration_tick: the fill runs BEFORE the tick,
-        # so on the first fused step of a run the dict does not exist yet
-        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
-        beta = float(self.args.fwd_loss_coeffs.beta)
-        try:
-            root, se, frac = winsorized_z_root(logw, beta)
-        except ValueError:
-            rep['z_fill/bad_batch'] = rep.get('z_fill/bad_batch', 0) + 1
-            return
+        mode = str(getattr(cfg, 'fill_mode', 'snap') or 'snap')
+        if mode == 'snap':
+            if abs(gap) <= threshold:
+                return
+            if abs(gap) <= float(getattr(cfg, 'fill_se', 5.0)) * se:
+                # includes the se = +inf case: an all-saturated batch never fills
+                rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
+                return
+            dz, drop_moments = gap, True
+        elif mode == 'absorb':
+            # ONE-DIMENSIONAL KALMAN FILTER ON log Z. State (Z, P): P is how
+            # uncertain the level is; it grows by fill_process_var per step
+            # between applied measurements (the policy moves Z) and shrinks when
+            # a measurement lands. Each measurement (root, se) moves Z by the
+            # fraction K = P_pred / (P_pred + se^2) of its gap: a precise one
+            # (a 10k-sample eval batch, or any batch late in training) is close
+            # to a snap, a noisy early batch-400 one is mostly averaged. No
+            # thresholds: the snap gates existed to keep noise out, and this
+            # weights noise down instead of discarding it. The first
+            # measurement is taken whole (diffuse prior) and leaves P = se^2.
+            if not math.isfinite(se):
+                rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
+                return
+            q = float(getattr(cfg, 'fill_process_var', 0.01) or 0.0)
+            P = getattr(self, '_z_fill_P', None)
+            last_applied = getattr(self, '_z_fill_last_applied', None)
+            if P is None:
+                K, P_post = 1.0, se * se
+            else:
+                elapsed = max(1, self.step_ind - last_applied) if last_applied is not None else 1
+                P_pred = P + q * elapsed
+                K = P_pred / (P_pred + se * se)
+                P_post = P_pred * (se * se) / (P_pred + se * se)
+            dz = K * gap
+            self._z_fill_P = P_post
+            rep['z_fill/K'] = K
+            rep['z_fill/P'] = P_post
+            rep['z_fill/dz'] = dz
+            # Adam's moments for the flow parameter describe a pre-move gradient;
+            # a small absorbed step leaves them meaningful, a large one does not
+            drop_moments = abs(dz) > float(getattr(cfg, 'fill_moment_reset', 0.5) or 0.0)
+        else:
+            raise ValueError(f"z_calibration.fill_mode must be 'snap' or 'absorb', got {mode!r}")
 
-        current = float(self.gfn_model.flow_model.scalar.detach())
-        gap = root - current
-        rep['z_fill/gap'] = gap
-        rep['z_fill/se'] = se
-        rep['z_fill/frac_unclipped'] = frac
-        if abs(gap) <= threshold:
-            return
-        if abs(gap) <= float(getattr(cfg, 'fill_se', 5.0)) * se:
-            # includes the se = +inf case: an all-saturated batch never fills
-            rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
-            return
-
+        target = current + dz
         with torch.no_grad():
-            self.gfn_model.flow_model.scalar.data.fill_(root)
-            self.ema_model.flow_model.scalar.data.fill_(root)
-        for name in ('fused', 'flow'):
-            opt = self.optimizers.get(name)
-            if opt is None:
-                continue
-            for p in self.gfn_model.flow_model.parameters():
-                opt.state.pop(p, None)
+            self.gfn_model.flow_model.scalar.data.fill_(target)
+            self.ema_model.flow_model.scalar.data.fill_(target)
+        if drop_moments:
+            for name in ('fused', 'flow'):
+                opt = self.optimizers.get(name)
+                if opt is None:
+                    continue
+                for p in self.gfn_model.flow_model.parameters():
+                    opt.state.pop(p, None)
         tracker = getattr(self, 'condition_log_z', None)
         if tracker is not None:
             with torch.no_grad():
                 # stored residual is logw - log_Z_learned, so raising log_Z by
-                # `gap` lowers every stored level reading by the same amount
-                tracker.z_bias_ema -= gap
-                tracker.z_grad_ema = (tracker.z_grad_ema - gap).clamp(
+                # `dz` lowers every stored level reading by the same amount
+                tracker.z_bias_ema -= dz
+                tracker.z_grad_ema = (tracker.z_grad_ema - dz).clamp(
                     -tracker.clip_beta, tracker.clip_beta)
         self._z_fill_last_step = self.step_ind
+        self._z_fill_last_applied = self.step_ind
         rep['z_fill/fired'] = rep.get('z_fill/fired', 0) + 1
         rep['z_fill/root'] = root
-        print(f"z_level_fill: log_Z {current:.3f} -> {root:.3f} "
-              f"(gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
+        print(f"z_level_fill[{mode},{source}]: log_Z {current:.3f} -> {target:.3f} "
+              f"(root {root:.3f}, gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
               f"at step {self.step_ind}")
+
+    def _eval_z_fill(self, fwd_stats):
+        """Feed the eval rollout's log w to z_level_fill (z_calibration.fill_from_eval).
+
+        The eval batch is the most precise Z measurement the run makes: se
+        scales as 1/sqrt(B), and eval_num_samples is 2500-10000 against a
+        training batch of 400-1600. 'report' logs z_fill/eval_gap and
+        z_fill/eval_se beside the training fill's; 'fill' applies it through
+        the same actuator (under fill_mode 'absorb' its precision sets its
+        weight automatically). Refused, with the reason logged, when the eval
+        batch is not a sample of the training policy at the training target:
+        temperature conditioning (a temperature sweep), a different eval grid,
+        or a separate EMA model.
+        """
+        cfg = getattr(self.args, 'z_calibration', None)
+        mode = str(getattr(cfg, 'fill_from_eval', 'off') or 'off') if cfg is not None else 'off'
+        if mode == 'off':
+            return
+        if mode not in ('report', 'fill'):
+            raise ValueError(f"z_calibration.fill_from_eval must be off, report or fill, got {mode!r}")
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
+        reason = None
+        if not self._z_fill_head_is_fillable():
+            reason = 'head'
+        elif getattr(self.args, 'temperature_conditioning', False):
+            reason = 'temperature'
+        elif int(self.args.eval_T) != int(self.args.integrator.T):
+            reason = 'grid'
+        elif getattr(self.args, 'ema_decay', None) is not None:
+            reason = 'ema'
+        if reason is not None:
+            rep[f'z_fill/eval_refused_{reason}'] = rep.get(f'z_fill/eval_refused_{reason}', 0) + 1
+            return
+        logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
+                - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
+        logw = logw[torch.isfinite(logw)]
+        if logw.numel() < 2:
+            return
+        self.z_level_fill(logw=logw, source='eval', apply=(mode == 'fill'))
 
     def _stash_z_cal_cache(self, condition_id):
         """
@@ -7124,6 +7218,10 @@ class Modeller:
                 metrics[key] = loggable_array(metrics[key])
             elif torch.is_tensor(metrics[key]):
                 metrics[key] = loggable_array(metrics[key].detach().cpu().numpy())
+
+        # the eval rollout as a Z measurement -- BEFORE maybe_advance, so it
+        # lands on the stage that produced it, never on the one being entered
+        self._eval_z_fill(fwd_stats)
 
         # stage-exit check + transition: the trigger's tick-resolvable terms
         # were latched at train cadence; eval/* terms (e.g. eval/wass_debiased)

@@ -24,7 +24,11 @@ STEPS = 2000
 BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
-def build(name, every, store_all):
+def build(name, every, store_all, fwd_frac=0.0):
+    """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
+    forward TB loss trains the policy with the batch's own root standing in for
+    log Z (tb_z_source batch_root), at that loss weight; the head is still set
+    only by the fill."""
     cfg = yaml.safe_load(BASE.read_text(encoding='utf-8'))
     cfg['run_name'] = name
     cfg['tag'] = 'rr07'
@@ -36,6 +40,13 @@ def build(name, every, store_all):
     zc['fill_threshold'] = 0.5
     zc['fill_se'] = 3.0
     zc['fill_cooldown_steps'] = 0
+    # the absorber: every measurement moves Z by its precision share
+    # (K = P/(P + se^2)); the eval rollout is the most precise one and is fed
+    # to the same actuator
+    zc['fill_mode'] = 'absorb'
+    zc['fill_process_var'] = 0.01
+    zc['fill_moment_reset'] = 0.5
+    zc['fill_from_eval'] = 'fill'
 
     n_fused = 0
     for proto in (cfg.get('protocols') or {}).values():
@@ -48,11 +59,15 @@ def build(name, every, store_all):
             st['fwd_rollout_every'] = int(every)
             st.setdefault('flags', {})['z_calibration'] = False
             # the gated-ramp controller: one sensor, two motions, hard rails
-            st['fracs'] = {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
+            f = float(fwd_frac)
+            st['fracs'] = {'fwd': f, 'bwd': (1 - f) / 2, 'replay': (1 - f) / 2}
             st.pop('min_fracs', None)
+            if f > 0:
+                fwd_lc = st.setdefault('loss_coeffs', {}).setdefault('fwd', {})
+                fwd_lc.update({'tb_z_source': 'batch_root', 'freeze_policy': 0.0, 'freeze_z': 1.0})
             st['balance'] = {
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
-                'pinned': {'fwd': 0.0},
+                'pinned': {'fwd': f},
                 'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
                 'up': 0.0017,      # 0.50 -> 0.75 replay share over ~1500 steps
                 'down': 0.043,     # 0.75 -> 0.10 over ~150 steps when the guard fires
@@ -95,11 +110,14 @@ def main():
     # log Z drifted over the N steps since the last one, and replay/resid_vs_intake
     # measures memorisation at reuse = N, so gap(N) and memo(N) on this system are a
     # real-data estimate of a reasonable N: where |gap| approaches the fill's se.
-    spec = {'rr_n1': (1, False), 'rr_n7': (7, True),
-            'rr_n20': (20, True), 'rr_n50': (50, True)}
+    # rr_n7_fwd: rr_n7 plus the level-blind forward policy step at weight 0.05
+    # (the only arm on which the forward branch trains anything).
+    spec = {'rr_n1': (1, False, 0.0), 'rr_n7': (7, True, 0.0),
+            'rr_n20': (20, True, 0.0), 'rr_n50': (50, True, 0.0),
+            'rr_n7_fwd': (7, True, 0.05)}
     arms = {}
-    for name, (every, store_all) in spec.items():
-        cfg = build(name, every, store_all)
+    for name, (every, store_all, fwd_frac) in spec.items():
+        cfg = build(name, every, store_all, fwd_frac)
         check(cfg, name, every, store_all)
         arms[name] = cfg
     for name, cfg in arms.items():

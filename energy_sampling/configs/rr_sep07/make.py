@@ -58,6 +58,12 @@ def deltas(cfg, name, every, fam):
     zc['fill_threshold'] = 0.5
     zc['fill_se'] = 3.0
     zc['fill_cooldown_steps'] = 0
+    # the absorber: every measurement moves Z by its precision share; the eval
+    # rollout (2500-10000 samples) is fed to the same actuator
+    zc['fill_mode'] = 'absorb'
+    zc['fill_process_var'] = 0.01
+    zc['fill_moment_reset'] = 0.5
+    zc['fill_from_eval'] = 'fill'
     n = 0
     for proto in (cfg.get('protocols') or {}).values():
         for st in (proto.get('stages') or []):
@@ -95,6 +101,7 @@ def check(cfg, name, every):
     assert st and all(s['fwd_rollout_every'] == every for s in st), name
     assert all(s['flags'].get('z_calibration') is False for s in st), name + ': servo on'
     assert cfg['z_calibration']['fill_threshold'] > 0, name + ': fill off'
+    assert cfg['z_calibration']['fill_mode'] == 'absorb' and cfg['z_calibration']['fill_from_eval'] == 'fill', name + ': absorber'
     for s in st:
         b = s.get('balance') or {}
         assert b.get('kind') == 'gated_ramp' and b.get('guard') == 'bwd', name + ': controller'

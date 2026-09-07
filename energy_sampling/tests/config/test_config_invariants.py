@@ -839,6 +839,51 @@ def test_fwd_rollout_cadence_accepts_the_well_formed_shape(canonical):
     assert not _fires(canonical, 'fwd_rollout_cadence_is_well_formed')
 
 
+def test_z_fill_mode_refuses_a_misspelt_mode_and_a_bad_eval_source(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['z_calibration']['fill_mode'] = 'ema'
+    assert _fires(cfg, 'z_fill_mode_is_well_formed')
+    cfg = copy.deepcopy(canonical)
+    cfg['z_calibration']['fill_from_eval'] = 'always'
+    assert _fires(cfg, 'z_fill_mode_is_well_formed')
+    cfg = copy.deepcopy(canonical)
+    cfg['z_calibration']['fill_process_var'] = -1.0
+    assert _fires(cfg, 'z_fill_mode_is_well_formed')
+
+
+def test_z_fill_mode_accepts_the_absorber(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['z_calibration'].update({'fill_mode': 'absorb', 'fill_process_var': 0.01,
+                                 'fill_moment_reset': 0.5, 'fill_from_eval': 'fill'})
+    assert not _fires(cfg, 'z_fill_mode_is_well_formed')
+    assert not _fires(canonical, 'z_fill_mode_is_well_formed')
+
+
+def test_batch_root_is_forward_only_and_needs_a_cadence(canonical):
+    # on the backward branch: refused outright
+    cfg = copy.deepcopy(canonical)
+    cfg['bwd_loss_coeffs']['tb_z_source'] = 'batch_root'
+    assert _fires(cfg, 'batch_root_forward_is_well_formed')
+    # on fwd without a cadence: refused
+    cfg = copy.deepcopy(canonical)
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
+                 if s.get('train_mode', 'fused') == 'fused' and 'fracs' in s)
+    stage.setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(
+        {'tb_z_source': 'batch_root', 'freeze_policy': 0.0})
+    assert _fires(cfg, 'batch_root_forward_is_well_formed')
+    # with a cadence but the policy frozen: refused (the branch would train nothing)
+    cfg, stage = _cadenced_fused_stage(canonical)
+    stage.setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(
+        {'tb_z_source': 'batch_root', 'freeze_policy': 1.0})
+    assert _fires(cfg, 'batch_root_forward_is_well_formed')
+    # the well-formed shape
+    cfg, stage = _cadenced_fused_stage(canonical)
+    stage.setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(
+        {'tb_z_source': 'batch_root', 'freeze_policy': 0.0})
+    assert not _fires(cfg, 'batch_root_forward_is_well_formed')
+    assert not _fires(canonical, 'batch_root_forward_is_well_formed')
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check
