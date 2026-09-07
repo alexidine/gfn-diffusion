@@ -254,7 +254,7 @@ on ELJ. On MLIP systems the rollout is a larger fraction, so gains continue to l
 | 7 | 1.73 | 1.55 | 1.10 | 0.985 (0.966) | 39.9 | 4.95 |
 | 20 | 2.16 | 1.73 | 1.23 | 0.899 (0.860) | 44.9 | 3.65 |
 | 50 | 1.60 | 2.16 | 0.76 | 0.911 (0.732) | 42.1 | **20.24** |
-| 1 | *(running — the noise-floor yardstick)* | | | | | |
+| 1 | 1.80 | 2.17 | 0.84 | 0.997 (0.98) | 40.6 | 10.53 |
 
 **Reading.** Z drift is never the binding constraint here: gap/se ≤ 1.2 at every N up
 to 50 — the fill's own batch noise dominates what the policy does to Z between
@@ -274,4 +274,13 @@ as replay-heavy training at reuse 50 forgot the prior; the sensor crossed +1 nat
 510, 2.57 @ 720); replay share cut 0.50 → 0.36 → 0.10 (the rail); under-coverage fell to
 41.7, the sensor went to −3.8, and the ramp resumed (0.26 by step 1760). Memorisation
 dipped to 0.77 at the replay-heavy peak and recovered to 0.95–0.99 after the cut. rr_n20
-ran the pre-fix code (sensor never written, share held 0.5); rr_n1 is the second live run.
+ran the pre-fix code (sensor never written, share held 0.5); rr_n1 was the second live run
+and repeated it (sensor 1.45/2.14 at 510/720, share cut to 0.10 by 760, back to 0.24 by 1760).
+
+**Open — the guard fires on the post-transition transient.** In both live runs the rise
+came at steps 300–750, when under-coverage climbs 4–5 nat as the policy first leaves
+the prior; both then ran ~1000 steps replay-starved and ended with worse energy (10.5,
+20.2) than the inert 0.5/0.5 runs (4.95, 3.65). The bar was calibrated on mature arms.
+Needs a warm-up (v1 item F). Also: N = 1 under the new gate runs 2.1 it/s, not 1.3 —
+the rollout's backward pass is gone even at N = 1, so the cost model's N = 1 point is
+the old design's.
