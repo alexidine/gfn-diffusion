@@ -330,6 +330,7 @@ class TrainerSnapshot:
         # stash from a discarded attempt could hard-set log_Z from a batch the
         # run never kept
         '_z_fill_last_step', '_z_fill_logw',
+        '_z_fill_P', '_z_fill_last_applied',   # the absorber's belief, per candidate
     )
 
     def __init__(self, modeller, label: str):

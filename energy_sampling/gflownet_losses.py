@@ -345,7 +345,10 @@ def get_gfn_forward_loss(loss_coeffs,
     """TB loss"""
     if loss_coeffs.tb > 0:
         use_persistent_z = tb_z_source == 'persistent'
-        tb_loss = get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
+        z_for_tb = log_Z_learned
+        if tb_z_source == 'batch_root':
+            z_for_tb = batch_root_z(log_Z_learned, log_pb, log_pf, log_r, beta)
+        tb_loss = get_tb_loss(z_for_tb, log_pb, log_pf, log_r,
                               beta=beta,
                               log_Z_target=log_z_target if use_persistent_z else None,
                               target_mask=log_z_target_mask if use_persistent_z else None)
@@ -927,6 +930,31 @@ def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
     # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
     tb_loss = beta * F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none', beta=beta)
     return tb_loss
+
+
+def batch_root_z(log_Z_learned, log_pb, log_pf, log_r, beta: float):
+    """The level the forward TB loss is measured against when the forward
+    branch trains the POLICY under rarer rollouts (fwd tb_z_source
+    'batch_root'): this batch's own Huber fixed point, detached.
+
+    With the learned scalar in the loss, a level error (the head lagging the
+    policy between fills) pushes every log p_F the same way -- a bias the
+    policy cannot fix and the fill removes anyway. The batch root makes the
+    winsorized mean residual zero by construction, so what remains is the
+    within-batch spread: a level-blind, Huber-VarGrad-like objective. The
+    learned head is not in the loss and is set by z_level_fill as before.
+
+    Falls back to the learned scalar when no row is inside the Huber knee (the
+    root is undefined there), so that batch carries the level term rather
+    than nothing.
+    """
+    with torch.no_grad():
+        logw = (log_pb + log_r - log_pf).detach().flatten()
+        try:
+            root, _, _ = winsorized_z_root(logw, beta)
+        except ValueError:
+            return log_Z_learned
+    return torch.full_like(log_Z_learned, float(root))
 
 
 def winsorized_z_root(logw, beta: float = 10.0, iters: int = 60):

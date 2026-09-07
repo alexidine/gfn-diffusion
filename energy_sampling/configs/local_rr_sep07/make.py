@@ -1,0 +1,135 @@
+"""Local acceptance rig for rarer rollouts v0 (docs/design/rarer_rollouts.md).
+
+Two arms off the validated local ELJ shape (configs/local_prod_sep02/lp02.yaml):
+
+  rr_n1    fwd_rollout_every: 1 with lp02's own buffer settings. Exercises the new
+           gate on the path that must reproduce today's behaviour; compare to the
+           localprod_lp02 run at matched step.
+  rr_n10   fwd_rollout_every: 10, store-all replay (churn_rate = batch), residence
+           5N steps. The design under test.
+
+Pass conditions are the spec's local acceptance list: z_fill/gap logged exactly on
+the cadence and nowhere else, lr_ctrl/scale flat, anchors static, replay occupancy
+~ B*tau/N, Bwd Frac 0.5 between rollouts and 0.475 on them, zero divergences, and
+energies / log Z tracking the N=1 arm within noise at matched step.
+"""
+import pathlib
+import yaml
+
+HERE = pathlib.Path(__file__).resolve().parent
+BASE = HERE.parent / 'local_prod_sep02' / 'lp02.yaml'
+
+STEPS = 2000
+# ELJ rails: bwd floor 0.25, replay cap 0.75. (MLIP arms use a 0.5 bwd floor.)
+BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
+
+
+def build(name, every, store_all, fwd_frac=0.0):
+    """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
+    forward TB loss trains the policy with the batch's own root standing in for
+    log Z (tb_z_source batch_root), at that loss weight; the head is still set
+    only by the fill."""
+    cfg = yaml.safe_load(BASE.read_text(encoding='utf-8'))
+    cfg['run_name'] = name
+    cfg['tag'] = 'rr07'
+    cfg['epochs'] = STEPS
+
+    zc = cfg.setdefault('z_calibration', {})
+    # the fill is the ONLY Z pin once the servo is off; >0 keeps it armed, small
+    # makes it fire at every rollout, se-gated so a batch must resolve the gap
+    zc['fill_threshold'] = 0.5
+    zc['fill_se'] = 3.0
+    zc['fill_cooldown_steps'] = 0
+    # the absorber: every measurement moves Z by its precision share
+    # (K = P/(P + se^2)); the eval rollout is the most precise one and is fed
+    # to the same actuator
+    zc['fill_mode'] = 'absorb'
+    zc['fill_process_var'] = 0.01
+    zc['fill_moment_reset'] = 0.5
+    zc['fill_from_eval'] = 'fill'
+
+    n_fused = 0
+    for proto in (cfg.get('protocols') or {}).values():
+        for st in (proto.get('stages') or []):
+            # ANCHOR-ONLY PRIOR: nothing writes a prior model any more
+            if 'snapshot_prior' in (st.get('on_exit') or []):
+                st['on_exit'] = [a for a in st['on_exit'] if a != 'snapshot_prior']
+            if st.get('train_mode') != 'fused':
+                continue
+            st['fwd_rollout_every'] = int(every)
+            st.setdefault('flags', {})['z_calibration'] = False
+            # the gated-ramp controller: one sensor, two motions, hard rails
+            f = float(fwd_frac)
+            st['fracs'] = {'fwd': f, 'bwd': (1 - f) / 2, 'replay': (1 - f) / 2}
+            st.pop('min_fracs', None)
+            if f > 0:
+                fwd_lc = st.setdefault('loss_coeffs', {}).setdefault('fwd', {})
+                fwd_lc.update({'tb_z_source': 'batch_root', 'freeze_policy': 0.0, 'freeze_z': 1.0})
+            st['balance'] = {
+                'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
+                'pinned': {'fwd': f},
+                'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
+                'up': 0.0017,      # 0.50 -> 0.75 replay share over ~1500 steps
+                'down': 0.043,     # 0.75 -> 0.10 over ~150 steps when the guard fires
+                'bounds': BOUNDS,
+            }
+            n_fused += 1
+    assert n_fused >= 1, f'{name}: no fused stage to cadence'
+    cfg['buffers']['prior_buffer']['source'] = 'anchors'
+
+    rb = cfg['buffers']['replay_buffer']
+    # OUTSIDE the store_all guard: rr_n1 is the control, and it can only be
+    # compared on the gap if it carries the split too. 10% of every admission
+    # is held out of the training draw so replay/val_gap is measured rather
+    # than inferred. Measurement only -- nothing actuates on it.
+    rb['val_frac'] = 0.1
+    if store_all:
+        rb['churn_rate'] = int(cfg['batch_size'])
+        rb['mean_residence_steps'] = 5 * int(every)
+    return cfg
+
+
+def check(cfg, name, every, store_all):
+    st = [s for p in cfg['protocols'].values() for s in p['stages']
+          if s.get('train_mode') == 'fused']
+    assert st and all(s['fwd_rollout_every'] == every for s in st), name
+    assert all(s['flags'].get('z_calibration') is False for s in st), name + ': servo on'
+    assert not any('fwd_rollout_drift_max' in s for s in st), name + ': drift trigger armed'
+    rb = cfg['buffers']['replay_buffer']
+    assert rb['val_frac'] == 0.1, name + ': val split'
+    if store_all:
+        assert rb['churn_rate'] == cfg['batch_size'], name
+        assert rb['mean_residence_steps'] == 5 * every, name
+
+
+def main():
+    # N = 7 is COPRIME with the 10-step metric cadence, so logged rows cover
+    # both rollout and non-rollout steps; at N = 10 every logged row was a
+    # rollout step and the 0.5/0.5 renormalisation was unobservable.
+    # rr_n20 / rr_n50: the cadence sweep. Each rollout's z_fill/gap measures how far
+    # log Z drifted over the N steps since the last one, and replay/resid_vs_intake
+    # measures memorisation at reuse = N, so gap(N) and memo(N) on this system are a
+    # real-data estimate of a reasonable N: where |gap| approaches the fill's se.
+    # rr_n7_fwd: rr_n7 plus the level-blind forward policy step at weight 0.05
+    # (the only arm on which the forward branch trains anything).
+    spec = {'rr_n1': (1, False, 0.0), 'rr_n7': (7, True, 0.0),
+            'rr_n20': (20, True, 0.0), 'rr_n50': (50, True, 0.0),
+            'rr_n7_fwd': (7, True, 0.05)}
+    arms = {}
+    for name, (every, store_all, fwd_frac) in spec.items():
+        cfg = build(name, every, store_all, fwd_frac)
+        check(cfg, name, every, store_all)
+        arms[name] = cfg
+    for name, cfg in arms.items():
+        with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        st = [s for p in cfg['protocols'].values() for s in p['stages'] if s.get('train_mode') == 'fused'][0]
+        rb = cfg['buffers']['replay_buffer']
+        print(f"{name:<8} every={st['fwd_rollout_every']} z_cal={st['flags']['z_calibration']} "
+              f"fill_thr={cfg['z_calibration']['fill_threshold']} churn={rb['churn_rate']} "
+              f"tau={rb['mean_residence_steps']} batch={cfg['batch_size']} "
+              f"val_frac={rb['val_frac']}")
+
+
+if __name__ == '__main__':
+    main()

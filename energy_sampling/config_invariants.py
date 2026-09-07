@@ -1173,6 +1173,122 @@ def every_protocol_parses(cfg: dict) -> list[Violation]:
     return out
 
 
+def fwd_rollout_cadence_is_well_formed(cfg: dict) -> list[Violation]:
+    """A stage running forward rollouts on 1 in N steps (`fwd_rollout_every`)
+    relies on two things the rest of the config can silently undo.
+
+    `flags.z_calibration` must be off: its `rollout` mode performs its own forward
+    rollout + energy call per Z step, off a sensor that is frozen between
+    rollouts, so it would fire on every skipped step -- restoring the cost the
+    cadence removes and moving Z in the interval the design keeps frozen.
+    `z_calibration.fill_threshold` must be > 0: that is the switch for
+    `z_level_fill`, the ONLY thing pinning log Z at each rollout once the servo is
+    off; 0 disables it, and an unpinned Z under rare rollouts is the failure mode
+    the design exists to avoid (docs/design/rarer_rollouts.md, invariants 1-2).
+    Stage.__init__ refuses the first case at load; this rule is the audit-path
+    twin and adds the second.
+
+    It also covers `fwd_rollout_drift_max`, the off-cadence rollout trigger:
+    it must be >= 0, and it only has meaning on a stage that skips forward
+    rollouts in the first place."""
+    out = []
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        bar = _num(st.get('fwd_rollout_drift_max'))
+        if bar is None:
+            continue
+        if bar < 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
+                                 f"{bar}; it is a drift in nats and must be >= 0 "
+                                 f"(0 = the trigger is off)."))
+        elif bar > 0 and (_num(st.get('fwd_rollout_every')) or 0) <= 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
+                                 f"{bar} without fwd_rollout_every > 0. The trigger only "
+                                 f"adds rollouts to steps a cadence skipped, so it is "
+                                 f"dead config here."))
+    cadenced = [st for st in active_stages(cfg)
+                if isinstance(st, dict) and (_num(st.get('fwd_rollout_every')) or 0) > 0]
+    for st in cadenced:
+        flags = st.get('flags') or {}
+        if bool(flags.get('z_calibration', False)):
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_every="
+                                 f"{st.get('fwd_rollout_every')} with flags.z_calibration "
+                                 f"true; the servo would call the energy function on every "
+                                 f"skipped step. Set it false."))
+    if cadenced:
+        ft = _num(_get(cfg, 'z_calibration.fill_threshold'))
+        if ft is None or ft <= 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f'z_calibration.fill_threshold={ft} but a stage runs '
+                                 f'fwd_rollout_every > 0; the fill is the only thing '
+                                 f'pinning log Z at each rollout and 0/absent disables it.'))
+    return out
+
+def z_fill_mode_is_well_formed(cfg: dict) -> list[Violation]:
+    """z_calibration.fill_mode is 'snap' or 'absorb'; fill_process_var and
+    fill_moment_reset are non-negative numbers; fill_from_eval is off, report
+    or fill. A typo here would surface as a ValueError on the first fill --
+    hundreds of steps into a cluster leg."""
+    out = []
+    zc = cfg.get('z_calibration') or {}
+    if not isinstance(zc, dict):
+        return out
+    mode = zc.get('fill_mode', 'snap')
+    if mode not in ('snap', 'absorb'):
+        out.append(Violation(ERROR, 'z_fill_mode_is_well_formed',
+                             f"z_calibration.fill_mode={mode!r}; must be 'snap' or 'absorb'."))
+    for key in ('fill_process_var', 'fill_moment_reset'):
+        v = zc.get(key)
+        if v is not None and (_num(v) is None or _num(v) < 0):
+            out.append(Violation(ERROR, 'z_fill_mode_is_well_formed',
+                                 f"z_calibration.{key}={v!r}; must be a number >= 0."))
+    fe = zc.get('fill_from_eval', 'off')
+    if fe not in ('off', 'report', 'fill'):
+        out.append(Violation(ERROR, 'z_fill_mode_is_well_formed',
+                             f"z_calibration.fill_from_eval={fe!r}; must be off, report or fill."))
+    return out
+
+
+def batch_root_forward_is_well_formed(cfg: dict) -> list[Violation]:
+    """tb_z_source 'batch_root' (the level-blind forward policy step) is a
+    FORWARD-branch mode for cadenced stages only: the batch root stands in for
+    the learned Z in the forward TB loss so the forward branch can train the
+    policy without carrying a level error, and z_level_fill keeps setting the
+    head. On bwd/replay it is meaningless (those branches freeze Z and train
+    against the head); without a cadence every step would train the policy
+    against its own batch's level with nothing bounding how often."""
+    out = []
+    base = (cfg.get('fwd_loss_coeffs') or {})
+    for mode in ('bwd', 'replay'):
+        if (cfg.get(f'{mode}_loss_coeffs') or {}).get('tb_z_source') == 'batch_root':
+            out.append(Violation(ERROR, 'batch_root_forward_is_well_formed',
+                                 f"{mode}_loss_coeffs.tb_z_source='batch_root' -- forward only."))
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        lc = st.get('loss_coeffs') or {}
+        for mode in ('bwd', 'replay'):
+            if (lc.get(mode) or {}).get('tb_z_source') == 'batch_root':
+                out.append(Violation(ERROR, 'batch_root_forward_is_well_formed',
+                                     f"stage {st.get('name')!r}: loss_coeffs.{mode}.tb_z_source="
+                                     f"'batch_root' -- forward only."))
+        fwd = dict(base); fwd.update(lc.get('fwd') or {})
+        if fwd.get('tb_z_source') == 'batch_root':
+            if (_num(st.get('fwd_rollout_every')) or 0) <= 0:
+                out.append(Violation(ERROR, 'batch_root_forward_is_well_formed',
+                                     f"stage {st.get('name')!r}: fwd tb_z_source 'batch_root' "
+                                     f"needs fwd_rollout_every > 0."))
+            if (_num(fwd.get('freeze_policy')) or 0) > 0.5:
+                out.append(Violation(ERROR, 'batch_root_forward_is_well_formed',
+                                     f"stage {st.get('name')!r}: fwd tb_z_source 'batch_root' with "
+                                     f"freeze_policy on -- the branch would train nothing."))
+    return out
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
@@ -1192,6 +1308,9 @@ RULES = (
     deactivate_threshold_is_sane,
     pinned_frac_matches_fracs,
     effective_batch_meets_baseline,
+    fwd_rollout_cadence_is_well_formed,
+    z_fill_mode_is_well_formed,
+    batch_root_forward_is_well_formed,
 )
 
 

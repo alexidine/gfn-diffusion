@@ -180,6 +180,10 @@ def test_a_non_finite_batch_is_reported_not_filled():
 
 def _stash(**kw):
     m = _stub(None, **kw)
+    # the arming predicate reads the stage cadence and the fwd loss's Z source
+    m.protocol = types.SimpleNamespace(stage=types.SimpleNamespace(fwd_rollout_every=0))
+    m.tb_z_source = types.MethodType(Modeller.tb_z_source, m)
+    m._z_fill_head_is_fillable = types.MethodType(Modeller._z_fill_head_is_fillable, m)
     n = 128
     loss_dict = {'log_pb': torch.zeros(n), 'log_r': torch.full((n,), -500.0),
                  'log_pf': torch.zeros(n)}

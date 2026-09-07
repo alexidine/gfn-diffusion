@@ -1,0 +1,5 @@
+arm	warm_src	fwd_rollout_every
+rrs_mip_n10	pt100_mip_lr4p0	10
+rrs_mipu_n10	pt100_mipu_lr4p0	10
+rrs_nehu_n10	pt100_nehu_lr4p0	10
+rrs_acr_n10	pt100_acr_lr4p0	10

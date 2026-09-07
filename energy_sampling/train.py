@@ -186,6 +186,20 @@ def _uniform_draw(n: int, k: int) -> torch.Tensor:
     return torch.randperm(n)[:k]
 
 
+def _val_flags(k: int, val_frac: float):
+    """Per-row held-out flags for an admission batch of k rows, Bernoulli(val_frac).
+
+    None (rather than an all-False tensor) when the split is off, so the buffer
+    takes its own default and a val_frac of 0 costs nothing. Held-out rows are
+    flagged at ADMISSION and never re-flagged, and they take eviction exactly
+    like any other row -- which is what keeps the held-out pool a refreshing
+    uniform sample of admissions rather than a frozen cohort.
+    """
+    if k <= 0 or not (val_frac > 0):
+        return None
+    return torch.rand(int(k)) < float(val_frac)
+
+
 class Modeller:
     def __init__(self, args=None):
         self.step_ind = None
@@ -1275,6 +1289,13 @@ class Modeller:
         # filled", and `raycal/deferred` with reason 'larder_filling' answers
         # that from the sensor's side, where a reader is already looking.
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
+        # Extra rollouts bought by the policy-drift trigger since the last
+        # report -- a window rate, drained on read, and ABSENT while the
+        # trigger is off (which is how it ships). Raw rather than tracked: an
+        # EMA of a count is not a count.
+        if getattr(self, '_drift_trigger_count', 0):
+            metrics['rollout/drift_trigger_fires'] = float(self._drift_trigger_count)
+            self._drift_trigger_count = 0
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
         # that the buffer is being fitted at its own trajectories.
@@ -3685,6 +3706,71 @@ class Modeller:
         self.update_ema_model()
         return reported_loss
 
+    def _fwd_gates(self, deactivate_threshold, force_refresh):
+        """(fwd_ran, fwd_active) for this fused step.
+
+        fwd_ran gates the ROLLOUT -- and with it the z_fill stash and replay
+        admission; fwd_active gates whether the forward loss carries any WEIGHT.
+        They are separate because a rollout is worth paying for on its own (the
+        Z pin and fresh buffer rows) even when the branch contributes no
+        gradient.
+
+        RARER ROLLOUTS (docs/design/rarer_rollouts.md). The forward branch is
+        the only branch that calls the energy function during a training step
+        -- bwd and replay score PRE-BUILT rows -- so running it on 1 in `every`
+        steps removes ~all training-time MLIP calls. The other two branches
+        train every step and renormalise between themselves; z_level_fill is
+        armed only on the steps fwd actually ran, so log Z is snapped at every
+        rollout and frozen in between (the safe shape: an unpinned interval is
+        where a low-lagging Z is absorbed by the policy). The force-refresh
+        must NOT run fwd under a cadence: at refresh_every 10 it would call the
+        MLIP every 10 steps regardless of `every`, silently.
+
+        fwd_active is DERIVED from fwd_ran on both branches, which reproduces
+        today's table exactly: off-cadence it is the frac test (and a
+        force-refresh-only run is detached, weight 0), on-cadence the stages
+        that set a cadence pin fwd_frac at 0, so it is False."""
+        rollout_every = int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0)
+        if rollout_every > 0:
+            fwd_ran = (self.step_ind % rollout_every == 0)
+            if fwd_ran:
+                self._last_rollout_step = self.step_ind
+            elif self._drift_trigger_fires(rollout_every):
+                fwd_ran = True
+        else:
+            fwd_ran = bool(self.fwd_frac >= deactivate_threshold
+                           or (force_refresh and not self.protocol.mode_dormant('fwd')))
+        return fwd_ran, bool(fwd_ran and self.fwd_frac >= deactivate_threshold)
+
+    def _drift_trigger_fires(self, rollout_every):
+        """Should an OFF-CADENCE step run an extra rollout because the policy
+        has drifted off the stored rows? (stage.fwd_rollout_drift_max, nats;
+        0/absent = off, which is what ships.)
+
+        The sensor is replay/policy_drift_std -- the non-circular one. The
+        minimum two-step gap is a PLACEMENT bound, not a cost bound: the drift
+        reading is taken before that step's admission, so without it a
+        chronically high drift would fire at step 1 of every window and turn
+        the cadence into rollouts at 0 and 1 (mod N).
+
+        Nothing here is serialized: a resume simply re-reads at the next
+        measurement, so every read goes through getattr with a default."""
+        bar = float(getattr(self.protocol.stage, 'fwd_rollout_drift_max', 0.0) or 0.0)
+        if bar <= 0:
+            return False
+        std = getattr(self, '_replay_drift_std', None)
+        if std is None or not math.isfinite(std) or std <= bar:
+            return False
+        last = getattr(self, '_last_rollout_step', None)
+        if last is not None and (self.step_ind - last) < 2:
+            return False
+        self._last_rollout_step = self.step_ind
+        self._drift_trigger_count = getattr(self, '_drift_trigger_count', 0) + 1
+        print(f"fwd rollout triggered by policy drift: std {std:.2f} > {bar:.2f} nat "
+              f"at step {self.step_ind} (cadence {rollout_every}, last rollout {last})",
+              flush=True)
+        return True
+
     def fused_train_step(self,
                          discretizer,
                          report_losses: bool = True):
@@ -3726,8 +3812,7 @@ class Modeller:
         sub_losses = {}
         weights = {}
 
-        fwd_active = self.fwd_frac >= deactivate_threshold
-        fwd_ran = fwd_active or (force_refresh and not self.protocol.mode_dormant('fwd'))
+        fwd_ran, fwd_active = self._fwd_gates(deactivate_threshold, force_refresh)
         if fwd_ran:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
@@ -4133,8 +4218,60 @@ class Modeller:
         # RAW (pre-EMA) stats cache, one step deep: the MLE slope gate samples
         # bwd/mle from here every 10 steps -- raw batch losses are ~independent
         # across steps, so its OLS slope needs no autocorrelation correction
+        # FORGETTING SENSOR for the gated-ramp balance (docs/design/rarer_rollouts.md):
+        # mean of bwd/under_coverage over the last 150 steps minus the mean over
+        # the 150 before. under_coverage oscillates with a ~150-step period and
+        # 0.4-0.7 nat amplitude, so a period-matched difference cancels the
+        # oscillation exactly where a sign-of-slope gate chattered 11-85% of the
+        # time; against an injected +3-nat deterioration over 300 steps it alarms
+        # in 120-190 steps at 0-5% false positives on four healthy arms
+        # (memory: project_under_coverage_gate_calibration). NOT written until the
+        # window is full: the tracker EMAs whatever it is given, so a NaN here
+        # would poison the EMA and a zero would read as "not rising".
+        if sub_type == 'bwd':
+            self._forgetting_sensor(stats)
         self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
+
+    _UC_WINDOW_STEPS = 150
+
+    def _forgetting_sensor(self, stats):
+        """Write stats['relative_under_rise150'] once 300 STEPS of bwd/relative_under
+        history exist: mean over the last 150 steps minus mean over the 150 before.
+
+        THE SENSOR MUST BE LEVEL-BLIND. `under_coverage` is the negative-tail RMS
+        of the Z-anchored residual log_pf + log_Z - log_r - log_pb, so a fill that
+        lowers log_Z by 4 nat raises it by ~4 -- under rarer rollouts, where the
+        fill snaps Z by several nat early in a stage, that read as "forgetting",
+        cut the replay weight to its rail, and starved replay for ~1000 steps.
+        `relative_under` is the same statistic centred on the batch's own mean
+        log w, so Z motion drops out and only the within-batch spread the policy
+        can actually fix remains.
+
+        Windows are in STEPS, not samples. This method runs on _update_rolling's
+        cadence -- every 10th trained bwd step -- so a sample-counted window would
+        be 10x longer than intended and would not fill inside a short run.
+        Timestamping each sample with step_ind makes the sensor indifferent to
+        the call cadence, and 'full' means the oldest kept sample is within one
+        stride of 300 steps old.
+        """
+        uc = stats.get('relative_under')
+        if uc is None:
+            return
+        uc = float(uc)
+        if not math.isfinite(uc):
+            return
+        w = self._UC_WINDOW_STEPS
+        now = int(self.step_ind)
+        hist = [(s, v) for s, v in getattr(self, '_uc_hist', []) if s > now - 2 * w]
+        hist.append((now, uc))
+        self._uc_hist = hist
+        recent = [v for s, v in hist if s > now - w]
+        older = [v for s, v in hist if s <= now - w]
+        stride = min((b - a for (a, _), (b, _) in zip(hist, hist[1:])), default=None)
+        full = stride is not None and older and recent and hist[0][0] <= now - 2 * w + stride
+        if full:
+            stats['relative_under_rise150'] = float(np.mean(recent) - np.mean(older))
 
     def _submodel_grad_norms(self):
         """
@@ -4988,6 +5125,33 @@ class Modeller:
                                  mol_batch, None, repeats)
         return out
 
+    def _z_fill_head_is_fillable(self):
+        """Can this step's forward batch legitimately set the log Z level?
+
+        Under a conditional or full_flow head there is no single scalar to fill
+        -- the level is a field, not a number -- so never.
+
+        Otherwise the requirement is that the forward branch is not itself
+        training the policy against this batch, because then the level and the
+        policy move together and the fill would snap to a target that is still
+        moving. Two configurations satisfy that:
+          freeze_policy > 0            the Z-only forward branch (today's
+                                       equilibration stage);
+          tb_z_source 'batch_root'     the forward TB term takes its level from
+            AND a rollout cadence      the batch root rather than the learned
+                                       head, so the head is not what the branch
+                                       is fitting -- but only under a cadence,
+                                       which is what bounds how often a
+                                       policy-training batch may set the level.
+        The second clause is inert today: nothing sets tb_z_source 'batch_root'.
+        """
+        if self.gfn_model.conditional or self.gfn_model.full_flow:
+            return False
+        if float(getattr(self.args.fwd_loss_coeffs, 'freeze_policy', 0.0) or 0.0):
+            return True
+        return (self.tb_z_source('fwd') == 'batch_root'
+                and int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0) > 0)
+
     def _stash_z_fill_logw(self, loss_dict):
         """
         Keep this fused step's forward per-trajectory `logw` for z_level_fill.
@@ -4998,19 +5162,12 @@ class Modeller:
         makes the fill free: no rollout and no energy call, unlike the
         rollout-mode sidecar.
 
-        Stashed ONLY when the forward branch is Z-ONLY (freeze_policy) on an
-        unconditional scalar head -- the equilibration stage's configuration.
-        Under a training policy the level and the policy move together, so a
-        fill would be snapping to a target that is still moving; under a
-        conditional or full_flow head there is no single scalar to fill and the
-        level is a field, not a number.
+        Armed only where the head is fillable -- see _z_fill_head_is_fillable.
         """
         self._z_fill_logw = None
         if loss_dict is None:
             return
-        if self.gfn_model.conditional or self.gfn_model.full_flow:
-            return
-        if not float(getattr(self.args.fwd_loss_coeffs, 'freeze_policy', 0.0) or 0.0):
+        if not self._z_fill_head_is_fillable():
             return
         if not all(k in loss_dict for k in ('log_pb', 'log_r', 'log_pf')):
             return
@@ -5018,10 +5175,19 @@ class Modeller:
             self._z_fill_logw = (loss_dict['log_pb'] + loss_dict['log_r']
                                  - loss_dict['log_pf']).detach().reshape(-1)
 
-    def z_level_fill(self):
+    def z_level_fill(self, logw=None, source='train', apply=True):
         """
         Set log_Z directly to this batch's TB fixed point, for gaps the
         frequency-modulated servo cannot close.
+
+        `logw` None consumes the single-use training stash; an explicit tensor
+        (the eval rollout, via _eval_z_fill) leaves the stash alone. `source`
+        prefixes the report keys ('' for train, 'eval_' otherwise); apply=False
+        reports the measurement and moves nothing -- not Z, not the absorber's
+        belief, not the cooldown clock.
+
+        fill_mode 'snap' (default) is the gated overwrite described below;
+        'absorb' is a one-dimensional Kalman filter on log Z (see the branch).
 
         WHY A FILL RATHER THAN MORE STEPS. The sidecar's step size is
         magnitude-blind twice over: the Huber clips dL/dZ at beta, so a batch
@@ -5061,64 +5227,149 @@ class Modeller:
         pre-fill gradient that no longer points anywhere useful -- the same
         reason bootstrap_log_z fits through a fresh local Adam.
         """
-        logw = getattr(self, '_z_fill_logw', None)
-        self._z_fill_logw = None  # single-use: never fill twice off one batch
+        if logw is None:
+            logw = getattr(self, '_z_fill_logw', None)
+            self._z_fill_logw = None  # single-use: never fill twice off one batch
         cfg = getattr(self.args, 'z_calibration', None)
         if logw is None or cfg is None:
             return
         threshold = float(getattr(cfg, 'fill_threshold', 0.0) or 0.0)
         if threshold <= 0:
             return  # the fill is off by configuration, not by accident
+
+        # created here, not in z_calibration_tick: the fill runs BEFORE the tick,
+        # so on the first fused step of a run the dict does not exist yet
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
+        pfx = '' if source == 'train' else f'{source}_'
+        beta = float(self.args.fwd_loss_coeffs.beta)
+        try:
+            root, se, frac = winsorized_z_root(logw, beta)
+        except ValueError:
+            rep[f'z_fill/{pfx}bad_batch'] = rep.get(f'z_fill/{pfx}bad_batch', 0) + 1
+            return
+
+        current = float(self.gfn_model.flow_model.scalar.detach())
+        gap = root - current
+        rep[f'z_fill/{pfx}gap'] = gap
+        rep[f'z_fill/{pfx}se'] = se
+        rep[f'z_fill/{pfx}frac_unclipped'] = frac
+        rep[f'z_fill/{pfx}n'] = float(logw.numel())
+        if not apply:
+            return
         cooldown = int(getattr(cfg, 'fill_cooldown_steps', 0) or 0)
         last = getattr(self, '_z_fill_last_step', None)
         if last is not None and (self.step_ind - last) < cooldown:
             return
 
-        # created here, not in z_calibration_tick: the fill runs BEFORE the tick,
-        # so on the first fused step of a run the dict does not exist yet
-        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
-        beta = float(self.args.fwd_loss_coeffs.beta)
-        try:
-            root, se, frac = winsorized_z_root(logw, beta)
-        except ValueError:
-            rep['z_fill/bad_batch'] = rep.get('z_fill/bad_batch', 0) + 1
-            return
+        mode = str(getattr(cfg, 'fill_mode', 'snap') or 'snap')
+        if mode == 'snap':
+            if abs(gap) <= threshold:
+                return
+            if abs(gap) <= float(getattr(cfg, 'fill_se', 5.0)) * se:
+                # includes the se = +inf case: an all-saturated batch never fills
+                rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
+                return
+            dz, drop_moments = gap, True
+        elif mode == 'absorb':
+            # ONE-DIMENSIONAL KALMAN FILTER ON log Z. State (Z, P): P is how
+            # uncertain the level is; it grows by fill_process_var per step
+            # between applied measurements (the policy moves Z) and shrinks when
+            # a measurement lands. Each measurement (root, se) moves Z by the
+            # fraction K = P_pred / (P_pred + se^2) of its gap: a precise one
+            # (a 10k-sample eval batch, or any batch late in training) is close
+            # to a snap, a noisy early batch-400 one is mostly averaged. No
+            # thresholds: the snap gates existed to keep noise out, and this
+            # weights noise down instead of discarding it. The first
+            # measurement is taken whole (diffuse prior) and leaves P = se^2.
+            if not math.isfinite(se):
+                rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
+                return
+            q = float(getattr(cfg, 'fill_process_var', 0.01) or 0.0)
+            P = getattr(self, '_z_fill_P', None)
+            last_applied = getattr(self, '_z_fill_last_applied', None)
+            if P is None:
+                K, P_post = 1.0, se * se
+            else:
+                elapsed = max(1, self.step_ind - last_applied) if last_applied is not None else 1
+                P_pred = P + q * elapsed
+                K = P_pred / (P_pred + se * se)
+                P_post = P_pred * (se * se) / (P_pred + se * se)
+            dz = K * gap
+            self._z_fill_P = P_post
+            rep['z_fill/K'] = K
+            rep['z_fill/P'] = P_post
+            rep['z_fill/dz'] = dz
+            # Adam's moments for the flow parameter describe a pre-move gradient;
+            # a small absorbed step leaves them meaningful, a large one does not
+            drop_moments = abs(dz) > float(getattr(cfg, 'fill_moment_reset', 0.5) or 0.0)
+        else:
+            raise ValueError(f"z_calibration.fill_mode must be 'snap' or 'absorb', got {mode!r}")
 
-        current = float(self.gfn_model.flow_model.scalar.detach())
-        gap = root - current
-        rep['z_fill/gap'] = gap
-        rep['z_fill/se'] = se
-        rep['z_fill/frac_unclipped'] = frac
-        if abs(gap) <= threshold:
-            return
-        if abs(gap) <= float(getattr(cfg, 'fill_se', 5.0)) * se:
-            # includes the se = +inf case: an all-saturated batch never fills
-            rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
-            return
-
+        target = current + dz
         with torch.no_grad():
-            self.gfn_model.flow_model.scalar.data.fill_(root)
-            self.ema_model.flow_model.scalar.data.fill_(root)
-        for name in ('fused', 'flow'):
-            opt = self.optimizers.get(name)
-            if opt is None:
-                continue
-            for p in self.gfn_model.flow_model.parameters():
-                opt.state.pop(p, None)
+            self.gfn_model.flow_model.scalar.data.fill_(target)
+            self.ema_model.flow_model.scalar.data.fill_(target)
+        if drop_moments:
+            for name in ('fused', 'flow'):
+                opt = self.optimizers.get(name)
+                if opt is None:
+                    continue
+                for p in self.gfn_model.flow_model.parameters():
+                    opt.state.pop(p, None)
         tracker = getattr(self, 'condition_log_z', None)
         if tracker is not None:
             with torch.no_grad():
                 # stored residual is logw - log_Z_learned, so raising log_Z by
-                # `gap` lowers every stored level reading by the same amount
-                tracker.z_bias_ema -= gap
-                tracker.z_grad_ema = (tracker.z_grad_ema - gap).clamp(
+                # `dz` lowers every stored level reading by the same amount
+                tracker.z_bias_ema -= dz
+                tracker.z_grad_ema = (tracker.z_grad_ema - dz).clamp(
                     -tracker.clip_beta, tracker.clip_beta)
         self._z_fill_last_step = self.step_ind
+        self._z_fill_last_applied = self.step_ind
         rep['z_fill/fired'] = rep.get('z_fill/fired', 0) + 1
         rep['z_fill/root'] = root
-        print(f"z_level_fill: log_Z {current:.3f} -> {root:.3f} "
-              f"(gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
+        print(f"z_level_fill[{mode},{source}]: log_Z {current:.3f} -> {target:.3f} "
+              f"(root {root:.3f}, gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
               f"at step {self.step_ind}")
+
+    def _eval_z_fill(self, fwd_stats):
+        """Feed the eval rollout's log w to z_level_fill (z_calibration.fill_from_eval).
+
+        The eval batch is the most precise Z measurement the run makes: se
+        scales as 1/sqrt(B), and eval_num_samples is 2500-10000 against a
+        training batch of 400-1600. 'report' logs z_fill/eval_gap and
+        z_fill/eval_se beside the training fill's; 'fill' applies it through
+        the same actuator (under fill_mode 'absorb' its precision sets its
+        weight automatically). Refused, with the reason logged, when the eval
+        batch is not a sample of the training policy at the training target:
+        temperature conditioning (a temperature sweep), a different eval grid,
+        or a separate EMA model.
+        """
+        cfg = getattr(self.args, 'z_calibration', None)
+        mode = str(getattr(cfg, 'fill_from_eval', 'off') or 'off') if cfg is not None else 'off'
+        if mode == 'off':
+            return
+        if mode not in ('report', 'fill'):
+            raise ValueError(f"z_calibration.fill_from_eval must be off, report or fill, got {mode!r}")
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
+        reason = None
+        if not self._z_fill_head_is_fillable():
+            reason = 'head'
+        elif getattr(self.args, 'temperature_conditioning', False):
+            reason = 'temperature'
+        elif int(self.args.eval_T) != int(self.args.integrator.T):
+            reason = 'grid'
+        elif getattr(self.args, 'ema_decay', None) is not None:
+            reason = 'ema'
+        if reason is not None:
+            rep[f'z_fill/eval_refused_{reason}'] = rep.get(f'z_fill/eval_refused_{reason}', 0) + 1
+            return
+        logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
+                - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
+        logw = logw[torch.isfinite(logw)]
+        if logw.numel() < 2:
+            return
+        self.z_level_fill(logw=logw, source='eval', apply=(mode == 'fill'))
 
     def _stash_z_cal_cache(self, condition_id):
         """
@@ -5267,10 +5518,15 @@ class Modeller:
                           discretizer,
                           repeats: int,
                           report_losses: bool = False,
-                          side_effects: bool = True):
+                          side_effects: bool = True,
+                          val_rows: int = 0):
         """side_effects=False draws and scores WITHOUT writing back to the
         buffer or the metric tracker. Used by z_calibration's replay mode, which
-        fires at its own rate and must not be mistaken for training.
+        fires at its own rate and must not be mistaken for training, and by the
+        held-out probe (_replay_val_stats) via val_rows > 0 -- which draws the
+        HELD-OUT rows, unweighted and with the Z tracker read-only, so its loss
+        is the same functional as this step's training loss on rows the policy
+        has never trained on.
 
         The three writes below are not bookkeeping, they are the inputs to two
         other controllers: `ema_loss` and `ema_logw` set the prioritised draw
@@ -5280,7 +5536,8 @@ class Modeller:
         as absorption the training branch did not do, so the servo would read a
         memorisation signal manufactured by the instrument watching for it."""
 
-        condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_replay_sample(repeats)
+        condition, condition_id, inds, latents, log_reward, mol_batch, traj = \
+            self.draw_replay_sample(repeats, val_rows=val_rows)
 
         loss, loss_dict = get_gfn_backward_loss(self.args.replay_loss_coeffs,
                                                 latents.to(self.device),
@@ -5295,9 +5552,14 @@ class Modeller:
                                                 condition_log_z=self.condition_log_z,
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('replay'),
-                                                update_log_z=self.protocol.flag('update_log_z'),
+                                                # the probe reads the per-condition
+                                                # Z target the training call just
+                                                # used; it must not write one
+                                                update_log_z=(self.protocol.flag('update_log_z')
+                                                              and not val_rows),
                                                 step=self.step_ind,
-                                                sample_weights=self._replay_is_w)
+                                                sample_weights=(None if val_rows
+                                                                else self._replay_is_w))
 
         if not side_effects:
             return loss, loss_dict
@@ -5317,19 +5579,153 @@ class Modeller:
         # On the 10-step metric cadence, like every other rolling stat -- it is
         # a mean over all resident rows, and the only consumer (the servo) ticks
         # every 10 steps.
-        if self.step_ind % 10 == 0 and (st := self.replay_buffer.absorption_stats()):
-            self.metric_tracker.update(
-                'replay',
-                {'ema_loss_mean': st['replay/ema_loss_mean'],
-                 'birth_loss_mean': st['replay/birth_loss_mean'],
-                 'resid_vs_intake': st['replay/resid_vs_intake'],
-                 'lambda_tau': st['replay/lambda_tau']},
-                self.step_ind)
+        #
+        # ONE update() per direction per step, deliberately: MetricTracker's
+        # alpha is 1 - exp(-dt/period) with dt PER DIRECTION, so a second
+        # same-step write to 'replay' would land at dt=1 and run ~10x slower
+        # than the 10-step one. Absorption, policy drift and the held-out gap
+        # therefore share a single payload. absorption_stats returns
+        # already-prefixed keys and the tracker prefixes again, hence the strip.
+        if self.step_ind % 10 == 0:
+            payload = {}
+            if (st := self.replay_buffer.absorption_stats()):
+                payload.update({'ema_loss_mean': st['replay/ema_loss_mean'],
+                                'birth_loss_mean': st['replay/birth_loss_mean'],
+                                'resid_vs_intake': st['replay/resid_vs_intake'],
+                                'lambda_tau': st['replay/lambda_tau']})
+            payload.update(self._policy_drift_stats(inds, loss_dict.get('log_pf')))
+            payload.update(self._replay_val_stats(discretizer, float(loss.detach())))
+            if payload:
+                self.metric_tracker.update('replay', payload, self.step_ind)
 
         self._larder_harvest('replay', loss_dict, condition, condition_id,
                              mol_batch, traj, repeats,
                              sample_weights=self._replay_is_w)
         return loss, loss_dict
+
+    def _condition_is_redrawn(self):
+        """True when draw_replay_sample's condition_samples call RE-DRAWS a
+        quantity that enters the condition vector, so a stored row is scored
+        under a different condition at draw than at admission.
+
+        It calls condition_samples(mol_batch, repeats=...) with no temperature
+        and no sg_inds, and condition_samples then samples log T, the space
+        group and Z' afresh. Only quantities that reach the forward kernel
+        matter -- it sees (state, t, condition_embedding, t_next, dts) -- so the
+        redraw closes the drift metric exactly when one of them is IN the
+        condition: temperature_conditioning, or sg/zp conditioning with more
+        than one choice. vector/embedding/molecule conditioning read off the
+        stored row and are stable across a draw.
+
+        MUST BE EXTENDED whenever condition_samples gains another redrawn term
+        that enters `conds`; otherwise the metric silently starts measuring the
+        redraw instead of the policy. Cached: the energy function is fixed for
+        the run."""
+        cached = getattr(self, '_cond_redrawn', None)
+        if cached is not None:
+            return cached
+        ef = self.energy_function
+        out = bool(getattr(ef, 'temperature_conditioning', False)
+                   or (getattr(ef, 'sg_conditioning', False)
+                       and len(getattr(ef, 'space_groups', ()) or ()) > 1)
+                   or (getattr(ef, 'zp_conditioning', False)
+                       and len(getattr(ef, 'z_primes', ()) or ()) > 1))
+        self._cond_redrawn = out
+        if out:
+            print("replay policy-drift metric CLOSED: this route redraws the "
+                  "condition at every replay draw, so log_pf at birth and at draw "
+                  "are scored under different conditions.", flush=True)
+        return out
+
+    @torch.no_grad()
+    def _policy_drift_stats(self, inds, log_pf_now):
+        """How far the POLICY has moved off the trajectories it stored.
+
+        d_i = log_pf_now - birth_log_pf over the drawn rows carrying a birth
+        score: the current policy's score for a stored trajectory against the
+        score the policy that generated it gave. Non-circular, unlike any
+        Z-fit statistic, because nothing in the fill or the servo touches
+        either side.
+
+        policy_drift_std is the HEADLINE. d is a sum over T x data_ndim
+        Gaussian log-density differences, so the Kish ESS of exp(d) is pinned
+        at its 1/n floor once std(d) is a couple of nats and carries no
+        gradation there; std stays informative on both sides and is the
+        statistic any future bar must be keyed on. ess_frac is logged beside it
+        because it is the recognisable form, not because it resolves.
+
+        Returns bare (unprefixed) keys for the tracker. On the thin path the
+        drift keys are ABSENT but covered_frac is still published, so 'nothing
+        carries a birth score' never looks like 'replay is not running'."""
+        self._replay_drift_std = None
+        if log_pf_now is None or self._condition_is_redrawn():
+            return {}
+        idx = torch.as_tensor(np.asarray(inds).ravel(), dtype=torch.long)
+        b = self.replay_buffer.birth_log_pf[idx].double()
+        now = log_pf_now.detach().double().cpu().flatten()
+        if now.numel() != b.numel():
+            return {}
+        d = now - b
+        n_tot = d.numel()
+        if n_tot == 0:
+            return {}
+        ok = torch.isfinite(d)
+        n_ok = int(ok.sum())
+        covered = float(n_ok) / float(n_tot)
+        if n_ok < 2:
+            return {'policy_drift_covered_frac': covered}
+        d = d[ok]
+        # max-shifted so an 800-nat spread stays finite; Kish is invariant to
+        # a uniform rescaling of the weights, so the shift is exact
+        w = torch.exp(d - d.max())
+        s1, s2 = float(w.sum()), float((w * w).sum())
+        std = float(d.std(unbiased=True))
+        self._replay_drift_std = std
+        return {'policy_drift_std': std,
+                'policy_drift_nats': float(d.abs().mean()),
+                'policy_drift_ess_frac': (s1 * s1 / (n_ok * s2)) if s2 > 0 else 1.0,
+                'policy_drift_covered_frac': covered}
+
+    @torch.no_grad()
+    def _replay_val_stats(self, discretizer, train_loss):
+        """The generalisation gap on the replay buffer: the same loss, at the
+        same parameters and the same Z, on rows that are never trained on.
+
+        val_gap > 0 means the policy fits the exact stored trajectories better
+        than equivalent ones it has not seen. Because it is a DIFFERENCE of two
+        means taken within one step, a Z-level or loss-scale error shifts both
+        sides together. It scores STORED trajectories through
+        prebuilt_sample_to_reward, so it calls no energy function
+        (docs/design/rarer_rollouts.md invariant 2)."""
+        k = self._replay_val_size()
+        if k <= 0:
+            return {}
+        # get_gfn_backward_loss overwrites gfn._live_bwd under this flag, and
+        # fused_train_step's pooled-VarGrad block reads it later in the SAME
+        # step -- the probe must not be what that term sees.
+        stash = getattr(self.gfn_model, '_stash_live_branches', False)
+        try:
+            self.gfn_model._stash_live_branches = False
+            _, loss_dict = self.replay_train_step(
+                discretizer, repeats=self.mode_repeats('replay'),
+                report_losses=True, side_effects=False, val_rows=k)
+        except Exception as e:
+            if not is_cuda_oom(e):
+                raise
+            # a diagnostic must never cut the global batch size: skip the
+            # measurement and say so on the same clock as the series it
+            # explains, so a val series that stops is a number rather than a
+            # hole
+            torch.cuda.empty_cache()
+            return {'val_skips': 1.0}
+        finally:
+            self.gfn_model._stash_live_branches = stash
+        losses = loss_dict['losses'].detach().flatten()
+        val_loss = float(losses.mean())
+        return {'val_loss': val_loss,
+                'val_gap': val_loss - train_loss,
+                'val_n': float(losses.numel()),
+                'val_skips': 0.0}
 
     @torch.no_grad()
     def draw_bwd_sample(self, repeats, target_cids=None):
@@ -5447,7 +5843,39 @@ class Modeller:
         cfg = getattr(self.args.buffers.replay_buffer, 'prioritise', None)
         return float(getattr(cfg, 'floor_frac', 0.25))
 
-    def draw_replay_sample(self, repeats):
+    def _replay_val_frac(self):
+        """`buffers.replay_buffer.val_frac`: the fraction of each admission
+        batch held out of training so the memorisation gap can be MEASURED.
+        Absent/0 => off, and every draw path is then bit-identical to before
+        the split existed (no row is flagged, so no mask is ever built)."""
+        return float(getattr(self.args.buffers.replay_buffer, 'val_frac', 0.0) or 0.0)
+
+    def _replay_val_size(self):
+        """How many held-out rows to score this measurement; 0 = do not measure.
+
+        Clipped to the live batch_size as well as to val_cap, so an OOM-cut
+        batch shrinks the probe instead of reproducing the OOM. Below val_min
+        the mean is noise, and writing it would poison the EMA it is read on."""
+        rb = getattr(self, 'replay_buffer', None)
+        if rb is None or self._replay_val_frac() <= 0:
+            return 0
+        cfg = self.args.buffers.replay_buffer
+        n_val = int(rb.is_val.sum())
+        if n_val < int(getattr(cfg, 'val_min', 64) or 0):
+            return 0
+        return int(min(int(getattr(cfg, 'val_cap', 256) or 0), self.batch_size, n_val))
+
+    def draw_replay_sample(self, repeats, val_rows: int = 0):
+        # val_rows > 0 draws that many HELD-OUT rows instead of a training
+        # batch (the generalisation probe, _replay_val_stats). It deliberately
+        # skips the prioritised machinery: the held-out rows have no residual
+        # (ema_logw is never written for a row that is never drawn), and it
+        # must not overwrite _replay_is_w / _replay_is_stats, which the
+        # training draw of this same step still owns.
+        if val_rows > 0:
+            mol_batch, traj, inds = self.replay_buffer.sample_val_graphs(val_rows)
+            return self._finish_replay_draw(mol_batch, traj, inds, repeats)
+
         # Condition-blocked draw (C conditions x up to M distinct terminals
         # each), same mechanism as draw_bwd_sample and active only while
         # condition-grouped replay VarGrad is. Without it that branch is a SILENT
@@ -5501,9 +5929,14 @@ class Modeller:
         if kappa is not None:
             log_z = self.current_log_z()
             if log_z is not None:
+                # exclude= is the measure's half of the held-out split; the
+                # draw's half is in CrystalBuffer._sample_indices. Both are
+                # needed: p is a measure over every row, and _sample_indices
+                # asserts the two agree.
                 p, w_row = self.replay_buffer.prioritised_weights(
                     log_z, kappa=kappa, symmetric=self.replay_priority_symmetric(),
-                    floor_frac=self.replay_priority_floor())
+                    floor_frac=self.replay_priority_floor(),
+                    exclude=self.replay_buffer.is_val)
 
         # beta is the fraction of the batch drawn UNIFORMLY, not a temperature:
         # _sample_indices splits the batch into n_uniform = batch*beta and
@@ -5543,6 +5976,14 @@ class Modeller:
                 'replay/is_elig_frac': float((np.asarray(p) > 0).mean()),
             }
 
+        return self._finish_replay_draw(mol_batch, traj, inds, repeats)
+
+    def _finish_replay_draw(self, mol_batch, traj, inds, repeats):
+        """Shared tail of every replay draw: latents, conditions, rewards.
+
+        Both draws -- the prioritised training one and the held-out probe --
+        must run this identically, or val_loss and train_loss would not be
+        measured on the same footing."""
         latents = self._batch_latents(mol_batch)
         latents = latents.to(self.device)
         traj = traj.to(self.device)
@@ -6778,6 +7219,10 @@ class Modeller:
             elif torch.is_tensor(metrics[key]):
                 metrics[key] = loggable_array(metrics[key].detach().cpu().numpy())
 
+        # the eval rollout as a Z measurement -- BEFORE maybe_advance, so it
+        # lands on the stage that produced it, never on the one being entered
+        self._eval_z_fill(fwd_stats)
+
         # stage-exit check + transition: the trigger's tick-resolvable terms
         # were latched at train cadence; eval/* terms (e.g. eval/wass_debiased)
         # are checked here against the fresh metrics, and the transition --
@@ -6788,7 +7233,10 @@ class Modeller:
 
         if self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
             self.manage_prior_buffer(sample_batch)
-            self.manage_replay_buffer(fwd_stats, sample_batch)
+            # on_policy=False: these fwd_stats come from the EMA model on the
+            # eval_T grid, so their log_pf is not comparable to a later
+            # get_traj_replay score under the training policy
+            self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=False)
 
         if hasattr(self, 'anchor_buffer'):
             self.anchor_eval_cycle_count = getattr(self, 'anchor_eval_cycle_count', 0) + 1
@@ -6917,6 +7365,9 @@ class Modeller:
 
         if hasattr(self, 'replay_buffer'):
             metrics.update(self._buffer_core_stats(self.replay_buffer, 'replay_buffer'))
+            # resident HELD-OUT rows: read against replay/val_n to see whether
+            # the probe is scoring a sample of the pool or the whole of it
+            metrics['replay_buffer_val_rows'] = float(self.replay_buffer.is_val.sum())
             replay_age = (self.step_ind - self.replay_buffer.birth_step).float()
             metrics.update({
                 'replay_buffer_mean_age': replay_age.mean().item(),
@@ -7370,6 +7821,20 @@ class Modeller:
         top-up paths.
         """
         if budget <= 0:
+            return
+        # ANCHOR-ONLY PRIOR (docs/design/rarer_rollouts.md, v1; the paper's S2
+        # "noised buffer"): the churn budget is met by noising and re-scoring
+        # rows drawn from the frozen anchor set -- top_up_prior_from_anchors,
+        # the same path the shortfall backfill already uses -- so the prior
+        # buffer refreshes on `mean_lifetime` with no prior MODEL in the loop.
+        # Opt-in. The default keeps today's prior-model churn untouched, which
+        # matters because the prod_sep02 arms are running on it. Under this
+        # source `snapshot_prior` and `prior_model_name` are unnecessary, and
+        # the resume gap those create (no prior_model after a restart) does not
+        # exist; prior_buffer_prior_admit_rate reads nan, as it counts prior-
+        # MODEL admits only.
+        if getattr(self.args.buffers.prior_buffer, 'source', 'prior_model') == 'anchors':
+            self.top_up_prior_from_anchors(budget)
             return
         if not self._has_prior_sampler():
             # Silent here changes the buffer's SOURCE MIX to 100% anchor with no
@@ -7951,7 +8416,7 @@ class Modeller:
                 return float(pinned['replay']) > 0.0
         return True
 
-    def manage_replay_buffer(self, fwd_stats, sample_batch):
+    def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True):
         """
         Store the full forward trajectory of on-policy samples with strongly
         over- or under-weighted terminals, so they can be replayed exactly
@@ -8000,6 +8465,17 @@ class Modeller:
         non-finite log_r/resid, and log_r < admit_reward_min. Eligibility is a
         BADNESS criterion, so without a reward floor the buffer's energy
         distribution is unbounded above.
+
+        ADMISSION ALSO WRITES THE TWO PER-ROW COLUMNS, and this is the only
+        place replay rows are born. `birth_log_pf` records the generating
+        policy's own score for the row -- but only when `on_policy`: the
+        eval-site call scores with the EMA model on the eval grid, which is not
+        the training policy, so those rows are born NaN and are excluded from
+        the drift statistic rather than reading as permanent drift.
+        `is_val` flags the held-out split (buffers.replay_buffer.val_frac); it
+        is orthogonal to prioritisation because the flag is drawn uniformly and
+        eviction is residual-independent, so p_survive still drops out of the
+        IS weight.
         """
         in_play = self.replay_in_play()
         if in_play is not self._replay_managed:
@@ -8056,6 +8532,10 @@ class Modeller:
                 init_loss=resid[add_inds].abs(),
                 exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
                 birth_step=self.step_ind,
+                # the bootstrap cohort is up to max_size rows -- flagging it
+                # here too is what stops the whole first buffer being trainable
+                birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
+                is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
             return
@@ -8099,7 +8579,21 @@ class Modeller:
             # the per-call budget is not silently spent on rows that were
             # leaving anyway
             surv = torch.argwhere(~expired_mask).flatten()
-            n_hazard = int(round(surv.numel() / tau))
+            # THE HAZARD IS PER STEP, NOT PER CALL. This function runs once per
+            # forward rollout (plus once per eval), and under fwd_rollout_every
+            # those calls are `every` steps apart -- a per-call budget of 1/tau
+            # would then give a residence of every*tau steps while the backstop
+            # above still compares an age in STEPS, so the two clocks disagreed
+            # by exactly `every`. Scaling the budget by the steps elapsed since
+            # the last call makes `mean_residence_steps` mean steps on every
+            # cadence, and at every=1 reproduces the old 1/tau per fused step.
+            # (It also stops the eval-site call, landing on the same step as a
+            # fused call, from spending a second full budget: elapsed is 0.)
+            last = getattr(self, '_last_replay_manage_step', None)
+            elapsed = (self.step_ind - last) if last is not None else 1
+            hazard_frac = min(1.0, max(0.0, float(elapsed) / tau))
+            n_hazard = int(round(surv.numel() * hazard_frac))
+            self._last_replay_manage_step = self.step_ind
             if n_hazard > 0:
                 hazard_mask[surv[torch.randperm(surv.numel())[:n_hazard]]] = True
 
@@ -8170,6 +8664,8 @@ class Modeller:
                 traj=flow_states[add_inds.to(flow_states.device)],
                 init_loss=resid[add_inds].abs(),
                 birth_step=self.step_ind,
+                birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
+                is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
 
