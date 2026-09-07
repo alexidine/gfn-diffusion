@@ -55,14 +55,14 @@ class _Sized:
     _sample_indices = CrystalBuffer._sample_indices
     _target_row_pool = lambda self, cids: None          # noqa: E731
 
-    def _draw_aligned(self, n, k, target_rows):
+    def _draw_aligned(self, pool, n_pool, k, target_rows):
         """Stubbed: alignment is not what these tests cover.
 
         With no target_rows the real method is a plain uniform draw, and the
         thing under test is the SIZE arithmetic that splits the request into
         uniform and weighted halves -- not which rows come back.
         """
-        return np.random.choice(n, size=k, replace=True)
+        return np.random.choice(pool, size=k, replace=True)
 
 
 @pytest.mark.parametrize('beta', [0.0, 0.1, 0.5, 1.0])

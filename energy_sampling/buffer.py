@@ -695,7 +695,8 @@ class CrystalBuffer:
         # measure actually drawn from; the assert below is the seam between the
         # two mechanisms.
         pool, n_pool = n, n
-        if bool(self.is_val.any()):
+        is_val = getattr(self, 'is_val', None)   # a store without the column holds nothing out
+        if is_val is not None and bool(is_val.any()):
             pool = np.flatnonzero(~self.is_val.numpy())
             n_pool = int(pool.size)
             if n_pool == 0:
