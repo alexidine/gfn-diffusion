@@ -173,7 +173,17 @@ arms at matched step count. Keep the 7-day p02 paper arms running untouched.
 
 ---
 
-## v1 — STILL DEFERRED
+## v1 — BUILT 2026-09-07 evening (all six items; short version in `handoff_rr_v1.md`)
+
+Status: A (birth log p_F → `replay/policy_drift_std`, trigger shipped off), B (held-out
+replay split → `replay/val_gap`), C (eval rollouts feed the fill, `fill_from_eval`),
+D (level-blind forward policy step, `tb_z_source: batch_root`, own arm `rr_n7_fwd`),
+E (absorber: 1-D Kalman on log Z, `fill_mode: absorb`), F (the forgetting sensor now
+reads `bwd/relative_under` — the Z-anchored under-coverage was measuring the fill; a
+warm-up would have hidden that). Commits 1d7eee7, a9b4560, 671da83 on top of v0/v1a.
+The section below is the original plan, kept for the reasoning.
+
+## v1 — the plan as written before the build
 
 - **`birth_log_pf`** (one float per row, stored at admission from
   `fwd_stats['log_pf']`, currently dropped at train.py ~8071) →
