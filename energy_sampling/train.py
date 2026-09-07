@@ -4164,16 +4164,42 @@ class Modeller:
         # (memory: project_under_coverage_gate_calibration). NOT written until the
         # window is full: the tracker EMAs whatever it is given, so a NaN here
         # would poison the EMA and a zero would read as "not rising".
-        if sub_type == 'bwd' and stats.get('under_coverage') is not None:
-            uc = float(stats['under_coverage'])
-            if math.isfinite(uc):
-                hist = getattr(self, '_uc_hist', [])
-                hist = (hist + [uc])[-300:]
-                self._uc_hist = hist
-                if len(hist) == 300:
-                    stats['under_coverage_rise150'] = float(np.mean(hist[150:]) - np.mean(hist[:150]))
+        if sub_type == 'bwd':
+            self._forgetting_sensor(stats)
         self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
+
+    _UC_WINDOW_STEPS = 150
+
+    def _forgetting_sensor(self, stats):
+        """Write stats['under_coverage_rise150'] once 300 STEPS of bwd/under_coverage
+        history exist: mean over the last 150 steps minus mean over the 150 before.
+
+        Windows are in STEPS, not samples. This method runs on _update_rolling's
+        cadence -- every 10th trained bwd step -- so a sample-counted window would
+        be 10x longer than the calibration (done on 10-step wandb rows) and would
+        not fill inside a 2000-step run; rr07_rr_n7 held gr_share at 0.5 for its
+        whole length that way. Timestamping each sample with step_ind makes the
+        sensor indifferent to the call cadence, and 'full' means the oldest kept
+        sample is within one stride of 300 steps old.
+        """
+        uc = stats.get('under_coverage')
+        if uc is None:
+            return
+        uc = float(uc)
+        if not math.isfinite(uc):
+            return
+        w = self._UC_WINDOW_STEPS
+        now = int(self.step_ind)
+        hist = [(s, v) for s, v in getattr(self, '_uc_hist', []) if s > now - 2 * w]
+        hist.append((now, uc))
+        self._uc_hist = hist
+        recent = [v for s, v in hist if s > now - w]
+        older = [v for s, v in hist if s <= now - w]
+        stride = min((b - a for (a, _), (b, _) in zip(hist, hist[1:])), default=None)
+        full = stride is not None and older and recent and hist[0][0] <= now - 2 * w + stride
+        if full:
+            stats['under_coverage_rise150'] = float(np.mean(recent) - np.mean(older))
 
     def _submodel_grad_norms(self):
         """
