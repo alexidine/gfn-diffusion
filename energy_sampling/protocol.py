@@ -225,7 +225,7 @@ class Stage:
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
-                               'mle_gate', 'hot_lr_sensor'}
+                               'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -249,6 +249,26 @@ class Stage:
         bad = set(self.loss_coeffs) - set(MODES)
         if bad:
             raise ValueError(f"stage '{self.name}': loss_coeffs for unknown modes {sorted(bad)}")
+        # RARER ROLLOUTS (docs/design/rarer_rollouts.md): run the forward branch
+        # -- the only branch that calls the energy function in a training step
+        # -- on 1 in `fwd_rollout_every` steps. 0 = every step, today's shape.
+        # REFUSED AT LOAD when paired with z_calibration: that servo's `rollout`
+        # mode does its OWN forward rollout + energy call per Z step, off a
+        # sensor that is frozen between rollouts and would therefore fire on
+        # every one of the skipped steps -- silently restoring the cost this key
+        # exists to remove, and moving Z in the interval the design keeps frozen.
+        self.fwd_rollout_every = int(spec.get('fwd_rollout_every', 0) or 0)
+        if self.fwd_rollout_every < 0:
+            raise ValueError(f"stage '{self.name}': fwd_rollout_every must be >= 0, "
+                             f"got {self.fwd_rollout_every}")
+        if self.fwd_rollout_every > 0 and bool(self.flags.get('z_calibration', False)):
+            raise ValueError(
+                f"stage '{self.name}': fwd_rollout_every={self.fwd_rollout_every} "
+                f"with flags.z_calibration true. z_calibration's rollout mode calls "
+                f"the energy function on every step it fires, off a sensor frozen "
+                f"between rollouts, so it would run on every skipped step. Set "
+                f"flags.z_calibration false; log Z is pinned by z_level_fill instead.")
+
 
         self.fracs = dict(spec.get('fracs') or {})
         if self.fracs:

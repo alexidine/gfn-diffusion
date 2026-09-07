@@ -1173,6 +1173,41 @@ def every_protocol_parses(cfg: dict) -> list[Violation]:
     return out
 
 
+def fwd_rollout_cadence_is_well_formed(cfg: dict) -> list[Violation]:
+    """A stage running forward rollouts on 1 in N steps (`fwd_rollout_every`)
+    relies on two things the rest of the config can silently undo.
+
+    `flags.z_calibration` must be off: its `rollout` mode performs its own forward
+    rollout + energy call per Z step, off a sensor that is frozen between
+    rollouts, so it would fire on every skipped step -- restoring the cost the
+    cadence removes and moving Z in the interval the design keeps frozen.
+    `z_calibration.fill_threshold` must be > 0: that is the switch for
+    `z_level_fill`, the ONLY thing pinning log Z at each rollout once the servo is
+    off; 0 disables it, and an unpinned Z under rare rollouts is the failure mode
+    the design exists to avoid (docs/design/rarer_rollouts.md, invariants 1-2).
+    Stage.__init__ refuses the first case at load; this rule is the audit-path
+    twin and adds the second."""
+    out = []
+    cadenced = [st for st in active_stages(cfg)
+                if isinstance(st, dict) and (_num(st.get('fwd_rollout_every')) or 0) > 0]
+    for st in cadenced:
+        flags = st.get('flags') or {}
+        if bool(flags.get('z_calibration', False)):
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_every="
+                                 f"{st.get('fwd_rollout_every')} with flags.z_calibration "
+                                 f"true; the servo would call the energy function on every "
+                                 f"skipped step. Set it false."))
+    if cadenced:
+        ft = _num(_get(cfg, 'z_calibration.fill_threshold'))
+        if ft is None or ft <= 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f'z_calibration.fill_threshold={ft} but a stage runs '
+                                 f'fwd_rollout_every > 0; the fill is the only thing '
+                                 f'pinning log Z at each rollout and 0/absent disables it.'))
+    return out
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
@@ -1192,6 +1227,7 @@ RULES = (
     deactivate_threshold_is_sane,
     pinned_frac_matches_fracs,
     effective_batch_meets_baseline,
+    fwd_rollout_cadence_is_well_formed,
 )
 
 

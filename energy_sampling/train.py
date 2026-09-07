@@ -3726,8 +3726,22 @@ class Modeller:
         sub_losses = {}
         weights = {}
 
-        fwd_active = self.fwd_frac >= deactivate_threshold
-        fwd_ran = fwd_active or (force_refresh and not self.protocol.mode_dormant('fwd'))
+        # RARER ROLLOUTS (docs/design/rarer_rollouts.md). The forward branch is
+        # the only branch that calls the energy function during a training step
+        # -- bwd and replay score PRE-BUILT rows -- so running it on 1 in `every`
+        # steps removes ~all training-time MLIP calls. The other two branches
+        # train every step and renormalise between themselves; the fill in
+        # z_level_fill is armed only on the steps fwd actually ran, so log Z is
+        # snapped at every rollout and frozen in between (the safe shape: an
+        # unpinned interval is where a low-lagging Z is absorbed by the policy).
+        # The force-refresh must NOT run fwd here: at refresh_every 10 it would
+        # call the MLIP every 10 steps regardless of `every`, silently.
+        rollout_every = int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0)
+        if rollout_every > 0:
+            fwd_active = fwd_ran = (self.step_ind % rollout_every == 0)
+        else:
+            fwd_active = self.fwd_frac >= deactivate_threshold
+            fwd_ran = fwd_active or (force_refresh and not self.protocol.mode_dormant('fwd'))
         if fwd_ran:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
@@ -8099,7 +8113,21 @@ class Modeller:
             # the per-call budget is not silently spent on rows that were
             # leaving anyway
             surv = torch.argwhere(~expired_mask).flatten()
-            n_hazard = int(round(surv.numel() / tau))
+            # THE HAZARD IS PER STEP, NOT PER CALL. This function runs once per
+            # forward rollout (plus once per eval), and under fwd_rollout_every
+            # those calls are `every` steps apart -- a per-call budget of 1/tau
+            # would then give a residence of every*tau steps while the backstop
+            # above still compares an age in STEPS, so the two clocks disagreed
+            # by exactly `every`. Scaling the budget by the steps elapsed since
+            # the last call makes `mean_residence_steps` mean steps on every
+            # cadence, and at every=1 reproduces the old 1/tau per fused step.
+            # (It also stops the eval-site call, landing on the same step as a
+            # fused call, from spending a second full budget: elapsed is 0.)
+            last = getattr(self, '_last_replay_manage_step', None)
+            elapsed = (self.step_ind - last) if last is not None else 1
+            hazard_frac = min(1.0, max(0.0, float(elapsed) / tau))
+            n_hazard = int(round(surv.numel() * hazard_frac))
+            self._last_replay_manage_step = self.step_ind
             if n_hazard > 0:
                 hazard_mask[surv[torch.randperm(surv.numel())[:n_hazard]]] = True
 

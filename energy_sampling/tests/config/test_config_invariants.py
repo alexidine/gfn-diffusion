@@ -799,6 +799,46 @@ def test_vargrad_rule_abstains_off_the_vargrad_route(canonical):
     assert _fired(canonical, 'vargrad_needs_groups') == []
 
 
+def _cadenced_fused_stage(canonical):
+    """A copy of canonical with the active protocol's fused stage running forward
+    rollouts on 1 in 10 steps (docs/design/rarer_rollouts.md). Returns (cfg, stage)
+    with the stage dict being cfg's own object."""
+    cfg = copy.deepcopy(canonical)
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
+                 if s.get('train_mode', 'fused') == 'fused' and 'fracs' in s)
+    stage['fwd_rollout_every'] = 10
+    stage.setdefault('flags', {})
+    return cfg, stage
+
+
+def test_fwd_rollout_cadence_refuses_the_z_calibration_servo(canonical):
+    """The servo's rollout mode calls the energy function on every step it fires,
+    off a sensor frozen between rollouts -- so left on, it silently restores the
+    cost the cadence removes. Must fire."""
+    cfg, stage = _cadenced_fused_stage(canonical)
+    stage['flags']['z_calibration'] = True
+    cfg['z_calibration']['fill_threshold'] = 0.5
+    assert _fires(cfg, 'fwd_rollout_cadence_is_well_formed')
+
+
+def test_fwd_rollout_cadence_refuses_a_disabled_fill(canonical):
+    """With the servo off, z_level_fill is the ONLY thing pinning log Z at each
+    rollout; fill_threshold 0 disables it, leaving Z unpinned. Must fire."""
+    cfg, stage = _cadenced_fused_stage(canonical)
+    stage['flags']['z_calibration'] = False
+    cfg['z_calibration']['fill_threshold'] = 0
+    assert _fires(cfg, 'fwd_rollout_cadence_is_well_formed')
+
+
+def test_fwd_rollout_cadence_accepts_the_well_formed_shape(canonical):
+    cfg, stage = _cadenced_fused_stage(canonical)
+    stage['flags']['z_calibration'] = False
+    cfg['z_calibration']['fill_threshold'] = 0.5
+    assert not _fires(cfg, 'fwd_rollout_cadence_is_well_formed')
+    # and with no cadence key at all the rule has nothing to say
+    assert not _fires(canonical, 'fwd_rollout_cadence_is_well_formed')
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check

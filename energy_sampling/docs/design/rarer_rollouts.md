@@ -1,0 +1,181 @@
+# Scope: rarer forward rollouts — v0 for pre-production tonight, v1 deferred
+
+Written 2026-09-07. Target: cluster pre-production this evening, production
+overnight. That timeline forces a split. **v0 is the cadence mechanism alone, on
+top of the shipped prod_sep02 shape, with fixed fractions and the existing Z
+machinery re-pointed.** Everything that needs a new sensor or a new controller
+is v1. v0 is small enough to build, test locally, and smoke on the cluster in one
+evening; v1 is not.
+
+Every design rule below is a consequence of the verified analysis in memory
+(`project_logz_lag_sign_and_cadence`, `project_replay_memorisation_monotone_in_lr`,
+`project_under_coverage_gate_calibration`); the ones that matter most are restated
+here so the spec stands alone.
+
+---
+
+## Why, in three sentences
+
+The MLIP is evaluated on the FULL forward batch every step (`fracs` are loss
+weights, not sample fractions), and only the forward branch calls it — bwd and
+replay use pre-scored rows. Skipping forward rollouts on k−1 of every k steps
+therefore removes ~all training-time energy calls; at the shipped fracs the fwd
+branch is only 5% of the gradient, so what is lost is the on-policy Z reading
+and the on-policy 5%. The design is safe exactly when Z is **snapped** to the
+fresh batch at every rollout and the unpinned interval is bounded.
+
+## The invariants (do not trade these away)
+
+1. **Z is pinned at every rollout by a closed-form fill, never by an EMA.** The
+   winsorized root's se is ~rms_clipped/(√B·frac_unclipped) ≈ 0.3 nat at B≈1000,
+   so a full-batch fill is more precise than any tracker. Between rollouts Z is
+   frozen. Under rare rollouts the dangerous lag sign is LOW (the policy absorbs
+   the level onto stored/anchor rows and the next root walks down to meet the
+   stale Z — the identifiability loop); a snap is the only brake.
+2. **Nothing else may call the MLIP or move Z between rollouts.** That means
+   `z_calibration` OFF (its `rollout` mode does its own forward rollout + energy
+   call per Z step, off a sensor that is frozen between rollouts and would fire
+   every step), and the controller force-refresh must not run fwd.
+3. **The replay buffer's residence clock is in STEPS, not manage calls.** Today
+   hazard is "per manage call, matching churn_rate" and the call happens on fwd
+   steps; the backstop compares an age in steps to `tau·backstop_mult`. At
+   cadence N the two clocks disagree by N×. Fix the clock; do not retune around it.
+4. **Store the whole forward batch** (`churn_rate := batch_size`). By Little's law
+   draws/row = N and occupancy = B·τ_steps/N; the buffer side is nearly free and
+   the pin frequency is the change. Fill event size = N/τ_steps; keep it ≤ 0.2.
+5. **Single-leg jobs only until the lj_coeff resume crash is fixed** (Monday
+   routine). A killed arm cannot resume today.
+
+---
+
+## v0 — TONIGHT
+
+### Config (one new stage key, five existing keys re-pointed)
+
+```yaml
+protocols.<name>.stages[equilibration]:
+  fwd_rollout_every: N            # NEW. 0/absent = today's behaviour (fwd every step)
+  z_calibration: false            # invariant 2
+  fracs: {fwd: 0.05, bwd: 0.475, replay: 0.475}   # unchanged; renormalised over
+                                                   # active branches per step
+z_calibration:                    # z_level_fill lives under this block; keep it
+  fill_threshold: 0.5             # >0 keeps the fill ON; small = snap every rollout
+  fill_se: 3.0                    # a batch must resolve the gap it claims
+  fill_cooldown_steps: 0          # once per rollout; the stash is single-use anyway
+buffers.replay_buffer:
+  churn_rate: <batch_size>        # store-all
+  mean_residence_steps: 5*N       # in STEPS after the clock fix; event size 0.2
+  backstop_mult: 5                # unchanged
+controller:
+  refresh_every: 10               # unchanged, but fwd is EXCLUDED from force-refresh
+                                  # when fwd_rollout_every is set (code, below)
+```
+
+Anchors stay frozen (prod_sep02 shape). Prior buffer untouched — its churn and
+MLIP re-scoring already run inside `evaluation()` at `eval_period`, not per step.
+`hot_lr_sensor.action: report`, `fire_cut_factor: 1.0`, `mode: fixed` with
+`burn_in_scale == fixed_scale`: all unchanged.
+
+### Code (four touch points; each is a few lines)
+
+1. **`fused_train_step` (train.py ~3745):** read
+   `N = stage.fwd_rollout_every`. If `N > 0`:
+   `fwd_ran = fwd_active = (self.step_ind % N == 0)`, and the force-refresh clause
+   must NOT set `fwd_ran` (fwd stats refresh naturally every N). Weights renormalise
+   over active branches exactly as today, so non-rollout steps train at
+   bwd/replay = 0.5/0.5 and rollout steps at 0.05/0.475/0.475.
+   `_stash_z_fill_logw` is already inside the fwd block, so the fill is armed only
+   on rollout steps.
+2. **`z_level_fill` (train.py ~5073):** no change needed — it early-returns when
+   nothing is stashed. Verify the fill fires on every rollout step: `z_fill/gap`
+   must be logged exactly once per N steps.
+3. **`manage_replay_buffer` (train.py ~8130):** convert the hazard from per-call to
+   per-step. Track `_last_replay_manage_step`; per call, evict a fraction
+   `min(1, (step − last)/tau)` of survivors instead of `1/tau`. Leave the backstop
+   as is (it already compares an age in steps). Document `mean_residence_steps`
+   as steps. This also fixes the same latent mismatch on today's eval-site call.
+4. **Stage schema:** register `fwd_rollout_every` wherever stage keys are
+   validated so an unknown-key check does not refuse it, and add one invariant:
+   `fwd_rollout_every > 0` requires `z_calibration: false` on that stage and
+   `fill_threshold > 0` (invariant 2 must be unforgeable by config).
+
+Not touched in v0: the LR controller (its `fused` channel still sees a loss every
+step; the fwd term is ≤5% of it, far under the 10× excursion bar), the hot-LR
+sensor (report), the grad guard, the anchor buffer, the prior buffer, eval.
+
+### What to watch in v0 (existing metrics, no new instrumentation)
+
+| metric | expectation | what a violation means |
+|---|---|---|
+| `z_fill/gap`, `z_fill/se` | logged once per N steps; `|gap|` ≤ 3·se after each fill | fill not firing, or batch does not resolve Z |
+| `lr_ctrl/scale` | flat | a fire moved the rate |
+| `replay_buffer` occupancy | ≈ B·τ_steps/N (e.g. 1000·100/20 = 5000) | clock fix wrong |
+| `replay/resid_vs_intake` | > 0.368; compare to the same-LR p02 arm | reuse = N is memorising |
+| `bwd/under_coverage` | MA(150) jump < 1 nat (read by eye or offline) | forgetting |
+| step time, non-rollout steps | ≈ (1 − fwd share) of today's; rollout steps ≈ today's | MLIP still being called between rollouts |
+| `nvidia-smi` sidecar | no periodic dips into the 38–49% band | the cluster's utilization killer |
+
+### Acceptance — local (ELJ rig, ~45 min)
+
+On `configs/local_prod_sep02/lp02.yaml` shape, N = 10, 2000 steps:
+(a) `z_fill/gap` appears at steps 10, 20, … and nowhere else; (b) `lr_ctrl/scale`
+flat; (c) `anchor_buffer_length` constant; (d) replay occupancy ≈ B·τ/N;
+(e) `Bwd Frac` reads 0.5 on non-rollout steps and 0.475 on rollout steps;
+(f) zero divergences; (g) energies and log Z track the N = 1 baseline (lp02) within
+noise at matched step — this is the one that says the design works, not merely
+runs. N = 1 must reproduce today's behaviour bit-for-bit in the fused step.
+
+### Acceptance — cluster smoke (20-min wall, one arm per system)
+
+Same shape as `configs/smoke_sep02`: mip, mipu, nehu, acr at their p02 centre
+rates, N = 10. Pass = all four reach wandb and log `z_fill/gap` on the cadence.
+Then read step time: UMA/MACE non-rollout steps should be a small fraction of
+today's 15–27 s/it.
+
+### Overnight production proposal (single-leg, 2-day walls)
+
+4 systems × N ∈ {5, 20} at the p02 centre rates = 8 arms. N = 5 is already a 5×
+cut in energy calls with FEWER draws/row than today (5 vs 12–20); N = 20 is 20×
+with slightly more. `mean_residence_steps` = 5N. Compare against the running p02
+arms at matched step count. Keep the 7-day p02 paper arms running untouched.
+
+---
+
+## v1 — DEFERRED (each needs a new sensor or a controller; none is tonight)
+
+- **`birth_log_pf`** (one float per row, stored at admission from
+  `fwd_stats['log_pf']`, currently dropped at train.py ~8071) →
+  `replay/policy_drift_ess_frac` = (Σw)²/(n·Σw²) with w = exp(log_pf_now −
+  birth_log_pf). This is the NON-circular rollout trigger (roll out when ESS < ~0.3,
+  hard cap at N_max); "Z-fit quality" is the circular one. Same weights give an
+  IS estimate of the on-policy root, trustworthy while ESS is high.
+- **Forgetting gate:** MA(150) difference on `bwd/under_coverage` > 1 nat as the
+  fast gate (120–190-step latency, 0–5% FP on healthy arms), slow EMA(hl 1500)
+  rise > 1 as the low-FP backstop. Actuator: bwd weight → 0.9 over ~100 steps.
+- **Memorisation gate:** replay validation split (tag 5–10% of admitted rows,
+  exclude from the draw, score at the metric cadence); train/val gap caps the
+  replay weight. Keep `birth` log_w SIGNED and score `resid_vs_intake` against the
+  CURRENT Z so a fill does not read as absorption.
+- **Eval rollouts → z_fill** (on-policy at training T; a different batch size
+  changes the root's se, not its location). Not into the buffer.
+- **fwd policy step on rollout steps** (`freeze_policy: 0` on the fwd branch):
+  the only level-blind policy gradient available; nearly free once the rollout is
+  paid for. Off in v0 to match today's branch roles exactly.
+- **Anchor-only bwd** (drop the prior model): the paper's "noised buffer" IS the
+  anchor buffer; the prior model is unclaimed machinery and the source of both
+  open resume failures. Needs a bwd memorisation sensor
+  (`prior_buffer.absorption_stats()` is one call away) and a coverage statement.
+- **Pin/absorber β**: today's fwd β = 10 (pin) vs bwd/replay β = 80 (absorbers)
+  is backwards for this design; revisit once v0 is measured.
+
+## Risks stated plainly
+
+- The synthetic +3-nat/300-step deterioration used to calibrate the gate is not a
+  measured collapse; real collapse shape is unknown. v0 has no automatic gate —
+  it relies on the LR controller's hard bars and on eyes.
+- Periodic utilization: rollout steps and buffer steps look different to the
+  cluster's sampler. The sidecar is in place; the usage investigation should
+  look at v0's profile before it is trusted overnight.
+- Reuse per row = N. At N = 20 that exceeds today's mipu (≈20) only marginally,
+  but `resid_vs_intake` is the number to read, and there is no gate on it in v0.
+- A killed v0 arm cannot resume until the lj_coeff stamp fix lands.
