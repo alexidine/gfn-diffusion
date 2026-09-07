@@ -211,3 +211,52 @@ arms at matched step count. Keep the 7-day p02 paper arms running untouched.
 - Reuse per row = N. At N = 20 that exceeds today's mipu (≈20) only marginally,
   but `resid_vs_intake` is the number to read, and there is no gate on it in v0.
 - A killed v0 arm cannot resume until the lj_coeff stamp fix lands.
+
+## Local acceptance and cadence measurements — 2026-09-07 evening
+
+Rig: `configs/local_rr_sep07` (ELJ mipcas, batch 400, 2000 steps, from `lp02`'s
+phase-1 exit). Runs `rr07_rr_n{1,7,20,50}`. Read with an UNFILTERED
+`scan_history` — `keys=[...]` keeps only rows carrying every key, and no row carries a
+fill, the controller sensor and an eval-only counter at once. `z_fill/gap` is a
+persisted metric; count fills from `z_fill/fired`.
+
+**rr_n7 — acceptance.** Anchors static (158,998). Prior buffer 63,000 at entry, then
+500/eval from noised anchors, 0 from any prior model. Replay occupancy 2,095 vs
+B·τ/N = 2,000 (per-step hazard clock). fracs 0.500/0.500 on and off rollout rows (fwd
+pinned 0; the old 0.475 no longer applies). 0 divergences, LR flat. Memorisation
+`resid_vs_intake` 0.97–1.00 at reuse 7. Energies 15.9 → 4.9 over the run.
+
+**Defect found by this run, fixed in 34dba58.** `bwd/under_coverage_rise150` never
+reached the tracker: the sensor lived in `_update_rolling`, which runs every 10th
+trained bwd step, so a 300-*sample* window was 3,000 *steps* — 10× the calibration
+(done on 10-step wandb rows) and longer than the run. `gr_share` held 0.5 throughout
+with `gr_sensor` unwritten. Now `Modeller._forgetting_sensor`: step-stamped samples,
+windows in steps, cadence-independent; `tests/protocol/test_forgetting_sensor.py`.
+Any sensor computed in `_update_rolling` sees one sample per 10 bwd steps.
+
+**The Z pin mostly refuses early in training, and that is correct.** At batch 400 the
+fill's se is ~1.6 nat against |gap| ~1.9, so the 3-se gate blocked ~88% of pins
+(`fired` on 22 report rows, `blocked_by_se` on 174): Z sat in a ±5 nat dead band, within
+the estimator's own noise. On the live production arms the same se is 0.07 nat (ELJ,
+batch 1000, step 69k) and 0.53 (UMA, batch 1600, step 31k) with |gap|/se ≈ 0.9 — the
+band collapses with convergence because se ∝ std(log w)/√B. Ship `fill_se: 3`; a
+precision-weighted absorber (Z += (root−Z)·se₀²/(se₀²+se²)) stays a v1 option.
+
+**Cost model, clean (no GPU co-tenant).** t(N) = 0.26 + 0.51/N s per step at batch 400:
+N=1 1.3 it/s (lp02), N=7 3.0 (steps 100–500), N=20 predicted 3.5 / measured 3.57. The
+rollout is 66% of an every-step ELJ step here; the speedup saturates at ~2.7× by N≈20
+on ELJ. On MLIP systems the rollout is a larger fraction, so gains continue to larger N.
+
+**Cadence sweep (Z drift and memorisation vs N), settled window steps > 600:**
+
+| N | \|gap\| med | se | gap/se | memo (min) | bwd under_cov @2000 | E_mean @2000 |
+|---|---|---|---|---|---|---|
+| 7 | 1.73 | 1.55 | 1.10 | 0.985 (0.966) | 39.9 | 4.95 |
+| 20 | 2.16 | 1.73 | 1.23 | 0.899 (0.860) | 44.9 | 3.65 |
+| 50 | *(running)* | | | | | |
+| 1 | *(queued — the noise-floor yardstick; also the live test of 34dba58)* | | | | | |
+
+Reading so far: Z drift over 20 steps is barely above the batch noise floor (cadence
+has headroom on this system at this stage); memorisation is the first thing to move
+(0.985 → 0.899 at reuse 20, bar 0.368 still far); the 5-nat under-coverage difference
+is one eval on one seed and needs N=50 and N=1 to interpret.

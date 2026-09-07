@@ -73,8 +73,14 @@ def main():
     # N = 7 is COPRIME with the 10-step metric cadence, so logged rows cover
     # both rollout and non-rollout steps; at N = 10 every logged row was a
     # rollout step and the 0.5/0.5 renormalisation was unobservable.
+    # rr_n20 / rr_n50: the cadence sweep. Each rollout's z_fill/gap measures how far
+    # log Z drifted over the N steps since the last one, and replay/resid_vs_intake
+    # measures memorisation at reuse = N, so gap(N) and memo(N) on this system are a
+    # real-data estimate of a reasonable N: where |gap| approaches the fill's se.
     arms = {'rr_n1': build('rr_n1', 1, store_all=False),
-            'rr_n7': build('rr_n7', 7, store_all=True)}
+            'rr_n7': build('rr_n7', 7, store_all=True),
+            'rr_n20': build('rr_n20', 20, store_all=True),
+            'rr_n50': build('rr_n50', 50, store_all=True)}
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
