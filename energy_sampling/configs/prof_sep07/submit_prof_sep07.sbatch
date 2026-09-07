@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --time=03:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --mem=48G
+#SBATCH --mem=200G
 #SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
@@ -13,6 +13,12 @@
 
 # PROFILE, 3 hours, two arms of the prod_sep02 shape with the torch.profiler window
 # armed in steady state. See make.py. Arm = row of INDEX.tsv (line 1 is the header).
+#
+# --mem IS 200G AND IT IS LOAD-BEARING, not a copy of the battery's 48G. torch.profiler
+# buffers every event in host RAM until its window closes; at 48G the first attempt's
+# RSS went 2.7 -> 48.2 GB inside the window and the cgroup killed the job before it
+# wrote anything. Training itself uses ~2.7 GB, the headroom is entirely the profiler's,
+# and the nodes have ~940 GB free.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif

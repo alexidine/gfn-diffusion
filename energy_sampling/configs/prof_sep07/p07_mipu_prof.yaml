@@ -70,10 +70,10 @@ profiling:
   regions: null
   trace:
     enabled: true
-    start_step: 5700
-    active_steps: 8
+    start_step: 5400
+    active_steps: 2
     outdir: profiling_results
-    write_trace: true
+    write_trace: false
     record_shapes: false
     with_stack: false
 compile_policy: auto

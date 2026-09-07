@@ -16,10 +16,26 @@ rollout/bookkeeping and not the energy route.
 
 WHY THESE STEPS. `start_step` is an ABSOLUTE step index (TraceWindow.step compares
 it to step_ind) and both arms resume from a phase-1 exit: mipu at 5010, mip at 19010.
-Steady state on the battery arrived ~2 h after start on mipu (regimes.csv) and within
-1 h on mip; 5700 / 19600 sit inside it. The chrome trace is ON, deliberately: the
-question is the gaps between kernels, which only a timeline shows. ~93 MB/step, 8
-steps, so ~0.8 GB per arm under profiling_results/.
+The window sits a few hundred steps in -- past the transition transient, near enough
+that a 3 h wall reaches it with hours to spare. The first attempt used 5700 / 19600,
+which took mip 83 minutes to reach; there is no reason to spend that much of the wall
+travelling to the measurement.
+
+/!\\ ACTIVE_STEPS IS 2, NOT 8, AND --mem IS 200G. THE FIRST ATTEMPT OOM'd THE HOST.
+p07_mip_prof, 2026-09-07: the window opened at step 19600 and process RSS went
+2.7 GB -> 44.8 -> 48.2 GB in eight minutes against `--mem=48G`; the cgroup killed it
+before 8 steps completed and nothing was written. torch.profiler buffers every CPU and
+CUDA event in host RAM until the window closes, and this step launches enough of them
+to outgrow a 48 GB allocation in roughly three steps -- which is itself evidence for
+the dispatch-bound reading this run exists to test. Two steps is ample for a
+key_averages table, and the nodes have ~940 GB free, so the memory ask is cheap
+insurance rather than a tuning choice.
+
+THE CHROME TRACE IS OFF. It was on for the first attempt to see the gaps between
+kernels, but it is ~93 MB/step to write and the export doubles the peak. The table is
+what a headless reader actually reads (profiling.py says so) and it is what names the
+operation. Turn the trace back on, for a single step, once the table says where to
+look.
 
 Everything else -- batch, fracs, anchors, clip, LR -- is the committed p02 yaml.
 """
@@ -30,8 +46,8 @@ ROOT = HERE.parent
 
 ARMS = {
     # name: (committed base, warm-src token, absolute trace start step)
-    'p07_mipu_prof': ('prod_sep02/p02_mipu_lr0p0625.yaml', 'pt100_mipu_lr4p0', 5700),
-    'p07_mip_prof':  ('prod_sep02/p02_mip_lr1.yaml',       'pt100_mip_lr4p0',  19600),
+    'p07_mipu_prof': ('prod_sep02/p02_mipu_lr0p0625.yaml', 'pt100_mipu_lr4p0', 5400),
+    'p07_mip_prof':  ('prod_sep02/p02_mip_lr1.yaml',       'pt100_mip_lr4p0',  19300),
 }
 
 
@@ -41,8 +57,8 @@ def deltas(cfg, name, start_step):
     cfg['epochs'] = 500000          # the wall ends the job; the trace closes itself
     cfg['profiling'] = {
         'enabled': True, 'regions': None,
-        'trace': {'enabled': True, 'start_step': int(start_step), 'active_steps': 8,
-                  'outdir': 'profiling_results', 'write_trace': True,
+        'trace': {'enabled': True, 'start_step': int(start_step), 'active_steps': 2,
+                  'outdir': 'profiling_results', 'write_trace': False,
                   'record_shapes': False, 'with_stack': False},
     }
     return cfg

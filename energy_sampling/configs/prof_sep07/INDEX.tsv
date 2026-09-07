@@ -1,3 +1,3 @@
 arm	warm_src	base	trace_start
-p07_mipu_prof	pt100_mipu_lr4p0	prod_sep02/p02_mipu_lr0p0625.yaml	5700
-p07_mip_prof	pt100_mip_lr4p0	prod_sep02/p02_mip_lr1.yaml	19600
+p07_mipu_prof	pt100_mipu_lr4p0	prod_sep02/p02_mipu_lr0p0625.yaml	5400
+p07_mip_prof	pt100_mip_lr4p0	prod_sep02/p02_mip_lr1.yaml	19300
