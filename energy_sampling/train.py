@@ -3738,7 +3738,14 @@ class Modeller:
         # call the MLIP every 10 steps regardless of `every`, silently.
         rollout_every = int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0)
         if rollout_every > 0:
-            fwd_active = fwd_ran = (self.step_ind % rollout_every == 0)
+            # ROLLOUT STEPS RUN THE FORWARD BRANCH BUT DO NOT TRAIN ON IT. fwd_ran
+            # gates the rollout, the z_fill stash and replay admission; fwd_active
+            # gates the loss. Keeping the loss out (the force-refresh semantics
+            # below: detached, weight 0) makes every fused step a pure bwd+replay
+            # step and leaves z_level_fill as the ONLY thing that moves log Z --
+            # a closed-form snap, never an Adam step off a 5%-weighted term.
+            fwd_ran = (self.step_ind % rollout_every == 0)
+            fwd_active = False
         else:
             fwd_active = self.fwd_frac >= deactivate_threshold
             fwd_ran = fwd_active or (force_refresh and not self.protocol.mode_dormant('fwd'))
@@ -4147,6 +4154,24 @@ class Modeller:
         # RAW (pre-EMA) stats cache, one step deep: the MLE slope gate samples
         # bwd/mle from here every 10 steps -- raw batch losses are ~independent
         # across steps, so its OLS slope needs no autocorrelation correction
+        # FORGETTING SENSOR for the gated-ramp balance (docs/design/rarer_rollouts.md):
+        # mean of bwd/under_coverage over the last 150 steps minus the mean over
+        # the 150 before. under_coverage oscillates with a ~150-step period and
+        # 0.4-0.7 nat amplitude, so a period-matched difference cancels the
+        # oscillation exactly where a sign-of-slope gate chattered 11-85% of the
+        # time; against an injected +3-nat deterioration over 300 steps it alarms
+        # in 120-190 steps at 0-5% false positives on four healthy arms
+        # (memory: project_under_coverage_gate_calibration). NOT written until the
+        # window is full: the tracker EMAs whatever it is given, so a NaN here
+        # would poison the EMA and a zero would read as "not rising".
+        if sub_type == 'bwd' and stats.get('under_coverage') is not None:
+            uc = float(stats['under_coverage'])
+            if math.isfinite(uc):
+                hist = getattr(self, '_uc_hist', [])
+                hist = (hist + [uc])[-300:]
+                self._uc_hist = hist
+                if len(hist) == 300:
+                    stats['under_coverage_rise150'] = float(np.mean(hist[150:]) - np.mean(hist[:150]))
         self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
 
@@ -7384,6 +7409,20 @@ class Modeller:
         top-up paths.
         """
         if budget <= 0:
+            return
+        # ANCHOR-ONLY PRIOR (docs/design/rarer_rollouts.md, v1; the paper's S2
+        # "noised buffer"): the churn budget is met by noising and re-scoring
+        # rows drawn from the frozen anchor set -- top_up_prior_from_anchors,
+        # the same path the shortfall backfill already uses -- so the prior
+        # buffer refreshes on `mean_lifetime` with no prior MODEL in the loop.
+        # Opt-in. The default keeps today's prior-model churn untouched, which
+        # matters because the prod_sep02 arms are running on it. Under this
+        # source `snapshot_prior` and `prior_model_name` are unnecessary, and
+        # the resume gap those create (no prior_model after a restart) does not
+        # exist; prior_buffer_prior_admit_rate reads nan, as it counts prior-
+        # MODEL admits only.
+        if getattr(self.args.buffers.prior_buffer, 'source', 'prior_model') == 'anchors':
+            self.top_up_prior_from_anchors(budget)
             return
         if not self._has_prior_sampler():
             # Silent here changes the buffer's SOURCE MIX to 100% anchor with no

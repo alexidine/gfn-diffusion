@@ -20,6 +20,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 BASE = HERE.parent / 'local_prod_sep02' / 'lp02.yaml'
 
 STEPS = 2000
+# ELJ rails: bwd floor 0.25, replay cap 0.75. (MLIP arms use a 0.5 bwd floor.)
+BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
 def build(name, every, store_all):
@@ -38,12 +40,27 @@ def build(name, every, store_all):
     n_fused = 0
     for proto in (cfg.get('protocols') or {}).values():
         for st in (proto.get('stages') or []):
+            # ANCHOR-ONLY PRIOR: nothing writes a prior model any more
+            if 'snapshot_prior' in (st.get('on_exit') or []):
+                st['on_exit'] = [a for a in st['on_exit'] if a != 'snapshot_prior']
             if st.get('train_mode') != 'fused':
                 continue
             st['fwd_rollout_every'] = int(every)
             st.setdefault('flags', {})['z_calibration'] = False
+            # the gated-ramp controller: one sensor, two motions, hard rails
+            st['fracs'] = {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
+            st.pop('min_fracs', None)
+            st['balance'] = {
+                'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
+                'pinned': {'fwd': 0.0},
+                'metric': 'bwd/under_coverage_rise150', 'bar': 1.0,
+                'up': 0.0017,      # 0.50 -> 0.75 replay share over ~1500 steps
+                'down': 0.043,     # 0.75 -> 0.10 over ~150 steps when the guard fires
+                'bounds': BOUNDS,
+            }
             n_fused += 1
     assert n_fused >= 1, f'{name}: no fused stage to cadence'
+    cfg['buffers']['prior_buffer']['source'] = 'anchors'
 
     if store_all:
         rb = cfg['buffers']['replay_buffer']
@@ -53,8 +70,11 @@ def build(name, every, store_all):
 
 
 def main():
+    # N = 7 is COPRIME with the 10-step metric cadence, so logged rows cover
+    # both rollout and non-rollout steps; at N = 10 every logged row was a
+    # rollout step and the 0.5/0.5 renormalisation was unobservable.
     arms = {'rr_n1': build('rr_n1', 1, store_all=False),
-            'rr_n10': build('rr_n10', 10, store_all=True)}
+            'rr_n7': build('rr_n7', 7, store_all=True)}
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)

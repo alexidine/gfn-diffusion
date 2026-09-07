@@ -44,8 +44,14 @@ SRC = {k: v['src'] for k, v in p02make.FAM.items()}
 SMOKE = [('mip', 10), ('mipu', 10), ('nehu', 10), ('acr', 10)]
 PROD = [(fam, n) for fam in ('mip', 'neh', 'mipu', 'nehu') for n in (5, 20)]
 
+# Controller rails. The bwd FLOOR is the measured one: 0.5 held on the MLIP arms
+# where lower starved coverage; ELJ tolerates 0.25 (replay cap 0.75).
+MLIP = {'mipu', 'nehu', 'acr'}
+BOUNDS_MLIP = {'bwd': [0.5, 0.9], 'replay': [0.1, 0.5]}
+BOUNDS_ELJ = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
-def deltas(cfg, name, every):
+
+def deltas(cfg, name, every, fam):
     cfg['run_name'] = name
     cfg['tag'] = 'rr07'
     zc = cfg.setdefault('z_calibration', {})
@@ -55,12 +61,25 @@ def deltas(cfg, name, every):
     n = 0
     for proto in (cfg.get('protocols') or {}).values():
         for st in (proto.get('stages') or []):
+            # ANCHOR-ONLY PRIOR: nothing writes a prior model any more
+            if 'snapshot_prior' in (st.get('on_exit') or []):
+                st['on_exit'] = [a for a in st['on_exit'] if a != 'snapshot_prior']
             if st.get('train_mode') != 'fused':
                 continue
             st['fwd_rollout_every'] = int(every)
             st.setdefault('flags', {})['z_calibration'] = False
+            st['fracs'] = {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
+            st.pop('min_fracs', None)
+            st['balance'] = {
+                'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
+                'pinned': {'fwd': 0.0},
+                'metric': 'bwd/under_coverage_rise150', 'bar': 1.0,
+                'up': 0.0017, 'down': 0.043,
+                'bounds': BOUNDS_MLIP if fam in MLIP else BOUNDS_ELJ,
+            }
             n += 1
     assert n >= 1, name + ': no fused stage'
+    cfg['buffers']['prior_buffer']['source'] = 'anchors'
     rb = cfg['buffers']['replay_buffer']
     rb['churn_rate'] = int(cfg['batch_size'])
     rb['mean_residence_steps'] = 5 * int(every)
@@ -72,6 +91,14 @@ def check(cfg, name, every):
     assert st and all(s['fwd_rollout_every'] == every for s in st), name
     assert all(s['flags'].get('z_calibration') is False for s in st), name + ': servo on'
     assert cfg['z_calibration']['fill_threshold'] > 0, name + ': fill off'
+    for s in st:
+        b = s.get('balance') or {}
+        assert b.get('kind') == 'gated_ramp' and b.get('guard') == 'bwd', name + ': controller'
+        assert s['fracs'] == {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}, name + ': entry fracs'
+        assert 'min_fracs' not in s, name
+    assert cfg['buffers']['prior_buffer'].get('source') == 'anchors', name + ': prior source'
+    assert not any('snapshot_prior' in (s.get('on_exit') or [])
+                   for p in cfg['protocols'].values() for s in p['stages']), name + ': snapshot_prior left'
     rb = cfg['buffers']['replay_buffer']
     assert rb['churn_rate'] == cfg['batch_size'] and rb['mean_residence_steps'] == 5 * every, name
     assert cfg['checkpoint_name'] == p02make.PLACEHOLDER, name
@@ -85,7 +112,7 @@ def build(arms, prefix):
         base = P02 / (CENTRE[fam] + '.yaml')
         name = '%s_%s_n%d' % (prefix, fam, every)
         cfg = yaml.safe_load(base.read_text(encoding='utf-8'))
-        cfg = deltas(cfg, name, every)
+        cfg = deltas(cfg, name, every, fam)
         check(cfg, name, every)
         out[name] = (cfg, fam, every)
     return out

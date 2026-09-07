@@ -263,7 +263,6 @@ protocols:
         patience: 1
       on_exit:
       - snapshot:phase1_exit
-      - snapshot_prior
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior
@@ -279,13 +278,9 @@ protocols:
       - rebuild_prior_by_churn
       - bootstrap_z:train_conditioner
       fracs:
-        fwd: 0.05
-        bwd: 0.93
-        replay: 0.02
-      min_fracs:
-        fwd: 0.02
-        bwd: 0.02
-        replay: 0.02
+        fwd: 0.0
+        bwd: 0.5
+        replay: 0.5
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd:
@@ -298,24 +293,22 @@ protocols:
           tb: 1.0
           beta: 80
       balance:
-        kind: ratio
+        kind: gated_ramp
+        ramp: replay
+        guard: bwd
         pinned:
-          fwd: 0.05
-        metrics:
-          replay: fwd/over_coverage
-          bwd: bwd/relative_under_wcen
-        numerator: replay
-        setpoint: 5.0
-        gain: 0.05
-        max_step: 0.05
-        bounds:
-          replay:
-          - 0.02
-          - 0.93
+          fwd: 0.0
+        metric: bwd/under_coverage_rise150
+        bar: 1.0
+        up: 0.0017
+        down: 0.043
+        bounds: &id001
           bwd:
-          - 0.02
-          - 0.93
-        converge_floor: 1.0
+          - 0.25
+          - 0.9
+          replay:
+          - 0.1
+          - 0.75
       buffer_servo:
         numerator: replay/ema_loss_mean
         denominator: replay/birth_loss_mean
@@ -353,7 +346,6 @@ protocols:
         patience: 1
       on_exit:
       - snapshot:phase1_exit
-      - snapshot_prior
     - name: var_conditioning
       train_mode: fused
       bwd_sampling_mode: prior
@@ -371,9 +363,9 @@ protocols:
       - rebuild_prior_by_churn
       - set_lr_flow:1.0e-4
       fracs:
-        fwd: 0.5
+        fwd: 0.0
         bwd: 0.5
-        replay: 0.0
+        replay: 0.5
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd:
@@ -394,29 +386,16 @@ protocols:
         replay:
           tb_z_source: persistent
       balance:
-        kind: lexicographic
-        default_boost:
-          fwd: 0.5
-          bwd: 0.5
-        rules:
-        - metric: pooled/pooled_vg
-          relative: best
-          margin: 1.25
-          drift: 0.01
-          if_missing: violated
-          boost:
-            fwd: 0.5
-            bwd: 0.5
-        - metric: zmatch/delta_mean
-          above: 20.0
-          if_missing: violated
-          boost:
-            fwd: 0.5
-            bwd: 0.5
-        anneal_coeffs:
-          lambda_mix:
-            target: 1.0
-            rate: 0.93
+        kind: gated_ramp
+        ramp: replay
+        guard: bwd
+        pinned:
+          fwd: 0.0
+        metric: bwd/under_coverage_rise150
+        bar: 1.0
+        up: 0.0017
+        down: 0.043
+        bounds: *id001
       fwd_rollout_every: 1
   prod_eq:
     stages:
@@ -437,8 +416,7 @@ protocols:
       - metric: bwd/mle
         above: -1000000000.0
         patience: 1
-      on_exit:
-      - snapshot_prior
+      on_exit: []
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior
@@ -454,9 +432,9 @@ protocols:
       on_enter:
       - rebuild_prior_by_churn
       fracs:
-        fwd: 0.05
-        bwd: 0.475
-        replay: 0.475
+        fwd: 0.0
+        bwd: 0.5
+        replay: 0.5
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd:
@@ -479,6 +457,17 @@ protocols:
         max_step: 0.05
         max_boost: 8.0
       fwd_rollout_every: 1
+      balance:
+        kind: gated_ramp
+        ramp: replay
+        guard: bwd
+        pinned:
+          fwd: 0.0
+        metric: bwd/under_coverage_rise150
+        bar: 1.0
+        up: 0.0017
+        down: 0.043
+        bounds: *id001
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -505,6 +494,7 @@ buffers:
     reward_min: 0
     ramp_floor: 100
     ramp_width: 50
+    source: anchors
   replay_buffer:
     churn_rate: 80
     mean_residence_steps: 50

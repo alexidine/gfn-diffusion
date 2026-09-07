@@ -208,6 +208,11 @@ def fresh_stage_ctrl():
         # yet seeded (first tick seeds it from the stage's entry fracs, so the
         # controller starts exactly where a fixed-mix arm would sit).
         'cs_theta': None,
+        # gated_ramp balance: the ramp mode's share of the split pair (the
+        # actuator, in share units) and whether the guard fired on the last tick.
+        # None = not yet seeded from the stage's entry fracs.
+        'gr_share': None,
+        'gr_fired': 0.0,
         # buffer freshness servo: log of the multiplicative churn/residence
         # boost. 0.0 = the configured buffer, i.e. inert.
         'bs_log_boost': 0.0,
@@ -987,9 +992,52 @@ class Stage:
                     raise ValueError(f"stage '{self.name}': ratio converge_floor must be "
                                      f"strictly positive or null, got {floor}")
             node['converge_floor'] = floor
+        elif kind == 'gated_ramp':
+            # ONE SENSOR, TWO MOTIONS (docs/design/rarer_rollouts.md, v1 controller).
+            # The `ramp` mode's share drifts UP by `up` per tick while the guard
+            # sensor sits at or below `bar`, and moves DOWN by `down` per tick
+            # while it exceeds it. The deadband is the SENSOR's, not a knob
+            # here: with bwd/under_coverage_rise150 and bar 1.0 the gate read 0%
+            # false positives on four healthy arms and alarmed 120-190 steps
+            # into an injected deterioration. `bounds` are hard rails, so a bwd
+            # floor is a guarantee rather than an equilibrium. No second metric,
+            # no priority multiple, no logit: it reads as one sentence in print.
+            if node.get('anneal_coeffs'):
+                raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
+                                 f"(it anneals off the lexicographic clean-streak event)")
+            bad = set(node) - {'kind', 'ramp', 'guard', 'metric', 'bar', 'up', 'down',
+                               'pinned', 'bounds'}
+            if bad:
+                raise ValueError(f"stage '{self.name}': gated_ramp balance unknown keys {sorted(bad)}")
+            ramp, guard = node.get('ramp'), node.get('guard')
+            if ramp not in MODES or guard not in MODES or ramp == guard:
+                raise ValueError(f"stage '{self.name}': gated_ramp needs distinct 'ramp' and "
+                                 f"'guard' modes from {sorted(MODES)}, got {ramp!r}/{guard!r}")
+            node['ramp'], node['guard'] = ramp, guard
+            metric = node.get('metric')
+            if not isinstance(metric, str) or '/' not in metric:
+                raise ValueError(f"stage '{self.name}': gated_ramp metric must look like "
+                                 f"dir/name, got {metric!r}")
+            node['metric'] = metric
+            # the split pair, in the shape _parse_pinned/_parse_bounds key on
+            metrics = {ramp: metric, guard: metric}
+            node['metrics'] = metrics
+            node['pinned'] = self._parse_pinned(node, metrics)
+            bar = node.get('bar')
+            if not isinstance(bar, (int, float)) or bar <= 0:
+                raise ValueError(f"stage '{self.name}': gated_ramp bar must be strictly positive "
+                                 f"(a rise, in the sensor's units), got {bar!r}")
+            node['bar'] = float(bar)
+            for key, default in (('up', 0.0017), ('down', 0.043)):
+                v = float(node.get(key, default))
+                if not 0.0 < v <= 1.0:
+                    raise ValueError(f"stage '{self.name}': gated_ramp {key} must be in (0, 1] "
+                                     f"(share of the split pair per tick), got {v}")
+                node[key] = v
+            node['bounds'] = self._parse_bounds(node, metrics, node['pinned'], 'gated_ramp')
         else:
             raise ValueError(f"stage '{self.name}': balance.kind must be "
-                             f"lexicographic|proportional|constraint|ratio")
+                             f"lexicographic|proportional|constraint|ratio|gated_ramp")
         node['kind'] = kind
         return node
 
@@ -1115,7 +1163,7 @@ class Stage:
         stage without balance makes no claims."""
         if self.balance is None:
             return set(MODES)
-        if self.balance['kind'] in ('proportional', 'constraint', 'ratio'):
+        if self.balance['kind'] in ('proportional', 'constraint', 'ratio', 'gated_ramp'):
             # the two split modes, PLUS any mode the stage pins at a nonzero
             # entry frac. A two-mode split only redistributes its two
             # modes' combined mass, so a third mode held fixed (e.g. fwd
@@ -1151,7 +1199,7 @@ class Stage:
         if self.balance is None:
             return set(MODES)
         names = []
-        if self.balance['kind'] in ('proportional', 'constraint', 'ratio'):
+        if self.balance['kind'] in ('proportional', 'constraint', 'ratio', 'gated_ramp'):
             names += list(self.balance['metrics'].values())
         else:
             names += [r['metric'] for r in self.balance['rules']]
@@ -1970,6 +2018,9 @@ class StageProtocol:
         if bal['kind'] == 'ratio':
             self._ratio_tick(bal)
             return
+        if bal['kind'] == 'gated_ramp':
+            self._gated_ramp_tick(bal)
+            return
         ctrl = self.m.args.controller
 
         chosen = None
@@ -2163,6 +2214,71 @@ class StageProtocol:
         if s_lo > s_hi:  # only reachable if a pinned frac drifted off its declared value
             s_lo = s_hi = 0.5 * (s_lo + s_hi)
         return self._logit(s_lo), self._logit(s_hi)
+
+    def _gated_ramp_tick(self, bal):
+        """One sensor, two motions, in SHARE space.
+
+            v = sensor (a rise, e.g. bwd/under_coverage_rise150)
+            v >  bar : share_ramp -= down        # forgetting -> hand weight to the guard, fast
+            v <= bar : share_ramp += up          # otherwise -> drift toward the cap, slow
+            clip share_ramp to the bounds; share_guard = 1 - share_ramp
+
+        WHY NOT AN INTEGRATOR IN THE LOGIT (the other kinds). Those need a second
+        metric to drive the best-effort side, and "drift unconditionally toward a
+        cap" has no honest metric -- the owner's rule IS a ramp with a gate, so
+        this states it directly. The rails are absolute frac bounds turned into a
+        share interval exactly as _share_interval does, minus the logit.
+
+        WHY IT DOES NOT CHATTER. A two-motion rule on a raw slope would flip on
+        the ~150-step oscillation of under_coverage. The sensor this is built for
+        is the period-matched moving-average difference, which cancels that
+        oscillation; measured on four healthy arms it never crossed a 1-nat bar,
+        and it crossed within 120-190 steps of an injected +3-nat deterioration.
+        The deadband therefore lives in the sensor and the bar, not here.
+
+        WHAT IT DOES NOT GUARD: memorisation of the replay buffer. That is owned
+        by the buffer/rollout side (residence, store-all reuse = N, the drift-ESS
+        trigger), by owner decision 2026-09-07.
+
+        Holds still (no motion, share re-clipped) while the sensor is unwritten:
+        the rise needs a full 300-step window, so the first ticks of a stage
+        leave the entry fracs in place. Ticks every 10 steps like the others.
+        """
+        m = self.m
+        for mode, value in (bal.get('pinned') or {}).items():
+            setattr(m, f'{mode}_frac', float(value))
+        ramp, guard = bal['ramp'], bal['guard']
+        frac_r, frac_g = getattr(m, f'{ramp}_frac'), getattr(m, f'{guard}_frac')
+        pair = frac_r + frac_g
+        if pair <= 0:
+            return
+        s_lo, s_hi = 0.0, 1.0
+        bounds = bal.get('bounds') or {}
+        if ramp in bounds:
+            s_lo = max(s_lo, bounds[ramp][0] / pair)
+            s_hi = min(s_hi, bounds[ramp][1] / pair)
+        if guard in bounds:
+            s_lo = max(s_lo, 1.0 - bounds[guard][1] / pair)
+            s_hi = min(s_hi, 1.0 - bounds[guard][0] / pair)
+        if s_lo > s_hi:  # only reachable if a pinned frac drifted off its declared value
+            s_lo = s_hi = 0.5 * (s_lo + s_hi)
+        share = self.ctrl.get('gr_share')
+        if share is None:
+            share = frac_r / pair
+        share = min(max(float(share), s_lo), s_hi)
+        v = self._resolve(bal['metric'])
+        fired = 0.0
+        if v is not None:
+            if v > bal['bar']:
+                share -= bal['down']
+                fired = 1.0
+            else:
+                share += bal['up']
+            share = min(max(share, s_lo), s_hi)
+        setattr(m, f'{ramp}_frac', share * pair)
+        setattr(m, f'{guard}_frac', (1.0 - share) * pair)
+        self.ctrl['gr_share'] = share
+        self.ctrl['gr_fired'] = fired
 
     def _ratio_tick(self, bal):
         """Hold the RATIO of the two split modes' error metrics at a setpoint,
@@ -2542,6 +2658,16 @@ class StageProtocol:
                 out[f'protocol/cs_drive_{mode}'] = d
             for mode, bar in stage.balance['bars'].items():
                 out[f'protocol/cs_bar_{mode}'] = float(bar)
+        if stage.balance is not None and stage.balance['kind'] == 'gated_ramp':
+            # share is the actuator itself; fired is the gate's last verdict, so
+            # a run can be read as "how long was bwd in charge" from one series
+            if self.ctrl.get('gr_share') is not None:
+                out['protocol/gr_share'] = float(self.ctrl['gr_share'])
+            out['protocol/gr_fired'] = float(self.ctrl.get('gr_fired', 0.0))
+            out['protocol/gr_bar'] = float(stage.balance['bar'])
+            v = self._resolve(stage.balance['metric'])
+            if v is not None:
+                out['protocol/gr_sensor'] = float(v)
         if stage.balance is not None and stage.balance['kind'] == 'ratio':
             # rt_err is the whole loop in one series: SIGNED, never clamped, so
             # unlike a one-sided drive it cannot read the same when satisfied

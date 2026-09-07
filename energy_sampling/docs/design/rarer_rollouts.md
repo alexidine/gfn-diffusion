@@ -80,12 +80,13 @@ MLIP re-scoring already run inside `evaluation()` at `eval_period`, not per step
 
 1. **`fused_train_step` (train.py ~3745):** read
    `N = stage.fwd_rollout_every`. If `N > 0`:
-   `fwd_ran = fwd_active = (self.step_ind % N == 0)`, and the force-refresh clause
-   must NOT set `fwd_ran` (fwd stats refresh naturally every N). Weights renormalise
-   over active branches exactly as today, so non-rollout steps train at
-   bwd/replay = 0.5/0.5 and rollout steps at 0.05/0.475/0.475.
-   `_stash_z_fill_logw` is already inside the fwd block, so the fill is armed only
-   on rollout steps.
+   `fwd_ran = (self.step_ind % N == 0); fwd_active = False`, and the force-refresh
+   clause must NOT set `fwd_ran`. `fwd_ran` gates the rollout, the `z_fill` stash
+   and replay admission; `fwd_active` gates the loss — so a rollout step is
+   rollout → stash → admit → a pure bwd+replay fused step → `z_fill`, and the
+   forward branch never contributes a gradient (owner review 2026-09-07: `fwd_frac`
+   was a loss weight, and the fill must be the ONLY thing that moves Z). EVERY fused
+   step is therefore bwd/replay only, renormalised over the two.
 2. **`z_level_fill` (train.py ~5073):** no change needed — it early-returns when
    nothing is stashed. Verify the fill fires on every rollout step: `z_fill/gap`
    must be logged exactly once per N steps.
@@ -115,9 +116,40 @@ sensor (report), the grad guard, the anchor buffer, the prior buffer, eval.
 | step time, non-rollout steps | ≈ (1 − fwd share) of today's; rollout steps ≈ today's | MLIP still being called between rollouts |
 | `nvidia-smi` sidecar | no periodic dips into the 38–49% band | the cluster's utilization killer |
 
+### Built the same evening, after owner review (was "v1")
+
+- **Loss-weight controller `balance.kind: gated_ramp`** (protocol.py): one sensor,
+  two motions, hard rails. `ramp: replay`, `guard: bwd`,
+  `metric: bwd/under_coverage_rise150`, `bar: 1.0`, `up: 0.0017` (0.50 → 0.75 replay
+  share over ~1500 steps), `down: 0.043` (0.75 → 0.10 over ~150 steps when the guard
+  fires), `pinned: {fwd: 0.0}`, `bounds` = bwd [0.5, 0.9] / replay [0.1, 0.5] on
+  MLIP, bwd [0.25, 0.9] / replay [0.1, 0.75] on ELJ. Ticks every 10 steps. Chosen
+  over a `constraint`-kind mapping because the owner's rule IS a ramp with a gate and
+  "drift unconditionally to a cap" has no honest second metric; memorisation is
+  owned by the buffer/rollout side, not this controller. `active_modes` /
+  `read_modes` enumerate kinds — the new kind is registered there (missing it is a
+  KeyError on the first fused step, as `ratio` once found).
+- **The sensor** (train.py, beside the bwd stats): `under_coverage_rise150` = mean of
+  the last 150 steps of `bwd/under_coverage` minus the mean of the previous 150;
+  written only once the 300-step window is full (the tracker EMAs what it is
+  given, so NaN would poison it). Calibrated: ~150-step oscillation cancelled, 0–5%
+  false positives on four healthy arms, 120–190-step latency on a +3-nat/300-step
+  injected deterioration.
+- **Anchor-only prior** (`buffers.prior_buffer.source: anchors`, opt-in): the churn
+  budget is met by `top_up_prior_from_anchors` (noise + re-score frozen anchors)
+  instead of prior-model draws, which were otherwise SKIPPED with a warning when no
+  model existed and left `rebuild_prior_by_churn` admitting nothing. This is the
+  paper's S2 "noised buffer" with refresh. `snapshot_prior` is dropped from the
+  stages; `prior_model_name` resolves to null and nothing needs it, so the leg-2
+  prior-model resume gap does not exist under this source. The default keeps the
+  running prod_sep02 arms untouched.
+- **Local acceptance uses N = 7**, coprime with the 10-step metric cadence: at N = 10
+  every logged row was a rollout step and the 0.5/0.5 renormalisation was
+  unobservable.
+
 ### Acceptance — local (ELJ rig, ~45 min)
 
-On `configs/local_prod_sep02/lp02.yaml` shape, N = 10, 2000 steps:
+On `configs/local_prod_sep02/lp02.yaml` shape, N = 7 (`configs/local_rr_sep07`), 2000 steps:
 (a) `z_fill/gap` appears at steps 10, 20, … and nowhere else; (b) `lr_ctrl/scale`
 flat; (c) `anchor_buffer_length` constant; (d) replay occupancy ≈ B·τ/N;
 (e) `Bwd Frac` reads 0.5 on non-rollout steps and 0.475 on rollout steps;
@@ -141,7 +173,7 @@ arms at matched step count. Keep the 7-day p02 paper arms running untouched.
 
 ---
 
-## v1 — DEFERRED (each needs a new sensor or a controller; none is tonight)
+## v1 — STILL DEFERRED
 
 - **`birth_log_pf`** (one float per row, stored at admission from
   `fwd_stats['log_pf']`, currently dropped at train.py ~8071) →
