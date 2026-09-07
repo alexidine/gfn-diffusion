@@ -2382,7 +2382,8 @@ class Modeller:
         unaffected.
         """
         setting = getattr(self.args, 'compile_policy', False)
-        if setting == 'auto':
+        step_mode = (setting == 'step')
+        if setting in ('auto', 'step'):
             import platform
             enable = platform.system() == 'Linux' and torch.cuda.is_available()
         else:
@@ -2390,7 +2391,18 @@ class Modeller:
         if not enable:
             return
 
-        trunk = ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model')
+        # 'step' COMPILES THE FUSED PER-TIMESTEP KERNELS INSTEAD OF THE SUBMODULES.
+        # Submodule compilation fuses kernels inside each MLP but leaves the
+        # boundaries between them, and each boundary is a host-side region entry:
+        # seven per timestep, ~3,000 per training step, ~2.2 s of host time
+        # (measured, p07_mip_prof 2026-09-07). That is what a CPU-heavy neighbour
+        # inflates into a low-occupancy cancellation. GFN.compile_step_kernels
+        # fuses them; flow_model stays a module compile because nothing else shares
+        # its call site. See that method for why `_fwd_step` itself is NOT the unit
+        # (its `i: int` arg specialises into ~100 graphs and silently falls back).
+        # Measure with `python -m bench.compile_rollout`, and read the REGION COUNT.
+        trunk = (('flow_model',) if step_mode
+                 else ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model'))
         try:
             # NB "as _dynamo": a bare `import torch._dynamo` would bind `torch`
             # as a LOCAL for this whole function, making the module-level torch
@@ -2427,6 +2439,9 @@ class Modeller:
                     mod = getattr(model, name, None)
                     if isinstance(mod, torch.nn.Module):
                         mod.compile()  # default mode -- see docstring for why not reduce-overhead
+            if step_mode:
+                for model in (self.gfn_model, self.ema_model):
+                    model.compile_step_kernels()
         except Exception as e:
             print(f"compile_policy: torch.compile unavailable here ({e}); continuing eager")
             return

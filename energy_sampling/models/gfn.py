@@ -660,6 +660,69 @@ class GFN(nn.Module):  # todo add seeding
 
         return s_new
 
+    def compile_step_kernels(self):
+        """
+        Compile the two FUSED per-timestep kernels, instead of the five trunk
+        submodules they are built from. Called only under
+        `compile_policy: step` (train.py:maybe_compile_policy).
+
+        WHY THIS EXISTS. Compiling `t_model`, `s_model`, `forward_policy`,
+        `backward_policy` and `flow_model` separately fuses kernels INSIDE each
+        MLP but leaves the BOUNDARIES between them intact, and every boundary is
+        a host-side compiled-region entry. One `_fwd_step` touches seven of them
+        (three in `_forward_kernel`, three in `_pb_net`, one for flow), so at
+        T=100 across three branches a training step pays ~3,000 region entries
+        at ~0.73 ms of self CPU each -- ~2.2 s of pure host time. Measured on the
+        cluster 2026-09-07 (p07_mip_prof, torch.profiler: `CompiledFunction`
+        5,988 calls over 2 steps, self CPU 4.343 s), and it accounts for
+        essentially all of the 2.4 s/step of host-only time that
+        configs/prod_sep02/analysis/low_util_cancellation/ measured independently
+        from utilization x step_time. That host time is what a noisy neighbour
+        inflates, which is how healthy runs get cancelled for low occupancy.
+
+        WHY THESE TWO FUNCTIONS AND NOT `_fwd_step` ITSELF. Both take TENSORS
+        ONLY. `_fwd_step` takes `i: int`, which dynamo specialises on -- 100
+        distinct graphs against a `cache_size_limit` of 24, so it would blow the
+        limit and, with `suppress_errors` on, fall back to eager SILENTLY. That
+        failure is indistinguishable from "compile did not help" without the
+        profiler's region count, and it is the likely reason a step-level
+        compile has not stuck before. Compiling the whole step needs `i` hoisted
+        out of the signature first (pass `ts[:, i]` / `ts[:, i+1]` and a bool for
+        the `i > 0` branch); that is the next rung, not this one.
+
+        `_pb_net`'s `_pb_frozen` check is a Python attribute read, so it costs at
+        most two graphs and only changes at a freeze_pb stage action.
+
+        ⚠ DEEPCOPY. This installs compiled callables as INSTANCE attributes, so
+        the model must not be deepcopied afterwards. Safe as called: `ema_model`
+        is deepcopied inside init_gfn well before maybe_compile_policy runs at
+        the end of it, and checkpoints ride `state_dict`, which is untouched.
+        `freeze_backward_policy(source_state=...)` does copy -- so
+        `freeze_backward_policy` and `compile_policy: step` are refused together
+        rather than left to fail obscurely mid-run.
+        """
+        if getattr(self, '_pb_frozen', None) is not None:
+            raise ValueError(
+                "compile_policy: 'step' installs compiled callables as instance "
+                "attributes and freeze_backward_policy deepcopies the trunk; the "
+                "two are mutually exclusive. Use compile_policy: auto with a "
+                "frozen P_B.")
+        compiled = ['_forward_kernel']
+        self._forward_kernel = torch.compile(self._forward_kernel)
+        # `_pb_net` was extracted by the pb_freeze work; on revisions predating it
+        # the P_B path calls backward_policy/s_model/t_model inline and there is no
+        # single function to fuse. Degrade LOUDLY rather than quietly compiling half
+        # of this and reporting success -- a partial win that reads as a full one is
+        # how a null result gets misattributed to the mechanism.
+        if getattr(type(self), '_pb_net', None) is not None:
+            self._pb_net = torch.compile(self._pb_net)
+            compiled.append('_pb_net')
+        note = ('' if len(compiled) == 2 else
+                '  ⚠ NO _pb_net ON THIS REVISION: the P_B half of the step keeps its '
+                'three separate entries, so only 2 of 7 per-timestep region entries '
+                'are removed and at most half the host-time saving is available.')
+        print(f'compile_policy step: fused kernels compiled -> {compiled}{note}')
+
     def _forward_kernel(self, state, t, condition_embedding, t_next, dts):
         """
         Evaluate the forward policy at `state`/`t`: this is the one density

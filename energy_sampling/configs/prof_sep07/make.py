@@ -44,17 +44,36 @@ import copy, pathlib, yaml
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 
+# THE A/B. `_prof` arms are the CONTROL and inherit the battery's compile_policy
+# ('auto' = five trunk submodules compiled separately). `_step` arms are the
+# TREATMENT: compile_policy 'step' compiles the fused `_forward_kernel` and
+# `_pb_net` as units instead, collapsing seven compiled-region entries per
+# timestep to three. Same warm start, same trace step, everything else identical,
+# so the two tables are directly comparable.
+#
+# PRE-NAMED FALSIFIER, and it is the region COUNT, not the step time.
+#   control  : CompiledFunction ~5,988 calls / 2 steps (measured 2026-09-07)
+#   treatment: expect ~2,600 if it took (3 of the 7 entries survive)
+# If the count does NOT fall, the compile silently fell back to eager --
+# `suppress_errors` guarantees that failure is otherwise invisible, and it is the
+# most likely way this change does nothing while appearing live. Step time is the
+# OUTCOME (expect ~1 s/step off ELJ) but it cannot distinguish "compiled and did
+# not help" from "never compiled at all".
 ARMS = {
-    # name: (committed base, warm-src token, absolute trace start step)
-    'p07_mipu_prof': ('prod_sep02/p02_mipu_lr0p0625.yaml', 'pt100_mipu_lr4p0', 5400),
-    'p07_mip_prof':  ('prod_sep02/p02_mip_lr1.yaml',       'pt100_mip_lr4p0',  19300),
+    # name: (committed base, warm-src token, trace start step, compile_policy)
+    'p07_mipu_prof': ('prod_sep02/p02_mipu_lr0p0625.yaml', 'pt100_mipu_lr4p0', 5400,  None),
+    'p07_mip_prof':  ('prod_sep02/p02_mip_lr1.yaml',       'pt100_mip_lr4p0',  19300, None),
+    'p07_mipu_step': ('prod_sep02/p02_mipu_lr0p0625.yaml', 'pt100_mipu_lr4p0', 5400,  'step'),
+    'p07_mip_step':  ('prod_sep02/p02_mip_lr1.yaml',       'pt100_mip_lr4p0',  19300, 'step'),
 }
 
 
-def deltas(cfg, name, start_step):
+def deltas(cfg, name, start_step, compile_policy):
     cfg['run_name'] = name
     cfg['tag'] = 'prof07'
     cfg['epochs'] = 500000          # the wall ends the job; the trace closes itself
+    if compile_policy is not None:
+        cfg['compile_policy'] = compile_policy
     cfg['profiling'] = {
         'enabled': True, 'regions': None,
         'trace': {'enabled': True, 'start_step': int(start_step), 'active_steps': 2,
@@ -65,12 +84,12 @@ def deltas(cfg, name, start_step):
 
 
 def main():
-    rows = ['arm\twarm_src\tbase\ttrace_start']
-    for name, (base, src, start) in ARMS.items():
+    rows = ['arm\twarm_src\tbase\ttrace_start\tcompile_policy']
+    for name, (base, src, start, comp) in ARMS.items():
         cfg = yaml.safe_load((ROOT / base).read_text())
-        cfg = deltas(copy.deepcopy(cfg), name, start)
+        cfg = deltas(copy.deepcopy(cfg), name, start, comp)
         (HERE / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False))
-        rows.append(f'{name}\t{src}\t{base}\t{start}')
+        rows.append(f'{name}\t{src}\t{base}\t{start}\t' + str(cfg['compile_policy']))
     (HERE / 'INDEX.tsv').write_text('\n'.join(rows) + '\n')
     print('\n'.join(rows))
 
