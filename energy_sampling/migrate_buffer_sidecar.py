@@ -1,6 +1,10 @@
-"""Bring a buffer sidecar (`<run>_buffers.pt`) up to the current format version.
+"""Bring buffer sidecars (`<run>_buffers.pt`) up to the current format version.
 
-    python migrate_buffer_sidecar.py <run>_buffers.pt [--lj-coeff X] [--out PATH] [--dry-run]
+    python migrate_buffer_sidecar.py <run>_buffers.pt [more sidecars...] [--lj-coeff X] [--out PATH] [--dry-run]
+
+Pass every sidecar in ONE call: torch is imported once and each file is then a
+load + save. On the cluster overlay the import alone is most of a minute, so
+one process per file was the slow part, not the migration.
 
 WHY THIS EXISTS. On 2026-09-02 the eLJ calibration coefficient moved ONTO the
 data (`stamp_lj_coeff`, applied inside `compute_eLJ_energy`), so a stored `.elj`
@@ -22,17 +26,19 @@ buffer.migrate_legacy_lj_coeff:
                                    rows stamped
   rows unstamped, other routes  -> rows stamped 1.0, nothing rescaled
 Anchor `reward` / `energy` are composite totals the old consumer had already
-scaled and are never touched. Partially stamped or mixed rows are refused.
+scaled and are never touched. Partially stamped or mixed rows are refused, and
+a refusal stops the run at that file (nothing after it is touched).
 
 THE COEFFICIENT. On the elj route it is the prior dataset's
 `thermal_scaling_factor` (mipcas 0.3635836825, nehzor 0.1555787474); on
 uma/mace it is 1.0 by construction (train.py refuses anything else). Pass it
-with --lj-coeff, or omit it and it is read from the prior .pt named in the
+with --lj-coeff, or omit it and it is read from the prior .pt named in each
 sidecar's own problem_def -- the two are cross-checked when both are available.
 
 The original is kept beside the result as `<name>.pre_lj_migration.bak`
 (never picked up by Checkpointer.sidecar_candidates, so it cannot be restored
-by accident).
+by accident). A file whose .bak already exists is refused rather than
+re-migrated on top of it.
 """
 import argparse
 import os
@@ -120,20 +126,10 @@ def migrate_sidecar_state(state: dict, lj_coeff: float = None, energy_key: str =
     return out, report
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('sidecar', help='<run>_buffers.pt to migrate')
-    ap.add_argument('--lj-coeff', type=float, default=None,
-                    help='the run\'s calibrated coefficient; read from the sidecar\'s '
-                         'problem_def prior_path when omitted')
-    ap.add_argument('--energy-function', default=None,
-                    help='override the sidecar problem_def energy_function')
-    ap.add_argument('--out', default=None,
-                    help='write here instead of in place (no .bak is made then)')
-    ap.add_argument('--dry-run', action='store_true', help='report only, write nothing')
-    args = ap.parse_args(argv)
-
-    state = torch.load(args.sidecar, map_location='cpu', weights_only=False)
+def migrate_one(sidecar: str, args) -> bool:
+    """Migrate one sidecar file per `args`. Returns True if something was
+    written. Raises SystemExit with the reason on a refusal."""
+    state = torch.load(sidecar, map_location='cpu', weights_only=False)
     problem_def = state.get('problem_def') or {}
     energy_key = args.energy_function or problem_def.get('energy_function')
     derived = None
@@ -144,18 +140,18 @@ def main(argv=None):
     if args.lj_coeff is not None and derived is not None \
             and abs(args.lj_coeff - derived) > 1e-6 * max(abs(derived), 1.0):
         raise SystemExit(
-            f'--lj-coeff {args.lj_coeff!r} disagrees with the prior named in the sidecar '
-            f'({problem_def.get("prior_path")}: {derived!r}). One of them is the wrong '
+            f'{sidecar}: --lj-coeff {args.lj_coeff!r} disagrees with the prior named in the '
+            f'sidecar ({problem_def.get("prior_path")}: {derived!r}). One of them is the wrong '
             f'calibration for these rows; refusing.')
     coeff = args.lj_coeff if args.lj_coeff is not None else derived
 
     try:
         new_state, report = migrate_sidecar_state(state, coeff, energy_key)
     except (BufferCurrencyError, ValueError) as e:
-        raise SystemExit(f'REFUSED: {e}')
+        raise SystemExit(f'REFUSED {sidecar}: {e}')
 
-    print(f'{args.sidecar}: energy_function={energy_key} lj_coeff={new_state["lj_coeff"]!r} '
-          f'(saved at step {state.get("step_ind")})')
+    print(f'{sidecar}: energy_function={energy_key} lj_coeff={new_state["lj_coeff"]!r} '
+          f'(saved at step {state.get("step_ind")})', flush=True)
     for key in BUFFER_KEYS:
         r = report[key]
         line = f'  {key:14s} {r["action"]}'
@@ -166,27 +162,49 @@ def main(argv=None):
         if 'after' in r:
             a = r['after']
             line += f" | after: stamp {a['stamp']} elj_mean {a['elj_mean']} y_mean {a['y_mean']}"
-        print(line)
+        print(line, flush=True)
     changed = [k for k in BUFFER_KEYS if 'after' in report[k] or
                report[k]['action'].startswith('stamped')]
     if not changed:
-        print('nothing to do: every buffer already carries its currency')
-        return 0
+        print('  nothing to do: every buffer already carries its currency', flush=True)
+        return False
     if args.dry_run:
-        print('dry run: nothing written')
-        return 0
+        print('  dry run: nothing written', flush=True)
+        return False
     if args.out is None:
-        backup = args.sidecar + '.pre_lj_migration.bak'
+        backup = sidecar + '.pre_lj_migration.bak'
         if os.path.exists(backup):
             raise SystemExit(f'{backup} already exists -- this sidecar was migrated once; '
                              f'refusing to overwrite the only pre-migration copy')
-        shutil.copyfile(args.sidecar, backup)
-        print(f'original kept at {backup}')
-        target = args.sidecar
+        shutil.copyfile(sidecar, backup)
+        print(f'  original kept at {backup}', flush=True)
+        target = sidecar
     else:
         target = args.out
     atomic_save(new_state, target)
-    print(f'wrote {target}')
+    print(f'  wrote {target}', flush=True)
+    return True
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('sidecars', nargs='+', help='<run>_buffers.pt file(s) to migrate')
+    ap.add_argument('--lj-coeff', type=float, default=None,
+                    help='the run\'s calibrated coefficient; read from each sidecar\'s '
+                         'problem_def prior_path when omitted')
+    ap.add_argument('--energy-function', default=None,
+                    help='override the sidecar problem_def energy_function')
+    ap.add_argument('--out', default=None,
+                    help='write here instead of in place (single sidecar only; no .bak is made)')
+    ap.add_argument('--dry-run', action='store_true', help='report only, write nothing')
+    args = ap.parse_args(argv)
+    if args.out is not None and len(args.sidecars) != 1:
+        raise SystemExit('--out takes exactly one sidecar')
+    written = 0
+    for i, sidecar in enumerate(args.sidecars, 1):
+        print(f'[{i}/{len(args.sidecars)}]', end=' ', flush=True)
+        written += bool(migrate_one(sidecar, args))
+    print(f'{written} of {len(args.sidecars)} sidecar(s) rewritten', flush=True)
     return 0
 
 
