@@ -2921,6 +2921,11 @@ class Modeller:
                 self.grow_prior_buffer()
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
+            # Restored or seeded, every resident crystal row must be stamped with
+            # THIS run's lj_coeff before anything draws from it. Here and not in
+            # restore_buffers because the coefficient is calibrated in
+            # init_prior_dataset, which runs after the sidecar is read.
+            self.checkpointer.assert_buffer_currency('buffers seeded')
             # buffer_device: cuda puts prior/replay/anchor on the card. A big jump in
             # LIVE (not cached) here is the buffers, not a leak -- a different fix.
             self.vram_ledger('buffers seeded')
