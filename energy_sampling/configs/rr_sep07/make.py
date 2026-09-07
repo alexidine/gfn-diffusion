@@ -73,7 +73,7 @@ def deltas(cfg, name, every, fam):
             st['balance'] = {
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
                 'pinned': {'fwd': 0.0},
-                'metric': 'bwd/under_coverage_rise150', 'bar': 1.0,
+                'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
                 'up': 0.0017, 'down': 0.043,
                 'bounds': BOUNDS_MLIP if fam in MLIP else BOUNDS_ELJ,
             }

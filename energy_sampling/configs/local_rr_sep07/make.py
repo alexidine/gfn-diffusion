@@ -53,7 +53,7 @@ def build(name, every, store_all):
             st['balance'] = {
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
                 'pinned': {'fwd': 0.0},
-                'metric': 'bwd/under_coverage_rise150', 'bar': 1.0,
+                'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
                 'up': 0.0017,      # 0.50 -> 0.75 replay share over ~1500 steps
                 'down': 0.043,     # 0.75 -> 0.10 over ~150 steps when the guard fires
                 'bounds': BOUNDS,

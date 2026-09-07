@@ -28,7 +28,7 @@ SHIPPED = HERE.parent.parent / 'configs' / 'prod_sep02' / 'p02_mip_lr1.yaml'
 
 BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 BALANCE = {'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
-           'pinned': {'fwd': 0.0}, 'metric': 'bwd/under_coverage_rise150',
+           'pinned': {'fwd': 0.0}, 'metric': 'bwd/relative_under_rise150',
            'bar': 1.0, 'up': 0.0017, 'down': 0.043, 'bounds': BOUNDS}
 
 
@@ -128,7 +128,7 @@ def test_holds_still_while_the_sensor_is_unwritten():
 
 
 def test_ramps_up_by_up_when_the_guard_is_quiet():
-    p = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 0.2}))
+    p = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 0.2}))
     p._gated_ramp_tick(p.stage.balance)
     assert p.m.replay_frac == pytest.approx(0.5 + 0.0017)
     assert p.m.bwd_frac == pytest.approx(0.5 - 0.0017)
@@ -136,7 +136,7 @@ def test_ramps_up_by_up_when_the_guard_is_quiet():
 
 
 def test_drops_by_down_and_reports_fired_when_the_guard_trips():
-    p = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 2.5}))
+    p = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 2.5}))
     p._gated_ramp_tick(p.stage.balance)
     assert p.m.replay_frac == pytest.approx(0.5 - 0.043)
     assert p.m.bwd_frac == pytest.approx(0.5 + 0.043)
@@ -145,17 +145,17 @@ def test_drops_by_down_and_reports_fired_when_the_guard_trips():
 
 def test_bar_is_a_strict_threshold():
     """Exactly AT the bar is 'not rising': the deadband is the bar itself."""
-    p = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 1.0}))
+    p = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 1.0}))
     p._gated_ramp_tick(p.stage.balance)
     assert p.ctrl['gr_fired'] == 0.0 and p.m.replay_frac > 0.5
 
 
 def test_rails_hold_at_both_ends():
-    up = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 0.0}), share=0.749)
+    up = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 0.0}), share=0.749)
     up._gated_ramp_tick(up.stage.balance)
     assert up.m.replay_frac == pytest.approx(0.75), 'replay cap 0.75 (== 1 - bwd floor 0.25)'
     assert up.m.bwd_frac == pytest.approx(0.25)
-    down = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 9.0}), share=0.12)
+    down = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 9.0}), share=0.12)
     down._gated_ramp_tick(down.stage.balance)
     assert down.m.replay_frac == pytest.approx(0.10), 'replay floor 0.1 (== 1 - bwd cap 0.9)'
     assert down.m.bwd_frac == pytest.approx(0.90)
@@ -169,7 +169,7 @@ def test_pinned_mode_is_reasserted_every_tick():
 
 
 def test_the_split_pair_is_conserved():
-    p = _proto(_stage(), _Tracker(**{'bwd/under_coverage_rise150': 3.0}))
+    p = _proto(_stage(), _Tracker(**{'bwd/relative_under_rise150': 3.0}))
     for _ in range(25):
         p._gated_ramp_tick(p.stage.balance)
     assert p.m.replay_frac + p.m.bwd_frac == pytest.approx(1.0)

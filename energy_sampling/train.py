@@ -4236,18 +4236,26 @@ class Modeller:
     _UC_WINDOW_STEPS = 150
 
     def _forgetting_sensor(self, stats):
-        """Write stats['under_coverage_rise150'] once 300 STEPS of bwd/under_coverage
+        """Write stats['relative_under_rise150'] once 300 STEPS of bwd/relative_under
         history exist: mean over the last 150 steps minus mean over the 150 before.
+
+        THE SENSOR MUST BE LEVEL-BLIND. `under_coverage` is the negative-tail RMS
+        of the Z-anchored residual log_pf + log_Z - log_r - log_pb, so a fill that
+        lowers log_Z by 4 nat raises it by ~4 -- under rarer rollouts, where the
+        fill snaps Z by several nat early in a stage, that read as "forgetting",
+        cut the replay weight to its rail, and starved replay for ~1000 steps.
+        `relative_under` is the same statistic centred on the batch's own mean
+        log w, so Z motion drops out and only the within-batch spread the policy
+        can actually fix remains.
 
         Windows are in STEPS, not samples. This method runs on _update_rolling's
         cadence -- every 10th trained bwd step -- so a sample-counted window would
-        be 10x longer than the calibration (done on 10-step wandb rows) and would
-        not fill inside a 2000-step run; rr07_rr_n7 held gr_share at 0.5 for its
-        whole length that way. Timestamping each sample with step_ind makes the
-        sensor indifferent to the call cadence, and 'full' means the oldest kept
-        sample is within one stride of 300 steps old.
+        be 10x longer than intended and would not fill inside a short run.
+        Timestamping each sample with step_ind makes the sensor indifferent to
+        the call cadence, and 'full' means the oldest kept sample is within one
+        stride of 300 steps old.
         """
-        uc = stats.get('under_coverage')
+        uc = stats.get('relative_under')
         if uc is None:
             return
         uc = float(uc)
@@ -4263,7 +4271,7 @@ class Modeller:
         stride = min((b - a for (a, _), (b, _) in zip(hist, hist[1:])), default=None)
         full = stride is not None and older and recent and hist[0][0] <= now - 2 * w + stride
         if full:
-            stats['under_coverage_rise150'] = float(np.mean(recent) - np.mean(older))
+            stats['relative_under_rise150'] = float(np.mean(recent) - np.mean(older))
 
     def _submodel_grad_norms(self):
         """

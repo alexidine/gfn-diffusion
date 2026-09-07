@@ -1015,7 +1015,7 @@ class Stage:
             # The `ramp` mode's share drifts UP by `up` per tick while the guard
             # sensor sits at or below `bar`, and moves DOWN by `down` per tick
             # while it exceeds it. The deadband is the SENSOR's, not a knob
-            # here: with bwd/under_coverage_rise150 and bar 1.0 the gate read 0%
+            # here: with bwd/relative_under_rise150 and bar 1.0 the gate read 0%
             # false positives on four healthy arms and alarmed 120-190 steps
             # into an injected deterioration. `bounds` are hard rails, so a bwd
             # floor is a guarantee rather than an equilibrium. No second metric,
@@ -2236,7 +2236,7 @@ class StageProtocol:
     def _gated_ramp_tick(self, bal):
         """One sensor, two motions, in SHARE space.
 
-            v = sensor (a rise, e.g. bwd/under_coverage_rise150)
+            v = sensor (a rise, e.g. bwd/relative_under_rise150)
             v >  bar : share_ramp -= down        # forgetting -> hand weight to the guard, fast
             v <= bar : share_ramp += up          # otherwise -> drift toward the cap, slow
             clip share_ramp to the bounds; share_guard = 1 - share_ramp
