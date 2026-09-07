@@ -230,7 +230,8 @@ class Stage:
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
-                               'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every'}
+                               'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
+                               'fwd_rollout_drift_max'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -250,10 +251,6 @@ class Stage:
             raise ValueError(f"stage '{self.name}': unknown flags {sorted(bad)} "
                              f"(known: {STAGE_FLAGS})")
 
-        self.loss_coeffs = {m: dict(v) for m, v in (spec.get('loss_coeffs') or {}).items()}
-        bad = set(self.loss_coeffs) - set(MODES)
-        if bad:
-            raise ValueError(f"stage '{self.name}': loss_coeffs for unknown modes {sorted(bad)}")
         # RARER ROLLOUTS (docs/design/rarer_rollouts.md): run the forward branch
         # -- the only branch that calls the energy function in a training step
         # -- on 1 in `fwd_rollout_every` steps. 0 = every step, today's shape.
@@ -274,6 +271,27 @@ class Stage:
                 f"between rollouts, so it would run on every skipped step. Set "
                 f"flags.z_calibration false; log Z is pinned by z_level_fill instead.")
 
+        # OFF-CADENCE ROLLOUT TRIGGER: run an extra forward rollout when
+        # replay/policy_drift_std -- how far the policy has moved off the rows
+        # it stored, in nats -- exceeds this. 0/absent = off, which is what
+        # ships: no run has reported a drift number, so no bar can be honestly
+        # chosen yet. Meaningless without a cadence, since off-cadence is the
+        # only kind of step it can add.
+        self.fwd_rollout_drift_max = float(spec.get('fwd_rollout_drift_max', 0.0) or 0.0)
+        if self.fwd_rollout_drift_max < 0:
+            raise ValueError(f"stage '{self.name}': fwd_rollout_drift_max must be >= 0, "
+                             f"got {self.fwd_rollout_drift_max}")
+        if self.fwd_rollout_drift_max > 0 and self.fwd_rollout_every == 0:
+            raise ValueError(
+                f"stage '{self.name}': fwd_rollout_drift_max="
+                f"{self.fwd_rollout_drift_max} with fwd_rollout_every=0. The "
+                f"trigger only adds rollouts to steps a cadence skipped; without "
+                f"one the forward branch already runs every step.")
+
+        self.loss_coeffs = {m: dict(v) for m, v in (spec.get('loss_coeffs') or {}).items()}
+        bad = set(self.loss_coeffs) - set(MODES)
+        if bad:
+            raise ValueError(f"stage '{self.name}': loss_coeffs for unknown modes {sorted(bad)}")
 
         self.fracs = dict(spec.get('fracs') or {})
         if self.fracs:

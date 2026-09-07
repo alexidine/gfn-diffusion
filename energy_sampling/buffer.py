@@ -85,6 +85,15 @@ class BufferCurrencyError(RuntimeError):
     currency it is in, so the only honest failure is a loud one."""
 
 
+class BufferColumnError(RuntimeError):
+    """A stored buffer missing a per-row column this build requires.
+
+    Distinct from BufferCurrencyError: the stored energies are fine, the
+    per-row bookkeeping is incomplete. Raised on RESTORE only, and only for a
+    store carrying trajectories -- see CrystalBuffer.from_state_dict for why a
+    missing column is refused rather than filled."""
+
+
 def _is_crystal_batch(batch) -> bool:
     """Crystal rows are the ones a lattice-energy coefficient governs.
 
@@ -253,6 +262,8 @@ class CrystalBuffer:
             init_loss: Optional[torch.Tensor] = None,
             exclude_keys: Optional[tuple] = None,
             birth_step: int = 0,
+            birth_log_pf: Optional[torch.Tensor] = None,
+            is_val: Optional[torch.Tensor] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -287,6 +298,20 @@ class CrystalBuffer:
         # update_losses; birth_loss never does -- the pair gives death-vs-birth
         # residual deltas at eviction (replay TTL-cohort telemetry).
         self.birth_loss = self.ema_loss.clone()
+        # admission-time log p_F of this row's stored trajectory under the
+        # policy that GENERATED it. NaN means no policy scored it: a prior /
+        # anchor / dataset store, or a row admitted off an eval batch (the EMA
+        # model on the eval grid is not the training policy). It is comparable
+        # to a later get_traj_replay score only while models/gfn.py's _fwd_step
+        # and _replay_step compute logpf identically -- the guard for that is
+        # tests/crystal/test_periodic_scoring.py::test_fwd_replay_roundtrip --
+        # and while the row's condition is unchanged between admission and draw.
+        self.birth_log_pf = self._seed_column(birth_log_pf, n, float('nan'), torch.float32)
+        # held out: never returned by a training draw (_sample_indices) and
+        # never counted by absorption_stats, whose two means feed the live
+        # buffer servo and would otherwise be pulled toward the intake by rows
+        # that are undrawable BY CONSTRUCTION.
+        self.is_val = self._seed_column(is_val, n, False, torch.bool)
 
         # per-sample rolling estimates of the log importance weight
         # logw = log_r + log_pb - log_pf under the current policy.
@@ -299,6 +324,22 @@ class CrystalBuffer:
                 f"traj has {traj.shape[0]} entries, expected {n} to match dataset size"
             traj = traj.detach().to(device).contiguous()
         self.traj = traj
+
+    @staticmethod
+    def _seed_column(value, n, default, dtype):
+        """One per-row side array: `default` everywhere, or a supplied scalar/[n].
+
+        Same shape contract as the init_loss seed above; shared by __init__ and
+        add so a column cannot be seeded one way at construction and another at
+        admission."""
+        if value is None:
+            return torch.full((n,), default, dtype=dtype)
+        col = torch.as_tensor(value, dtype=dtype).detach().cpu().flatten()
+        if col.numel() == 1:
+            col = col.expand(n).clone()
+        assert col.shape[0] == n, \
+            f"per-row column has {col.shape[0]} entries, expected {n}"
+        return col
 
     # ---------------------------------------------------------------------
     # Persistence
@@ -330,6 +371,8 @@ class CrystalBuffer:
             'select_counts': self.select_counts.cpu(),
             'birth_step': self.birth_step.cpu(),
             'birth_loss': self.birth_loss.cpu(),
+            'birth_log_pf': self.birth_log_pf.cpu(),
+            'is_val': self.is_val.cpu(),
             'ema_logw': self.ema_logw.cpu(),
             'ema_logw_sq': self.ema_logw_sq.cpu(),
             'ema_log_z_emp': self.ema_log_z_emp.cpu(),
@@ -338,6 +381,22 @@ class CrystalBuffer:
 
     @classmethod
     def from_state_dict(cls, state, device):
+        # PER-ROW COLUMNS ARE REQUIRED, NOT DEFAULTED, on any store carrying
+        # trajectories -- i.e. every replay sidecar. Checked FIRST, before the
+        # batch is moved onto `device`, so the refusal costs no transfer.
+        # Filling a per-row field silently is the 2026-09-02 lj_coeff lesson:
+        # the obvious default is the dangerous one and the failure has to
+        # surface at RESTORE, not at the first draw. Traj-free stores (prior,
+        # anchor, datasets) never had a generating policy or a held-out split,
+        # so the defaults below are the true values there, not a fallback.
+        if state.get('traj', None) is not None:
+            missing = [k for k in ('birth_log_pf', 'is_val') if k not in state]
+            if missing:
+                raise BufferColumnError(
+                    f"{cls.__name__}: this stored buffer carries trajectories but no "
+                    f"{missing} column(s). It was written by a build that predates them "
+                    f"and is refused rather than filled -- start from a checkpoint "
+                    f"written by this build.")
         obj = cls.__new__(cls)
         obj.device = device
         obj.max_z_prime = state['max_z_prime']
@@ -364,6 +423,10 @@ class CrystalBuffer:
             'birth_step', torch.zeros_like(obj.select_counts)).cpu()
         obj.birth_loss = state.get(
             'birth_loss', torch.full_like(obj.ema_loss, float('nan'))).cpu()
+        obj.birth_log_pf = state.get(
+            'birth_log_pf', torch.full_like(obj.ema_loss, float('nan'))).cpu().float()
+        obj.is_val = state.get(
+            'is_val', torch.zeros_like(obj.ema_loss, dtype=torch.bool)).cpu().bool()
         obj.ema_logw = state['ema_logw'].cpu()
         obj.ema_logw_sq = state['ema_logw_sq'].cpu()
         obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
@@ -575,21 +638,26 @@ class CrystalBuffer:
         rows = np.flatnonzero(np.isin(cid, tgt))
         return rows if rows.size else None
 
-    def _draw_aligned(self, n, k, target_rows):
+    def _draw_aligned(self, pool, n_pool, k, target_rows):
         """`k` rows, preferring the requested conditions, topping up from the rest.
 
         ORDER, DON'T FILTER: a request the buffer cannot fill degrades to the old
         broad draw rather than under-filling the batch, matching
         _sample_condition_blocked_indices' contract.
+
+        `pool` is the universe the top-up draws from -- the row count when every
+        row is drawable, or the explicit index array of trainable rows once any
+        row is held out (`is_val`), with `n_pool` its size.
         """
         if k <= 0:
             return np.empty(0, dtype=np.int64)
         if target_rows is None:
-            return np.random.choice(n, size=k, replace=k > n)
+            return np.random.choice(pool, size=k, replace=k > n_pool)
         take = min(k, target_rows.size)
         out = np.random.choice(target_rows, size=take, replace=take > target_rows.size)
         if take < k:
-            out = np.concatenate([out, np.random.choice(n, size=k - take, replace=k - take > n)])
+            out = np.concatenate(
+                [out, np.random.choice(pool, size=k - take, replace=k - take > n_pool)])
         return out.astype(np.int64)
 
     def _sample_indices(
@@ -618,6 +686,34 @@ class CrystalBuffer:
         if batch_size <= 0:
             return np.empty(0, dtype=np.int64)
 
+        # HELD-OUT ROWS ARE NEVER DRAWN, ON ANY PATH. Read off self.is_val here
+        # rather than threaded down from the caller because EVERY draw path in
+        # this method has to honour it, and a caller that forgot would put the
+        # held-out set back into training with no error and no symptom. The
+        # measure `p` is excluded on its own side (prioritised_weights'
+        # `exclude`), which is what keeps the IS weights consistent with the
+        # measure actually drawn from; the assert below is the seam between the
+        # two mechanisms.
+        pool, n_pool = n, n
+        if bool(self.is_val.any()):
+            pool = np.flatnonzero(~self.is_val.numpy())
+            n_pool = int(pool.size)
+            if n_pool == 0:
+                raise ValueError(
+                    "every resident row is held out (is_val); there is nothing "
+                    "left to draw for training.")
+            if condition_block_m >= 2:
+                raise ValueError(
+                    "condition_block_m >= 2 is mutually exclusive with a held-out "
+                    "split: the blocked draw selects whole CONDITIONS and returns "
+                    "before any row mask is consulted, so held-out rows would enter "
+                    "training silently. Set buffers.replay_buffer.val_frac 0 or "
+                    "condition_block_m 0.")
+            if p is not None:
+                assert float(np.asarray(p)[self.is_val.numpy()].sum()) == 0.0, \
+                    "supplied `p` puts weight on held-out rows -- prioritised_weights " \
+                    "was called without exclude=is_val"
+
         # ALIGNMENT IS CONDITION SELECTION, AND IT APPLIES ON EVERY PATH.
         # It used to live only inside _sample_condition_blocked_indices, which
         # made it contingent on condition_block_m >= 2: a stage that asked for
@@ -627,6 +723,10 @@ class CrystalBuffer:
         #     WHICH/HOW MANY ROWS in each -> condition_block_m, p, beta
         # -- so they compose instead of one silently cancelling the other.
         target_rows = self._target_row_pool(target_cids)
+        if n_pool != n and target_rows is not None:
+            target_rows = np.intersect1d(target_rows, pool)
+            if target_rows.size == 0:
+                target_rows = None
 
         if condition_block_m >= 2:
             # the blocked path expresses alignment as an ORDERING over whole
@@ -650,10 +750,10 @@ class CrystalBuffer:
             # train.py exists to prevent. The uniform slice carries no such
             # correction, so it can be aligned freely.
             weighted_inds = np.random.choice(n, size=n_weighted, replace=True, p=p)
-            uniform_inds = self._draw_aligned(n, n_uniform, target_rows)
+            uniform_inds = self._draw_aligned(pool, n_pool, n_uniform, target_rows)
             inds = np.concatenate([weighted_inds, uniform_inds])
         elif p is None and target_rows is not None:
-            inds = self._draw_aligned(n, batch_size, target_rows)
+            inds = self._draw_aligned(pool, n_pool, batch_size, target_rows)
         else:
             if replace is None:
                 # A supplied `p` is a DESIGN MEASURE, and importance-sampling
@@ -663,8 +763,14 @@ class CrystalBuffer:
                 # delta_plus <= 0 row, and once the eligible pool falls below
                 # batch_size numpy raises "Fewer non-zero entries in p than
                 # size". That killed the kappa=0 arm at step 119 on 2026-08-07.
-                replace = True if p is not None else batch_size > n
-            inds = np.random.choice(n, size=batch_size, replace=replace, p=p)
+                replace = True if p is not None else batch_size > n_pool
+            # `p` is a measure over ALL n rows (already zero on held-out ones),
+            # so it must be drawn against n; the unweighted draw takes the
+            # trainable pool directly, which is what keeps it WITHOUT
+            # replacement whenever the pool is bigger than the batch.
+            inds = (np.random.choice(n, size=batch_size, replace=replace, p=p)
+                    if p is not None
+                    else np.random.choice(pool, size=batch_size, replace=replace))
 
         if repeats > 1:
             inds = np.repeat(inds, repeats)
@@ -788,6 +894,27 @@ class CrystalBuffer:
             traj = None
 
         return graphs, inds, traj
+
+    @torch.no_grad()
+    def sample_val_graphs(self, k, exclude_keys=("symmetry_operators", "smiles", "identifier")):
+        """Up to `k` HELD-OUT rows, uniformly without replacement, with their
+        stored trajectories. Returns (None, None, empty) when nothing is held out.
+
+        Deliberately NOT routed through sample_graphs/loader: those bump
+        select_counts, and a draw count on a row that is never trained on would
+        make it look drawn to every consumer of that counter (prioritised_weights'
+        NaN policy, the hazard-cohort deltas, replay_buffer_live_delta_*).
+        """
+        rows = np.flatnonzero(self.is_val.numpy())
+        if rows.size == 0 or k <= 0:
+            return None, None, np.empty(0, dtype=np.int64)
+        take = int(min(int(k), rows.size))
+        inds = np.random.choice(rows, size=take, replace=False)
+        graphs = self._drop_keys(self.batch.subsample_new_batch(inds), exclude_keys)
+        traj = None
+        if self.traj is not None:
+            traj = self.traj[torch.as_tensor(inds, device=self.device, dtype=torch.long)]
+        return graphs, traj, inds
 
     def loader(
             self,
@@ -952,7 +1079,8 @@ class CrystalBuffer:
 
     @torch.no_grad()
     def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None,
-            birth_step: int = 0):
+            birth_step: int = 0, birth_log_pf: Optional[torch.Tensor] = None,
+            is_val: Optional[torch.Tensor] = None):
         """
         Append new graphs.
 
@@ -964,6 +1092,11 @@ class CrystalBuffer:
 
         init_loss, if given, seeds ema_loss for the k new entries instead of
         leaving them NaN. Accepts a scalar or a [k] tensor.
+
+        birth_log_pf / is_val seed the two per-row columns for the k new
+        entries; both default to "unknown"/"trainable" (NaN / False), which is
+        the true value for every admission path that has no generating policy
+        and no held-out split.
         """
         if isinstance(data, list) and len(data) == 0:
             return
@@ -1028,6 +1161,11 @@ class CrystalBuffer:
         new_birth_step_full = torch.cat(
             [self.birth_step, torch.full((k,), int(birth_step), dtype=torch.long)], dim=0)
         new_birth_loss_full = torch.cat([self.birth_loss, new_ema_loss.clone()], dim=0)
+        new_birth_log_pf_full = torch.cat(
+            [self.birth_log_pf,
+             self._seed_column(birth_log_pf, k, float('nan'), torch.float32)], dim=0)
+        new_is_val_full = torch.cat(
+            [self.is_val, self._seed_column(is_val, k, False, torch.bool)], dim=0)
 
         new_nan = torch.full((k,), float("nan"), dtype=torch.float32)
         new_ema_logw_full = torch.cat([self.ema_logw, new_nan], dim=0)
@@ -1044,6 +1182,8 @@ class CrystalBuffer:
         self.select_counts = new_select_counts_full
         self.birth_step = new_birth_step_full
         self.birth_loss = new_birth_loss_full
+        self.birth_log_pf = new_birth_log_pf_full
+        self.is_val = new_is_val_full
         self.ema_logw = new_ema_logw_full
         self.ema_logw_sq = new_ema_logw_sq_full
         self.ema_log_z_emp = new_ema_log_z_emp_full
@@ -1095,6 +1235,8 @@ class CrystalBuffer:
         new_select_counts = self.select_counts[keep_cpu]
         new_birth_step = self.birth_step[keep_cpu]
         new_birth_loss = self.birth_loss[keep_cpu]
+        new_birth_log_pf = self.birth_log_pf[keep_cpu]
+        new_is_val = self.is_val[keep_cpu]
         new_ema_logw = self.ema_logw[keep_cpu]
         new_ema_logw_sq = self.ema_logw_sq[keep_cpu]
         new_ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
@@ -1109,6 +1251,8 @@ class CrystalBuffer:
         self.select_counts = new_select_counts
         self.birth_step = new_birth_step
         self.birth_loss = new_birth_loss
+        self.birth_log_pf = new_birth_log_pf
+        self.is_val = new_is_val
         self.ema_logw = new_ema_logw
         self.ema_logw_sq = new_ema_logw_sq
         self.ema_log_z_emp = new_ema_log_z_emp
@@ -1276,10 +1420,15 @@ class CrystalBuffer:
         touches drawn rows) and so contribute ratio 1. That is correct: a row
         nothing has trained on cannot have been memorised, and a buffer churning
         fast enough that most rows are never drawn genuinely is not memorising.
+        That defence does NOT extend to rows that are undrawable BY
+        CONSTRUCTION: a held-out row (is_val) has ema_loss == birth_loss
+        forever, so it contributes ratio 1.0 permanently and would pull both
+        means -- the live buffer servo's numerator and denominator -- toward
+        the intake by the held-out fraction. Held-out rows are masked out here.
         """
         e = self.ema_loss.double()
         b = self.birth_loss.double()
-        m = torch.isfinite(e) & torch.isfinite(b) & (b > 0)
+        m = torch.isfinite(e) & torch.isfinite(b) & (b > 0) & ~self.is_val
         n = int(m.sum())
         if n < 8:
             return {}
@@ -1303,6 +1452,7 @@ class CrystalBuffer:
             nan_quantile: float = 0.90,
             floor_frac: float = 0.25,
             symmetric: bool = False,
+            exclude: Optional[torch.Tensor] = None,
     ):
         """
         Prioritised-IS sampling distribution over rows (docs/to_do_rebuild.md
@@ -1382,16 +1532,32 @@ class CrystalBuffer:
         stays bounded. It does NOT rescue rows already at delta_plus == 0 --
         those are excluded outright (see ABSORBING STARVATION above), and the
         floor never applies to them.
+
+        `exclude` (a [n] bool mask, e.g. the held-out `is_val` rows) is ANDed
+        into the eligible set BEFORE n_elig, so the median, the floor and the
+        IS weights are all computed against the population that can actually be
+        drawn. It also has to reach the three degenerate fallbacks below --
+        each of them returns a uniform measure, and a uniform measure over ALL
+        rows is exactly how a held-out set leaks back into training.
         """
         n = len(self)
         if n == 0:
             return np.ones(0, dtype=np.float64), np.ones(0, dtype=np.float64)
 
+        excl = None if exclude is None else np.asarray(
+            torch.as_tensor(exclude).detach().cpu().bool().numpy())
+
+        def _uniform_over_drawable():
+            keep = np.ones(n, dtype=np.float64) if excl is None else (~excl).astype(np.float64)
+            s = keep.sum()
+            if s <= 0:
+                raise ValueError("prioritised_weights: every row is excluded from the draw")
+            return keep / s, np.ones(n, dtype=np.float64)
+
         logw = self.ema_logw.clone().float()
         valid = ~torch.isnan(logw)
         if not bool(valid.any()):
-            p = np.ones(n, dtype=np.float64) / n
-            return p, np.ones(n, dtype=np.float64)
+            return _uniform_over_drawable()
 
         delta = float(log_z) - logw
         # score IS delta_plus in the default (one-sided) mode; `symmetric`
@@ -1414,10 +1580,11 @@ class CrystalBuffer:
         # probability ~0 carries weight ~inf and single-handedly owns a
         # self-normalised batch.
         elig = score > 0
+        if excl is not None:
+            elig &= ~torch.as_tensor(excl)
         n_elig = int(elig.sum())
         if n_elig == 0:
-            p = np.ones(n, dtype=np.float64) / n
-            return p, np.ones(n, dtype=np.float64)
+            return _uniform_over_drawable()
 
         # RELATIVE FLOOR on the surviving positive values, so the weight's
         # dynamic range is bounded by (median/floor)^kappa rather than by the
@@ -1433,8 +1600,7 @@ class CrystalBuffer:
         raw[~elig] = 0.0
         s = float(raw.sum())
         if not np.isfinite(s) or s <= 0.0:
-            p = np.ones(n, dtype=np.float64) / n
-            return p, np.ones(n, dtype=np.float64)
+            return _uniform_over_drawable()
         p = (raw / s).cpu().numpy()
 
         # Importance weight per ROW: uniform target over the ELIGIBLE rows,

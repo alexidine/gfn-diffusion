@@ -1186,8 +1186,29 @@ def fwd_rollout_cadence_is_well_formed(cfg: dict) -> list[Violation]:
     off; 0 disables it, and an unpinned Z under rare rollouts is the failure mode
     the design exists to avoid (docs/design/rarer_rollouts.md, invariants 1-2).
     Stage.__init__ refuses the first case at load; this rule is the audit-path
-    twin and adds the second."""
+    twin and adds the second.
+
+    It also covers `fwd_rollout_drift_max`, the off-cadence rollout trigger:
+    it must be >= 0, and it only has meaning on a stage that skips forward
+    rollouts in the first place."""
     out = []
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        bar = _num(st.get('fwd_rollout_drift_max'))
+        if bar is None:
+            continue
+        if bar < 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
+                                 f"{bar}; it is a drift in nats and must be >= 0 "
+                                 f"(0 = the trigger is off)."))
+        elif bar > 0 and (_num(st.get('fwd_rollout_every')) or 0) <= 0:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
+                                 f"{bar} without fwd_rollout_every > 0. The trigger only "
+                                 f"adds rollouts to steps a cadence skipped, so it is "
+                                 f"dead config here."))
     cadenced = [st for st in active_stages(cfg)
                 if isinstance(st, dict) and (_num(st.get('fwd_rollout_every')) or 0) > 0]
     for st in cadenced:

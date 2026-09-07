@@ -107,3 +107,47 @@ def test_invariant_is_silent_on_a_well_formed_cadence():
     st['flags']['z_calibration'] = False
     cfg['z_calibration']['fill_threshold'] = 0.5
     assert _violations(cfg) == []
+
+
+# -------------------------------------------- fwd_rollout_drift_max (item A)
+
+def test_stage_accepts_the_drift_key_and_defaults_to_off():
+    st, i = _equilibration(_cfg())
+    assert Stage(copy.deepcopy(st), i).fwd_rollout_drift_max == 0.0
+    st = copy.deepcopy(st)
+    st['fwd_rollout_every'] = 10
+    st['flags']['z_calibration'] = False
+    st['fwd_rollout_drift_max'] = 2.5
+    assert Stage(st, i).fwd_rollout_drift_max == 2.5
+
+
+@pytest.mark.parametrize('bar', [-1.0, 3.0])
+def test_stage_refuses_a_negative_bar_or_a_bar_without_a_cadence(bar):
+    """A bar with no cadence is dead config: the trigger only adds rollouts to
+    steps a cadence skipped."""
+    st, i = _equilibration(_cfg())
+    st = copy.deepcopy(st)
+    st['flags']['z_calibration'] = False
+    if bar < 0:
+        st['fwd_rollout_every'] = 10
+    st['fwd_rollout_drift_max'] = bar
+    with pytest.raises(ValueError, match='fwd_rollout_drift_max'):
+        Stage(st, i)
+
+
+def test_invariant_fires_on_a_drift_bar_without_a_cadence():
+    cfg = _cfg()
+    st, _ = _equilibration(cfg)
+    st['fwd_rollout_drift_max'] = 2.5
+    v = _violations(cfg)
+    assert v and any('fwd_rollout_drift_max' in x.detail for x in v)
+
+
+def test_invariant_is_silent_on_an_armed_trigger_under_a_cadence():
+    cfg = _cfg()
+    st, _ = _equilibration(cfg)
+    st['fwd_rollout_every'] = 10
+    st['flags']['z_calibration'] = False
+    st['fwd_rollout_drift_max'] = 2.5
+    cfg['z_calibration']['fill_threshold'] = 0.5
+    assert _violations(cfg) == []

@@ -505,6 +505,7 @@ buffers:
       kappa: 1.0
       floor_frac: 0.25
       symmetric: true
+    val_frac: 0.1
   anchor_buffer:
     frozen: true
     online_loss_flow: false

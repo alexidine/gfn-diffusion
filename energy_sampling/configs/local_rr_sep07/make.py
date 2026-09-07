@@ -62,11 +62,29 @@ def build(name, every, store_all):
     assert n_fused >= 1, f'{name}: no fused stage to cadence'
     cfg['buffers']['prior_buffer']['source'] = 'anchors'
 
+    rb = cfg['buffers']['replay_buffer']
+    # OUTSIDE the store_all guard: rr_n1 is the control, and it can only be
+    # compared on the gap if it carries the split too. 10% of every admission
+    # is held out of the training draw so replay/val_gap is measured rather
+    # than inferred. Measurement only -- nothing actuates on it.
+    rb['val_frac'] = 0.1
     if store_all:
-        rb = cfg['buffers']['replay_buffer']
         rb['churn_rate'] = int(cfg['batch_size'])
         rb['mean_residence_steps'] = 5 * int(every)
     return cfg
+
+
+def check(cfg, name, every, store_all):
+    st = [s for p in cfg['protocols'].values() for s in p['stages']
+          if s.get('train_mode') == 'fused']
+    assert st and all(s['fwd_rollout_every'] == every for s in st), name
+    assert all(s['flags'].get('z_calibration') is False for s in st), name + ': servo on'
+    assert not any('fwd_rollout_drift_max' in s for s in st), name + ': drift trigger armed'
+    rb = cfg['buffers']['replay_buffer']
+    assert rb['val_frac'] == 0.1, name + ': val split'
+    if store_all:
+        assert rb['churn_rate'] == cfg['batch_size'], name
+        assert rb['mean_residence_steps'] == 5 * every, name
 
 
 def main():
@@ -77,10 +95,13 @@ def main():
     # log Z drifted over the N steps since the last one, and replay/resid_vs_intake
     # measures memorisation at reuse = N, so gap(N) and memo(N) on this system are a
     # real-data estimate of a reasonable N: where |gap| approaches the fill's se.
-    arms = {'rr_n1': build('rr_n1', 1, store_all=False),
-            'rr_n7': build('rr_n7', 7, store_all=True),
-            'rr_n20': build('rr_n20', 20, store_all=True),
-            'rr_n50': build('rr_n50', 50, store_all=True)}
+    spec = {'rr_n1': (1, False), 'rr_n7': (7, True),
+            'rr_n20': (20, True), 'rr_n50': (50, True)}
+    arms = {}
+    for name, (every, store_all) in spec.items():
+        cfg = build(name, every, store_all)
+        check(cfg, name, every, store_all)
+        arms[name] = cfg
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
@@ -88,7 +109,8 @@ def main():
         rb = cfg['buffers']['replay_buffer']
         print(f"{name:<8} every={st['fwd_rollout_every']} z_cal={st['flags']['z_calibration']} "
               f"fill_thr={cfg['z_calibration']['fill_threshold']} churn={rb['churn_rate']} "
-              f"tau={rb['mean_residence_steps']} batch={cfg['batch_size']}")
+              f"tau={rb['mean_residence_steps']} batch={cfg['batch_size']} "
+              f"val_frac={rb['val_frac']}")
 
 
 if __name__ == '__main__':

@@ -83,6 +83,10 @@ def deltas(cfg, name, every, fam):
     rb = cfg['buffers']['replay_buffer']
     rb['churn_rate'] = int(cfg['batch_size'])
     rb['mean_residence_steps'] = 5 * int(every)
+    # hold 10% of every admission out of the training draw so the buffer's
+    # generalisation gap (replay/val_gap) is measured rather than inferred.
+    # Measurement only -- nothing actuates on it.
+    rb['val_frac'] = 0.1
     return cfg
 
 
@@ -101,6 +105,8 @@ def check(cfg, name, every):
                    for p in cfg['protocols'].values() for s in p['stages']), name + ': snapshot_prior left'
     rb = cfg['buffers']['replay_buffer']
     assert rb['churn_rate'] == cfg['batch_size'] and rb['mean_residence_steps'] == 5 * every, name
+    assert rb['val_frac'] == 0.1, name + ': val split'
+    assert not any('fwd_rollout_drift_max' in s for s in st), name + ': drift trigger armed'
     assert cfg['checkpoint_name'] == p02make.PLACEHOLDER, name
     assert cfg['prior_model_name'] == p02make.PRIOR_PLACEHOLDER, name
     p02make._scan_local_paths(cfg, name)
