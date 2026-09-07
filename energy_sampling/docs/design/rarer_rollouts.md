@@ -253,10 +253,25 @@ on ELJ. On MLIP systems the rollout is a larger fraction, so gains continue to l
 |---|---|---|---|---|---|---|
 | 7 | 1.73 | 1.55 | 1.10 | 0.985 (0.966) | 39.9 | 4.95 |
 | 20 | 2.16 | 1.73 | 1.23 | 0.899 (0.860) | 44.9 | 3.65 |
-| 50 | *(running)* | | | | | |
-| 1 | *(queued — the noise-floor yardstick; also the live test of 34dba58)* | | | | | |
+| 50 | 1.60 | 2.16 | 0.76 | 0.911 (0.732) | 42.1 | **20.24** |
+| 1 | *(running — the noise-floor yardstick)* | | | | | |
 
-Reading so far: Z drift over 20 steps is barely above the batch noise floor (cadence
-has headroom on this system at this stage); memorisation is the first thing to move
-(0.985 → 0.899 at reuse 20, bar 0.368 still far); the 5-nat under-coverage difference
-is one eval on one seed and needs N=50 and N=1 to interpret.
+**Reading.** Z drift is never the binding constraint here: gap/se ≤ 1.2 at every N up
+to 50 — the fill's own batch noise dominates what the policy does to Z between
+rollouts. What binds is **on-policy quality per training step**: fwd scatter 52.0 /
+54.4 / 58.1 and mean sample energy 4.95 / 3.65 / 20.2 at N = 7 / 20 / 50 at step 2000,
+with N = 50's scatter *rising* over the run (56.4 → 58.5) while N = 7's falls (56.6 →
+52.0). N = 20 is indistinguishable from N = 7 at matched step; N = 50 is not viable on
+this system — 40 rollouts in 2000 steps, each stored row reused 50×. Since the ELJ
+speedup is already 2.7× at N = 20 (asymptote 2.96×), there is no reason to go past
+~20 on ELJ; the MLIP arms are where N = 20's larger gain matters, and the cluster
+battery's {5, 20} brackets the useful range. Caveats: one seed, batch 400, 2000 steps
+from a phase-1 exit (early training, where the policy moves fastest).
+
+**The controller worked live, in rr_n50** (the only sweep arm that loaded 34dba58):
+`bwd/under_coverage_rise150` written from step 300; bwd under-coverage rose 45.2 → 48.0
+as replay-heavy training at reuse 50 forgot the prior; the sensor crossed +1 nat (1.12 @
+510, 2.57 @ 720); replay share cut 0.50 → 0.36 → 0.10 (the rail); under-coverage fell to
+41.7, the sensor went to −3.8, and the ramp resumed (0.26 by step 1760). Memorisation
+dipped to 0.77 at the replay-heavy peak and recovered to 0.95–0.99 after the cut. rr_n20
+ran the pre-fix code (sensor never written, share held 0.5); rr_n1 is the second live run.
