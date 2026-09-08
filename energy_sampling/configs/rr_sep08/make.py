@@ -244,8 +244,8 @@ ARMS = (
     # a 12h wall may not reach -- that arm would report a transient as a level.
     #
     #   n20_det   tau/N= 3   O =  3B  (already in the battery, task 9 -- CONTROL)
-    #   tau12     tau/N=12   O = 12B  ->  48000 rows at the grown batch
-    #   tau24     tau/N=24   O = 24B  ->  96000 rows at the grown batch
+    #   occ12     tau/N=12   O = 12B  ->  48000 rows at the grown batch
+    #   occ24     tau/N=24   O = 24B  ->  96000 rows at the grown batch
     #
     # All three N=20, tb=1.0, deterministic, so the DOSE is identical and only
     # occupancy and age differ. PREDICTION: lambda_tau and val_gap_nats are FLAT
@@ -257,8 +257,14 @@ ARMS = (
     # Second-order channels that do NOT cancel and are the reason to look:
     # draw diversity (B drawn from O), priority staleness (redraw spacing O/B),
     # and displacement eviction breaking birth_loss as an intake baseline.
-    ('tau12',       'mip',  N_SHIP,  {'tau_over_n': 12, 'val_gap_max': 0.0}),
-    ('tau24',       'mip',  N_SHIP,  {'tau_over_n': 24, 'val_gap_max': 0.0}),
+    #
+    # NAMED occ*, NOT tau* -- `tau12` was a DIFFERENT arm in this same battery
+    # this morning (N_LOOSE, tau/N 12, task 8, since retired). The sbatch resumes
+    # from `*${ARM}_*_running.pt`, so a name collision across two arms is a
+    # silent cross-resume waiting to happen. occ names what actually varies here:
+    # O = B * tau/N, i.e. the occupancy, not the staleness the old block chased.
+    ('occ12',       'mip',  N_SHIP,  {'tau_over_n': 12, 'val_gap_max': 0.0}),
+    ('occ24',       'mip',  N_SHIP,  {'tau_over_n': 24, 'val_gap_max': 0.0}),
 )
 
 

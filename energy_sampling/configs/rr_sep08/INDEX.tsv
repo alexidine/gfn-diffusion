@@ -17,5 +17,5 @@ nehu_b1600	pt100_nehu_lr4p0	200	3	1600	-
 acr_b1000	pt100_acr_lr4p0	200	3	1000	-
 pbf_mip	pt100_mip_lr4p0	200	3	1000	freeze_pb=True
 pbf_mipu	pt100_mipu_lr4p0	200	3	1600	freeze_pb=True
-tau12	pt100_mip_lr4p0	20	12	1000	tau_over_n=12,val_gap_max=0.0
-tau24	pt100_mip_lr4p0	20	24	1000	tau_over_n=24,val_gap_max=0.0
+occ12	pt100_mip_lr4p0	20	12	1000	tau_over_n=12,val_gap_max=0.0
+occ24	pt100_mip_lr4p0	20	24	1000	tau_over_n=24,val_gap_max=0.0
