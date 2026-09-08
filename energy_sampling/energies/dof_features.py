@@ -181,6 +181,53 @@ def state_features(en, prior=None):
     return out
 
 
+def free_dof_atom_index(en):
+    """``(atoms [k, R, MAX_FRAME], mask [k, R])`` -- which atoms each STATE COLUMN moves.
+
+    The learned counterpart to :func:`state_features`. That function averages handcrafted
+    per-row features over a column's driven rows; this returns the ATOM INDICES instead, so a
+    correlator can learn the same reduction over per-atom encoder embeddings --
+    ``f_j = F_tau(g_i1, ..., g_in)`` from conformer_conditional_stack.md section 5.
+
+    THE COLUMN ORDER IS ``_M``'s, WHICH IS THE STATE'S. It must be, or coordinate j's features
+    describe coordinate k's atoms -- silent, since every shape still matches. The ordering is
+    taken from the same ``en._M`` / ``en._driven_idx`` pair `state_features` reads, rather
+    than re-deriving it, so the two cannot drift apart.
+
+    A column at ``level='torsion'`` is COLLECTIVE: rotating one bond shifts every dihedral
+    about it. So a column owns SEVERAL rows, ``R`` is the widest such set in this molecule,
+    and short columns are zero-padded with ``mask`` false. Atom indices are in SPEC (tree)
+    numbering, which is the numbering `models.encoder_cache` stores embeddings in.
+    """
+    spec = en.spec
+    tables = {'r': np.asarray(spec.bond_index), 'theta': np.asarray(spec.angle_index),
+              'phi': np.asarray(spec.torsion_index)}
+    m = en._M.detach().cpu().numpy()
+    driven = en._driven_idx.detach().cpu().numpy()
+    per_col = [driven[np.flatnonzero(m[:, j])] for j in range(m.shape[1])]
+    R = max((len(c) for c in per_col), default=1) or 1
+
+    atoms = np.zeros((m.shape[1], R, MAX_FRAME), dtype=np.int64)
+    mask = np.zeros((m.shape[1], R), dtype=bool)
+    for j, rows in enumerate(per_col):
+        for s_, row in enumerate(rows):
+            row = int(row)
+            if row < en.n_r:
+                kind, local = 'r', row
+            elif row < en.n_r + en.n_th:
+                kind, local = 'theta', row - en.n_r
+            else:
+                kind, local = 'phi', row - en.n_r - en.n_th
+            frame = [int(a) for a in tables[kind][local]]
+            # r spans 2 atoms and theta 3, so short frames REPEAT their last atom rather
+            # than padding with index 0 -- index 0 is a real atom, and a correlator cannot
+            # tell a padded slot from a genuine reference to it.
+            frame = frame + [frame[-1]] * (MAX_FRAME - len(frame))
+            atoms[j, s_] = frame[:MAX_FRAME]
+            mask[j, s_] = True
+    return atoms, mask
+
+
 def state_feature_names() -> list:
     return feature_names() + ['n_driven_rows']
 

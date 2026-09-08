@@ -148,3 +148,114 @@ def set_policy_for(energy, t_dim: int, prior=None, **kw) -> SetPolicy:
     """
     from energies.dof_features import state_features
     return SetPolicy(state_features(energy, prior), energy.periodic_dims, t_dim, **kw)
+
+
+# ------------------------------------------------------------------ conditional route
+
+class DoFCorrelator(nn.Module):
+    """``f_j = F_tau(g_i1, ..., g_in)`` -- learned per-coordinate identity from atom embeddings.
+
+    conformer_conditional_stack.md section 5 defines `f_j` as n-body correlators over per-atom
+    GNN embeddings, one per DoF class. This is that, at the first rung of the capacity ladder:
+    an MLP over the concatenated embeddings of the MAX_FRAME atoms a driven row spans, reduced
+    over the rows a state column owns.
+
+    WHY A REDUCTION IS NEEDED AT ALL. At ``level='torsion'`` a state column is COLLECTIVE --
+    rotating one bond shifts every dihedral about it -- so a column owns several rows and there
+    is no single frame to describe it. `state_features` handles the handcrafted case by
+    AVERAGING the rows and carrying a count; this uses the augmented softmax the rest of the
+    stack uses, whose unnormalised half carries that count implicitly while the softmax half
+    can pick out the row that matters.
+
+    THIS REPLACES THE HANDCRAFTED `f_j`, which survives as a control (owner decision,
+    2026-08-19). The two are interchangeable inputs to `SetPolicy` by construction.
+    """
+
+    def __init__(self, enc_dim: int, out_dim: int, frame_size: int = 4,
+                 hidden: int = 64, layers: int = 2, dropout: Optional[float] = 0,
+                 norm: Optional[str] = None):
+        super().__init__()
+        self.enc_dim, self.frame_size, self.out_dim = int(enc_dim), int(frame_size), int(out_dim)
+        self.frame = scalarMLP(layers=layers, input_dim=self.frame_size * self.enc_dim,
+                               filters=hidden, output_dim=hidden, dropout=dropout, norm=norm)
+        self.score = nn.Linear(hidden, 1)
+        self.proj = scalarMLP(layers=layers, input_dim=2 * hidden, filters=hidden,
+                              output_dim=self.out_dim, dropout=dropout, norm=norm)
+
+    def forward(self, atom_emb: torch.Tensor, atoms: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        """``atom_emb [N, E]``, ``atoms [M, R, frame]`` (GLOBAL atom rows), ``mask [M, R]``
+        -> ``[M, out_dim]``."""
+        if atoms.shape[-1] != self.frame_size:
+            raise ValueError(f'atoms frame is {atoms.shape[-1]}, expected {self.frame_size}')
+        z = self.frame(atom_emb[atoms].flatten(-2))                     # [M, R, H]
+        m = mask.unsqueeze(-1).to(z.dtype)
+        # MASK BEFORE THE SOFTMAX, not after. A padded row left in the logits takes softmax
+        # weight from the real ones, which is a silent dilution that grows with how ragged
+        # the molecule is -- exactly the molecules the conditional route exists for.
+        logits = self.score(z).masked_fill(~mask.unsqueeze(-1), float('-inf'))
+        a = torch.softmax(logits, dim=1)
+        a = torch.nan_to_num(a, nan=0.0)                                # a fully padded row
+        return self.proj(torch.cat([(a * z).sum(1), (z * m).sum(1)], dim=-1))
+
+
+class ConditionalSetPolicy(SetPolicy):
+    """`SetPolicy` whose per-coordinate identity and global context come from the MOLECULE.
+
+    Two differences, and both are what make it conditional rather than merely set-structured:
+
+    * ``f_j`` IS NO LONGER A BUFFER. The parent bakes `static_features` at construction, which
+      pins the module to one molecule -- fine for the unconditional route, useless across a
+      molecule set. Here `f_j` is computed per sample by :class:`DoFCorrelator` from the
+      batch's per-atom embeddings. Without this, molecule A's coordinate 0 and molecule B's
+      coordinate 0 present IDENTICALLY to the head.
+    * THE POOLED MOLECULAR EMBEDDING JOINS THE CONTEXT, beside `t_emb`. `rho` then sees its
+      own token, both set-pooled channels, time, and what molecule this is.
+
+    `static_features` is still accepted and still used -- the handcrafted features are
+    concatenated onto the learned ones rather than replaced, so the control is available by
+    zeroing the correlator rather than by rebuilding the model.
+    """
+
+    def __init__(self, static_features, angular_mask: Sequence[bool], t_dim: int,
+                 enc_dim: int, mol_dim: int, corr_dim: int = 32,
+                 frame_size: int = 4, **kw):
+        super().__init__(static_features, angular_mask, t_dim, **kw)
+        self.enc_dim, self.mol_dim, self.corr_dim = int(enc_dim), int(mol_dim), int(corr_dim)
+        self.correlator = DoFCorrelator(enc_dim, corr_dim, frame_size=frame_size,
+                                        hidden=kw.get('hidden_dim', 64),
+                                        dropout=kw.get('dropout', 0), norm=kw.get('norm'))
+        # phi and rho both widen: phi by the learned per-coordinate features, rho by the
+        # molecule embedding. Rebuilt rather than patched so their declared input widths stay
+        # the truth about what they read.
+        h_dim = kw.get('hidden_dim', 64)
+        layers = kw.get('layers', 4)
+        self.phi = scalarMLP(layers=layers, input_dim=self.n_static + 4 + self.corr_dim,
+                             filters=h_dim, output_dim=h_dim,
+                             dropout=kw.get('dropout', 0), norm=kw.get('norm'))
+        self.rho = scalarMLP(layers=layers, input_dim=3 * h_dim + t_dim + self.mol_dim,
+                             filters=h_dim, output_dim=self.out_per_token,
+                             dropout=kw.get('dropout', 0), norm=kw.get('norm'))
+        if kw.get('zero_init'):
+            self.rho.output_layer.weight.data.fill_(0.0)
+
+    def forward(self, state: torch.Tensor, t_emb: torch.Tensor,
+                atom_emb: torch.Tensor = None, dof_atoms: torch.Tensor = None,
+                dof_mask: torch.Tensor = None, mol_emb: torch.Tensor = None) -> torch.Tensor:
+        if atom_emb is None or dof_atoms is None or mol_emb is None:
+            raise ValueError(
+                'ConditionalSetPolicy needs atom_emb / dof_atoms / dof_mask / mol_emb. They '
+                'ride on the batch, baked by build_conformer_conditions.py --encoder-ckpt; a '
+                'run reaching here without them was configured for the conditional route on '
+                'an unconditional conditions file.')
+        if state.shape[-1] != self.dim:
+            raise ValueError(f'state has {state.shape[-1]} coordinates, expected {self.dim}')
+        b = state.shape[0]
+        f = self.correlator(atom_emb, dof_atoms.reshape(-1, *dof_atoms.shape[-2:]),
+                            dof_mask.reshape(-1, dof_mask.shape[-1])).reshape(b, self.dim, -1)
+        h = self.phi(torch.cat([self.tokens(state), f], dim=-1))         # [B, dim, H]
+        logits = self.score(h)
+        a = torch.softmax(logits, dim=1)
+        pooled = torch.cat([(a * h).sum(dim=1), h.sum(dim=1)], dim=-1)   # [B, 2H]
+        ctx = torch.cat([pooled, t_emb, mol_emb], dim=-1).unsqueeze(1).expand(-1, self.dim, -1)
+        return self._to_blocks(self.rho(torch.cat([h, ctx], dim=-1)))
