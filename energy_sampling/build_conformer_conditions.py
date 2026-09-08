@@ -85,6 +85,11 @@ def main():
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--no-check", action="store_true",
                     help="skip the graph-vs-energy geometry check (don't)")
+    ap.add_argument("--level", default="torsion",
+                    choices=("torsion", "dihedral", "flex", "full"),
+                    help="which internal DoF the state drives. `full` is every one of them; "
+                         "the narrower tiers freeze the rest at the reference conformer, which "
+                         "is a DIFFERENT distribution, not a coarser view of the same one")
     ap.add_argument("--k", type=int, default=None,
                     help="keep only molecules with this state dimension. Default: take k from "
                          "the first molecule that builds. A conditions file is ONE k, and k is "
@@ -134,7 +139,7 @@ def main():
         # condition/prior file format stores per-graph `torsion_state` and n_torsions,
         # both of which mean something else at a wider level.
         try:
-            energy = ConformerTorsions(smiles=smiles, device="cpu", level="torsion", **ff)
+            energy = ConformerTorsions(smiles=smiles, device="cpu", level=args.level, **ff)
         except Exception as exc:                              # noqa: BLE001 - reported below
             skipped.append((smiles, f"{type(exc).__name__}: {exc}"))
             continue
@@ -160,9 +165,23 @@ def main():
         # invariant tests/conformer/test_conformer_levels.py asserts, so it is an upstream
         # defect in the chart, not a property a dataset should absorb. Refusing here keeps
         # the file coherent and names the molecules instead of writing quiet nonsense.
-        if int(energy.mask.shape[1]) != int(energy._M.shape[1]):
+        # ONLY AT `torsion`, and the restriction is the point. `mask` counts ROTATABLE BONDS
+        # and `_M` counts SURVIVING STATE COLUMNS; those are the same quantity only at the
+        # torsion tier. Above it they differ by construction -- butanol is mask 2 against _M
+        # 39 at `full` -- so applying this comparison at every tier rejected every molecule.
+        # That was a torsion-tier check generalised without re-deriving it.
+        if args.level == 'torsion' and int(energy.mask.shape[1]) != int(energy._M.shape[1]):
             skipped.append((smiles, f"chart defect: mask has {int(energy.mask.shape[1])} "
                                     f"columns, _M has {int(energy._M.shape[1])} (alkyne?)"))
+            continue
+        # A CONSTRAINED CHART MUST NOT ENTER A FILE LABELLED `full`. A globally nonlinear
+        # molecule has 3N-6 internal degrees of freedom whether or not one of its centres is
+        # locally linear, so a shortfall at `full` means this chart froze coordinates -- a
+        # different distribution, and one that would be reported under the wrong name.
+        if args.level == 'full' and int(getattr(energy, 'constrained_rows', 0)):
+            skipped.append((smiles, f"CONSTRAINED at full: d={energy.data_ndim} against "
+                                    f"3N-6={3 * energy.spec.n_atoms - 6}, "
+                                    f"{energy.constrained_rows} row(s) held at a linear centre"))
             continue
         k_here = int(energy.data_ndim)
         if want_k is None:
