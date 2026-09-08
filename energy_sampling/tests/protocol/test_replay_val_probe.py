@@ -11,6 +11,7 @@ The size rule is the other half: the probe is clipped to the live batch_size as
 well as to val_cap, and it refuses to publish at all below val_min, where the
 mean is noise that would poison the EMA it is read on.
 """
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -110,3 +111,63 @@ def test_nothing_is_published_while_the_pool_is_below_val_min():
     """Not even a skip: 'the pool has not filled' is a different statement from
     'the measurement failed', and replay_buffer_val_rows already says it."""
     assert _m(n_val=10)._replay_val_stats(discretizer=None, train_loss=0.0) == {}
+
+
+# ---------------------------------------------------------------------------
+# The nats spelling (val_gap_nats): median |resid|, val minus train.
+# ---------------------------------------------------------------------------
+
+def test_weighted_median_matches_the_plain_one_with_flat_weights():
+    x = torch.tensor([5.0, 1.0, 3.0, 2.0, 4.0])
+    assert Modeller._weighted_median(x) == pytest.approx(3.0)
+    assert Modeller._weighted_median(x, torch.ones(5)) == pytest.approx(3.0)
+
+
+def test_weighted_median_undoes_a_skewed_draw():
+    """The training draw is prioritised toward high |resid|; the IS weights that
+    make the MEAN unbiased for the uniform buffer must move the MEDIAN too, or
+    the two sides of the gap are quantiles of different populations."""
+    x = torch.tensor([1.0, 2.0, 3.0, 90.0, 95.0])       # the tail is over-drawn
+    w = torch.tensor([8.0, 8.0, 8.0, 1.0, 1.0])          # ... and down-weighted
+    assert Modeller._weighted_median(x) == pytest.approx(3.0)
+    assert Modeller._weighted_median(x, w) == pytest.approx(2.0)
+
+
+def test_weighted_median_falls_back_rather_than_dividing_by_zero():
+    x = torch.tensor([1.0, 2.0, 3.0])
+    assert Modeller._weighted_median(x, torch.zeros(3)) == pytest.approx(2.0)
+    assert math.isnan(Modeller._weighted_median(torch.empty(0)))
+
+
+def test_weighted_median_tiles_weights_over_repeats():
+    """One weight per ROW, K residuals per row -- the same tiling the loss
+    reduction does. A mis-pairing here would silently weight the wrong rows."""
+    x = torch.tensor([1.0, 1.0, 9.0, 9.0])               # 2 rows x 2 repeats
+    w = torch.tensor([10.0, 1.0])                        # row 0 dominates
+    assert Modeller._weighted_median(x, w) == pytest.approx(1.0)
+
+
+def test_one_clash_row_moves_the_mean_gap_but_not_the_nats_gap():
+    """The reason the nats spelling exists. A single |resid|=200 row is worth
+    more than the whole measured gap in loss units, and nothing in a median."""
+    clean = torch.tensor([40.0] * 200)
+    dirty = torch.cat([torch.tensor([40.0] * 199), torch.tensor([200.0])])
+    beta = 80.0
+
+    def huber_mean(r):
+        a = r.abs()
+        return float(torch.where(a < beta, 0.5 * r ** 2, beta * (a - 0.5 * beta)).mean())
+
+    assert huber_mean(dirty) - huber_mean(clean) > 40      # bigger than the real gap (45)
+    med = Modeller._weighted_median
+    assert med(dirty) - med(clean) == pytest.approx(0.0)   # the median does not notice
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs an accelerator')
+def test_weighted_median_accepts_weights_from_another_device():
+    """_replay_is_w is built host-side by the buffer's draw while `resid` lives on
+    the accelerator. The CPU-only tests above cannot see that mismatch; it took
+    down rr07_rr_n7_rat on its first live measurement at step 10."""
+    x = torch.tensor([1.0, 2.0, 3.0, 90.0, 95.0], device='cuda')
+    w = torch.tensor([8.0, 8.0, 8.0, 1.0, 1.0])          # CPU, deliberately
+    assert Modeller._weighted_median(x, w) == pytest.approx(2.0)

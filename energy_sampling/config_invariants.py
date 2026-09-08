@@ -1188,27 +1188,39 @@ def fwd_rollout_cadence_is_well_formed(cfg: dict) -> list[Violation]:
     Stage.__init__ refuses the first case at load; this rule is the audit-path
     twin and adds the second.
 
-    It also covers `fwd_rollout_drift_max`, the off-cadence rollout trigger:
-    it must be >= 0, and it only has meaning on a stage that skips forward
-    rollouts in the first place."""
+    It also covers `fwd_rollout_triggers`, the off-cadence rollout bars: every
+    bar must be a known name and >= 0, and they only have meaning on a stage that
+    skips forward rollouts in the first place. `fwd_rollout_drift_max` is the
+    retired spelling of `drift_std_max` and is refused, not ignored -- a dead
+    trigger key reads as an armed trigger."""
+    known = {'drift_std_max', 'ess_min', 'val_gap_max',
+             'occupancy_min_batches'}
     out = []
     for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
-        bar = _num(st.get('fwd_rollout_drift_max'))
-        if bar is None:
+        if 'fwd_rollout_drift_max' in st:
+            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max; it "
+                                 f"moved into fwd_rollout_triggers as 'drift_std_max'."))
+        trig = st.get('fwd_rollout_triggers')
+        if not isinstance(trig, dict) or not trig:
             continue
-        if bar < 0:
+        for k, v in trig.items():
+            n = _num(v)
+            if k not in known:
+                out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                     f"stage {st.get('name')!r}: fwd_rollout_triggers.{k} is "
+                                     f"not a known bar; known are {sorted(known)}."))
+            elif n is None or n < 0:
+                out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
+                                     f"stage {st.get('name')!r}: fwd_rollout_triggers.{k}={v!r} "
+                                     f"must be a number >= 0 (0 = that bar is off)."))
+        if any((_num(v) or 0) > 0 for v in trig.values())                 and (_num(st.get('fwd_rollout_every')) or 0) <= 0:
             out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
-                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
-                                 f"{bar}; it is a drift in nats and must be >= 0 "
-                                 f"(0 = the trigger is off)."))
-        elif bar > 0 and (_num(st.get('fwd_rollout_every')) or 0) <= 0:
-            out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
-                                 f"stage {st.get('name')!r} sets fwd_rollout_drift_max="
-                                 f"{bar} without fwd_rollout_every > 0. The trigger only "
-                                 f"adds rollouts to steps a cadence skipped, so it is "
-                                 f"dead config here."))
+                                 f"stage {st.get('name')!r} sets fwd_rollout_triggers without "
+                                 f"fwd_rollout_every > 0. The triggers only add rollouts to "
+                                 f"steps a cadence skipped, so they are dead config here."))
     cadenced = [st for st in active_stages(cfg)
                 if isinstance(st, dict) and (_num(st.get('fwd_rollout_every')) or 0) > 0]
     for st in cadenced:

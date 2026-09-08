@@ -1293,9 +1293,18 @@ class Modeller:
         # report -- a window rate, drained on read, and ABSENT while the
         # trigger is off (which is how it ships). Raw rather than tracked: an
         # EMA of a count is not a count.
-        if getattr(self, '_drift_trigger_count', 0):
-            metrics['rollout/drift_trigger_fires'] = float(self._drift_trigger_count)
-            self._drift_trigger_count = 0
+        # one series per trigger REASON, not one total: 'the cadence was cut
+        # short' and 'why' are different questions, and a single counter answers
+        # neither ("was that Z going stale, or the buffer draining?")
+        counts = getattr(self, '_rollout_trigger_counts', None)
+        if counts:
+            for key, n in counts.items():
+                metrics[f'rollout/trigger_{key}'] = float(n)
+            metrics['rollout/trigger_fires'] = float(sum(counts.values()))
+            self._rollout_trigger_counts = {}
+        last = getattr(self, '_last_rollout_step', None)
+        if last is not None:
+            metrics['rollout/steps_since'] = float(self.step_ind - last)
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
         # that the buffer is being fitted at its own trajectories.
@@ -2292,6 +2301,63 @@ class Modeller:
             **vars(self.args.model),
         )
 
+    def set_pb_freeze(self, mode, source_state=None):
+        """
+        Switch P_B's freeze. Runtime-only (not in gfn_config, so checkpoints
+        and problem hashes are unaffected); the snapshot itself IS persisted
+        by the checkpointer ('pb_frozen') so a resumed leg keeps the same P_B.
+        `learn_pb: false` is the construction-time cousin (identity bridge, no
+        network); this keeps the learned correction and stops moving it.
+
+          None / False   trainable: lift any snapshot, head requires_grad on.
+          'head'         requires_grad off on backward_policy only -- the cheap
+                         "zero that param group" freeze. NOT a freeze of P_B:
+                         the head reads the shared s_model/t_model trunk, which
+                         P_F keeps training, and P_B's loss terms keep pushing
+                         that trunk. Measured worst of the three
+                         (configs/local_pb_freeze); kept for comparison runs.
+          'full' / True  P_B evaluated on a snapshot of t_model+s_model+
+                         backward_policy, ONE object shared by the train and
+                         EMA models. P_B carries no gradient at all;
+                         gradnorm/backward_policy reads exactly 0.
+
+        source_state: the snapshot a checkpoint carried (full mode only).
+        Without it, 'full' snapshots the live weights -- unless a snapshot is
+        already installed, which is kept: re-snapshotting on a resumed leg
+        would put phase-1's head on a phase-2 trunk.
+        """
+        mode = {True: 'full', False: None}.get(mode, mode)
+        if mode not in (None, 'head', 'full'):
+            raise ValueError(f"freeze_backward_policy must be false, 'head' or 'full'/true, got {mode!r}")
+        models = (self.gfn_model, self.ema_model)
+        if mode is None:
+            for model in models:
+                model.unfreeze_backward_policy()
+            for p in self.gfn_model.backward_policy.parameters():
+                p.requires_grad_(True)
+            print("freeze_backward_policy: lifted -- P_B trainable")
+            return
+        for p in self.gfn_model.backward_policy.parameters():
+            p.requires_grad_(False)
+        if mode == 'head':
+            for model in models:
+                model.unfreeze_backward_policy()
+            n = sum(p.numel() for p in self.gfn_model.backward_policy.parameters())
+            print(f"freeze_backward_policy=head: {n} backward_policy parameters held fixed "
+                  f"(trunk still trains -- P_B is NOT fixed)")
+            return
+        if source_state is None and self.gfn_model.pb_frozen:
+            print("freeze_backward_policy=full: snapshot already installed (restored from the "
+                  "checkpoint) -- kept, not re-taken from the drifted live trunk")
+            frozen = self.gfn_model._pb_frozen
+        else:
+            frozen = self.gfn_model.freeze_backward_policy(source_state=source_state)
+            src = 'checkpoint' if source_state is not None else 'live weights'
+            n = sum(p.numel() for p in frozen.parameters())
+            print(f"freeze_backward_policy=full: P_B evaluated on a {n}-parameter snapshot "
+                  f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
+        self.ema_model.install_pb_snapshot(frozen)
+
     def init_gfn(self):
         reload = False
 
@@ -2325,6 +2391,16 @@ class Modeller:
         # hashing unaffected)
         for model in (self.gfn_model, self.ema_model):
             model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
+
+        # freeze_backward_policy (config key): freeze from step 0 of THIS
+        # process. The stage action freeze_pb / unfreeze_pb (protocol.py) is
+        # the way to switch it at a stage boundary. A checkpoint that carried
+        # a snapshot has already restored it by now (checkpointer -> set_pb_freeze
+        # with source_state), and set_pb_freeze never re-snapshots over one.
+        mode = getattr(self.args, 'freeze_backward_policy', False)
+        mode = {True: 'full', False: None}.get(mode, mode)
+        if mode is not None:
+            self.set_pb_freeze(mode)
 
         # A kNN reference is a set of coordinates in one particular latent geometry.
         # Change the space group, flip periodic_centroids, or move to another Z' and
@@ -2382,7 +2458,8 @@ class Modeller:
         unaffected.
         """
         setting = getattr(self.args, 'compile_policy', False)
-        if setting == 'auto':
+        step_mode = (setting == 'step')
+        if setting in ('auto', 'step'):
             import platform
             enable = platform.system() == 'Linux' and torch.cuda.is_available()
         else:
@@ -2390,7 +2467,21 @@ class Modeller:
         if not enable:
             return
 
-        trunk = ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model')
+        # 'step' COMPILES THE WHOLE PER-TIMESTEP BODY INSTEAD OF THE SUBMODULES.
+        # Measured 2026-09-07 (bench/compile_rollout.py, A100, both routes): the
+        # submodule compile removes almost no kernel launches (116,510 -> 110,098
+        # per rollout) and is SLOWER than eager (0.96x ELJ, 0.87x UMA). The MLPs are
+        # a few big GEMMs; the launches are in the elementwise SDE math around them
+        # -- ~388 kernels per step execution -- which no compiled region ever
+        # contained. compile_step_kernels compiles `_fwd_step`/`_replay_step` whole
+        # so that math is inside one graph. Nothing is listed in `trunk` for this
+        # mode on purpose: every submodule is called from inside those bodies, and
+        # nesting a compiled module inside a compiled region is not a behaviour to
+        # assume while measuring something else.
+        # Measure with `python -m bench.compile_rollout`, and read the LAUNCH COUNT:
+        # suppress_errors makes a failed compile fall back to eager silently.
+        trunk = (() if step_mode
+                 else ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model'))
         try:
             # NB "as _dynamo": a bare `import torch._dynamo` would bind `torch`
             # as a LOCAL for this whole function, making the module-level torch
@@ -2427,10 +2518,17 @@ class Modeller:
                     mod = getattr(model, name, None)
                     if isinstance(mod, torch.nn.Module):
                         mod.compile()  # default mode -- see docstring for why not reduce-overhead
+            if step_mode:
+                for model in (self.gfn_model, self.ema_model):
+                    model.compile_step_kernels()
         except Exception as e:
             print(f"compile_policy: torch.compile unavailable here ({e}); continuing eager")
             return
-        print(f"compile_policy: trunk {trunk} compiled (default mode, lazy on first forward)")
+        print(f"compile_policy: trunk {trunk} compiled (default mode, lazy on first forward)"
+              + ("; fused _forward_kernel + _pb_net compiled as units (step mode) -- "
+                 "verify it TOOK by the profiler's CompiledFunction count per step, "
+                 "not by step time alone: suppress_errors makes a failed compile fall "
+                 "back to eager silently" if step_mode else ""))
 
     def init_schedulers_optimizers(self):
         """
@@ -3732,42 +3830,124 @@ class Modeller:
         that set a cadence pin fwd_frac at 0, so it is False."""
         rollout_every = int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0)
         if rollout_every > 0:
-            fwd_ran = (self.step_ind % rollout_every == 0)
+            # THE CADENCE IS ANCHORED TO THE STAGE, NOT TO THE ABSOLUTE COUNTER, so
+            # the FIRST fused step of a cadenced stage always rolls out. That step
+            # is the Z bootstrap: it is the only thing that pins log Z on entry
+            # (phase 1 gives Z no gradient at all -- it opens at whatever the
+            # checkpoint carried), and the same rollout seeds the replay buffer, so
+            # the buffer is not drawn from empty for the first N steps either.
+            #
+            # `step_ind % every` looked equivalent only because the acceptance runs
+            # SKIP phase 1 (prior_loaded), which puts stage entry at step 0 where
+            # 0 % every == 0. A run that actually trains phase 1 and transitions at,
+            # say, step 5000 gets 5000 % 7 = 4: four steps of phase 2 trained
+            # against an MLE-era log Z before anything pinned it.
+            #
+            # Derived lazily rather than checkpointed: on a mid-stage resume the
+            # anchor re-seeds to the resume step, which rolls out immediately. That
+            # is what a restart should do anyway -- re-pin Z before training on it.
+            if getattr(self, '_cadence_anchor_stage', None) != self.protocol.stage.name:
+                self._cadence_anchor_stage = self.protocol.stage.name
+                self._cadence_anchor = self.step_ind
+            fwd_ran = ((self.step_ind - self._cadence_anchor) % rollout_every == 0)
             if fwd_ran:
                 self._last_rollout_step = self.step_ind
-            elif self._drift_trigger_fires(rollout_every):
+            elif self._rollout_trigger_fires(rollout_every):
                 fwd_ran = True
         else:
             fwd_ran = bool(self.fwd_frac >= deactivate_threshold
                            or (force_refresh and not self.protocol.mode_dormant('fwd')))
         return fwd_ran, bool(fwd_ran and self.fwd_frac >= deactivate_threshold)
 
-    def _drift_trigger_fires(self, rollout_every):
-        """Should an OFF-CADENCE step run an extra rollout because the policy
-        has drifted off the stored rows? (stage.fwd_rollout_drift_max, nats;
-        0/absent = off, which is what ships.)
+    #: (key, default, direction) -- direction 'above' fires when the reading
+    #: EXCEEDS the bar, 'below' when it falls under it. 0/None disables a bar.
+    #: NO Z BAR. There is no live estimate of log Z's fixed point between
+    #: rollouts -- the root is a property of a FRESH batch, and getting one IS the
+    #: rollout. Two candidates were tried and both rejected: sqrt(q*elapsed)
+    #: measures nothing (the backstop period respelled in nats), and the signed
+    #: drift off birth_log_pf is only the P_F half, since learn_pb re-scores
+    #: log_pb on every draw too. So the unpinned Z interval is bounded OPEN-LOOP,
+    #: by fwd_rollout_every alone. That is a real limit of the design.
+    ROLLOUT_TRIGGERS = (('drift_std_max', 'above'), ('ess_min', 'below'),
+                        ('val_gap_max', 'above'), ('occupancy_min_batches', 'below'))
 
-        The sensor is replay/policy_drift_std -- the non-circular one. The
-        minimum two-step gap is a PLACEMENT bound, not a cost bound: the drift
-        reading is taken before that step's admission, so without it a
-        chronically high drift would fire at step 1 of every window and turn
-        the cadence into rollouts at 0 and 1 (mod N).
+    def _rollout_trigger_reading(self, key, elapsed):
+        """The live value each trigger compares against its bar, or None when it
+        cannot be read yet (a missing reading NEVER fires -- an unmeasured
+        quantity is not evidence of a problem)."""
+        if key == 'drift_std_max':
+            return getattr(self, '_replay_drift_std', None)
+        if key == 'ess_min':
+            return self.metric_tracker.get('replay', 'policy_drift_ess_frac')
+        if key == 'val_gap_max':
+            return self.metric_tracker.get('replay', 'val_gap_nats')
+        if key == 'occupancy_min_batches':
+            rb = getattr(self, 'replay_buffer', None)
+            n = len(rb) if rb is not None else None
+            return (float(n) / max(self.batch_size, 1)) if n is not None else None
+        return None
 
-        Nothing here is serialized: a resume simply re-reads at the next
-        measurement, so every read goes through getattr with a default."""
-        bar = float(getattr(self.protocol.stage, 'fwd_rollout_drift_max', 0.0) or 0.0)
-        if bar <= 0:
-            return False
-        std = getattr(self, '_replay_drift_std', None)
-        if std is None or not math.isfinite(std) or std <= bar:
+    def _rollout_trigger_fires(self, rollout_every):
+        """Should an OFF-CADENCE step run an extra rollout?
+
+        `fwd_rollout_every` is the BACKSTOP period, deliberately loose; these
+        bars are what actually set the cadence, so a run spends rollouts where
+        the state says it needs them rather than on a clock. Each bar answers a
+        different failure, and each is reported under its own name so a run says
+        WHY every off-cadence rollout happened:
+
+          drift_std_max   replay/policy_drift_std -- the stored rows are far
+                          off-policy. A rollout DILUTES (fresh rows in), it does
+                          not evict; the hazard timescale is the stronger
+                          actuator for staleness (replay_occupancy_and_cadence.md).
+          ess_min         replay/policy_drift_ess_frac -- the same failure as a
+                          fraction rather than nats; scale-free across systems.
+          val_gap_max     replay/val_gap_nats -- the buffer is being memorised.
+                          A rollout RAISES the admission rate and so LOWERS
+                          reuse (= draws/admissions), which is the correct
+                          actuator for this one.
+          occupancy_min_batches   len(replay_buffer)/batch_size -- the draw has
+                          too little to draw from. O >= B is a hard requirement
+                          (each step draws a full batch); this is what a loose
+                          period violates first.
+
+        The minimum two-step gap is a PLACEMENT bound, not a cost bound: the
+        readings are taken before this step's admission, so without it a
+        chronically tripped bar fires at step 1 of every window and turns the
+        cadence into rollouts at 0 and 1 (mod N).
+
+        Nothing here is serialized: a resume re-reads at the next measurement,
+        so every read goes through a default and a None reading never fires.
+        """
+        bars = getattr(self.protocol.stage, 'fwd_rollout_triggers', None) or {}
+        if not bars:
             return False
         last = getattr(self, '_last_rollout_step', None)
-        if last is not None and (self.step_ind - last) < 2:
+        elapsed = (self.step_ind - last) if last is not None else self.step_ind
+        fired = []
+        for key, direction in self.ROLLOUT_TRIGGERS:
+            bar = bars.get(key)
+            if bar is None or float(bar) <= 0:
+                continue
+            v = self._rollout_trigger_reading(key, elapsed)
+            if v is None or not math.isfinite(float(v)):
+                continue
+            v = float(v)
+            if (v > float(bar)) if direction == 'above' else (v < float(bar)):
+                fired.append((key, v, float(bar)))
+        if not fired:
+            return False
+        if last is not None and elapsed < 2:
             return False
         self._last_rollout_step = self.step_ind
-        self._drift_trigger_count = getattr(self, '_drift_trigger_count', 0) + 1
-        print(f"fwd rollout triggered by policy drift: std {std:.2f} > {bar:.2f} nat "
-              f"at step {self.step_ind} (cadence {rollout_every}, last rollout {last})",
+        counts = getattr(self, '_rollout_trigger_counts', None)
+        if counts is None:
+            counts = self._rollout_trigger_counts = {}
+        for key, v, bar in fired:
+            counts[key] = counts.get(key, 0) + 1
+        why = ', '.join(f"{k} {v:.3f} vs {b:.3f}" for k, v, b in fired)
+        print(f"fwd rollout triggered at step {self.step_ind} ({why}); "
+              f"backstop period {rollout_every}, {elapsed} steps since the last rollout",
               flush=True)
         return True
 
@@ -4235,18 +4415,31 @@ class Modeller:
 
     _UC_WINDOW_STEPS = 150
 
-    def _forgetting_sensor(self, stats):
-        """Write stats['relative_under_rise150'] once 300 STEPS of bwd/relative_under
-        history exist: mean over the last 150 steps minus mean over the 150 before.
+    _FORGETTING_CHANNELS = ('under_coverage', 'relative_under')
 
-        THE SENSOR MUST BE LEVEL-BLIND. `under_coverage` is the negative-tail RMS
-        of the Z-anchored residual log_pf + log_Z - log_r - log_pb, so a fill that
-        lowers log_Z by 4 nat raises it by ~4 -- under rarer rollouts, where the
-        fill snaps Z by several nat early in a stage, that read as "forgetting",
-        cut the replay weight to its rail, and starved replay for ~1000 steps.
-        `relative_under` is the same statistic centred on the batch's own mean
-        log w, so Z motion drops out and only the within-batch spread the policy
-        can actually fix remains.
+    def _forgetting_sensor(self, stats):
+        """Write stats['<channel>_rise150'] for each channel in
+        _FORGETTING_CHANNELS once 300 STEPS of that channel's history exist:
+        mean over the last 150 steps minus mean over the 150 before.
+
+        BOTH ARE COMPUTED; the stage's `balance.metric` picks which one steers.
+        They measure different things and the choice is a design decision, not a
+        default:
+
+          under_coverage   negative-tail RMS of the Z-anchored residual
+                           log_pf + log_Z - log_r - log_pb. Carries the level, so
+                           a fill that moves log_Z by 4 nat moves it by ~4. That
+                           is a feature when the bar is at 0 and the response is
+                           symmetric (Z motion is then noise a hunting servo
+                           averages out) and a defect when the bar is high and
+                           the response is one-way: at bar 1.0 it fired on the
+                           fill alone and starved replay for ~1000 steps.
+          relative_under   the same statistic centred on the batch's own mean
+                           log w, so Z motion drops out and only the within-batch
+                           spread the policy can fix remains. Level-blind, and on
+                           the 2026-09-07 acceptance run its whole observed range
+                           was [-0.26, +0.63] against a bar of 1.0 -- it could not
+                           fire at all.
 
         Windows are in STEPS, not samples. This method runs on _update_rolling's
         cadence -- every 10th trained bwd step -- so a sample-counted window would
@@ -4255,23 +4448,28 @@ class Modeller:
         the call cadence, and 'full' means the oldest kept sample is within one
         stride of 300 steps old.
         """
-        uc = stats.get('relative_under')
-        if uc is None:
-            return
-        uc = float(uc)
-        if not math.isfinite(uc):
-            return
         w = self._UC_WINDOW_STEPS
         now = int(self.step_ind)
-        hist = [(s, v) for s, v in getattr(self, '_uc_hist', []) if s > now - 2 * w]
-        hist.append((now, uc))
-        self._uc_hist = hist
-        recent = [v for s, v in hist if s > now - w]
-        older = [v for s, v in hist if s <= now - w]
-        stride = min((b - a for (a, _), (b, _) in zip(hist, hist[1:])), default=None)
-        full = stride is not None and older and recent and hist[0][0] <= now - 2 * w + stride
-        if full:
-            stats['relative_under_rise150'] = float(np.mean(recent) - np.mean(older))
+        store = getattr(self, '_uc_hist', None)
+        if not isinstance(store, dict):
+            store = {}  # pre-multichannel runs kept a bare list here
+        for channel in self._FORGETTING_CHANNELS:
+            uc = stats.get(channel)
+            if uc is None:
+                continue
+            uc = float(uc)
+            if not math.isfinite(uc):
+                continue
+            hist = [(s, v) for s, v in store.get(channel, []) if s > now - 2 * w]
+            hist.append((now, uc))
+            store[channel] = hist
+            recent = [v for s, v in hist if s > now - w]
+            older = [v for s, v in hist if s <= now - w]
+            stride = min((b - a for (a, _), (b, _) in zip(hist, hist[1:])), default=None)
+            full = stride is not None and older and recent and hist[0][0] <= now - 2 * w + stride
+            if full:
+                stats[f'{channel}_rise150'] = float(np.mean(recent) - np.mean(older))
+        self._uc_hist = store
 
     def _submodel_grad_norms(self):
         """
@@ -4416,6 +4614,25 @@ class Modeller:
         coef = {k: weights[k] / total_weight for k in active}
         norms = {k: float(flat[k].norm()) for k in active}
         report = {f'fused_grad/{k}_norm_raw': norms[k] for k in active}  # BEFORE weighting
+
+        # PER-SUBMODEL split of each branch's gradient. The whole-model
+        # gradnorm/backward_policy is the FUSED loss's norm, so it cannot say
+        # whether P_B is being moved by bwd (reparameterised path gradient,
+        # score term averaging to zero) or by replay (a straight regression
+        # gradient on a stored path). Same autograd.grad as above, sliced by
+        # the child module each parameter belongs to; norm over the slice.
+        pid_to_child = {id(p): name for name, mod in self.gfn_model.named_children()
+                        for p in mod.parameters(recurse=True)}
+        spans, offset = {}, 0
+        for p in params:
+            child = pid_to_child.get(id(p))
+            if child is not None:
+                spans.setdefault(child, []).append((offset, offset + p.numel()))
+            offset += p.numel()
+        for k in active:
+            for child, sp in spans.items():
+                e = sum(float(flat[k][a:b].norm()) ** 2 for a, b in sp)
+                report[f'fused_grad/{k}_norm_{child}'] = e ** 0.5
 
         for k in active:
             others = torch.zeros_like(touched[k])
@@ -5332,6 +5549,66 @@ class Modeller:
               f"(root {root:.3f}, gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
               f"at step {self.step_ind}")
 
+    def bootstrap_z_by_rollout(self, n_samples=None):
+        """
+        Set log Z at stage entry from a LARGE forward rollout, through the same
+        winsorized-Huber root every ordinary fill uses.
+
+        WHY THIS EXISTS. Phase 1 gives log Z no gradient at all -- the MLE stage
+        never touches the flow scalar, and the phase-1 exit checkpoints carry it
+        at exactly 0.0 (verified on dev_elj_p2_cruise ... _phase1_exit.pt). Phase 2
+        therefore opens tens of nats from its own fixed point and the cadenced fill
+        has to walk the level in, which on rr07_rr_n7_v1 took 5.5 nats over the
+        first 50 steps and was still climbing at step 1000. Everything trained in
+        that window is trained against a level that is simply wrong.
+
+        WHY THE HUBER ROOT AND NOT jensen_z / emp_z. Those are the two estimates
+        the record-keeping has always carried, and neither is what the loss
+        optimises: the Huber TB loss's stationary point in z is the winsorized
+        root, and on a batch with a catastrophic-terminal tail the three separate
+        by tens of nats (measured: jensen -15.0, emp +12.7, huber -0.6 on one
+        synthetic batch with a 5% tail). Seeding from an estimator the fill will
+        then pull away from just spends the walk-in twice. `quick_tb_stats` now
+        reports `huber_z` alongside them so the three are comparable on every
+        branch.
+
+        WHY A BIG DRAW. se ~ rms/(sqrt(B) * frac_unclipped), and the entry batch is
+        the least resolved one the run ever takes -- on rr07_rr_n7_v1 the step-0
+        fill ran at se 2.60 with 18% of rows unclipped, the worst of all 201 fills,
+        and the absorber handed it K = 1 because P opens empty. A bootstrap is
+        exactly where the whole gap gets taken, so it is exactly where the
+        measurement must be the best one available rather than the worst.
+
+        The filter is re-opened (P := None) so this fill takes the whole gap even
+        when one has already been applied, and the same rollout is admitted to the
+        replay buffer -- so the buffer is seeded at entry rather than filling over
+        the first N steps.
+        """
+        n = int(n_samples or getattr(self.args, 'eval_num_samples', 0) or self.batch_size)
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        # side_effects False: this is a Z measurement, not an eval. It must not
+        # write tracker Emin(c) or screen/admit anchors -- the anchor buffer is
+        # frozen by config here, and a bootstrap that quietly moved it would be a
+        # different run from the one the config describes.
+        fwd_stats, sample_batch = self.fwd_eval_sampling(
+            self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False)
+        logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
+                - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
+        logw = logw[torch.isfinite(logw)]
+        if logw.numel() < 2:
+            print(f"bootstrap_z_by_rollout: {n} samples produced {logw.numel()} finite "
+                  f"log w -- log Z left at its checkpoint value")
+            return
+        before = float(self.gfn_model.flow_model.scalar.detach())
+        self._z_fill_P = None            # re-open the filter: take the whole gap
+        self._z_fill_last_step = None    # and bypass any cooldown
+        self.z_level_fill(logw=logw, source='boot', apply=True)
+        after = float(self.gfn_model.flow_model.scalar.detach())
+        print(f"bootstrap_z_by_rollout: log Z {before:.3f} -> {after:.3f} "
+              f"from {logw.numel()} forward samples")
+        if self.protocol.flag('buffers_active'):
+            self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=True)
+
     def _eval_z_fill(self, fwd_stats):
         """Feed the eval rollout's log w to z_level_fill (z_calibration.fill_from_eval).
 
@@ -5594,7 +5871,9 @@ class Modeller:
                                 'resid_vs_intake': st['replay/resid_vs_intake'],
                                 'lambda_tau': st['replay/lambda_tau']})
             payload.update(self._policy_drift_stats(inds, loss_dict.get('log_pf')))
-            payload.update(self._replay_val_stats(discretizer, float(loss.detach())))
+            payload.update(self._replay_val_stats(
+                discretizer, float(loss.detach()),
+                train_resid=loss_dict.get('resid'), train_weights=self._replay_is_w))
             if payload:
                 self.metric_tracker.update('replay', payload, self.step_ind)
 
@@ -5682,21 +5961,96 @@ class Modeller:
         std = float(d.std(unbiased=True))
         self._replay_drift_std = std
         return {'policy_drift_std': std,
+                # SIGNED, where std/nats/ess are all magnitudes: the spread of
+                # the drift (decorrelation) and its level shift are different
+                # things and a policy can do either alone. Diagnostic ONLY.
+                #
+                # NOT a log w drift, and nothing should read it as one. Only
+                # log_r is fixed for a stored row -- that is what makes replay
+                # energy-free -- while `learn_pb` re-scores log_pb on every draw
+                # exactly as it re-scores log_pf, so
+                #     d log w = d log_pb - d log_pf
+                # and this is the second term alone. Measuring d log w needs a
+                # birth_log_w column the buffer does not have.
+                'policy_drift_signed': float(d.mean()),
                 'policy_drift_nats': float(d.abs().mean()),
                 'policy_drift_ess_frac': (s1 * s1 / (n_ok * s2)) if s2 > 0 else 1.0,
                 'policy_drift_covered_frac': covered}
 
+    @staticmethod
+    def _weighted_median(x, w=None):
+        """Median of `x`, or the w-weighted median when `w` is given.
+
+        The training draw is PRIORITISED, so a plain median over drawn rows is a
+        median of the priority distribution, not of the buffer. The same weights
+        that make the mean unbiased for the uniform-buffer average
+        (prioritised_weights: E_p[w f] = E_uniform[f]) make this the uniform
+        buffer's median, so the two sides of the gap estimate the same quantile
+        of the same population. Ties and zero weights are harmless; an all-zero
+        weight vector falls back to the unweighted median."""
+        x = x.flatten()
+        if x.numel() == 0:
+            return float('nan')
+        if w is None:
+            return float(x.median())
+        # .to(x.device): the IS weights are kept host-side (_replay_is_w is built
+        # on CPU by the buffer's draw) while `resid` is on the accelerator, so the
+        # argsort's indices and the weight vector land on different devices. The
+        # CPU-only unit tests could not see this -- it failed on the first live
+        # measurement instead, at step 10.
+        w = w.flatten().clamp(min=0).to(x.device, x.dtype)
+        if w.numel() != x.numel():
+            # K repeats tile over the batch, exactly as the loss reduction does
+            reps = x.numel() // max(w.numel(), 1)
+            if reps * w.numel() != x.numel():
+                return float(x.median())
+            w = w.repeat_interleave(reps)
+        total = float(w.sum())
+        if not (total > 0):
+            return float(x.median())
+        order = torch.argsort(x)
+        xs, cw = x[order], torch.cumsum(w[order], 0) / total
+        idx = int(torch.searchsorted(cw, torch.tensor(0.5, device=cw.device, dtype=cw.dtype)))
+        return float(xs[min(idx, xs.numel() - 1)])
+
     @torch.no_grad()
-    def _replay_val_stats(self, discretizer, train_loss):
-        """The generalisation gap on the replay buffer: the same loss, at the
-        same parameters and the same Z, on rows that are never trained on.
+    def _replay_val_stats(self, discretizer, train_loss, train_resid=None,
+                          train_weights=None):
+        """The generalisation gap on the replay buffer: the same statistic, at
+        the same parameters and the same Z, on rows that are never trained on.
 
         val_gap > 0 means the policy fits the exact stored trajectories better
         than equivalent ones it has not seen. Because it is a DIFFERENCE of two
-        means taken within one step, a Z-level or loss-scale error shifts both
-        sides together. It scores STORED trajectories through
+        summaries taken within one step, a Z-level or loss-scale error shifts
+        both sides together. It scores STORED trajectories through
         prebuilt_sample_to_reward, so it calls no energy function
-        (docs/design/rarer_rollouts.md invariant 2)."""
+        (docs/design/rarer_rollouts.md invariant 2).
+
+        TWO SPELLINGS ARE REPORTED, and `val_gap_nats` is the one to read.
+
+          val_gap       mean Huber loss, val minus train. NATS SQUARED, and a
+                        MEAN of a statistic whose knee (beta 80) sits inside the
+                        residual distribution (rms ~72 nats on rr07_rr_n7_v1), so
+                        ~a quarter of rows land in the linear regime and the mean
+                        is set by how many catastrophic rows fell on each side.
+                        Measured 2026-09-07: one row at |resid| = 200 moves it by
+                        63 -- larger than the whole median gap of 45. Kept only so
+                        series already recorded stay comparable.
+          val_gap_nats  median |resid|, val minus train, in NATS. One row cannot
+                        move a median, and nats are the units every other scale on
+                        the run is in (policy drift 13, log Z motion 8, fill se
+                        1.5), so the number can be compared to something. The
+                        train side uses the IS-WEIGHTED median so both sides
+                        estimate the same quantile of the same population.
+          val_gap_nats_se  the median's own standard error, from the val side's
+                        MAD: 1.858 * MAD / sqrt(n) (the normal-consistent
+                        1.253 * sigma / sqrt(n) with sigma = 1.4826 * MAD). A gap
+                        inside ~2 se is not a measurement, and at val_cap 256 that
+                        floor is ~2 nats -- which is what the sensor's resolution
+                        actually is, stated rather than inferred.
+
+        train_resid / train_weights are the TRAINING call's per-row residual and
+        IS weights; without them only the loss-unit pair is written."""
         k = self._replay_val_size()
         if k <= 0:
             return {}
@@ -5722,10 +6076,33 @@ class Modeller:
             self.gfn_model._stash_live_branches = stash
         losses = loss_dict['losses'].detach().flatten()
         val_loss = float(losses.mean())
-        return {'val_loss': val_loss,
-                'val_gap': val_loss - train_loss,
-                'val_n': float(losses.numel()),
-                'val_skips': 0.0}
+        out = {'val_loss': val_loss,
+               'val_gap': val_loss - train_loss,
+               'val_n': float(losses.numel()),
+               'val_skips': 0.0}
+
+        # The nats spelling. |resid| is the per-row distance from log Z that the
+        # Huber loss is a function of, so a robust summary of it is the same
+        # quantity the loss reports, minus the squaring and the tail weighting.
+        vr = loss_dict.get('resid')
+        if vr is None or train_resid is None:
+            return out
+        vr = vr.detach().abs().flatten()
+        vr = vr[torch.isfinite(vr)]
+        tr = train_resid.detach().abs().flatten()
+        if vr.numel() < 2 or tr.numel() < 1:
+            return out
+        v_med = self._weighted_median(vr)
+        t_med = self._weighted_median(tr, train_weights)
+        out['val_resid_med'] = v_med
+        out['train_resid_med'] = t_med
+        out['val_gap_nats'] = v_med - t_med
+        # MAD-based se of the val median. Only the val side is used: the train
+        # median is over ~2x the rows and is IS-weighted, so its se is the
+        # smaller of the two and the sum is dominated by this term.
+        mad = float((vr - v_med).abs().median())
+        out['val_gap_nats_se'] = 1.858 * mad / (vr.numel() ** 0.5)
+        return out
 
     @torch.no_grad()
     def draw_bwd_sample(self, repeats, target_cids=None):

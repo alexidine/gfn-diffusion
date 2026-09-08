@@ -2121,6 +2121,27 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     if clip_beta is not None:
         clipped = resid.clamp(-clip_beta, clip_beta)
         mets['tb_resid_clipped'] = clipped.mean().item()
+        # THE TARGET THE LOSS IS ACTUALLY PULLING log Z TOWARD, reported next to
+        # the two estimators that are not it. z_jensen is E[log w] and z_emp is
+        # logmeanexp(log w); the Huber TB loss's stationary point in z is neither
+        # -- it is the WINSORIZED root, the z at which mean(clip(z - log w, +-beta))
+        # is zero, which is exactly `tb_resid_clipped` above driven to zero. Every
+        # record-keeping path reported the estimators and left the trained-toward
+        # quantity to be inferred from a gap, so "is log Z where the loss wants it"
+        # was not answerable from the logged series (owner 2026-09-07).
+        #
+        # Local import: gflownet_losses imports THIS module, so a top-level one
+        # would be circular.
+        from gflownet_losses import winsorized_z_root
+        try:
+            h_root, h_se, h_frac = winsorized_z_root(log_w, float(clip_beta))
+            mets['huber_z'] = h_root
+            mets['huber_z_se'] = h_se
+            mets['huber_z_frac_unclipped'] = h_frac
+        except (ValueError, RuntimeError):
+            # a degenerate batch identifies no root; say nothing rather than
+            # publish a number the se cannot qualify
+            pass
         # per-condition dL/dZ: clip, group-mean (spread averages out), THEN abs
         cond_z_grad = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
             0, inverse, clipped) / counts.clamp(min=1)

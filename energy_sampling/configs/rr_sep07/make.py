@@ -76,13 +76,41 @@ def deltas(cfg, name, every, fam):
             st.setdefault('flags', {})['z_calibration'] = False
             st['fracs'] = {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
             st.pop('min_fracs', None)
+            # THE REPLAY-SIDE BARS SET THE CADENCE; fwd_rollout_every above is the
+            # backstop, and the only thing bounding how long log Z goes unpinned
+            # (nothing measures the root between rollouts -- getting one IS the
+            # rollout). On rr07_rr_n7_v2, fwd/tb_resid_clipped held within +-0.05
+            # nats all run at N=7, so that cadence was far more often than the Z
+            # pin needed.
+            st['fwd_rollout_triggers'] = {
+                'ess_min': 0.10,            # replay/policy_drift_ess_frac; v2 ended 0.30
+                'val_gap_max': 4.0,         # replay/val_gap_nats, ~8x its se on v2 (0.44)
+                'occupancy_min_batches': 2.0,   # O >= B is hard; 2B leaves reaction room
+            }
+            # GUARD: bar 0 on the Z-anchored channel, RATCHET on the same
+            # quantity's level with tol 0. Both tolerances zero -- the guard's job
+            # is to keep bwd coverage improving, so "did it get worse at all" is
+            # the bar and "is it at its best" is the release (owner 2026-09-07).
+            # Gains 4x slower than the original: v2 moved bwd 0.50 -> 0.79 in 2000
+            # steps at 20x slower, so the loop closes well inside a cluster leg.
             st['balance'] = {
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
                 'pinned': {'fwd': 0.0},
-                'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
-                'up': 0.0017, 'down': 0.043,
+                'metric': 'bwd/under_coverage_rise150', 'bar': 0.0,
+                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.0,
+                'up': 0.000425, 'down': 0.01075,
                 'bounds': BOUNDS_MLIP if fam in MLIP else BOUNDS_ELJ,
             }
+            # Z BOOTSTRAP AT PHASE-2 ENTRY. Phase 1 gives the flow scalar no
+            # gradient -- the exit checkpoints carry log Z at exactly 0.0 -- so
+            # without this the fill walks the level in over the first few hundred
+            # steps and everything trained meanwhile is trained against a wrong
+            # level. Measured on v2: 0.000 -> 16.557 in one shot, at se 0.73
+            # against the 400-row entry fill's 2.60.
+            on_enter = list(st.get('on_enter') or [])
+            if not any(str(a).startswith('bootstrap_z') for a in on_enter):
+                on_enter.append('bootstrap_z:rollout:4000')
+            st['on_enter'] = on_enter
             n += 1
     assert n >= 1, name + ': no fused stage'
     cfg['buffers']['prior_buffer']['source'] = 'anchors'
@@ -93,6 +121,9 @@ def deltas(cfg, name, every, fam):
     # generalisation gap (replay/val_gap) is measured rather than inferred.
     # Measurement only -- nothing actuates on it.
     rb['val_frac'] = 0.1
+    # _replay_val_size returns min(val_cap, batch_size, n_val), so anything above
+    # batch_size is inert. Set to batch_size as the honest ceiling.
+    rb['val_cap'] = int(cfg['batch_size'])
     return cfg
 
 
@@ -113,7 +144,15 @@ def check(cfg, name, every):
     rb = cfg['buffers']['replay_buffer']
     assert rb['churn_rate'] == cfg['batch_size'] and rb['mean_residence_steps'] == 5 * every, name
     assert rb['val_frac'] == 0.1, name + ': val split'
-    assert not any('fwd_rollout_drift_max' in s for s in st), name + ': drift trigger armed'
+    assert rb['val_cap'] == cfg['batch_size'], name + ': val cap above batch_size is inert'
+    assert not any('fwd_rollout_drift_max' in s for s in st), name + ': retired drift key'
+    for s in st:
+        b = s['balance']
+        assert b['bar'] == 0.0 and b['ratchet_tol'] == 0.0, name + ': tolerances'
+        assert b['metric'] == 'bwd/under_coverage_rise150', name + ': guard channel'
+        assert b['ratchet_metric'] == 'bwd/under_coverage', name + ": ratchet must be the guard's LEVEL"
+        assert s['fwd_rollout_triggers'], name + ': no cadence triggers'
+        assert any(str(a).startswith('bootstrap_z') for a in (s.get('on_enter') or [])),             name + ': no phase-2 Z bootstrap'
     assert cfg['checkpoint_name'] == p02make.PLACEHOLDER, name
     assert cfg['prior_model_name'] == p02make.PRIOR_PLACEHOLDER, name
     p02make._scan_local_paths(cfg, name)

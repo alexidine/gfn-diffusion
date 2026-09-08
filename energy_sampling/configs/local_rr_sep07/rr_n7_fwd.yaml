@@ -304,10 +304,12 @@ protocols:
         guard: bwd
         pinned:
           fwd: 0.05
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: &id001
           bwd:
           - 0.25
@@ -326,6 +328,10 @@ protocols:
         max_step: 0.05
         max_boost: 8.0
       fwd_rollout_every: 7
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -399,12 +405,18 @@ protocols:
         guard: bwd
         pinned:
           fwd: 0.05
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
       fwd_rollout_every: 7
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
   prod_eq:
     stages:
     - name: train_prior
@@ -467,16 +479,22 @@ protocols:
         max_step: 0.05
         max_boost: 8.0
       fwd_rollout_every: 7
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
         ramp: replay
         guard: bwd
         pinned:
           fwd: 0.05
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
 controller:
   min_mode_frac: 0.001
@@ -515,6 +533,7 @@ buffers:
       kappa: 1.0
       floor_frac: 0.25
       symmetric: true
+    val_cap: 400
     val_frac: 0.1
   anchor_buffer:
     frozen: true

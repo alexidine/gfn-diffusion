@@ -473,6 +473,11 @@ class Checkpointer:
             'problem_hash': m.problem_hash,  # fast fingerprint of problem_def, also embedded in the filename
             'model_train': m.gfn_model.state_dict(),
             'model_eval': m.ema_model.state_dict(),
+            # P_B's frozen snapshot (Modeller.set_pb_freeze 'full'), or None. Lives
+            # outside the model state_dict on purpose (not a submodule) and is
+            # restored by every load path below, so a resumed leg scores P_B on
+            # the SAME function rather than re-snapshotting a drifted trunk.
+            'pb_frozen': m.gfn_model.pb_snapshot_state(),
             # the rollout length this checkpoint was trained at. A prior reused
             # by another run (prior_model_name) must be SAMPLED at
             # its own training T, not the consumer's eval_T -- a T=10 prior fed
@@ -635,6 +640,7 @@ class Checkpointer:
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)
         m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
         m.ema_model.eval()
@@ -711,6 +717,7 @@ class Checkpointer:
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)
         m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
         m.ema_model.eval()
@@ -757,11 +764,27 @@ class Checkpointer:
                         f"measurement.") from e
                 print(f"Could not restore optimizer state for '{key}' ({e}) - starting it fresh")
 
+    def _restore_pb_snapshot(self, checkpoint):
+        """A checkpoint written under a full P_B freeze carries the snapshot;
+        one written trainable carries None, which also LIFTS a freeze on a
+        model that had one (a rewind to a pre-freeze checkpoint must not keep
+        the later snapshot). Pre-snapshot checkpoints have no key: no-op."""
+        if 'pb_frozen' not in checkpoint:
+            return
+        state = checkpoint['pb_frozen']
+        m = self.modeller
+        if state is None:
+            if m.gfn_model.pb_frozen:
+                m.set_pb_freeze(None)
+            return
+        m.set_pb_freeze('full', source_state=state)
+
     def load_model_only(self, path, load_optimizers: bool = False):
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._restore_pb_snapshot(checkpoint)
         m.gfn_model.train()
         m.ema_model.eval()
         if load_optimizers:

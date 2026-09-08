@@ -1457,7 +1457,11 @@ def combo_fig(num_polymorphs,
               basin_min_batch,
               polymorph_basin_index,
               energy_function,
+              poly_labels=None,
               ):
+    """poly_labels: names for the experimental references (e.g. CSD refcodes).
+    None falls back to generated Roman numerals of the right LENGTH -- the old
+    hard-coded ['I', 'II'] IndexErrored at the third reference."""
     marker_font_size = 16
 
     # Build subplot_titles aligned to the specs grid
@@ -1468,12 +1472,14 @@ def combo_fig(num_polymorphs,
     point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8)
 
     embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds)
+              sample_embedding, sample_inds, poly_labels=poly_labels)
 
     fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
-             polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function)
+             polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function,
+             poly_labels=poly_labels)
 
-    table_trace = new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins)
+    table_trace = new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins,
+                                poly_labels=poly_labels)
     fig.add_trace(table_trace, row=3, col=1)
 
     """
@@ -1653,7 +1659,7 @@ def make_specs_fig(n_basins):
 
 
 def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds):
+              sample_embedding, sample_inds, poly_labels=None):
     fig.add_scatter(x=sample_embedding[sample_inds, 0],
                     y=sample_embedding[sample_inds, 1],
                     marker_color=sample_colors,
@@ -1684,8 +1690,15 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     #
     # # Polymorph markers: X at true location, label offset with arrow
     # polymorph_labels = ['I', 'II'] if num_polymorphs else ['I']
+    # X at the true embedding position, with the reference NAMED next to it.
+    # Unlabelled markers are unreadable as soon as there is more than one, and
+    # two references can land on top of each other.
+    heads = polymorph_labels(len(polymorph_inds), poly_labels)
     fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
-                    mode='markers',
+                    mode='markers+text',
+                    text=heads,
+                    textposition='top right',
+                    textfont=dict(size=marker_font_size, color='black'),
                     marker_symbol='x-thin',
                     marker_color='black',
                     marker_line_color='black',
@@ -1729,7 +1742,8 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     #
 
 def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
-             polymorph_basin_index, sample_energy, stats, thermo_metrics, energy_function):
+             polymorph_basin_index, sample_energy, stats, thermo_metrics, energy_function,
+             poly_labels=None):
     for i, basin_ind in enumerate(np.arange(n_basins)):  # enumerate(sorted_minima_inds[:4]):
         row, col = basin_positions[i]
 
@@ -1774,12 +1788,15 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
             ),
             showlegend=False
         ), row=row, col=col)
-        if basin_ind in polymorph_basin_index:
-            poly_ind = torch.argwhere(polymorph_basin_index == basin_ind ).flatten()[0]
+        # EVERY reference assigned to this basin, not just the first. The old
+        # code took .flatten()[0], so two co-basin polymorphs drew one marker,
+        # and labelled it 'I' or 'II' by index, which is wrong past the second.
+        heads = polymorph_labels(len(polymorph_basin_index), poly_labels)
+        for poly_ind in torch.argwhere(polymorph_basin_index == basin_ind).flatten().tolist():
             fig.add_trace(go.Scatter(
                 x=[stats['sample_cp'][n_basins + poly_ind]],
                 y=[stats['sample_energy'][n_basins + poly_ind]],
-                mode='markers+text', text='I' if poly_ind == 0 else 'II',
+                mode='markers+text', text=heads[poly_ind],
                 marker_color='black', marker_line_color='black', marker_line_width=4,
                 textfont_color='white',
                 marker=dict(
@@ -1792,7 +1809,23 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
             ), row=row, col=col)
 
 
-def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins):
+def polymorph_labels(num_polymorphs, labels=None):
+    """Column/marker labels for the experimental references.
+
+    Replaces the literal `heads = ['I', 'II']`, which IndexErrors at the third
+    reference -- acridine's polymorph file holds seven. Pass `labels` (e.g. CSD
+    refcodes) to name them; otherwise Roman numerals are generated to length.
+    """
+    if labels is not None:
+        labels = list(labels)
+        if len(labels) >= num_polymorphs:
+            return labels[:num_polymorphs]
+    romans = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII']
+    return [romans[i] if i < len(romans) else str(i + 1) for i in range(num_polymorphs)]
+
+
+def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins,
+                  poly_labels=None):
     "summary table"
     e_min = stats['sample_energy']
     p = stats['density'].numpy()
@@ -1821,7 +1854,7 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     bold_min_rows = {0}  # E
     bold_max_rows = {1}  # P
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
-    heads = ['I', 'II']
+    heads = polymorph_labels(num_polymorphs, poly_labels)
     for ind in range(num_polymorphs):
         header_vals.append(f"Polymorph {heads[ind]}")
     cell_vals = [row_labels]
@@ -1842,21 +1875,29 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     header_fill = ["rgb(255, 255, 255)"] + [basin_colorscale[i + 1] for i in range(n_basins)]
     for ind in range(num_polymorphs):
         header_fill.append(polymorph_colorscale[ind])
-    fill_colors = [row_bg] + [row_bg for _ in range(n_basins)]
+    # one entry per COLUMN incl. the polymorph columns; the old
+    # `range(n_basins)` left the polymorph columns unshaded
+    fill_colors = [row_bg] + [row_bg for _ in range(n_basins + num_polymorphs)]
+    # The row-label column needs roughly twice a data column, and a header that
+    # carries a refcode ("Polymorph ACRDIN04") wraps to two lines -- at the old
+    # flat height=36 that pushed the last data row out of the table's third of
+    # the figure, so c_p was clipped off the bottom.
+    col_widths = [2.0] + [1.0] * (n_basins + num_polymorphs)
     f2 = go.Figure(data=[go.Table(
+        columnwidth=col_widths,
         header=dict(
             values=header_vals,
             align="center",
             font=dict(size=22, color="black"),
             fill_color=header_fill,
-            height=36,
+            height=64,
         ),
         cells=dict(
             values=cell_vals,
             align="center",
             font=dict(size=18),
             fill_color=fill_colors,
-            height=36,
+            height=34,
         ),
     )])
     table_trace = f2.data[0]

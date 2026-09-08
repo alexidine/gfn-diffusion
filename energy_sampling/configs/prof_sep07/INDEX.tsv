@@ -1,0 +1,5 @@
+arm	warm_src	base	trace_start	compile_policy
+p07_mipu_prof	pt100_mipu_lr4p0	prod_sep02/p02_mipu_lr0p0625.yaml	5400	auto
+p07_mip_prof	pt100_mip_lr4p0	prod_sep02/p02_mip_lr1.yaml	19300	auto
+p07_mipu_step	pt100_mipu_lr4p0	prod_sep02/p02_mipu_lr0p0625.yaml	5400	step
+p07_mip_step	pt100_mip_lr4p0	prod_sep02/p02_mip_lr1.yaml	19300	step

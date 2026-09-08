@@ -111,14 +111,36 @@ def test_invariant_is_silent_on_a_well_formed_cadence():
 
 # -------------------------------------------- fwd_rollout_drift_max (item A)
 
-def test_stage_accepts_the_drift_key_and_defaults_to_off():
+def test_stage_accepts_the_trigger_block_and_defaults_to_empty():
     st, i = _equilibration(_cfg())
-    assert Stage(copy.deepcopy(st), i).fwd_rollout_drift_max == 0.0
+    assert Stage(copy.deepcopy(st), i).fwd_rollout_triggers == {}
+    st = copy.deepcopy(st)
+    st['fwd_rollout_every'] = 10
+    st['flags']['z_calibration'] = False
+    st['fwd_rollout_triggers'] = {'drift_std_max': 2.5, 'ess_min': 0.1}
+    assert Stage(st, i).fwd_rollout_triggers == {'drift_std_max': 2.5, 'ess_min': 0.1}
+
+
+def test_the_retired_drift_key_is_refused_not_ignored():
+    """A dead trigger key reads as an armed trigger -- the one failure mode a
+    silent rename guarantees."""
+    st, i = _equilibration(_cfg())
     st = copy.deepcopy(st)
     st['fwd_rollout_every'] = 10
     st['flags']['z_calibration'] = False
     st['fwd_rollout_drift_max'] = 2.5
-    assert Stage(st, i).fwd_rollout_drift_max == 2.5
+    with pytest.raises(ValueError, match='drift_std_max'):
+        Stage(st, i)
+
+
+def test_stage_refuses_an_unknown_bar_name():
+    st, i = _equilibration(_cfg())
+    st = copy.deepcopy(st)
+    st['fwd_rollout_every'] = 10
+    st['flags']['z_calibration'] = False
+    st['fwd_rollout_triggers'] = {'drift_max': 2.5}
+    with pytest.raises(ValueError, match='unknown bars'):
+        Stage(st, i)
 
 
 @pytest.mark.parametrize('bar', [-1.0, 3.0])
@@ -143,11 +165,24 @@ def test_invariant_fires_on_a_drift_bar_without_a_cadence():
     assert v and any('fwd_rollout_drift_max' in x.detail for x in v)
 
 
-def test_invariant_is_silent_on_an_armed_trigger_under_a_cadence():
+def test_invariant_is_silent_on_armed_triggers_under_a_cadence():
     cfg = _cfg()
     st, _ = _equilibration(cfg)
     st['fwd_rollout_every'] = 10
     st['flags']['z_calibration'] = False
-    st['fwd_rollout_drift_max'] = 2.5
+    st['fwd_rollout_triggers'] = {'drift_std_max': 20.0, 'ess_min': 0.1,
+                                  'val_gap_max': 4.0, 'occupancy_min_batches': 2.0}
     cfg['z_calibration']['fill_threshold'] = 0.5
     assert _violations(cfg) == []
+
+
+def test_invariant_flags_the_retired_key_and_unknown_bars():
+    cfg = _cfg()
+    st, _ = _equilibration(cfg)
+    st['fwd_rollout_every'] = 10
+    st['flags']['z_calibration'] = False
+    cfg['z_calibration']['fill_threshold'] = 0.5
+    st['fwd_rollout_drift_max'] = 2.5
+    st['fwd_rollout_triggers'] = {'nope': 1.0}
+    msgs = ' '.join(v.detail for v in _violations(cfg))
+    assert 'fwd_rollout_drift_max' in msgs and 'not a known bar' in msgs
