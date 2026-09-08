@@ -1312,13 +1312,26 @@ class Modeller:
         n_roll = getattr(self, '_rollout_count', 0)
         last_report = getattr(self, '_rollout_report_step', None)
         if last_report is not None and self.step_ind > last_report:
-            span = self.step_ind - last_report
-            metrics['rollout/n'] = float(n_roll)
-            metrics['rollout/rate'] = n_roll / span          # == energy calls per step
-            if n_roll > 0:
-                metrics['rollout/every_eff'] = span / n_roll
+            metrics['rollout/n'] = float(n_roll)     # raw count this window
         self._rollout_report_step = self.step_ind
         self._rollout_count = 0
+        # CUMULATIVE SINCE STAGE ENTRY, not per window. A per-window figure
+        # cannot measure an interval longer than the window: at N=20 against a
+        # 10-step report cadence, every window holds 0 or 1 rollouts, and
+        # `span / n_roll` skips the zero-windows and reads `span` -- i.e. the
+        # window length, 10, for any N > 10. Measured that way on rr_hc_n20 and
+        # it read a flat 10.0 against a true cadence of 20.
+        #
+        # The two keys are RECIPROCALS of one number, kept because each is the
+        # natural unit for a different question: `rate` is energy calls per
+        # training step (the cost), `every_eff` is steps per rollout (the
+        # cadence). Under a trigger the cadence is emergent, so both are OUTPUTS
+        # -- `fwd_rollout_every` is only the backstop.
+        total = getattr(self, '_rollout_total', 0)
+        since = self.step_ind - getattr(self, '_rollout_total_from', 0)
+        if total > 0 and since > 0:
+            metrics['rollout/rate'] = total / since
+            metrics['rollout/every_eff'] = since / total
         last = getattr(self, '_last_rollout_step', None)
         if last is not None:
             # kept as a freshness reading -- 'how stale is log Z RIGHT NOW' -- not
@@ -3884,6 +3897,13 @@ class Modeller:
             # an off-cadence trigger, and the un-cadenced case (where it is 1.0
             # by construction, which is the baseline the savings are against).
             self._rollout_count = getattr(self, '_rollout_count', 0) + 1
+            # ...and a CUMULATIVE total, because a per-window figure cannot
+            # measure an interval longer than the window. See the report block.
+            if getattr(self, '_rollout_total_stage', None) != self.protocol.stage.name:
+                self._rollout_total_stage = self.protocol.stage.name
+                self._rollout_total = 0
+                self._rollout_total_from = self.step_ind
+            self._rollout_total = getattr(self, '_rollout_total', 0) + 1
         return fwd_ran, bool(fwd_ran and self.fwd_frac >= deactivate_threshold)
 
     #: (key, default, direction) -- direction 'above' fires when the reading

@@ -301,3 +301,25 @@ def test_every_rollout_path_increments_the_cost_counter():
         plain.step_ind = step
         plain._fwd_gates(THRESH, False)
     assert plain._rollout_count == 5, 'the 1.0-per-step baseline'
+
+
+def test_the_cadence_readout_is_cumulative_not_per_window():
+    """REGRESSION. rollout/every_eff was span/n_roll over the report window, which
+    cannot measure an interval longer than the window: with N=20 and a 10-step
+    report cadence every window holds 0 or 1 rollouts, the zero-windows are
+    skipped, and it read a flat 10.0 against a true cadence of 20 (rr_hc_n20).
+    The cumulative form is exact at any N."""
+    m = _m(every=20, prime_anchor=False)
+    m.protocol.stage.name = 'equilibration'
+    for step in range(0, 200):
+        m.step_ind = step
+        m._fwd_gates(THRESH, False)
+    total = m._rollout_total
+    since = m.step_ind - m._rollout_total_from
+    assert total == 10, 'steps 0,20,...,180'
+    assert since / total == pytest.approx(19.9, abs=0.2), 'cadence, not the window span'
+
+    m.protocol.stage.name = 'second_stage'          # a transition re-baselines
+    m.step_ind = 200
+    m._fwd_gates(THRESH, False)
+    assert m._rollout_total == 1 and m._rollout_total_from == 200
