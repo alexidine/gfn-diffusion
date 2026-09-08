@@ -327,7 +327,6 @@ protocols:
         max_boost: 8.0
       fwd_rollout_every: 1
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
   conditional_vargrad:
@@ -410,7 +409,6 @@ protocols:
         bounds: *id001
       fwd_rollout_every: 1
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
   prod_eq:
@@ -474,7 +472,6 @@ protocols:
         max_boost: 8.0
       fwd_rollout_every: 1
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
       balance:

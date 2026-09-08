@@ -24,7 +24,8 @@ STEPS = 2000
 BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
-def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None):
+def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
+          batch=None, lr_scale=None):
     """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
     forward TB loss trains the policy with the batch's own root standing in for
     log Z (tb_z_source batch_root), at that loss weight; the head is still set
@@ -33,6 +34,22 @@ def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None):
     cfg['run_name'] = name
     cfg['tag'] = 'rr07'
     cfg['epochs'] = int(steps or STEPS)
+    if batch:
+        # SET BEFORE val_cap AND churn_rate, both of which derive from batch_size
+        # below. grow_batch_size is on, so max must move with it or the cap binds.
+        cfg['batch_size'] = int(batch)
+        cfg['max_batch_size'] = int(batch)
+        # max_size MUST SCALE WITH BATCH or the cap binds and takes tau with it.
+        # At batch 1000 against the hardcoded 12000, occupancy pinned at the cap
+        # and rr_hc2_n20 / rr_hc2_n50 came out IDENTICAL on every buffer metric
+        # (occupancy 12000, reuse 2.85/2.90, mean_age 21.0/21.1) despite a 2.5x
+        # cadence difference -- the N knob was dead. Same rule the cluster
+        # generator uses (configs/rr_sep08/make.py _size_replay).
+        cfg['buffers']['replay_buffer']['max_size'] = max(12000, int(batch) * 50)
+    if lr_scale is not None:
+        # lr_control.mode is 'fixed', so the LIVE rate is seed_lr * fixed_scale.
+        # The first harm curve ran 1.25e-4 * 0.125 = 1.5625e-5.
+        cfg['lr_control']['fixed_scale'] = float(lr_scale)
     if warm:
         # A DIFFERENT PHASE-1 EXIT. The eight e01bd1 exits on disk are not
         # interchangeable in quality: screened at 2000 forward samples each,
@@ -131,8 +148,16 @@ def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None):
             # getting one IS the rollout. So the unpinned Z interval is bounded
             # OPEN-LOOP by fwd_rollout_every, and that period is the only thing
             # standing behind design invariant 1. Keep it tight enough to mean it.
+            # ess_min IS RETIRED -- it LATCHES, and no rr_sep08 arm carries it.
+            # policy_drift_ess_frac falls through 0.10 around step 2500 at a
+            # realistic LR (never at 1.56e-5). The trigger then fires EVERY OTHER
+            # STEP -- rollout/n per 10-step window 0.5 -> 5 -- floods the buffer
+            # (occupancy 5.5k -> cap, mean_age 72 -> 21, reuse 21 -> 3), and the
+            # sensor STILL does not clear (0.131 -> 0.088). The actuator cannot
+            # satisfy its own sensor at that rate, so the arm spends the rest of
+            # its life at a 10x rollout rate -- the premise of rare rollouts,
+            # inverted. Measured on rr_hc2_n20 (step 2520) and rr_hc2_n50 (2460).
             st['fwd_rollout_triggers'] = {
-                'ess_min': 0.10,
                 'val_gap_max': 4.0,
                 'occupancy_min_batches': 2.0,
             }
@@ -274,6 +299,15 @@ def main():
              'rr_hc_n20':  (20,  True, 0.0, 4000, 'dev_race_L2_transition', 4000),
              'rr_hc_n50':  (50,  True, 0.0, 4000, 'dev_race_L2_transition', 4000),
              'rr_hc_n100': (100, True, 0.0, 4000, 'dev_race_L2_transition', 4000)}
+    # THE HARM CURVE, SECOND CUT -- same three cadences, two things changed.
+    # BATCH 1000 matches the cluster rig (val_cap and churn_rate follow it), and
+    # fixed_scale 0.8 puts the live LR at exactly 1.0e-4 against the first cut's
+    # 1.5625e-5. The first cut measured val_gap 0.36/0.59/1.36 at N=20/50/100 with
+    # the policy barely moving; reuse cannot hurt a policy that is not changing,
+    # so a 6.4x LR is the condition under which the knee should move IN.
+    hc2 = {'rr_hc2_n20':  (20,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8),
+           'rr_hc2_n50':  (50,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8),
+           'rr_hc2_n100': (100, True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8)}
     arms = {}
     for name, (every, store_all, fwd_frac) in spec.items():
         cfg = build(name, every, store_all, fwd_frac)
@@ -287,6 +321,15 @@ def main():
         cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps)
         check(cfg, name, every, store_all)
         assert cfg['checkpoint_name'].startswith(warm) and cfg['prior_model_name'].startswith(warm), name
+        arms[name] = cfg
+    for name, (every, store_all, fwd_frac, boot, warm, steps, batch, lrs) in hc2.items():
+        cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps,
+                    batch=batch, lr_scale=lrs)
+        check(cfg, name, every, store_all)
+        rb = cfg['buffers']['replay_buffer']
+        assert cfg['batch_size'] == batch == cfg['max_batch_size'], name
+        assert rb['val_cap'] == batch and rb['churn_rate'] == batch, name
+        assert cfg['lr_control']['fixed_scale'] == lrs, name
         arms[name] = cfg
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:
