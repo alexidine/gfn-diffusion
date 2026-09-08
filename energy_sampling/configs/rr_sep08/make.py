@@ -143,7 +143,9 @@ TRIGGER_KEYS = ('val_gap_max', 'occupancy_min_batches')
 #         the staleness half is inert too. tau12 additionally reaches 48000 rows
 #         against max_size 50000 at full batch and would run cap-bound, which is
 #         the degenerate state that voided the local re-run.
-RETIRED = {'vg10', 'tau6', 'tau12'}
+# Their three SLOTS are reused below by the dose arms, which is why RETIRED
+# is now empty: the rows are occupied again, so nothing re-maps either way.
+RETIRED = set()
 
 ARMS = (
     # -- block 1: CONTROLLER (already submitted; rows 0-2 are running or crashed
@@ -165,7 +167,33 @@ ARMS = (
     # never be satisfied, drives N_eff to the 2-step trigger floor, and asks for
     # ~300 batches of buffer. That arm would spend 12h pinned against max_size
     # measuring overflow eviction.
-    ('vg10',        'mip', N_LOOSE, {'val_gap_max': 1.0}),
+    # -- SLOT 3 (was vg10). THE DOSE TEST ---------------------------------------
+    # Memorisation goes as D = N * lr * w_eff / B, fitted at lambda ~ 0.0195*D^0.75
+    # (R2 0.935) over six local arms spanning 12.8x in D. `w` is the ONE factor in
+    # that law never varied anywhere in the corpus -- its exponent is assumed, not
+    # measured -- and it is also the only factor that is FREE: N costs energy
+    # calls, w costs nothing.
+    #
+    # These three arms and the existing n20_det form a D-matched set reached by
+    # three different (N, w) routes, plus a pure-w contrast:
+    #
+    #   n20_det    N= 20  tb=1.0   D ~  20   (already in the battery, position 9)
+    #   dose_n50   N= 50  tb=0.4   D ~  20   matched, 2.5x fewer energy calls
+    #   dose_n200  N=200  tb=0.1   D ~  20   matched, 10x fewer energy calls
+    #   dose_w10   N= 20  tb=0.1   D ~   2   pure w at fixed N -- the exponent
+    #   vg_off     N=200  tb=1.0   D ~ 200   the UNCOMPENSATED control (position 6)
+    #
+    # PREDICTION: the three D~20 arms land together on lambda_tau and
+    # val_gap_nats despite a 10x span in N and in energy cost; dose_w10 sits
+    # 10^0.75 = 5.6x below them; vg_off sits 5.6x above.
+    # IF IT HOLDS, the cadence penalty is cancellable in config -- ship
+    # replay_tb ~ 20/N and let N be set by the speedup curve alone. IF IT FAILS,
+    # w is not interchangeable with N and per-row exposure separates from
+    # support recency, which no run in the corpus currently distinguishes.
+    #
+    # All three are DETERMINISTIC (val_gap_max 0): a firing trigger would change
+    # admissions and so change the dose being matched. check() enforces it.
+    ('dose_n200',   'mip', N_LOOSE, {'replay_tb': 0.1, 'val_gap_max': 0.0}),
     ('vg20',        'mip', N_LOOSE, {'val_gap_max': 2.0}),
     ('vg40',        'mip', N_LOOSE, {'val_gap_max': 4.0}),
     # bar 0 disables it (_rollout_trigger_fires skips bars <= 0): the
@@ -178,8 +206,9 @@ ARMS = (
     # NB these carry the SHIPPED bar (4.0), not 2.0 -- one override per arm, and
     # the shipped bar is the right control for a tau sweep. Named for what they
     # actually vary.
-    ('tau6',        'mip', N_LOOSE, {'tau_over_n': 6}),
-    ('tau12',       'mip', N_LOOSE, {'tau_over_n': 12}),
+    # -- SLOTS 7-8 (were tau6/tau12). The rest of the D-matched set; see slot 3.
+    ('dose_n50',    'mip', 50,      {'replay_tb': 0.4, 'val_gap_max': 0.0}),
+    ('dose_w10',    'mip', N_SHIP,  {'replay_tb': 0.1, 'val_gap_max': 0.0}),
 
     # -- block 4: deterministic reference points --------------------------------
     # Fixed cadence, no adaptive bar, so an adaptive arm that settles at N_eff=X
@@ -210,7 +239,8 @@ ARMS = (
 
 
 OVERRIDE_KEYS = {'ratchet_tol', 'bwd_hi', 'gain_mult', 'tau_over_n',
-                 'val_gap_max', 'fill_process_var', 'batch', 'freeze_pb'}
+                 'val_gap_max', 'fill_process_var', 'batch', 'freeze_pb',
+                 'replay_tb'}
 
 
 def _fused(cfg, active_only=False):
@@ -281,6 +311,19 @@ def _apply(cfg, every, ov):
     if 'fill_process_var' in ov:
         cfg['z_calibration']['fill_process_var'] = float(ov['fill_process_var'])
 
+    if 'replay_tb' in ov:
+        # THE DOSE KNOB, and the only one that reaches w without touching fracs.
+        # Memorisation goes as D = N * lr * w_eff / B with w_eff = fracs.replay *
+        # replay_loss_coeffs.tb. `fracs.replay` is railed at [0.1, ...] by
+        # gated_ramp and also gates deactivate_threshold, so it CANNOT carry the
+        # sweep; the coefficient multiplies the TB loss directly
+        # (gflownet_losses.py: `losses.append(tb_loss * loss_coeffs.tb)`) and the
+        # branch stays fully live. Both readouts are invariant to it:
+        # val_gap_nats is built from raw residuals in nats, and lambda_tau is a
+        # RATIO of ema to birth loss, so a common factor cancels.
+        assert 'replay_loss_coeffs' in cfg, 'no replay_loss_coeffs to scale'
+        cfg['replay_loss_coeffs']['tb'] = float(ov['replay_tb'])
+
     for st in _fused(cfg):
         bal = st['balance']
         if 'ratchet_tol' in ov:
@@ -313,6 +356,11 @@ def _apply(cfg, every, ov):
 def check(cfg, name, fam, every, ov):
     tau_over_n = ov.get('tau_over_n', TAU_OVER_N_SHIP)
     where = name + ': '
+    if 'replay_tb' in ov:
+        assert cfg['replay_loss_coeffs']['tb'] == float(ov['replay_tb']), where + 'replay_tb'
+        assert ov.get('val_gap_max') == 0.0, where + (
+            'a dose arm MUST be deterministic -- a firing trigger changes '
+            'admissions and so changes the very dose being matched')
 
     st = _fused(cfg)
     active = _fused(cfg, active_only=True)

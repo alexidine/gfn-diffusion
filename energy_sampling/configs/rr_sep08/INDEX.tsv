@@ -2,12 +2,12 @@ arm	warm_src	fwd_rollout_every	tau_over_n	batch	override
 base	pt100_mip_lr4p0	20	3	1000	-
 tol05	pt100_mip_lr4p0	20	3	1000	ratchet_tol=0.5
 cap75	pt100_mip_lr4p0	20	3	1000	bwd_hi=0.75
-RETIRED_vg10	pt100_mip_lr4p0	200	3	1000	retired 2026-09-08
+dose_n200	pt100_mip_lr4p0	200	3	1000	replay_tb=0.1,val_gap_max=0.0
 vg20	pt100_mip_lr4p0	200	3	1000	val_gap_max=2.0
 vg40	pt100_mip_lr4p0	200	3	1000	val_gap_max=4.0
 vg_off	pt100_mip_lr4p0	200	3	1000	val_gap_max=0.0
-RETIRED_tau6	pt100_mip_lr4p0	200	6	1000	retired 2026-09-08
-RETIRED_tau12	pt100_mip_lr4p0	200	12	1000	retired 2026-09-08
+dose_n50	pt100_mip_lr4p0	50	3	1000	replay_tb=0.4,val_gap_max=0.0
+dose_w10	pt100_mip_lr4p0	20	3	1000	replay_tb=0.1,val_gap_max=0.0
 n20_det	pt100_mip_lr4p0	20	3	1000	val_gap_max=0.0
 n50_det	pt100_mip_lr4p0	50	3	1000	val_gap_max=0.0
 mipu_b1600	pt100_mipu_lr4p0	200	3	1600	-
