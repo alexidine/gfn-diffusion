@@ -237,7 +237,7 @@ epochs: 4
 # remaining gap per 10k steps, so halving takes ~56k and the rate is itself decaying.
 # 60k was not enough to see a plateau twice over; this is.
 
-eval_period: 100  # beyond the 4-step smoke horizon; the eval batch source does not yet carry embeddings
+eval_period: 2  # eval now RUNS in the smoke; it was stepped around before
 
 # ============================================================================
 # EXIT CRITERION -- rate of improvement, not slope. Currently PUBLISHED AND NOT
@@ -290,7 +290,7 @@ progress_gate:
   # step 3,000 all the way to 200,000.
   veto_metrics:
     - { key: 'w1r/worst', target_key: 'w1r/perfect_worst' }
-figs_period: 100  # beyond the 4-step smoke horizon; the eval batch source does not yet carry embeddings
+figs_period: 2  # eval now RUNS in the smoke; it was stepped around before
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
 # throughput -- whose answer is the CONSTANT batch_size = fused_grad_accum_min_samples,

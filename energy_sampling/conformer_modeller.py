@@ -790,6 +790,30 @@ class ConformerModeller(Modeller):
 
     # -------------------------------------------------------------- datasets
 
+    @staticmethod
+    def _as_run_dtype(batch):
+        """Cast a batch's float tensors to the run's dtype, in place.
+
+        Condition and prior files are written under float64 (the builder sets it for its
+        geometry checks) while the run is float32. Storage precision is only free where the
+        tensor never meets a parameter, and these do -- states feed the policy, embeddings
+        feed the conditioner -- so a double batch raises at the first matmul.
+        """
+        want = torch.get_default_dtype()
+        for key, val in list(batch._store.items()):
+            if torch.is_tensor(val) and val.is_floating_point() and val.dtype != want:
+                batch[key] = val.to(want)
+        return batch
+
+    @staticmethod
+    def _read_graph_file(path, what):
+        blob = torch.load(path, weights_only=False, map_location='cpu')
+        if not isinstance(blob, dict) or 'prior' not in blob:
+            raise SystemExit(
+                f'{path} is not a graph-form {what} file; expected a dict with a `prior` key '
+                f'as written by build_conformer_conditions.py')
+        return blob
+
     def init_mol_dataset(self):
         """One condition: the molecule itself, carrying no state.
 
@@ -798,6 +822,26 @@ class ConformerModeller(Modeller):
         zero of this parameterisation.
         """
         from energies.conformer_data import collate_conditions, condition_from_energy
+
+        # THE CONDITION SET IS THE FILE, when there is one. Rebuilding it from
+        # `self.energy_function` gives two copies of ONE molecule carrying no embeddings, so
+        # on the conditional route every evaluation drew a batch the policy could not be
+        # conditioned on -- `condition_samples` then refused it. Same shape as the prior
+        # intake, and the same fix: read the set that the run actually trains over.
+        path = getattr(self.args, 'molecules_path', None)
+        if path:
+            batch = self._as_run_dtype(self._read_graph_file(path, 'conditions')['prior'])
+            self.mol_dataset = ConformerBuffer(batch,
+                                               device=self.buffer_device,
+                                               **self._buffer_kwargs(),
+                                               exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
+            self.test_mol_dataset = None
+            n_mols = len(set(batch.identifier)) if hasattr(batch, 'identifier') else 1
+            has_emb = getattr(batch, 'embedding', None) is not None
+            print(f'mol_dataset: {batch.num_graphs} condition(s) over {n_mols} molecule(s) '
+                  f'from {path}' + ('; embeddings present' if has_emb else
+                                    '; NO embeddings -- eval cannot be conditioned'))
+            return
 
         cond = condition_from_energy(self.energy_function,
                                      identifier=self.energy_function.smiles)
@@ -961,11 +1005,7 @@ class ConformerModeller(Modeller):
         # read by nothing.
         graph_prior = getattr(self.args, 'prior_path', None)
         if graph_prior:
-            blob = torch.load(graph_prior, weights_only=False, map_location='cpu')
-            if not isinstance(blob, dict) or 'prior' not in blob:
-                raise SystemExit(
-                    f'{graph_prior} is not a graph-form prior file; expected a dict with a '
-                    f'`prior` key as written by build_conformer_conditions.py --prior-out')
+            blob = self._read_graph_file(graph_prior, 'prior')
             batch = blob.get('equalized_prior', None) or blob['prior']
             # CAST TO THE RUN'S DTYPE. build_conformer_conditions runs under float64 for its
             # geometry checks, so every float tensor on the file is double while the run is
@@ -973,10 +1013,7 @@ class ConformerModeller(Modeller):
             # parameter, and these do: states feed the policy and the embeddings feed the
             # conditioner, so a double batch raises `expected m1 and m2 to have the same
             # dtype` at the first matmul rather than merely wasting memory.
-            want = torch.get_default_dtype()
-            for key, val in list(batch._store.items()):
-                if torch.is_tensor(val) and val.is_floating_point() and val.dtype != want:
-                    batch[key] = val.to(want)
+            batch = self._as_run_dtype(batch)
             e_t = getattr(batch, 'conformer_energy', None)
             if e_t is None:
                 raise SystemExit(
