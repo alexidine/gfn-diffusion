@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: q05
+run_name: vg10
 tag: rr08
 seed: 12345
 device: cuda
@@ -233,7 +233,7 @@ z_calibration:
   se2_floor: 0.25
   holdout_modulus: 8
   fill_mode: absorb
-  fill_process_var: 0.05
+  fill_process_var: 0.01
   fill_moment_reset: 0.5
   fill_from_eval: fill
 conditional_worst_quantile: 0.25
@@ -304,10 +304,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 1.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -392,10 +391,9 @@ protocols:
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 1.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -475,10 +473,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 1.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -522,8 +519,8 @@ buffers:
     source: anchors
   replay_buffer:
     churn_rate: 1000
-    mean_residence_steps: 100
-    max_size: 12000
+    mean_residence_steps: 600
+    max_size: 50000
     admit_reward_min: -200
     prioritise:
       enabled: true

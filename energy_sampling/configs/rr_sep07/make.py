@@ -83,9 +83,36 @@ def deltas(cfg, name, every, fam):
             # nats all run at N=7, so that cadence was far more often than the Z
             # pin needed.
             st['fwd_rollout_triggers'] = {
-                'ess_min': 0.10,            # replay/policy_drift_ess_frac; v2 ended 0.30
-                'val_gap_max': 4.0,         # replay/val_gap_nats, ~8x its se on v2 (0.44)
-                'occupancy_min_batches': 2.0,   # O >= B is hard; 2B leaves reaction room
+                # OVERFIT IS THE CONTROLLING BAR (owner 2026-09-08). It is the only
+                # one of the three replay sensors that is both unconfounded and NOT
+                # self-correcting: reuse is N identically, and nothing in the system
+                # pushes back on memorisation the way the prioritised draw pushes
+                # back on drift. Since reuse = N = 1/(energy calls per step), an
+                # overfit-driven cadence is literally a quality-vs-compute dial.
+                # The BAR ITSELF IS NOT CALIBRATED: 1.25 nats measured at reuse 20
+                # is 8.6 sigma, but whether that level is harmful is unknown. 4.0 is
+                # a guess with the resolution floor (~2 sigma) behind it.
+                'val_gap_max': 4.0,
+                # The draw needs something to draw from. NOTE this reading is
+                # len(buffer)/batch_size, which in steady state IS tau/N -- it is the
+                # configured ratio, not an independent measurement.
+                # 2.0, one half-burst below the tau/N = 3 floor. Occupancy
+                # sawtooths -- B admitted per burst, ~B drained between -- so the
+                # TROUGH is what the bar sees: O_trough/B = tau/N - 0.5 = 2.5.
+                # A bar AT the ratio would fire every cycle; at 2.0 there is 25%
+                # headroom and it fires only on a genuine shortfall (initial fill,
+                # a batch growth the buffer has not caught up with, a servo churn
+                # boost). Owner rule 2026-09-08: never below 2 batches.
+                'occupancy_min_batches': 2.0,
+                # ess_min RETIRED. policy_drift_ess_frac is Kish on exp(d), so it is
+                # scale-invariant and reads 1.000 when EVERY row's log p_F drops by
+                # the same 5.7 nats -- it cannot see the policy walking away from the
+                # buffer, only the spread. It was also the ONLY bar firing on the
+                # rr08 arms (360 times, +36% rollouts, effective cadence 14.7 vs a
+                # configured 20), so it was setting the cadence off a quantity we do
+                # not want to steer on. drift_std_max stays off: same failure, and
+                # policy_drift_nats is the natural reading, which is not wired as a
+                # bar yet.
             }
             # GUARD: bar 0 on the Z-anchored channel, RATCHET on the same
             # quantity's level with tol 0. Both tolerances zero -- the guard's job
