@@ -221,9 +221,10 @@ def main(argv=None):
               + f"{r['compiled_region_entries']:16d}" + f"{r['kernel_launches']:11d}"
               + f"{r['self_cpu_ms']:13.1f}" + f"{r['self_cuda_ms']:14.1f}" + speed)
 
-    print('\nREAD THE REGION ENTRIES FIRST. If step does not cut them well below auto, '
-          'the fused compile did NOT take (suppress_errors hides that) and the timing '
-          'below it is measuring the same program twice.')
+    print('\nREAD THE LAUNCH COUNT FIRST. Region entries are NOT the cost -- cutting '
+          'them 6x bought nothing on 2026-09-07. If launches do not fall well below '
+          'eager, either the compile did not take (suppress_errors hides that) or it '
+          'fused nothing, and the timing beside it is measuring the same program.')
 
     os.makedirs(RESULTS, exist_ok=True)
     path = a.out or os.path.join(RESULTS, 'compile_rollout.json')

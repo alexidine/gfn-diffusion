@@ -2391,17 +2391,20 @@ class Modeller:
         if not enable:
             return
 
-        # 'step' COMPILES THE FUSED PER-TIMESTEP KERNELS INSTEAD OF THE SUBMODULES.
-        # Submodule compilation fuses kernels inside each MLP but leaves the
-        # boundaries between them, and each boundary is a host-side region entry:
-        # seven per timestep, ~3,000 per training step, ~2.2 s of host time
-        # (measured, p07_mip_prof 2026-09-07). That is what a CPU-heavy neighbour
-        # inflates into a low-occupancy cancellation. GFN.compile_step_kernels
-        # fuses them; flow_model stays a module compile because nothing else shares
-        # its call site. See that method for why `_fwd_step` itself is NOT the unit
-        # (its `i: int` arg specialises into ~100 graphs and silently falls back).
-        # Measure with `python -m bench.compile_rollout`, and read the REGION COUNT.
-        trunk = (('flow_model',) if step_mode
+        # 'step' COMPILES THE WHOLE PER-TIMESTEP BODY INSTEAD OF THE SUBMODULES.
+        # Measured 2026-09-07 (bench/compile_rollout.py, A100, both routes): the
+        # submodule compile removes almost no kernel launches (116,510 -> 110,098
+        # per rollout) and is SLOWER than eager (0.96x ELJ, 0.87x UMA). The MLPs are
+        # a few big GEMMs; the launches are in the elementwise SDE math around them
+        # -- ~388 kernels per step execution -- which no compiled region ever
+        # contained. compile_step_kernels compiles `_fwd_step`/`_replay_step` whole
+        # so that math is inside one graph. Nothing is listed in `trunk` for this
+        # mode on purpose: every submodule is called from inside those bodies, and
+        # nesting a compiled module inside a compiled region is not a behaviour to
+        # assume while measuring something else.
+        # Measure with `python -m bench.compile_rollout`, and read the LAUNCH COUNT:
+        # suppress_errors makes a failed compile fall back to eager silently.
+        trunk = (() if step_mode
                  else ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model'))
         try:
             # NB "as _dynamo": a bare `import torch._dynamo` would bind `torch`
