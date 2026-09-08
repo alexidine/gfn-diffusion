@@ -123,6 +123,28 @@ TRIGGER_KEYS = ('val_gap_max', 'occupancy_min_batches')
 # N=20 because nothing drifts far enough to fire it, so the bar has to be varied
 # at the cadence where it is live; pbf_mipu: the freeze needs a batch that
 # survives the night, and block 3 predicts 3200 is it).
+# RETIRED 2026-09-08, AFTER the local harm-curve work. These three keep their
+# INDEX ROW -- the sbatch resolves an arm from `INDEX.tsv` line
+# SLURM_ARRAY_TASK_ID + 2 AT TASK START, so deleting a row would silently re-map
+# every queued task below it onto a different arm. The row stays, the config is
+# not written, and the sbatch's `missing config` guard fails those tasks fast
+# (before any checkpoint glob). --array is unchanged at 0-17.
+#
+#  vg10   the bar (1.0) sits BELOW the gap it must clear. The block-2 comment
+#         already makes this argument at N=20 ("a lower bar can never be
+#         satisfied, drives N_eff to the 2-step trigger floor"); at N_LOOSE the
+#         gap is LARGER, so 1.0 latches for the same reason. A latched trigger
+#         runs at the maximal rollout rate for the rest of the arm -- the most
+#         expensive failure mode there is on an energy-bound route.
+#  tau6   tau has NO CHANNEL to what block 3 says it separates. A row's exposure
+#  tau12  is tau/O = 1/admissions (branch losses are normalised MEANS), so tau
+#         and occupancy CANCEL EXACTLY; and policy drift saturates at cluster LR
+#         (drift_std flat to slightly inverted over a 5.2x span of mean age), so
+#         the staleness half is inert too. tau12 additionally reaches 48000 rows
+#         against max_size 50000 at full batch and would run cap-bound, which is
+#         the degenerate state that voided the local re-run.
+RETIRED = {'vg10', 'tau6', 'tau12'}
+
 ARMS = (
     # -- block 1: CONTROLLER (already submitted; rows 0-2 are running or crashed
     #    and must keep their index so the INDEX still documents what they ran) --
@@ -395,6 +417,13 @@ def build():
 def emit(arms):
     rows = []
     for name, (cfg, fam, every, ov) in arms.items():
+        if name in RETIRED:
+            # position preserved, config removed -- see RETIRED above
+            (HERE / (name + '.yaml')).unlink(missing_ok=True)
+            rows.append(('RETIRED_' + name, rr07make.SRC[fam], every,
+                         cfg['buffers']['replay_buffer']['mean_residence_steps'] // every,
+                         cfg['batch_size'], 'retired 2026-09-08'))
+            continue
         with (HERE / (name + '.yaml')).open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
         rows.append((name, rr07make.SRC[fam], every,
@@ -405,7 +434,11 @@ def emit(arms):
         for r in rows:
             f.write('%s\t%s\t%d\t%d\t%d\t%s\n' % r)
     for r in rows:
+        if r[0].startswith('RETIRED_'):
+            assert not (HERE / (r[0][len('RETIRED_'):] + '.yaml')).exists(),                 'retired arm still has a config: ' + r[0]
+            continue
         assert (HERE / (r[0] + '.yaml')).exists(), 'index names a missing config: ' + r[0]
+    assert len(rows) == len(ARMS), 'INDEX row count changed -- queued tasks would RE-MAP'
 
     text = p02make._HEAD.format(
         wall=WALL, last=len(rows) - 1, jobname='rr08', index='INDEX.tsv',
