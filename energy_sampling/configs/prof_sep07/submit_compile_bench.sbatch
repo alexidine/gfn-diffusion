@@ -37,6 +37,8 @@ if [ -z "${MIP}" ] || [ -z "${MIPU}" ]; then
     echo "FATAL: could not resolve both phase-1 exit checkpoints" >&2
     ls ${CKPTS}/*phase1_exit.pt >&2; exit 1
 fi
+echo "NODE: $(hostname)   PARTITION: ${SLURM_JOB_PARTITION}"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "ELJ  checkpoint: $(basename ${MIP})"
 echo "UMA  checkpoint: $(basename ${MIPU})"
 nvidia-smi -L
@@ -51,9 +53,9 @@ srun singularity exec --nv \
         export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         echo '================================================== ELJ (mip), batch 4000'
         python -u -m bench.compile_rollout --checkpoint ${MIP}  --modes eager,auto,step \
-            --batch 4000 --T 100 --reps 5 --out bench/results/compile_rollout_mip.json
+            --batch 4000 --T 100 --reps 5 --out bench/results/compile_rollout_mip_\${SLURM_JOB_ID}.json
         echo
         echo '================================================== UMA (mipu), batch 1600'
         python -u -m bench.compile_rollout --checkpoint ${MIPU} --modes eager,auto,step \
-            --batch 1600 --T 100 --reps 5 --out bench/results/compile_rollout_mipu.json
+            --batch 1600 --T 100 --reps 5 --out bench/results/compile_rollout_mipu_\${SLURM_JOB_ID}.json
     "
