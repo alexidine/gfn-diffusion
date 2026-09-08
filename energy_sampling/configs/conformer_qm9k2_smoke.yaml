@@ -6,10 +6,10 @@
 # the checkpoint problem_def's schema_version (which versions problem identity).
 project_state_version: 10
 
-run_name: 'gly4_mle_clean_aug24a'  # TB on the prebuilt semi-optimized prior dataset; fixed LR
+run_name: 'qm9k2_conditional_smoke'
 tag: 'conformer'
 seed: 12345
-device: 'cuda'
+device: 'cpu'  # CPU smoke: wiring only, no training claim
 cuda_memory_fraction: 0.9
 anomaly_detection: false  # dramatic slowdown when True
 
@@ -28,8 +28,8 @@ load_weights_only: false     # FULL load -- this is a resume into phase 1, not a
 # optimizers, condition_log_z and the step count all start FRESH, so every baked energy in
 # every buffer is scored WITH energy_clip active. Restoring the MLE run's buffers instead
 # would mix clipped and unclipped rows in one buffer and nothing would raise.
-prior_path: 'conformer_prior_emb.pt'  # same builder, --prior-out. Must carry matching .identifier fields, since init_identifiers mints mol_id across both files
-molecules_path: 'conformer_conditions_emb.pt'  # the multi-molecule condition set, WITH embeddings baked on. Build it: python build_conformer_conditions.py --smiles <...> --encoder-ckpt models/results/encoder_ckpt/mp+attn+spd_n20000_s0.pt --out conformer_conditions_emb.pt --prior-out conformer_prior_emb.pt   (one file is ONE k)
+prior_path: 'C:/Users/mikem/AppData/Local/Temp/claude/C--Users-mikem-Projects-mxt-gfn-gfn-diffusion-energy-sampling/dfa892d3-7c2f-48dd-9572-9310066fdf37/scratchpad/qm9k2_prior.pt'  # 9,000 rows (45 x 200)
+molecules_path: 'C:/Users/mikem/AppData/Local/Temp/claude/C--Users-mikem-Projects-mxt-gfn-gfn-diffusion-energy-sampling/dfa892d3-7c2f-48dd-9572-9310066fdf37/scratchpad/qm9k2_conditions.pt'  # 45 QM9 molecules, k=2, embeddings baked
 test_molecules_path: null  # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent
 archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
@@ -222,19 +222,22 @@ model:
 
 # training params
 ################################################################
-buffer_device: cuda  # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
-batch_size: 256  # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
+buffer_device: cpu  # SMOKE: cpu, not cuda. `device: cpu` alone does NOT make the run
+                    # CPU-only -- the buffers and datasets live wherever this says, so
+                    # a 'cpu' run with buffer_device: cuda still allocates on the card
+                    # and still co-tenants with whatever else holds it.
+batch_size: 8  # tiny: this run exercises the path, it does not learn
 grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 20000  # matched to mk_dev; the sizer stops where OCCUPANCY says, and a low cap silently becomes the binding bound (it reported exactly that at 1024)
 eval_num_samples: 2048  # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 150000  # train_prior is terminal (no exit block), so this is the whole run.
+epochs: 4
 # Sized from the MEASURED rate rather than guessed: w1r/median improves ~11.6% of its
 # remaining gap per 10k steps, so halving takes ~56k and the rate is itself decaying.
 # 60k was not enough to see a plateau twice over; this is.
 
-eval_period: 500  # how often to do evaluation & reporting  |  project cadence
+eval_period: 100  # beyond the 4-step smoke horizon; the eval batch source does not yet carry embeddings
 
 # ============================================================================
 # EXIT CRITERION -- rate of improvement, not slope. Currently PUBLISHED AND NOT
@@ -287,7 +290,7 @@ progress_gate:
   # step 3,000 all the way to 200,000.
   veto_metrics:
     - { key: 'w1r/worst', target_key: 'w1r/perfect_worst' }
-figs_period: 1000  # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire  |  project cadence; must be a multiple of eval_period
+figs_period: 100  # beyond the 4-step smoke horizon; the eval batch source does not yet carry embeddings
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
 # throughput -- whose answer is the CONSTANT batch_size = fused_grad_accum_min_samples,
@@ -708,8 +711,10 @@ buffers:
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
     churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover
-    min_size: 10000
-    max_size: 250000
+    min_size: 0  # SMOKE: 0 disables grow_prior_buffer, whose generator
+                 # draws from the single config molecule and cannot append
+                 # to a 45-molecule resident batch
+    max_size: 9000  # = the seeded row count, so nothing is missing
     init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
     expire_max_frac: 0.1  # per manage call, max fraction of the buffer purged for no longer clearing energy < Emin(c) + ramp_floor. 0 = channel off
     anchor_floor_frac: 0.1  # per churn cycle, minimum share of each condition's intake drawn from anchor_buffer. 0 = pooled shortfall backfill only
@@ -821,10 +826,13 @@ embedding_conditioning_dim: 256  # 2 x the encoder hidden (128). The pooled read
 energy_config:
   # THE PROBLEM. `level` has no default anywhere and ConformerTorsions takes no **kwargs,
   # so a config that omits it fails at construction rather than silently running `torsion`.
-  smiles: 'NCC(=O)NCC(=O)NCC(=O)NCC(=O)O'  # tetraglycine. Acyclic and achiral: no ring
+  smiles: 'CCC(=O)CC'  # SMOKE ONLY. The energy function is SINGLE-MOLECULE;
+            # a 45-molecule batch is scored as if every row were this
+            # molecule. Rewards are therefore MEANINGLESS -- this run
+            # exercises the conditioning WIRING, nothing else.
   # bank involved and no stereocentre, so this rung isolates LONG-RANGE TORSIONAL
   # COUPLING and nothing else. 28 free torsions against phenyl-THP's 16.
-  level: 'full'
+  level: 'torsion'  # must match the dataset's k
   force_field: 'mmff'
   log_temperature: 0.0
   temperature: 1.0
@@ -859,7 +867,7 @@ energy_config:
   # because TB is off-policy -- the fixed point does not depend on the backward terminal
   # distribution -- but it means the backward branch is being taught good states rather
   # than the thermal shape, which the policy then has to supply itself.
-  prior_dataset_path: 'conformer_prior_dataset_20k.pt'
+  prior_dataset_path: null  # the graph-form prior rides on prior_path; this key wants a FLAT {'states','energies'} file, a different artefact
   prior_sample_size: 50000   # rows drawn from the prior model when no prior dataset exists
   prior_relax_steps: 10      # REQUIRED on a chain this long -- see ConformerModeller
   # ._draw_prior_states. The prior draws torsions independently so the chain walks

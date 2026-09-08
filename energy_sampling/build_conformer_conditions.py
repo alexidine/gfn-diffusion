@@ -39,6 +39,7 @@ from energies.conformer_data import (attach_states, bake_energies, check_state_c
                                      collate_conditions, condition_from_energy,
                                      save_condition_file, save_prior_file)
 from energies.conformer_torsions import ConformerTorsions
+from energies.dof_features import free_dof_atom_index
 from models import encoder_cache
 
 
@@ -84,6 +85,10 @@ def main():
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--no-check", action="store_true",
                     help="skip the graph-vs-energy geometry check (don't)")
+    ap.add_argument("--k", type=int, default=None,
+                    help="keep only molecules with this state dimension. Default: take k from "
+                         "the first molecule that builds. A conditions file is ONE k, and k is "
+                         "not a stable property of the SMILES -- see known gap 2")
     ap.add_argument("--encoder-ckpt", type=Path, default=None,
                     help="bake a frozen molecular embedding onto every entry, so the policy "
                          "can be conditioned on molecular identity. Writes per-graph "
@@ -110,12 +115,49 @@ def main():
               f"hidden {bundle['hidden']}  ->  embedding_conditioning_dim: "
               f"{2 * bundle['hidden']}")
 
-    conditions, energies = [], []
+    conditions, energies, dof_rows, skipped = [], [], [], []
+    want_k = int(args.k) if args.k else None
     for smiles, ident in zip(args.smiles, identifiers):
         # see build_conformer_buffer.py: `torsion` is explicit, not a default. The
         # condition/prior file format stores per-graph `torsion_state` and n_torsions,
         # both of which mean something else at a wider level.
-        energy = ConformerTorsions(smiles=smiles, device="cpu", level="torsion", **ff)
+        try:
+            energy = ConformerTorsions(smiles=smiles, device="cpu", level="torsion", **ff)
+        except Exception as exc:                              # noqa: BLE001 - reported below
+            skipped.append((smiles, f"{type(exc).__name__}: {exc}"))
+            continue
+        # K IS DECIDED BY THE FIRST MOLECULE (or --k) AND THE REST MUST MATCH.
+        # `collate_conditions` refuses a mixed-k file, but it refuses at the END, after every
+        # molecule has been built and priors possibly drawn -- and `check_state_convention`
+        # gets there first with a bare IndexError naming neither the molecule nor k. Worse,
+        # k is NOT a stable property of the SMILES: section 6's second known gap is that the
+        # chart is measured off a reference conformer, so the same molecule can present a
+        # different d from a different embedding. Filtering here means a molecule set can be
+        # handed in whole and the file comes out coherent, with the rejects named.
+        # THE CHART AND THE COLLECTIVE MAP MUST AGREE ON HOW MANY COLUMNS THERE ARE.
+        # `energy.mask` carries one column per ROTATABLE AXIS while `_M` and `data_ndim`
+        # carry one per SURVIVING axis, and they disagree whenever an axis is dropped as
+        # degenerate. `_state_columns` reads `mask`, so it then emits a column index the
+        # state cannot hold: `condition_from_energy` succeeds and `check_state_convention`
+        # dies deep in `state_to_phi` with a bare IndexError naming neither the molecule nor
+        # the mismatch -- and had the surplus column not been LAST, rows would have been
+        # attributed to the wrong state dimension with no error at all.
+        #
+        # Measured on 400 QM9 molecules: 11 (2.8%) disagree, and EVERY ONE CONTAINS AN
+        # ALKYNE -- rotation about a bond adjacent to a linear C#C. This also violates the
+        # invariant tests/conformer/test_conformer_levels.py asserts, so it is an upstream
+        # defect in the chart, not a property a dataset should absorb. Refusing here keeps
+        # the file coherent and names the molecules instead of writing quiet nonsense.
+        if int(energy.mask.shape[1]) != int(energy._M.shape[1]):
+            skipped.append((smiles, f"chart defect: mask has {int(energy.mask.shape[1])} "
+                                    f"columns, _M has {int(energy._M.shape[1])} (alkyne?)"))
+            continue
+        k_here = int(energy.data_ndim)
+        if want_k is None:
+            want_k = k_here
+        if k_here != want_k:
+            skipped.append((smiles, f"k={k_here}, file is k={want_k}"))
+            continue
         print(energy.describe())
         mol = condition_from_energy(energy, identifier=ident)
         if not args.no_check:
@@ -130,8 +172,46 @@ def main():
                                           perm=energy.spec.perm, z_tree=energy.spec.z)
             mol.embedding = g[None, :].to(torch.get_default_dtype())
             mol.atom_embedding = h.to(torch.get_default_dtype())
+            a, msk = free_dof_atom_index(energy)
+            dof_rows.append((mol, a, msk))
         conditions.append(mol)
         energies.append(energy)
+
+    if dof_rows:
+        # R IS GLOBAL ACROSS THE FILE, not per molecule. A state column at level='torsion' is
+        # collective and owns however many dihedral rows its bond drives -- 3 for one
+        # molecule, 2 for the next -- and PyG concatenates these along dim 0, which requires
+        # dim 1 to agree. Padding per molecule would fail at collation; padding to the file's
+        # maximum makes the ragged dimension a property of the FILE, which is what the
+        # consumer can reason about.
+        R = max(a.shape[1] for _, a, _ in dof_rows)
+        for mol, a, msk in dof_rows:
+            pa = np.zeros((a.shape[0], R, a.shape[2]), dtype=np.int64)
+            pm = np.zeros((a.shape[0], R), dtype=bool)
+            pa[:, :a.shape[1]] = a
+            pm[:, :msk.shape[1]] = msk
+            # FLATTENED TO ONE ROW PER GRAPH, not left as [k, R, frame]. MolData's
+            # `append_batch` classifies a tensor by matching dim 0 to the node or the graph
+            # count; a [k, R, frame] field matches neither, so it is taken for SHARED
+            # metadata and validated for equality across molecules -- which fails the moment
+            # two molecules differ, i.e. always. As [1, k*R*frame] it is an ordinary
+            # graph-level field that concatenates, replicates across prior states, and
+            # survives the collate. `ConformerGFN.bind_molecular_conditioning` restores the
+            # shape from k and MAX_FRAME.
+            mol.dof_atoms = torch.as_tensor(pa).reshape(1, -1)
+            mol.dof_mask = torch.as_tensor(pm).reshape(1, -1)
+        print(f"   DoF atom frames: R = {R} (widest collective column in this file)")
+
+    if skipped:
+        print("")
+        print(f"{len(skipped)} of {len(args.smiles)} molecules skipped:")
+        why = {}
+        for smi, reason in skipped:
+            why.setdefault(reason.split(',')[0], []).append(smi)
+        for reason, smis in sorted(why.items(), key=lambda kv: -len(kv[1]))[:6]:
+            print(f"   {len(smis):4d}  {reason}   e.g. {smis[0]}")
+    if not conditions:
+        raise SystemExit("no molecules survived; nothing to write")
 
     batch = collate_conditions(conditions)
     save_condition_file(batch, args.out)

@@ -396,6 +396,15 @@ class ConformerModeller(Modeller):
                if k not in _NON_ENERGY_KEYS}
         cfg['device'] = str(self.device)
         cfg['temperature_conditioning'] = self.args.temperature_conditioning
+        # FROM THE TOP LEVEL, like temperature_conditioning and for the same reason: these
+        # live beside it in the config because `train.get_conditioning_dim` reads them there
+        # to size the conditioner. Forwarding them here is what keeps the two halves of the
+        # contract agreeing -- without it the conditioner is built 256 wide while the energy
+        # still emits a 1-wide zeros column, and the mismatch surfaces as a bare
+        # `mat1 and mat2 shapes cannot be multiplied (8x1 and 256x512)` inside the MLP.
+        cfg['embedding_conditioning'] = bool(getattr(self.args, 'embedding_conditioning', False))
+        cfg['embedding_conditioning_dim'] = getattr(
+            self.args, 'embedding_conditioning_dim', None)
 
         # FILTERED AGAINST THE SIGNATURE, AND THE DROPS ARE ANNOUNCED. energy_config is
         # shared with the crystal route and carries keys this energy has no concept of
@@ -459,7 +468,8 @@ class ConformerModeller(Modeller):
     #: NAMES ARE PREFIXED DELIBERATELY. `policy_layers` and `policy_hidden_dim` already
     #: exist in the model block as the FLAT policy's own GFN arguments; popping either
     #: would silently unbuild the flat path.
-    _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers')
+    _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
+                    'set_policy_corr_dim')
 
     def init_gfn(self):
         """Base build, then swap the flat policy for the set policy if asked."""
@@ -506,21 +516,47 @@ class ConformerModeller(Modeller):
                 f"TRANSPOSED -- finite, plausible and wrong. Set dplr_rank: 0 for this run.")
 
         from copy import deepcopy
-        from models.set_policy import set_policy_for
+        from models.set_policy import conditional_set_policy_for, set_policy_for
 
-        policy = set_policy_for(
-            self.energy_function, int(self.gfn_config['t_dim']),
-            hidden_dim=int(spec.get('set_policy_hidden', 64)),
-            layers=int(spec.get('set_policy_layers', 4)),
-            out_per_token=2).to(self.device)
+        common = dict(hidden_dim=int(spec.get('set_policy_hidden', 64)),
+                      layers=int(spec.get('set_policy_layers', 4)),
+                      out_per_token=2)
+        conditional = bool(getattr(self.args, 'embedding_conditioning', False))
+        if conditional:
+            mol_dim = int(getattr(self.args, 'embedding_conditioning_dim', 0) or 0)
+            if not mol_dim:
+                raise ValueError(
+                    'embedding_conditioning is on but embedding_conditioning_dim is unset; '
+                    'the set policy needs the width to build its context input')
+            policy = conditional_set_policy_for(
+                self.energy_function, int(self.gfn_config['t_dim']), mol_dim,
+                corr_dim=int(spec.get('set_policy_corr_dim', 32)), **common).to(self.device)
+        else:
+            policy = set_policy_for(
+                self.energy_function, int(self.gfn_config['t_dim']), **common).to(self.device)
         self.gfn_model.forward_policy = policy
+
+        if conditional:
+            # RE-CLASS, in the same post-construction spirit as the policy swap above and for
+            # the same reason: `models/gfn.py` is shared with crystal. `ConformerGFN` adds no
+            # constructor state beyond `_mol_cond`, which is set here, so rebinding __class__
+            # is exactly equivalent to having built one -- and it keeps the conformer route's
+            # only structural need (carrying the molecule into the policy call) out of the
+            # shared file. The EMA copy is taken AFTER, so it inherits the class.
+            from models.conformer_gfn import ConformerGFN
+            self.gfn_model.__class__ = ConformerGFN
+            self.gfn_model._mol_cond = None
+
         self.ema_model = deepcopy(self.gfn_model)
         self.init_schedulers_optimizers()
 
         n_new = sum(p.numel() for p in policy.parameters())
-        print(f"policy: SET over {policy.dim} coordinate tokens, {n_new:,} params, "
-              f"width independent of dim; the flat scalarMLP is replaced and the "
-              f"optimizers were rebuilt over it")
+        print(f"policy: {'CONDITIONAL ' if conditional else ''}SET over {policy.dim} "
+              f"coordinate tokens, {n_new:,} params, width independent of dim; the flat "
+              f"scalarMLP is replaced and the optimizers were rebuilt over it")
+        if conditional:
+            print(f"        f_j is LEARNED from per-atom embeddings (DoFCorrelator); the "
+                  f"pooled {mol_dim}-d molecular embedding joins rho's context")
 
     def _resolve_periodic_centroid_axes(self):
         """No cell, so no centroids to wrap. config_invariants refuses the flag outright."""
@@ -853,6 +889,59 @@ class ConformerModeller(Modeller):
         ON -- the path that benchmarks 32x-87000x over uniform-on-box.
         """
         from energies.conformer_data import attach_states, bake_energies, condition_from_energy
+
+        # MULTI-MOLECULE GRAPH-FORM PRIOR, and it is the only intake that can carry a
+        # molecule SET. Everything below this branch rebuilds the batch from
+        # `self.energy_function`, which is ONE molecule (problem.smiles) -- so the states may
+        # vary but the graph, and therefore the condition, never does. A conditional run needs
+        # per-row molecular identity to survive into the backward branch, and the frozen
+        # embeddings ride on the graph, so the batch has to be taken off disk WHOLE rather
+        # than reconstructed. `prior_path` was previously named only in an error message and
+        # read by nothing.
+        graph_prior = getattr(self.args, 'prior_path', None)
+        if graph_prior:
+            blob = torch.load(graph_prior, weights_only=False, map_location='cpu')
+            if not isinstance(blob, dict) or 'prior' not in blob:
+                raise SystemExit(
+                    f'{graph_prior} is not a graph-form prior file; expected a dict with a '
+                    f'`prior` key as written by build_conformer_conditions.py --prior-out')
+            batch = blob.get('equalized_prior', None) or blob['prior']
+            # CAST TO THE RUN'S DTYPE. build_conformer_conditions runs under float64 for its
+            # geometry checks, so every float tensor on the file is double while the run is
+            # float32. Storage precision is only free where the tensor never meets a
+            # parameter, and these do: states feed the policy and the embeddings feed the
+            # conditioner, so a double batch raises `expected m1 and m2 to have the same
+            # dtype` at the first matmul rather than merely wasting memory.
+            want = torch.get_default_dtype()
+            for key, val in list(batch._store.items()):
+                if torch.is_tensor(val) and val.is_floating_point() and val.dtype != want:
+                    batch[key] = val.to(want)
+            e_t = getattr(batch, 'conformer_energy', None)
+            if e_t is None:
+                raise SystemExit(
+                    f'{graph_prior} carries no `conformer_energy`; prebuilt_sample_to_reward '
+                    f'reads it off the graph and REFUSES to recompute, so a file without it '
+                    f'would train on rewards that were never scored')
+            energies = torch.as_tensor(e_t).reshape(-1).to(self.energy_function.dtype)
+            self.prior_dataset = ConformerBuffer(batch,
+                                                 device=self.buffer_device,
+                                                 **self._buffer_kwargs(),
+                                                 x_fn=None,
+                                                 y_fn=self._buffer_y_fn(),
+                                                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
+                                                 )
+            e = energies.detach().cpu().numpy()
+            n_mols = len(set(batch.identifier)) if hasattr(batch, 'identifier') else 1
+            teff = 1 + 2 * (float(np.median(e)) - float(e.min())) / self.energy_function.ndim
+            print(f'prior dataset: {batch.num_graphs:,} rows over {n_mols} MOLECULES from '
+                  f'{graph_prior} -- median {np.median(e):.1f}, '
+                  f'p10 {np.percentile(e, 10):.1f}, p90 {np.percentile(e, 90):.1f} kcal/mol, '
+                  f'T_eff/T = {teff:.2f}')
+            if getattr(batch, 'embedding', None) is not None:
+                print(f'               molecular embeddings present '
+                      f'({tuple(batch.embedding.shape)}), so the backward branch is '
+                      f'condition-aware')
+            return
 
         path = getattr(self.args.energy_config, 'prior_dataset_path', None)
         n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
