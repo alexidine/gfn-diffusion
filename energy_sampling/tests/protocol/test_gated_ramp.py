@@ -63,7 +63,9 @@ class _Tracker:
 def _proto(stg, tracker, share=None):
     m = SimpleNamespace(fwd_frac=0.0, bwd_frac=0.5, replay_frac=0.5, step_ind=0,
                         metric_tracker=tracker)
-    p = SimpleNamespace(m=m, stage=stg, ctrl={'gates': {}, 'gr_share': share, 'gr_fired': 0.0})
+    p = SimpleNamespace(m=m, stage=stg, tracker=tracker,
+                        ctrl={'gates': {}, 'gr_share': share, 'gr_fired': 0.0,
+                              'gr_best': None, 'gr_held': 0.0})
     p._resolve = MethodType(StageProtocol._resolve, p)
     p._gated_ramp_tick = MethodType(StageProtocol._gated_ramp_tick, p)
     return p
@@ -82,8 +84,7 @@ def test_parses_the_shipped_stage_with_the_controller():
 
 @pytest.mark.parametrize('patch, match', [
     ({'ramp': 'bwd'}, 'distinct'),
-    ({'bar': 0.0}, 'strictly positive'),
-    ({'bar': -1.0}, 'strictly positive'),
+    ({'bar': -1.0}, 'must be >= 0'),
     ({'up': 0.0}, r'\(0, 1\]'),
     ({'down': 2.0}, r'\(0, 1\]'),
     ({'gain': 0.5}, 'unknown keys'),
@@ -174,3 +175,166 @@ def test_the_split_pair_is_conserved():
         p._gated_ramp_tick(p.stage.balance)
     assert p.m.replay_frac + p.m.bwd_frac == pytest.approx(1.0)
     assert p.m.replay_frac == pytest.approx(0.10), '25 ticks x 0.043 from 0.5 is past the floor; must rail, not overshoot'
+
+
+def _bar0(**patch):
+    """A stage whose guard fires on ANY deterioration (bar 0), reading the
+    Z-anchored channel -- the owner's 2026-09-07 call."""
+    bal = dict(BALANCE, metric='bwd/under_coverage_rise150', bar=0.0)
+    return _stage(balance=bal, **patch)
+
+
+def test_bar_zero_is_accepted_and_parses_as_the_setpoint():
+    """bar 0 is the SETPOINT spelling: the guard's job is to keep the metric's
+    slope negative, so 'fire whenever it rose at all' is the honest bar and any
+    positive value is a TOLERATED rate of deterioration. Refused as 'strictly
+    positive' until 2026-09-07, when bar 1.0 was measured firing 0 times in 2000
+    steps while the metric it watches doubled."""
+    b = _bar0().balance
+    assert b['bar'] == 0.0 and b['metric'] == 'bwd/under_coverage_rise150'
+
+
+def test_bar_zero_ramps_only_while_the_guard_metric_is_FALLING():
+    """The motion that bar 1.0 could not produce: a small positive rise -- well
+    inside the old bar -- now backs the ramp off instead of being ignored."""
+    rising = _proto(_bar0(), _Tracker(**{'bwd/under_coverage_rise150': 0.22}))
+    rising._gated_ramp_tick(rising.stage.balance)
+    assert rising.ctrl['gr_fired'] == 1.0
+    assert rising.m.replay_frac == pytest.approx(0.5 - 0.043)
+    assert rising.m.bwd_frac == pytest.approx(0.5 + 0.043)
+
+    falling = _proto(_bar0(), _Tracker(**{'bwd/under_coverage_rise150': -0.1}))
+    falling._gated_ramp_tick(falling.stage.balance)
+    assert falling.ctrl['gr_fired'] == 0.0
+    assert falling.m.replay_frac == pytest.approx(0.5 + 0.0017)
+
+
+def test_bar_zero_holds_the_ramp_open_on_an_exactly_flat_sensor():
+    """`>` not `>=`, so a converged run (slope 0) still ramps rather than
+    deadlocking on the boundary."""
+    p = _proto(_bar0(), _Tracker(**{'bwd/under_coverage_rise150': 0.0}))
+    p._gated_ramp_tick(p.stage.balance)
+    assert p.ctrl['gr_fired'] == 0.0 and p.m.replay_frac > 0.5
+
+
+def test_negative_bar_is_still_refused():
+    """It would demand the run keep IMPROVING at a rate merely to stay quiet."""
+    with pytest.raises(ValueError, match='must be >= 0'):
+        _stage(balance=dict(BALANCE, bar=-1.0))
+
+
+# ---------------------------------------------------------------------------
+# The ratchet: the ramp is released only at a new best LEVEL of ratchet_metric.
+# ---------------------------------------------------------------------------
+
+# Level and slope of the SAME quantity -- a ratchet on a different metric from
+# the one the guard watches does not ratchet anything the guard cares about.
+RATCHET = dict(BALANCE, metric='bwd/under_coverage_rise150', bar=0.0,
+               ratchet_metric='bwd/under_coverage', ratchet_tol=0.25)
+
+
+def _r(level, sensor=-1.0, share=0.5):
+    """A tick with the slope sensor QUIET (-1, well under bar 0), so any motion
+    away from the ramp is the ratchet's doing and not the slope gate's."""
+    p = _proto(_stage(balance=dict(RATCHET)),
+               _Tracker(**{'bwd/under_coverage_rise150': sensor,
+                           'bwd/under_coverage': level}), share=share)
+    p._gated_ramp_tick(p.stage.balance)
+    return p
+
+
+def test_ratchet_parses_and_defaults_to_absent():
+    assert _stage(balance=dict(RATCHET)).balance['ratchet_metric'] == 'bwd/under_coverage'
+    assert _stage().balance['ratchet_metric'] is None, 'absent = pure slope gate'
+
+
+def test_ratchet_refuses_a_malformed_metric_or_negative_tol():
+    with pytest.raises(ValueError, match='ratchet_metric'):
+        _stage(balance=dict(RATCHET, ratchet_metric='relative_under'))
+    with pytest.raises(ValueError, match='ratchet_tol'):
+        _stage(balance=dict(RATCHET, ratchet_tol=-1.0))
+
+
+def test_first_level_seen_is_a_new_best_and_releases_the_ramp():
+    p = _r(level=5.0)
+    assert p.ctrl['gr_best'] == pytest.approx(5.0)
+    assert p.ctrl['gr_held'] == 0.0
+    assert p.m.replay_frac == pytest.approx(0.5 + RATCHET['up'])
+
+
+def test_a_level_above_the_best_vetoes_the_ramp_even_with_a_quiet_slope():
+    """The failure the ratchet exists for: on rr07_rr_n7_uc0 the slope was
+    negative on two thirds of ticks while the level went nowhere."""
+    p = _proto(_stage(balance=dict(RATCHET)),
+               _Tracker(**{'bwd/under_coverage_rise150': -1.0, 'bwd/under_coverage': 5.0}))
+    p._gated_ramp_tick(p.stage.balance)          # best := 5.0, ramp released
+    p.tracker.values['bwd/under_coverage'] = 6.0  # ... then the level worsens
+    p._gated_ramp_tick(p.stage.balance)
+    assert p.ctrl['gr_best'] == pytest.approx(5.0), 'best must not follow the level up'
+    assert p.ctrl['gr_held'] == 1.0
+    assert p.m.replay_frac < 0.5, 'weight went to the guard despite a negative slope'
+
+
+def test_the_tolerance_band_still_counts_as_at_best():
+    assert _r(level=5.0).ctrl['gr_held'] == 0.0
+    p = _proto(_stage(balance=dict(RATCHET)),
+               _Tracker(**{'bwd/under_coverage_rise150': -1.0, 'bwd/under_coverage': 5.0}))
+    p._gated_ramp_tick(p.stage.balance)
+    for lvl, held in ((5.20, 0.0), (5.30, 1.0)):      # tol 0.25
+        p.tracker.values['bwd/under_coverage'] = lvl
+        p._gated_ramp_tick(p.stage.balance)
+        assert p.ctrl['gr_held'] == held, lvl
+
+
+def test_a_new_best_re_releases_the_ramp_after_a_hold():
+    p = _proto(_stage(balance=dict(RATCHET)),
+               _Tracker(**{'bwd/under_coverage_rise150': -1.0, 'bwd/under_coverage': 5.0}))
+    for lvl in (5.0, 9.0, 9.0):
+        p.tracker.values['bwd/under_coverage'] = lvl
+        p._gated_ramp_tick(p.stage.balance)
+    held_share = p.ctrl['gr_share']
+    assert p.ctrl['gr_held'] == 1.0 and held_share < 0.5
+    p.tracker.values['bwd/under_coverage'] = 4.0      # earned it
+    p._gated_ramp_tick(p.stage.balance)
+    assert p.ctrl['gr_best'] == pytest.approx(4.0)
+    assert p.ctrl['gr_held'] == 0.0
+    assert p.ctrl['gr_share'] > held_share
+
+
+def test_the_ratchet_holds_before_the_slope_sensor_has_a_window():
+    """The rise needs 300 steps; the level does not. A stage must not spend its
+    first 300 steps ramping into a deterioration just because v is unwritten."""
+    p = _proto(_stage(balance=dict(RATCHET)), _Tracker(**{'bwd/under_coverage': 5.0}))
+    p._gated_ramp_tick(p.stage.balance)           # best := 5.0, no v -> no motion
+    assert p.m.replay_frac == pytest.approx(0.5)
+    p.tracker.values['bwd/under_coverage'] = 8.0
+    p._gated_ramp_tick(p.stage.balance)
+    assert p.ctrl['gr_held'] == 1.0
+    assert p.m.replay_frac == pytest.approx(0.5 - RATCHET['down'])
+
+
+def test_gr_fired_reports_the_SLOPE_gate_only_not_the_ratchet():
+    """Two different reasons to feed the guard; conflating them would make the
+    run unreadable ('did it deteriorate, or was it merely not at its best?')."""
+    p = _r(level=9.0, sensor=-1.0, share=0.5)     # first tick -> best, released
+    p.tracker.values['bwd/under_coverage'] = 20.0
+    p._gated_ramp_tick(p.stage.balance)
+    assert p.ctrl['gr_held'] == 1.0 and p.ctrl['gr_fired'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_z:rollout -- the phase-2 entry Z seed (a different mechanism from
+# the bare bootstrap_z, which regresses the head onto the tracker's ema_logw).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('arg', ['rollout', 'rollout:4000', 'train_conditioner', ''])
+def test_bootstrap_z_accepts_its_forms(arg):
+    action = f'bootstrap_z:{arg}' if arg else 'bootstrap_z'
+    st = _stage(on_enter=['rebuild_prior_by_churn', action])
+    assert ('bootstrap_z', arg) in st.on_enter
+
+
+@pytest.mark.parametrize('arg', ['rollout:', 'rollout:many', 'rollouts', 'rollout:4000:2'])
+def test_bootstrap_z_refuses_a_malformed_rollout_arg(arg):
+    with pytest.raises(ValueError, match='bootstrap_z'):
+        _stage(on_enter=[f'bootstrap_z:{arg}'])

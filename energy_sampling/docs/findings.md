@@ -13,6 +13,88 @@ Newest first.
 
 ---
 
+## F-059 · The prod_sep02 neighbour is observed: a 48-CPU CPU-only job on the `all` partition landed on the GPU node at the minute the step time jumped · `REPLICATED`
+
+*2026-09-07. Follows F-058. Owner's `sacct -N ga036` around mipu_lr0p125's onset.*
+
+`H2O_prod` (em5339, partition `all`, 48 CPUs, 150 GB, no GPU) started 2026-09-03 22:30:40 ET on
+ga036. Our first slow 10-step block ran 22:30:03-22:32:12 ET; step time 9.7 -> 12.9 s, then 14.4 s
+47 minutes later with no further job start. The neighbour ran to 09:30; we were killed at 01:00.
+The node was also carrying a 1-CPU and two 8-CPU GPU jobs, so it is oversubscribed only on the
+host side. Since cgroups pin our 8 cores, the contended resource is memory bandwidth / cache /
+SMT, not CPU time: `--cpus-per-task` is not a lever, isolation from CPU-only tenants or a less
+host-bound loop is.
+
+Correction to F-058 §4: the three arms at batch 1000 were `wallclock_cut` (sizer reason 7) by the
+`max_step_seconds` runaway guard on the stage-transition transient, not OOM cuts; the cut is
+permanent because the base-restore path requires `batch_sizer is None` and the expiry re-derivation
+excludes `wallclock_cut` (train.py:974).
+
+---
+
+## F-058 · prod_sep02 low-utilization kills: the GPU work per step never changed, the node did · `MECHANISM` + `REPLICATED`
+
+*2026-09-07. wandb `config.tag == p02`, 16 runs with history, training history plus wandb's
+system stream pulled in full. Report, per-run figures, regime table and scripts:
+`configs/prod_sep02/analysis/low_util_cancellation/`. Extends the single-case
+2026-09-01 sidecar read (`project_external_slowdown_reads_as_low_utilization`) to 7 kills
+against 9 controls.*
+
+**Cases:** neh_lr0p5 (24 h), mipu_lr0p0625 (42 h, a 7-day paper arm), mipu_lr0p125 (30 h),
+mipu_lr0p03125 (21 h), mipu_lr0p25 (15 h), mipu_lr0p015625 (2.3 h), acr_lr0p025 (3.8 h). **Controls:**
+mip_lr1 and nehu_lr0p125 (both past 116 h), four nehu and three acr short arms (all to the 48 h wall).
+All five mipu arms died; no nehu arm did.
+
+**1. The kill boundary is a ~2 h trailing mean of device utilization at 54-55%, not 60%.** Every
+cancelled run ended with its 2 h mean at 48.3-53.0%; no survivor's 2 h mean ever fell below 53.5%
+(survivors spent 0.0 h under 54%, up to 2.1 h under 56%). Windows of 30-60 min overlap (survivors dip to
+47-50), windows of 3-4 h overlap the other way. Kill followed the crossing by 0.1-4.7 h.
+
+**2. Utilization x step time is constant within every run across every regime** (CV 5-9%; neh_lr0p5
+5.52/5.51/5.48/5.51 GPU-busy s/step through 8.0 -> 12.3 s steps). The added step time is pure idle. It
+sits entirely in the non-energy part of the step (neh 7.4 -> 11.7 s; mipu 5.8 -> 8.4-10.5 s) while
+`energy/seconds_in_step` moves +2-13%. SM clock 1410 MHz in fast regimes, power and temperature fall
+with utilization: not throttling. Device util falls, not rises: not a GPU co-tenant. Not more work.
+
+**3. The slow regimes are the node's.** Identical configs agree to 2-3% in their fast regime across
+nodes (mipu@1600 9.61/9.63/9.65 s; acr@1000 10.27/10.28/10.31; nehu@1600 19.06/19.07/19.10) and differ
+20-100% in slow ones (mipu 13.4 s on ga037 from step one; acr 19-28 s on ga024). Slow regimes start and
+end abruptly, last 1-30 h, and reverse (mipu_lr0p03125 sped up 12.3 -> 9.7 at hour 10; mip_lr1 alternated
+five times in five days; nehu_lr0p125 shows 20-min fast windows every ~11 h at steps unrelated to any
+cadence of ours). Onsets fall at steps 22450, 16780, 14180, 10880: none on the eval grid; no buffer-size
+trend; checkpoint every 50 steps leaves no ripple; z-cal at zero. Host-wide memory shifts near many onsets
+but with inconsistent sign, so neighbours are visible but the contended resource is not identifiable
+from wandb data. Ranked: node co-tenancy (CPU / memory bandwidth / PCIe) > filesystem stalls (not
+supported: uniform shift, not spikes) > throttling (excluded) > GPU co-tenant (excluded) > in-process
+growth (excluded).
+
+**4. mipu dies and nehu does not because of margin.** mipcas at batch 1600 runs 66% util in its fast
+regime (`t_crit = B/0.54 = 12.0 s` against 9.7 s: +24%); nehzor at 1600 runs 85% (t_crit 30 s vs 19 s:
++57%). Observed spells are +25-55%. Two kills had no spell: mipu_lr0p25 after an OOM cut 1600 -> 1000
+sat at 55% from hour 3 (the ceiling retest never restored the batch in 13 h); mipu_lr0p015625 on ga037
+ran 13.4 s from its first step. The init MLIP pass ran at 80-100% util on every arm: it is GPU-bound,
+and acr_lr0p025 died of a 2x-slow steady state, not of init.
+
+**5. Predictor.** `util = B / t` with B a per-config constant, so step time alone predicts the reading.
+The trailing 1 h device-util mean under 54% for >30 min: zero false positives on nine survivors (their
+longest excursion 0.5 h), fired 1.6-16 h ahead on all five long kills (16.4, 8.1, 1.6, 9.3, 4.3 h).
+56% is the warning level. The step-time form (`t_1h > B/0.54`) needs no sensor but misses the chronic
+case and fires on startup unless gated past hour 3.
+
+**6. `gpu/util_policy`: retire as an occupancy estimate.** Offset against wandb's 2 h mean: ELJ@4000
++9/+13, UMA mipu -9 to -12, UMA nehu -29 to -34, MACE -26 to -28. It already reads the NVML counter;
+the defect is one phase-locked sample per 60 s at the step boundary and none during eval. Replace with
+a daemon-thread sampler every 5-10 s publishing `gpu/util_1h`, `gpu/util_2h`, `gpu/kill_margin`, or
+delete it and read the sidecar.
+
+**7. Mitigation ranking:** (i) every arm resumable and chained, `--requeue`, after the lj_coeff stamp
+fix; (ii) margin via batch on mipu (3200 at 22% VRAM predicted ~80% util) and make the OOM-ceiling
+retest actually restore the batch; (iii) CUDA graphs on the rollout to remove the host dependence;
+(iv) in-process self-requeue on the 1 h rule; (v) node shape (`--cpus-per-task`, `--exclusive`) only
+after `sacct -N <node>` around the onsets in `regimes.csv` names the neighbour.
+
+---
+
 ## F-057 · Neither MLIP route carries a systematic bias; MACE's apparent heavy tail is the ENERGY-MAGNITUDE distribution, not an accuracy tail · `REPLICATED`
 
 *2026-08-30. CPU, n=1 per call, both backends. `scratchpad/bias_measurement_cpu.py`.

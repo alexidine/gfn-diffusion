@@ -34,7 +34,10 @@ declares:
                     bootstrap_z, seed_prior_from_anchors,
                     reseed_prior_from_dataset, rebuild_prior_by_churn,
                     set_lr_flow:<float>; set_max_batch_size:<int>;
-                    set_traj_checkpoint:<0|1>; ACTIONS below is the authoritative
+                    set_traj_checkpoint:<0|1>; freeze_pb[:full|head] /
+                    unfreeze_pb (P_B snapshot, Modeller.set_pb_freeze --
+                    on_enter of the stage after the MLE warm-start is the
+                    measured place, configs/local_pb_freeze); ACTIONS below is the authoritative
                     list) -- the route-specific physics; everything generic
                     (optimizer rebuild, monitor cooldown, LR re-warm) happens
                     automatically at EVERY transition.
@@ -151,7 +154,8 @@ MLE_GATE_DEFAULTS = {
 }
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
-           'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint', 'stop')
+           'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint', 'stop',
+           'freeze_pb', 'unfreeze_pb')
 SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
@@ -213,6 +217,12 @@ def fresh_stage_ctrl():
         # None = not yet seeded from the stage's entry fracs.
         'gr_share': None,
         'gr_fired': 0.0,
+        # ratchet: the stage's best (lowest) ratchet_metric level so far, and
+        # whether the ramp is currently vetoed for not being at it. Stage state,
+        # so a transition re-baselines instead of holding the incoming stage to
+        # the outgoing one's high-water mark.
+        'gr_best': None,
+        'gr_held': 0.0,
         # buffer freshness servo: log of the multiplicative churn/residence
         # boost. 0.0 = the configured buffer, i.e. inert.
         'bs_log_boost': 0.0,
@@ -231,6 +241,10 @@ class Stage:
                                'deactivate_threshold', 'balance', 'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
+                               'fwd_rollout_triggers',
+                               # accepted here ONLY so Stage.__init__'s own check
+                               # reports the rename; the generic unknown-key error
+                               # would otherwise fire first and say nothing useful
                                'fwd_rollout_drift_max'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
@@ -277,16 +291,40 @@ class Stage:
         # ships: no run has reported a drift number, so no bar can be honestly
         # chosen yet. Meaningless without a cadence, since off-cadence is the
         # only kind of step it can add.
-        self.fwd_rollout_drift_max = float(spec.get('fwd_rollout_drift_max', 0.0) or 0.0)
-        if self.fwd_rollout_drift_max < 0:
-            raise ValueError(f"stage '{self.name}': fwd_rollout_drift_max must be >= 0, "
-                             f"got {self.fwd_rollout_drift_max}")
-        if self.fwd_rollout_drift_max > 0 and self.fwd_rollout_every == 0:
+        if 'fwd_rollout_drift_max' in spec:
             raise ValueError(
-                f"stage '{self.name}': fwd_rollout_drift_max="
-                f"{self.fwd_rollout_drift_max} with fwd_rollout_every=0. The "
-                f"trigger only adds rollouts to steps a cadence skipped; without "
-                f"one the forward branch already runs every step.")
+                f"stage '{self.name}': fwd_rollout_drift_max has moved into "
+                f"fwd_rollout_triggers as 'drift_std_max' (one block, one bar per "
+                f"failure, one logged reason each). Refused rather than silently "
+                f"ignored -- a dead trigger key reads as an armed trigger.")
+        # THE BARS THAT ACTUALLY SET THE CADENCE. fwd_rollout_every is the
+        # BACKSTOP period; these fire rollouts early, each answering a different
+        # failure, each reported under its own name (Modeller._rollout_trigger_fires
+        # documents what each one reads and which failure it can actually fix).
+        # Absent/0 disables a bar; an empty block is the fixed-period behaviour.
+        # Meaningless without a cadence, since off-cadence is the only kind of
+        # step a trigger can add.
+        trig = spec.get('fwd_rollout_triggers') or {}
+        if not isinstance(trig, dict):
+            raise ValueError(f"stage '{self.name}': fwd_rollout_triggers must be a mapping "
+                             f"of bar name -> value, got {type(trig).__name__}")
+        known = {'drift_std_max', 'ess_min', 'val_gap_max',
+                 'occupancy_min_batches'}
+        unknown = set(trig) - known
+        if unknown:
+            raise ValueError(f"stage '{self.name}': fwd_rollout_triggers unknown bars "
+                             f"{sorted(unknown)}; known are {sorted(known)}")
+        for k, v in trig.items():
+            if not isinstance(v, (int, float)) or v < 0:
+                raise ValueError(f"stage '{self.name}': fwd_rollout_triggers.{k}={v!r} "
+                                 f"must be a number >= 0 (0 = that bar is off)")
+        if trig and any(float(v) > 0 for v in trig.values()) and self.fwd_rollout_every == 0:
+            raise ValueError(
+                f"stage '{self.name}': fwd_rollout_triggers set with "
+                f"fwd_rollout_every=0. The triggers only add rollouts to steps a "
+                f"cadence skipped; without one the forward branch already runs "
+                f"every step.")
+        self.fwd_rollout_triggers = {k: float(v) for k, v in trig.items()}
 
         self.loss_coeffs = {m: dict(v) for m, v in (spec.get('loss_coeffs') or {}).items()}
         bad = set(self.loss_coeffs) - set(MODES)
@@ -1015,16 +1053,21 @@ class Stage:
             # The `ramp` mode's share drifts UP by `up` per tick while the guard
             # sensor sits at or below `bar`, and moves DOWN by `down` per tick
             # while it exceeds it. The deadband is the SENSOR's, not a knob
-            # here: with bwd/relative_under_rise150 and bar 1.0 the gate read 0%
-            # false positives on four healthy arms and alarmed 120-190 steps
-            # into an injected deterioration. `bounds` are hard rails, so a bwd
-            # floor is a guarantee rather than an equilibrium. No second metric,
+            # here. At bar 0 the controller is a servo hunting the sensor's
+            # zero: it ramps while the guard metric is falling and backs off
+            # while it rises, so the ramp's default action is no longer "always
+            # give the ramp mode more". A high bar makes it open-loop instead --
+            # measured 2026-09-07: bwd/relative_under_rise150 spanned
+            # [-0.26, +0.63] against bar 1.0, fired 0 times in 2000 steps, and
+            # replay ramped unopposed to its cap while the guard metric doubled.
+            # `bounds` are hard rails, so a bwd floor is a guarantee rather than
+            # an equilibrium. No second metric,
             # no priority multiple, no logit: it reads as one sentence in print.
             if node.get('anneal_coeffs'):
                 raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
                                  f"(it anneals off the lexicographic clean-streak event)")
             bad = set(node) - {'kind', 'ramp', 'guard', 'metric', 'bar', 'up', 'down',
-                               'pinned', 'bounds'}
+                               'pinned', 'bounds', 'ratchet_metric', 'ratchet_tol'}
             if bad:
                 raise ValueError(f"stage '{self.name}': gated_ramp balance unknown keys {sorted(bad)}")
             ramp, guard = node.get('ramp'), node.get('guard')
@@ -1042,9 +1085,19 @@ class Stage:
             node['metrics'] = metrics
             node['pinned'] = self._parse_pinned(node, metrics)
             bar = node.get('bar')
-            if not isinstance(bar, (int, float)) or bar <= 0:
-                raise ValueError(f"stage '{self.name}': gated_ramp bar must be strictly positive "
-                                 f"(a rise, in the sensor's units), got {bar!r}")
+            # >= 0, not > 0. bar 0 is the SETPOINT SPELLING of the controller:
+            # the guard's job is to keep the sensor's slope negative, so "fires
+            # whenever the metric rose at all" is the honest bar and any positive
+            # value is a tolerated rate of deterioration. A strictly-positive bar
+            # also has a floor set by the sensor's own noise -- on the 2026-09-07
+            # acceptance run bwd/relative_under_rise150 spanned [-0.26, +0.63]
+            # against bar 1.0 and fired 0 times in 2000 steps while the metric it
+            # watches doubled. Negative is still refused: it would demand the run
+            # improve at a rate to stay quiet, which is a different controller.
+            if not isinstance(bar, (int, float)) or bar < 0:
+                raise ValueError(f"stage '{self.name}': gated_ramp bar must be >= 0 "
+                                 f"(a rise, in the sensor's units; 0 = fire on any "
+                                 f"deterioration), got {bar!r}")
             node['bar'] = float(bar)
             for key, default in (('up', 0.0017), ('down', 0.043)):
                 v = float(node.get(key, default))
@@ -1053,6 +1106,31 @@ class Stage:
                                      f"(share of the split pair per tick), got {v}")
                 node[key] = v
             node['bounds'] = self._parse_bounds(node, metrics, node['pinned'], 'gated_ramp')
+            # THE RATCHET (owner 2026-09-07). A slope gate is a random walk on the
+            # LEVEL: the slope can be negative on most ticks while the level still
+            # climbs, because the positive excursions are larger. Measured on
+            # rr07_rr_n7_uc0 -- the guard fired on 34% of ticks, held bwd at 0.75-0.90
+            # for 2000 steps, and moved bwd/relative_under from 2.82 to 2.78. Maximal
+            # protection, no net progress.
+            #
+            # ratchet_metric names a LEVEL (not a rise). The ramp mode is released
+            # only while that level is within ratchet_tol of the best (lowest) value
+            # seen in this stage; above it the guard is fed at the `down` rate
+            # regardless of slope. So replay time is EARNED by a demonstrated new
+            # best rather than granted by a momentarily quiet derivative, and the
+            # controller acquires the level reference that neither bar setting gave
+            # it. Absent = pure slope gate, the pre-ratchet behaviour.
+            rm = node.get('ratchet_metric')
+            if rm is not None:
+                if not isinstance(rm, str) or '/' not in rm:
+                    raise ValueError(f"stage '{self.name}': gated_ramp ratchet_metric must look "
+                                     f"like dir/name, got {rm!r}")
+                tol = node.get('ratchet_tol', 0.0)
+                if not isinstance(tol, (int, float)) or tol < 0:
+                    raise ValueError(f"stage '{self.name}': gated_ramp ratchet_tol must be a "
+                                     f"number >= 0 (the metric's own units), got {tol!r}")
+                node['ratchet_tol'] = float(tol)
+            node['ratchet_metric'] = rm
         else:
             raise ValueError(f"stage '{self.name}': balance.kind must be "
                              f"lexicographic|proportional|constraint|ratio|gated_ramp")
@@ -1160,9 +1238,22 @@ class Stage:
             if name == 'reseed_prior_from_dataset' and arg and arg != 'flush':
                 raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                  f"reseed_prior_from_dataset or reseed_prior_from_dataset:flush")
+            if name == 'bootstrap_z' and arg and arg != 'train_conditioner':
+                parts = arg.split(':')
+                ok = parts[0] == 'rollout' and (len(parts) == 1
+                                                or (len(parts) == 2 and parts[1].isdigit()))
+                if not ok:
+                    raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                     f"bootstrap_z, bootstrap_z:train_conditioner, "
+                                     f"bootstrap_z:rollout or bootstrap_z:rollout:<n>")
             if name == 'rebuild_prior_by_churn' and arg and not arg.isdigit():
                 raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                  f"rebuild_prior_by_churn or rebuild_prior_by_churn:<int>")
+            if name == 'freeze_pb' and arg not in ('', 'full', 'head'):
+                raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                 f"freeze_pb, freeze_pb:full or freeze_pb:head")
+            if name == 'unfreeze_pb' and arg:
+                raise ValueError(f"stage '{self.name}' {where}: '{a}' -- unfreeze_pb takes no argument")
             if name in ('set_lr_flow', 'set_lr_policy'):
                 try:
                     if float(arg) <= 0:
@@ -1690,7 +1781,19 @@ class StageProtocol:
         elif name == 'snapshot_prior':
             self._snapshot_prior()
         elif name == 'bootstrap_z':
-            self._bootstrap_z(eval_metrics, train_conditioner=(arg == 'train_conditioner'))
+            # 'rollout' / 'rollout:<n>' is a DIFFERENT MECHANISM from the bare
+            # action, not a variant of it. The bare one regresses the flow head
+            # onto the tracker's ema_logw (no rollouts, no reward calls);
+            # 'rollout' takes a large forward sample and sets log Z to its
+            # winsorized-Huber root -- the same estimator every cadenced fill
+            # uses, and the one the TB loss actually optimises. Under rarer
+            # rollouts that is the right seed: phase 1 leaves the scalar at 0.0,
+            # and the fill is then the only thing that moves it.
+            if arg.startswith('rollout'):
+                parts = arg.split(':')
+                self.m.bootstrap_z_by_rollout(int(parts[1]) if len(parts) > 1 else None)
+            else:
+                self._bootstrap_z(eval_metrics, train_conditioner=(arg == 'train_conditioner'))
         elif name == 'seed_prior_from_anchors':
             parts = arg.split(':') if arg else []
             n_per_condition = int(parts[0]) if parts else 1
@@ -1700,6 +1803,13 @@ class StageProtocol:
             self.m.reseed_prior_from_dataset(flush=(arg == 'flush'))
         elif name == 'rebuild_prior_by_churn':
             self.m.rebuild_prior_by_churn(int(arg) if arg else None)
+        elif name == 'freeze_pb':
+            # Runs AFTER the optimizer rebuild (on_enter), so the fresh Adam
+            # simply never sees a P_B gradient; as an on_exit action it runs
+            # before the outgoing snapshot, which then carries the snapshot.
+            self.m.set_pb_freeze(arg or 'full')
+        elif name == 'unfreeze_pb':
+            self.m.set_pb_freeze(None)
         elif name == 'stop':
             # consumed by advance() and the host loop; a snapshot-less stop is
             # legal (the config decides what to keep)
@@ -2236,10 +2346,23 @@ class StageProtocol:
     def _gated_ramp_tick(self, bal):
         """One sensor, two motions, in SHARE space.
 
-            v = sensor (a rise, e.g. bwd/relative_under_rise150)
-            v >  bar : share_ramp -= down        # forgetting -> hand weight to the guard, fast
-            v <= bar : share_ramp += up          # otherwise -> drift toward the cap, slow
+            v = sensor (a rise, e.g. bwd/under_coverage_rise150)
+            L = ratchet level (e.g. bwd/relative_under), best = its stage minimum
+
+            L > best + tol      : share_ramp -= down   # not at a new best -> guard
+            v > bar             : share_ramp -= down   # deteriorating       -> guard
+            otherwise           : share_ramp += up     # earned              -> ramp
             clip share_ramp to the bounds; share_guard = 1 - share_ramp
+
+        THE RATCHET IS WHAT MAKES THIS A CONTROLLER RATHER THAN A DRIFT. Measured
+        2026-09-07 on two arms of the same rig: with bar 1.0 the slope sensor never
+        fired and replay ramped unopposed to its cap while bwd coverage doubled;
+        with bar 0 it fired on 34% of ticks and, at down/up = 25, pinned replay at
+        its FLOOR instead -- and still moved bwd/relative_under only 2.82 -> 2.78 in
+        2000 steps. A slope gate has no level reference, so it saturates whichever
+        way the slope statistics happen to point. The ratchet supplies the missing
+        reference without needing an absolute setpoint, which is the thing we have
+        no honest way to choose.
 
         WHY NOT AN INTEGRATOR IN THE LOGIT (the other kinds). Those need a second
         metric to drive the best-effort side, and "drift unconditionally toward a
@@ -2258,9 +2381,15 @@ class StageProtocol:
         by the buffer/rollout side (residence, store-all reuse = N, the drift-ESS
         trigger), by owner decision 2026-09-07.
 
-        Holds still (no motion, share re-clipped) while the sensor is unwritten:
-        the rise needs a full 300-step window, so the first ticks of a stage
-        leave the entry fracs in place. Ticks every 10 steps like the others.
+        Holds still (no motion, share re-clipped) while the sensor is unwritten AND
+        the ratchet is satisfied: the rise needs a full 300-step window, so the
+        first ticks of a stage leave the entry fracs in place. A level above its
+        best still feeds the guard from step one -- the ratchet needs no window.
+        Ticks every 10 steps like the others.
+
+        Reports gr_best (the stage's high-water mark) and gr_held (1 = the ramp is
+        vetoed by the ratchet) alongside gr_fired, so "why is replay not growing"
+        is answerable from the logged series rather than by inference.
         """
         m = self.m
         for mode, value in (bal.get('pinned') or {}).items():
@@ -2285,14 +2414,33 @@ class StageProtocol:
             share = frac_r / pair
         share = min(max(float(share), s_lo), s_hi)
         v = self._resolve(bal['metric'])
+
+        # THE RATCHET, evaluated first: it can veto the ramp on its own. Its best
+        # is stage state (self.ctrl), so a transition re-baselines rather than
+        # holding the incoming stage to the outgoing one's high-water mark.
+        held = 0.0
+        level = self._resolve(bal.get('ratchet_metric')) if bal.get('ratchet_metric') else None
+        if level is not None and math.isfinite(level):
+            best = self.ctrl.get('gr_best')
+            if best is None or level < best:
+                best = level
+            self.ctrl['gr_best'] = best
+            # `<=` so the tick that SETS a new best also releases the ramp
+            held = 0.0 if level <= best + bal.get('ratchet_tol', 0.0) else 1.0
+        self.ctrl['gr_held'] = held
+
         fired = 0.0
         if v is not None:
-            if v > bal['bar']:
+            if v > bal['bar'] or held:
                 share -= bal['down']
-                fired = 1.0
+                fired = 1.0 if v is not None and v > bal['bar'] else 0.0
             else:
                 share += bal['up']
             share = min(max(share, s_lo), s_hi)
+        elif held:
+            # the slope sensor needs a 300-step window; the ratchet does not, so a
+            # level above its best still hands weight to the guard from step one
+            share = min(max(share - bal['down'], s_lo), s_hi)
         setattr(m, f'{ramp}_frac', share * pair)
         setattr(m, f'{guard}_frac', (1.0 - share) * pair)
         self.ctrl['gr_share'] = share
@@ -2686,6 +2834,17 @@ class StageProtocol:
             v = self._resolve(stage.balance['metric'])
             if v is not None:
                 out['protocol/gr_sensor'] = float(v)
+            # the ratchet's two series: gr_held answers "why is the ramp not
+            # growing" without inference, and gr_best is the high-water mark the
+            # veto is measured against
+            out['protocol/gr_held'] = float(self.ctrl.get('gr_held', 0.0))
+            best = self.ctrl.get('gr_best')
+            if best is not None and math.isfinite(best):
+                out['protocol/gr_best'] = float(best)
+            if stage.balance.get('ratchet_metric'):
+                lv = self._resolve(stage.balance['ratchet_metric'])
+                if lv is not None:
+                    out['protocol/gr_level'] = float(lv)
         if stage.balance is not None and stage.balance['kind'] == 'ratio':
             # rt_err is the whole loop in one series: SIGNED, never clamped, so
             # unlike a one-sided drive it cannot read the same when satisfied

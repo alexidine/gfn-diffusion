@@ -24,7 +24,7 @@ STEPS = 2000
 BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
-def build(name, every, store_all, fwd_frac=0.0):
+def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None):
     """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
     forward TB loss trains the policy with the batch's own root standing in for
     log Z (tb_z_source batch_root), at that loss weight; the head is still set
@@ -32,7 +32,20 @@ def build(name, every, store_all, fwd_frac=0.0):
     cfg = yaml.safe_load(BASE.read_text(encoding='utf-8'))
     cfg['run_name'] = name
     cfg['tag'] = 'rr07'
-    cfg['epochs'] = STEPS
+    cfg['epochs'] = int(steps or STEPS)
+    if warm:
+        # A DIFFERENT PHASE-1 EXIT. The eight e01bd1 exits on disk are not
+        # interchangeable in quality: screened at 2000 forward samples each,
+        # six sit at frac(E>0) 0.42-0.46 and one -- dev_race_L2_transition --
+        # at 0.054 with mean energy -97.5 kJ/mol (prior buffer is -126.5).
+        # The W1 progress gate phase 1 exits on cannot see that: marginals
+        # match (wass_debiased 0.0018 vs null 0.028) while the energy is
+        # ~150 kJ/mol out. Both files must move together -- prior_model_name
+        # is what skip_if: prior_loaded tests, and a mismatched pair silently
+        # retrains phase 1 instead of warm-starting.
+        stem = f'{warm}_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-e01bd1'
+        cfg['checkpoint_name'] = f'{stem}_phase1_exit.pt'
+        cfg['prior_model_name'] = f'{stem}_prior.pt'
 
     zc = cfg.setdefault('z_calibration', {})
     # the fill is the ONLY Z pin once the servo is off; >0 keeps it armed, small
@@ -47,6 +60,21 @@ def build(name, every, store_all, fwd_frac=0.0):
     zc['fill_process_var'] = 0.01
     zc['fill_moment_reset'] = 0.5
     zc['fill_from_eval'] = 'fill'
+    # q RE-MEASURED ON THE GOOD WARM START, and it reverts to the original.
+    # The 0.09-0.50 estimated from the dev_elj_p2_cruise arms was that
+    # checkpoint's policy THRASHING (root moving 0.5-0.7 nats/step), not a
+    # property of the system. From dev_race_L2_transition the same estimator
+    # gives 0.003-0.010 (0.06-0.10 nats/step) -- the shipped value was right.
+    # At 0.25 with se now 0.55, K ran to 0.87 and log Z was near-snapping onto
+    # measurement noise. See docs/design/z_fill_process_variance.md sec.4/5:
+    # this is the "re-estimate from a good warm start" caveat firing.
+    zc['fill_process_var'] = 0.01
+
+    # _replay_val_size returns min(val_cap, batch_size, n_val), so anything above
+    # batch_size is INERT -- v2 ran val_cap 2048 and measured val_n 234-400. The
+    # se improvement there (2.0 -> 0.44 nats) came from the better checkpoint's
+    # tighter residuals, not from this. Left at batch_size as the honest ceiling.
+    cfg['buffers']['replay_buffer']['val_cap'] = int(cfg['batch_size'])
 
     n_fused = 0
     for proto in (cfg.get('protocols') or {}).values():
@@ -56,7 +84,58 @@ def build(name, every, store_all, fwd_frac=0.0):
                 st['on_exit'] = [a for a in st['on_exit'] if a != 'snapshot_prior']
             if st.get('train_mode') != 'fused':
                 continue
+            # Z BOOTSTRAP AT PHASE-2 ENTRY. Phase 1 gives the flow scalar no
+            # gradient -- the exit checkpoints carry log Z at exactly 0.0 -- so
+            # without this the cadenced fill walks the level in from zero over
+            # the first several hundred steps and everything trained meanwhile is
+            # trained against a wrong level. 4000 samples: the entry fill is the
+            # one that takes the WHOLE gap, so it is the one that must be well
+            # resolved (se ~ rms/(sqrt(B)*frac_unclipped); the 400-row step-0 fill
+            # ran at se 2.60, the worst of the run).
+            if boot:
+                on_enter = list(st.get('on_enter') or [])
+                if not any(str(a).startswith('bootstrap_z') for a in on_enter):
+                    on_enter.append(f'bootstrap_z:rollout:{int(boot)}')
+                st['on_enter'] = on_enter
             st['fwd_rollout_every'] = int(every)
+            # THE BACKSTOP IS DELIBERATELY LOOSE. On v2 at N=7,
+            # fwd/tb_resid_clipped held within +-0.05 nats of zero for the whole
+            # run -- log Z was sitting on its fixed point continuously, so that
+            # cadence was far more often than the Z pin needed. The replay-side
+            # bars below are meant to set the real cadence; `every` only bounds
+            # how long Z can go unpinned when they are all quiet, which is the
+            # one thing nothing else watches.
+            # THE CADENCE IS EVENT-DRIVEN; `every` is only the backstop period.
+            # Values picked by judgement, not derived -- the grid that would
+            # derive them is in docs/design/replay_occupancy_and_cadence.md.
+            # Each bar owns one failure and each fixes what it fires on:
+            #
+            #  ess_min 0.10        policy_drift_ess_frac. Below this the replay
+            #                      gradient is >90% spent on trajectories the
+            #                      policy has left. We measured 0.15 at N=7, so
+            #                      this sits just under the known-tolerable point.
+            #  val_gap_max 4.0     nats of held-out gap. ~2x the se at val_cap
+            #                      2048 (~0.7), so it needs a real signal to fire.
+            #                      A rollout RAISES the admission rate and so
+            #                      LOWERS reuse -- the correct actuator here.
+            #  occupancy_min 2.0   in batches. O >= B is hard (every step draws a
+            #                      full batch); 2B leaves headroom to react. This
+            #                      is the bar a loose period violates first.
+            #
+            # drift_std_max is left off: it is the same failure as ess_min in nats
+            # rather than as a fraction, and two bars on one failure just double
+            # the fire rate.
+            #
+            # THERE IS NO Z BAR, deliberately. Nothing measures log Z's fixed
+            # point between rollouts -- the root is a property of a FRESH batch and
+            # getting one IS the rollout. So the unpinned Z interval is bounded
+            # OPEN-LOOP by fwd_rollout_every, and that period is the only thing
+            # standing behind design invariant 1. Keep it tight enough to mean it.
+            st['fwd_rollout_triggers'] = {
+                'ess_min': 0.10,
+                'val_gap_max': 4.0,
+                'occupancy_min_batches': 2.0,
+            }
             st.setdefault('flags', {})['z_calibration'] = False
             # the gated-ramp controller: one sensor, two motions, hard rails
             f = float(fwd_frac)
@@ -68,9 +147,45 @@ def build(name, every, store_all, fwd_frac=0.0):
             st['balance'] = {
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
                 'pinned': {'fwd': f},
-                'metric': 'bwd/relative_under_rise150', 'bar': 1.0,
-                'up': 0.0017,      # 0.50 -> 0.75 replay share over ~1500 steps
-                'down': 0.043,     # 0.75 -> 0.10 over ~150 steps when the guard fires
+                # SETPOINT 0 ON THE Z-ANCHORED CHANNEL (owner call 2026-09-07).
+                # The guard's purpose is to keep bwd coverage IMPROVING, so the
+                # honest bar is "did it get worse at all", not a tolerated rate.
+                # bar 1.0 on the level-blind channel fired 0 times in 2000 steps
+                # while the metric it watched doubled (rr07_rr_n7_v1): the
+                # deterioration that actually occurs is ~1.6 nats/1000 steps and
+                # a 150-step-difference sensor needs 6.7 to clear 1.0.
+                # under_coverage carries the Z level, which at bar 0 with a
+                # symmetric hunt is noise the servo averages out rather than the
+                # one-way starve it caused at bar 1.0.
+                'metric': 'bwd/under_coverage_rise150', 'bar': 0.0,
+                # RATCHET ON THE SAME QUANTITY THE SLOPE WATCHES -- its level.
+                # A ratchet whose level and slope are different metrics does not
+                # ratchet: the "best" being chased is not the thing the guard
+                # guards, and the two can disagree indefinitely.
+                #
+                # And the channel is the Z-ANCHORED one on purpose (owner
+                # 2026-09-07). under_coverage is the RMS of the negative tail of
+                # the RAW residual log_pf + log_Z - log_r - log_pb, so it measures
+                # the buffer's absorption w.r.t. the LIVE POLICY's normalisation.
+                # relative_under re-centres on the batch's own Jensen centre
+                # (utils.py:2019), which removes log Z entirely and leaves the
+                # internal calibration -- the VarGrad-equivalent. That is a
+                # different question and not the one this guard asks.
+                # BOTH TOLERANCES ZERO (owner 2026-09-07). The slope bar is
+                # already 0 ("did it get worse at all"); the level tol matches it,
+                # so the ramp is released ONLY at or below the running best.
+                # Consequence to watch: on rr07_rr_n7_v2 the level plateaued at
+                # 14.8-15.8 against a best of 14.71, so at tol 0 the ramp is
+                # clamped nearly always and bwd drifts to its 0.9 cap. There is
+                # still no mechanism that decides a plateau counts as absorbed.
+                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.0,
+                # 4x slower than the original, i.e. 5x FASTER than the 20x cut
+                # (owner 2026-09-07, third pass). v2 moved bwd 0.50 -> 0.79 in
+                # 2000 steps at the slow gains, so the loop does close in a run;
+                # this makes it close inside a local arm too. Ticks are 10 steps,
+                # so 0.25 of share is ~230 steps down and ~5900 up.
+                'up': 0.000425,
+                'down': 0.01075,
                 'bounds': BOUNDS,
             }
             n_fused += 1
@@ -112,13 +227,54 @@ def main():
     # real-data estimate of a reasonable N: where |gap| approaches the fill's se.
     # rr_n7_fwd: rr_n7 plus the level-blind forward policy step at weight 0.05
     # (the only arm on which the forward branch trains anything).
+    # rr_n7_v1: the v1 ACCEPTANCE arm. Identical settings to rr_n7 -- a distinct
+    # NAME, because rr_n7 is also the pre-v1 run it is compared against
+    # (docs/design/handoff_rr_v1.md), and both the wandb run name and the local
+    # checkpoint prefix are {tag}_{run_name}. Re-using the name would overwrite the
+    # baseline's checkpoints and put two same-named runs in the comparison.
+    # rr_n7_uc0: the SECOND acceptance run -- same arm as rr_n7_v1, but every
+    # config here now carries the bar-0 guard on bwd/under_coverage_rise150, so
+    # it needs its own name to stay comparable against rr07_rr_n7_v1 (which ran
+    # the bar-1.0 guard on the level-blind channel and never fired).
     spec = {'rr_n1': (1, False, 0.0), 'rr_n7': (7, True, 0.0),
+            'rr_n7_v1': (7, True, 0.0), 'rr_n7_uc0': (7, True, 0.0),
+            # rr_n7_rat: the ratchet arm. Third acceptance run of the same arm --
+            # bar 0 on the slope, high-water mark on the level, gains halved.
+            'rr_n7_rat': (7, True, 0.0),
             'rr_n20': (20, True, 0.0), 'rr_n50': (50, True, 0.0),
             'rr_n7_fwd': (7, True, 0.05)}
+    # rr_n7_boot: rr_n7_rat plus the phase-2 Z bootstrap, and NOTHING else --
+    # a 4000-sample entry rollout whose winsorized-Huber root sets log Z. Its own
+    # arm rather than a change to rr_n7_rat so the bootstrap's effect on the level
+    # walk-in is readable as a one-variable difference.
+    boots = {'rr_n7_boot': (7, True, 0.0, 4000)}
+    # rr_n7_race: 300 steps from the ONE phase-1 exit that clears the owner's
+    # bars, to confirm the screen's verdict in a live run before anything else
+    # is re-based on it. Everything else matches rr_n7_boot.
+    warms = {'rr_n7_race': (7, True, 0.0, 4000, 'dev_race_L2_transition', 300),
+             # rr_n7_v2: the acceptance run for everything built 2026-09-07 --
+             # good warm start, entry Z bootstrap, ratchet + bar-0 guard at 20x
+             # slower gains, q 0.25, val_cap 2048, event-driven rollout triggers.
+             # Full length, so it is comparable to rr07_rr_n7_v1 at matched step.
+             'rr_n7_v2': (7, True, 0.0, 4000, 'dev_race_L2_transition', 2000),
+             # rr_n50_v3: the loose-backstop arm. N=50 with tau=5N keeps occupancy
+             # at 2000 rows and reuse at 50 -- 7x v2's reuse and 1/7 its energy
+             # calls, with the replay-side bars expected to pull the effective
+             # cadence back in wherever that is too far.
+             'rr_n50_v3': (50, True, 0.0, 4000, 'dev_race_L2_transition', 2000)}
     arms = {}
     for name, (every, store_all, fwd_frac) in spec.items():
         cfg = build(name, every, store_all, fwd_frac)
         check(cfg, name, every, store_all)
+        arms[name] = cfg
+    for name, (every, store_all, fwd_frac, boot) in boots.items():
+        cfg = build(name, every, store_all, fwd_frac, boot=boot)
+        check(cfg, name, every, store_all)
+        arms[name] = cfg
+    for name, (every, store_all, fwd_frac, boot, warm, steps) in warms.items():
+        cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps)
+        check(cfg, name, every, store_all)
+        assert cfg['checkpoint_name'].startswith(warm) and cfg['prior_model_name'].startswith(warm), name
         arms[name] = cfg
     for name, cfg in arms.items():
         with (HERE / f'{name}.yaml').open('w', encoding='utf-8') as f:

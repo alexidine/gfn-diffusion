@@ -4,6 +4,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 import torch
+from copy import deepcopy
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
@@ -659,69 +660,6 @@ class GFN(nn.Module):  # todo add seeding
             s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
 
         return s_new
-
-    def compile_step_kernels(self):
-        """
-        Compile the per-timestep STEP BODIES -- `_fwd_step` and `_replay_step` -- as
-        single units. Called only under `compile_policy: step`
-        (train.py:maybe_compile_policy).
-
-        WHY THE STEP AND NOT THE SUBMODULES. `compile_policy: auto` compiles five
-        trunk MLPs separately. Measured on an A100 2026-09-07
-        (`bench/compile_rollout.py`, T=100, both routes), that removes almost
-        nothing: kernel launches per rollout go 116,510 eager -> 110,098, and wall
-        time gets WORSE (0.96x on ELJ, 0.87x on UMA). The MLPs were never the
-        problem -- they are a handful of large GEMMs. The launches live in the
-        ELEMENTWISE SDE MATH around them: variance schedules, propagate, angular
-        wrap, dead-row pinning, the Gaussian log-prob, the exact P_B reversal,
-        DPLR corrections. ~388 kernels per step execution, of which maybe 80 are
-        the MLPs, and NONE of the rest sat inside any compiled region until now.
-
-        Compiling `_forward_kernel`/`_pb_net` (the previous shape of this method)
-        cut compiled-region ENTRIES 1797 -> 300 and still bought no time, which is
-        what established that entries are not the cost and launch volume is.
-
-        WHY THIS IS NEWLY POSSIBLE. `_fwd_step` used to take `i: int`, which dynamo
-        specialises on -- 100 graphs against a `cache_size_limit` of 24, blowing the
-        limit and falling back to eager SILENTLY under `suppress_errors`. The
-        signature now carries `t_cur`/`t_next` TENSORS (hoisted to the loop) and an
-        `is_first` BOOL, so the whole body traces as at most two graphs. Verified
-        bitwise: all 22 tensors across get_traj_fwd / _grad / replay / bwd are
-        identical to the pre-change code on CPU with pinned seeds.
-
-        ⚠ `_bwd_step` IS STILL EAGER. It keeps `i: int` and `trajectory_length: int`
-        (`ts[:, trajectory_length - i]` in get_bwd_correction), so it needs the same
-        hoist before it can join. The backward rollout is one of the three branches,
-        so a third of the rollout work is untouched by this -- do not read a
-        one-third-scale result as the ceiling.
-
-        ⚠ NOTHING ELSE IS COMPILED IN THIS MODE, deliberately. The trunk submodules
-        are called from INSIDE these step bodies; compiling both would nest a
-        compiled module inside a compiled region, whose inlining behaviour is not
-        something to assume while measuring something else.
-
-        ⚠ DEEPCOPY. This installs compiled callables as INSTANCE attributes, so the
-        model must not be deepcopied afterwards. Safe as called: `ema_model` is
-        deepcopied inside init_gfn well before maybe_compile_policy runs at the end
-        of it, and checkpoints ride `state_dict`, which is untouched.
-        `freeze_backward_policy(source_state=...)` does copy, so it is refused here
-        rather than left to fail obscurely mid-run.
-
-        Measure with `python -m bench.compile_rollout --modes eager,auto,step`, and
-        read the LAUNCH COUNT: `suppress_errors` makes a failed compile fall back to
-        eager silently, and wall time alone cannot tell that apart from "compiled
-        and did not help".
-        """
-        if getattr(self, '_pb_frozen', None) is not None:
-            raise ValueError(
-                "compile_policy: 'step' installs compiled callables as instance "
-                "attributes and freeze_backward_policy deepcopies the trunk; the "
-                "two are mutually exclusive. Use compile_policy: auto with a "
-                "frozen P_B.")
-        self._fwd_step = torch.compile(self._fwd_step)
-        self._replay_step = torch.compile(self._replay_step)
-        print('compile_policy step: _fwd_step + _replay_step compiled as whole-step '
-              'units (_bwd_step remains eager -- it still takes int indices)')
 
     def _forward_kernel(self, state, t, condition_embedding, t_next, dts):
         """
@@ -1444,11 +1382,143 @@ class GFN(nn.Module):  # todo add seeding
         wrapped_comp_logp = torch.logsumexp(comp_logp, dim=-1)           # [B, ang, K]
         return torch.logsumexp(log_pi + wrapped_comp_logp, dim=-1).sum(1)
 
+    PB_SNAPSHOT_MODULES = ('t_model', 's_model', 'backward_policy')
+
+    def freeze_backward_policy(self, source_state=None):
+        """
+        Hold P_B at a FIXED function. The learned correction is
+        backward_policy(s_model(x_{t+1}), t_model(t+1)), and s_model/t_model
+        are the trunk P_F trains on, so zeroing backward_policy's gradient
+        (requires_grad off, or its optimizer group at lr 0) freezes only the
+        head: P_B keeps drifting through the shared trunk, and P_B's loss
+        terms keep pushing the trunk through the frozen head -- measured
+        WORSE than leaving it trainable (configs/local_pb_freeze). A real
+        freeze evaluates P_B on a SNAPSHOT of all three, which this takes.
+
+        source_state: a state_dict from pb_snapshot_state() -- the snapshot a
+        checkpoint carried. Without it the snapshot is the CURRENT live
+        weights. Restoring from the checkpoint rather than re-snapshotting on
+        resume matters: on a resumed leg the live trunk has drifted under P_F,
+        so a fresh snapshot would be phase-1's head on a phase-2 trunk.
+
+        The snapshot is not a registered submodule (invisible to
+        named_children/gradnorm, never EMA'd, not in the model state_dict);
+        the checkpointer persists it under its own key ('pb_frozen') and
+        restores it through Modeller.set_pb_freeze. Returns the ModuleDict so
+        the EMA model can share the same object (install_pb_snapshot).
+        Conditional runs: the live conditioner still feeds the snapshot
+        (detached) -- the freeze covers the trunk and head, not the condition
+        embedding.
+        """
+        frozen = torch.nn.ModuleDict({n: deepcopy(getattr(self, n))
+                                      for n in self.PB_SNAPSHOT_MODULES})
+        if source_state is not None:
+            frozen.load_state_dict(source_state)
+        for p in frozen.parameters():
+            p.requires_grad_(False)
+        frozen.eval()
+        self.install_pb_snapshot(frozen)
+        return frozen
+
+    def install_pb_snapshot(self, frozen):
+        """Attach an existing snapshot (see freeze_backward_policy); None lifts it."""
+        if frozen is None:
+            self.__dict__.pop('_pb_frozen', None)
+        else:
+            object.__setattr__(self, '_pb_frozen', frozen)
+
+    def unfreeze_backward_policy(self):
+        self.install_pb_snapshot(None)
+
+    @property
+    def pb_frozen(self) -> bool:
+        return getattr(self, '_pb_frozen', None) is not None
+
+    def pb_snapshot_state(self):
+        """The snapshot's state_dict (CPU), or None when P_B is not frozen."""
+        fr = getattr(self, '_pb_frozen', None)
+        if fr is None:
+            return None
+        return {k: v.detach().cpu() for k, v in fr.state_dict().items()}
+
+    def compile_step_kernels(self):
+        """
+        Compile the per-timestep STEP BODIES -- `_fwd_step` and `_replay_step` -- as
+        single units. Called only under `compile_policy: step`
+        (train.py:maybe_compile_policy).
+
+        WHY THE STEP AND NOT THE SUBMODULES. `compile_policy: auto` compiles five
+        trunk MLPs separately. Measured on an A100 2026-09-07
+        (`bench/compile_rollout.py`, T=100, both routes), that removes almost
+        nothing: kernel launches per rollout go 116,510 eager -> 110,098, and wall
+        time gets WORSE (0.96x on ELJ, 0.87x on UMA). The MLPs were never the
+        problem -- they are a handful of large GEMMs. The launches live in the
+        ELEMENTWISE SDE MATH around them: variance schedules, propagate, angular
+        wrap, dead-row pinning, the Gaussian log-prob, the exact P_B reversal,
+        DPLR corrections. ~388 kernels per step execution, of which maybe 80 are
+        the MLPs, and NONE of the rest sat inside any compiled region until now.
+
+        Compiling `_forward_kernel`/`_pb_net` (the previous shape of this method)
+        cut compiled-region ENTRIES 1797 -> 300 and still bought no time, which is
+        what established that entries are not the cost and launch volume is.
+
+        WHY THIS IS NEWLY POSSIBLE. `_fwd_step` used to take `i: int`, which dynamo
+        specialises on -- 100 graphs against a `cache_size_limit` of 24, blowing the
+        limit and falling back to eager SILENTLY under `suppress_errors`. The
+        signature now carries `t_cur`/`t_next` TENSORS (hoisted to the loop) and an
+        `is_first` BOOL, so the whole body traces as at most two graphs. Verified
+        bitwise: all 22 tensors across get_traj_fwd / _grad / replay / bwd are
+        identical to the pre-change code on CPU with pinned seeds.
+
+        ⚠ `_bwd_step` IS STILL EAGER. It keeps `i: int` and `trajectory_length: int`
+        (`ts[:, trajectory_length - i]` in get_bwd_correction), so it needs the same
+        hoist before it can join. The backward rollout is one of the three branches,
+        so a third of the rollout work is untouched by this -- do not read a
+        one-third-scale result as the ceiling.
+
+        ⚠ NOTHING ELSE IS COMPILED IN THIS MODE, deliberately. The trunk submodules
+        are called from INSIDE these step bodies; compiling both would nest a
+        compiled module inside a compiled region, whose inlining behaviour is not
+        something to assume while measuring something else.
+
+        ⚠ DEEPCOPY. This installs compiled callables as INSTANCE attributes, so the
+        model must not be deepcopied afterwards. Safe as called: `ema_model` is
+        deepcopied inside init_gfn well before maybe_compile_policy runs at the end
+        of it, and checkpoints ride `state_dict`, which is untouched.
+        `freeze_backward_policy(source_state=...)` does copy, so it is refused here
+        rather than left to fail obscurely mid-run.
+
+        Measure with `python -m bench.compile_rollout --modes eager,auto,step`, and
+        read the LAUNCH COUNT: `suppress_errors` makes a failed compile fall back to
+        eager silently, and wall time alone cannot tell that apart from "compiled
+        and did not help".
+        """
+        if getattr(self, '_pb_frozen', None) is not None:
+            raise ValueError(
+                "compile_policy: 'step' installs compiled callables as instance "
+                "attributes and freeze_backward_policy deepcopies the trunk; the "
+                "two are mutually exclusive. Use compile_policy: auto with a "
+                "frozen P_B.")
+        self._fwd_step = torch.compile(self._fwd_step)
+        self._replay_step = torch.compile(self._replay_step)
+        print('compile_policy step: _fwd_step + _replay_step compiled as whole-step '
+              'units (_bwd_step remains eager -- it still takes int indices)')
+
+    def _pb_net(self, expanded_state, condition_embedding, t):
+        """(dmean, dvar) from the P_B network -- the live trunk+head, or the
+        frozen snapshot when freeze_backward_policy has been called."""
+        fr = getattr(self, '_pb_frozen', None)
+        if fr is not None:
+            with torch.no_grad():
+                ce = condition_embedding.detach() if condition_embedding is not None else None
+                pbs = fr['backward_policy'](fr['s_model'](expanded_state.detach(), ce), fr['t_model'](t))
+            return gaussian_params(pbs)
+        return gaussian_params(self.backward_policy(
+            self.s_model(expanded_state, condition_embedding), self.t_model(t)))
+
     def fwd_get_back_correction(self, condition_embedding, expanded_next_state, t_next):
         if self.learn_pb:
-            t_emb = self.t_model(t_next)
-            pbs = self.backward_policy(self.s_model(expanded_next_state, condition_embedding), t_emb)
-            dmean, dvar = gaussian_params(pbs)
+            dmean, dvar = self._pb_net(expanded_next_state, condition_embedding, t_next)
             back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
 
             if self.learned_variance:
@@ -1513,9 +1583,8 @@ class GFN(nn.Module):  # todo add seeding
 
     def get_bwd_correction(self, condition_embedding, expanded_current_state, i, trajectory_length, ts):
         if self.learn_pb:
-            t = self.t_model(ts[:, trajectory_length - i])
-            pbs = self.backward_policy(self.s_model(expanded_current_state, condition_embedding), t)
-            dmean, dvar = gaussian_params(pbs)
+            dmean, dvar = self._pb_net(expanded_current_state, condition_embedding,
+                                       ts[:, trajectory_length - i])
             back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
 
             if self.learned_variance:

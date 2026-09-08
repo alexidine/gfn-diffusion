@@ -49,7 +49,7 @@ runs:
     config_path:   D:\crystal_datasets\mipcas\new_mipcas_2_mipcas_2_uma_baseline_10_model_config.npy
     molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
     exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-    dataset_path:  D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.pt
+    dataset_path:  D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.ptj
 
   - run_name: nehzor_elj
     energy_function: elj

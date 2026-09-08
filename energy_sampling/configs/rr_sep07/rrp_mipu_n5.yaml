@@ -308,16 +308,22 @@ protocols:
         max_step: 0.05
         max_boost: 8.0
       fwd_rollout_every: 5
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
         ramp: replay
         guard: bwd
         pinned:
           fwd: 0.0
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: &id001
           bwd:
           - 0.5
@@ -368,6 +374,7 @@ protocols:
       on_enter:
       - rebuild_prior_by_churn
       - set_lr_flow:1.0e-4
+      - bootstrap_z:rollout:4000
       fracs:
         fwd: 0.0
         bwd: 0.5
@@ -392,16 +399,22 @@ protocols:
         replay:
           tb_z_source: persistent
       fwd_rollout_every: 5
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
         ramp: replay
         guard: bwd
         pinned:
           fwd: 0.0
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
   prod_eq:
     stages:
@@ -469,16 +482,22 @@ protocols:
         max_step: 0.05
         max_boost: 8.0
       fwd_rollout_every: 5
+      fwd_rollout_triggers:
+        ess_min: 0.1
+        val_gap_max: 4.0
+        occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
         ramp: replay
         guard: bwd
         pinned:
           fwd: 0.0
-        metric: bwd/relative_under_rise150
-        bar: 1.0
-        up: 0.0017
-        down: 0.043
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.0
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
 controller:
   min_mode_frac: 0.001
@@ -518,6 +537,7 @@ buffers:
       floor_frac: 0.25
       symmetric: true
     val_frac: 0.1
+    val_cap: 1600
   anchor_buffer:
     seed_source: prior_dataset
     max_size: 200000
