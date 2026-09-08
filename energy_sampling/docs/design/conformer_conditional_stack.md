@@ -300,7 +300,24 @@ Every local representation also needs global molecular context, obtained cheaply
 aggregate-and-broadcast: `g_global = Agg_i(g_i)`, then `g̃_i = [g_i, g_global]`. **None of
 this depends on the current conformer.**
 
-#### Choosing the encoder — STUB, still under discussion
+#### Choosing the encoder — RESOLVED 2026-09-01, WIRED 2026-09-08
+
+`models/graph_encoder.py`'s `mp+attn+spd` (local message passing + global attention + RWSE +
+shortest-path bias), pretrained and validated against nine deterministic self-supervised
+probes — 8 of 9 at 100/100 train/held-out, `orbit_size` at 100/99.6, on a split where no
+molecular skeleton crosses the boundary. Full spec, results, files and reproduction:
+[`conformer_encoder_architecture.md`](conformer_encoder_architecture.md).
+
+It is consumed **frozen and pre-encoded** (`models/encoder_cache.py`): the encoder reads the
+2D bond graph only, so nothing it sees changes during a rollout and calling it inside the SDE
+loop recomputes a constant. ⚠ The encoder and the torsion tree order atoms differently; the
+alignment is `spec.perm` and it is asserted, not assumed.
+
+One caveat carried forward: the attention has never been exercised. QM9's diameter is 6 and
+four message-passing layers already span it, so nothing measured yet says the global path
+earns its place on Gly4 (diameter 14) or Gly6 (20).
+
+#### Old stub, retained for the record
 
 **The cost objection does not apply here.** The usual case against dense attention is
 O(N²) in the hot loop, but this encoder is static: it runs once and amortises over the
@@ -496,11 +513,20 @@ small set of internal-coordinate tokens.
 ### Sequencing
 
 1. Unconditional, fixed-dim MLP, one molecule — validates parameterisation, force field
-   and prior in isolation. **This is where the stack is now.**
+   and prior in isolation. **Done.**
 2. Swap the policy for the set architecture, still one molecule at a time, so any
    regression is attributable to the architecture rather than the conditioning.
 3. Condition over a molecule set; watch held-out evaluation, which catches what training
-   metrics hide.
+   metrics hide. **The channel now exists** (`embedding_conditioning`, 2026-09-08) — before
+   that the condition vector was log-temperature or a zeros column and the policy was
+   molecule-blind by construction. `configs/conformer_gly4_conditional.yaml` is the first
+   config on this route that passes both `config_invariants` and `preflight_config`.
+
+**This is where the stack is now: between 2 and 3.** `SetPolicy` is built and installed by
+`conformer_modeller._install_set_policy`; the conditioning channel is open and tested. Still
+unbuilt: the n-body correlator heads `F_tau` (docstrings only) and the `log Z(c)` head (no
+`Z_MLP` anywhere), and 25 of 26 conformer configs still fail `preflight_config` on
+`adaptive_lr` — `python -m config_state migrate <config.yaml>` is the mechanical fix.
 
 ---
 

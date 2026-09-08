@@ -78,6 +78,14 @@ class ConformerTorsions(BaseSet):
                  # caller state its own intent, and the exactness gates pass dtype outright.
                  dtype=None,
                  temperature_conditioning: bool = False,
+                 #: Pre-encoded molecular identity, appended to the condition vector. Same
+                 #: name and same contract as MolecularCrystal's, so `get_conditioning_dim`
+                 #: and the config invariants already handle it. The embedding is baked by
+                 #: models/encoder_cache.py from a FROZEN encoder, so there is no per-step
+                 #: cost and no gradient into it -- see that module on why the encoder can
+                 #: be frozen and why it must be pre-encoded rather than run in the loop.
+                 embedding_conditioning: bool = False,
+                 embedding_conditioning_dim: Optional[int] = None,
                  log_temperature_range=(-1.0, 1.0),
                  lj_coeff: float = 1.0,
                  *,
@@ -122,6 +130,14 @@ class ConformerTorsions(BaseSet):
         # to mol_id; condition_library_size is re-set by init_identifiers().
         self.energy_function = 'conformer_torsions'
         self.temperature_conditioning = bool(temperature_conditioning)
+        self.embedding_conditioning = bool(embedding_conditioning)
+        if self.embedding_conditioning and embedding_conditioning_dim is None:
+            raise ValueError(
+                "embedding_conditioning requires embedding_conditioning_dim (the width of "
+                "the `embedding` on each conditions-file entry -- 2 * the encoder hidden "
+                "size, e.g. 256 for the shipped 128-wide encoder, because the pooled "
+                "readout is [softmax-weighted sum || unnormalised sum])")
+        self.embedding_conditioning_dim = embedding_conditioning_dim
         self.log_temperature_range = tuple(log_temperature_range)
         self.lj_coeff = float(lj_coeff)
         self.n_sg, self.n_zp, self.n_molecules = 1, 1, 1
@@ -1536,6 +1552,10 @@ class ConformerTorsions(BaseSet):
         ``conditions`` / ``condition_id`` to the batch, matching the crystal contract so
         every caller in train.py works unchanged.
 
+        The condition carries log-temperature (when `temperature_conditioning`) and the
+        pre-encoded molecular embedding (when `embedding_conditioning`), in that order. With
+        neither, it is a single zero column.
+
         ``sg_inds`` and ``z_primes`` are accepted and ignored -- a conformer has neither.
         They stay in the signature because callers pass them positionally by keyword and
         it costs nothing to tolerate; with n_sg = n_zp = 1 the mixed-radix condition_id
@@ -1549,6 +1569,7 @@ class ConformerTorsions(BaseSet):
         n_groups = n // max(repeats, 1)
         dev = mol_batch.device
 
+        conds = []
         if self.temperature_conditioning:
             if temperature is not None:
                 log_T = torch.log10(torch.as_tensor(temperature, device=dev)).flatten()
@@ -1556,12 +1577,39 @@ class ConformerTorsions(BaseSet):
                 lo, hi = self.log_temperature_range
                 u = torch.rand(n_groups, device=dev)
                 log_T = (lo + u * (hi - lo)).repeat_interleave(max(repeats, 1))
-            condition = log_T.reshape(-1, 1).float()
+            conds.append(log_T.reshape(-1, 1).float())
         else:
             log_T = torch.full((n,), float(self.log_temperature), device=dev)
-            # matches the crystal's no-conditioning branch: a single zero column, so the
-            # conditioner sees a well-shaped tensor rather than an empty one
+
+        # MOLECULAR IDENTITY. Until this existed the condition vector was log-temperature or
+        # a zeros column, and `mol_id` reached only `condition_id`, which the policy never
+        # reads -- so the policy was MOLECULE-BLIND BY CONSTRUCTION and no encoder, however
+        # good, could have changed that. The embedding is baked offline by
+        # models/encoder_cache.py onto each conditions-file entry; same attribute name and
+        # same width contract as MolecularCrystal's, so `train.get_conditioning_dim` and the
+        # config invariants need no conformer-specific case.
+        if self.embedding_conditioning:
+            emb = getattr(mol_batch, 'embedding', None)
+            if emb is None:
+                raise RuntimeError(
+                    "embedding_conditioning is enabled but this batch has no `embedding` -- "
+                    "the conditions file was not built with one. Bake it with: "
+                    "python build_conformer_conditions.py --smiles ... --encoder-ckpt "
+                    "<ckpt> --out conformer_conditions.pt")
+            emb = emb.to(dev).reshape(mol_batch.num_graphs, -1)
+            if emb.shape[-1] != self.embedding_conditioning_dim:
+                raise RuntimeError(
+                    f"embedding width {emb.shape[-1]} != embedding_conditioning_dim "
+                    f"{self.embedding_conditioning_dim}; the conditioner was built for a "
+                    f"different encoder than the one that baked this file")
+            conds.append(emb.float())
+
+        if not conds:
+            # the crystal's no-conditioning branch: a single zero column, so the conditioner
+            # sees a well-shaped tensor rather than an empty one
             condition = torch.zeros((n, 1), device=dev)
+        else:
+            condition = torch.cat(conds, dim=-1)
 
         mol_id = getattr(mol_batch, 'mol_id', None)
         mol_id = (torch.zeros(n, dtype=torch.long, device=dev) if mol_id is None

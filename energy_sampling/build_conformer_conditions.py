@@ -39,6 +39,7 @@ from energies.conformer_data import (attach_states, bake_energies, check_state_c
                                      collate_conditions, condition_from_energy,
                                      save_condition_file, save_prior_file)
 from energies.conformer_torsions import ConformerTorsions
+from models import encoder_cache
 
 
 def draw_prior_states(energy, n: int, internal_prior: Path, fatten: float, seed: int):
@@ -83,6 +84,12 @@ def main():
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--no-check", action="store_true",
                     help="skip the graph-vs-energy geometry check (don't)")
+    ap.add_argument("--encoder-ckpt", type=Path, default=None,
+                    help="bake a frozen molecular embedding onto every entry, so the policy "
+                         "can be conditioned on molecular identity. Writes per-graph "
+                         "`embedding` (pooled, 2*hidden) and per-atom `atom_embedding` "
+                         "(hidden, in TREE order). Enable with model.embedding_conditioning "
+                         "and set embedding_conditioning_dim to the printed width")
     args = ap.parse_args()
 
     torch.set_default_dtype(torch.float64)
@@ -96,6 +103,13 @@ def main():
               scale_14=args.scale_14, lj_k_factor=args.lj_k_factor,
               include_trivial_rotations=args.include_trivial_rotations, seed=args.seed)
 
+    bundle = None
+    if args.encoder_ckpt is not None:
+        bundle = encoder_cache.load_encoder(str(args.encoder_ckpt), device="cpu")
+        print(f"encoder {bundle['arm']} @ {bundle['sha256'][:12]}  "
+              f"hidden {bundle['hidden']}  ->  embedding_conditioning_dim: "
+              f"{2 * bundle['hidden']}")
+
     conditions, energies = [], []
     for smiles, ident in zip(args.smiles, identifiers):
         # see build_conformer_buffer.py: `torsion` is explicit, not a default. The
@@ -107,6 +121,15 @@ def main():
         if not args.no_check:
             err = check_state_convention(mol, energy)
             print(f"   state convention: graph and energy agree to {err:.2e} A")
+        if bundle is not None:
+            # TREE ORDER, via spec.perm, and asserted against spec.z inside `embed`. The
+            # encoder and the conformer path order atoms differently (heavy-then-hydrogen
+            # against tree placement), and attaching encoder-order rows to a conformer batch
+            # would condition every atom on another atom with no shape error to catch it.
+            h, g, _ = encoder_cache.embed(bundle, smiles,
+                                          perm=energy.spec.perm, z_tree=energy.spec.z)
+            mol.embedding = g[None, :].to(torch.get_default_dtype())
+            mol.atom_embedding = h.to(torch.get_default_dtype())
         conditions.append(mol)
         energies.append(energy)
 
@@ -114,6 +137,10 @@ def main():
     save_condition_file(batch, args.out)
     print(f"\nwrote conditions -> {args.out}  ({batch.num_graphs} graphs, "
           f"k = {int(batch.n_torsions[0])})")
+    if bundle is not None:
+        print("   embeddings baked. In the config set:")
+        print("     embedding_conditioning: true")
+        print(f"     embedding_conditioning_dim: {2 * bundle['hidden']}")
 
     if args.prior_out is None:
         return
