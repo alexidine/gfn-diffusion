@@ -18,11 +18,18 @@ native Windows, so `compile_policy: auto` resolves OFF on the dev box and every
 compile-dependent result is unreachable there
 ([[project_compile_only_failures_invisible_locally]]).
 
-READ THE REGION COUNT, NOT THE TIME. `suppress_errors` is on (as in training), so a
+READ THE LAUNCH COUNT, NOT THE TIME. `suppress_errors` is on (as in training), so a
 compile that specialises badly blows `cache_size_limit` and falls back to eager
-SILENTLY. That failure looks exactly like "compiled fine, didn't help". The entry
-count separates them and the wall time does not, which is why both are reported and
-the count is listed first.
+SILENTLY, which looks exactly like "compiled fine, didn't help". Counts separate
+those; wall time cannot.
+
+AND LAUNCHES, NOT REGION ENTRIES. Measured 2026-09-07: compiling the fused MLP kernels
+cut entries 1797 -> 300 and bought nothing, so entries were never the cost. Launches
+barely moved (116,510 -> 104,510). Note launches are IDENTICAL across routes and batch
+sizes -- 116,510 for ELJ at 4000 and UMA at 1600 -- because they are a property of the
+graph, not the data. That is why the host cost is a fixed number of seconds per step
+regardless of batch, and it also means a SMALL batch answers the launch question when
+a large one will not fit.
 
     python -m bench.compile_rollout --checkpoint <a phase1_exit .pt> --batch 1600
     python -m bench.compile_rollout --checkpoint ... --modes eager,auto,step --reps 5
@@ -160,11 +167,11 @@ def run_mode(ckpt, mode, batch, T, reps, backward, device, traj_checkpoint):
     total_self_cuda_ms = sum(e.self_device_time_total if hasattr(e, 'self_device_time_total')
                              else e.self_cuda_time_total for e in prof.key_averages()) / 1e3
 
-    # GPU-busy fraction, both ways, because neither alone is honest. Against the
-    # PROFILED wall it is a lower bound (the profiler adds host overhead and so
-    # depresses it); the CLEAN wall is the one we care about, but self CUDA was
-    # collected under the profiler. Above 1.0 means kernels overlapped on more than
-    # one stream (autograd does this), not an error.
+    # ⚠ NOT AN OCCUPANCY FRACTION. This is summed kernel time over wall, and kernels
+    # OVERLAP across streams (autograd uses more than one), so it exceeded 1.0 on ELJ
+    # -- 1.421 on 2026-09-07. Read it as a kernel-time-to-wall RATIO and as a relative
+    # comparison between modes on one card; it cannot be read as "the GPU was busy
+    # X% of the time". A real occupancy number has to come from the NVML sampler.
     busy_prof = round((total_self_cuda_ms / 1e3) / prof_wall, 3) if prof_wall else None
     busy_clean = round((total_self_cuda_ms / 1e3) / per_rollout, 3) if per_rollout else None
     res = dict(mode=mode, s_per_rollout=round(per_rollout, 4),
@@ -221,23 +228,40 @@ def main(argv=None):
           f'reps {a.reps}  backward {not a.no_backward}  traj_checkpoint {tc}')
     print(f'torch {torch.__version__}  device {torch.cuda.get_device_name(0)}')
 
-    out = [run_mode(a.checkpoint, m, a.batch, a.T, a.reps,
-                    not a.no_backward, device, tc) for m in modes]
+    # A MODE THAT OOMs MUST NOT TAKE THE OTHERS WITH IT. compile_policy 'step'
+    # OOM'd both routes on 2026-09-07 (64-75 GiB): compiling the step body defeats
+    # gradient checkpointing, because AOTAutograd saves the compiled region's own
+    # activations and the outer torch.utils.checkpoint cannot discard them. That is
+    # a RESULT, not a crash, and the modes after it still need to report.
+    out = []
+    for m in modes:
+        try:
+            out.append(run_mode(a.checkpoint, m, a.batch, a.T, a.reps,
+                                not a.no_backward, device, tc))
+        except torch.OutOfMemoryError as e:
+            print(f'  MODE {m} OUT OF MEMORY: {str(e).splitlines()[0]}', flush=True)
+            print(f'  (this is a finding: {m} needs more activation memory than the card '
+                  f'has at batch {a.batch}. Launch count is INDEPENDENT of batch, so rerun '
+                  f'at a small batch to get it anyway.)', flush=True)
+            out.append(dict(mode=m, oom=True, s_per_rollout=float('nan'),
+                            kernel_launches=0, compiled_region_entries=0,
+                            self_cpu_ms=float('nan'), self_cuda_ms=float('nan')))
+            torch.cuda.empty_cache()
 
     print('\n' + 'mode'.ljust(8) + 'launches'.rjust(11) + 's/rollout'.rjust(11)
-          + 'GPUbusy'.rjust(9) + 'entries'.rjust(9) + 'self CPU ms'.rjust(13)
+          + 'kern/wall'.rjust(10) + 'entries'.rjust(9) + 'self CPU ms'.rjust(13)
           + 'self CUDA ms'.rjust(14))
-    print('-' * 76)
+    print('-' * 77)
     base = out[0] if out else None
     for r in out:
         speed = ('' if r is base or not base['s_per_rollout']
                  else f"   ({base['s_per_rollout'] / r['s_per_rollout']:.2f}x vs {base['mode']})")
-        # the CLEAN-wall ratio is the meaningful one: kernel durations barely move
-        # under profiling, but the profiled WALL does (~8x locally), so dividing by
-        # it understates badly. Both are kept in the JSON.
+        # the clean-wall ratio: kernel durations barely move under profiling but the
+        # profiled wall inflates badly, so this is the comparable one. Above 1.0 means
+        # overlapping streams, NOT an occupancy over 100%.
         busy = r.get('gpu_busy_vs_clean_wall')
         print(r['mode'].ljust(8) + f"{r['kernel_launches']:11d}"
-              + f"{r['s_per_rollout']:11.4f}" + (f"{busy:9.2f}" if busy else ' ' * 9)
+              + f"{r['s_per_rollout']:11.4f}" + (f"{busy:10.2f}" if busy else ' ' * 10)
               + f"{r['compiled_region_entries']:9d}"
               + f"{r['self_cpu_ms']:13.1f}" + f"{r['self_cuda_ms']:14.1f}" + speed)
 
