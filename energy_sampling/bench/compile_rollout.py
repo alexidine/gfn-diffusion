@@ -137,10 +137,15 @@ def run_mode(ckpt, mode, batch, T, reps, backward, device, traj_checkpoint):
     torch.cuda.synchronize()
     per_rollout = (time.perf_counter() - t0) / reps
 
+    # TIME THE PROFILED ROLLOUT TOO. Without this the table carries self CUDA from
+    # one rollout and wall from a different one, and dividing them is meaningless --
+    # on ELJ that produced a "GPU busy" figure of 145%, which is what exposed the gap.
     acts = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    t1 = time.perf_counter()
     with torch.profiler.profile(activities=acts) as prof:
         one_rollout(model, batch, T, backward)
         torch.cuda.synchronize()
+    prof_wall = time.perf_counter() - t1
     rows = {e.key: e for e in prof.key_averages()}
 
     def count(k):
@@ -155,7 +160,16 @@ def run_mode(ckpt, mode, batch, T, reps, backward, device, traj_checkpoint):
     total_self_cuda_ms = sum(e.self_device_time_total if hasattr(e, 'self_device_time_total')
                              else e.self_cuda_time_total for e in prof.key_averages()) / 1e3
 
+    # GPU-busy fraction, both ways, because neither alone is honest. Against the
+    # PROFILED wall it is a lower bound (the profiler adds host overhead and so
+    # depresses it); the CLEAN wall is the one we care about, but self CUDA was
+    # collected under the profiler. Above 1.0 means kernels overlapped on more than
+    # one stream (autograd does this), not an error.
+    busy_prof = round((total_self_cuda_ms / 1e3) / prof_wall, 3) if prof_wall else None
+    busy_clean = round((total_self_cuda_ms / 1e3) / per_rollout, 3) if per_rollout else None
     res = dict(mode=mode, s_per_rollout=round(per_rollout, 4),
+               prof_wall_s=round(prof_wall, 4),
+               gpu_busy_vs_prof_wall=busy_prof, gpu_busy_vs_clean_wall=busy_clean,
                compiled_region_entries=entries,
                compiled_fn=count('CompiledFunction'),
                compiled_fn_backward=count('CompiledFunctionBackward'),
@@ -210,15 +224,21 @@ def main(argv=None):
     out = [run_mode(a.checkpoint, m, a.batch, a.T, a.reps,
                     not a.no_backward, device, tc) for m in modes]
 
-    print('\n' + 'mode'.ljust(8) + 's/rollout'.rjust(11) + 'region entries'.rjust(16)
-          + 'launches'.rjust(11) + 'self CPU ms'.rjust(13) + 'self CUDA ms'.rjust(14))
-    print('-' * 73)
+    print('\n' + 'mode'.ljust(8) + 'launches'.rjust(11) + 's/rollout'.rjust(11)
+          + 'GPUbusy'.rjust(9) + 'entries'.rjust(9) + 'self CPU ms'.rjust(13)
+          + 'self CUDA ms'.rjust(14))
+    print('-' * 76)
     base = out[0] if out else None
     for r in out:
         speed = ('' if r is base or not base['s_per_rollout']
                  else f"   ({base['s_per_rollout'] / r['s_per_rollout']:.2f}x vs {base['mode']})")
-        print(r['mode'].ljust(8) + f"{r['s_per_rollout']:11.4f}"
-              + f"{r['compiled_region_entries']:16d}" + f"{r['kernel_launches']:11d}"
+        # the CLEAN-wall ratio is the meaningful one: kernel durations barely move
+        # under profiling, but the profiled WALL does (~8x locally), so dividing by
+        # it understates badly. Both are kept in the JSON.
+        busy = r.get('gpu_busy_vs_clean_wall')
+        print(r['mode'].ljust(8) + f"{r['kernel_launches']:11d}"
+              + f"{r['s_per_rollout']:11.4f}" + (f"{busy:9.2f}" if busy else ' ' * 9)
+              + f"{r['compiled_region_entries']:9d}"
               + f"{r['self_cpu_ms']:13.1f}" + f"{r['self_cuda_ms']:14.1f}" + speed)
 
     print('\nREAD THE LAUNCH COUNT FIRST. Region entries are NOT the cost -- cutting '
