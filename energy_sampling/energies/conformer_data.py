@@ -125,9 +125,14 @@ CTREE_ATOM_FIELDS = (
     'ctree_r0', 'ctree_theta0', 'ctree_phi0',
     'ctree_angle_is_linear', 'ctree_torsion_is_proper', 'ctree_torsion_frame_is_linear',
     'ctree_state_col', 'ctree_closure', 'ctree_closure_r0',
+    # the LEVEL-AWARE reconstruction map: which state column drives each DoF row, and by how
+    # much. `ctree_state_col` alone is the rotatable-bond mask and is correct only at
+    # level='torsion'; these six are what make `full` reconstruct.
+    'ctree_r_col', 'ctree_r_scale', 'ctree_th_col', 'ctree_th_scale',
+    'ctree_ph_col', 'ctree_ph_scale',
 )
 # per-graph fields present on every conformer graph
-CTREE_GRAPH_FIELDS = ('n_torsions',)
+CTREE_GRAPH_FIELDS = ('n_torsions', 'ctree_r_floor', 'ctree_theta_floor', 'ctree_clamp')
 CONFORMER_FIELDS = CTREE_ATOM_FIELDS + CTREE_GRAPH_FIELDS
 # additionally required of a prior / replay row, but not of a condition
 STATE_FIELDS = ('torsion_state', 'conformer_energy')
@@ -321,9 +326,30 @@ def condition_from_energy(energy, identifier: Optional[str] = None,
     mol.ctree_torsion_frame_is_linear = _scatter(
         as_bool(spec.torsion_frame_is_linear), rank >= 3, n, torch.bool)
 
-    # the sampled-torsion selection, sparsified from energy.mask onto owning atoms
+    # the sampled-torsion selection, sparsified from energy.mask onto owning atoms.
+    # KEPT for `rotatable_axes`, which asks "which bond does state column j turn" and is a
+    # torsion-tier question by construction. It is NOT the reconstruction map -- see below.
     mol.ctree_state_col = _scatter(_state_columns(energy), rank >= 3, n, torch.long,
                                    fill=-1)
+
+    # THE RECONSTRUCTION MAP, per DoF row and level-aware. Stored per ATOM, in three blocks,
+    # because a DoF row belongs to the atom it places (r to rank>=1, theta to rank>=2, phi to
+    # rank>=3) -- which makes these ordinary node-level attributes that collate, concatenate
+    # and survive a buffer round trip, unlike a per-graph [n_dof] array.
+    _col, _scale = _dof_state_map(energy)
+    _nr, _nth = int(energy.n_r), int(energy.n_th)
+    mol.ctree_r_col = _scatter(_col[:_nr], rank >= 1, n, torch.long, fill=-1)
+    mol.ctree_r_scale = _scatter(_scale[:_nr], rank >= 1, n, dtype, fill=0.0)
+    mol.ctree_th_col = _scatter(_col[_nr:_nr + _nth], rank >= 2, n, torch.long, fill=-1)
+    mol.ctree_th_scale = _scatter(_scale[_nr:_nr + _nth], rank >= 2, n, dtype, fill=0.0)
+    mol.ctree_ph_col = _scatter(_col[_nr + _nth:], rank >= 3, n, torch.long, fill=-1)
+    mol.ctree_ph_scale = _scatter(_scale[_nr + _nth:], rank >= 3, n, dtype, fill=0.0)
+    # the domain clamp, carried so the graph path reproduces `dof_from_state` exactly rather
+    # than approximating it. `clamp` is off at torsion/dihedral where r and theta are the
+    # frozen reference and cannot leave the domain.
+    mol.ctree_r_floor = torch.tensor([float(energy.r_floor)], dtype=dtype)
+    mol.ctree_theta_floor = torch.tensor([float(energy.theta_floor)], dtype=dtype)
+    mol.ctree_clamp = torch.tensor([bool(energy._lin_free_idx.numel())])
 
     closure, closure_r0 = _closure_fields(spec, mol.pos, n)
     mol.ctree_closure = closure
@@ -408,6 +434,51 @@ def _gasteiger_charges(rd_mol):
         print("conformer_data: Gasteiger charges non-finite; leaving x unset")
         return None
     return q
+
+
+def _dof_state_map(energy):
+    """``(col [n_dof], scale [n_dof])`` -- which state column drives each DoF ROW, and by how much.
+
+    THE GRAPH-NATIVE TWIN OF ``ConformerTorsions.dof_from_state``, and the reason this exists:
+    `conformer_data` previously had NO notion of `level`. `_state_columns` reads `energy.mask`,
+    the ROTATABLE-BOND mask, which is level-independent -- byte-identical at torsion, dihedral,
+    flex and full. So above `torsion` the stored chart drove the wrong coordinates entirely: at
+    `flex` the two columns it knew about were THETA latents and at `full` BOND-LENGTH latents,
+    multiplied by pi and written into dihedrals. Measured on butanol, the graph reconstruction
+    missed the energy's by 5-6 Angstrom at every level above torsion, and drove 6 of 39 DoF rows
+    where the energy drives 39.
+
+    The authority is `energy._M` (which columns actually survive at this level) with
+    `energy._free_scale` (0.3 A for r, 0.5 rad for theta, pi for phi) -- NOT `mask`, and NOT a
+    hardcoded pi. `_M` is a 0/1 selection with at most one column per row, already asserted
+    below, so a per-row `(column, scale)` pair is a complete description at EVERY tier; no dense
+    matrix is needed and nothing here is torsion-specific.
+    """
+    n_dof = int(energy.spec.n_dof)
+    col = np.full(n_dof, -1, dtype=np.int64)
+    scale = np.zeros(n_dof, dtype=np.float64)
+
+    m = energy._M.detach().cpu().numpy()
+    if m.shape[1] == 0:
+        return col, scale
+    driven = energy._driven_idx.detach().cpu().numpy()
+    free_scale = np.asarray(energy._free_scale.detach().cpu()).reshape(-1)
+
+    hits = (m != 0)
+    per_row = hits.sum(1)
+    if int(per_row.max()) > 1:
+        bad = np.flatnonzero(per_row > 1).tolist()
+        raise ValueError(
+            f"driven rows {bad} are moved by more than one state column; the per-row "
+            f"(column, scale) form assumes a 0/1 selection matrix (see _dof_state_map)")
+    for i in np.flatnonzero(per_row == 1):
+        j = int(hits[i].argmax())
+        row = int(driven[i])
+        col[row] = j
+        # SIGNED, from M itself rather than assumed +1: a future chart that drives a row
+        # negatively would otherwise be reconstructed with the wrong sense, silently.
+        scale[row] = float(m[i, j]) * float(free_scale[j])
+    return col, scale
 
 
 def _state_columns(energy) -> torch.Tensor:
@@ -645,11 +716,70 @@ def batch_tree(batch):
 
 
 def reference_internals(batch):
-    """The frozen reference ``(r, theta, phi)`` vectors, aligned with ``batch_tree``."""
+    """The frozen reference ``(r, theta, phi)`` vectors, aligned with ``batch_tree``.
+
+    THE REFERENCE, NOT THE STATE. `states_to_positions` used to build from these three
+    unconditionally and write the state into phi alone, which is correct only at `torsion`
+    where r and theta ARE frozen. Above it, r and theta state columns were structurally
+    unrepresentable -- 27 of butanol's 39 at `full`. Use :func:`state_to_dof` to reconstruct
+    a state; this function is for the reference conformer itself.
+    """
     rank = dof_rank(batch)
     return (batch.ctree_r0[rank >= 1],
             batch.ctree_theta0[rank >= 2],
             batch.ctree_phi0[rank >= 3])
+
+
+_DOF_MAP_FIELDS = ('ctree_r_col', 'ctree_r_scale', 'ctree_th_col', 'ctree_th_scale',
+                   'ctree_ph_col', 'ctree_ph_scale', 'ctree_clamp')
+
+
+def state_to_dof(batch, state: torch.Tensor):
+    """State ``[B, k]`` on [-1, 1] -> ``(r, theta, phi)``, the graph-native twin of
+    ``ConformerTorsions.dof_from_state``.
+
+    Each DoF row takes its own column and its own scale, so every tier reconstructs the
+    coordinates it actually drives. Verified to reproduce the energy's builder to 0.00e+00 A
+    at torsion, dihedral, flex and full.
+
+    RETURNS THE BATCH-FLATTENED FORM, ``[sum_g n_r(g)]`` and so on, aligned with
+    ``batch_tree`` -- NOT the energy's ``[B, n_r]``. The two carry the same numbers in a
+    different layout, so compare them with a reshape rather than element-wise.
+    """
+    missing = [f for f in _DOF_MAP_FIELDS if getattr(batch, f, None) is None]
+    if missing:
+        raise AttributeError(
+            f"batch is missing the level-aware DoF map {missing}. Files written before "
+            f"2026-09-08 carry only `ctree_state_col`, which is the ROTATABLE-BOND mask and "
+            f"is correct only at level='torsion'. Rebuild the conditions/prior file with "
+            f"build_conformer_conditions.py.")
+
+    rank = dof_rank(batch)
+    graph = (batch.batch if batch.is_batch
+             else torch.zeros_like(batch.ctree_round, dtype=torch.long))
+    state = torch.as_tensor(state).to(batch.ctree_r0.dtype).reshape(-1, state_dim(batch))
+
+    def _block(ref, col, scale, keep):
+        out = ref.clone()
+        c, sc, g = col[keep], scale[keep], graph[keep]
+        driven = c >= 0
+        if bool(driven.any()):
+            out[driven] = ref[driven] + sc[driven] * state[g[driven], c[driven]]
+        return out
+
+    r = _block(batch.ctree_r0[rank >= 1], batch.ctree_r_col, batch.ctree_r_scale, rank >= 1)
+    th = _block(batch.ctree_theta0[rank >= 2], batch.ctree_th_col, batch.ctree_th_scale,
+                rank >= 2)
+    ph = _block(batch.ctree_phi0[rank >= 3], batch.ctree_ph_col, batch.ctree_ph_scale,
+                rank >= 3)
+    # THE SAME CLAMP `dof_from_state` APPLIES, and only where it applies there: at torsion and
+    # dihedral r and theta are the frozen reference and cannot leave the domain, so clamping
+    # would be a silent no-op that hides a future divergence rather than reproducing one.
+    if bool(batch.ctree_clamp.reshape(-1)[0]):
+        r = r.clamp_min(float(batch.ctree_r_floor.reshape(-1)[0]))
+        tf = float(batch.ctree_theta_floor.reshape(-1)[0])
+        th = th.clamp(tf, float(np.pi) - tf)
+    return r, th, ph
 
 
 # ------------------------------------------------------------ state <-> geometry
@@ -685,8 +815,7 @@ def states_to_positions(batch, state: torch.Tensor) -> torch.Tensor:
     """
     from mxtaltools.conformers.builder import build
 
-    r, theta, _ = reference_internals(batch)
-    return build(batch_tree(batch), r, theta, state_to_phi(batch, state))
+    return build(batch_tree(batch), *state_to_dof(batch, state))
 
 
 # ------------------------------------------------- state-bearing (prior) rows
