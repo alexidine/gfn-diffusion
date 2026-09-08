@@ -25,7 +25,7 @@ BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
 def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
-          batch=None, lr_scale=None, tau_mult=5):
+          batch=None, lr_scale=None, tau_mult=5, val_gap_max=None):
     """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
     forward TB loss trains the policy with the batch's own root standing in for
     log Z (tb_z_source batch_root), at that loss weight; the head is still set
@@ -161,6 +161,11 @@ def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
                 'val_gap_max': 4.0,
                 'occupancy_min_batches': 2.0,
             }
+            if val_gap_max is not None:
+                # THE CADENCE BECOMES AN OUTPUT. `every` is only the backstop;
+                # the bar pulls the effective cadence in to wherever the gap is
+                # satisfied. Read rollout/n summed, not `every`.
+                st['fwd_rollout_triggers']['val_gap_max'] = float(val_gap_max)
             st.setdefault('flags', {})['z_calibration'] = False
             # the gated-ramp controller: one sensor, two motions, hard rails
             f = float(fwd_frac)
@@ -324,6 +329,34 @@ def main():
            # 6000 steps, not 4000 -- the buffer needs ~5*tau = 2500 steps to reach
            # age equilibrium, and a settled window has to come after that.
            'rr_hc2_n20_t25': (20, True, 0.0, 4000, 'dev_race_L2_transition', 6000, 1000, 0.8, 25)}
+
+    # CAN A BIG BUFFER PAY FOR A LOOSE CADENCE? The two levers point opposite ways:
+    # N sets reuse (total draws per row) and costs energy calls; tau/N sets DENSITY
+    # (draws per row per STEP = N/tau) and is free. n20_t25 showed density alone
+    # buys -34% on val_gap at zero cost. These ask whether it also pays off the
+    # N=100 penalty.
+    #
+    #   hc2_n20      N= 20  O= 5544  density 0.20   val_gap 1.497
+    #   hc2_n100     N=100  O= 6371  density 0.20   val_gap 2.730
+    #   hc2_n20_t25  N= 20  O=26340  density 0.04   val_gap 0.942
+    #   n100_t25     N=100  O=25000  density 0.04   val_gap ?      <- HIGH reuse,
+    #                                                                 LOW density
+    # Same buffer as n20_t25, so N is isolated. If density fully compensates it
+    # lands near 0.94; if reuse dominates it stays near 2.73; the -34% seen at
+    # N=20 would put it at ~1.80, i.e. BETTER than N=20 today at a FIFTH of the
+    # energy calls.
+    #
+    # 18000 steps because tau = 2500 and the buffer needs 5*tau = 12500 to reach
+    # age equilibrium -- reading this before then inverts the sign (measured: the
+    # same n20 pair gave lambda_tau +18% at 2*tau and -4% settled).
+    #
+    # _vg is the PRODUCTION shape: the cadence is emergent, `every` is only the
+    # backstop, and the bar is the knob. Few energy calls is then a RESULT, not
+    # a setting -- read rollout/n summed over the settled window.
+    hc3 = {'rr_hc2_n100_t25':
+               (100, True, 0.0, 4000, 'dev_race_L2_transition', 18000, 1000, 0.8, 25, None),
+           'rr_hc2_n100_t25_vg':
+               (100, True, 0.0, 4000, 'dev_race_L2_transition', 18000, 1000, 0.8, 25, 1.5)}
     arms = {}
     for name, (every, store_all, fwd_frac) in spec.items():
         cfg = build(name, every, store_all, fwd_frac)
@@ -342,6 +375,14 @@ def main():
         cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps,
                     batch=batch, lr_scale=lrs, tau_mult=tm)
         check(cfg, name, every, store_all, tau_mult=tm)
+        arms[name] = cfg
+    for name, (every, store_all, fwd_frac, boot, warm, steps, batch, lrs, tm, vg) in hc3.items():
+        cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps,
+                    batch=batch, lr_scale=lrs, tau_mult=tm, val_gap_max=vg)
+        check(cfg, name, every, store_all, tau_mult=tm)
+        st = [s for p in cfg['protocols'].values() for s in p['stages']
+              if s.get('train_mode') == 'fused'][0]
+        assert st['fwd_rollout_triggers']['val_gap_max'] == (4.0 if vg is None else vg), name
         rb = cfg['buffers']['replay_buffer']
         assert cfg['batch_size'] == batch == cfg['max_batch_size'], name
         assert rb['val_cap'] == batch and rb['churn_rate'] == batch, name
