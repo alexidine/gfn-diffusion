@@ -235,6 +235,30 @@ ARMS = (
     # -- block 7: P_B frozen at T=100 (separate workstream) ----------------------
     ('pbf_mip',     'mip',  N_LOOSE, {'freeze_pb': True}),
     ('pbf_mipu',    'mipu', N_LOOSE, {'freeze_pb': True}),
+
+    # -- block 7: LET THE BUFFER GET LARGE (appended -- tasks 18-19) -------------
+    # O = B * tau/N depends ONLY on tau/N, not on N, so the occupancy sweep is
+    # run at N_SHIP where tau is SHORT and the buffer actually equilibrates: tau
+    # = 60 / 240 / 480 steps, i.e. 5*tau = 300 / 1200 / 2400. At N_LOOSE the same
+    # occupancies need tau = 600 / 2400 / 4800 and 5*tau up to 24000 steps, which
+    # a 12h wall may not reach -- that arm would report a transient as a level.
+    #
+    #   n20_det   tau/N= 3   O =  3B  (already in the battery, task 9 -- CONTROL)
+    #   tau12     tau/N=12   O = 12B  ->  48000 rows at the grown batch
+    #   tau24     tau/N=24   O = 24B  ->  96000 rows at the grown batch
+    #
+    # All three N=20, tb=1.0, deterministic, so the DOSE is identical and only
+    # occupancy and age differ. PREDICTION: lambda_tau and val_gap_nats are FLAT
+    # across all three, because a row's exposure is tau/O = 1/admissions and tau
+    # cancels against occupancy exactly. This is the assumption the tau6/tau12
+    # pull rested on, and it has never been tested at scale -- the only large
+    # buffer ever run was cap-bound, which measures nothing. If absorption moves
+    # with tau, the cancellation is wrong and the dose law loses its denominator.
+    # Second-order channels that do NOT cancel and are the reason to look:
+    # draw diversity (B drawn from O), priority staleness (redraw spacing O/B),
+    # and displacement eviction breaking birth_loss as an intake baseline.
+    ('tau12',       'mip',  N_SHIP,  {'tau_over_n': 12, 'val_gap_max': 0.0}),
+    ('tau24',       'mip',  N_SHIP,  {'tau_over_n': 24, 'val_gap_max': 0.0}),
 )
 
 
@@ -282,7 +306,15 @@ def _size_replay(cfg, tau_over_n):
     watch replay_buffer_length == max_size.
     """
     rb = cfg['buffers']['replay_buffer']
-    occupancy = int(rb['churn_rate']) * tau_over_n
+    # SIZE FROM THE BATCH THE ARM GROWS TO. churn_rate is the ENTRY batch; with
+    # grow_batch_size the draw reaches max_batch_size, and O = B*tau/N grows with
+    # it. Sizing from churn alone under-sizes by exactly that ratio -- which is
+    # what put the old tau12 at 48000 rows against a 50000 cap (entry 1000, grown
+    # 4000, tau/N 12) and would have run it cap-bound, i.e. tau-disconnected, the
+    # one state that measures nothing. No tau/N = 3 arm changes: churn*50 still
+    # dominates for all of them.
+    grown = max(int(rb['churn_rate']), int(cfg.get('max_batch_size') or 0))
+    occupancy = grown * tau_over_n
     rb['max_size'] = max(12000, int(rb['churn_rate']) * 50, int(math.ceil(occupancy * 1.25)))
 
 
@@ -356,6 +388,15 @@ def _apply(cfg, every, ov):
 def check(cfg, name, fam, every, ov):
     tau_over_n = ov.get('tau_over_n', TAU_OVER_N_SHIP)
     where = name + ': '
+    if ov.get('tau_over_n', TAU_OVER_N_SHIP) != TAU_OVER_N_SHIP:
+        assert ov.get('val_gap_max') == 0.0, where + (
+            'a tau arm MUST be deterministic -- a firing trigger raises '
+            'admissions, which moves the occupancy the arm exists to set')
+        rb = cfg['buffers']['replay_buffer']
+        grown = max(int(rb['churn_rate']), int(cfg.get('max_batch_size') or 0))
+        assert rb['max_size'] >= grown * tau_over_n * 1.2, where + (
+            'max_size %d leaves no headroom over grown occupancy %d -- it would '
+            'run cap-bound' % (rb['max_size'], grown * tau_over_n))
     if 'replay_tb' in ov:
         assert cfg['replay_loss_coeffs']['tb'] == float(ov['replay_tb']), where + 'replay_tb'
         assert ov.get('val_gap_max') == 0.0, where + (
