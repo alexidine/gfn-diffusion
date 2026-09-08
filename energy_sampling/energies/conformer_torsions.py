@@ -301,19 +301,53 @@ class ConformerTorsions(BaseSet):
 
         # A DoF sitting on a parameterisation singularity is HELD, not driven: log sin
         # theta diverges as theta -> pi and the dependent dihedral frame is undefined
-        # there. Physically these are stiff and constant anyway (alkynes, nitriles,
-        # azides). Zeroing the ROW (not dropping the column) is what makes this uniform
+        # there. Zeroing the ROW (not dropping the column) is what makes this uniform
         # across levels; a column left driving nothing is then dropped below.
+        #
+        # ⚠ THIS IS A CONSTRAINED APPROXIMATION, NOT `full`, AND IT IS NOT BECAUSE THE
+        # MOTION IS ABSENT. An earlier version of this comment said these bends are
+        # "physically stiff and constant anyway"; that is wrong on its own terms -- measured
+        # over alkynes and nitriles they cost 0.62-1.43 kcal/mol at +/-10 deg against 2.2-2.4
+        # for the ordinary angles this chart keeps free, i.e. they are among the SOFTEST
+        # angular perturbations tested, not the stiffest.
+        #
+        # A linear EQUILIBRIUM geometry is not a rigid constraint. The divergence is a
+        # SINGULARITY OF THE (theta, phi) CHART, exactly as the polar coordinate (rho, phi)
+        # is singular at rho = 0 while displacement in either transverse direction stays
+        # perfectly physical. The standard remedy in the internal-coordinate literature is a
+        # pair of TRANSVERSE LINEAR-BENDING coordinates rather than deletion:
+        #
+        #     rho = pi - theta,  u = rho cos(phi),  v = rho sin(phi)
+        #     sin(theta) dtheta dphi = (sin(rho) / rho) du dv        -> finite, smooth at 0
+        #
+        # so the divergent `log sin theta` becomes a regular term, the coordinate count is
+        # unchanged (2 -> 2), and `data_ndim` returns to 3N-6. Freezing instead DEFINES A
+        # DIFFERENT DISTRIBUTION -- legitimate as an approximation, but it is not the `full`
+        # target and must not be reported as one.
+        #
+        # Until that chart lands, the reduction is RECORDED rather than silent: see
+        # `self.constrained_rows` and the CONSTRAINED line in `describe()`.
         singular = np.zeros(n_dof, dtype=bool)
         singular[self.n_r + np.flatnonzero(self.angle_is_linear)] = True
         singular[self.n_r + self.n_th + np.flatnonzero(self.torsion_frame_is_linear)] = True
         m_full[singular, :] = 0.0
 
         keep = m_full.any(axis=0)
+        #: rows held at their reference because the (theta, phi) chart is singular there, and
+        #: the state columns lost with them. A GLOBALLY NONLINEAR molecule has 3N-6 internal
+        #: degrees of freedom whether or not one of its centres is locally linear -- the
+        #: 3N-5 count belongs to a WHOLLY linear molecule -- so a shortfall here is a property
+        #: of this chart, never of the molecule.
+        self.constrained_rows = int(singular.sum())
+        self.constrained_columns = int((~keep).sum())
         m_full, col_block = m_full[:, keep], col_block[keep]
         self.data_ndim = int(keep.sum())
         if self.data_ndim == 0:
-            raise ValueError(f"{smiles} at level {level!r} has no free degrees of freedom")
+            raise ValueError(
+                f"{smiles} at level {level!r} has no free degrees of freedom. "
+                f"{self.constrained_rows} row(s) were held because the (theta, phi) chart is "
+                f"singular at a linear centre -- which is a chart limitation, not a rigid "
+                f"molecule. See section 3.2 of docs/design/conformer_parameterisation.md.")
 
         self._free_block = col_block                       # per STATE COLUMN: 0=r 1=th 2=phi
         self.free_mask = m_full.any(axis=1)                # per DoF ROW: is it driven
@@ -472,6 +506,21 @@ class ConformerTorsions(BaseSet):
                  f"   linearity flags MEASURED: {int(self.angle_is_linear.sum())} linear "
                  f"angle(s), {int(self.torsion_frame_is_linear.sum())} ill-conditioned "
                  f"frame(s), all held"]
+        # SAY SO WHEN THE TIER IS NOT WHAT IT CLAIMS. A globally nonlinear molecule has 3N-6
+        # internal degrees of freedom regardless of a locally linear centre, so at 'full' any
+        # shortfall is this chart's, and reporting `full` without saying so would present a
+        # constrained approximation as the complete one.
+        if getattr(self, 'constrained_rows', 0):
+            expected = 3 * self.spec.n_atoms - 6
+            lines.append(
+                f"   CONSTRAINED, not {self.level!r}: {self.constrained_rows} row(s) held and "
+                f"{self.constrained_columns} column(s) dropped at linear centre(s), where the "
+                f"(theta, phi) chart is singular -- NOT because the bend is absent")
+            if self.level == 'full':
+                lines.append(
+                    f"      d = {self.data_ndim} against 3N-6 = {expected}; the molecule is "
+                    f"globally nonlinear, so the shortfall is the chart's. Transverse "
+                    f"linear-bending coordinates would restore it (design note 3.2).")
         if n_free[0] or n_free[1]:
             lines.append(f"   box: r +/-{self.delta_r_max} A, theta "
                          f"+/-{self.delta_theta_max} rad, wall {self.bounding_coeff}, "
