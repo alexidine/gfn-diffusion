@@ -419,7 +419,26 @@ class ConformerModeller(Modeller):
         if dropped:
             print(f'energy_config: ignoring {dropped} -- not parameters of '
                   f'ConformerTorsions (crystal-route keys)')
-        self.energy_function = ConformerTorsions(**cfg)
+        # A MOLECULE SET GETS A SET ENERGY. `ConformerTorsions` is ONE chart -- `energy`
+        # reads its own `_M`, `r0` and Jacobian constants -- so a batch drawn from a
+        # multi-molecule condition file was scored entirely against `energy_config.smiles`.
+        # The shapes agree whenever k agrees, so it returned numbers rather than raising:
+        # measured 3.33 nats of per-row error across three ordinary QM9 molecules, which is
+        # a per-condition log Z error and therefore aimed straight at what the conditional
+        # route is trying to learn.
+        #
+        # The molecule list is read from the CONDITIONS FILE rather than from a new config
+        # key, so it cannot disagree with the set actually being trained on.
+        set_smiles, set_idents = self._condition_set_molecules()
+        print(f'condition set: {0 if not set_idents else len(set(set_idents))} distinct '
+              f'molecule(s) read from molecules_path')
+        if set_smiles and len(set(set_idents)) > 1:
+            from energies.multi_conformer import MultiConformerTorsions
+            cfg.pop('smiles', None)
+            self.energy_function = MultiConformerTorsions(
+                set_smiles, identifiers=set_idents, **cfg)
+        else:
+            self.energy_function = ConformerTorsions(**cfg)
         print(self.energy_function.describe())
         # THE BASE METHOD ALSO BUILDS THE TRACE WINDOW, and this override does not call
         # super(). Dropping it left profiling.trace silently INERT on the whole conformer
@@ -470,6 +489,48 @@ class ConformerModeller(Modeller):
     #: would silently unbuild the flat path.
     _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
                     'set_policy_corr_dim')
+
+    def _condition_set_molecules(self):
+        """`(smiles, identifiers)` of the condition set, or `(None, None)`.
+
+        Read straight off `molecules_path` because that file IS the set the run trains over;
+        a separate config list could disagree with it, and the failure would be a chart
+        mismatch discovered rows later.
+        """
+        path = getattr(self.args, 'molecules_path', None)
+        if not path:
+            return None, None
+        try:
+            blob = torch.load(path, weights_only=False, map_location='cpu')
+        except Exception as exc:                              # noqa: BLE001 - reported
+            print(f'condition set: could not read {path} ({type(exc).__name__}); '
+                  f'falling back to the single energy_config.smiles')
+            return None, None
+        batch = blob['prior'] if isinstance(blob, dict) and 'prior' in blob else blob
+        smis = getattr(batch, 'smiles', None)
+        idents = getattr(batch, 'identifier', None)
+        if smis is None or idents is None:
+            return None, None
+        smis, idents = list(smis), list(idents)
+        seen, out_s, out_i = set(), [], []
+        for smi, ident in zip(smis, idents):
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out_s.append(smi)
+            out_i.append(ident)
+        return out_s, out_i
+
+    def init_identifiers(self):
+        """Base registry, then hand it to a multi-molecule energy.
+
+        Without this a buffered row -- which carries `mol_id` but not `identifier` -- cannot be
+        matched to its chart, and the energy would have to guess.
+        """
+        super().init_identifiers()
+        binder = getattr(self.energy_function, 'bind_identifier_registry', None)
+        if binder is not None:
+            binder(self.identifier_registry)
 
     def init_gfn(self):
         """Base build, then swap the flat policy for the set policy if asked."""

@@ -100,6 +100,14 @@ def main():
     torch.set_default_dtype(torch.float64)
     torch.set_num_threads(args.threads)
 
+    # STRIPPED. A SMILES list piped in from a CRLF file carries a trailing carriage
+    # return into the identifier, which then keys the buffers, the mol_id registry and
+    # the per-molecule energy table -- all of which match by string equality. The
+    # contamination is invisible until one lookup uses a stripped key and raises a
+    # KeyError three layers away.
+    args.smiles = [s.strip() for s in args.smiles if s.strip()]
+    if args.identifiers:
+        args.identifiers = [s.strip() for s in args.identifiers if s.strip()]
     identifiers = args.identifiers or args.smiles
     if len(identifiers) != len(args.smiles):
         raise SystemExit(f"{len(args.smiles)} SMILES against {len(identifiers)} identifiers")
@@ -115,7 +123,11 @@ def main():
               f"hidden {bundle['hidden']}  ->  embedding_conditioning_dim: "
               f"{2 * bundle['hidden']}")
 
-    conditions, energies, dof_rows, skipped = [], [], [], []
+    # `kept` TRACKS THE SURVIVORS. Zipping the prior loop against the original
+    # `identifiers` instead pairs survivor i with input i, so every row after the
+    # first skip is labelled with the WRONG molecule -- no error, and the identifier
+    # is what the buffers, the mol_id registry and the per-molecule energy all key on.
+    conditions, energies, dof_rows, skipped, kept = [], [], [], [], []
     want_k = int(args.k) if args.k else None
     for smiles, ident in zip(args.smiles, identifiers):
         # see build_conformer_buffer.py: `torsion` is explicit, not a default. The
@@ -176,6 +188,7 @@ def main():
             dof_rows.append((mol, a, msk))
         conditions.append(mol)
         energies.append(energy)
+        kept.append(ident)
 
     if dof_rows:
         # R IS GLOBAL ACROSS THE FILE, not per molecule. A state column at level='torsion' is
@@ -227,7 +240,7 @@ def main():
 
     print(f"\nprior: {args.n_prior} states per molecule")
     parts = []
-    for mol, energy, ident in zip(conditions, energies, identifiers):
+    for mol, energy, ident in zip(conditions, energies, kept):
         states = draw_prior_states(energy, args.n_prior, args.internal_prior,
                                   args.fatten, args.seed)
         # RAW energy, T = 1: prebuilt_sample_to_reward divides by the sampling
