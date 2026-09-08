@@ -274,3 +274,30 @@ def test_an_empty_trigger_block_is_the_fixed_period_behaviour():
         assert m._fwd_gates(THRESH, False)[0] is False
     m.step_ind = 7
     assert m._fwd_gates(THRESH, False)[0] is True
+
+
+def test_every_rollout_path_increments_the_cost_counter():
+    """rollout/rate is energy calls per step -- the number the whole design is
+    trying to cut -- so it must count the cadence, off-cadence triggers, and the
+    un-cadenced baseline alike, or the savings are computed off a partial count."""
+    m = _m(every=7, prime_anchor=False)
+    m.step_ind = 0
+    m._fwd_gates(THRESH, False)                              # stage-entry rollout
+    for step in range(1, 15):
+        m.step_ind = step
+        m._fwd_gates(THRESH, False)
+    assert m._rollout_count == 3, 'steps 0, 7, 14'
+
+    trig = _m(every=1000, triggers={'drift_std_max': 5.0}, drift_std=9.0,
+              prime_anchor=False)
+    trig.step_ind = 0
+    trig._fwd_gates(THRESH, False)                           # entry
+    trig.step_ind = 40
+    assert trig._fwd_gates(THRESH, False)[0] is True         # trigger, off cadence
+    assert trig._rollout_count == 2, 'off-cadence rollouts count too'
+
+    plain = _m(every=0, fwd_frac=1.0)                        # no cadence: every step
+    for step in range(5):
+        plain.step_ind = step
+        plain._fwd_gates(THRESH, False)
+    assert plain._rollout_count == 5, 'the 1.0-per-step baseline'

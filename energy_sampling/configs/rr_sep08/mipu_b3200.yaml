@@ -307,9 +307,8 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
       balance:
@@ -398,9 +397,8 @@ protocols:
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
       balance:
@@ -481,9 +479,8 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
         val_gap_max: 4.0
         occupancy_min_batches: 2.0
       balance:
@@ -528,8 +525,8 @@ buffers:
     source: anchors
   replay_buffer:
     churn_rate: 3200
-    mean_residence_steps: 100
-    max_size: 20000
+    mean_residence_steps: 600
+    max_size: 160000
     admit_reward_min: -200
     prioritise:
       enabled: true

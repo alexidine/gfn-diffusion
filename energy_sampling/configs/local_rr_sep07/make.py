@@ -261,7 +261,19 @@ def main():
              # at 2000 rows and reuse at 50 -- 7x v2's reuse and 1/7 its energy
              # calls, with the replay-side bars expected to pull the effective
              # cadence back in wherever that is too far.
-             'rr_n50_v3': (50, True, 0.0, 4000, 'dev_race_L2_transition', 2000)}
+             'rr_n50_v3': (50, True, 0.0, 4000, 'dev_race_L2_transition', 2000),
+             # THE HARM CURVE. val_gap_nats against reuse, from the good warm start,
+             # all else fixed. Per-training-row reuse is ~N/(1-v), so these are ~22,
+             # 56 and 111 draws per row against rr_n7_v2's ~7.8 -- the first look at
+             # whether the gap grows with reuse and, if it does, whether run quality
+             # follows it down. 4000 steps because tau = 5N and the buffer needs a few
+             # tau to reach its age equilibrium (at N=100 that is tau=500).
+             #
+             # LOCAL RIG IS T=10 / batch 400 against the cluster's T=100 / batch 1000,
+             # so read the SHAPE of gap-vs-reuse, not the absolute nats.
+             'rr_hc_n20':  (20,  True, 0.0, 4000, 'dev_race_L2_transition', 4000),
+             'rr_hc_n50':  (50,  True, 0.0, 4000, 'dev_race_L2_transition', 4000),
+             'rr_hc_n100': (100, True, 0.0, 4000, 'dev_race_L2_transition', 4000)}
     arms = {}
     for name, (every, store_all, fwd_frac) in spec.items():
         cfg = build(name, every, store_all, fwd_frac)

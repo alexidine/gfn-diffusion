@@ -1,18 +1,18 @@
 project_state_version: 10
-run_name: acr_b2000
+run_name: vg20
 tag: rr08
 seed: 12345
 device: cuda
 cuda_memory_fraction: 0.9
 anomaly_detection: false
 continue_from_checkpoint: false
-mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 checkpoint_name: WARM_CHECKPOINT_PLACEHOLDER
 prior_model_name: PRIOR_MODEL_PLACEHOLDER
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
@@ -39,7 +39,7 @@ lr_control:
   seed_lr: 0.000125
   control_flow_lr: false
   burn_in_steps: 500
-  burn_in_scale: 0.025
+  burn_in_scale: 1.0
   min_root_bias_correction: 0.9
   candidate_scales:
   - 0.05
@@ -53,7 +53,7 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.025
+  fixed_scale: 1.0
   verbose: true
   hard_failure:
     loss_excursion_k: 60.0
@@ -121,19 +121,19 @@ model:
   dplr_mask_angular: true
   pb_exact_reversal: true
 buffer_device: cuda
-batch_size: 2000
+batch_size: 1000
 grow_batch_size: true
-max_batch_size: 2000
-eval_num_samples: 2500
+max_batch_size: 4000
+eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 209010
-eval_period: 1000
+epochs: 219010
+eval_period: 500
 figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50
-batch_util_target: 0
+batch_util_target: 0.95
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 60
 gpu_util_policy_window_s: 7200
@@ -164,9 +164,6 @@ fwd_loss_coeffs:
   repeats: 1.0
   loss_clip: 1000000000.0
   beta: 10.0
-  pooled_vg: 0.0
-  pooled_beta: 40.0
-  pooled_ratio: 0.5
 bwd_loss_coeffs:
   tb: 0.0
   freeze_policy: 0.0
@@ -307,10 +304,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 2.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -326,11 +322,11 @@ protocols:
         down: 0.01075
         bounds: &id001
           bwd:
-          - 0.5
+          - 0.25
           - 0.9
           replay:
           - 0.1
-          - 0.5
+          - 0.75
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -361,7 +357,7 @@ protocols:
       train_mode: fused
       bwd_sampling_mode: prior
       hot_lr_sensor:
-        channel: fwd/logw_std_within
+        channel: fwd/vg_lb
         rows: 11
         above: 3.0
         action: report
@@ -382,26 +378,22 @@ protocols:
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd:
-          vg_lb: 0.0
+          vg_lb: 1.0
           vg_by_condition: 1.0
           emp_z: 1.0
           repeats: 2.0
-          pooled_vg: 1.0
-          pooled_beta: 40.0
-          pooled_ratio: 0.5
           tb_z_source: persistent
         bwd:
-          vg_lb: 0.0
+          vg_lb: 1.0
           condition_block_m: 2.0
           repeats: 1.0
           level_gap: 0.0
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 2.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -481,10 +473,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 20
+      fwd_rollout_every: 200
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 2.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -527,9 +518,9 @@ buffers:
     ramp_width: 50
     source: anchors
   replay_buffer:
-    churn_rate: 2000
-    mean_residence_steps: 100
-    max_size: 12500
+    churn_rate: 1000
+    mean_residence_steps: 600
+    max_size: 50000
     admit_reward_min: -200
     prioritise:
       enabled: true
@@ -537,7 +528,7 @@ buffers:
       floor_frac: 0.25
       symmetric: true
     val_frac: 0.1
-    val_cap: 2000
+    val_cap: 1000
   anchor_buffer:
     seed_source: prior_dataset
     max_size: 200000
@@ -563,12 +554,12 @@ buffers:
     reach_topup_size: 1000
     frozen: true
     online_loss_flow: false
-energy_function: mace
+energy_function: elj
 temperature_conditioning: false
 molecule_conditioning: false
 sg_conditioning: false
 space_groups:
-- 14
+- 2
 zp_conditioning: false
 z_primes:
 - 1
@@ -577,7 +568,7 @@ vector_conditioning_dim: 3
 embedding_conditioning: false
 embedding_conditioning_dim: 192
 energy_config:
-  internal_oom_recovery: true
+  internal_oom_recovery: false
   temperature: 2.5
   log_temperature_range:
   - 0

@@ -1302,8 +1302,27 @@ class Modeller:
                 metrics[f'rollout/trigger_{key}'] = float(n)
             metrics['rollout/trigger_fires'] = float(sum(counts.values()))
             self._rollout_trigger_counts = {}
+        # EFFECTIVE CADENCE, from a COUNT over the reporting window -- not from
+        # rollout/steps_since below, which is 'age since the last event' sampled
+        # on a fixed grid and so reads about HALF the interval (3.0 against a true
+        # 7 on rr07_rr_n7_v2) and aliases outright when the grid and the cadence
+        # share factors (N=50 on a 10-step grid samples 0,10,20,30,40 and reads
+        # 20). That estimator gets worse exactly where the cadence is emergent,
+        # which is the case this controller creates.
+        n_roll = getattr(self, '_rollout_count', 0)
+        last_report = getattr(self, '_rollout_report_step', None)
+        if last_report is not None and self.step_ind > last_report:
+            span = self.step_ind - last_report
+            metrics['rollout/n'] = float(n_roll)
+            metrics['rollout/rate'] = n_roll / span          # == energy calls per step
+            if n_roll > 0:
+                metrics['rollout/every_eff'] = span / n_roll
+        self._rollout_report_step = self.step_ind
+        self._rollout_count = 0
         last = getattr(self, '_last_rollout_step', None)
         if last is not None:
+            # kept as a freshness reading -- 'how stale is log Z RIGHT NOW' -- not
+            # as a cadence estimate; see above for why it cannot serve as one
             metrics['rollout/steps_since'] = float(self.step_ind - last)
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
@@ -3857,6 +3876,14 @@ class Modeller:
         else:
             fwd_ran = bool(self.fwd_frac >= deactivate_threshold
                            or (force_refresh and not self.protocol.mode_dormant('fwd')))
+        if fwd_ran:
+            # THE COST AXIS OF THE WHOLE DESIGN, counted rather than inferred.
+            # Energy calls per training step == rollout rate, because the forward
+            # branch is the only branch that calls the energy function. Counted
+            # here so it covers every path that produces a rollout: the cadence,
+            # an off-cadence trigger, and the un-cadenced case (where it is 1.0
+            # by construction, which is the baseline the savings are against).
+            self._rollout_count = getattr(self, '_rollout_count', 0) + 1
         return fwd_ran, bool(fwd_ran and self.fwd_frac >= deactivate_threshold)
 
     #: (key, default, direction) -- direction 'above' fires when the reading

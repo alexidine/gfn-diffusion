@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: fast4
+run_name: n20_det
 tag: rr08
 seed: 12345
 device: cuda
@@ -306,8 +306,7 @@ protocols:
         max_boost: 8.0
       fwd_rollout_every: 20
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -319,8 +318,8 @@ protocols:
         bar: 0.0
         ratchet_metric: bwd/under_coverage
         ratchet_tol: 0.0
-        up: 0.0017
-        down: 0.043
+        up: 0.000425
+        down: 0.01075
         bounds: &id001
           bwd:
           - 0.25
@@ -394,8 +393,7 @@ protocols:
           tb_z_source: persistent
       fwd_rollout_every: 20
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -407,8 +405,8 @@ protocols:
         bar: 0.0
         ratchet_metric: bwd/under_coverage
         ratchet_tol: 0.0
-        up: 0.0017
-        down: 0.043
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
   prod_eq:
     stages:
@@ -477,8 +475,7 @@ protocols:
         max_boost: 8.0
       fwd_rollout_every: 20
       fwd_rollout_triggers:
-        ess_min: 0.1
-        val_gap_max: 4.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -490,8 +487,8 @@ protocols:
         bar: 0.0
         ratchet_metric: bwd/under_coverage
         ratchet_tol: 0.0
-        up: 0.0017
-        down: 0.043
+        up: 0.000425
+        down: 0.01075
         bounds: *id001
 controller:
   min_mode_frac: 0.001
@@ -522,8 +519,8 @@ buffers:
     source: anchors
   replay_buffer:
     churn_rate: 1000
-    mean_residence_steps: 100
-    max_size: 12000
+    mean_residence_steps: 60
+    max_size: 50000
     admit_reward_min: -200
     prioritise:
       enabled: true

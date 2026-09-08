@@ -80,11 +80,43 @@ p02make = rr07make.p02make
 # N=20 ~ N=7 in quality per step with ELJ speed saturating ~2.7x by then, so it
 # is the value most likely to ship; tau/N = 5 is rr_sep07's.
 N_SHIP = 20
-TAU_OVER_N_SHIP = 5
+# LOOSE BACKSTOP for the bar sweep: the deterministic maximum that bounds time
+# without fresh forward samples, while the val_gap bar sets the real cadence.
+N_LOOSE = 200
+TAU_OVER_N_SHIP = 3
+# HARD FLOOR ON tau/N (owner 2026-09-08). Occupancy O = churn * tau/N and the draw
+# takes a full batch every step, so O/B = tau/N -- the "occupancy in batches" the
+# trigger reads IS this ratio. Below 2 the draw starts repeating itself out of a
+# pool smaller than two batches.
+#
+# WHY THE GUARANTEE IS WORST-CASE: fwd_rollout_every is a MAXIMUM, not a target --
+# triggers only ever SHORTEN the interval, which raises the admission rate, which
+# raises occupancy. So tau = TAU_OVER_N_MIN * N bounds O/B from BELOW for any
+# trigger behaviour; the ratio can only come out higher than configured.
+TAU_OVER_N_MIN = 3
+# ...and the trigger bar sits BELOW the floor on purpose. If bar == floor, the
+# boundary arm reads exactly the floor and fires on any transient -- a bar that
+# merely restates the config.
+#
+# THE SAWTOOTH IS WHY THE MARGIN HAS TO BE ONE HALF-BURST. Admissions arrive as a
+# burst of B every N steps and the hazard drains ~B between bursts, so occupancy
+# cycles from O+B/2 down to O-B/2 and the TROUGH is what the bar sees:
+#
+#     O_trough / B  =  tau/N - 0.5
+#
+# At tau/N = 2 the trough is 1.5, so a 2.0 bar fires every cycle. At tau/N = 3 the
+# trough is 2.5 and a 2.0 bar has 25% headroom, firing only on a genuine shortfall
+# (initial fill, a batch growth the buffer has not caught up with, a servo churn
+# boost). Corroborated: local rr_n7_v1 ran length 2024-2381 against B=400, i.e. an
+# amplitude of ~B as predicted. Owner call 2026-09-08: the floor is "never below 2
+# batches", so the floor moves to 3 and the bar to 2.
+OCCUPANCY_BAR = 2.0
 ROLLOUT_BOOTSTRAP = 'bootstrap_z:rollout:4000'
 GUARD_METRIC = 'bwd/under_coverage_rise150'
 GUARD_LEVEL = 'bwd/under_coverage'
-TRIGGER_KEYS = ('ess_min', 'val_gap_max', 'occupancy_min_batches')
+# ess_min retired 2026-09-08 -- Kish on exp(d) is scale-invariant, so it reads
+# 1.000 for a uniform collapse and cannot see the policy leaving the buffer.
+TRIGGER_KEYS = ('val_gap_max', 'occupancy_min_batches')
 
 # (arm, family, N, overrides). EXACTLY ONE override per arm, except where the
 # override is only meaningful in combination (n50_ess25: the ess bar is inert at
@@ -92,32 +124,71 @@ TRIGGER_KEYS = ('ess_min', 'val_gap_max', 'occupancy_min_batches')
 # at the cadence where it is live; pbf_mipu: the freeze needs a batch that
 # survives the night, and block 3 predicts 3200 is it).
 ARMS = (
-    # -- block 1: controller gains and rails ------------------------------------
+    # -- block 1: CONTROLLER (already submitted; rows 0-2 are running or crashed
+    #    and must keep their index so the INDEX still documents what they ran) --
     ('base',        'mip',  N_SHIP, {}),
     ('tol05',       'mip',  N_SHIP, {'ratchet_tol': 0.5}),
     ('cap75',       'mip',  N_SHIP, {'bwd_hi': 0.75}),
-    ('fast4',       'mip',  N_SHIP, {'gain_mult': 4.0}),
-    # -- block 2: cadence and buffer composition --------------------------------
-    ('n5',          'mip',       5, {}),
-    ('n50',         'mip',      50, {}),
-    ('n50_ess25',   'mip',      50, {'ess_min': 0.25}),
-    ('tau2',        'mip',  N_SHIP, {'tau_over_n': 2}),
-    ('tau10',       'mip',  N_SHIP, {'tau_over_n': 10}),
-    ('q05',         'mip',  N_SHIP, {'fill_process_var': 0.05}),
-    # -- block 3: MLIP cost ladder ----------------------------------------------
-    ('mipu_b1600',  'mipu', N_SHIP, {}),
-    ('mipu_b3200',  'mipu', N_SHIP, {'batch': 3200}),
-    ('mipu_b6400',  'mipu', N_SHIP, {'batch': 6400}),
-    ('nehu_b1600',  'nehu', N_SHIP, {}),
-    ('acr_b1000',   'acr',  N_SHIP, {}),
-    ('acr_b2000',   'acr',  N_SHIP, {'batch': 2000}),
-    # -- block 4: P_B frozen at T=100 -------------------------------------------
-    ('pbf_mip',     'mip',  N_SHIP, {'freeze_pb': True}),
-    ('pbf_mipu',    'mipu', N_SHIP, {'batch': 3200, 'freeze_pb': True}),
+
+    # -- block 2: THE val_gap BAR SWEEP -- the point of the battery -------------
+    # The bar is the KNOB and the effective cadence is the READOUT. Loose
+    # backstop (N_max 200), so each arm's trigger pulls the cadence in to
+    # wherever its bar is satisfied: reuse grows the gap, the gap hits the bar,
+    # the trigger fires, admissions rise, reuse falls. Equilibrium is gap ~ bar
+    # at whatever N_eff achieves it, so sweeping the bar traces the
+    # quality-vs-cost curve with each arm self-selecting one point on it.
+    # Read rollout/rate as an OUTPUT.
+    #
+    # No bar below 1.0: the measured gap at N=20 is 1.25, so a lower bar can
+    # never be satisfied, drives N_eff to the 2-step trigger floor, and asks for
+    # ~300 batches of buffer. That arm would spend 12h pinned against max_size
+    # measuring overflow eviction.
+    ('vg10',        'mip', N_LOOSE, {'val_gap_max': 1.0}),
+    ('vg20',        'mip', N_LOOSE, {'val_gap_max': 2.0}),
+    ('vg40',        'mip', N_LOOSE, {'val_gap_max': 4.0}),
+    # bar 0 disables it (_rollout_trigger_fires skips bars <= 0): the
+    # uncontrolled endpoint of the same curve, i.e. deterministic N = N_LOOSE.
+    ('vg_off',      'mip', N_LOOSE, {'val_gap_max': 0.0}),
+
+    # -- block 3: the tau axis at a fixed bar -----------------------------------
+    # tau has NEVER been varied independently of N -- every arm ever run set
+    # tau = 5N. At a fixed bar this separates staleness and occupancy from reuse.
+    # NB these carry the SHIPPED bar (4.0), not 2.0 -- one override per arm, and
+    # the shipped bar is the right control for a tau sweep. Named for what they
+    # actually vary.
+    ('tau6',        'mip', N_LOOSE, {'tau_over_n': 6}),
+    ('tau12',       'mip', N_LOOSE, {'tau_over_n': 12}),
+
+    # -- block 4: deterministic reference points --------------------------------
+    # Fixed cadence, no adaptive bar, so an adaptive arm that settles at N_eff=X
+    # can be read against a deterministic arm actually run at N=X. n20_det is
+    # also the ONLY clean comparison to base/tol05/cap75, which ran N=20 under
+    # the retired ess_min bar -- it isolates what retiring it changed.
+    ('n20_det',     'mip',      20, {'val_gap_max': 0.0}),
+    ('n50_det',     'mip',      50, {'val_gap_max': 0.0}),
+
+    # -- block 5: MLIP cost ladder ----------------------------------------------
+    # Where the wall-clock payoff lives, and where utilisation binds: the running
+    # ELJ arms sit at ~61% mean GPU util with 5.7% memory allocated, and rare
+    # rollouts REMOVE the energy work that was filling the card. Batch is the
+    # lever that refills it, and it is nearly free here because energy cost is
+    # batch * rollout_rate and the rate is already cut ~15x.
+    ('mipu_b1600',  'mipu', N_LOOSE, {}),
+    ('mipu_b3200',  'mipu', N_LOOSE, {'batch': 3200}),
+    ('mipu_b6400',  'mipu', N_LOOSE, {'batch': 6400}),
+
+    # -- block 6: transfer to other systems --------------------------------------
+    ('nehu_b1600',  'nehu', N_LOOSE, {}),
+    ('acr_b1000',   'acr',  N_LOOSE, {}),
+
+    # -- block 7: P_B frozen at T=100 (separate workstream) ----------------------
+    ('pbf_mip',     'mip',  N_LOOSE, {'freeze_pb': True}),
+    ('pbf_mipu',    'mipu', N_LOOSE, {'freeze_pb': True}),
 )
 
+
 OVERRIDE_KEYS = {'ratchet_tol', 'bwd_hi', 'gain_mult', 'tau_over_n',
-                 'ess_min', 'fill_process_var', 'batch', 'freeze_pb'}
+                 'val_gap_max', 'fill_process_var', 'batch', 'freeze_pb'}
 
 
 def _fused(cfg, active_only=False):
@@ -139,13 +210,28 @@ def _force_rollout_bootstrap(cfg):
 
 
 def _size_replay(cfg, tau_over_n):
-    """max_size from the occupancy the hazard actually produces, so eviction
-    stays hazard-driven rather than cap-driven at every batch on the ladder.
-    1.25x headroom for the Poisson spread around the mean residence; never
-    below rr_sep07's 12000, because a cap that never binds costs nothing."""
+    """max_size as an honest MEMORY BUDGET, sized for the range the controller
+    actually operates in rather than for the idle case.
+
+    tau is fixed in STEPS, so occupancy O = B * tau / N_eff grows as 1/N_eff --
+    and N_eff is what the val_gap trigger pulls DOWN. Sizing max_size from N_max
+    (i.e. from tau_over_n alone) caps the buffer at the one cadence where the
+    trigger never fires, so it binds the moment it does.
+
+    When it binds, admission uniformly purges live rows to make room
+    (train.py, `headroom`/`extra_purge`) -- residual-independent, so composition
+    is NOT distorted. What is lost is tau: effective residence becomes
+    max_size * N_eff / B and the configured tau goes inert. Verified on
+    rr08_tol05: max_size 12000, grown batch 4000, N_eff 14.7 -> tau_eff ~44
+    against a configured 100, and mean_age 21 ~ tau_eff/2.
+
+    50 * B covers N_eff down to N_max/50 at tau/N = 3. Past that the arm is
+    running tau-disconnected, which is fine if deliberate and bad if silent --
+    watch replay_buffer_length == max_size.
+    """
     rb = cfg['buffers']['replay_buffer']
     occupancy = int(rb['churn_rate']) * tau_over_n
-    rb['max_size'] = max(12000, int(math.ceil(occupancy * 1.25)))
+    rb['max_size'] = max(12000, int(rb['churn_rate']) * 50, int(math.ceil(occupancy * 1.25)))
 
 
 def _apply(cfg, every, ov):
@@ -163,6 +249,10 @@ def _apply(cfg, every, ov):
         rb['churn_rate'] = b
         rb['val_cap'] = b
 
+    if tau_over_n < TAU_OVER_N_MIN:
+        raise ValueError(f"tau_over_n={tau_over_n} is below the occupancy floor "
+                         f"{TAU_OVER_N_MIN}: O/B = tau/N would leave the draw taking a "
+                         f"full batch from a pool smaller than {TAU_OVER_N_MIN} batches.")
     cfg['buffers']['replay_buffer']['mean_residence_steps'] = tau_over_n * every
     _size_replay(cfg, tau_over_n)
 
@@ -183,8 +273,8 @@ def _apply(cfg, every, ov):
         if 'gain_mult' in ov:
             k = float(ov['gain_mult'])
             bal['up'], bal['down'] = bal['up'] * k, bal['down'] * k
-        if 'ess_min' in ov:
-            st['fwd_rollout_triggers']['ess_min'] = float(ov['ess_min'])
+        if 'val_gap_max' in ov:
+            st['fwd_rollout_triggers']['val_gap_max'] = float(ov['val_gap_max'])
         if ov.get('freeze_pb'):
             # AFTER the bootstrap: on_enter runs in order and the freeze must
             # not be holding a snapshot while log Z is still being seeded.
@@ -234,7 +324,14 @@ def check(cfg, name, fam, every, ov):
         assert b['up'] < b['down'], where + 'guard must act faster than the ramp'
         trig = s.get('fwd_rollout_triggers') or {}
         assert all(t in trig for t in TRIGGER_KEYS), where + 'cadence triggers'
-        assert trig['ess_min'] == float(ov.get('ess_min', 0.10)), where + 'ess_min'
+        assert trig['val_gap_max'] == float(ov.get('val_gap_max', 4.0)), where + 'val_gap_max'
+        assert 'ess_min' not in trig, where + 'ess_min is retired'
+        # this constant documents the contract; rr07's deltas() OWNS it, so a
+        # drift between the two would otherwise be silent
+        assert trig['occupancy_min_batches'] == OCCUPANCY_BAR, where + 'occupancy bar'
+        assert (cfg['buffers']['replay_buffer']['mean_residence_steps']
+                >= TAU_OVER_N_MIN * s['fwd_rollout_every']), (
+            where + 'tau/N below the occupancy floor')
         assert ('freeze_pb' in s['on_enter']) == bool(ov.get('freeze_pb')), where + 'freeze_pb'
         if ov.get('freeze_pb'):
             assert s['on_enter'].index(ROLLOUT_BOOTSTRAP) < s['on_enter'].index('freeze_pb'), \
