@@ -25,7 +25,7 @@ BOUNDS = {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}
 
 
 def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
-          batch=None, lr_scale=None):
+          batch=None, lr_scale=None, tau_mult=5):
     """fwd_frac > 0 is the level-blind forward policy step: on rollout steps the
     forward TB loss trains the policy with the batch's own root standing in for
     log Z (tb_z_source batch_root), at that loss weight; the head is still set
@@ -225,11 +225,13 @@ def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
     rb['val_frac'] = 0.1
     if store_all:
         rb['churn_rate'] = int(cfg['batch_size'])
-        rb['mean_residence_steps'] = 5 * int(every)
+        # tau_mult is the OCCUPANCY knob: O = B * tau/N = B * tau_mult, so it sets
+        # the pool size and the mean age together and leaves reuse (= N) alone.
+        rb['mean_residence_steps'] = int(tau_mult) * int(every)
     return cfg
 
 
-def check(cfg, name, every, store_all):
+def check(cfg, name, every, store_all, tau_mult=5):
     st = [s for p in cfg['protocols'].values() for s in p['stages']
           if s.get('train_mode') == 'fused']
     assert st and all(s['fwd_rollout_every'] == every for s in st), name
@@ -239,7 +241,14 @@ def check(cfg, name, every, store_all):
     assert rb['val_frac'] == 0.1, name + ': val split'
     if store_all:
         assert rb['churn_rate'] == cfg['batch_size'], name
-        assert rb['mean_residence_steps'] == 5 * every, name
+        assert rb['mean_residence_steps'] == tau_mult * every, name
+        # a cap-bound buffer is tau-DISCONNECTED and measures nothing -- this is
+        # the state that voided the first hc2 re-run (occupancy pinned at 12000
+        # for both N=20 and N=50, mean_age 21 for both, the N knob dead).
+        occ = cfg['batch_size'] * tau_mult
+        assert rb['max_size'] >= occ * 1.5, (
+            '%s: max_size %d leaves no headroom over occupancy %d'
+            % (name, rb['max_size'], occ))
 
 
 def main():
@@ -305,9 +314,16 @@ def main():
     # 1.5625e-5. The first cut measured val_gap 0.36/0.59/1.36 at N=20/50/100 with
     # the policy barely moving; reuse cannot hurt a policy that is not changing,
     # so a 6.4x LR is the condition under which the knee should move IN.
-    hc2 = {'rr_hc2_n20':  (20,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8),
-           'rr_hc2_n50':  (50,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8),
-           'rr_hc2_n100': (100, True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8)}
+    hc2 = {'rr_hc2_n20':  (20,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8, 5),
+           'rr_hc2_n50':  (50,  True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8, 5),
+           'rr_hc2_n100': (100, True, 0.0, 4000, 'dev_race_L2_transition', 4000, 1000, 0.8, 5),
+           # 5x THE RETENTION at the same cadence: tau 100 -> 500, so occupancy
+           # goes 5000 -> 25000 rows and mean age 73 -> ~370 steps, while reuse
+           # stays at N = 20. The direct test of whether tau cancels: a row's
+           # exposure is tau/O = 1/admissions, so absorption should NOT move.
+           # 6000 steps, not 4000 -- the buffer needs ~5*tau = 2500 steps to reach
+           # age equilibrium, and a settled window has to come after that.
+           'rr_hc2_n20_t25': (20, True, 0.0, 4000, 'dev_race_L2_transition', 6000, 1000, 0.8, 25)}
     arms = {}
     for name, (every, store_all, fwd_frac) in spec.items():
         cfg = build(name, every, store_all, fwd_frac)
@@ -322,10 +338,10 @@ def main():
         check(cfg, name, every, store_all)
         assert cfg['checkpoint_name'].startswith(warm) and cfg['prior_model_name'].startswith(warm), name
         arms[name] = cfg
-    for name, (every, store_all, fwd_frac, boot, warm, steps, batch, lrs) in hc2.items():
+    for name, (every, store_all, fwd_frac, boot, warm, steps, batch, lrs, tm) in hc2.items():
         cfg = build(name, every, store_all, fwd_frac, boot=boot, warm=warm, steps=steps,
-                    batch=batch, lr_scale=lrs)
-        check(cfg, name, every, store_all)
+                    batch=batch, lr_scale=lrs, tau_mult=tm)
+        check(cfg, name, every, store_all, tau_mult=tm)
         rb = cfg['buffers']['replay_buffer']
         assert cfg['batch_size'] == batch == cfg['max_batch_size'], name
         assert rb['val_cap'] == batch and rb['churn_rate'] == batch, name
