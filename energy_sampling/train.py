@@ -2,6 +2,7 @@ import copy
 import gc
 import math
 import os
+import threading
 from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Optional
@@ -37,7 +38,7 @@ from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, ad
     log_ess_frac, condition_tracker_figs, fig_guard
 from energy_sampling.eval.traj_reporting import traj_overlap_report, to_scalars
 
-from time import time
+from time import time, sleep
 
 import numpy as np
 import torch
@@ -701,17 +702,20 @@ class Modeller:
         75/62/54/49/48/48%. In-process it feeds select_batch_size's per-rung
         calibration readings and its S2 audit; the deleted gpu_util_floor rule --
         which grew on the windowed mean directly -- stays deleted
-        (utils._RETIRED_KEYS holds the record). NB the trailing-window means built
-        on these samples disagree with the out-of-process samplers by a
-        batch-dependent, sign-flipping error (handoff §2), so the number the
-        scheduler judges is the out-of-process one.
+        (utils._RETIRED_KEYS holds the record). The batch-dependent, sign-flipping
+        disagreement with the out-of-process samplers (handoff §2) was diagnosed as
+        PHASE, not source, and the sampler thread is the fix; until a run has been
+        compared against `system.gpu.0.gpu` again the out-of-process number remains
+        the one the scheduler judges and the one to quote.
 
-        SAMPLED ON A TIME CADENCE, NOT A STEP CADENCE. It used to be sampled once per
-        ten_step_reporting, which is fine at 2 s/step and useless at 200 s/step: two
-        readings 2000 s apart cannot populate a 900 s window, so `_gpu_util_mean`
-        returned None and the metric was simply absent -- on exactly the slow MLIP
-        arms whose utilization we most needed to watch. A wall-clock period decouples
-        the sensor from the step time it is trying to characterise.
+        SAMPLED ON A TIME CADENCE, NOT A STEP CADENCE, AND OFF THE TRAINING THREAD.
+        It used to be sampled once per ten_step_reporting, which is fine at 2 s/step
+        and useless at 200 s/step: two readings 2000 s apart cannot populate a 900 s
+        window, so `_gpu_util_mean` returned None and the metric was simply absent --
+        on exactly the slow MLIP arms whose utilization we most needed to watch. A
+        wall-clock period fixed the RATE; it did not fix the PHASE, because the call
+        still sat at one fixed position in the step body. `_start_gpu_util_thread`
+        carries that argument and is where the reading is now taken from.
 
         TWO SOURCES, because the obvious one is not always there.
         `torch.cuda.utilization()` needs the pynvml bindings, which are NOT installed
@@ -740,7 +744,131 @@ class Modeller:
             return
         if not hasattr(self, '_gpu_util'):
             self._gpu_util = deque(maxlen=4096)
-        self._gpu_util.append((now, reading))
+        lock = getattr(self, '_gpu_util_lock', None)
+        if lock is None:
+            self._gpu_util.append((now, reading))
+        else:
+            with lock:
+                self._gpu_util.append((now, reading))
+
+    def _gpu_util_samples(self):
+        """
+        A stable snapshot of the reading deque. EVERY reader must go through this.
+
+        The sampler runs on its own thread (see `_start_gpu_util_thread`), so a bare
+        iteration over `_gpu_util` races an append -- and once the deque is at its
+        maxlen an append also POPS, which raises 'deque mutated during iteration' in
+        whichever consumer happened to be reading. That would surface as an
+        intermittent crash inside select_batch_size's calibration, i.e. the least
+        debuggable place available.
+        """
+        samples = getattr(self, '_gpu_util', None)
+        if not samples:
+            return ()
+        lock = getattr(self, '_gpu_util_lock', None)
+        if lock is None:
+            return tuple(samples)
+        with lock:
+            return tuple(samples)
+
+    def _start_gpu_util_thread(self):
+        """
+        Move occupancy sampling OFF the training loop, onto a daemon thread.
+
+        WHY. Called from the loop, the sensor fired at one fixed position in the step
+        body -- always just after the step was timed, always before
+        select_batch_size. A GPU step is not uniformly busy (the MLIP call saturates
+        the card, the host-side buffer work does not), so reading the same intra-step
+        phase every time samples a biased slice of the duty cycle, and the size of
+        that slice moves with the batch. That is the batch-dependent, SIGN-FLIPPING
+        error handoff §2 measured between `gpu/util_policy` and the out-of-process
+        streams -- and it is why the scheduler's number and ours disagree in level
+        while correlating in shape.
+
+        The two out-of-process samplers -- wandb's `system.gpu.0.gpu` and the
+        `joblogs/*_smi.csv` sidecar -- were cross-checked 2026-08-19 and AGREE. They
+        do not use a better sensor than we do (the sidecar is `nvidia-smi`, which is
+        also our fallback leaf); they sample on a wall clock that knows nothing about
+        our loop. So the fix is the cadence, not the source.
+
+        NOT STARTED IN bench/. The sandbox drives `_sample_gpu_util` itself on a
+        virtual clock -- thousands of steps in a second -- and a real-time thread
+        there would sample the synthetic device at a rate unrelated to the simulated
+        one. Only `train()` starts it.
+        """
+        if getattr(self, '_gpu_util_thread', None) is not None:
+            return
+        if getattr(self, '_gpu_util_off', False):
+            return
+        self._announce_gpu_util_source()
+        self._gpu_util_lock = threading.Lock()
+        period = float(getattr(self.args, 'gpu_util_sample_period_s', 60) or 0)
+        if period <= 0:
+            return
+
+        def _loop():
+            while not getattr(self, '_gpu_util_off', False):
+                try:
+                    self._sample_gpu_util()
+                except Exception as e:      # a dead sensor must never kill training
+                    print(f"gpu util sampler thread error ({e!r}) -- sensor going inert")
+                    self._gpu_util_off = True
+                    return
+                # the period gate inside _sample_gpu_util is still authoritative;
+                # ticking at a fraction of it keeps the sample times from drifting
+                # into a fixed offset as the read cost varies.
+                sleep(period / 4.0)
+
+        t = threading.Thread(target=_loop, name='gpu-util-sampler', daemon=True)
+        self._gpu_util_thread = t
+        t.start()
+
+    def _announce_gpu_util_source(self):
+        """
+        Say once, into the joblog, WHICH sensor answered and WHICH card it read.
+
+        WHY THIS IS NOT DECORATION. A compute node here holds four GPUs running
+        four unrelated jobs -- NYU HPC's own example output shows one node at
+        97 / 5 / 100 / 88 percent simultaneously. Reading the wrong row does not
+        fail; it silently reports a stranger's job, and the number that comes back
+        is a plausible occupancy that no amount of downstream statistics can
+        identify as someone else's. `gpu_guard._visible_index` exists because that
+        was a live bug (it read row 0 unconditionally until 2026-08-14, which is
+        inside the window handoff §2's measurements were taken in -- so whether
+        those numbers were ever OURS is not now decidable from the logs, and this
+        line is what makes it decidable next time).
+
+        The two sensors do not select a card the same way, which is the other half
+        of why the source has to be named. `torch.cuda.utilization()` reads the
+        CURRENT CUDA DEVICE, which CUDA_VISIBLE_DEVICES has already remapped, so it
+        is right by construction. The nvidia-smi fallback reads a ROW of a table
+        listing every card on the node, and has to do the remap itself. A run whose
+        joblog does not say which of those it used cannot be reconciled against the
+        `*_smi.csv` sidecar beside it.
+        """
+        source, detail = 'none', ''
+        try:
+            import torch as _t
+            _t.cuda.utilization()
+            source = 'pynvml/torch.cuda.utilization'
+            detail = f'current cuda device {_t.cuda.current_device()}'
+        except Exception:
+            try:
+                import gpu_guard
+                if gpu_guard.gpu_memory() is not None:
+                    source = 'nvidia-smi (gpu_guard)'
+                    detail = (f'row {gpu_guard._visible_index()} of nvidia-smi, '
+                              f'CUDA_VISIBLE_DEVICES='
+                              f'{os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")!r}')
+            except Exception:
+                pass
+        period = float(getattr(self.args, 'gpu_util_sample_period_s', 60) or 0)
+        print(f'gpu util sensor: {source}' + (f' -- {detail}' if detail else '') +
+              f' | every {period:g}s on its own thread | windows '
+              f'{getattr(self.args, "gpu_util_window_s", 900):g}s (util_recent) / '
+              f'{getattr(self.args, "gpu_util_policy_window_s", 7200):g}s (util_policy). '
+              f'Reconcile against the *_smi.csv sidecar beside this log, which reads '
+              f'the same instrument out of process.')
 
     def _read_gpu_util(self):
         """
@@ -768,7 +896,7 @@ class Modeller:
         """Mean utilization over the trailing `window_s` seconds, or None if the
         sensor is off or the window is not yet populated. None means 'no reading',
         never 'fine'."""
-        samples = getattr(self, '_gpu_util', None)
+        samples = self._gpu_util_samples()
         if not samples:
             return None
         cutoff = self._now() - window_s
@@ -1138,7 +1266,7 @@ class Modeller:
             return
         interval = max(1, int(getattr(self.args, 'batch_growth_interval', 0) or 50))
         rung_steps = self.step_ind - int(s.get('rung_start_step', 0))
-        samples = [u for ts, u in getattr(self, '_gpu_util', ())
+        samples = [u for ts, u in self._gpu_util_samples()
                    if ts >= float(s.get('rung_start_time', 0.0))]
         if med is None or rung_steps < interval or len(samples) < _BS_MIN_UTIL_SAMPLES:
             if rung_steps >= _BS_RUNG_TIMEOUT_INTERVALS * interval and \
@@ -1438,12 +1566,13 @@ class Modeller:
         metrics.update(energy_timing)
         # GPU occupancy. Two consumers now: these metrics, and select_batch_size --
         # which reads RAW per-rung samples during calibration and the policy-window
-        # mean once for its S2 audit, never these windows as a control input. NB the
-        # in-process gpu/util_policy is known to disagree with the out-of-process
-        # samplers by a batch-dependent, sign-flipping error (handoff §2): the number
-        # the scheduler judges is the OUT-OF-PROCESS one (wandb system stream /
-        # nvidia-smi sidecar); this series survives as the in-process view of it.
-        # Sampling happens in the train loop on a wall-clock cadence; this only reads.
+        # mean once for its S2 audit, never these windows as a control input. The
+        # in-process/out-of-process disagreement handoff §2 measured came from
+        # sampling at a fixed intra-step phase; the sampler now runs on its own
+        # thread, and whether that closes the gap is an open MEASUREMENT -- until it
+        # is made, the number the scheduler judges is still the OUT-OF-PROCESS one
+        # (wandb `system.gpu.0.gpu` / the nvidia-smi sidecar).
+        # Sampling happens on the sampler thread; this only reads.
         util_recent = self._gpu_util_mean(
             float(getattr(self.args, 'gpu_util_window_s', 900) or 900))
         if util_recent is not None:
@@ -3037,6 +3166,11 @@ class Modeller:
                          tags=[self.args.tag])):
             self.times['initialization_start'] = time()
 
+            # up before anything else so the occupancy trace covers init too -- the
+            # MLIP load and the whole-prior scan are minutes of card time that the
+            # scheduler's average includes and ours used not to see at all.
+            self._start_gpu_util_thread()
+
             self.vram_ledger('baseline')
 
             # Reward init
@@ -3090,7 +3224,13 @@ class Modeller:
             # the number every training allocation has to fit under, printed BEFORE
             # the first step so a launch that is already doomed says so at step 0
             self.vram_ledger('READY TO TRAIN')
-            if torch.cuda.is_available():
+            # device_count, NOT is_available alone: with CUDA_VISIBLE_DEVICES="" a CUDA
+            # build still reports available on this machine while exposing no device, so
+            # `get_device_properties(0)` raises "Invalid device id" and a deliberately
+            # CPU-only run dies at READY TO TRAIN -- after every buffer is seeded, which is
+            # the most expensive possible place to discover it. Same family as `device: cpu`
+            # not being enough to keep a run off the card.
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 _total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
                 _cap = float(getattr(self.args, 'cuda_memory_fraction', 1.0) or 1.0) * _total
                 _res = torch.cuda.memory_reserved() / (1024 ** 2)
@@ -3180,12 +3320,12 @@ class Modeller:
                 self._throughput['seconds'] += step_dt
                 self._throughput['energy_seconds'] += max(
                     0.0, getattr(self.energy_function, 'energy_seconds', 0.0) - energy_s_before)
-                # occupancy sampled on a WALL-CLOCK cadence (the call is a cheap
-                # no-op between periods), so the trailing windows populate at 200 s
-                # a step as well as at 2 s. Doing this from ten_step_reporting tied
-                # the sample rate to the step rate and left the metric absent on
-                # exactly the slow MLIP arms it was added to watch.
-                self._sample_gpu_util()
+                # occupancy is NOT sampled here any more. It is sampled by the
+                # daemon thread `_start_gpu_util_thread` puts up, because a reading
+                # taken from this line lands at the same intra-step phase every time
+                # and that bias moves with the batch -- handoff §2's sign-flipping
+                # disagreement with the out-of-process streams. bench/ still drives
+                # `_sample_gpu_util` directly on its virtual clock.
                 # the controller scores the step it just timed, at the batch that
                 # actually ran it: moving the batch before the append paired a new
                 # batch with the old rung's timings (and made 'Batch Size' log one
@@ -9063,7 +9203,25 @@ class Modeller:
         # and the since-retired hard age cap). Supply-side intake
         # runs whether or not replay is training, so the buffer is warm
         # whenever a stage wants to draw from it ---
-        n_admit = min(elig.numel(), int(rb_cfg.churn_rate))
+        # CHURN TRACKS THE LIVE BATCH. `churn_rate` is configured against the ENTRY
+        # batch, but grow_batch_size moves the draw underneath it while the occupancy
+        # bar is read as len(buffer) / LIVE batch. Frozen churn therefore made a
+        # 2.0-batch bar UNREACHABLE -- steady state is
+        #     O / B_live = (churn / B_live) * (tau / N_eff)
+        # so at churn 1000 against a grown 4000 the bar needed tau/N_eff = 8 while the
+        # arms shipped 3, occupancy_min_batches fired forever, and every rr_sep08
+        # cadence was dragged to N_eff = churn*tau/(2*B_live) = 0.375*N: 2.7x the
+        # intended energy calls, on the one axis the whole design exists to control.
+        # Predicted 7.5/18.75/37.5/75 against measured 7.5/18.3/33.1/72.9.
+        #
+        # Scaling by the ratio preserves what the config MEANT at any live batch:
+        # store-all where churn == batch (the rr07 contract asserts it), and a
+        # deliberate fraction where it is less -- the conformer route ships churn 80
+        # against batches of 16-1000 and keeps that fraction rather than being
+        # silently promoted to store-all.
+        entry_b = max(1, int(getattr(self.args, 'batch_size', self.batch_size) or 1))
+        churn_live = int(round(float(rb_cfg.churn_rate) * self.batch_size / entry_b))
+        n_admit = min(elig.numel(), max(1, churn_live))
         add_inds = elig[_uniform_draw(elig.numel(), n_admit)]
 
         # --- purge: TTL/toxic eviction frees headroom first; a uniform-random
