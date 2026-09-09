@@ -2120,7 +2120,18 @@ class Modeller:
             mol_batch = next(self.mol_dataset.loader(int(self.batch_size), mode='graphs'))
             mol_batch = mol_batch.to(self.device)
             mol_batch.orient_molecule(mode='std')
-            mol_batch, _, _, _, condition, condition_id = \
+            # FOUR values, like every other `condition_samples` call site in this file.
+            # This one unpacked SIX, so it raised on ANY route that reached it -- the
+            # crystal one included, whose production configs call
+            # `bootstrap_z:train_conditioner` on the equilibration stage's on_enter.
+            # The six-value form was the old crystal-shaped signature;
+            # `MolecularCrystal.condition_samples` dropped `sg_ind` and `z_prime` from
+            # its return precisely so a non-crystal energy could implement it without
+            # padding, and this caller was not moved with it. The action stayed listed in
+            # ACTIONS and documented as THE way to anchor log Z at a stage boundary the
+            # whole time, which is worse than being absent: a config that asks for it
+            # reads as protected and dies inside the transition.
+            mol_batch, _, condition, condition_id = \
                 self.energy_function.condition_samples(mol_batch)
             return mol_batch, condition.to(self.device), condition_id
 
