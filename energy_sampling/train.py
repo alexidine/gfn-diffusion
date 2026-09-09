@@ -1207,8 +1207,37 @@ class Modeller:
             if stamp is None:
                 self.batch_sizer_at = stamp = self.step_ind
             if self.step_ind - int(stamp) >= resize:
-                print(f"batch: ladder has stood at {self.batch_size} for {resize}+ "
-                      f"steps on a target_met verdict -- re-measuring")
+                # STEP ONE RUNG DOWN BEFORE RE-WALKING. Re-measuring from the
+                # CURRENT size makes the ladder a one-way ratchet: the walk starts
+                # where the last one ended, the configured base is never re-measured
+                # after the first walk, and -- because `grew = len(table) > 1` -- a
+                # rung that clears immediately leaves a one-row table, so `audit_at`
+                # is never armed and the S2 stand-down, the only slow downward path,
+                # never runs. OOM and a wallclock overrun are then the sole ways down.
+                #
+                # One rung down forces the question either way, for one rung of
+                # measurement rather than a full walk from base: if the lower rung
+                # clears, the batch genuinely descends; if it does not, the walk
+                # climbs back and the two-row table ARMS the audit. Floored at the
+                # configured base -- this is a re-measurement, not a cut, and the
+                # base-restore branch above owns everything below it.
+                f_down = float(getattr(self.args, 'batch_growth_factor', 2.0)) or 2.0
+                stepped = max(int(self._batch_floor()),
+                              int(round(self.batch_size / f_down)))
+                if stepped < self.batch_size:
+                    print(f"batch: ladder has stood at {self.batch_size} for {resize}+ "
+                          f"steps on a target_met verdict -- re-measuring from one rung "
+                          f"down ({stepped}), so a rung that still clears leaves a "
+                          f"two-row table and arms the audit")
+                    self.batch_size = stepped
+                    # the new rung must be judged on its OWN samples, exactly as the
+                    # base-restore branch does
+                    self._recent_step_times.clear()
+                    self._recent_step_work.clear()
+                else:
+                    print(f"batch: ladder has stood at {self.batch_size} for {resize}+ "
+                          f"steps on a target_met verdict -- re-measuring (already at "
+                          f"the base rung)")
                 self.batch_sizer = None
                 self.batch_sizer_at = self.step_ind
                 self.batch_sizer_retests = getattr(self, 'batch_sizer_retests', 0) + 1
