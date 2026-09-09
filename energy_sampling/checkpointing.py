@@ -21,6 +21,21 @@ MODELLER_STATE_DEFAULTS = {
     # first batch it sees as if nothing were known.
     '_z_fill_P': None,
     '_z_fill_last_applied': None,
+    # THE PROGRESS GATE'S EVIDENCE. progress_gate needs SIX evals per metric
+    # before _series will return anything, and the production phase-1 stage exits
+    # on `gates/progress_done` -- whose on_exit is the ONLY thing that writes
+    # phase1_exit.pt and the prior snapshot. Unpersisted, a resumed leg started
+    # with an empty history and could not conclude for ~6 evals (~3000 steps at
+    # eval_period 500, ~5.8 h on the MLIP route at 7 s/step). min_history does not
+    # save it: that guard is keyed on the ABSOLUTE step, which a resume inherits
+    # at ~19000, so it passes instantly and the blackout is invisible.
+    # The failure that matters is not the wasted steps: a leg that ENDS inside the
+    # blackout never fires on_exit, so it writes NO phase1_exit and NO prior, and
+    # a _best.pt without a phase1_exit is the known-fatal case. On a leg shorter
+    # than the rebuild, phase 1 could never exit at all.
+    # A plain dict of key -> list of (step, value), already capped at 400 entries
+    # per key by the writer, so it costs a few hundred floats.
+    '_progress_history': None,
     # the run's position in the config's protocol.stages list, BY NAME --
     # checkpoints carry position only; behavior (coeffs, balance rules, exit
     # thresholds) is always re-derived from the current config, so editing the
