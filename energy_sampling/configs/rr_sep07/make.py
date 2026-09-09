@@ -65,6 +65,17 @@ def deltas(cfg, name, every, fam):
     zc['fill_moment_reset'] = 0.5
     zc['fill_from_eval'] = 'fill'
     n = 0
+    # buffer_servo is RETIRED (2026-09-09) and the controller deleted, but the
+    # prod_sep02 bases still carry the block -- strip it HERE, at the contract,
+    # so every arm this generator makes still loads. It scaled churn_rate up and
+    # mean_residence_steps down by one boost, leaving occupancy
+    # (churn * tau / N_eff) exactly INVARIANT while silently rewriting tau: on
+    # rr_sep08 it reached its 8.0 ceiling and cut occ_n200's effective tau from
+    # 1800 to 418, so the arm whose purpose was to sweep tau ran at tau/N 2.1.
+    for _p in (cfg.get('protocols') or {}).values():
+        for _s in (_p.get('stages') or []):
+            _s.pop('buffer_servo', None)
+
     for proto in (cfg.get('protocols') or {}).values():
         for st in (proto.get('stages') or []):
             # ANCHOR-ONLY PRIOR: nothing writes a prior model any more

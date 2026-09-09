@@ -71,11 +71,10 @@ mode's frac. It declares an exchange rate between two disjoint halves of one
 residual field instead of a bar per side, so neither drive can clamp to zero
 and go one-sided (see _ratio_tick).
 
-A stage may also declare `buffer_servo`: a second, independent controller whose
-actuator is the replay buffer's freshness rather than the loss weights (see
-_buffer_servo_tick). It exists because branch weights cannot fix replay
-OVERFITTING -- down-weighting a memorized buffer trains less on it but does not
-make it less memorized -- so the two pathologies need two actuators.
+`buffer_servo` is RETIRED (2026-09-09) and the controller deleted: it scaled
+churn_rate up and mean_residence_steps down by the same factor, leaving
+occupancy (churn x tau / N_eff) exactly invariant while silently rewriting
+the tau an experiment sweeps. Set the buffer knobs directly.
 
 The same clean-streak anneal event can also RAMP UP energy_config
 coefficients (balance.anneal_coeffs: {bounding_coeff: {target: 10.0}, ...})
@@ -226,7 +225,6 @@ def fresh_stage_ctrl():
         'gr_tripped': False,
         # buffer freshness servo: log of the multiplicative churn/residence
         # boost. 0.0 = the configured buffer, i.e. inert.
-        'bs_log_boost': 0.0,
     }
 
 
@@ -239,7 +237,11 @@ class Stage:
             raise TypeError(f"protocol.stages[{index}] must be a mapping, got {type(spec)}")
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
                                'loss_coeffs', 'fracs', 'min_fracs',
-                               'deactivate_threshold', 'balance', 'buffer_servo',
+                               'deactivate_threshold', 'balance',
+                               # RETIRED 2026-09-09, accepted here ONLY so
+                               # _parse_buffer_servo reports the deletion; the
+                               # generic unknown-key error would say nothing useful
+                               'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
                                'fwd_rollout_triggers',
@@ -1159,71 +1161,28 @@ class Stage:
         return node
 
     def _parse_buffer_servo(self, node):
-        """The replay-buffer freshness servo (see _buffer_servo_tick). Declared
-        per stage because it is only meaningful where replay trains, and
-        because its state resets at transitions like every other controller
-        here. Absent = the buffer runs exactly at its configured knobs."""
+        """RETIRED 2026-09-09. The replay-buffer freshness servo is DELETED.
+
+        It scaled `churn_rate` UP by a boost and `mean_residence_steps` DOWN by
+        the same boost, which leaves `churn_rate * mean_residence_steps`
+        INVARIANT -- and occupancy is `churn * tau / N_eff`. So the one quantity
+        it could appear to fix, it could not move at all. What it DID move was
+        the age structure: on rr_sep08 it drove boost to its 8.0 ceiling and cut
+        the effective tau of `occ_n200` from 1800 to 418, i.e. an arm whose whole
+        purpose was to sweep tau ran at tau/N 2.1 instead of 9, silently.
+
+        Removed rather than disabled: a controller that cannot affect its target
+        but does rewrite the knob an experiment is sweeping is a source of
+        confusion with no upside."""
         if node is None:
             return None
-        bad = set(node) - {'numerator', 'denominator', 'bar', 'release', 'scale',
-                           'gain', 'relax', 'max_boost', 'max_step'}
-        if bad:
-            raise ValueError(f"stage '{self.name}': buffer_servo unknown keys {sorted(bad)}")
-        out = {'numerator': node.get('numerator', 'replay/scatter_err'),
-               'denominator': node.get('denominator', 'fwd/scatter_err')}
-        for key in ('numerator', 'denominator'):
-            if not isinstance(out[key], str) or '/' not in out[key]:
-                raise ValueError(f"stage '{self.name}': buffer_servo.{key} must be a "
-                                 f"'dir/metric' name, got {out[key]!r}")
-        bar = float(node.get('bar', 1.0))
-        release = float(node.get('release', 1.5))
-        if not 0.0 < bar <= release:
-            raise ValueError(f"stage '{self.name}': buffer_servo needs 0 < bar <= release "
-                             f"(got bar={bar}, release={release}) -- bar > release would make "
-                             f"the tighten and release terms fire simultaneously and fight")
-        out['bar'], out['release'] = bar, release
-        # Deviation at which the servo runs at FULL rate. Without it the drive
-        # is the raw deficit (bar - ratio), which is bounded above by `bar` and
-        # in practice sits at ~0.03: measured live, replay/fwd scatter entered
-        # at 0.964, so a raw-deficit servo would need ~23k steps to traverse
-        # its boost range and is effectively inert exactly where it lives. The
-        # inversion is a THRESHOLD phenomenon -- crossing below 1 at all is the
-        # pathology, and depth below it is not proportionally meaningful -- so
-        # the drive saturates at `scale` and the servo behaves like a
-        # constant-rate ramp with a deadband, which is also why it cannot
-        # chatter (the two ramp directions are separated by bar..release).
-        scale = float(node.get('scale', 0.1))
-        if scale <= 0.0:
-            raise ValueError(f"stage '{self.name}': buffer_servo.scale must be > 0, got {scale}")
-        out['scale'] = scale
-        # Sized against the LOOP DELAY, which is what limits this servo: the
-        # sensor is a metric_tracker EMA refreshed once per 10 replay steps
-        # (~250 train steps of smoothing) sitting on top of a buffer that needs
-        # ~mean_residence_steps to turn over. An integrator whose traverse time
-        # is comparable to that delay will overshoot and hunt, so the default
-        # puts a full-drive traverse of the boost range at ~1200 train steps,
-        # several times the delay.
-        gain = float(node.get('gain', 0.02))
-        if not 0.0 < gain <= 1.0:
-            raise ValueError(f"stage '{self.name}': buffer_servo.gain must be in (0, 1], got {gain}")
-        out['gain'] = gain
-        # relax < 1 releases SLOWER than it tightens. It must be > 0: a
-        # one-way servo's fixed point is the maximum boost, which is the same
-        # ratchet failure the LR controller's recovery ramp exists to avoid.
-        relax = float(node.get('relax', 0.25))
-        if not 0.0 < relax <= 1.0:
-            raise ValueError(f"stage '{self.name}': buffer_servo.relax must be in (0, 1] -- 0 "
-                             f"makes the servo one-way and its fixed point max_boost")
-        out['relax'] = relax
-        max_boost = float(node.get('max_boost', 12.0))
-        if max_boost < 1.0:
-            raise ValueError(f"stage '{self.name}': buffer_servo.max_boost must be >= 1, got {max_boost}")
-        out['max_boost'] = max_boost
-        max_step = float(node.get('max_step', 0.03))
-        if not 0.0 < max_step <= 1.0:
-            raise ValueError(f"stage '{self.name}': buffer_servo.max_step must be in (0, 1], got {max_step}")
-        out['max_step'] = max_step
-        return out
+        raise ValueError(
+            f"stage '{self.name}': buffer_servo is RETIRED (2026-09-09) and the "
+            f"controller is deleted. It scaled churn_rate up and "
+            f"mean_residence_steps down by the same factor, so it left occupancy "
+            f"(churn * tau / N_eff) exactly invariant while silently rewriting the "
+            f"tau that experiments sweep. Delete the `buffer_servo` block from this "
+            f"stage; set churn_rate and mean_residence_steps directly.")
 
     def _parse_exit(self, node):
         if node is None:
@@ -1337,8 +1296,6 @@ class Stage:
             names.append(term['metric'])
         # the buffer servo reads two branch metrics of its own, and a branch it
         # reads must not be allowed to skip its force-refresh rollout
-        if self.buffer_servo is not None:
-            names += [self.buffer_servo['numerator'], self.buffer_servo['denominator']]
         # ...and so does the hot-LR sensor. This clause used to name the plateau
         # LR sensor, for the same reason, and it went dead when `plateau` left
         # LR_SENSOR_KINDS -- a gate on a retired key can never fire, so it reads
@@ -1378,7 +1335,6 @@ class StageProtocol:
         # boost itself rides in stage_ctrl: base x checkpointed boost
         # reconstructs the live values exactly, with no risk of a boosted value
         # being mistaken for the base after a resume.
-        self._rb_base = None
 
     # ------------------------------------------------------------------ parse
 
@@ -1563,7 +1519,6 @@ class StageProtocol:
         evaluation() (maybe_advance), with fresh eval metrics in hand."""
         if self.stage.balance is not None:
             self._balance_tick()
-        self._buffer_servo_tick()
         self._exit_tick()
 
     # ------------------------------------------------------------- exit logic
@@ -2683,97 +2638,6 @@ class StageProtocol:
         self.ctrl['cs_at_bound'] = (-1.0 if theta <= th_lo + 1e-9
                                     else 1.0 if theta >= th_hi - 1e-9 else 0.0)
         self.ctrl['boost'] = mode_r if step > 0 else mode_c
-
-    # ---------------------------------------------------------- buffer servo
-
-    def _buffer_servo_tick(self):
-        """Hold the replay buffer on the healthy side of the train/test
-        crossover by moving its FRESHNESS, not its loss weight.
-
-        SENSOR: ratio = replay/scatter_err over fwd/scatter_err. Replay draws
-        are a |resid|-prioritized resample of stored forward rollouts, so a
-        replay batch is by construction the HARD tail of the forward
-        distribution and its residual spread should exceed fresh forward's --
-        the observed healthy value is ~2x. The ratio crossing below 1 says the
-        policy fits reused stored trajectories BETTER than the fresh draws they
-        were selected from, which is memorization of the buffer's contents and
-        nothing else. Both branches now carry policy gradient (fwd runs
-        freeze_policy 0 in this route), so the two sides differ only in their
-        sampler, which is what makes the ratio a clean generalization gap
-        rather than a train-vs-heldout artifact.
-
-        ACTUATOR: one multiplicative boost B applied as churn_rate x B and
-        mean_residence_steps / B. In steady state (train.py manage_replay_buffer,
-        Little's law) occupancy = churn_rate x mean_residence_steps and
-        draws_per_row = batch_size / churn_rate, so this leaves OCCUPANCY
-        exactly invariant and moves only reuse (1/B) and policy lag (1/B). One
-        knob with one invariant is deliberate: churn_rate, mean_residence_steps
-        and max_size are three handles on the same steady state, and moving
-        them independently is how a buffer ends up in a corner nobody meant.
-        toxic_min_draws rides 1/B too, because it is defined relative to the
-        expected number of draws a row sees and would otherwise silently change
-        meaning as B moves.
-
-        WHY THIS IS A SECOND CONTROLLER AND NOT A BALANCE RULE. Loss weights
-        cannot fix overfitting. Down-weighting replay trains less on a
-        memorized buffer; it does not make the buffer less memorized, and it
-        also gives up the residual-tail correction replay exists to provide.
-        Freshness is the actuator that acts on the cause, so it gets its own
-        loop -- and the two loops are near-orthogonal by construction (this one
-        holds occupancy fixed and changes no frac; the balance controller
-        changes fracs and touches no buffer knob).
-
-        DEADBAND AND RELEASE. Tighten below `bar`, release above `release`,
-        hold in between, with `relax` < 1 making release the slower direction.
-        Each side's drive is the deviation normalized by `scale` and saturated
-        at 1, so the rate is set by the CONFIGURED ramp speed rather than by
-        how deep the excursion happens to be -- see the `scale` note in
-        _parse_buffer_servo for why the raw deficit is unusable here.
-        The deadband keeps the servo off during normal ratio jitter, and the
-        release term is what keeps it from being a ratchet whose fixed point is
-        max_boost -- the same one-way-anneal failure mode as
-        controller-ratchet-marginal-breach. Cost of over-churning is real
-        (admission work rises with B, and at high B replay degenerates into an
-        on-policy duplicate of fwd), which is why release exists at all.
-        """
-        spec = self.stage.buffer_servo
-        if spec is None:
-            # a previous stage's boost must not survive into a stage that
-            # declares no servo (stage_ctrl resets, so nothing else would undo it)
-            if self._rb_base is not None:
-                self._apply_buffer_boost(1.0)
-            return
-        num, den = self._resolve(spec['numerator']), self._resolve(spec['denominator'])
-        if num is None or den is None or den <= 0.0:
-            return  # cold start (replay has not trained yet): hold at the configured buffer
-        ratio = num / den
-        sc = spec['scale']
-        drive = (min(max(spec['bar'] - ratio, 0.0) / sc, 1.0)
-                 - spec['relax'] * min(max(ratio - spec['release'], 0.0) / sc, 1.0))
-        step = min(max(spec['gain'] * drive, -spec['max_step']), spec['max_step'])
-        log_boost = float(self.ctrl.get('bs_log_boost', 0.0)) + step
-        log_boost = min(max(log_boost, 0.0), math.log(spec['max_boost']))
-        self.ctrl['bs_log_boost'] = log_boost
-        self.ctrl['bs_ratio'] = ratio
-        self._apply_buffer_boost(math.exp(log_boost))
-
-    def _apply_buffer_boost(self, boost):
-        """Write the live replay-buffer knobs as base x boost. train.py reads
-        these off args on every manage call, so the change takes effect on the
-        next churn with no plumbing."""
-        rb = self.m.args.buffers.replay_buffer
-        # `toxic_min_draws` used to be scaled here too. It is a DELETED
-        # retirement (utils._RETIRED_KEYS), so no config can set it: the base
-        # captured 0.0 every time and the branch that scaled it was unreachable.
-        if self._rb_base is None:
-            self._rb_base = {'churn_rate': float(rb.churn_rate),
-                             'mean_residence_steps': float(rb.mean_residence_steps)}
-        base = self._rb_base
-        rb.churn_rate = max(1, int(round(base['churn_rate'] * boost)))
-        # floor at 2 steps: below that the hazard evicts essentially the whole
-        # buffer every call and replay stops being a buffer at all
-        rb.mean_residence_steps = max(2.0, base['mean_residence_steps'] / boost)
-
     def _nudge_mode_fracs(self, boost):
         """EMA nudge of the fracs toward a target split, with PER-MODE floors
         -- the stage's explicit min_fracs where given, controller.min_mode_frac
@@ -2906,20 +2770,6 @@ class StageProtocol:
                 v = self._resolve(metric)
                 if v is not None:
                     out[f'protocol/rt_metric_{mode}'] = v
-        if stage.buffer_servo is not None:
-            out['protocol/bs_boost'] = math.exp(float(self.ctrl.get('bs_log_boost', 0.0)))
-            if 'bs_ratio' in self.ctrl:
-                out['protocol/bs_ratio'] = self.ctrl['bs_ratio']
-            # The ACTUATOR, not just the sensor. Without this a servo that is
-            # reading fine but has no authority looks identical to one that is
-            # correctly holding -- the S2 drive-liveness failure shape again.
-            if 'bs_log_boost' in self.ctrl:
-                out['protocol/bs_log_boost'] = self.ctrl['bs_log_boost']
-            rb = self.m.args.buffers.replay_buffer
-            # the LIVE knobs, so the servo's effect is visible next to its
-            # sensor rather than having to be recomputed from boost x base
-            out['protocol/bs_churn_rate'] = float(rb.churn_rate)
-            out['protocol/bs_residence'] = float(rb.mean_residence_steps)
         if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
             for i, rule in enumerate(stage.balance['rules']):
                 rs = self.ctrl['rules'].get(i, {})

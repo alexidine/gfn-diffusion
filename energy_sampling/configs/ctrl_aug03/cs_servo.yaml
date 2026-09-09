@@ -275,16 +275,6 @@ protocol:
       pinned:
         fwd: 0.05
       priority: 3.0
-    buffer_servo:
-      bar: 1.0
-      denominator: fwd/scatter_err
-      gain: 0.02
-      max_boost: 12.0
-      max_step: 0.03
-      numerator: replay/scatter_err
-      relax: 0.25
-      release: 1.5
-      scale: 0.1
     bwd_sampling_mode: prior
     deactivate_threshold: 0.01
     flags:

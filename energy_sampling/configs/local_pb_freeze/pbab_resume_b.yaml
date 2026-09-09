@@ -382,17 +382,7 @@ protocols:
       - snapshot_prior
       skip_if: prior_loaded
       train_mode: bwd
-    - buffer_servo:
-        bar: 0.368
-        denominator: replay/birth_loss_mean
-        gain: 0.05
-        max_boost: 8.0
-        max_step: 0.05
-        numerator: replay/ema_loss_mean
-        relax: 0.5
-        release: 0.6
-        scale: 0.15
-      bwd_sampling_mode: prior
+    - bwd_sampling_mode: prior
       deactivate_threshold: 0.01
       flags:
         buffers_active: true
@@ -467,16 +457,6 @@ protocols:
         pinned:
           fwd: 0.05
         setpoint: 5.0
-      buffer_servo:
-        bar: 0.368
-        denominator: replay/birth_loss_mean
-        gain: 0.05
-        max_boost: 8.0
-        max_step: 0.05
-        numerator: replay/ema_loss_mean
-        relax: 0.5
-        release: 0.6
-        scale: 0.15
       bwd_sampling_mode: prior
       deactivate_threshold: 0.01
       flags:

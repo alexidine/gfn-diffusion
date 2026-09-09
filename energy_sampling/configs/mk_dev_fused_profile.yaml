@@ -510,16 +510,6 @@ protocols:
         # residual against the one it was admitted with; actuator = one boost B
         # applied as churn_rate*B and mean_residence_steps/B, which leaves
         # occupancy exactly invariant and moves only reuse and policy lag.
-        buffer_servo:
-          numerator: replay/ema_loss_mean
-          denominator: replay/birth_loss_mean
-          bar: 0.368        # DERIVED, not calibrated: ratio ~ exp(-lambda*tau), so lambda*tau = 1 lands at exactly 1/e. Nothing in it was measured, so it transfers across problem, T and buffer size
-          release: 0.60     # stop tightening once back to lambda*tau ~ 0.5
-          scale: 0.15       # error scale over which the drive saturates
-          gain: 0.05
-          relax: 0.5        # decay of the boost when the sensor is clear
-          max_step: 0.05
-          max_boost: 8.0    # at B=8: churn 640, residence 6.25, occupancy still 4000
         # !! Only unbiased under a residual-INDEPENDENT hazard: birth_loss exists
         # only for residents, so it is the intake distribution *of survivors*.
         # prioritise.enabled above is what switches the residual-dependent purge

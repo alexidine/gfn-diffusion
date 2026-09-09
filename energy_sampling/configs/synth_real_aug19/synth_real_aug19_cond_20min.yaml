@@ -303,16 +303,6 @@ protocols:
           - 0.02
           - 0.93
         converge_floor: 1.0
-      buffer_servo:
-        numerator: replay/ema_loss_mean
-        denominator: replay/birth_loss_mean
-        bar: 0.368
-        release: 0.6
-        scale: 0.15
-        gain: 0.05
-        relax: 0.5
-        max_step: 0.05
-        max_boost: 8.0
   conditional_vargrad:
     stages:
     - name: train_prior
