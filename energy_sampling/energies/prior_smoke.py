@@ -1744,6 +1744,15 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
         # measure it.
         for k in PRIOR_REPORT_CHECKS:
             led.skip(k, name, level, f'{type(ex).__name__}: {ex}', K_UNREACHABLE)
+    elif 'skipped' in rep:
+        # `prior_report` CATCHES the density's NotImplementedError itself and returns a
+        # labelled skip, so nothing reaches the `except` above and this branch used to run
+        # straight into `rep['ess_fitted']` -- a KeyError that took down the rest of LEG 4
+        # and every molecule after it in the run. Ring molecules have always come back this
+        # way; the transverse chart adds nitriles, whose density is refused because the state
+        # is (u, v) while the fitted histogram is polar.
+        for k in PRIOR_REPORT_CHECKS:
+            led.skip(k, name, level, str(rep['skipped']), K_UNREACHABLE)
     else:
         led.note('prior_n', name, level, int(prior_n),
                  units='draws the fitted-prior report was computed over')

@@ -703,8 +703,22 @@ def run(args):
     dim = energy.data_ndim
     # the resolved level and width go to wandb.summary, not just stdout: a config that
     # says one thing and a run that does another is the failure this guards
+    # THE CHART THE RUN ACTUALLY SOLVED, not just the level it was asked for. Without
+    # these a constrained result is indistinguishable from a complete one in the summary,
+    # and n_free_r + n_free_theta + n_free_phi does not even sum to data_ndim once a
+    # transverse pair is free -- those columns are block 3 and were counted nowhere.
+    _blk = getattr(energy, '_free_block', None)
+    _n_tv = int((_blk == 3).sum()) if _blk is not None else 0
     wandb.run.summary.update({'problem/level': energy.level,
                               'problem/data_ndim': dim,
+                              'problem/n_free_transverse': _n_tv,
+                              'problem/n_internal_dof': 3 * int(energy.spec.n_atoms) - 6,
+                              'problem/constrained_rows':
+                                  int(getattr(energy, 'constrained_rows', 0)),
+                              'problem/uncovered_linear_angles':
+                                  int(getattr(energy, 'uncovered_linear_angles', 0)),
+                              'problem/allow_constrained':
+                                  bool(getattr(energy, 'allow_constrained', False)),
                               'problem/n_atoms': energy.spec.n_atoms,
                               'problem/n_free_r': int((energy._free_block == 0).sum()),
                               'problem/n_free_theta': int((energy._free_block == 1).sum()),

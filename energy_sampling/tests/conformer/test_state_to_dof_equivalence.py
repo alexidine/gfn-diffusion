@@ -31,11 +31,22 @@ TOL = 1e-9
 #: spans the structural cases that broke differently: plain acyclic, branched, a RING (closure
 #: encoding), a CHIRAL centre (parity must survive the round trip), and a LINEAR centre, which
 #: used to raise IndexError at `dihedral` rather than merely disagree.
-MOLECULES = ['CCCCO', 'CCC(C)CO', 'C1CCCCC1CO', 'C[C@H](O)CC=O', 'CC#CCO']
+#: 'CC#N' and 'CCC#N' were added when the transverse chart landed. They are the cases whose
+#: linear bend is COVERED by it -- so their theta and phi slots hold (u, v), the two builders
+#: must agree about that, and the graph path must reconstruct through place_nerf_transverse.
+#: 'CC#CCO' is NOT covered (its linear angle sits at a frame seed with collinear reference
+#: frames) and is kept for the held-row case; the two are different tests, not a duplicate.
+MOLECULES = ['CCCCO', 'CCC(C)CO', 'C1CCCCC1CO', 'C[C@H](O)CC=O', 'CC#CCO',
+             'CC#N', 'CCC#N']
 
 
 def _energy(smiles, level):
-    return ConformerTorsions(smiles=smiles, device='cpu', level=level)
+    # allow_constrained: 'CC#CCO' is here precisely BECAUSE its chart is incomplete at
+    # 'full' -- it is the held-row contrast case for the transverse molecules. Without the
+    # opt-in the refusal would turn this file's most interesting case into a skip, which is
+    # coverage lost to a guard rather than a guard doing its job.
+    return ConformerTorsions(smiles=smiles, device='cpu', level=level,
+                             allow_constrained=True)
 
 
 def _states(energy, n=4, seed=0):
@@ -121,6 +132,26 @@ def test_reference_state_is_the_reference_conformer(level):
     r, th, ph = state_to_dof(_graph(energy, 'CCCCO', x), x)
     assert float((r.reshape(2, -1) - energy.r0).abs().max()) < TOL
     assert float((th.reshape(2, -1) - energy.th0).abs().max()) < TOL
+
+
+@pytest.mark.parametrize('smiles', ['CC#N', 'CCC#N'])
+def test_a_covered_linear_bend_is_driven_not_held(smiles):
+    """The point of the transverse chart, asserted on the energy the graph is built from.
+
+    Without it these molecules lose their linear bend to `constrained_rows` and report fewer
+    than 3N-6 columns at `full`. The equivalence tests above then still pass -- both builders
+    agree on a constrained chart just as happily as on a complete one -- so agreement alone
+    would never have shown the coordinate back.
+    """
+    energy = _energy(smiles, 'full')
+    assert int(energy.transverse_angles.sum()) > 0, 'no covered linear bend to test'
+    assert energy.uncovered_linear_angles == 0
+    assert energy.data_ndim == 3 * energy.spec.n_atoms - 6
+    assert getattr(energy, 'constrained_rows', 0) == 0
+    # the flag has to reach the graph, or states_to_positions reads (u, v) as (theta, phi)
+    mol = condition_from_energy(energy, identifier=smiles)
+    assert bool(mol.ctree_transverse.any())
+    assert int(mol.ctree_transverse.sum()) == int(energy.transverse_angles.sum())
 
 
 @pytest.mark.parametrize('level', LEVELS)

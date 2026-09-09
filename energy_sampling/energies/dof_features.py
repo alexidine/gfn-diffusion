@@ -49,8 +49,29 @@ def _elem_onehot(z: int) -> np.ndarray:
 
 
 def feature_names() -> list:
-    """One name per column. Kept beside the builder so a feature cannot drift unnamed."""
-    names = ['kind_r', 'kind_theta', 'kind_phi']
+    """One name per column. Kept beside the builder so a feature cannot drift unnamed.
+
+    THE KIND BLOCK NAMES THE QUANTITY, NOT THE SLOT. A linear bend is carried as the
+    transverse pair (u, v) in the theta and phi SLOTS of the atom it places, but neither
+    component is an angle and neither is a dihedral: they are the two Cartesian components of
+    one 2-D displacement on the open disc rho < pi, non-periodic, with equilibrium exactly at
+    the origin. Labelling them kind_theta / kind_phi inverted every inductive bias this block
+    exists to supply -- the policy was told a coordinate centred at 0 was a bond angle on
+    (0, pi) whose reference was pi.
+
+    TWO flags rather than one, because u and v are not interchangeable: u lies along m2 and v
+    along n, built from different cross products (geometry.place_nerf_transverse). With a
+    single flag the only thing separating them would be an incidental padding bit, which is
+    exactly the implicit encoding this module exists to remove.
+
+    Widening this block costs nothing in stored artefacts. An earlier note here claimed it
+    "invalidates stored conditions files and the policy input width"; that was wrong on the
+    first count and moot on the second. `condition_from_energy` stores no feature matrix, and
+    a set-policy resume is already refused outright (conformer_modeller.py), so no loadable
+    checkpoint carries this width. What DOES depend on a real artefact is the atom frame --
+    see :func:`free_dof_atom_index`.
+    """
+    names = ['kind_r', 'kind_theta', 'kind_phi', 'kind_bend_u', 'kind_bend_v']
     for s in range(MAX_FRAME):
         names += ['a{}_z_{}'.format(s, e) for e in ELEMENTS] + ['a{}_z_other'.format(s)]
         names += ['a{}_degree'.format(s), 'a{}_in_ring'.format(s),
@@ -58,7 +79,7 @@ def feature_names() -> list:
                   'a{}_present'.format(s)]
     names += ['row_in_ring', 'row_aromatic', 'is_improper',
               'is_group_member', 'is_rotatable', 'is_free_at_tier']
-    names += ['log_thermal_sigma', 'ref_r', 'ref_theta']
+    names += ['log_thermal_sigma', 'ref_r', 'ref_theta', 'ref_bend']
     return names
 
 
@@ -66,7 +87,7 @@ def feature_names() -> list:
 # noise. The split is not cosmetic: the reference conformer comes from an RDKit embedding,
 # so anything measured off it inherits a seed dependence. Consumers that need a stable key
 # (caching, cross-molecule matching, tests) must use the categorical block alone.
-CONTINUOUS = ('log_thermal_sigma', 'ref_r', 'ref_theta')
+CONTINUOUS = ('log_thermal_sigma', 'ref_r', 'ref_theta', 'ref_bend')
 
 
 def categorical_columns() -> list:
@@ -115,11 +136,37 @@ def dof_features(en, prior=None) -> np.ndarray:
     th0 = en.th0.detach().cpu().numpy()
     free = np.asarray(en.free_mask)
 
+    # THE TRANSVERSE PAIR. `transverse_angles` is per ANGLE row and `transverse_partner`
+    # gives the torsion row holding v, so a phi row is a bend component exactly when it is
+    # some flagged angle row's partner -- hence the inverse lookup. `_ref_dof` rather than
+    # th0/ph0 because it is the vector `dof_from_state` actually starts from; th0/ph0 stay
+    # POLAR for the prior histograms, and reading them here is what put pi into a slot whose
+    # true value is ~0.
+    tv = np.asarray(en.transverse_angles, dtype=bool)
+    tv_partner = np.asarray(en.transverse_partner, dtype=np.int64)
+    angle_of_v = {int(tv_partner[j]): int(j) for j in np.flatnonzero(tv)}
+    ref_dof = en._ref_dof.detach().cpu().numpy()
+    KINDS = ('r', 'theta', 'phi', 'bend_u', 'bend_v')
+
     rows = []
     for kind, table, n in (('r', bi, en.n_r), ('theta', ai, en.n_th), ('phi', ti, en.n_ph)):
         for j in range(n):
-            atoms = [int(a) for a in table[j]]
-            f = [1.0 if kind == k else 0.0 for k in ('r', 'theta', 'phi')]
+            # which row of a transverse pair is this, if either
+            if kind == 'theta' and bool(tv[j]):
+                bend, angle_row = 'bend_u', j
+            elif kind == 'phi' and j in angle_of_v:
+                bend, angle_row = 'bend_v', angle_of_v[j]
+            else:
+                bend, angle_row = None, None
+
+            # THE FOUR-ATOM PLACEMENT FRAME ON BOTH ROWS OF A PAIR, not the 3-atom angle
+            # frame. This is correctness, not convenience: place_nerf_transverse builds n
+            # from (pb - pa) and m2 from n, so the direction u points in is fixed by atom a,
+            # which the angle frame omits entirely. It also makes the two rows of a pair
+            # identical in every atom column and different only in the kind bit and the
+            # reference -- which is precisely the truth about them.
+            atoms = [int(a) for a in (ti[tv_partner[angle_row]] if bend else table[j])]
+            f = [1.0 if (bend or kind) == k else 0.0 for k in KINDS]
             for s in range(MAX_FRAME):
                 if s < len(atoms):
                     a = atoms[s]
@@ -130,24 +177,40 @@ def dof_features(en, prior=None) -> np.ndarray:
                     f += [0.0] * N_ELEM + [0.0, 0.0, 0.0, 0.0, 0.0]
             f.append(float(all(in_ring[a] for a in atoms)))
             f.append(float(all(arom[a] for a in atoms)))
-            if kind == 'phi':
+
+            row_global = (j if kind == 'r' else en.n_r + j if kind == 'theta'
+                          else en.n_r + en.n_th + j)
+            if bend:
+                # BOTH components share the bend force constant of the angle they replace --
+                # they are measured in radians of the same rho. Taking the phi branch's
+                # sigma on the v row handed it a torsion jitter (log 0.1) for a bend.
+                sig = s_th[angle_row]
+                # is_improper / is_group_member / is_rotatable are ROTATION-ABOUT-A-BOND
+                # semantics. An out-of-plane bend component is none of the three, and the v
+                # row was picking up is_group_member from torsion_groups().
+                flags = [0.0, 0.0, 0.0]
+                refs = [0.0, 0.0, float(ref_dof[row_global])]
+            elif kind == 'phi':
                 gi = next((i for i, g in enumerate(groups) if j in g), None)
                 sig = (s_imp if j in improper
                        else g_sigma[gi] if gi is not None else s_imp)
                 central = tuple(sorted((int(ti[j, 1]), int(ti[j, 2]))))
-                f += [float(j in improper), float(j in member),
-                      float(central in rot_bonds)]
-                row_global = en.n_r + en.n_th + j
-                f += [float(np.log(max(sig, 1e-12))), 0.0, 0.0]
+                flags = [float(j in improper), float(j in member),
+                         float(central in rot_bonds)]
+                refs = [0.0, 0.0, 0.0]
             else:
                 sig = s_r[j] if kind == 'r' else s_th[j]
-                row_global = j if kind == 'r' else en.n_r + j
-                f += [0.0, 0.0, 0.0]
-                f += [float(np.log(max(sig, 1e-12))),
-                      float(r0[j]) if kind == 'r' else 0.0,
-                      float(th0[j]) if kind == 'theta' else 0.0]
-            # the tier flag goes in last so the block above stays tier-invariant
-            f.insert(len(f) - 3, float(free[row_global]))
+                flags = [0.0, 0.0, 0.0]
+                refs = [float(r0[j]) if kind == 'r' else 0.0,
+                        float(th0[j]) if kind == 'theta' else 0.0, 0.0]
+            # BUILT EXPLICITLY, in feature_names() order. This used to end with
+            # `f.insert(len(f) - 3, tier_flag)`, which positioned the tier flag by counting
+            # back from the end of the trailing reference block -- so appending `ref_bend`
+            # would have shifted it one slot silently, with every shape still correct and
+            # every value still finite. Naming the tail removes that trap.
+            f += flags
+            f += [float(free[row_global])]
+            f += [float(np.log(max(sig, 1e-12)))] + refs
             rows.append(f)
     out = np.asarray(rows, dtype=np.float64)
     assert out.shape == (en.spec.n_dof, len(feature_names())), \
@@ -218,7 +281,15 @@ def free_dof_atom_index(en):
                 kind, local = 'theta', row - en.n_r
             else:
                 kind, local = 'phi', row - en.n_r - en.n_th
-            frame = [int(a) for a in tables[kind][local]]
+            # A TRANSVERSE ANGLE ROW TAKES ITS PARTNER'S FOUR-ATOM FRAME, for the reason
+            # dof_features does: both transverse directions are built from (pb - pa), so the
+            # 3-atom angle frame omits the atom that fixes which way u points, and padding
+            # would repeat an atom where a real one belongs. Changes the VALUES of dof_atoms,
+            # not its shape -- see the note in build_conformer_conditions.
+            if kind == 'theta' and bool(np.asarray(en.transverse_angles, dtype=bool)[local]):
+                frame = [int(a) for a in tables['phi'][int(en.transverse_partner[local])]]
+            else:
+                frame = [int(a) for a in tables[kind][local]]
             # r spans 2 atoms and theta 3, so short frames REPEAT their last atom rather
             # than padding with index 0 -- index 0 is a real atom, and a correlator cannot
             # tell a padded slot from a genuine reference to it.

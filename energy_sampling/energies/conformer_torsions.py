@@ -95,6 +95,18 @@ class ConformerTorsions(BaseSet):
                  bounding_coeff: float = 10.0,
                  r_floor: float = 0.50,
                  theta_floor: float = 1.0e-3,
+                 # radius at which the TRANSVERSE disc wall engages, in radians of rho. The
+                 # chart is injective only on rho < pi; this is a soft preference well inside
+                 # it, exactly zero below rho_wall, and measured to be inert at the current
+                 # operating point (max rho over a 400-epoch run: 0.682). See bounding_energy.
+                 rho_wall: float = 1.0,
+                 # opt in to a chart that is INCOMPLETE at level 'full'. Off by default: a
+                 # globally nonlinear molecule has 3N-6 internal degrees of freedom whether
+                 # or not a centre is locally linear, so a shortfall at 'full' means this
+                 # chart froze real coordinates and is sampling a different distribution.
+                 # Partial coverage is fine when it is EXPLICIT -- which is what setting this
+                 # makes it -- and not fine when it is silent.
+                 allow_constrained: bool = False,
                  ring_jitter_scale: float = 0.1,
                  ring_min_bank_rows: int = 2,
                  force_field: str = 'reference',
@@ -273,6 +285,36 @@ class ConformerTorsions(BaseSet):
         n_dof = self.n_r + self.n_th + self.n_ph          # == 3N - 6 == spec.n_dof
         assert n_dof == self.spec.n_dof, (n_dof, self.spec.n_dof)
 
+        # ---- TRANSVERSE linear-bending rows ------------------------------------------
+        # A linear bend is a POLE OF THE (theta, phi) CHART, not a rigid constraint. Below,
+        # such a row is re-expressed as the transverse pair (u, v) = rho (cos phi, sin phi)
+        # with rho = pi - theta, which is regular at the pole and carries the SAME two
+        # coordinates -- so the row stays driven instead of being held, and `full` keeps its
+        # 3N-6. See mxtaltools/conformers/geometry.py:place_nerf_transverse.
+        #
+        # THREE CONDITIONS, and the last two are why this does not fix every linear centre:
+        #   1. the bend is linear                              (angle_is_linear)
+        #   2. the atom HAS a torsion row to carry v           (frame seeds do not)
+        #   3. its placement frame a-b-c is NOT itself collinear
+        # Failing 2 means the missing component is the sixth EXTERNAL DoF, under a frame
+        # convention that stops fixing a frame at all once atoms 0-1-2 are collinear.
+        # Failing 3 means the normal defining phi is arbitrary, so there is no frame to bend
+        # in -- a smooth frame construction, not this pair, is what that needs. Rows failing
+        # either are still HELD, and `describe()` reports them separately.
+        ang_atom = np.asarray(self.spec.angle_index)[:, 2]
+        tor_atom = np.asarray(self.spec.torsion_index)[:, 3]
+        slot_of = {int(a): i for i, a in enumerate(tor_atom)}
+        partner = np.array([slot_of.get(int(a), -1) for a in ang_atom], dtype=np.int64)
+        has_partner = partner >= 0
+        frame_bad = np.zeros(self.n_th, dtype=bool)
+        frame_bad[has_partner] = self.torsion_frame_is_linear[partner[has_partner]]
+        #: per ANGLE ROW: this row's (theta, phi) pair is carried as (u, v)
+        self.transverse_angles = self.angle_is_linear & has_partner & ~frame_bad
+        #: per angle row: the torsion row holding its v, -1 where there is none
+        self.transverse_partner = partner
+        self.uncovered_linear_angles = int(
+            (self.angle_is_linear & ~self.transverse_angles).sum())
+
         block = np.concatenate([np.zeros(self.n_r, dtype=np.int64),
                                 np.ones(self.n_th, dtype=np.int64),
                                 np.full(self.n_ph, 2, dtype=np.int64)])
@@ -297,6 +339,39 @@ class ConformerTorsions(BaseSet):
                    "full": np.arange(n_dof)}[level]
             m_full = np.zeros((n_dof, len(sel)))
             m_full[sel, np.arange(len(sel))] = 1.0
+            col_block = block[sel]
+
+        # A TRANSVERSE PAIR IS ONE 2-D COORDINATE AND CANNOT BE HALF-FREE. `dihedral` drives
+        # the phi rows only, so it would free v and leave u frozen -- half a bend, and a
+        # measure term reading a component the state cannot move. `torsion` is worse: its
+        # col_block is overwritten to all-2 above, so a driven transverse column would be
+        # declared PERIODIC, and u and v do not wrap.
+        #
+        # Both tiers therefore keep the PREVIOUS treatment -- the linear row stays held and
+        # is reported as constrained -- rather than being refused. The transverse chart is a
+        # `flex` / `full` feature, which is where the target is; narrowing here rather than
+        # raising keeps every tier below it byte-identical to the pre-transverse code.
+        if level == 'torsion':
+            self.transverse_angles = np.zeros_like(self.transverse_angles)
+        else:
+            _in_sel = np.zeros(n_dof, dtype=bool)
+            _in_sel[sel] = True
+            for _j in np.flatnonzero(self.transverse_angles):
+                if not (_in_sel[self.n_r + _j]
+                        and _in_sel[self.n_r + self.n_th + partner[_j]]):
+                    self.transverse_angles[_j] = False
+        self.uncovered_linear_angles = int(
+            (self.angle_is_linear & ~self.transverse_angles).sum())
+
+        # BLOCK 3 = transverse. A distinct code rather than reusing 1 or 2, because these
+        # columns differ from both: unlike phi they do NOT wrap (so `periodic_dims`, which
+        # reads `block == 2`, correctly excludes them and `state_from_dof` does not fold
+        # them onto a circle), and unlike theta they must NOT be clamped to (0, pi) -- they
+        # live on a disc of radius pi and the pole is an interior point, not a boundary.
+        _tv_rows = np.flatnonzero(self.transverse_angles)
+        if _tv_rows.size:
+            block[self.n_r + _tv_rows] = 3
+            block[self.n_r + self.n_th + partner[_tv_rows]] = 3
             col_block = block[sel]
 
         # A DoF sitting on a parameterisation singularity is HELD, not driven: log sin
@@ -327,8 +402,12 @@ class ConformerTorsions(BaseSet):
         #
         # Until that chart lands, the reduction is RECORDED rather than silent: see
         # `self.constrained_rows` and the CONSTRAINED line in `describe()`.
+        # A TRANSVERSE ROW IS NOT SINGULAR AND IS NOT HELD -- that is the whole point of the
+        # pair. Its partner phi row carries v and is free for the same reason; it cannot be
+        # in `torsion_frame_is_linear`, because condition 3 above excluded exactly those.
         singular = np.zeros(n_dof, dtype=bool)
-        singular[self.n_r + np.flatnonzero(self.angle_is_linear)] = True
+        singular[self.n_r + np.flatnonzero(self.angle_is_linear
+                                           & ~self.transverse_angles)] = True
         singular[self.n_r + self.n_th + np.flatnonzero(self.torsion_frame_is_linear)] = True
         m_full[singular, :] = 0.0
 
@@ -340,6 +419,21 @@ class ConformerTorsions(BaseSet):
         #: of this chart, never of the molecule.
         self.constrained_rows = int(singular.sum())
         self.constrained_columns = int((~keep).sum())
+        # REFUSED IN THE ENERGY, not only in build_conformer_conditions.py. The builder guard
+        # covered exactly one of the eight paths that construct a chart; a config naming a
+        # constrained molecule at 'full' trained silently, and its run summary, its checkpoint
+        # and its conditions file all said 'full'. Raising here closes every path at once and
+        # demotes the builder's check to a redundant early skip.
+        if level == 'full' and self.constrained_rows and not allow_constrained:
+            n_lin = 3 * self.spec.n_atoms - 6
+            raise ValueError(
+                f"{smiles} does not have a complete chart at level 'full': "
+                f"{self.constrained_rows} row(s) held and {self.constrained_columns} "
+                f"column(s) dropped, giving d = {int(keep.sum())} against 3N-6 = {n_lin}. "
+                f"{self.uncovered_linear_angles} linear angle(s) are not covered by the "
+                f"transverse pair (frame seed, or collinear reference frame) -- a chart "
+                f"limitation, not a rigid molecule. Pass allow_constrained=True to study it "
+                f"deliberately; the shortfall is then recorded on the run.")
         m_full, col_block = m_full[:, keep], col_block[keep]
         self.data_ndim = int(keep.sum())
         if self.data_ndim == 0:
@@ -349,7 +443,9 @@ class ConformerTorsions(BaseSet):
                 f"singular at a linear centre -- which is a chart limitation, not a rigid "
                 f"molecule. See section 3.2 of docs/design/conformer_parameterisation.md.")
 
-        self._free_block = col_block                       # per STATE COLUMN: 0=r 1=th 2=phi
+        #: per STATE COLUMN: 0=r 1=th 2=phi 3=TRANSVERSE (a (u, v) component of a linear
+        #: bend -- non-periodic like r/theta, unclamped like neither; see the block-3 note)
+        self._free_block = col_block
         self.free_mask = m_full.any(axis=1)                # per DoF ROW: is it driven
 
         # A COLLECTIVE column drives more than one DoF row (a `torsion` column rotates a
@@ -365,16 +461,90 @@ class ConformerTorsions(BaseSet):
                                            dtype=torch.long, device=self.device)
         self._M = torch.as_tensor(m_full[self.free_mask], dtype=dtype, device=self.device)
 
-        scale = np.where(col_block == 0, float(delta_r_max),
-                         np.where(col_block == 1, float(delta_theta_max), np.pi))
-        self._ref_dof = torch.cat([r0, th0, ph0]).to(dtype)
+        scale = np.select(
+            [col_block == 0, col_block == 1, col_block == 3],
+            [float(delta_r_max), float(delta_theta_max), float(delta_theta_max)],
+            default=np.pi)
+
+        # THE REFERENCE IN CHART UNITS. A transverse row's stored reference is (u0, v0), not
+        # (theta0, phi0), or `dof_from_state` would write a bend displacement onto an angle.
+        # `self.th0`/`self.ph0` stay POLAR: they are what the prior histograms and the
+        # reporting paths are keyed on, and converting them in place would silently change
+        # the meaning of every one of those consumers.
+        th_ref, ph_ref = th0, ph0
+        if bool(self.transverse_angles.any()):
+            from mxtaltools.conformers.geometry import transverse_from_polar
+            tj = torch.as_tensor(_tv_rows, dtype=torch.long, device=th0.device)
+            tm = torch.as_tensor(partner[_tv_rows], dtype=torch.long, device=th0.device)
+            u0, v0 = transverse_from_polar(th0.index_select(0, tj), ph0.index_select(0, tm))
+            th_ref = th0.clone().index_copy(0, tj, u0)
+            ph_ref = ph0.clone().index_copy(0, tm, v0)
+            # The chart is valid on the open disc rho < pi. The reachable set is
+            # |u - u0| <= delta_theta_max and likewise v, so this is a CHECK on the
+            # configured scale rather than an assumption about it.
+            reach = (u0.abs() + float(delta_theta_max)) ** 2 + \
+                    (v0.abs() + float(delta_theta_max)) ** 2
+            if float(reach.max()) >= np.pi ** 2:
+                raise ValueError(
+                    f"{smiles}: delta_theta_max {delta_theta_max} lets a transverse bend "
+                    f"reach rho >= pi, where the (u, v) chart stops being injective and its "
+                    f"measure turns negative. Reduce it, or exclude this molecule.")
+        self._ref_dof = torch.cat([r0, th_ref, ph_ref]).to(dtype)
         self._free_scale = torch.as_tensor(scale, dtype=dtype, device=self.device)
         # indexes the STATE, not the DoF vector: the box wall applies to the non-periodic
         # blocks only. Empty at `torsion` and `dihedral`, which is what keeps those levels
         # bitwise identical to the pre-ladder code.
         self._lin_free_idx = torch.as_tensor(np.flatnonzero(col_block != 2),
                                              dtype=torch.long, device=self.device)
+        #: per ANGLE ROW, for `build` / `log_jacobian` / the theta clamp. None when no row
+        #: is transverse, which keeps every molecule without a linear centre on exactly the
+        #: code path it was on before.
+        self._transverse_t = (
+            torch.as_tensor(self.transverse_angles, dtype=torch.bool, device=self.device)
+            if bool(self.transverse_angles.any()) else None)
+        #: STATE COLUMNS of each transverse pair, u and v aligned pairwise. Derived from the
+        #: same `_M` the map uses rather than from the block code, because block 3 alone does
+        #: not say WHICH v belongs to WHICH u -- and a wall or a crossing count computed on
+        #: mismatched halves would be a plausible number for the wrong quantity.
+        _u_cols, _v_cols = [], []
+        if self._transverse_t is not None:
+            _sel = np.argmax(m_full, axis=0)               # state column -> its DoF row
+            _row_of_col = {int(r): int(c) for c, r in enumerate(_sel)
+                           if m_full[int(r), int(c)] != 0}
+            for _j in _tv_rows:
+                _ur = self.n_r + int(_j)
+                _vr = self.n_r + self.n_th + int(partner[int(_j)])
+                if _ur in _row_of_col and _vr in _row_of_col:
+                    _u_cols.append(_row_of_col[_ur])
+                    _v_cols.append(_row_of_col[_vr])
+        self._tv_u_cols = torch.as_tensor(_u_cols, dtype=torch.long, device=self.device)
+        self._tv_v_cols = torch.as_tensor(_v_cols, dtype=torch.long, device=self.device)
+        # the affine map's reference and SIGNED scale for those columns, so rho can be formed
+        # in chart radians straight from a state. Signed because `_M` is a signed selection:
+        # a chart that drove a row negatively would otherwise get a wall on |x| with the
+        # wrong sense, silently.
+        _uref = [float(th_ref[int(_j)]) for _j in _tv_rows[:len(_u_cols)]]
+        _vref = [float(ph_ref[int(partner[int(_j)])]) for _j in _tv_rows[:len(_u_cols)]]
+        _usc = [float(m_full[self.n_r + int(_j), _c] * scale[_c])
+                for _j, _c in zip(_tv_rows[:len(_u_cols)], _u_cols)]
+        _vsc = [float(m_full[self.n_r + self.n_th + int(partner[int(_j)]), _c] * scale[_c])
+                for _j, _c in zip(_tv_rows[:len(_u_cols)], _v_cols)]
+        _t = lambda a: torch.as_tensor(a, dtype=dtype, device=self.device)
+        self._tv_u_ref, self._tv_v_ref = _t(_uref), _t(_vref)
+        self._tv_u_scale, self._tv_v_scale = _t(_usc), _t(_vsc)
+        #: radius past which the transverse wall engages. Below pi with a wide margin: the
+        #: measured maximum over a 400-epoch run is 0.682, so this is inert today.
+        self.rho_wall = float(rho_wall)
+        # every surviving transverse row must own BOTH state columns -- guaranteed by the
+        # narrowing above, asserted because a wall or a crossing count formed from half a
+        # pair would be a plausible number for the wrong quantity rather than an error.
+        assert len(_u_cols) == int(self.transverse_angles.sum()), (
+            f"{smiles} at {level!r}: {len(_u_cols)} complete pairs of "
+            f"{int(self.transverse_angles.sum())} flagged")
 
+        #: set when the caller opted in to an incomplete chart, so downstream reporting can
+        #: mark the result rather than letting `level: full` speak for it
+        self.allow_constrained = bool(allow_constrained)
         self.delta_r_max, self.delta_theta_max = float(delta_r_max), float(delta_theta_max)
         self.bounding_coeff = float(bounding_coeff)
         self.r_floor, self.theta_floor = float(r_floor), float(theta_floor)
@@ -390,6 +560,12 @@ class ConformerTorsions(BaseSet):
         # permanently and the sampler is exploring a geometry the reward cannot see.
         free_r = self.free_mask[:self.n_r]
         free_th = self.free_mask[self.n_r:self.n_r + self.n_th]
+        # A TRANSVERSE ROW IS NOT A THETA ROW and this guard does not apply to it: its slot
+        # holds u, whose domain is a disc, not the interval (0, pi). Checking it here would
+        # reject every molecule the transverse pair exists to support -- theta0 ~ pi by
+        # definition at a linear centre, so theta0 + delta always breaches pi. The disc is
+        # checked separately, on (u0, v0), where the constructor builds the reference.
+        free_th = free_th & ~self.transverse_angles
         if free_r.any():
             worst = float(r0[free_r].min().item()) - self.delta_r_max
             if worst <= self.r_floor:
@@ -414,12 +590,11 @@ class ConformerTorsions(BaseSet):
         # means the constant cannot silently drift from the computed value. Its uses are
         # (a) adding the measure back to a baked potential, and (b) reporting, since it is
         # the offset by which step 2 moved every stored log Z on those levels.
-        from mxtaltools.conformers.builder import log_jacobian as _log_jac
         _probe = torch.zeros(1, self.data_ndim, dtype=dtype, device=self.device)
         _tree, _ = self._batch(1)
-        _pr, _pth, _ = self.dof_from_state(_probe)
+        _pr, _pth, _pph = self.dof_from_state(_probe)
         self.log_jacobian_const = (
-            float(_log_jac(_tree, _pr.reshape(-1), _pth.reshape(-1)).item())
+            float(self._log_jac(_tree, _pr, _pth, _pph, 1).item())
             if self._lin_free_idx.numel() == 0 else None)
 
         # THE CHART VOLUME ELEMENT, log|dq/dx|. The sampler proposes x on [-1, 1]^d, but
@@ -498,14 +673,22 @@ class ConformerTorsions(BaseSet):
         sym = Chem.GetPeriodicTable()
         z = np.asarray(self.spec.z)
         name = lambda i: f"{sym.GetElementSymbol(int(z[i]))}{i}"
-        n_free = [int((self._free_block == b).sum()) for b in (0, 1, 2)]
+        n_free = [int((self._free_block == b).sum()) for b in (0, 1, 2, 3)]
         lines = [f"{self.smiles}: {self.spec.n_atoms} atoms, {self.spec.n_dof} internal DoF",
                  f"   level {self.level!r}: {self.data_ndim} free "
                  f"(r {n_free[0]}/{self.n_r}, theta {n_free[1]}/{self.n_th}, "
-                 f"phi {n_free[2]}/{self.n_ph})",
-                 f"   linearity flags MEASURED: {int(self.angle_is_linear.sum())} linear "
+                 f"phi {n_free[2]}/{self.n_ph}, transverse {n_free[3]})",
+                 f"   linearity flags {self.linearity_source.upper()}: "
+                 f"{int(self.angle_is_linear.sum())} linear "
                  f"angle(s), {int(self.torsion_frame_is_linear.sum())} ill-conditioned "
-                 f"frame(s), all held"]
+                 f"frame(s)"]
+        n_tv = int(self.transverse_angles.sum())
+        if n_tv:
+            lines.append(
+                f"   TRANSVERSE: {n_tv} linear bend(s) carried as (u, v) = rho(cos phi, "
+                f"sin phi), regular at the pole; their measure is log sinc(rho), not "
+                f"log sin(theta). {self.uncovered_linear_angles} linear angle(s) NOT "
+                f"covered (frame seed or collinear reference frame) and still held.")
         # SAY SO WHEN THE TIER IS NOT WHAT IT CLAIMS. A globally nonlinear molecule has 3N-6
         # internal degrees of freedom regardless of a locally linear centre, so at 'full' any
         # shortfall is this chart's, and reporting `full` without saying so would present a
@@ -631,7 +814,15 @@ class ConformerTorsions(BaseSet):
             # only pay for the clamp where a linear block is actually free; at `torsion`
             # and `dihedral` r and th are the frozen reference and cannot leave the domain
             r = r.clamp_min(self.r_floor)
-            th = th.clamp(self.theta_floor, np.pi - self.theta_floor)
+            th_c = th.clamp(self.theta_floor, np.pi - self.theta_floor)
+            # A TRANSVERSE ROW IS NOT CLAMPED. Its slot holds u, not theta: the domain is a
+            # disc on which the pole is an INTERIOR point, so clamping to [floor, pi-floor]
+            # would fence off the linear geometry all over again -- and would do it by
+            # pinning a positive-probability region onto a boundary, which is the failure
+            # this chart was adopted to avoid. The disc is enforced at construction instead,
+            # by the reach check on delta_theta_max.
+            th = th_c if self._transverse_t is None else torch.where(self._transverse_t,
+                                                                     th, th_c)
         return r, th, ph
 
     def build_positions(self, x: torch.Tensor) -> torch.Tensor:
@@ -646,7 +837,31 @@ class ConformerTorsions(BaseSet):
 
         r, th, ph = self.dof_from_state(x)
         tree, _ = self._batch(x.shape[0])
-        return build(tree, r.reshape(-1), th.reshape(-1), ph.reshape(-1))
+        return build(tree, r.reshape(-1), th.reshape(-1), ph.reshape(-1),
+                     transverse=self._tiled_transverse(x.shape[0]))
+
+    def _tiled_transverse(self, b: int):
+        """The per-angle-row transverse mask, tiled over a b-replica batch tree.
+
+        `_batch(b)` collates b copies of one spec molecule-major, so the batched
+        `angle_index` is this molecule's rows repeated b times and a plain tile lines up.
+        None passes straight through, which is what keeps a molecule with no linear centre
+        byte-identical to the pre-transverse code path.
+        """
+        return None if self._transverse_t is None else self._transverse_t.repeat(b)
+
+    def _log_jac(self, tree, r, th, ph, b: int):
+        """`builder.log_jacobian` with the transverse rows measured as ``log sinc(rho)``.
+
+        Routed through one helper because the mask has to reach EVERY call site. A site that
+        built with it and measured without it would return a correct geometry under a wrong
+        density -- finite, right-shaped, and wrong -- so there is deliberately no way to
+        compute this Jacobian here without the mask coming along.
+        """
+        from mxtaltools.conformers.builder import log_jacobian
+        tv = self._tiled_transverse(b)
+        return log_jacobian(tree, r.reshape(-1), th.reshape(-1),
+                            None if tv is None else ph.reshape(-1), transverse=tv)
 
     def bounding_energy(self, x: torch.Tensor, temperature) -> torch.Tensor:
         """Box wall on the NON-PERIODIC state blocks, pre-multiplied by temperature.
@@ -662,7 +877,67 @@ class ConformerTorsions(BaseSet):
         """
         xl = x.to(self.dtype).index_select(-1, self._lin_free_idx)
         v = torch.relu(xl - 1.0) ** 2 + torch.relu(-(xl + 1.0)) ** 2
-        return self.bounding_coeff * v.sum(-1) * temperature
+        w = self.bounding_coeff * v.sum(-1)
+
+        # THE TRANSVERSE DISC, walled in RHO rather than per column. The box above is a
+        # SQUARE in (x_u, x_v) and does not know the transverse domain is a disc: at
+        # |x_u| = |x_v| = 1, where it is exactly zero, rho is already 0.71, and the diagonal
+        # route out is measured 42 kcal/mol CHEAPER than the axial one. So the cheapest
+        # escape is the direction nothing was checking.
+        #
+        # A PREFERENCE, NOT A CLAMP -- it pins nothing and it is exactly zero inside
+        # rho_wall. The number is measured, not chosen: over 947,022 transverse rows of a
+        # 400-epoch run the largest rho was 0.682, equal to the seed prior's own maximum, and
+        # the physical 99.99th percentile is 0.53. At rho_wall = 1.0 this term is therefore
+        # identically zero on every state either run has ever produced, and it only bites in
+        # a regime nothing has reached.
+        #
+        # WHY IT IS NEEDED AT ALL, given log sinc already vanishes at rho = pi: that barrier
+        # is LOGARITHMIC and therefore weak -- 8.1 nats one milliradian from the boundary,
+        # against a box wall worth 279 kcal/mol at the same point. The measure marks the
+        # boundary; it does not hold it. Past rho = pi the chart is an orientation-reversing
+        # double cover and log_sinc is -inf, so the reward is zero and the TB residual
+        # infinite. See docs/design/conformer_parameterisation.md 3.2.
+        if self._transverse_t is not None:
+            rho2 = self._transverse_rho2(x)
+            rho = torch.sqrt(rho2.clamp_min(1e-24))
+            w = w + self.bounding_coeff * (torch.relu(rho - self.rho_wall) ** 2).sum(-1)
+        return w * temperature
+
+    def _transverse_rho2(self, x: torch.Tensor) -> torch.Tensor:
+        """``u^2 + v^2`` per transverse PAIR, ``[B, n_pairs]``. Empty when there are none.
+
+        IN RADIANS OF THE CHART, not in state units: ``u = u0 + scale * x``, the same affine
+        map `dof_from_state` applies. A first version of this read the raw state columns as
+        though they were u and v, which made the wall fire on the box coordinate instead of
+        the bend and made the crossing counter report a crossing at rho = 2.0 -- inside the
+        disc, whose boundary is pi. The two differ by a factor of 1/delta_theta_max, so the
+        error was a plausible number for the wrong quantity in both consumers at once.
+
+        Computed from the state rather than by calling `dof_from_state`, so the wall and the
+        counter can run on the proposal itself before any reconstruction.
+        """
+        xt = x.to(self.dtype)
+        u = self._tv_u_ref + self._tv_u_scale * xt.index_select(-1, self._tv_u_cols)
+        v = self._tv_v_ref + self._tv_v_scale * xt.index_select(-1, self._tv_v_cols)
+        return u * u + v * v
+
+    def transverse_crossings(self, x: torch.Tensor) -> int:
+        """How many transverse pairs in this batch left the chart's disc (``rho >= pi``).
+
+        NAMED AND COUNTED rather than left to surface as a NaN. Past the disc the chart is
+        not injective, ``log sinc`` is ``-inf``, the log reward is ``-inf`` and one row takes
+        the whole batch's TB loss and every gradient to infinity -- with nothing in the reward
+        path checking finiteness, so the operator would see a dead run and no attribution.
+        Extrapolated per-row probability is 1e-15 (pessimistic) to 1e-127 (Gaussian fit) at
+        the current operating point, and the measured maximum over 947,022 rows is 0.682
+        against a boundary of pi -- so this is expected to read zero forever, and that is
+        exactly why it has to be reported rather than assumed.
+        """
+        if self._transverse_t is None:
+            return 0
+        with torch.no_grad():
+            return int((self._transverse_rho2(x) >= np.pi ** 2).sum())
 
     # -------------------------------------------------------------- prior draw
 
@@ -679,6 +954,26 @@ class ConformerTorsions(BaseSet):
                 f"state_from_dof needs a selection map, but level {self.level!r} has "
                 f"collective columns (one bond rotation drives several dihedrals). Use "
                 f"build_prior_states.draw_states for the torsion route.")
+        # THE INPUT IS POLAR, THE STATE IS NOT. Every caller of this function -- the prior
+        # histograms, the ring-frame correction, prior_diagnostics -- produces (theta, phi),
+        # because that is what an angle distribution is fitted in. A transverse row's state
+        # slot holds (u, v), so the pair is converted HERE rather than at each call site.
+        # Skipping it would land a theta near pi in a u slot: a bend of ~3.1 rad instead of
+        # ~0, off the disc entirely, and silent because the shapes are identical.
+        #
+        # This makes `state_from_dof` the inverse of (dof_from_state THEN chart -> polar),
+        # not of `dof_from_state` alone. They agree on every non-transverse row, which is
+        # every row of every molecule without a linear centre.
+        if self._transverse_t is not None:
+            from mxtaltools.conformers.geometry import transverse_from_polar
+            tj = torch.as_tensor(np.flatnonzero(self.transverse_angles),
+                                 dtype=torch.long, device=th.device)
+            tm = torch.as_tensor(self.transverse_partner[self.transverse_angles],
+                                 dtype=torch.long, device=ph.device)
+            u, v = transverse_from_polar(th.index_select(-1, tj), ph.index_select(-1, tm))
+            th = th.index_copy(-1, tj, u)
+            ph = ph.index_copy(-1, tm, v)
+
         dof = torch.cat([r, th, ph], dim=-1).to(self.dtype)
         sel = self._sel_rows
         x = ((dof.index_select(1, sel) - self._ref_dof.index_select(0, sel).unsqueeze(0))
@@ -983,6 +1278,15 @@ class ConformerTorsions(BaseSet):
         there is no importance weight, and so no ESS: the number people quote for the
         upgraded prior would silently be the density of a DIFFERENT distribution.
 
+        NO TRANSVERSE ROWS. This returns a density over the POLAR dof, while the state those
+        dof map to is in (u, v) on a transverse row -- so the two differ by the chart
+        Jacobian ``|d(theta, phi)/d(u, v)| = 1 / rho`` per such row, and an importance weight
+        formed from them would be wrong by that factor. Refused rather than approximated: the
+        whole point of this function is that an unmatched density gives an ESS for a
+        distribution nobody sampled. Fitting the bend in (u, v) directly -- a 2-D
+        distribution on a disc, not a 1-D angle histogram -- is the real fix and is a
+        modelling question, not plumbing.
+
         ACYCLIC ONLY. Ring blocks draw from a bank or a pucker subspace whose density is a
         mixture over fitted rows, and the subspace is lower-dimensional than the block it
         fills, so the block's density is singular in the held directions. That is a real
@@ -995,6 +1299,15 @@ class ConformerTorsions(BaseSet):
         """
         from mxtaltools.conformers.prior import R_RANGE, THETA_RANGE, PHI_RANGE
         spans = {'r': R_RANGE, 'theta': THETA_RANGE, 'phi': PHI_RANGE}
+
+        if self._transverse_t is not None:
+            raise NotImplementedError(
+                f'prior_log_prob is a density over the POLAR dof, but {self.smiles} has '
+                f'{int(self.transverse_angles.sum())} transverse bend row(s) whose state is '
+                f'(u, v). The two differ by |d(theta, phi)/d(u, v)| = 1/rho per row, so an '
+                f'importance weight built from them would be wrong by that factor -- which '
+                f'is exactly the "ESS for a distribution nobody sampled" this function was '
+                f'written to prevent. Fit the bend as a 2-D distribution on the disc first.')
 
         if any(True for _ in self.ring_blocks(prior)):
             raise NotImplementedError(
@@ -1335,6 +1648,11 @@ class ConformerTorsions(BaseSet):
         stats['clip_frac'] = {
             'r': float(outside[:, self._free_block == 0].to(self.dtype).mean()) if (self._free_block == 0).any() else 0.0,
             'theta': float(outside[:, self._free_block == 1].to(self.dtype).mean()) if (self._free_block == 1).any() else 0.0,
+            # transverse columns are non-periodic and walled like r/theta, so a draw can
+            # leave their box too. Reported separately rather than folded into 'theta': the
+            # box means a different thing there (a disc radius, not an angle range), and a
+            # clip rate that mixed the two would not say which box was too narrow.
+            'transverse': float(outside[:, self._free_block == 3].to(self.dtype).mean()) if (self._free_block == 3).any() else 0.0,
         }
         x = x.clamp(-1.0, 1.0)
 
@@ -1468,11 +1786,9 @@ class ConformerTorsions(BaseSet):
         in x, but it is NOT constant in c, and log_jacobian's own docstring says it "must
         be added back if partition functions are compared across molecules".
         """
-        from mxtaltools.conformers.builder import log_jacobian
-
         tree, _ = self._batch(x.shape[0])
-        r, th, _ = self.dof_from_state(x)
-        return -temperature * log_jacobian(tree, r.reshape(-1), th.reshape(-1))
+        r, th, ph = self.dof_from_state(x)
+        return -temperature * self._log_jac(tree, r, th, ph, x.shape[0])
 
     def energy(self, x, mol_batch=None, log_temperature=None,
                return_exp: bool = False, keep_grads: bool = False,
@@ -1696,12 +2012,11 @@ class ConformerTorsions(BaseSet):
             # reason the potential is baked: a measure divided by the sampling temperature
             # is not a measure, so it cannot be folded into the stored scalar.
             from energies.conformer_data import batch_states
-            from mxtaltools.conformers.builder import log_jacobian
             state = torch.as_tensor(batch_states(mols), dtype=self.dtype,
                                     device=self.device)
-            r, th, _ = self.dof_from_state(state)
+            r, th, ph = self.dof_from_state(state)
             tree, _ = self._batch(state.shape[0])
-            log_j = log_jacobian(tree, r.reshape(-1), th.reshape(-1)).to(e.device)
+            log_j = self._log_jac(tree, r, th, ph, state.shape[0]).to(e.device)
             return -(e.flatten() / t) + log_j.flatten() + self.log_chart_jacobian
         # BOTH measure terms, or this path disagrees with energy() by a constant that is
         # different for every molecule. The chart term is as temperature-independent as the

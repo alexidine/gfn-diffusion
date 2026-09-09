@@ -738,8 +738,9 @@ LINEAR_SET = [('acetonitrile', 'CC#N'), ('butyronitrile', 'CCCC#N'),
 def test_chart_is_a_function_of_the_graph():
     """Under MMFF the chart must not depend on the embedding seed, and `d` with it.
 
-    Linearity decides which DoF are HELD, so it decides `d` -- acetonitrile is 11, not
-    3N-6 = 12. Measured off a reference conformer that is a hazard: the same molecule could
+    Linearity decides which DoF are HELD, so it decides `d`. Acetonitrile USED to be 11
+    against 3N-6 = 12; since the transverse pair it is 12, and propargyl alcohol is the
+    remaining kind of case at 16 of 18 (its linear angle sits at a frame seed). Measured off a reference conformer that is a hazard: the same molecule could
     get a different chart from a different seed, which would silently reinterpret every
     stored state. MMFF types its angles from the graph, so theta0 >= 179.99 removes the
     hazard by construction.
@@ -750,8 +751,14 @@ def test_chart_is_a_function_of_the_graph():
     for name, smi in LINEAR_SET:
         charts = set()
         for seed in range(4):
+            # allow_constrained: LINEAR_SET deliberately includes molecules whose chart is
+            # INCOMPLETE at 'full' (propargyl alcohol holds 2 rows, allene 2, azide 2). This
+            # gate is about the chart being a function of the graph, which is a property the
+            # constrained ones must satisfy too -- so it opts in explicitly rather than
+            # letting the refusal turn a coverage gate into a skip.
             e = ConformerTorsions(smiles=smi, device="cpu", level="full",
-                                  force_field="mmff", seed=seed)
+                                  force_field="mmff", seed=seed,
+                                  allow_constrained=True)
             charts.add((e.data_ndim, int(e.angle_is_linear.sum()),
                         int(e.torsion_frame_is_linear.sum())))
         assert e.linearity_source == 'mmff_typed', e.linearity_source

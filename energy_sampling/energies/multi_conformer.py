@@ -229,19 +229,45 @@ class MultiConformerTorsions(ConformerTorsions):
         n = int(e.shape[0])
         if self.n_charts <= 1:
             return super().prebuilt_sample_to_reward(mols, temperature)
+        t = torch.as_tensor(temperature, dtype=e.dtype, device=e.device).flatten()
         if self.log_jacobian_const is None:
-            raise NotImplementedError(
-                'the multi-molecule energy supports the CONSTANT-Jacobian levels (torsion, '
-                'dihedral) only. Above them log J is state-dependent and has to be rebuilt '
-                'per row through each molecule\'s own tree, which needs a per-member '
-                '`_batch` cache this class does not keep.')
+            # STATE-DEPENDENT log J -- `flex` and `full`, where r and theta are free so the
+            # BAT term prod r^2 sin(theta) moves with the sample and cannot be a per-molecule
+            # constant. This used to raise, which made `full` unreachable on the ENTIRE
+            # conditional route: the conditional arm is always a MultiConformerTorsions, and
+            # the anchor-buffer seed calls this before the first training step.
+            #
+            # The dispatch is the same grouping `energy()` uses, and each member is a whole
+            # ConformerTorsions with its own `_batch` tree cache -- so the "per-member cache
+            # this class does not keep" was already there, one level down. Rebuilding per
+            # member rather than per row keeps it one `build` call per distinct molecule.
+            from energies.conformer_data import batch_states
+            state = torch.as_tensor(batch_states(mols), dtype=self.dtype,
+                                    device=self.device)
+            if int(state.shape[0]) != n:
+                raise RuntimeError(
+                    f'{state.shape[0]} baked states against {n} baked energies; the prebuilt '
+                    f'rows disagree with themselves')
+            parts, idxs = [], []
+            for member, idx in self._groups(mols, n, state.device):
+                xi = state.index_select(0, idx)
+                r, th, ph = member.dof_from_state(xi)
+                tree, _ = member._batch(int(xi.shape[0]))
+                # the CHART term is per member too: it is sum(log scale) over that molecule's
+                # own free columns, so it differs whenever the free-column sets differ. Adding
+                # the reference member's to every row is the same per-condition log Z error
+                # this class exists to remove, one level further in.
+                parts.append(member._log_jac(tree, r, th, ph, int(xi.shape[0])).flatten()
+                             + float(member.log_chart_jacobian))
+                idxs.append(idx)
+            log_j = self._regroup(parts, idxs, n).to(e.device)
+            return -(e / t) + log_j
 
         idents = self._row_identifiers(mols, n)
         lj = torch.tensor([float(self._members[i].log_jacobian_const) for i in idents],
                           dtype=e.dtype, device=e.device)
         ch = torch.tensor([float(self._members[i].log_chart_jacobian) for i in idents],
                           dtype=e.dtype, device=e.device)
-        t = torch.as_tensor(temperature, dtype=e.dtype, device=e.device).flatten()
         return -(e / t) + lj + ch
 
     # ------------------------------------------------------------------ reporting

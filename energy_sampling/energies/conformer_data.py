@@ -130,6 +130,12 @@ CTREE_ATOM_FIELDS = (
     # level='torsion'; these six are what make `full` reconstruct.
     'ctree_r_col', 'ctree_r_scale', 'ctree_th_col', 'ctree_th_scale',
     'ctree_ph_col', 'ctree_ph_scale',
+    # per ANGLE-OWNING atom: this row's (theta, phi) pair is carried as the TRANSVERSE pair
+    # (u, v), which is regular at a linear centre where the polar pair is not. It changes
+    # what the theta and phi slots MEAN, so it has to travel with them -- a batch that
+    # carries the reference and the map but not this flag reconstructs a wrong geometry
+    # from right-shaped tensors.
+    'ctree_transverse',
 )
 # per-graph fields present on every conformer graph
 CTREE_GRAPH_FIELDS = ('n_torsions', 'ctree_r_floor', 'ctree_theta_floor', 'ctree_clamp')
@@ -312,12 +318,21 @@ def condition_from_energy(energy, identifier: Optional[str] = None,
     mol.ctree_ref_b = as_long(np.where(rank >= 2, spec.ref_b - slots, 0))
     mol.ctree_ref_c = as_long(np.where(rank >= 1, spec.ref_c - slots, 0))
 
-    # reference internals, scattered onto the owning atom. energy.r0/th0/ph0 were
-    # measure()'d off the same ref_pos, so these are exactly the values build_positions
-    # freezes r and theta at.
-    mol.ctree_r0 = _scatter(energy.r0, rank >= 1, n, dtype)
-    mol.ctree_theta0 = _scatter(energy.th0, rank >= 2, n, dtype)
-    mol.ctree_phi0 = _scatter(energy.ph0, rank >= 3, n, dtype)
+    # reference internals, scattered onto the owning atom -- taken from `energy._ref_dof`,
+    # which is the vector `dof_from_state` actually starts from, NOT from energy.r0/th0/ph0.
+    # The two differ on a TRANSVERSE row: the energy's reference there is (u0, v0) while
+    # th0/ph0 remain polar for the prior histograms and the reporting paths. Reading the
+    # polar pair here would leave the graph reconstructing from a reference the energy does
+    # not use, which is a silent several-Angstrom disagreement of exactly the kind
+    # tests/conformer/test_state_to_dof_equivalence.py exists to catch. They are identical
+    # whenever no row is transverse.
+    _ref = energy._ref_dof.detach().cpu()
+    _nr, _nth = int(energy.n_r), int(energy.n_th)
+    mol.ctree_r0 = _scatter(_ref[:_nr], rank >= 1, n, dtype)
+    mol.ctree_theta0 = _scatter(_ref[_nr:_nr + _nth], rank >= 2, n, dtype)
+    mol.ctree_phi0 = _scatter(_ref[_nr + _nth:], rank >= 3, n, dtype)
+    mol.ctree_transverse = _scatter(as_bool(energy.transverse_angles), rank >= 2, n,
+                                    torch.bool, fill=False)
 
     mol.ctree_angle_is_linear = _scatter(as_bool(spec.angle_is_linear), rank >= 2, n,
                                          torch.bool)
@@ -716,7 +731,11 @@ def batch_tree(batch):
 
 
 def reference_internals(batch):
-    """The frozen reference ``(r, theta, phi)`` vectors, aligned with ``batch_tree``.
+    """The frozen reference vectors in CHART units, aligned with ``batch_tree``.
+
+    ``(r, theta, phi)`` on an ordinary row and ``(r, u, v)`` on a transverse one -- the same
+    substitution the energy's own reference makes, since this is what both builders start
+    from. Use :func:`transverse_mask` to tell which rows are which.
 
     THE REFERENCE, NOT THE STATE. `states_to_positions` used to build from these three
     unconditionally and write the state into phi alone, which is correct only at `torsion`
@@ -731,7 +750,22 @@ def reference_internals(batch):
 
 
 _DOF_MAP_FIELDS = ('ctree_r_col', 'ctree_r_scale', 'ctree_th_col', 'ctree_th_scale',
-                   'ctree_ph_col', 'ctree_ph_scale', 'ctree_clamp')
+                   'ctree_ph_col', 'ctree_ph_scale', 'ctree_clamp', 'ctree_transverse')
+
+
+def transverse_mask(batch):
+    """Per-ANGLE-ROW transverse flags for ``builder.build``, or None when there are none.
+
+    The stored flag is per ATOM; the builder wants it per angle row. Both orderings are
+    atom order restricted to ``rank >= 2``, which is exactly how ``batch_tree`` builds
+    ``angle_index``, so the restriction IS the conversion. Returning None rather than an
+    all-False mask keeps a batch with no linear centre on the identical code path it was on
+    before the chart existed.
+    """
+    flag = getattr(batch, 'ctree_transverse', None)
+    if flag is None or not bool(flag.any()):
+        return None
+    return flag[dof_rank(batch) >= 2]
 
 
 def state_to_dof(batch, state: torch.Tensor):
@@ -778,7 +812,13 @@ def state_to_dof(batch, state: torch.Tensor):
     if bool(batch.ctree_clamp.reshape(-1)[0]):
         r = r.clamp_min(float(batch.ctree_r_floor.reshape(-1)[0]))
         tf = float(batch.ctree_theta_floor.reshape(-1)[0])
-        th = th.clamp(tf, float(np.pi) - tf)
+        # NOT ON A TRANSVERSE ROW, matching `dof_from_state`: that slot holds u, whose domain
+        # is a disc with the linear geometry at its INTERIOR, so clamping to (0, pi) would
+        # push a positive-probability region onto a boundary -- and would do it on one of the
+        # two reconstruction paths only, which is worse than doing it on both.
+        tv = transverse_mask(batch)
+        th_c = th.clamp(tf, float(np.pi) - tf)
+        th = th_c if tv is None else torch.where(tv, th, th_c)
     return r, th, ph
 
 
@@ -815,7 +855,8 @@ def states_to_positions(batch, state: torch.Tensor) -> torch.Tensor:
     """
     from mxtaltools.conformers.builder import build
 
-    return build(batch_tree(batch), *state_to_dof(batch, state))
+    return build(batch_tree(batch), *state_to_dof(batch, state),
+                 transverse=transverse_mask(batch))
 
 
 # ------------------------------------------------- state-bearing (prior) rows
