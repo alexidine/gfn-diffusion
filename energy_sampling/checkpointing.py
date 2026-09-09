@@ -714,6 +714,38 @@ class Checkpointer:
                         else:
                             group['lr'] = target_lrs[key]
 
+    #: The ONLY problem_def keys `warm_start_ignore_problem_keys` may exempt, and
+    #: only on the weights-only path. Deliberately one key: a warm start across a
+    #: different ENERGY FUNCTION or space group would load weights that mean
+    #: nothing for the new target, and no config should be able to ask for that.
+    #: prior_path is exemptible because it names the MLE sample, which
+    #: `load_weights_only` does not restore any part of -- see below.
+    WARM_START_EXEMPTIBLE = ('prior_path',)
+
+    def _warm_start_ignore_keys(self):
+        """Problem-def keys this run is permitted to warm-start ACROSS.
+
+        Empty unless the config asks, and every entry must sit in
+        WARM_START_EXEMPTIBLE. The motivating case: a prior rebuilt to hold more
+        noised rows around the SAME anchors at the SAME calibrated noise range is
+        the same problem, but `prior_path` hashes the FILENAME, so the identity
+        moves when the distribution has not.
+
+        Whoever sets this is asserting the two priors describe one target. Nothing
+        here can check that, so it prints what it exempted -- a silent exemption
+        is how a genuinely different prior would slip through wearing an old
+        model's weights.
+        """
+        wanted = tuple(getattr(self.modeller.args, 'warm_start_ignore_problem_keys', None) or ())
+        bad = [k for k in wanted if k not in self.WARM_START_EXEMPTIBLE]
+        if bad:
+            raise ValueError(
+                f"warm_start_ignore_problem_keys={list(wanted)} names {bad}, which "
+                f"may not be exempted. Only {list(self.WARM_START_EXEMPTIBLE)} can be: "
+                f"the rest change what the target IS, so weights trained under the old "
+                f"value do not transfer and the guard is the only thing that says so.")
+        return wanted
+
     def load_weights_only(self, path):
         """
         Warm-start from a checkpoint's model weights alone: rebuilds the GFN
@@ -723,10 +755,23 @@ class Checkpointer:
         condition_log_z, and every MODELLER_STATE_DEFAULTS field are left for
         the caller to initialize fresh (phase 1, step 0, LR warmup from
         scratch).
+
+        WHY THIS PATH MAY EXEMPT A PROBLEM KEY AND `load_full` MAY NOT.
+        assert_problem_match exists because restoring across problems corrupts
+        state meaningful only under the old one -- most destructively the buffers,
+        whose rows carry the old energy's keys. This path restores NO buffers, no
+        optimizer and no step count; it carries weights and the P_B snapshot and
+        nothing else. So `warm_start_ignore_problem_keys` is honoured here and
+        deliberately ignored by load_full, which does restore buffers.
         """
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
-        self.assert_problem_match(checkpoint, path, 'checkpoint_name')
+        ignore = self._warm_start_ignore_keys()
+        if ignore:
+            print(f"checkpoint: warm start EXEMPTING {list(ignore)} from the problem "
+                  f"match for weights-only load of {path} -- asserting these describe "
+                  f"the same target. Buffers, optimizers and step count start fresh.")
+        self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = GFN(**m.gfn_config).to(m.device)
         m.gfn_model.load_state_dict(checkpoint['model_train'])

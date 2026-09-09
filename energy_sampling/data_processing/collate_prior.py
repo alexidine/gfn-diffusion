@@ -208,6 +208,16 @@ if __name__ == '__main__':
     ap.add_argument('--mace-model', default=r"D:\crystal_datasets\acr_112025_mh1_stagetwo.model")
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--noised-samples', type=int, default=50000)
+    ap.add_argument('--memory-fraction', type=float, default=0.9,
+                    help="HARD cap on this process's share of the card, the same "
+                         "guard train.py:130 applies and this script never did. "
+                         "Without it an over-large chunk does not raise OOM on "
+                         "Windows -- it spills into shared host memory, which on "
+                         "this box means a BSOD/restart loop, not a slow scan "
+                         "(bench/calibrate_noise.py records the same history). "
+                         "With the cap the allocator raises, and "
+                         "adaptive_batched_analysis's OOM handler can actually "
+                         "shrink the chunk instead of the machine dying.")
     ap.add_argument('--score-batch-size', type=int, default=10000,
                     help="structures per MLIP scoring chunk in the noising loop. "
                          "adaptive_batched_analysis is supposed to shrink this on "
@@ -226,6 +236,11 @@ if __name__ == '__main__':
                          "name outright, so re-running after an energy-function change "
                          "silently returns the old prior and reports success.")
     cli = ap.parse_args()
+
+    # BEFORE any allocation, so the cap covers the model load too.
+    if cli.device.startswith('cuda') and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(float(cli.memory_fraction))
+        print(f'cuda memory fraction capped at {cli.memory_fraction}')
 
     cfg = TARGETS[cli.target]
     search_output_dir = cfg['search_output_dir']
