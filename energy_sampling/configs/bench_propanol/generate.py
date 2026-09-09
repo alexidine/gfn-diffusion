@@ -89,6 +89,14 @@ PROTOCOL = """protocols:
       - name: tb
         train_mode: fused
         bwd_sampling_mode: dataset
+        # ANCHOR log Z ON ENTRY. The MLE stage runs tb: 0.0, so nothing trains the flow head
+        # there and log Z sits at its initial value for the whole warm start -- the run says
+        # so ("no mode trains the flow (Z) head"). Without this the TB stage's first
+        # thousands of steps are spent moving log Z rather than the policy, which is exactly
+        # the transient the warm start exists to avoid, and it would be spent DIFFERENTLY by
+        # the two arms (their Z heads differ: a scalar against Z_MLP(condition)). Anchoring
+        # both on the tracker's ema_logw is what makes the log Z comparison start level.
+        on_enter: [ 'bootstrap_z' ]
         flags:
           update_log_z: true
           buffers_active: true

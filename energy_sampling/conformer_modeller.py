@@ -760,18 +760,48 @@ class ConformerModeller(Modeller):
                                              condition_from_energy)
 
         n = max(int(num_samples), 2)      # attach_states refuses a single row
+
+        # LABEL BY IDENTIFIER, NOT BY SMILES. Everything downstream -- the buffers, the
+        # mol_id registry, the per-molecule energy table -- keys on the identifier, and a
+        # conditions file is free to make that distinct from the SMILES (and must, when one
+        # molecule appears more than once). On the single-molecule route the two coincide,
+        # which is why `self.energy_function.smiles` worked there and raised KeyError the
+        # moment a real condition set appeared.
+        ident = getattr(self.energy_function, 'reference_identifier', None) \
+            or self.energy_function.smiles
+
+        # THIS DRAW IS FROM THE REFERENCE MEMBER ALONE. `_draw_prior_states` goes through the
+        # energy's own chart, and a multi-molecule energy's chart is its reference member's.
+        # Churning those rows into a buffer that is supposed to represent a SET would skew it
+        # toward one molecule -- silently, because every row is individually valid. That is
+        # harmless when the set is one molecule repeated (the paired-benchmark case) and is a
+        # real bias otherwise, so it is refused rather than left to be discovered in a result.
+        distinct = int(getattr(self.energy_function, 'distinct_smiles', 1) or 1)
+        if distinct > 1:
+            raise NotImplementedError(
+                f'prior-buffer churn draws from the reference member only, but this energy '
+                f'holds {distinct} distinct molecules -- the churned rows would all be '
+                f'{self.energy_function.smiles!r} and would skew the buffer toward it. Draw '
+                f'per member before enabling churn on a heterogeneous set, or disable churn '
+                f'(prior_buffer.mean_lifetime) for this run.')
+
         states, _ = self._draw_prior_states(n, self._prior_rng, report=False)
         energies = bake_energies(self.energy_function, states)
-        cond = condition_from_energy(self.energy_function,
-                                     identifier=self.energy_function.smiles)
+        # THE CONDITION IS THE FILE'S, when there is one. `condition_from_energy` rebuilds a
+        # BARE graph: no `embedding`, no `atom_embedding`, no `dof_atoms`. Those are baked by
+        # the conditions builder from the encoder and cannot be recovered from the energy, so
+        # a churned row built that way is a row the conditional policy cannot read --
+        # `condition_samples` refuses the whole batch, at the first churn, which is inside
+        # the first evaluation. Exactly the defect `init_mol_dataset` already documents for
+        # the eval batch; this is the same mistake on the churn path.
+        cond = self._condition_template(ident)
         batch = attach_states(cond, states.cpu(), energies.cpu(),
-                              identifier=self.energy_function.smiles,
+                              identifier=ident,
                               periodic=self.energy_function.periodic_dims)
         batch = batch.to(self.device)
         if hasattr(self, 'identifier_registry'):
             batch.add_graph_attr(
-                torch.full((batch.num_graphs,),
-                           self.identifier_registry[self.energy_function.smiles],
+                torch.full((batch.num_graphs,), self.identifier_registry[ident],
                            dtype=torch.long, device=batch.device), 'mol_id')
 
         # THROUGH condition_samples, not around it. It is what attaches `conditions` and
@@ -872,6 +902,36 @@ class ConformerModeller(Modeller):
                                            **self._buffer_kwargs(),
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
         self.test_mol_dataset = None
+
+    def _condition_template(self, identifier):
+        """One condition graph for `identifier`, carrying whatever the file baked onto it.
+
+        Read from `mol_dataset` -- the set the run actually trains over -- rather than
+        rebuilt, so the embedding, the per-atom embedding and the DoF atom frames ride along.
+        Cached: the churn path calls this on every prior-buffer cycle and `to_data_list` on a
+        32-graph batch is not free.
+
+        Falls back to `condition_from_energy` only when there is no condition set at all,
+        which is the unconditional route -- where there is nothing baked to lose.
+        """
+        from energies.conformer_data import condition_from_energy
+
+        cache = getattr(self, '_cond_template_cache', None)
+        if cache is None:
+            cache = self._cond_template_cache = {}
+        if identifier in cache:
+            return cache[identifier]
+
+        ds = getattr(self, 'mol_dataset', None)
+        batch = getattr(ds, 'batch', None) if ds is not None else None
+        if batch is not None and getattr(batch, 'identifier', None) is not None:
+            idents = list(batch.identifier)
+            if identifier in idents:
+                graph = batch.to_data_list()[idents.index(identifier)]
+                cache[identifier] = graph
+                return graph
+        cache[identifier] = condition_from_energy(self.energy_function, identifier=identifier)
+        return cache[identifier]
 
     @property
     def _prior_rng(self):

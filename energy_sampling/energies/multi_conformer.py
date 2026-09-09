@@ -97,6 +97,26 @@ class MultiConformerTorsions(ConformerTorsions):
     def n_charts(self) -> int:
         return len(self._members)
 
+    @property
+    def reference_identifier(self) -> str:
+        """The identifier of the member every single-molecule path implicitly draws from.
+
+        `self.smiles` is the reference member's SMILES, and on this route that is NOT a key
+        of anything: the buffers, the mol_id registry and the per-molecule energy table are
+        all keyed by IDENTIFIER, which a conditions file is free to make distinct from the
+        SMILES (and must, when the same molecule appears more than once).
+        """
+        return next(iter(self._members))
+
+    @property
+    def distinct_smiles(self) -> int:
+        """How many genuinely different molecules the set holds.
+
+        1 when a set is one molecule repeated -- the case where a reference-only draw is
+        representative of the whole set rather than a sample of one member of it.
+        """
+        return len(set(self._member_smiles.values()))
+
     def _row_identifiers(self, mol_batch, n: int) -> List[str]:
         """One identifier per ROW, in batch order.
 

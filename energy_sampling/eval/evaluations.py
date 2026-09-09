@@ -378,13 +378,20 @@ def _decode_condition_ids(cid, energy_function):
     n_zp = getattr(energy_function, 'n_zp', None)
     if not n_sg or not n_zp:
         return None
+    # THE SAME GUARD, FINISHED. n_sg/n_zp default to 1 on a conformer energy, so the check
+    # above passes and the two LIBRARIES below -- which only a crystal energy has -- were
+    # then read unguarded. The result was an AttributeError on every figure period of every
+    # conformer run: non-fatal, so the run continued, but a traceback per eval is where a
+    # real one goes unnoticed.
+    sg_lib = getattr(energy_function, 'space_groups', None)
+    zp_lib = getattr(energy_function, 'z_primes', None)
+    if sg_lib is None or zp_lib is None:
+        return None
     n_combos = n_sg * n_zp
     mol = cid // n_combos
     sg_local = (cid % n_combos) // n_zp
     zp_local = cid % n_zp
-    sgs = np.asarray(energy_function.space_groups)[sg_local]
-    zps = np.asarray(energy_function.z_primes)[zp_local]
-    return mol, sgs, zps
+    return mol, np.asarray(sg_lib)[sg_local], np.asarray(zp_lib)[zp_local]
 
 
 # per-condition scatter diagnostics (splom + Z-calibration funnel) are off by
