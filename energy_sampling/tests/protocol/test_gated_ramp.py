@@ -338,3 +338,64 @@ def test_bootstrap_z_accepts_its_forms(arg):
 def test_bootstrap_z_refuses_a_malformed_rollout_arg(arg):
     with pytest.raises(ValueError, match='bootstrap_z'):
         _stage(on_enter=[f'bootstrap_z:{arg}'])
+
+
+# ---------------------------------------------------------------------------
+# The Schmitt ratchet: trip high, release low. A single threshold lets an arm
+# CYCLE -- excurse, drift back to the trip line, ramp, excurse again -- because
+# touching the line is enough to be released. These pin the two thresholds
+# apart and pin the degenerate cases back onto the old behaviour.
+# ---------------------------------------------------------------------------
+
+def _ratchet_run(levels, tol, release_tol, sensor=-1.0):
+    """Feed a level series through the ratchet; return the held flags."""
+    st = _stage(balance=dict(RATCHET, ratchet_tol=tol, ratchet_release_tol=release_tol))
+    bal = st.balance
+    ctrl, held = {}, []
+    best = float('inf')
+    for L in levels:
+        if L < best:
+            best = L
+        hi, lo = float(bal['ratchet_tol']), float(bal['ratchet_release_tol'])
+        tripped = bool(ctrl.get('gr_tripped', False))
+        if L > best + hi:
+            tripped = True
+        elif L <= best + min(lo, hi):
+            tripped = False
+        ctrl['gr_tripped'] = tripped
+        held.append(tripped)
+    return held
+
+
+def test_release_is_lower_than_trip_so_a_touch_does_not_clear_it():
+    """Level dips to 10 (best), excurses to 10.6 (over trip 0.5), then settles at
+    10.4 -- back under the TRIP line but not under the RELEASE line, so it stays
+    held. Under one threshold it would have been released at 10.4 and could
+    excurse again immediately: that is the cycle this exists to stop."""
+    held = _ratchet_run([10.0, 10.6, 10.4, 10.4], tol=0.5, release_tol=0.2)
+    assert held == [False, True, True, True]
+
+
+def test_a_repaired_excursion_releases():
+    held = _ratchet_run([10.0, 10.6, 10.4, 10.15], tol=0.5, release_tol=0.2)
+    assert held == [False, True, True, False]
+
+
+def test_equal_thresholds_reduce_to_the_old_single_threshold_behaviour():
+    lv = [10.0, 10.6, 10.4, 10.15, 10.9]
+    assert _ratchet_run(lv, tol=0.5, release_tol=0.5) == [L > 10.0 + 0.5 for L in lv]
+
+
+def test_release_tol_defaults_to_the_trip_tol():
+    st = _stage(balance=dict(RATCHET, ratchet_tol=0.25))
+    assert st.balance['ratchet_release_tol'] == pytest.approx(0.25)
+
+
+def test_release_above_trip_is_refused():
+    with pytest.raises(ValueError, match='ratchet_release_tol'):
+        _stage(balance=dict(RATCHET, ratchet_tol=0.2, ratchet_release_tol=0.5))
+
+
+def test_a_negative_release_is_refused():
+    with pytest.raises(ValueError, match='ratchet_release_tol'):
+        _stage(balance=dict(RATCHET, ratchet_tol=0.5, ratchet_release_tol=-0.1))

@@ -208,14 +208,16 @@ def build(name, every, store_all, fwd_frac=0.0, boot=0, warm=None, steps=None,
                 # 14.8-15.8 against a best of 14.71, so at tol 0 the ramp is
                 # clamped nearly always and bwd drifts to its 0.9 cap. There is
                 # still no mechanism that decides a plateau counts as absorbed.
-                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.0,
+                # see configs/rr_sep07/make.py for the measurement behind these
+                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.5,
+                'ratchet_release_tol': 0.25,
                 # 4x slower than the original, i.e. 5x FASTER than the 20x cut
                 # (owner 2026-09-07, third pass). v2 moved bwd 0.50 -> 0.79 in
                 # 2000 steps at the slow gains, so the loop does close in a run;
                 # this makes it close inside a local arm too. Ticks are 10 steps,
                 # so 0.25 of share is ~230 steps down and ~5900 up.
-                'up': 0.000425,
-                'down': 0.01075,
+                'up': 0.004,
+                'down': 0.006,
                 'bounds': BOUNDS,
             }
             n_fused += 1

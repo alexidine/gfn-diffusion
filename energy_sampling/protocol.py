@@ -223,6 +223,7 @@ def fresh_stage_ctrl():
         # the outgoing one's high-water mark.
         'gr_best': None,
         'gr_held': 0.0,
+        'gr_tripped': False,
         # buffer freshness servo: log of the multiplicative churn/residence
         # boost. 0.0 = the configured buffer, i.e. inert.
         'bs_log_boost': 0.0,
@@ -1067,7 +1068,8 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
                                  f"(it anneals off the lexicographic clean-streak event)")
             bad = set(node) - {'kind', 'ramp', 'guard', 'metric', 'bar', 'up', 'down',
-                               'pinned', 'bounds', 'ratchet_metric', 'ratchet_tol'}
+                               'pinned', 'bounds', 'ratchet_metric', 'ratchet_tol',
+                               'ratchet_release_tol'}
             if bad:
                 raise ValueError(f"stage '{self.name}': gated_ramp balance unknown keys {sorted(bad)}")
             ramp, guard = node.get('ramp'), node.get('guard')
@@ -1130,6 +1132,25 @@ class Stage:
                     raise ValueError(f"stage '{self.name}': gated_ramp ratchet_tol must be a "
                                      f"number >= 0 (the metric's own units), got {tol!r}")
                 node['ratchet_tol'] = float(tol)
+                # THE RELEASE THRESHOLD, and it is deliberately allowed to differ
+                # from the trip threshold: one threshold lets an arm CYCLE --
+                # excurse, drift back to the line, ramp, excurse again -- because
+                # returning to the trip point is enough to be released. Trip high
+                # and release low and an excursion has to be genuinely repaired
+                # before replay is earned back. 0 is the strictest form (release
+                # only on a NEW BEST); it is not the default because records get
+                # rarer as a run converges and vanish at the fixed point, so a
+                # zero release can latch a converged arm for the rest of its stage.
+                rel = node.get('ratchet_release_tol', tol)
+                if not isinstance(rel, (int, float)) or rel < 0:
+                    raise ValueError(f"stage '{self.name}': gated_ramp ratchet_release_tol "
+                                     f"must be a number >= 0, got {rel!r}")
+                if rel > node['ratchet_tol']:
+                    raise ValueError(f"stage '{self.name}': gated_ramp ratchet_release_tol "
+                                     f"{rel} exceeds ratchet_tol {node['ratchet_tol']} -- the "
+                                     f"release must be at or below the trip or the trigger "
+                                     f"releases the instant it fires")
+                node['ratchet_release_tol'] = float(rel)
             node['ratchet_metric'] = rm
         else:
             raise ValueError(f"stage '{self.name}': balance.kind must be "
@@ -2425,8 +2446,22 @@ class StageProtocol:
             if best is None or level < best:
                 best = level
             self.ctrl['gr_best'] = best
-            # `<=` so the tick that SETS a new best also releases the ramp
-            held = 0.0 if level <= best + bal.get('ratchet_tol', 0.0) else 1.0
+            # A SCHMITT TRIGGER, not a threshold. Trip on a real excursion
+            # (best + ratchet_tol), and stay tripped until the level is genuinely
+            # repaired (best + ratchet_release_tol) rather than merely until it
+            # touches the trip line again -- otherwise an arm cycles: excurse,
+            # drift back to the edge, ramp, excurse. With release_tol == tol this
+            # reduces exactly to the old single-threshold behaviour, and at
+            # tol == 0 to `held unless this tick set a new best`.
+            hi = float(bal.get('ratchet_tol', 0.0))
+            lo = float(bal.get('ratchet_release_tol', hi))
+            tripped = bool(self.ctrl.get('gr_tripped', False))
+            if level > best + hi:
+                tripped = True
+            elif level <= best + min(lo, hi):
+                tripped = False
+            self.ctrl['gr_tripped'] = tripped
+            held = 1.0 if tripped else 0.0
         self.ctrl['gr_held'] = held
 
         fired = 0.0
@@ -2838,6 +2873,11 @@ class StageProtocol:
             # growing" without inference, and gr_best is the high-water mark the
             # veto is measured against
             out['protocol/gr_held'] = float(self.ctrl.get('gr_held', 0.0))
+            # the LATCH state, distinct from gr_held only while the two
+            # thresholds differ: it says the arm is inside an excursion it has
+            # not yet repaired, which is why the ramp is vetoed even on a tick
+            # whose level looks acceptable against the trip line alone.
+            out['protocol/gr_tripped'] = float(bool(self.ctrl.get('gr_tripped', False)))
             best = self.ctrl.get('gr_best')
             if best is not None and math.isfinite(best):
                 out['protocol/gr_best'] = float(best)
