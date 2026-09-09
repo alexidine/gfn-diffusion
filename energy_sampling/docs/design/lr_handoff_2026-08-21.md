@@ -16,6 +16,15 @@
 > **Sections 1–5 are still worth reading**, and section 9 especially: the reason
 > the frozen-data race was retired (wrong objective) is unaffected, and the
 > pitfalls are real. What is dead is the direction, not the evidence.
+>
+> **The code this document plans no longer exists (deleted 2026-09-09).** The
+> estimator, the ladder and its trainer side (`lr_pool.py`, `lr_ramp.py`,
+> `lr_ramp_probe.py`) were removed as an unreachable island, along with the tests
+> this document cites for them (`test_lr_pool.py`, `test_lr_ramp.py`,
+> `test_lr_ramp_driver.py`, already gone before that). Every file reference in
+> sections 6–8 is therefore historical — recover from git history rather than
+> expecting to find them. The harvester (`lr_larder.py`) is the one module named
+> here that survives, and it is live.
 
 **Read this first if you are picking up learning-rate control.** It is the
 single source: what was tried today, what it measured, why the direction

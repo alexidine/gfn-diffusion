@@ -1,4 +1,4 @@
-# Module: target metrics (`utils.py::quick_tb_stats`, `MetricTracker`, `sample_metrics.py`)
+# Module: target metrics (`utils.py::quick_tb_stats`, `MetricTracker`)
 
 > **Status: MODULE SNAPSHOT.** The verification dates below are historical.
 > Use this document for explanation and navigation; verify material claims
@@ -422,12 +422,19 @@ equally the signature of memorisation — which is what P3 exists to detect — 
 of a coverage gap. The statistic does not distinguish them, and reading it as
 either one alone is unwarranted.
 
-**T1 — `sample_metrics.py` is ~65% class-3 dead code.** *(confirmed; deletion approved)*
+**T1 — `sample_metrics.py` is ~65% class-3 dead code.** *(✅ **deleted 2026-09-09**, all 309 lines. Recover from git history if any of it is ever wanted.)*
 
-Of 309 lines, only `wasserstein` has external callers (6). Zero external callers
-for `linear_mmd2`, `poly_mmd2`, `mix_rbf_mmd2`, `mix_rbf_mmd2_and_ratio`,
-`_mmd2`, `_mmd2_and_ratio`, `_mmd2_and_variance`, `compute_distances`, and
-`compute_distribution_distances` — including the top-level entry point.
+The surviving caller count recorded here was wrong, and the error is worth
+keeping because it is the shape this codebase keeps producing: the six callers
+attributed to `wasserstein` are calls to a **different function of a similar
+name** — `sliced_wasserstein` in `eval/evaluations.py`, which is live and
+untouched. `sample_metrics.wasserstein` had none. So the module was not ~65%
+dead, it was entirely dead.
+
+Zero external callers for `linear_mmd2`, `poly_mmd2`, `mix_rbf_mmd2`,
+`mix_rbf_mmd2_and_ratio`, `_mmd2`, `_mmd2_and_ratio`, `_mmd2_and_variance`,
+`compute_distances`, and `compute_distribution_distances` — including the
+top-level entry point.
 
 Unlike the loss term bank and the class-2 diagnostics, this one is genuinely
 dead: nothing computes it, so nothing reads it either.

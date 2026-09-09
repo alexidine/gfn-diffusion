@@ -261,7 +261,12 @@ touching any LR arm here.
   `adaptive_lr.calibration.mode` now defaults to **`pooled`**; `servo` restores the
   retired v8 rule for comparison. Absent key = pooled.
 - **Initial calibration is a checkpointed ramp** (`lr_ramp.py`, `lr_ramp_probe.py`,
-  `lr_pool.py`, `lr_larder.py`).
+  `lr_pool.py`, `lr_larder.py`). **SUPERSEDED 2026-09-09: the ramp is gone.** The
+  brute-force bracket replaced it (`lr_bracket.py`, `lr_bracket_probe.py`), and the
+  three ramp modules were deleted as an unreachable island — nothing had imported
+  them since `controller.py` was rewritten onto the bracket. Recover them from git
+  history if the ramp is ever revived. Of the four named here only the harvester
+  (`lr_larder.py`) survives, and it is live: do not read this list as a deletion set.
 - **`hyper` is not the future.** "Magnitude-only edge guard: **recommended
   AGAINST**, on measurement. Not built." §1.1(d)'s description of the hypergradient
   integrator stands as an account of what the *old* runs did — and it is why those

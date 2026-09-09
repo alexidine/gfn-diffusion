@@ -16,6 +16,7 @@ energy_sampling/energies/results/
 energy_sampling/eval/paper1_results/
 energy_sampling/*.png
 energy_sampling/SCRATCH/
+energy_sampling/tmp/
 energy_sampling/*.log
 energy_sampling/logs_*.txt
 energy_sampling/.vram_registry.json
