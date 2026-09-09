@@ -77,11 +77,35 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
 
+#: WALL-CLOCK SECONDS a set of occupancy readings must span before their mean is
+#: allowed to stand for anything -- the metric windows and the sizer's per-rung
+#: calibration both.
+#:
+#: WHY A SPAN AND NOT A COUNT. GPU occupancy is not white noise. A 1 Hz trace
+#: taken on this project's local card measured sd 19.2 over a 2..83 range with an
+#: integrated autocorrelation time of ~24 s, so readings closer together than that
+#: are one observation reported several times. Every guard here used to be written
+#: as a sample COUNT, which silently encodes the sampling period: at 60 s, three
+#: samples span 180 s and are three near-independent looks at the card; at 2 s they
+#: span 6 s and are a quarter of one. Lowering the period to buy resolution would
+#: therefore have LOOSENED the very gates that exist to refuse a coin flip -- a
+#: better metric and a more credulous controller in the same change.
+#:
+#: 60 s is ~2.5x the one autocorrelation time we have measured, on one card. It is
+#: a floor chosen to be clearly past that scale, not a calibration; a route whose
+#: occupancy varies on a slower cycle than this (a long eval block, a periodic
+#: host stall) is not made safe by it.
+_UTIL_MIN_SPAN_S = 60.0
+
 # --- batch sizer (select_batch_size) -----------------------------------------
 #: Fewer raw occupancy samples than this is a coin flip, not a rung reading. The
 #: same domain boundary _gpu_util_mean draws at 5 for its windowed mean; smaller
 #: here because a calibration rung reads a dedicated dwell rather than a trailing
 #: window that may straddle rungs.
+#:
+#: A COUNT ALONE MEANS NOTHING -- see _UTIL_MIN_SPAN_S. Three samples is three
+#: independent observations at a 60 s period and one observation read three times
+#: at 2 s, so this bound is paired with a time span everywhere it is used.
 _BS_MIN_UTIL_SAMPLES = 3
 #: Dwell multiplier after which a rung still short of _BS_MIN_UTIL_SAMPLES is
 #: declared starved and the walk concludes -- a sensor that answers nothing
@@ -743,13 +767,37 @@ class Modeller:
                   "cancels on and we will have no record of it.")
             return
         if not hasattr(self, '_gpu_util'):
-            self._gpu_util = deque(maxlen=4096)
+            self._gpu_util = deque(maxlen=self._gpu_util_capacity())
         lock = getattr(self, '_gpu_util_lock', None)
         if lock is None:
             self._gpu_util.append((now, reading))
         else:
             with lock:
                 self._gpu_util.append((now, reading))
+
+    def _gpu_util_capacity(self):
+        """
+        How many readings to retain: the WIDEST window this run will ask for, at
+        this run's sampling period, plus headroom.
+
+        A FIXED 4096 WAS SAFE ONLY AT A SLOW PERIOD, and silently so. At 60 s it
+        held 68 hours -- far past the 7200 s policy window, so eviction never
+        touched anything a window wanted. At 2 s it holds 8192 s, which clears the
+        same window by 14%; below ~1.8 s it holds LESS than the window, and at that
+        point `_gpu_util_mean(7200)` averages whatever survived eviction and returns
+        a confident number for a span it no longer has. Nothing downstream can tell
+        that from a real reading -- the sizer's S2 audit would compare a grown rung
+        against a window that had quietly become a shorter one.
+
+        So the capacity follows the period rather than the period having to respect
+        the capacity. 25% headroom covers a sampler running slightly behind its
+        nominal cadence (the period gate enforces a minimum spacing, never a
+        maximum, so a slow nvidia-smi stretches the span a reading covers).
+        """
+        period = max(1e-3, float(getattr(self.args, 'gpu_util_sample_period_s', 60) or 60))
+        widest = max(float(getattr(self.args, 'gpu_util_window_s', 900) or 900),
+                     float(getattr(self.args, 'gpu_util_policy_window_s', 7200) or 7200))
+        return max(512, int(math.ceil(widest / period * 1.25)))
 
     def _gpu_util_samples(self):
         """
@@ -900,13 +948,21 @@ class Modeller:
         if not samples:
             return None
         cutoff = self._now() - window_s
-        recent = [u for ts, u in samples if ts >= cutoff]
+        recent = [(ts, u) for ts, u in samples if ts >= cutoff]
         # a couple of readings inside a 15-minute window is not a mean, it is a coin
         # flip. With time-cadence sampling this is reachable at any step time; on the
         # old step-cadence it was what made the metric vanish on slow MLIP arms.
-        if len(recent) < 5:
+        #
+        # BOTH BOUNDS, because either alone is defeated by a sampling period. Five
+        # readings span 300 s at a 60 s period and 10 s at 2 s, and 10 s of a signal
+        # whose autocorrelation time is ~24 s is one look at the card -- so a count
+        # alone would let a faster sampler publish a 900 s mean built from ten
+        # seconds. The span bound does NOT hold the metric back to the full window:
+        # a trailing mean legitimately reports what exists early in a run, and both
+        # out-of-process references are compared over that same span.
+        if len(recent) < 5 or recent[-1][0] - recent[0][0] < _UTIL_MIN_SPAN_S:
             return None
-        return sum(recent) / len(recent)
+        return sum(u for _, u in recent) / len(recent)
 
     def _batch_floor(self) -> int:
         """
@@ -1266,16 +1322,24 @@ class Modeller:
             return
         interval = max(1, int(getattr(self.args, 'batch_growth_interval', 0) or 50))
         rung_steps = self.step_ind - int(s.get('rung_start_step', 0))
-        samples = [u for ts, u in self._gpu_util_samples()
-                   if ts >= float(s.get('rung_start_time', 0.0))]
-        if med is None or rung_steps < interval or len(samples) < _BS_MIN_UTIL_SAMPLES:
-            if rung_steps >= _BS_RUNG_TIMEOUT_INTERVALS * interval and \
-                    len(samples) < _BS_MIN_UTIL_SAMPLES:
+        rung_samples = [(ts, u) for ts, u in self._gpu_util_samples()
+                        if ts >= float(s.get('rung_start_time', 0.0))]
+        samples = [u for _, u in rung_samples]
+        # THE RUNG MUST BE MEASURED OVER TIME, not merely often. Three readings
+        # 2 s apart are one look at a card whose occupancy decorrelates over ~24 s,
+        # and a rung verdict decides whether a batch size is held or refused --
+        # the place where a coin flip is most expensive. Both bounds, for the
+        # reason _UTIL_MIN_SPAN_S gives.
+        span = (rung_samples[-1][0] - rung_samples[0][0]) if len(rung_samples) > 1 else 0.0
+        thin = len(samples) < _BS_MIN_UTIL_SAMPLES or span < _UTIL_MIN_SPAN_S
+        if med is None or rung_steps < interval or thin:
+            if rung_steps >= _BS_RUNG_TIMEOUT_INTERVALS * interval and thin:
                 # the sensor is not producing on this cadence. S3: a sensor that
                 # answers nothing removes nothing, and it grows nothing either.
                 self._conclude_batch_calibration(
                     target, hi, ceiling_binds, stage_name,
-                    note='the occupancy sensor starved a rung')
+                    note=(f'the occupancy sensor starved a rung '
+                          f'({len(samples)} readings spanning {span:.0f}s)'))
             return
         util = float(sum(samples) / len(samples))
         s['table'].append(dict(batch=int(self.batch_size), med_s=float(med),

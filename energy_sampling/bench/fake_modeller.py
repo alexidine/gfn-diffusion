@@ -260,10 +260,15 @@ class FakeModeller:
         self._probe_exclude_from = 0
         self._probe_refusals_seen = set()
 
-        # Ramp-driver surface (lr_ramp_probe.RampDriver): a real model to
-        # snapshot and a real MetricTracker to read coherence from. Tiny, but
-        # REAL -- the driver's contract is that a rollback is bitwise, and a
-        # stub with no parameters could not test that at all.
+        # Bracket-driver surface (lr_bracket_probe.TrainerSnapshot, which reads
+        # `gfn_model.state_dict()`): a real model to snapshot and a real
+        # MetricTracker to read coherence from. Tiny, but REAL -- the driver's
+        # contract is that a rollback is bitwise, and a stub with no parameters
+        # could not test that at all.
+        #
+        # This block used to name lr_ramp_probe.RampDriver, deleted 2026-09-09
+        # with the rest of the ramp. The requirement did not go with it: the
+        # bracket snapshots the same surface for the same reason.
         #
         # BUILT INSIDE fork_rng. `nn.Linear` initialises its weights from the
         # GLOBAL torch stream, so constructing a fake would shift the RNG for
@@ -339,6 +344,11 @@ def attach_real_batch_sizer(cls=FakeModeller):
     # Only _read_gpu_util (the NVML leaf) stays faked -- see FakeModeller.
     cls._sample_gpu_util = train.Modeller._sample_gpu_util
     cls._gpu_util_mean = train.Modeller._gpu_util_mean
+    # the snapshot every reader goes through. Bound real because it is what makes
+    # the deque safe to read while the (real-run) sampler thread appends; the bench
+    # never starts that thread, so here it is a plain copy -- but a stub would let
+    # the trainer's readers and the bench's diverge silently.
+    cls._gpu_util_samples = train.Modeller._gpu_util_samples
     return cls
 
 

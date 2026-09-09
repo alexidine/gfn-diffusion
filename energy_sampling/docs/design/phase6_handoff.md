@@ -66,6 +66,49 @@ training portion of the loop body, so eval, figure logging and archiving
 contribute no samples, and the longer and more internally varied the step, the
 less representative that instant is.
 
+**2026-09-09 — the cause above was acted on; the verdict row is NOT yet
+revised.** The sampler was moved off the training thread onto a daemon thread
+(`train.Modeller._start_gpu_util_thread`), so readings are no longer taken at a
+fixed position in the step body and eval/figure/archive time now contributes
+samples like any other. The leaf sensor is unchanged and was never the problem:
+our fallback is `nvidia-smi`, which is what the sidecar uses. Nothing in the
+table above may be restated until a run's `gpu/util_policy` has been compared
+against its own `system.gpu.0.gpu` over a matched window — until then
+`gpu/util_policy` stays UNUSABLE by default, and the out-of-process stream stays
+the number to quote. `select_batch_size` reads this sensor (raw per-rung samples
+for calibration, the policy window for its S2 audit), so it inherits whatever the
+comparison finds; it is inert while `batch_util_target` is unset.
+
+**2026-09-09 — LOCAL sweep, 8 arms: no bias resolvable, and the two
+out-of-process instruments disagree with each other almost as much as ours
+disagrees with them.** Arms spanning batch 100→2000, T 10→100, width 128→1024
+and elj→uma, each 6 minutes, compared over whole-run means against wandb
+`system.gpu.0.gpu` AND against a local `nvidia-smi --loop=10` trace — the exact
+command NYU HPC says the scheduler collects.
+
+| comparison | mean | spread |
+|---|---:|---:|
+| ours − cluster instrument | −0.4 | −3.0 .. +6.5 |
+| ours − wandb | −0.9 | −4.5 .. +6.3 |
+| **cluster instrument − wandb** | **−0.5** | **−3.5 .. +4.9** |
+
+Mean absolute ours-vs-reference is 2.8 pts; mean absolute
+reference-vs-reference is 1.8. No axis reproduces the table above's signature —
+across a 16x batch range the residual moves 4.4 pts and is not monotone, where
+the old defect moved 46 pts monotonically. **This bounds the bias at these duty
+cycles; it does not measure it at the cluster's.** A 6 minute span is at the
+resolution limit of a 10-15 s sampler; the scheduler averages over hours, where
+all three converge. The table above stays as it is until the same comparison is
+made on a real arm — which now needs only the joblog's `gpu util sensor:` line
+and the `*_smi.csv` beside it.
+
+Two things the local sweep could not test. It ran on a single-GPU laptop, so
+the row-selection risk on a 4-GPU node (HPC's own example shows one node at
+97/5/100/88) is untested — that is what the announcement line exists for. And
+`latent_gaussian` never started: the problem registry pairs anchor
+`seed_source: prior_dataset` with `prior_path: null`, so the host-bound extreme
+of the energy axis is still unmeasured.
+
 **So occupancy *is* measurable — every figure in §3 and §4 comes from the
 out-of-process stream, including the threshold bracket in §4.3.** What is
 refused is `gpu/util_policy` specifically. Phase 4's proxy question resolves to:

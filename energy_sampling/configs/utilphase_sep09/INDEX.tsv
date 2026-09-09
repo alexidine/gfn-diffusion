@@ -1,0 +1,10 @@
+name	problem	batch	epochs	state	canonical_sha
+b125	mipcas_elj	125	1000000	10	65fdf5851ec2
+b500	mipcas_elj	500	1000000	10	65fdf5851ec2
+b500r	mipcas_elj	500	1000000	10	65fdf5851ec2
+b2000	mipcas_elj	2000	1000000	10	65fdf5851ec2
+T100	mipcas_elj	500	1000000	10	65fdf5851ec2
+w128	mipcas_elj	500	1000000	10	65fdf5851ec2
+w1024	mipcas_elj	500	1000000	10	65fdf5851ec2
+lgauss	latent_gaussian	500	1000000	10	65fdf5851ec2
+uma	mipcas_elj	100	1000000	10	65fdf5851ec2
