@@ -2645,6 +2645,13 @@ class Modeller:
         # hashing unaffected)
         for model in (self.gfn_model, self.ema_model):
             model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
+            # WHICH BRANCHES checkpoint. Absent/empty = all of them, unchanged.
+            # Only fwd shares a step with the energy function's footprint, and it
+            # runs 1 step in N, so the bwd/replay steps pay recompute on headroom
+            # nothing is using. See GFN._use_traj_checkpoint for the fragmentation
+            # caveat this does not remove.
+            tcm = getattr(self.args, 'traj_checkpoint_modes', None)
+            model.traj_checkpoint_modes = tuple(tcm) if tcm else None
 
         # freeze_backward_policy (config key): freeze from step 0 of THIS
         # process. The stage action freeze_pb / unfreeze_pb (protocol.py) is

@@ -147,6 +147,9 @@ class GFN(nn.Module):  # todo add seeding
         # rollout activation memory becomes ~O(1) in T for one extra policy
         # forward per step. Values and gradients are identical either way.
         self.traj_checkpoint = False
+        # Which BRANCHES checkpoint their trajectory. None = all of them, the
+        # historical behaviour. See _use_traj_checkpoint.
+        self.traj_checkpoint_modes = None
 
     def init_policies(self, s_emb_dim, t_dim, policy_hidden_dim, policy_layers, zero_init, norm, dropout):
         # head layout when dplr_rank > 0: [mean(dim), log(s^2)(dim), rho_logit(dim), U(dim*rank)]
@@ -682,8 +685,34 @@ class GFN(nn.Module):  # todo add seeding
             state_update, self.var_log_rate(t, t_next, dts))
         return pf_mean, logvar, d, V, s_emb, t_emb
 
-    def _use_traj_checkpoint(self):
-        return self.traj_checkpoint and torch.is_grad_enabled()
+    def _use_traj_checkpoint(self, mode=None):
+        """Per BRANCH, because the branches do not share a memory profile.
+
+        Trajectory checkpointing trades ~33x trajectory activation memory for
+        recompute time (33.6x measured at T=100), and it is applied identically
+        to fwd, bwd and replay today. But only fwd holds the energy function's
+        footprint at the same time, and fwd runs 1 step in N -- so at N=200 the
+        99.5% of steps that are bwd+replay pay the recompute while sitting on the
+        headroom the MLIP would have used. Turning it off for those alone is
+        worth up to ~2x on the step, and costs nothing on the rollout step.
+
+        `traj_checkpoint_modes` is None (all branches, unchanged) or a collection
+        of branch names to checkpoint. Note fwd is usually MOOT: this returns
+        False whenever grad is disabled, and with fracs.fwd = 0 the forward
+        branch carries no gradient -- so listing it or not rarely matters.
+
+        THE RISK THIS DOES NOT REMOVE is fragmentation: peak memory is set by the
+        WORST step, and a bwd step that allocates a large block can leave the
+        caching allocator unable to find contiguous space for the next rollout's
+        MLIP. Each step fitting alone does not imply the pair fits. Measure a run
+        that spans several rollouts before trusting it; gpu_guard keys its cached
+        peak on the regime, so a fwd-only run will not inherit an all-branches
+        measurement, and `set_traj_checkpoint:1` drops the restriction outright.
+        """
+        if not (self.traj_checkpoint and torch.is_grad_enabled()):
+            return False
+        modes = getattr(self, 'traj_checkpoint_modes', None)
+        return True if not modes else (mode in modes)
 
     def _run_step(self, use_ckpt, step_fn, *args):
         """
@@ -1037,7 +1066,7 @@ class GFN(nn.Module):  # todo add seeding
         self._z_cal_embedding = (condition_embedding.detach()
                                  if condition_embedding is not None else None)
 
-        use_ckpt = self._use_traj_checkpoint()
+        use_ckpt = self._use_traj_checkpoint('fwd')
         if not self.full_flow:
             log_flow[:, 0] = self._condition_flow(condition_embedding)
 
@@ -1171,7 +1200,7 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
-        use_ckpt = self._use_traj_checkpoint()
+        use_ckpt = self._use_traj_checkpoint('bwd')
         # matches the old (i - 1) == 0 gating: a T=1 backward traj never wrote
         # the constant flow and left log_flow[:, 0] at zero
         if not self.full_flow and trajectory_length > 1:
@@ -1248,7 +1277,7 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
-        use_ckpt = self._use_traj_checkpoint()
+        use_ckpt = self._use_traj_checkpoint('replay')
         if not self.full_flow:
             log_flow[:, 0] = self._condition_flow(condition_embedding)
 

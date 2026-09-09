@@ -355,8 +355,11 @@ def config_signature(cfg):
             # traj_checkpoint trades ~33x trajectory activation memory for time (mk_dev's
             # own comment; 33.6x measured at T=100). Omitting it let a peak measured with
             # it ON be reused with it OFF -- an UNDER-estimate, the direction that
-            # crashes the box.
-            int(bool(_get(cfg, 'traj_checkpoint', False))),
+            # crashes the box. traj_checkpoint_modes re-opens that same hole one level
+            # down: checkpointing only fwd peaks like OFF on the bwd and replay steps,
+            # which are 99.5% of them at N=200. Unset modes emits the historical '1'/'0'
+            # so this does not invalidate the peaks already cached.
+            _traj_checkpoint_key(cfg),
             # record_peak fires right after the eval block, so eval memory is INSIDE the
             # measurement; and buffer_device: cuda puts the datasets and buffers on the
             # card. Both move the peak, so both belong in the key.
@@ -365,6 +368,22 @@ def config_signature(cfg):
         ))
     except (TypeError, ValueError):
         return None
+
+
+def _traj_checkpoint_key(cfg):
+    """The checkpointing REGIME, not the flag, because they no longer agree.
+
+    `traj_checkpoint_modes` names which branches checkpoint; unset means all of
+    them. A run checkpointing fwd alone peaks like one with checkpointing OFF on
+    every bwd and replay step -- so it must not reuse an all-branches peak. Unset
+    hashes to the historical '1'/'0' and keeps the existing cache valid.
+    """
+    if not _get(cfg, 'traj_checkpoint', False):
+        return '0'
+    modes = _get(cfg, 'traj_checkpoint_modes', None)
+    if not modes:
+        return '1'
+    return '1:' + ','.join(sorted(str(x) for x in modes))
 
 
 def declared_ceiling_mb(cfg, total_mb):

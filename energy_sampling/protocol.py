@@ -1827,15 +1827,30 @@ class StageProtocol:
             # memory changes by an order of magnitude across this switch. Clearing
             # the ladder is the point: rungs measured under the old regime say
             # nothing about the new one.
+            #
+            # TURNING IT ON CLEARS traj_checkpoint_modes, because this action is
+            # the memory panic lever and a per-branch restriction would gut it.
+            # `traj_checkpoint_modes: [fwd]` checkpoints the branch that runs 1
+            # step in N and is usually under no_grad anyway; re-arming that alone
+            # would print a lever that fired while the peak did not move -- a
+            # stage that OOMs needs the bwd and replay steps back under
+            # checkpointing, which is what OFF -> ON has always meant here.
             v = str(arg).strip().lower() not in ('0', 'false', 'off', '')
             m = self.m
+            had_modes = bool(getattr(m.args, 'traj_checkpoint_modes', None))
             m.args.traj_checkpoint = v
+            if v:
+                m.args.traj_checkpoint_modes = None
             for mdl in (getattr(m, 'gfn_model', None), getattr(m, 'ema_model', None)):
                 if mdl is not None:
                     mdl.traj_checkpoint = v
+                    if v:
+                        mdl.traj_checkpoint_modes = None
             m.batch_sizer = None
             print(f"protocol: traj_checkpoint -> {v} on entering "
-                  f"'{self.stage.name}'; ladder re-armed")
+                  f"'{self.stage.name}'; ladder re-armed"
+                  + ("; per-branch restriction dropped, ALL branches checkpoint"
+                     if (v and had_modes) else ""))
         elif name == 'set_max_batch_size':
             # PER-STAGE BATCH CEILING, because what a step COSTS is a property of
             # the stage, not of the run. On the MLIP routes train_prior makes no
