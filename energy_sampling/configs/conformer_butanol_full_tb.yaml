@@ -575,6 +575,13 @@ protocols:
         train_mode: fused
         flags:
           update_log_z: true
+          # REQUIRED for the replay branch to have anything to draw. Without it nothing is
+          # admitted to the replay store, and `min_fracs` still floors replay at 0.02 -- so
+          # the branch runs anyway and draws from an empty buffer. The symptom is a one-row
+          # state against a 16-graph batch, which is a shape complaint about an empty store,
+          # NOT an initial-state that needs broadcasting: replay rows are per-graph by
+          # definition, each one a distinct sampled terminal.
+          buffers_active: true
         # all three branches ON, so the smoke reports which are actually active rather than
         # leaving it to be inferred from the loss keys
         fracs: { fwd: 0.34, bwd: 0.33, replay: 0.33 }

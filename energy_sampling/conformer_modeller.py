@@ -814,6 +814,25 @@ class ConformerModeller(Modeller):
                 f'as written by build_conformer_conditions.py')
         return blob
 
+    def _prior_row_energy(self):
+        """The prior buffer's current per-row training energy, conformer currency.
+
+        The base implementation mixes `physical_energy` with `flow_energy` -- both written by
+        `analyze_crystal_batch`, which no conformer row ever passes through. Its error even
+        diagnoses the absence as a stale checkpoint, which is wrong on this route: the field
+        was never produced here at all.
+
+        The conformer analogue is the baked `conformer_energy`, the same scalar
+        `prebuilt_sample_to_reward` reads, so expiry compares rows in the currency they were
+        admitted in. There is no lambda leg on this route, so there is nothing to mix.
+        """
+        e = getattr(self.prior_buffer.batch, 'conformer_energy', None)
+        if e is None:
+            raise AttributeError(
+                'prior_buffer rows carry no `conformer_energy`; the prior prep must attach '
+                'it (see build_conformer_conditions.py --prior-out)')
+        return e.detach().cpu().flatten()
+
     def init_mol_dataset(self):
         """One condition: the molecule itself, carrying no state.
 
