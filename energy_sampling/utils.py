@@ -839,7 +839,29 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # sampled, so a checkpoint stays usable across it.
                                     # The cost is the same one reward_range already
                                     # carries -- log Z is NOT comparable across settings.
-                                    'energy_clip')
+                                    'energy_clip',
+                                    # THE MLIP EXECUTION KNOBS, exempt for exactly the
+                                    # reason internal_oom_recovery is: they choose HOW the
+                                    # energy is computed -- compiled or eager, edge dim
+                                    # bucketed or not, activations stored or recomputed --
+                                    # never WHAT the energy is. Without this every phase-1
+                                    # exit written before they existed is REFUSED at load,
+                                    # because get_problem_definition folds all of
+                                    # energy_config into the identity minus this list and
+                                    # assert_problem_match raises on the checkpoint_name
+                                    # path, which is exactly how an exit is consumed
+                                    # (prior_model_name loads through the same assert, so
+                                    # every *_prior.pt goes with it). Verified: an old
+                                    # prod_t100 mipu config and an mlipc_sep09 config differ
+                                    # in energy_config ONLY by internal_oom_recovery plus
+                                    # these, so exempting them restores the match exactly.
+                                    # mlip_compile's own note concedes it moves energies at
+                                    # ULP level by changing float summation order -- that is
+                                    # a different rounding, not a different landscape, and
+                                    # it is strictly smaller than the reward_range and
+                                    # energy_clip reshapes already exempt above.
+                                    'mlip_compile', 'mlip_edge_chunk_size',
+                                    'mlip_activation_checkpointing')
 
 # Explicit version of the problem_def SCHEMA (the set of fields below that
 # constitute a problem's identity). It rides in the dict and therefore in the
