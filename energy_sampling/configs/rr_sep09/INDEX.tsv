@@ -7,7 +7,7 @@ g_n100_t3	pt100_mip_lr4p0	100	3	1000	tau_over_n=3,val_gap_max=0.0
 g_n100_t9	pt100_mip_lr4p0	100	9	1000	tau_over_n=9,val_gap_max=0.0
 mipu_n20	pt100_mipu_lr4p0	20	3	3200	batch=3200,val_gap_max=0.0
 mipu_n200	pt100_mipu_lr4p0	200	3	3200	batch=3200,val_gap_max=0.0
-nehu_n200	pt100_nehu_lr4p0	200	3	1600	batch=1600,val_gap_max=0.0
+nehu_n200	pt100_nehu_lr4p0	200	3	3200	batch=3200,val_gap_max=0.0
 pbf_mip	pt100_mip_lr4p0	100	3	1000	freeze_pb=True,val_gap_max=0.0
 pbf_lr2	pt100_mip_lr4p0	100	3	1000	freeze_pb=True,lr_mult=2.0,val_gap_max=0.0
 lr2	pt100_mip_lr4p0	100	3	1000	lr_mult=2.0,val_gap_max=0.0

@@ -76,7 +76,7 @@ profiling:
     write_trace: false
     record_shapes: false
     with_stack: false
-compile_policy: auto
+compile_policy: false
 traj_checkpoint: true
 gradient_norm_clip: auto
 grad_clip_guard:

@@ -168,7 +168,13 @@ ARMS = (
     # These bracket the cadence on the SAME batch so the saving is attributable.
     ('mipu_n20',   'mipu',  20,  {'batch': 3200, 'val_gap_max': 0.0}),
     ('mipu_n200',  'mipu', 200,  {'batch': 3200, 'val_gap_max': 0.0}),
-    ('nehu_n200',  'nehu', 200,  {'batch': 1600, 'val_gap_max': 0.0}),
+    # nehu AT 3200, NOT 1600: rr08 ran exactly this cell at 1600 (nehu_b1600,
+    # N=200) and it was CANCELLED BY ROOT at 2h49 with a 53.6% mean. All three
+    # rr08 MLIP arms at batch 1600 were root-killed (mipu_b1600 48.8% at 2h09,
+    # pbf_mipu 50.4% at 3h19); both arms at >=3200 survived to the manual cancel
+    # (mipu_b3200 70.3%, mipu_b6400 80.8%). 1600 is a known-fatal rung on this
+    # route, so the cadence question cannot be asked there.
+    ('nehu_n200',  'nehu', 200,  {'batch': 3200, 'val_gap_max': 0.0}),
 
     # ---- frozen P_B, one run --------------------------------------------------
     ('pbf_mip',    'mip', 100,  {'freeze_pb': True, 'val_gap_max': 0.0}),
@@ -333,10 +339,14 @@ def _apply(cfg, every, ov):
             st['on_enter'] = list(st['on_enter']) + ['freeze_pb']
 
     if ov.get('freeze_pb'):
-        # compile_policy 'step' installs compiled callables as instance
-        # attributes and freeze_backward_policy deepcopies the trunk; gfn.py
-        # raises on the pair. Pin the older mode rather than inherit.
-        cfg['compile_policy'] = 'auto'
+        # compile_policy 'step' installs compiled callables as instance attributes
+        # and freeze_backward_policy deepcopies the trunk; gfn.py raises on the
+        # pair. FALSE, not 'auto': eager installs no compiled callables at all, so
+        # it is equally safe here, it is the battery-wide setting every other arm
+        # gets, and pinning 'auto' would put COMPILE inside the freeze_pb contrast
+        # -- pbf_mip and pbf_lr2 compiled against an eager lr2 control is a third
+        # factor in a two-factor comparison.
+        cfg['compile_policy'] = False
     return cfg
 
 
@@ -410,7 +420,11 @@ def check(cfg, name, fam, every, ov):
             assert s['on_enter'].index(ROLLOUT_BOOTSTRAP) < s['on_enter'].index('freeze_pb'), \
                 where + 'freeze_pb must run after the Z bootstrap'
     if ov.get('freeze_pb'):
-        assert cfg.get('compile_policy') == 'auto', where + "compile_policy 'step' is incompatible with the freeze"
+        # the invariant is NOT 'step', which is what the incompatibility actually is:
+        # 'step' installs compiled callables as instance attributes and the freeze
+        # deepcopies the trunk. Asserting == 'auto' over-specified it and forced
+        # these arms to compile while the rest of the battery runs eager.
+        assert cfg.get('compile_policy') != 'step', where + "compile_policy 'step' is incompatible with the freeze"
 
     # buffer composition, and the cap that has to track the batch
     rb = cfg['buffers']['replay_buffer']
@@ -457,6 +471,15 @@ def build():
         cfg = yaml.safe_load(base.read_text(encoding='utf-8'))
         cfg = rr07make.deltas(cfg, name, every, fam)   # the shipped v2 contract
         cfg['tag'] = TAG
+        # COMPILE OFF. The base is a prod_sep02 arm, which carries the old
+        # 'auto' default; mk_dev flipped to false after these bases were cut, so
+        # it does not reach here. torch.compile on the trunk submodules measures
+        # SLOWER than eager on both routes and two card types, and it matters
+        # more in this battery than in prod_sep02: with the MLIP amortised over N
+        # steps the rollout IS the step, so the penalty is paid on nearly all of
+        # them. Lower step time at unchanged GPU work also raises utilization,
+        # which is the quantity that killed the rr08 MLIP arms.
+        cfg['compile_policy'] = False
         _force_rollout_bootstrap(cfg)
         cfg = _apply(cfg, every, ov)
         check(cfg, name, fam, every, ov)

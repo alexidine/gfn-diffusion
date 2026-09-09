@@ -76,7 +76,7 @@ profiling:
     write_trace: false
     record_shapes: false
     with_stack: false
-compile_policy: auto
+compile_policy: false
 traj_checkpoint: true
 gradient_norm_clip: auto
 grad_clip_guard:
@@ -121,9 +121,9 @@ model:
   dplr_mask_angular: true
   pb_exact_reversal: true
 buffer_device: cuda
-batch_size: 1600
+batch_size: 3200
 grow_batch_size: false
-max_batch_size: 1600
+max_batch_size: 3200
 eval_num_samples: 2500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
@@ -502,9 +502,9 @@ buffers:
     ramp_width: 50
     source: anchors
   replay_buffer:
-    churn_rate: 1600
+    churn_rate: 3200
     mean_residence_steps: 600
-    max_size: 80000
+    max_size: 160000
     admit_reward_min: -200
     prioritise:
       enabled: true
@@ -512,7 +512,7 @@ buffers:
       floor_frac: 0.25
       symmetric: true
     val_frac: 0.1
-    val_cap: 1600
+    val_cap: 3200
   anchor_buffer:
     seed_source: prior_dataset
     max_size: 200000
