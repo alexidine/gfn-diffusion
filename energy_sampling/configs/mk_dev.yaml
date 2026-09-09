@@ -288,7 +288,7 @@ profiling:
     write_trace: false       # also write the chrome timeline JSON. OFF: measured 748 MB for 8 steps (~93 MB/step) on ELJ with shapes and stacks both off, which is unopenable and is what pins active_steps to single digits. The *_table.txt beside it is 9 KB and carries the op breakdown; turn this on only when a TIMELINE is the question
     record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
     with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
-compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
+compile_policy: false          # torch.compile the policy. false = eager; 'auto' = on for Linux+CUDA only (no inductor on native Windows); true forces it; 'step' compiles the whole per-timestep body instead of the trunk submodules. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # set by default TRUE when using MACE or UMA MLIP. gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream).
 # Fallback clip. With grad_clip_guard on it does NOT clip the policy -- the guard
 # does -- so here it governs only the flow head in the z_calibration sidecars.
