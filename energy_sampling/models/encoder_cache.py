@@ -48,6 +48,7 @@ import numpy as np
 import torch
 
 from models.encoder_probe import ARMS, Sample, atom_features
+from paths import artifact
 from models.graph_encoder import MPNNEncoder, dense_spd_batch
 from models.graph_encodings import (bond_features_from_smiles, canonical_root,
                                     graph_from_smiles, mol_for_labels, rwse, shortest_paths)
@@ -187,7 +188,7 @@ def embed(bundle: Dict, smiles: str, perm: Optional[np.ndarray] = None,
 
 
 def build_cache(smiles: Sequence[str], ckpt_path: str = DEFAULT_CKPT,
-                out_path: str = 'conformer_embeddings.pt', device='cpu',
+                out_path: str = None, device='cpu',
                 level: str = 'torsion') -> Dict:
     """Encode every molecule once and write the stamped cache, keyed on canonical SMILES.
 
@@ -196,6 +197,8 @@ def build_cache(smiles: Sequence[str], ckpt_path: str = DEFAULT_CKPT,
     mistake that leaked 67.9% of a held-out set out of the probe battery, and it is silent
     both times.
     """
+    if out_path is None:
+        out_path = str(artifact('conformer_embeddings.pt'))
     from rdkit import Chem
     from energies.conformer_torsions import ConformerTorsions
 
@@ -285,7 +288,7 @@ def main(argv=None):
     ap.add_argument('--smiles-file', default=None,
                     help='one SMILES per line; blank lines and # comments ignored')
     ap.add_argument('--ckpt', default=DEFAULT_CKPT)
-    ap.add_argument('--out', default='conformer_embeddings.pt')
+    ap.add_argument('--out', default=str(artifact('conformer_embeddings.pt')))
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--level', default='torsion')
     a = ap.parse_args(argv)

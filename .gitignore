@@ -13,6 +13,10 @@ energy_sampling/*.pt
 energy_sampling/bench/results/
 energy_sampling/energies/results/
 
+# Build-script output. The writers resolve this from `paths.py`, never from the CWD --
+# a bare default filename is what refilled the package root with loose .pt files twice.
+energy_sampling/artifacts/
+
 energy_sampling/eval/paper1_results/
 energy_sampling/*.png
 energy_sampling/SCRATCH/

@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from energies.conformer_torsions import ConformerTorsions
+from paths import artifact
 
 
 def wrap(x):
@@ -151,7 +152,7 @@ def main():
     print(f"\nprior   E: median {e.median():+8.3f}   p10 {torch.quantile(e, 0.1):+8.3f}")
     print(f"uniform E: median {e_unif.median():+8.3f}   p10 {torch.quantile(e_unif, 0.1):+8.3f}")
 
-    out = args.out or Path(f"conformer_prior_states_{args.smiles.replace('/', '_')}.pt")
+    out = args.out or artifact(f"conformer_prior_states_{args.smiles.replace('/', '_')}.pt")
     torch.save(dict(states=states, energies=e, smiles=args.smiles,
                     k=energy.data_ndim, fatten=args.fatten,
                     n_uniform_dims=n_uniform, source="InternalPrior",

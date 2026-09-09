@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from energies.conformer_torsions import ConformerTorsions
+from paths import artifact
 
 
 def wrap(x):
@@ -155,7 +156,7 @@ def main():
                                level="torsion")
     print(energy.describe())
     k = energy.data_ndim
-    out = args.out or Path(f"conformer_buffer_{args.smiles.replace('/', '_')}.pt")
+    out = args.out or artifact(f"conformer_buffer_{args.smiles.replace('/', '_')}.pt")
 
     t0 = time.time()
     all_x, all_e = [], []

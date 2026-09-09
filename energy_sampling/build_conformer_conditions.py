@@ -41,6 +41,7 @@ from energies.conformer_data import (attach_states, bake_energies, check_state_c
 from energies.conformer_torsions import ConformerTorsions
 from energies.dof_features import free_dof_atom_index
 from models import encoder_cache
+from paths import artifact
 
 
 def draw_prior_states(energy, n: int, internal_prior: Path, fatten: float, seed: int):
@@ -69,7 +70,7 @@ def main():
     ap.add_argument("--identifiers", nargs="*", default=None,
                     help="one per SMILES; defaults to the SMILES themselves. train.py "
                          "resolves condition identity through this string alone")
-    ap.add_argument("--out", type=Path, default=Path("conformer_conditions.pt"))
+    ap.add_argument("--out", type=Path, default=artifact("conformer_conditions.pt"))
     ap.add_argument("--prior-out", type=Path, default=None)
     ap.add_argument("--n-prior", type=int, default=4000,
                     help="states per molecule in the prior file")
