@@ -172,12 +172,31 @@ ARMS = (
 
     # ---- frozen P_B, one run --------------------------------------------------
     ('pbf_mip',    'mip', 100,  {'freeze_pb': True, 'val_gap_max': 0.0}),
+
+    # ---- does freezing P_B buy LR HEADROOM? (tasks 10-11) ----------------------
+    # rr08's pbf_mip was stable but a few percent WORSE than its unfrozen control
+    # (bwd tb_worst 6.94 vs 6.68, val_gap 2.84 vs 2.58), so freezing is not free and
+    # the case for it must be that it buys something back. The candidate is RATE:
+    # freezing removes P_B's parameters from the optimiser, and replay is 43% of
+    # P_B's gradient, so a large buffer-coupled term goes with them. Fewer coupled
+    # parameters is exactly the condition for a higher stable rate.
+    #
+    # 'Frozen tolerates 2x' is UNFALSIFIABLE without an unfrozen arm at 2x, so these
+    # two complete a 2x2 against arms this battery already has:
+    #                1x                    2x
+    #   frozen       pbf_mip   (task 9)    pbf_lr2  (task 10)
+    #   unfrozen     g_n100_t3 (task 4)    lr2      (task 11)
+    # All four are N=100, tau/N=3, batch 1000 -- identical but for the two factors.
+    # 2x not 4x: a double blow-up at 4x teaches only that 4x is too much, whereas at
+    # 2x both likely survive and the signal is convergence rate and stability margin.
+    ('pbf_lr2',    'mip', 100,  {'freeze_pb': True, 'lr_mult': 2.0, 'val_gap_max': 0.0}),
+    ('lr2',        'mip', 100,  {'lr_mult': 2.0, 'val_gap_max': 0.0}),
 )
 
 
 OVERRIDE_KEYS = {'ratchet_tol', 'bwd_hi', 'gain_mult', 'tau_over_n',
                  'val_gap_max', 'fill_process_var', 'batch', 'freeze_pb',
-                 'replay_tb', 'down_over_up'}
+                 'replay_tb', 'down_over_up', 'lr_mult'}
 
 
 def _fused(cfg, active_only=False):
@@ -264,6 +283,13 @@ def _apply(cfg, every, ov):
                          f"full batch from a pool smaller than {TAU_OVER_N_MIN} batches.")
     cfg['buffers']['replay_buffer']['mean_residence_steps'] = tau_over_n * every
     _size_replay(cfg, tau_over_n)
+
+    if 'lr_mult' in ov:
+        # lr_control.mode is 'fixed', so the LIVE rate is seed_lr * fixed_scale
+        # and the multiplier belongs on the scale. MULTIPLIED, not assigned, so
+        # an arm states the FACTOR it tests and inherits the contract's base.
+        lc = cfg['lr_control']
+        lc['fixed_scale'] = float(lc.get('fixed_scale', 1.0)) * float(ov['lr_mult'])
 
     if 'fill_process_var' in ov:
         cfg['z_calibration']['fill_process_var'] = float(ov['fill_process_var'])
