@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from bench.fake_modeller import (MK_DEV_BATCH, MK_DEV_CONTROL, MK_DEV_HARD_FAILURE,
-                                 MK_DEV_LR, MK_DEV_RAYCAL, FakeModeller, FakeStage,
+                                 MK_DEV_LR, FakeModeller, FakeStage,
                                  make_args)
 from bench.real_modeller import build_real_modeller
 from energy_sampling.controller import LRController
@@ -74,7 +74,7 @@ UNORDERED_KEYS = {'lr_servo_managed'}
 ARGS_SURFACE = [
     'lr_policy', 'lr_back', 'lr_replay', 'lr_fused', 'lr_flow', 'min_lr',
     'lr_servo_managed', 'lr_control',
-    'lr_control.hard_failure', 'lr_control.ray_calibration',
+    'lr_control.hard_failure',
     'batch_size', 'max_batch_size', 'grow_batch_size', 'batch_growth_factor',
     'batch_growth_cap', 'batch_growth_interval', 'batch_util_target',
     'max_step_seconds', 'oom_batch_shrink_factor',
@@ -143,7 +143,6 @@ def test_fake_supplies_the_deferred_surface(real):
     ('batch', MK_DEV_BATCH, None),
     ('lr_control', MK_DEV_CONTROL, 'lr_control'),
     ('hard_failure', MK_DEV_HARD_FAILURE, 'lr_control.hard_failure'),
-    ('ray_calibration', MK_DEV_RAYCAL, 'lr_control.ray_calibration'),
 ])
 def test_transcribed_defaults_match_the_shipping_config(real, block, source, path):
     """
@@ -160,7 +159,7 @@ def test_transcribed_defaults_match_the_shipping_config(real, block, source, pat
 
     drift = {}
     for key, mine in source.items():
-        if key in ('hard_failure', 'ray_calibration') or not hasattr(node, key):
+        if key == 'hard_failure' or not hasattr(node, key):
             continue
         theirs = getattr(node, key)
         if key in UNORDERED_KEYS:
@@ -205,8 +204,10 @@ def test_the_retired_ray_keys_are_gone_from_the_bench_too(real):
     assert _dig(real.args, 'lr_control.ray_calibration.enabled') is _MISSING, (
         '`enabled` is deleted: the switch is which stages declare '
         'lr_sensor: {kind: ray}, and a second flag could disagree with them')
-    assert 'enabled' not in MK_DEV_RAYCAL, (
-        'the bench is still transcribing a key the trainer refuses at load')
+    # the old check here was `'enabled' not in MK_DEV_RAYCAL`. The bench no longer
+    # transcribes a ray_calibration block AT ALL, which is the stronger statement:
+    # canonical defines one under none of its three spellings, so a fake carrying
+    # one would be inventing config the trainer never sees.
 
     # ...and the retired spellings must FAIL here rather than being carried as
     # private bench keys, which is what the unchecked nested branch allowed.

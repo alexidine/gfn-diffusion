@@ -108,7 +108,7 @@ MK_DEV_BATCH = dict(
     # bracket: cancelled <=0.40, survived >=0.494). The canonical config ships
     # the ladder ARMED at 0.6 as of 2026-08-19; 0 still means off -- hold the
     # base batch (S3). train.select_batch_size does the one percent conversion.
-    batch_util_target=0.6,
+    batch_util_target=0.65,
     # how long an OOM ceiling stands before the ladder re-probes past it. An OOM
     # retest is not free -- a failed re-probe costs a wasted step plus a cooldown.
     batch_oom_ceiling_retest_steps=1000,

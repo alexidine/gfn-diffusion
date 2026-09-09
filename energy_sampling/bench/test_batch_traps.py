@@ -496,9 +496,16 @@ class _TransientlyBusyDevice(SyntheticDevice):
         self.reads = 0
 
     def utilization(self, work):
-        self.reads += 1
+        # COUNTED AT THE GROWN BATCH ONLY. This used to tick on every read,
+        # including the base rung's dwell, so the transient's length was really
+        # 'lie_reads minus however many samples the base dwell happened to take'
+        # -- a number set by the sampling period rather than by this cell. At a
+        # 60 s period a base dwell took ~2 samples and the lie survived; at 2 s it
+        # takes ~50 and the lie was spent before a grown batch was ever read, so
+        # the growth this cell exists to catch never happened.
         if float(work) <= self.base_batch:
             return 30.0
+        self.reads += 1
         # a grown batch reads busy while the transient lasts, then reads WORSE than
         # the base -- so a lived policy window cannot help but disagree with the
         # calibration dwell, even if a lie sample or two lands inside the window
@@ -512,10 +519,20 @@ def test_s2_audit_stands_a_failed_growth_back_down():
     """
     S2: a growth kept on the strength of a calibration reading must survive a full
     policy window of lived occupancy, or stand down to the base rung. Without the
-    audit this run would hold the grown batch forever on the strength of ten
-    transient samples.
+    audit this run would hold the grown batch forever on the strength of one
+    dwell's worth of transient samples.
     """
-    dev = _TransientlyBusyDevice(lie_reads=10, base_batch=1000,
+    # THE TRANSIENT IS SIZED IN TIME, not in reads. A rung reading must span
+    # train._UTIL_MIN_SPAN_S before it may conclude, so a lie shorter than that is
+    # averaged away and buys no growth -- correct behaviour, but it would leave
+    # this cell testing nothing (and it says so, below). The lie therefore lasts
+    # just past that span and nowhere near a policy window: long enough to fool
+    # one dwell, far too short to survive the audit.
+    import train
+    from bench.fake_modeller import make_args
+    period = float(make_args().gpu_util_sample_period_s)
+    lie_reads = int(math.ceil(train._UTIL_MIN_SPAN_S / period)) + 10
+    dev = _TransientlyBusyDevice(lie_reads=lie_reads, base_batch=1000,
                                  t_fixed=2.0, sps_max=5000.0, util_shape=FLAT)
     run = BatchRun(dev, Sizer(util_target=0.60, batch=1000, max_batch=50000),
                    steps=12000)
