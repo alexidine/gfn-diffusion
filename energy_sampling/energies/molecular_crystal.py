@@ -86,6 +86,12 @@ class MolecularCrystal(BaseSet):
                  pressure: float = 1,  # in atm
                  log_temperature_range: list = None,
                  analyze_kwargs: Optional[dict] = None,  # extra kwargs passed through to crystal_batch.analyze()
+                 # MLIP execution knobs, uma route only. All three default to the
+                 # behaviour every run has had; see init_uma_crystal_predictor and
+                 # crystal_inference_settings for when each pays and what it costs.
+                 mlip_compile: bool = False,
+                 mlip_edge_chunk_size: Optional[int] = None,
+                 mlip_activation_checkpointing: bool = True,
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
                  prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
@@ -168,7 +174,22 @@ class MolecularCrystal(BaseSet):
         self._gas_pot_cache = {}
         if self.energy_function == 'uma':
             self.mlip_path = mlip_path
-            self.predictor = init_uma_crystal_predictor(mlip_path, device=self.device)
+            self.predictor = init_uma_crystal_predictor(
+                mlip_path, device=self.device,
+                compile=bool(mlip_compile),
+                edge_chunk_size=(int(mlip_edge_chunk_size)
+                                 if mlip_edge_chunk_size else None),
+                activation_checkpointing=bool(mlip_activation_checkpointing))
+            if mlip_compile or not mlip_activation_checkpointing or mlip_edge_chunk_size:
+                # say it once, loudly: all three change how the MLIP executes and two
+                # of them can fail QUIETLY (a compile that recompiles past dynamo's
+                # cache limit falls back to eager; a chunk size under the batch's edge
+                # count does the same). Read energy/uma_edges_max against the chunk.
+                print(f"MLIP execution: compile={bool(mlip_compile)} "
+                      f"edge_chunk_size={mlip_edge_chunk_size} "
+                      f"activation_checkpointing={bool(mlip_activation_checkpointing)} "
+                      f"-- non-default; check energy/ms_per_sample and "
+                      f"energy/uma_edges_max before believing a null result")
         elif self.energy_function == 'mace':
             self.mlip_path = mlip_path
             self.predictor = load_mace_model(self.mlip_path, self.device, torch.float32)

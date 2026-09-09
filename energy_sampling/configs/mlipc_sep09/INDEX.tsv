@@ -1,0 +1,5 @@
+arm	compile	edge_chunk	act_ckpt
+ctrl	False	None	True
+ckoff	False	None	False
+comp	True	None	True
+comp_ckoff	True	None	False

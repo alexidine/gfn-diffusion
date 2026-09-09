@@ -1070,6 +1070,10 @@ energy_config:
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   analyze_kwargs: { }  # elj: none
+  # MLIP EXECUTION, uma route only; all three are the behaviour every run has had.
+  mlip_compile: false            # torch.compile the MLIP. Needs mlip_edge_chunk_size set, or every distinct edge count is a recompile and dynamo silently falls back to eager. Unconditional/single-molecule arms only: a molecule-conditioned run makes atoms-per-batch dynamic too, which edge padding cannot fix. Changes float summation order, so energies move at ULP level
+  mlip_edge_chunk_size: null     # pad the edge dimension into buckets of this size, the one truly dynamic shape in the batch. Set it comfortably above `energy/uma_edges_max`; too small forces recompiles, too large pads. null = no bucketing
+  mlip_activation_checkpointing: true  # recompute MLIP activations instead of storing them. Inert on the training reward when reward_grads is 0 (the call runs under no_grad), load-bearing for the init-time prior re-analysis and whenever reward_grads is nonzero. Memory/speed trade, not a free win
   # LAMBDA PATH between the prior's own implied density and the physical energy:
   #     -log p_lambda = (1-lambda)*(-log q_flow) + lambda*E_phys/T
   # exactly linear in lambda, so Delta = (E_phys - (-log q))/T is the path's
