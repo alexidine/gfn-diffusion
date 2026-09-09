@@ -208,6 +208,17 @@ if __name__ == '__main__':
     ap.add_argument('--mace-model', default=r"D:\crystal_datasets\acr_112025_mh1_stagetwo.model")
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--noised-samples', type=int, default=50000)
+    ap.add_argument('--score-batch-size', type=int, default=10000,
+                    help="structures per MLIP scoring chunk in the noising loop. "
+                         "adaptive_batched_analysis is supposed to shrink this on "
+                         "OOM, but it re-reads initial_batch_size on EVERY call "
+                         "(mxtaltools adaptive_batching.py asks hasattr() of a dict, "
+                         "which is always False), so no shrink survives the next "
+                         "iteration. On a card that spills to shared host memory "
+                         "instead of raising OOM the shrink never fires at all and "
+                         "the scan crawls. Measured on a 16 GB RTX 5080: ~17 MiB per "
+                         "crystal under UMA, so 400 sits at 6.7 GiB and the 10000 "
+                         "default would ask for ~156 GiB.")
     ap.add_argument('--dataset-suffix', default='',
                     help="appended to the output name, e.g. '_f047' -> "
                          "<run>_f047_prior_dataset.pt. A REBUILD MUST USE ONE: the "
@@ -232,6 +243,13 @@ if __name__ == '__main__':
         predictor = init_uma_crystal_predictor(uma_model_path, device)
     elif energy_function == 'mace':
         predictor = load_mace_model(mace_model_path, device, torch.float32)
+    else:
+        # elj scores analytically and takes no model, but `predictor` is passed
+        # UNCONDITIONALLY to every analyze() call below, so leaving it unbound made
+        # --target mipcas_elj / nehzor_elj raise NameError before scoring a single
+        # structure. It worked in March because predictor was bound unconditionally
+        # then (845fa9b); the branch above is what stranded the elj targets.
+        predictor = None
 
     "get files"
     os.chdir(search_output_dir)
@@ -312,7 +330,7 @@ if __name__ == '__main__':
                 batch,
                 analyses=[energy_function, 'reduction_en'],
                 state=state,
-                initial_batch_size=10000,
+                initial_batch_size=cli.score_batch_size,
                 predictor=predictor,
                 return_state=True,
                 device=device,
