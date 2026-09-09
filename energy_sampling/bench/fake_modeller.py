@@ -116,7 +116,7 @@ MK_DEV_BATCH = dict(
     # policy-window mean once for its S2 audit; the `gpu_util_floor` actuator
     # (grow on a low windowed mean) stays retired (utils._RETIRED_KEYS).
     gpu_util_window_s=900, gpu_util_policy_window_s=7200,
-    gpu_util_sample_period_s=60,
+    gpu_util_sample_period_s=2,
 )
 
 
