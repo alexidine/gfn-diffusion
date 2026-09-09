@@ -157,6 +157,15 @@ ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors
            'freeze_pb', 'unfreeze_pb')
 SKIP_CONDITIONS = ('prior_loaded',)
 
+#: `set_traj_checkpoint` argument vocabulary. BARE MEANS ON, like every other action --
+#: `freeze_pb` with no argument is the affirmative 'full'. It used to read '' as OFF, so
+#: naming the memory panic lever by itself DISABLED it, which is the opposite of what a
+#: config author reaching for it wants. It also silently accepted 'no' / 'n' / 'disabled' as
+#: ON, because they were merely absent from its false-list; the action prints its result, so
+#: a typo read as a successful line that did the wrong thing.
+TRAJ_CKPT_TRUE = ('', '1', 'true', 'on', 'yes')
+TRAJ_CKPT_FALSE = ('0', 'false', 'off', 'no')
+
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
 # declared rather than derived from the active loss coefficients.
 # DIAGNOSTIC ONLY since the LR bracket took over actuation (controller.py).
@@ -1226,6 +1235,23 @@ class Stage:
                     raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                      f"bootstrap_z, bootstrap_z:train_conditioner, "
                                      f"bootstrap_z:rollout or bootstrap_z:rollout:<n>")
+            if name == 'set_traj_checkpoint':
+                if str(arg).strip().lower() not in TRAJ_CKPT_TRUE + TRAJ_CKPT_FALSE:
+                    raise ValueError(
+                        f"stage '{self.name}' {where}: '{a}' -- unrecognised argument; "
+                        f"expected one of {TRAJ_CKPT_TRUE + TRAJ_CKPT_FALSE} "
+                        f"(bare means ON)")
+            if name == 'set_max_batch_size':
+                # validated here for the reason the block above states: a config typo must
+                # fail at STARTUP, not part-way through a run inside a stage transition,
+                # where `int(float(arg))` would raise with nothing to attribute it to.
+                try:
+                    if int(float(arg)) <= 0:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError(
+                        f"stage '{self.name}' {where}: '{a}' -- expected "
+                        f"set_max_batch_size:<positive int>")
             if name == 'rebuild_prior_by_churn' and arg and not arg.isdigit():
                 raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                  f"rebuild_prior_by_churn or rebuild_prior_by_churn:<int>")
@@ -1835,7 +1861,15 @@ class StageProtocol:
             # would print a lever that fired while the peak did not move -- a
             # stage that OOMs needs the bwd and replay steps back under
             # checkpointing, which is what OFF -> ON has always meant here.
-            v = str(arg).strip().lower() not in ('0', 'false', 'off', '')
+            # BARE MEANS ON, like every other action. `set_traj_checkpoint` used to read
+            # '' as OFF, so naming the memory panic lever by itself DISABLED it -- the
+            # opposite of what a config author reaching for it wants, and the opposite of
+            # `freeze_pb`, whose bare form is the affirmative 'full'. It also accepted 'no',
+            # 'n' and 'disabled' as ON, because they are simply not in the false-list.
+            # Validated here rather than silently coerced: an unrecognised argument is a
+            # config typo, and this action prints its result, so a typo would otherwise read
+            # as a successful line that did the wrong thing.
+            v = str(arg).strip().lower() in TRAJ_CKPT_TRUE
             m = self.m
             had_modes = bool(getattr(m.args, 'traj_checkpoint_modes', None))
             m.args.traj_checkpoint = v
@@ -1925,6 +1959,25 @@ class StageProtocol:
         draws switch to the prior buffer via the next stage's declarative
         bwd_sampling_mode -- no flip here any more.)"""
         m = self.m
+        # REFUSE WHERE `prior_model` IS NOT THE PRIOR. This action's whole contract is
+        # "freeze the warm-start as THE prior", and it ends by DELETING best.pt on that
+        # basis. On a route whose prior sampler is something else -- the conformer route
+        # draws from a fitted InternalPrior and never consults `prior_model` -- naming this
+        # action wrote a checkpoint nothing reads, set an attribute nothing reads, and
+        # deleted best.pt anyway. Silent, and the destructive half is the one that lands.
+        #
+        # Detected through the sampler rather than by route name: `_has_prior_sampler` is
+        # already the question "what does backward sampling actually draw from", and a
+        # route that answers it without `prior_model` is a route where this action's
+        # premise is false.
+        if getattr(m, 'internal_prior', None) is not None:
+            raise NotImplementedError(
+                "`snapshot_prior` freezes the warm-start policy as THE prior model and "
+                "deletes best.pt on that basis, but this run's backward sampling draws from "
+                "a fitted InternalPrior and never reads `prior_model` -- so the action would "
+                "delete a checkpoint and change nothing else. Drop it from this stage's "
+                "on_exit; the fitted prior already is the product the crystal route uses "
+                "this action to build.")
         m.checkpointer.save('prior')
         m.prior_model = deepcopy(m.ema_model)
         m.prior_model.eval()

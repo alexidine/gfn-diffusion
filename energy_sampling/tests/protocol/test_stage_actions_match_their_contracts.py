@@ -108,3 +108,87 @@ def test_the_action_list_and_the_parser_agree():
     src = inspect.getsource(protocol)
     for action in protocol.ACTIONS:
         assert f"'{action}'" in src, f'{action} is listed but never referenced'
+
+
+# --------------------------------------------------------------------- the same shape, twice
+
+def test_set_traj_checkpoint_bare_means_on():
+    """It used to mean OFF -- so naming the memory panic lever by itself disabled it.
+
+    Every other bare action does the affirmative thing (`freeze_pb` -> 'full'). This one read
+    `''` as false, and additionally accepted 'no' / 'n' / 'disabled' as TRUE, because they are
+    simply absent from its false-list. The action prints its result, so a typo read as a
+    successful line that did the opposite of what was asked.
+    """
+    import protocol
+
+    class _Args:
+        traj_checkpoint = False
+        traj_checkpoint_modes = ['fwd']
+
+    class _M:
+        args = _Args()
+        gfn_model = None
+        ema_model = None
+
+    # `stage` is a derived property that walks the whole config; this action only needs it
+    # for its log line, so a subclass supplies one rather than standing up a modeller.
+    class _SP(protocol.StageProtocol):
+        @property
+        def stage(self):
+            return self._fake_stage
+
+    sp = _SP.__new__(_SP)
+    sp.m = _M()
+    sp._fake_stage = protocol.Stage({'name': 's', 'train_mode': 'fused',
+                                     'loss_coeffs': {'fwd': {'tb': 1.0}}}, 0)
+
+    sp._run_action('set_traj_checkpoint', '', {})
+    assert _M.args.traj_checkpoint is True, 'bare set_traj_checkpoint must turn it ON'
+
+    for off in protocol.TRAJ_CKPT_FALSE:
+        _M.args.traj_checkpoint = True
+        sp._run_action('set_traj_checkpoint', off, {})
+        assert _M.args.traj_checkpoint is False, off
+
+    # and an unrecognised argument fails at CONFIG PARSE, not part-way through a run
+    with pytest.raises(ValueError, match='unrecognised argument'):
+        protocol.Stage({'name': 's', 'train_mode': 'fused',
+                        'on_enter': ['set_traj_checkpoint:disabled'],
+                        'loss_coeffs': {'fwd': {'tb': 1.0}}}, 0)
+
+
+def test_set_max_batch_size_validates_at_parse_time():
+    """`int(float(arg))` raised mid-transition, with nothing to attribute it to.
+
+    The block that validates `seed_prior_from_anchors` says exactly why: a config typo must
+    fail at startup. Two of the actions in that list had been left out of it.
+    """
+    import protocol
+    for bad in ('', 'lots', '0', '-4'):
+        with pytest.raises(ValueError, match='set_max_batch_size'):
+            protocol.Stage({'name': 's', 'train_mode': 'fused',
+                            'on_enter': [f'set_max_batch_size:{bad}'.rstrip(':')],
+                            'loss_coeffs': {'fwd': {'tb': 1.0}}}, 0)
+    protocol.Stage({'name': 's', 'train_mode': 'fused',
+                    'on_enter': ['set_max_batch_size:512'],
+                    'loss_coeffs': {'fwd': {'tb': 1.0}}}, 0)
+
+
+def test_snapshot_prior_refuses_where_prior_model_is_not_the_prior():
+    """It deletes best.pt on the premise that `prior_model` IS the prior sampler.
+
+    On a route that draws from a fitted InternalPrior and never reads `prior_model`, the
+    premise is false: the action wrote a checkpoint nothing reads, set an attribute nothing
+    reads, and deleted best.pt anyway -- silently, with the destructive half the only one
+    that landed.
+    """
+    import protocol
+
+    class _M:
+        internal_prior = object()          # this route's backward sampler
+
+    sp = protocol.StageProtocol.__new__(protocol.StageProtocol)
+    sp.m = _M()
+    with pytest.raises(NotImplementedError, match='never reads `prior_model`'):
+        sp._snapshot_prior()
