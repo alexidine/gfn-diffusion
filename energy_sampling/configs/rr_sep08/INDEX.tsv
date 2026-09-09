@@ -3,11 +3,11 @@ base	pt100_mip_lr4p0	20	3	1000	-
 tol05	pt100_mip_lr4p0	20	3	1000	ratchet_tol=0.5
 cap75	pt100_mip_lr4p0	20	3	1000	bwd_hi=0.75
 dose_n200	pt100_mip_lr4p0	200	3	1000	replay_tb=0.1,val_gap_max=0.0
-vg20	pt100_mip_lr4p0	200	3	1000	val_gap_max=2.0
-vg40	pt100_mip_lr4p0	200	3	1000	val_gap_max=4.0
-vg_off	pt100_mip_lr4p0	200	3	1000	val_gap_max=0.0
-dose_n50	pt100_mip_lr4p0	50	3	1000	replay_tb=0.4,val_gap_max=0.0
-dose_w10	pt100_mip_lr4p0	20	3	1000	replay_tb=0.1,val_gap_max=0.0
+n100_det	pt100_mip_lr4p0	100	3	1000	val_gap_max=0.0
+occ_n200	pt100_mip_lr4p0	200	9	1000	tau_over_n=9,val_gap_max=0.0
+n200_det	pt100_mip_lr4p0	200	3	1000	val_gap_max=0.0
+ctrl_tol10	pt100_mip_lr4p0	20	3	1000	ratchet_tol=1.0,val_gap_max=0.0
+ctrl_du25	pt100_mip_lr4p0	20	3	1000	down_over_up=2.5,val_gap_max=0.0
 n20_det	pt100_mip_lr4p0	20	3	1000	val_gap_max=0.0
 n50_det	pt100_mip_lr4p0	50	3	1000	val_gap_max=0.0
 mipu_b1600	pt100_mipu_lr4p0	200	3	1600	-

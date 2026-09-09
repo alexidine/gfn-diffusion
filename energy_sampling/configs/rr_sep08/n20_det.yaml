@@ -317,9 +317,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: &id001
           bwd:
           - 0.25
@@ -404,9 +405,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: *id001
   prod_eq:
     stages:
@@ -486,9 +488,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: *id001
 controller:
   min_mode_frac: 0.001

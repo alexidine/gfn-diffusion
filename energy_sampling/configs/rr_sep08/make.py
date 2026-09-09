@@ -167,54 +167,37 @@ ARMS = (
     # never be satisfied, drives N_eff to the 2-step trigger floor, and asks for
     # ~300 batches of buffer. That arm would spend 12h pinned against max_size
     # measuring overflow eviction.
-    # -- SLOT 3 (was vg10). THE DOSE TEST ---------------------------------------
-    # Memorisation goes as D = N * lr * w_eff / B, fitted at lambda ~ 0.0195*D^0.75
-    # (R2 0.935) over six local arms spanning 12.8x in D. `w` is the ONE factor in
-    # that law never varied anywhere in the corpus -- its exponent is assumed, not
-    # measured -- and it is also the only factor that is FREE: N costs energy
-    # calls, w costs nothing.
-    #
-    # These three arms and the existing n20_det form a D-matched set reached by
-    # three different (N, w) routes, plus a pure-w contrast:
-    #
-    #   n20_det    N= 20  tb=1.0   D ~  20   (already in the battery, position 9)
-    #   dose_n50   N= 50  tb=0.4   D ~  20   matched, 2.5x fewer energy calls
-    #   dose_n200  N=200  tb=0.1   D ~  20   matched, 10x fewer energy calls
-    #   dose_w10   N= 20  tb=0.1   D ~   2   pure w at fixed N -- the exponent
-    #   vg_off     N=200  tb=1.0   D ~ 200   the UNCOMPENSATED control (position 6)
-    #
-    # PREDICTION: the three D~20 arms land together on lambda_tau and
-    # val_gap_nats despite a 10x span in N and in energy cost; dose_w10 sits
-    # 10^0.75 = 5.6x below them; vg_off sits 5.6x above.
-    # IF IT HOLDS, the cadence penalty is cancellable in config -- ship
-    # replay_tb ~ 20/N and let N be set by the speedup curve alone. IF IT FAILS,
-    # w is not interchangeable with N and per-row exposure separates from
-    # support recency, which no run in the corpus currently distinguishes.
-    #
-    # All three are DETERMINISTIC (val_gap_max 0): a firing trigger would change
-    # admissions and so change the dose being matched. check() enforces it.
+    # -- SLOT 3: dose_n200 (N=200, replay_tb 0.1). RUNNING since 2026-09-08 and
+    #    left alone -- the dose axis is retired, so this is now the corpus's only
+    #    variation of w. Keep it as an orphan data point rather than pay to stop it.
     ('dose_n200',   'mip', N_LOOSE, {'replay_tb': 0.1, 'val_gap_max': 0.0}),
-    ('vg20',        'mip', N_LOOSE, {'val_gap_max': 2.0}),
-    ('vg40',        'mip', N_LOOSE, {'val_gap_max': 4.0}),
-    # bar 0 disables it (_rollout_trigger_fires skips bars <= 0): the
-    # uncontrolled endpoint of the same curve, i.e. deterministic N = N_LOOSE.
-    ('vg_off',      'mip', N_LOOSE, {'val_gap_max': 0.0}),
 
-    # -- block 3: the tau axis at a fixed bar -----------------------------------
-    # tau has NEVER been varied independently of N -- every arm ever run set
-    # tau = 5N. At a fixed bar this separates staleness and occupancy from reuse.
-    # NB these carry the SHIPPED bar (4.0), not 2.0 -- one override per arm, and
-    # the shipped bar is the right control for a tau sweep. Named for what they
-    # actually vary.
-    # -- SLOTS 7-8 (were tau6/tau12). The rest of the D-matched set; see slot 3.
-    ('dose_n50',    'mip', 50,      {'replay_tb': 0.4, 'val_gap_max': 0.0}),
-    ('dose_w10',    'mip', N_SHIP,  {'replay_tb': 0.1, 'val_gap_max': 0.0}),
+    # -- block 2: THE N LADDER (slots 4-6, 9-10) --------------------------------
+    # The val_gap bar is retired (see rr_sep07/make.py), so N is SET and the gap is
+    # MEASURED, instead of both being fixed points of one loop. Four cadences at
+    # 50/20/10/5 energy calls per 1000 steps trace the quality-vs-cost curve
+    # directly, and fit the level law lambda(N) on THIS rig -- which is the input a
+    # feedforward cadence needs and which no run in the corpus has at T=100.
+    ('n100_det',    'mip', 100,     {'val_gap_max': 0.0}),
+    # -- block 3: the tau axis at the LOOSE cadence -----------------------------
+    # occ12/occ24 (tasks 18-19) sweep occupancy at N_SHIP where tau is short enough
+    # to equilibrate; this is the same axis at N_LOOSE, where the local result says
+    # the free lever should matter most. tau/N 9 -> O = 9B, clear of max_size.
+    ('occ_n200',    'mip', N_LOOSE, {'tau_over_n': 9, 'val_gap_max': 0.0}),
+    ('n200_det',    'mip', N_LOOSE, {'val_gap_max': 0.0}),
 
-    # -- block 4: deterministic reference points --------------------------------
-    # Fixed cadence, no adaptive bar, so an adaptive arm that settles at N_eff=X
-    # can be read against a deterministic arm actually run at N=X. n20_det is
-    # also the ONLY clean comparison to base/tol05/cap75, which ran N=20 under
-    # the retired ess_min bar -- it isolates what retiring it changed.
+    # -- block 4: CONTROLLER, bracketing the new defaults (slots 7-8) -----------
+    # The shipped ratchet is now tol 0.5 / release 0.25 / down_over_up 1.5. Both
+    # knobs are bracketed on the loose side, because the failure that was measured
+    # was ALWAYS railing to the floor, never running away to the cap.
+    #   tol10   trips only on a 1.0-nat excursion -- looser than the ~0.8 nat
+    #           excursions actually seen, so its ratchet should be near-inert and
+    #           the slope gate alone governs.
+    #   du25    q* = 1/(1+2.5) = 29% instead of 40%: a stricter demand that the
+    #           guarded metric keep falling.
+    ('ctrl_tol10',  'mip', N_SHIP,  {'ratchet_tol': 1.0, 'val_gap_max': 0.0}),
+    ('ctrl_du25',   'mip', N_SHIP,  {'down_over_up': 2.5, 'val_gap_max': 0.0}),
+
     ('n20_det',     'mip',      20, {'val_gap_max': 0.0}),
     ('n50_det',     'mip',      50, {'val_gap_max': 0.0}),
 
@@ -270,7 +253,7 @@ ARMS = (
 
 OVERRIDE_KEYS = {'ratchet_tol', 'bwd_hi', 'gain_mult', 'tau_over_n',
                  'val_gap_max', 'fill_process_var', 'batch', 'freeze_pb',
-                 'replay_tb'}
+                 'replay_tb', 'down_over_up'}
 
 
 def _fused(cfg, active_only=False):
@@ -373,6 +356,10 @@ def _apply(cfg, every, ov):
             lo_r, _ = bal['bounds']['replay']
             hi = float(ov['bwd_hi'])
             bal['bounds'] = {'bwd': [lo_b, hi], 'replay': [lo_r, 1.0 - lo_b]}
+        if 'down_over_up' in ov:
+            # THE SETPOINT. q* = up/(up+down) is the fraction of ticks the guarded
+            # metric may rise; gain_mult scales both and so cannot move it.
+            bal['down'] = bal['up'] * float(ov['down_over_up'])
         if 'gain_mult' in ov:
             k = float(ov['gain_mult'])
             bal['up'], bal['down'] = bal['up'] * k, bal['down'] * k
@@ -434,14 +421,21 @@ def check(cfg, name, fam, every, ov):
         assert b['bar'] == 0.0, where + 'bar is not varied in this battery'
         assert b['metric'] == GUARD_METRIC, where + 'guard channel'
         assert b['ratchet_metric'] == GUARD_LEVEL, where + "ratchet must be the guard's level"
-        assert b['ratchet_tol'] == float(ov.get('ratchet_tol', 0.0)), where + 'ratchet_tol'
+        # these mirror rr07's deltas(), which OWNS them -- a drift would be silent
+        assert b['ratchet_tol'] == float(ov.get('ratchet_tol', 0.5)), where + 'ratchet_tol'
+        assert 0.0 < b['ratchet_release_tol'] <= b['ratchet_tol'], where + 'release tol'
         assert b['bounds']['bwd'][1] == float(ov.get('bwd_hi', 0.9)), where + 'bwd upper rail'
         k = float(ov.get('gain_mult', 1.0))
-        assert abs(b['up'] - 0.000425 * k) < 1e-12 and abs(b['down'] - 0.01075 * k) < 1e-12, where + 'gains'
-        assert b['up'] < b['down'], where + 'guard must act faster than the ramp'
+        assert abs(b['up'] - 0.004 * k) < 1e-12, where + 'ramp gain'
+        du = float(ov.get('down_over_up', 1.5))
+        assert abs(b['down'] - b['up'] * du) < 1e-12, where + 'guard gain'
+        # THE SETPOINT: q* = up/(up+down) is the fraction of ticks the guarded
+        # metric may rise. The sensor sits positive ~29% of the time, so a ratio
+        # past ~2.5 asks for something the plant cannot deliver and rails.
+        assert b['up'] < b['down'] <= b['up'] * 2.5, where + 'gain asymmetry'
         trig = s.get('fwd_rollout_triggers') or {}
         assert all(t in trig for t in TRIGGER_KEYS), where + 'cadence triggers'
-        assert trig['val_gap_max'] == float(ov.get('val_gap_max', 4.0)), where + 'val_gap_max'
+        assert trig['val_gap_max'] == float(ov.get('val_gap_max', 0.0)), where + 'val_gap_max'
         assert 'ess_min' not in trig, where + 'ess_min is retired'
         # this constant documents the contract; rr07's deltas() OWNS it, so a
         # drift between the two would otherwise be silent
@@ -528,6 +522,17 @@ def emit(arms):
         f.write('arm\twarm_src\tfwd_rollout_every\ttau_over_n\tbatch\toverride\n')
         for r in rows:
             f.write('%s\t%s\t%d\t%d\t%d\t%s\n' % r)
+    # PRUNE ORPHANS. A renamed or dropped arm leaves its old yaml on disk: the
+    # index no longer names it, nothing runs it, and it silently rots out of date
+    # while still looking like a config someone could hand-run. Measured after the
+    # 2026-09-08 rewrite, which left five (vg20, vg40, vg_off, dose_n50, dose_w10).
+    named = {r[0] for r in rows} | {r[0][len('RETIRED_'):] for r in rows
+                                    if r[0].startswith('RETIRED_')}
+    for stale in sorted(HERE.glob('*.yaml')):
+        if stale.stem not in named:
+            stale.unlink()
+            print(f'  pruned orphan config {stale.name}')
+
     for r in rows:
         if r[0].startswith('RETIRED_'):
             assert not (HERE / (r[0][len('RETIRED_'):] + '.yaml')).exists(),                 'retired arm still has a config: ' + r[0]

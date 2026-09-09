@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: vg20
+run_name: n100_det
 tag: rr08
 seed: 12345
 device: cuda
@@ -304,9 +304,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 200
+      fwd_rollout_every: 100
       fwd_rollout_triggers:
-        val_gap_max: 2.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -317,9 +317,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: &id001
           bwd:
           - 0.25
@@ -391,9 +392,9 @@ protocols:
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
-      fwd_rollout_every: 200
+      fwd_rollout_every: 100
       fwd_rollout_triggers:
-        val_gap_max: 2.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -404,9 +405,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: *id001
   prod_eq:
     stages:
@@ -473,9 +475,9 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-      fwd_rollout_every: 200
+      fwd_rollout_every: 100
       fwd_rollout_triggers:
-        val_gap_max: 2.0
+        val_gap_max: 0.0
         occupancy_min_batches: 2.0
       balance:
         kind: gated_ramp
@@ -486,9 +488,10 @@ protocols:
         metric: bwd/under_coverage_rise150
         bar: 0.0
         ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.0
-        up: 0.000425
-        down: 0.01075
+        ratchet_tol: 0.5
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds: *id001
 controller:
   min_mode_frac: 0.001
@@ -519,7 +522,7 @@ buffers:
     source: anchors
   replay_buffer:
     churn_rate: 1000
-    mean_residence_steps: 600
+    mean_residence_steps: 300
     max_size: 50000
     admit_reward_min: -200
     prioritise:

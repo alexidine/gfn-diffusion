@@ -92,7 +92,25 @@ def deltas(cfg, name, every, fam):
                 # The BAR ITSELF IS NOT CALIBRATED: 1.25 nats measured at reuse 20
                 # is 8.6 sigma, but whether that level is harmful is unknown. 4.0 is
                 # a guess with the resolution floor (~2 sigma) behind it.
-                'val_gap_max': 4.0,
+                # RETIRED 2026-09-08. Not a mis-set bar -- an unplaceable one.
+                # (a) The generator's own note below says 4.0 is a guess.
+                # (b) The actuator's TOTAL authority over the sensor across
+                #     N in [20, 200] is 10^0.366 = 2.32x, while the two local
+                #     cuts of the level law disagree by 4.2x. A controller with
+                #     less authority than its setpoint has error is a rail-picker.
+                # (c) The actuator writes into its own sensor's sample: every
+                #     admission flags val_frac of the new rows held-out
+                #     (train.py `is_val=_val_flags(...)`), and those ARE the rows
+                #     val_gap is measured on.
+                # (d) The lag is the POLICY's adaptation timescale (~1000 steps,
+                #     identical at tau 100 and 250), against a 2-step re-fire
+                #     floor -- 500:1, with a wrong-way excursion for the first
+                #     ~100 steps. It latched in the one arm where it ever fired.
+                # Cadence is now feedforward: pick N, tau and w, all calculable.
+                # occupancy_min_batches stays -- one-step plant, unit gain,
+                # self-clearing. The rule is "no trigger on a sensor slower than
+                # the cadence it sets", not "no triggers".
+                'val_gap_max': 0.0,
                 # The draw needs something to draw from. NOTE this reading is
                 # len(buffer)/batch_size, which in steady state IS tau/N -- it is the
                 # configured ratio, not an independent measurement.
@@ -124,8 +142,27 @@ def deltas(cfg, name, every, fam):
                 'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd',
                 'pinned': {'fwd': 0.0},
                 'metric': 'bwd/under_coverage_rise150', 'bar': 0.0,
-                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.0,
-                'up': 0.000425, 'down': 0.01075,
+                # LOOSENED 2026-09-08 after the ratchet was measured pinning
+                # replay at its floor in EVERY arm in the corpus. At tol 0 the
+                # release condition is `level <= best`, i.e. THIS TICK SET A NEW
+                # ALL-TIME LOW -- true on ~14% of ticks -- while down/up 25.3
+                # needs it true on 96.2%. Net drift was -0.009/tick regardless of
+                # the slope, and gr_share went 0.5 -> 0.1 in every run.
+                #   ratchet_tol 0.5   trips on a REAL excursion. Measured excursions
+                #                     on the memorising arm run ~0.8 nats, so 0.5
+                #                     catches them and 1.0 would sail past.
+                #   release 0.25      trip high / release low: returning to the trip
+                #                     LINE is not repair, or the arm cycles.
+                #   down/up 1.5       the ratio IS the setpoint: q* = up/(up+down)
+                #                     is the fraction of ticks the guarded metric is
+                #                     allowed to rise. 25.3 asked for 3.8%; the
+                #                     sensor delivers ~29%, which is the whole rail.
+                #   up 0.004          the ratio sets the equilibrium, the magnitude
+                #                     sets the response: ~5k steps to traverse the
+                #                     rails, against ~15k before.
+                'ratchet_metric': 'bwd/under_coverage', 'ratchet_tol': 0.5,
+                'ratchet_release_tol': 0.25,
+                'up': 0.004, 'down': 0.006,
                 'bounds': BOUNDS_MLIP if fam in MLIP else BOUNDS_ELJ,
             }
             # Z BOOTSTRAP AT PHASE-2 ENTRY. Phase 1 gives the flow scalar no
@@ -175,7 +212,10 @@ def check(cfg, name, every):
     assert not any('fwd_rollout_drift_max' in s for s in st), name + ': retired drift key'
     for s in st:
         b = s['balance']
-        assert b['bar'] == 0.0 and b['ratchet_tol'] == 0.0, name + ': tolerances'
+        assert b['bar'] == 0.0 and b['ratchet_tol'] == 0.5, name + ': tolerances'
+        assert 0.0 < b['ratchet_release_tol'] <= b['ratchet_tol'], name + ': release'
+        # the ratio is the SETPOINT, not a safety margin -- see deltas()
+        assert b['down'] / b['up'] <= 2.5, name + ': gain asymmetry too steep to ramp'
         assert b['metric'] == 'bwd/under_coverage_rise150', name + ': guard channel'
         assert b['ratchet_metric'] == 'bwd/under_coverage', name + ": ratchet must be the guard's LEVEL"
         assert s['fwd_rollout_triggers'], name + ': no cadence triggers'
