@@ -1,0 +1,3 @@
+arm	warm_src	modes
+tck_all	pt100_mipu_lr4p0	all
+tck_fwd	pt100_mipu_lr4p0	fwd
