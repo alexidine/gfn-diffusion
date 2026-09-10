@@ -1534,8 +1534,12 @@ class Modeller:
         last_report = getattr(self, '_rollout_report_step', None)
         if last_report is not None and self.step_ind > last_report:
             metrics['rollout/n'] = float(n_roll)     # raw count this window
+            # the z-pin share of those calls, so the extra energy this knob buys
+            # is read rather than inferred from the configured cadences
+            metrics['rollout/n_z_pin'] = float(getattr(self, '_z_pin_count', 0))
         self._rollout_report_step = self.step_ind
         self._rollout_count = 0
+        self._z_pin_count = 0
         # CUMULATIVE SINCE STAGE ENTRY, not per window. A per-window figure
         # cannot measure an interval longer than the window: at N=20 against a
         # 10-step report cadence, every window holds 0 or 1 rollouts, and
@@ -4112,6 +4116,8 @@ class Modeller:
         force-refresh-only run is detached, weight 0), on-cadence the stages
         that set a cadence pin fwd_frac at 0, so it is False."""
         rollout_every = int(getattr(self.protocol.stage, 'fwd_rollout_every', 0) or 0)
+        z_pin_every = int(getattr(self.protocol.stage, 'z_pin_rollout_every', 0) or 0)
+        z_pin = False
         if rollout_every > 0:
             # THE CADENCE IS ANCHORED TO THE STAGE, NOT TO THE ABSOLUTE COUNTER, so
             # the FIRST fused step of a cadenced stage always rolls out. That step
@@ -4137,6 +4143,12 @@ class Modeller:
                 self._last_rollout_step = self.step_ind
             elif self._rollout_trigger_fires(rollout_every):
                 fwd_ran = True
+            # Z-PIN: an extra rollout purely to re-pin log Z, on its own cadence.
+            # Its rows are kept OUT of replay (see the manage_replay_buffer guard)
+            # and it carries no gradient, so the only thing it changes against the
+            # same stage without it is how often Z was pinned.
+            if not fwd_ran and z_pin_every > 0                     and (self.step_ind - self._cadence_anchor) % z_pin_every == 0:
+                fwd_ran = z_pin = True
         else:
             fwd_ran = bool(self.fwd_frac >= deactivate_threshold
                            or (force_refresh and not self.protocol.mode_dormant('fwd')))
@@ -4155,7 +4167,15 @@ class Modeller:
                 self._rollout_total = 0
                 self._rollout_total_from = self.step_ind
             self._rollout_total = getattr(self, '_rollout_total', 0) + 1
-        return fwd_ran, bool(fwd_ran and self.fwd_frac >= deactivate_threshold)
+            if z_pin:
+                # counted INSIDE the rollout tally (a z-pin is a real energy call
+                # and the cost axis must not under-report it) and again on its own,
+                # so the extra calls this knob buys are attributable.
+                self._z_pin_count = getattr(self, '_z_pin_count', 0) + 1
+        # a z-pin never carries weight: it exists for the stash, not the gradient
+        return (fwd_ran,
+                bool(fwd_ran and not z_pin and self.fwd_frac >= deactivate_threshold),
+                z_pin)
 
     #: (key, default, direction) -- direction 'above' fires when the reading
     #: EXCEEDS the bar, 'below' when it falls under it. 0/None disables a bar.
@@ -4290,7 +4310,8 @@ class Modeller:
         sub_losses = {}
         weights = {}
 
-        fwd_ran, fwd_active = self._fwd_gates(deactivate_threshold, force_refresh)
+        fwd_ran, fwd_active, fwd_z_pin = self._fwd_gates(deactivate_threshold,
+                                                         force_refresh)
         if fwd_ran:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
@@ -4404,9 +4425,13 @@ class Modeller:
             self._log_fused_gradient_geometry(sub_losses, weights, total_weight)
 
         if fwd_ran:
-            # churn on the fly
-            self.manage_replay_buffer(fwd_loss_dict,
-                                      crystal_batch)
+            # A Z-PIN ROLLOUT IS NOT INTAKE. Admitting it would put the extra
+            # rollouts back into the buffer and re-couple pin frequency to buffer
+            # freshness -- the exact confound the key exists to break.
+            if not fwd_z_pin:
+                # churn on the fly
+                self.manage_replay_buffer(fwd_loss_dict,
+                                          crystal_batch)
             del crystal_batch
 
         return fused_loss, sub_losses

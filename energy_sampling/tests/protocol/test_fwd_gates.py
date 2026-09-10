@@ -47,11 +47,11 @@ def _m(every=0, fwd_frac=0.0, triggers=None, drift_std=None, dormant=False,
 # ------------------------------------------------- no cadence: today's table
 
 @pytest.mark.parametrize('fwd_frac,force_refresh,dormant,expected', [
-    (0.5, False, False, (True, True)),      # trains
-    (0.5, True, False, (True, True)),
-    (0.0, False, False, (False, False)),    # below threshold, no refresh due
-    (0.0, True, False, (True, False)),      # force-refresh only: runs, weight 0
-    (0.0, True, True, (False, False)),      # dormant branch skips its refresh
+    (0.5, False, False, (True, True, False)),      # trains
+    (0.5, True, False, (True, True, False)),
+    (0.0, False, False, (False, False, False)),  # below threshold, no refresh due
+    (0.0, True, False, (True, False, False)),    # force-refresh only: runs, weight 0
+    (0.0, True, True, (False, False, False)),    # dormant branch skips its refresh
 ])
 def test_the_uncadenced_table_is_unchanged(fwd_frac, force_refresh, dormant, expected):
     m = _m(every=0, fwd_frac=fwd_frac, dormant=dormant)
@@ -65,7 +65,7 @@ def test_the_cadence_runs_on_its_multiples_and_never_trains():
     ran = []
     for step in range(70):
         m.step_ind = step
-        r, active = m._fwd_gates(THRESH, force_refresh=(step % 10 == 0))
+        r, active, _ = m._fwd_gates(THRESH, force_refresh=(step % 10 == 0))
         assert active is False, 'a cadenced stage pins fwd_frac at 0'
         if r:
             ran.append(step)
@@ -86,9 +86,9 @@ def test_a_cadenced_rollout_would_train_if_the_stage_gave_fwd_weight():
     every cadenced stage ships fracs.fwd 0."""
     m = _m(every=7, fwd_frac=0.5)
     m.step_ind = 14
-    assert m._fwd_gates(THRESH, False) == (True, True)
+    assert m._fwd_gates(THRESH, False) == (True, True, False)
     m.step_ind = 15
-    assert m._fwd_gates(THRESH, False) == (False, False)
+    assert m._fwd_gates(THRESH, False) == (False, False, False)
 
 
 # ------------------------------------------------------------- drift trigger
@@ -115,7 +115,7 @@ def test_the_trigger_holds_before_any_drift_has_been_measured():
     m.ROLLOUT_TRIGGERS = Modeller.ROLLOUT_TRIGGERS
     m._fwd_gates = MethodType(Modeller._fwd_gates, m)
     m._cadence_anchor_stage, m._cadence_anchor = 'equilibration', 0
-    assert m._fwd_gates(THRESH, False) == (False, False)
+    assert m._fwd_gates(THRESH, False) == (False, False, False)
 
 
 def test_the_trigger_respects_the_two_step_gap():

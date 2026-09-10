@@ -253,7 +253,7 @@ class Stage:
                                'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
-                               'fwd_rollout_triggers',
+                               'fwd_rollout_triggers', 'z_pin_rollout_every',
                                # accepted here ONLY so Stage.__init__'s own check
                                # reports the rename; the generic unknown-key error
                                # would otherwise fire first and say nothing useful
@@ -296,6 +296,37 @@ class Stage:
                 f"the energy function on every step it fires, off a sensor frozen "
                 f"between rollouts, so it would run on every skipped step. Set "
                 f"flags.z_calibration false; log Z is pinned by z_level_fill instead.")
+
+        # Z-PIN ROLLOUTS: an extra forward rollout, on its own cadence, whose
+        # ONLY product is the z_fill stash -- it carries no gradient and its rows
+        # do NOT enter the replay buffer.
+        #
+        # WHY IT NEEDS TO EXIST SEPARATELY. `fwd_ran` gates the rollout, the
+        # z_fill stash and replay admission together (train.py's _fwd_gates), so
+        # fwd_rollout_every moves Z-pin frequency, fresh-data rate and buffer
+        # reuse as ONE knob and no fan over it can say which of the three drove a
+        # result. This splits the Z pin off: hold fwd_rollout_every fixed, vary
+        # this, and the only thing that changed is how often log Z was pinned.
+        #
+        # 0 = off, the shape everything before this ran.
+        self.z_pin_rollout_every = int(spec.get('z_pin_rollout_every', 0) or 0)
+        if self.z_pin_rollout_every < 0:
+            raise ValueError(f"stage '{self.name}': z_pin_rollout_every must be "
+                             f">= 0, got {self.z_pin_rollout_every}")
+        if self.z_pin_rollout_every > 0:
+            if self.fwd_rollout_every <= 0:
+                raise ValueError(
+                    f"stage '{self.name}': z_pin_rollout_every="
+                    f"{self.z_pin_rollout_every} needs fwd_rollout_every > 0. With "
+                    f"the forward branch running every step there is no interval to "
+                    f"pin Z inside, and the key would silently do nothing.")
+            if self.z_pin_rollout_every >= self.fwd_rollout_every:
+                raise ValueError(
+                    f"stage '{self.name}': z_pin_rollout_every="
+                    f"{self.z_pin_rollout_every} must be STRICTLY LESS than "
+                    f"fwd_rollout_every={self.fwd_rollout_every}. A z-pin only fires "
+                    f"on steps the ordinary cadence skipped, so at >= it fires on "
+                    f"nothing and reads as a configured knob that never ran.")
 
         # OFF-CADENCE ROLLOUT TRIGGER: run an extra forward rollout when
         # replay/policy_drift_std -- how far the policy has moved off the rows
