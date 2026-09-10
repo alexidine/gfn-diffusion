@@ -85,10 +85,23 @@ stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.me
     --format=csv,nounits -l 10 > ${J}_smi.csv &
 SMI=$!
 
-singularity exec --nv \
-  --overlay ${OVERLAY}:ro \
-  ${IMAGE} \
-  /bin/bash -c "source /ext3/env.sh; cd ${WORKDIR}; python train.py --config ${RESOLVED}"
+# THE LAUNCH LINE IS COPIED FROM configs/prod_t100, NOT REWRITTEN. Four things
+# in it are load-bearing and none are obvious:
+#   PYTHONPATH  train.py does `from energy_sampling...`, so the PARENT of this
+#               directory must be on the path. Running `python train.py` from
+#               inside energy_sampling/ puts only energy_sampling/ on sys.path,
+#               and every arm dies at import with ModuleNotFoundError.
+#   --bind      the container sees neither the project tree nor
+#               /scratch/mk8347/data without them. The seed glob above runs
+#               OUTSIDE the container and passes regardless, so this fails late
+#               and looks unrelated to the launch line.
+#   --pwd       sets the working directory inside the container.
+#   -u          unbuffered, so a joblog tail shows progress rather than nothing.
+srun singularity exec --nv     --overlay ${OVERLAY}:ro     --bind ${PROJECT_ROOT}:${PROJECT_ROOT}     --bind /scratch/mk8347/data:/scratch/mk8347/data     --pwd ${WORKDIR}     ${IMAGE}     /bin/bash -c "
+        source /ext3/env.sh
+        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
+        python -u train.py --config ${RESOLVED}
+    "
 RC=$?
 kill ${SMI} 2>/dev/null
 exit ${RC}
