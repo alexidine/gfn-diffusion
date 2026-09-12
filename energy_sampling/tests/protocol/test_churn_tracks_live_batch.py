@@ -18,8 +18,11 @@ import pytest
 
 def _admit(churn_rate, entry_batch, live_batch, eligible):
     """The arithmetic of train.py's admission cap, in isolation."""
-    entry_b = max(1, int(entry_batch or 1))
-    churn_live = int(round(float(churn_rate) * live_batch / entry_b))
+    if float(churn_rate) <= 0:          # sentinel: no cap, store the live draw
+        churn_live = int(live_batch)
+    else:
+        entry_b = max(1, int(entry_batch or 1))
+        churn_live = int(round(float(churn_rate) * live_batch / entry_b))
     return min(eligible, max(1, churn_live))
 
 
@@ -62,3 +65,31 @@ def test_the_occupancy_bar_is_now_reachable_at_the_shipped_ratio(tau_over_n, n):
     churn_live = _admit(1000, 1000, live_b, eligible=live_b)
     assert (churn_live / live_b) * tau_over_n >= 2.0
     assert (1000 / live_b) * tau_over_n < 2.0        # the defect, for contrast
+
+
+# --- churn_rate 0 = store-all, the contract as one value ---------------------
+
+
+def test_zero_means_the_live_batch():
+    assert _admit(0, 1000, 1000, eligible=1000) == 1000
+
+
+def test_zero_tracks_growth_with_no_ratio():
+    """The entry batch is irrelevant at 0 -- it reads the LIVE draw directly."""
+    assert _admit(0, 1000, 4000, eligible=4000) == 4000
+    assert _admit(0, 16, 4000, eligible=4000) == 4000
+
+
+def test_zero_does_not_fall_through_to_the_one_row_floor():
+    """0 * B/entry_b is 0, which max(1, ...) would turn into a single row a call
+    -- the buffer would never fill. The sentinel must precede the ratio."""
+    assert _admit(0, 1000, 4000, eligible=4000) != 1
+
+
+def test_zero_is_still_bounded_by_what_is_eligible():
+    assert _admit(0, 1000, 4000, eligible=37) == 37
+
+
+def test_a_positive_churn_is_untouched_by_the_sentinel():
+    assert _admit(80, 256, 512, eligible=512) == 160
+    assert _admit(1000, 1000, 4000, eligible=4000) == 4000

@@ -73,6 +73,36 @@ def strip_lazy_sg_caches(batch):
 #: (some construction path skipped the stamp) and must NOT be migrated.
 BUFFER_FORMAT_VERSION = 2
 
+#: What AnchorBuffer.energy holds, recorded in its state dict as `energy_currency`.
+#: E_anchor is the training total at lambda = 1: physical_energy + bounding_energy
+#: * bounding_coeff on a run carrying a prior_flow, and the site's own -log_r * T on
+#: a run without one (the same number up to the round trip through log_r). An
+#: AnchorBuffer built by this code writes this value; a dict without it predates
+#: the currency and, on a run with a prior_flow, holds MIXED energies at each row's
+#: admission-time lambda (train.py apply_anchor_buffer_policy refuses it there).
+ANCHOR_ENERGY_CURRENCY = 'e_anchor'
+
+#: WHICH ROLLOUT A ROW CAME OFF, stored per row as `origin` (int8). Not every
+#: admission is the same sample: the eval-site call admits the EMA model's
+#: rollout on the eval_T grid, and bootstrap_z_by_rollout admits a one-off
+#: measurement draw. Both used to be indistinguishable from the fused step's own
+#: forward rows once resident, so buffer composition was readable only as an
+#: absence -- eval rows are born with a NaN birth_log_pf and drop out of the
+#: drift statistic, which is why `replay/policy_drift_covered_frac` read 0.84 and
+#: nothing said why. ORIGIN_ROLLOUT is the default because it is the ordinary
+#: admission; the two others are passed explicitly by their call sites.
+ORIGIN_ROLLOUT = 0     # the fused/fwd train step's own forward rollout
+ORIGIN_EVAL = 1        # evaluation()'s EMA-model rollout on the eval_T grid
+ORIGIN_BOOTSTRAP = 2   # bootstrap_z_by_rollout and any init/seed admission
+
+#: code -> metric-safe name, the ONE spelling the origin_frac keys are built
+#: from. A second hand-written name list is how a code and its label drift.
+ORIGIN_NAMES = {
+    ORIGIN_ROLLOUT: 'rollout',
+    ORIGIN_EVAL: 'eval',
+    ORIGIN_BOOTSTRAP: 'bootstrap',
+}
+
 
 class BufferCurrencyError(RuntimeError):
     """A crystal buffer whose stored energies are in an unknown or mixed currency.
@@ -264,6 +294,7 @@ class CrystalBuffer:
             birth_step: int = 0,
             birth_log_pf: Optional[torch.Tensor] = None,
             is_val: Optional[torch.Tensor] = None,
+            origin: Optional[torch.Tensor] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -312,6 +343,11 @@ class CrystalBuffer:
         # buffer servo and would otherwise be pulled toward the intake by rows
         # that are undrawable BY CONSTRUCTION.
         self.is_val = self._seed_column(is_val, n, False, torch.bool)
+        # which rollout admitted this row (ORIGIN_* above). Read by the
+        # replay_buffer_origin_frac/* composition metrics, and the only record
+        # that survives admission: an eval row and a fused-step row are the same
+        # object once resident.
+        self.origin = self._seed_column(origin, n, ORIGIN_ROLLOUT, torch.int8)
 
         # per-sample rolling estimates of the log importance weight
         # logw = log_r + log_pb - log_pf under the current policy.
@@ -373,6 +409,7 @@ class CrystalBuffer:
             'birth_loss': self.birth_loss.cpu(),
             'birth_log_pf': self.birth_log_pf.cpu(),
             'is_val': self.is_val.cpu(),
+            'origin': self.origin.cpu(),
             'ema_logw': self.ema_logw.cpu(),
             'ema_logw_sq': self.ema_logw_sq.cpu(),
             'ema_log_z_emp': self.ema_log_z_emp.cpu(),
@@ -390,7 +427,7 @@ class CrystalBuffer:
         # anchor, datasets) never had a generating policy or a held-out split,
         # so the defaults below are the true values there, not a fallback.
         if state.get('traj', None) is not None:
-            missing = [k for k in ('birth_log_pf', 'is_val') if k not in state]
+            missing = [k for k in ('birth_log_pf', 'is_val', 'origin') if k not in state]
             if missing:
                 raise BufferColumnError(
                     f"{cls.__name__}: this stored buffer carries trajectories but no "
@@ -427,6 +464,8 @@ class CrystalBuffer:
             'birth_log_pf', torch.full_like(obj.ema_loss, float('nan'))).cpu().float()
         obj.is_val = state.get(
             'is_val', torch.zeros_like(obj.ema_loss, dtype=torch.bool)).cpu().bool()
+        obj.origin = state.get(
+            'origin', torch.full_like(obj.ema_loss, ORIGIN_ROLLOUT)).cpu().to(torch.int8)
         obj.ema_logw = state['ema_logw'].cpu()
         obj.ema_logw_sq = state['ema_logw_sq'].cpu()
         obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
@@ -660,6 +699,65 @@ class CrystalBuffer:
                 [out, np.random.choice(pool, size=k - take, replace=k - take > n_pool)])
         return out.astype(np.int64)
 
+    def _trainable_condition_ids(self):
+        """(rows, cid): the TRAINABLE row indices (held-out `is_val` rows
+        dropped) and their stored condition_id, both as int64 numpy arrays.
+        Raises when the stored batch carries no condition_id."""
+        if not hasattr(self.batch, 'condition_id'):
+            raise ValueError(
+                f"{type(self).__name__}: the stored batch has no condition_id, so "
+                f"it cannot be counted or drawn per condition. Every training buffer "
+                f"on a conditional route stores the post-condition_samples batch, "
+                f"which carries it; a buffer without it was built by another route.")
+        cid = np.asarray(self.batch.condition_id.detach().cpu().flatten()).astype(np.int64)
+        rows = np.arange(cid.size, dtype=np.int64)
+        is_val = getattr(self, 'is_val', None)
+        if is_val is not None and bool(is_val.any()):
+            keep = ~is_val.numpy()
+            rows, cid = rows[keep], cid[keep]
+        return rows, cid
+
+    def condition_row_counts(self, minlength: int = 0) -> np.ndarray:
+        """Trainable rows per condition_id: bincount over the rows a training
+        draw may return (held-out rows excluded), at least `minlength` long."""
+        _, cid = self._trainable_condition_ids()
+        return np.bincount(cid, minlength=int(minlength))
+
+    def _sample_condition_aligned_indices(self, cids, rows_per: int):
+        """EXACTLY `rows_per` distinct trainable rows for EACH condition in
+        `cids`, grouped by condition in the order given (C conditions -> C *
+        rows_per indices). Within a condition the rows are uniform without
+        replacement.
+
+        No top-up and no fallback, unlike _sample_condition_blocked_indices and
+        _draw_aligned: a row whose condition has no partner in the batch carries
+        no condition-grouped signal, so the caller picks only conditions that
+        hold enough rows (condition_row_counts) and a short one is an error
+        here. Held-out rows are masked, not refused, because the rows come from
+        the trainable pool only."""
+        want = np.asarray(cids, dtype=np.int64).ravel()
+        if np.unique(want).size != want.size:
+            raise ValueError("aligned draw: the requested conditions repeat; each "
+                             "must be served once, with its rows_per rows.")
+        rows, cid = self._trainable_condition_ids()
+        sel = np.isin(cid, want)
+        rows, cid = rows[sel], cid[sel]
+        # a random key within each condition, so the first rows_per after each
+        # group boundary are a uniform draw without replacement
+        order = np.lexsort((np.random.random(rows.size), cid))
+        rows, cid = rows[order], cid[order]
+        starts = np.searchsorted(cid, want, side='left')
+        have = np.searchsorted(cid, want, side='right') - starts
+        short = have < rows_per
+        if short.any():
+            raise ValueError(
+                f"aligned draw: {int(short.sum())} of {want.size} requested conditions "
+                f"hold fewer than {rows_per} trainable rows (e.g. condition "
+                f"{int(want[short][0])} holds {int(have[short][0])}). Eligibility is the "
+                f"caller's to check before drawing.")
+        inds = (starts[:, None] + np.arange(rows_per)[None, :]).ravel()
+        return rows[inds]
+
     def _sample_indices(
             self,
             batch_size: int,
@@ -669,6 +767,8 @@ class CrystalBuffer:
             beta: float = 0.0,  # fraction drawn uniformly
             condition_block_m: int = 0,
             target_cids=None,
+            draw_cids=None,
+            rows_per_condition: int = 0,
     ):
         n = len(self)
 
@@ -685,6 +785,33 @@ class CrystalBuffer:
         # shortfall that came out empty) must get an empty result.
         if batch_size <= 0:
             return np.empty(0, dtype=np.int64)
+
+        # ALIGNED PER-CONDITION DRAW (train.py's condition_draw): exactly
+        # `rows_per_condition` distinct trainable rows for each of `draw_cids`,
+        # then the usual `repeats` tiling. It replaces every other path rather
+        # than composing with them: `p` would be divided by a measure this draw
+        # never used, a block size would be a second answer to "how many rows per
+        # condition", and target_cids' top-up is exactly what it excludes.
+        # Held-out rows are masked inside the helper. Unreachable at the default
+        # arguments.
+        if draw_cids is not None:
+            if p is not None or condition_block_m >= 2 or target_cids is not None:
+                raise ValueError(
+                    "the aligned per-condition draw (draw_cids) takes no `p`, no "
+                    "condition_block_m and no target_cids: it fixes the conditions "
+                    "and the rows per condition by itself.")
+            if int(rows_per_condition) < 1:
+                raise ValueError(f"aligned draw needs rows_per_condition >= 1, got "
+                                 f"{rows_per_condition!r}")
+            n_cids = int(np.asarray(draw_cids).size)
+            if batch_size != n_cids * int(rows_per_condition):
+                raise ValueError(
+                    f"aligned draw: batch_size {batch_size} != {n_cids} conditions x "
+                    f"{rows_per_condition} rows; the draw returns exactly the product.")
+            inds = self._sample_condition_aligned_indices(draw_cids, int(rows_per_condition))
+            if repeats > 1:
+                inds = np.repeat(inds, repeats)
+            return inds
 
         # HELD-OUT ROWS ARE NEVER DRAWN, ON ANY PATH. Read off self.is_val here
         # rather than threaded down from the caller because EVERY draw path in
@@ -872,6 +999,8 @@ class CrystalBuffer:
             p: Optional[np.ndarray] = None,
             condition_block_m: int = 0,
             target_cids=None,
+            draw_cids=None,
+            rows_per_condition: int = 0,
     ):
         # p, if given, overrides the built-in loss-weighted distribution entirely
         # (e.g. an externally-computed per-condition z_gap weighting) -- weighted/
@@ -880,9 +1009,16 @@ class CrystalBuffer:
             p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta,
                                     condition_block_m=condition_block_m,
-                                    target_cids=target_cids)
+                                    target_cids=target_cids,
+                                    draw_cids=draw_cids,
+                                    rows_per_condition=rows_per_condition)
         self._bump_counts(inds)
+        graphs, traj = self._graphs_at(inds, exclude_keys, return_traj)
+        return graphs, inds, traj
 
+    def _graphs_at(self, inds, exclude_keys, return_traj):
+        """(graphs, traj) for already-chosen row indices: the shared tail of
+        sample_graphs and sample_graphs_at."""
         # No data_list round trip. Storage is std-oriented at admission
         # (_orient_stored_batch), so draws need no per-draw orientation.
         graphs = self.batch.subsample_new_batch(inds)
@@ -894,7 +1030,21 @@ class CrystalBuffer:
         else:
             traj = None
 
-        return graphs, inds, traj
+        return graphs, traj
+
+    @torch.no_grad()
+    def sample_graphs_at(self, rows, repeats: int = 1,
+                         exclude_keys=("symmetry_operators", "smiles", "identifier")):
+        """The graphs for CALLER-CHOSEN rows, tiled `repeats` times each
+        (terminal-major, like every other draw), with counts bumped. For a
+        caller that picks the rows itself -- train.py's non-iid rollout
+        condition draw -- rather than handing this buffer a measure."""
+        inds = np.asarray(rows, dtype=np.int64).ravel()
+        if repeats > 1:
+            inds = np.repeat(inds, repeats)
+        self._bump_counts(inds)
+        graphs, _ = self._graphs_at(inds, exclude_keys, False)
+        return graphs
 
     @torch.no_grad()
     def sample_val_graphs(self, k, exclude_keys=("symmetry_operators", "smiles", "identifier")):
@@ -930,6 +1080,8 @@ class CrystalBuffer:
             p: Optional[np.ndarray] = None,
             condition_block_m: int = 0,
             target_cids=None,
+            draw_cids=None,
+            rows_per_condition: int = 0,
     ):
         """
         Infinite random-batch generator. Use next() on it.
@@ -944,8 +1096,14 @@ class CrystalBuffer:
         e.g. an externally-computed per-condition z_gap weighting over this
         buffer's rows. beta (fraction drawn uniformly instead) still applies
         on top of it.
+
+        draw_cids + rows_per_condition ("graphs" mode only) is the aligned
+        per-condition draw: exactly rows_per_condition rows for each listed
+        condition (see _sample_indices).
         """
         assert mode in ("tensors", "graphs")
+        if draw_cids is not None and mode != "graphs":
+            raise ValueError("the aligned per-condition draw (draw_cids) is graphs-mode only")
 
         while True:
             if mode == "tensors":
@@ -964,7 +1122,9 @@ class CrystalBuffer:
                                                         repeats=repeats, weighted=weighted, temperature=temperature,
                                                         beta=beta, return_traj=return_traj, p=p,
                                                         condition_block_m=condition_block_m,
-                                                        target_cids=target_cids)
+                                                        target_cids=target_cids,
+                                                        draw_cids=draw_cids,
+                                                        rows_per_condition=rows_per_condition)
                 result = (graphs,)
                 if return_traj:
                     result = result + (traj,)
@@ -1081,7 +1241,8 @@ class CrystalBuffer:
     @torch.no_grad()
     def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None,
             birth_step: int = 0, birth_log_pf: Optional[torch.Tensor] = None,
-            is_val: Optional[torch.Tensor] = None):
+            is_val: Optional[torch.Tensor] = None,
+            origin: Optional[torch.Tensor] = None):
         """
         Append new graphs.
 
@@ -1097,7 +1258,9 @@ class CrystalBuffer:
         birth_log_pf / is_val seed the two per-row columns for the k new
         entries; both default to "unknown"/"trainable" (NaN / False), which is
         the true value for every admission path that has no generating policy
-        and no held-out split.
+        and no held-out split. `origin` seeds the admission-source code
+        (ORIGIN_*), defaulting to ORIGIN_ROLLOUT -- the ordinary forward-rollout
+        admission, which every other call site overrides explicitly.
         """
         if isinstance(data, list) and len(data) == 0:
             return
@@ -1167,6 +1330,8 @@ class CrystalBuffer:
              self._seed_column(birth_log_pf, k, float('nan'), torch.float32)], dim=0)
         new_is_val_full = torch.cat(
             [self.is_val, self._seed_column(is_val, k, False, torch.bool)], dim=0)
+        new_origin_full = torch.cat(
+            [self.origin, self._seed_column(origin, k, ORIGIN_ROLLOUT, torch.int8)], dim=0)
 
         new_nan = torch.full((k,), float("nan"), dtype=torch.float32)
         new_ema_logw_full = torch.cat([self.ema_logw, new_nan], dim=0)
@@ -1185,6 +1350,7 @@ class CrystalBuffer:
         self.birth_loss = new_birth_loss_full
         self.birth_log_pf = new_birth_log_pf_full
         self.is_val = new_is_val_full
+        self.origin = new_origin_full
         self.ema_logw = new_ema_logw_full
         self.ema_logw_sq = new_ema_logw_sq_full
         self.ema_log_z_emp = new_ema_log_z_emp_full
@@ -1238,6 +1404,7 @@ class CrystalBuffer:
         new_birth_loss = self.birth_loss[keep_cpu]
         new_birth_log_pf = self.birth_log_pf[keep_cpu]
         new_is_val = self.is_val[keep_cpu]
+        new_origin = self.origin[keep_cpu]
         new_ema_logw = self.ema_logw[keep_cpu]
         new_ema_logw_sq = self.ema_logw_sq[keep_cpu]
         new_ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
@@ -1254,6 +1421,7 @@ class CrystalBuffer:
         self.birth_loss = new_birth_loss
         self.birth_log_pf = new_birth_log_pf
         self.is_val = new_is_val
+        self.origin = new_origin
         self.ema_logw = new_ema_logw
         self.ema_logw_sq = new_ema_logw_sq
         self.ema_log_z_emp = new_ema_log_z_emp
@@ -1764,7 +1932,8 @@ class ConditionLogZTracker:
         # steps rather than elapsed update() calls.
         self.last_update_step = torch.full((library_size,), -1, dtype=torch.long)
         self.best_energy = torch.full((library_size,), float("inf"), dtype=torch.float32)
-        # the same minimum at lambda=1. Identical to best_energy on every
+        # the same minimum in the ANCHOR CURRENCY E_anchor (the training total at
+        # lambda=1, buffer.ANCHOR_ENERGY_CURRENCY). Identical to best_energy on every
         # lambda-free run; see update_best_energy for why both are needed.
         self.best_energy_phys = torch.full((library_size,), float("inf"), dtype=torch.float32)
         # True until some caller supplies an explicit energy_phys. While it holds,
@@ -2671,18 +2840,22 @@ class ConditionLogZTracker:
         and first visits (inf -> finite). These accumulate into the
         _window_* scalars for pop_discovery_stats to drain.
 
-        `energy_phys` is the SAME quantity evaluated at lambda=1 -- the physical
-        leg -- tracked in parallel as `best_energy_phys`. Two minima are needed
-        because the two consumers want different things and only one of them can
-        be satisfied by a single tensor:
+        `energy_phys` is the SAME per-sample total evaluated at lambda=1 -- the
+        ANCHOR CURRENCY E_anchor = physical_energy + bounding_energy * bounding_coeff
+        (train.py Modeller._anchor_energy) -- tracked in parallel as
+        `best_energy_phys`. Two minima are needed because the two consumers want
+        different things and only one of them can be satisfied by a single tensor:
 
           best_energy       the mixture actually being sampled. What coverage and
                             the ramp are questions about.
           best_energy_phys  lambda-INVARIANT, and therefore the only one whose
-                            running minimum is genuinely monotone. Anchor
-                            filtering must use it, because an anchor trim on mixed
-                            energy would evict good structures irreversibly (see
-                            AnchorBuffer.thin: "can never re-qualify").
+                            running minimum is genuinely monotone. Every anchor
+                            decision reads it against rows stored in the same
+                            currency (AnchorBuffer.energy): thin's energy window,
+                            the screen window, and the top-up record breakers.
+                            An anchor trim on mixed energy evicts good structures
+                            irreversibly (see AnchorBuffer.thin: "can never
+                            re-qualify").
 
         ⚠ WHY, precisely -- an earlier version of this note had the reason wrong in
         a way that would mislead someone into applying it to the prior buffer too.
@@ -2699,7 +2872,9 @@ class ConditionLogZTracker:
         target and should be judged in the mixture.
 
         Pass None on a lambda-free run: the mixture IS the physical energy there,
-        so the two tensors stay bit-identical and nothing changes.
+        so the two tensors stay bit-identical and nothing changes. The trainer does
+        exactly that -- _anchor_energy returns energy_phys=None whenever the energy
+        function carries no prior_flow, at every call site.
         """
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
@@ -2711,8 +2886,9 @@ class ConditionLogZTracker:
                     "physical leg are DIFFERENT quantities. Aliasing them would write "
                     "mixed energies into best_energy_phys and then stamp "
                     "phys_is_alias=True, which is precisely the claim that flag exists "
-                    "to make false. Pass the physical leg (ens_dict['physical_energy'], "
-                    "carried on the scored batch) alongside the mixture.")
+                    "to make false. Pass E_anchor alongside the mixture: "
+                    "Modeller._anchor_energy(batch, energy) reads it off the scored "
+                    "batch (physical_energy + bounding_energy * bounding_coeff).")
             energy_phys = energy
         else:
             self.phys_is_alias = False
@@ -2852,10 +3028,11 @@ class ConditionLogZTracker:
         mask is False, so it's always safe to use directly without a
         separate inf-guard.
 
-        `physical=True` returns the lambda=1 minimum instead. Ask for it wherever
-        the answer must not move when lambda does -- anchor admission and trim
-        above all, since those are irreversible. The default is the mixture, so
-        every existing caller keeps the behaviour it was written against.
+        `physical=True` returns the lambda=1 (E_anchor) minimum instead. The
+        default is the mixture, so every existing caller keeps the behaviour it was
+        written against. The anchor sites in train.py read `best_energy_phys`
+        directly rather than through here: they must run on lambda-free runs too,
+        where this refuses and the tensor is bit-for-bit `best_energy`.
 
         REFUSES while the physical stream is still an alias, rather than handing
         back the mixture under a name that promises otherwise. On a lambda-free
@@ -2970,10 +3147,11 @@ class ConditionLogZTracker:
         # 2026-08-30 qm9c_lam* checkpoints carry a MIXED minimum under the name
         # `best_energy`, so cloning it here produces a physical stream that is
         # nothing of the sort. Those are not resumable into this design.
-        # What makes that safe rather than merely documented: the trainer sets
-        # `requires_phys_energy` after every load (train.py's resume path), so a
-        # mixing run raises on its first update_best_energy instead of quietly
-        # inheriting a mislabelled minimum.
+        # What catches it: the trainer re-arms `requires_phys_energy` after every
+        # load (Modeller._arm_phys_energy_guard, run by init_condition_log_z on a
+        # full resume and by the rewind path), and that helper REFUSES a run with
+        # a prior_flow whose restored tracker holds finite minima under
+        # phys_is_alias=True -- a physical stream nothing vouches for.
         obj.best_energy_phys = state.get("best_energy_phys", obj.best_energy.clone()).cpu()
         # absent => the checkpoint predates the physical stream => it is an alias
         obj.phys_is_alias = bool(state.get("phys_is_alias", True))
@@ -3124,6 +3302,15 @@ class AnchorBuffer(CrystalBuffer):
     reward is kept only for logging and for the reward-scale ramps
     elsewhere in train.py that were already written in reward space.
 
+    self.energy is the ANCHOR CURRENCY E_anchor (ANCHOR_ENERGY_CURRENCY): the
+    row's training total at lambda=1, which does not move when lambda does, so
+    freezing it at admission is exact. Every caller that writes it (the two
+    constructors and admit) passes E_anchor, and every per-condition minimum it
+    is compared against is ConditionLogZTracker.best_energy_phys, the same
+    currency. On a lambda-free run E_anchor is the site's own -log_r * T, i.e.
+    exactly the number this attribute always held. `energy_currency` records
+    that on disk; a restored dict without it is None.
+
     original_surprise (self.original_surprise) is stored per entry at
     admission time and never updated afterward -- it's the one non-adaptive
     quantity on an anchor, used only by thin()'s hard-cap backstop (evict
@@ -3187,6 +3374,8 @@ class AnchorBuffer(CrystalBuffer):
         # consumed/refreshed by pop_mean_energy_improvement()
         self._prev_cond_ids = None
         self._prev_cond_mean_energy = None
+        # what self.energy holds -- see the class docstring
+        self.energy_currency = ANCHOR_ENERGY_CURRENCY
 
     @property
     def condition_id(self):
@@ -3201,6 +3390,9 @@ class AnchorBuffer(CrystalBuffer):
         state = super().state_dict()
         state['reward'] = self.reward.cpu()
         state['energy'] = self.energy.cpu()
+        # carried through unchanged: a buffer restored without one stays None,
+        # because rows admitted since do not vouch for the rows it came back with
+        state['energy_currency'] = self.energy_currency
         state['original_surprise'] = self.original_surprise.cpu()
         if self._prev_cond_ids is not None:
             state['prev_cond_ids'] = self._prev_cond_ids.cpu()
@@ -3216,6 +3408,9 @@ class AnchorBuffer(CrystalBuffer):
         # until the buffer churns in fresh, correctly energy-scored
         # admissions)
         obj.energy = state.get('energy', -state['reward']).cpu()
+        # absent => written before the anchor currency existed => None; judged
+        # trainer-side, where the prior_flow is known (apply_anchor_buffer_policy)
+        obj.energy_currency = state.get('energy_currency', None)
         # older checkpoints predate original_surprise -- NaN ("unmeasured") is
         # the only honest fallback; see __init__'s legacy-path comment
         obj.original_surprise = state.get(
@@ -3336,6 +3531,8 @@ class AnchorBuffer(CrystalBuffer):
         candidate_batch/reward/energy are expected to already be the
         confirmed-surprising set (see train.py's screen_and_admit_anchors) --
         surprise, not distance or energy proximity, is the novelty gate.
+        `energy` is E_anchor, the currency self.energy is stored in (class
+        docstring), so the replacement comparison below is like-for-like.
         admit_range is DEAD: both call sites (train.py's
         top_up_prior_from_anchors and screen_and_admit_anchors) pass None, so
         every candidate handed in is admitted, and the energy-proximity branch
@@ -3503,8 +3700,8 @@ class AnchorBuffer(CrystalBuffer):
         energy - per_condition_min_energy[cid] exceeds energy_window (deliberately
         wide -- an anchor irrelevant at low T may carry real weight at high T,
         so this should stay generous). per_condition_min_energy is supplied by
-        the caller (train.py's condition_log_z.best_energy, i.e. Emin(c)) rather
-        than recomputed here, so buffer.py stays free of any condition_log_z
+        the caller (train.py's condition_log_z.best_energy_phys, i.e. Emin(c) in
+        the anchor currency self.energy is stored in) rather than recomputed here, so buffer.py stays free of any condition_log_z
         coupling -- pass a [library_size] tensor indexable by condition_id, or a
         dict/Tensor-like keyed the same way; energy_window=None skips this pass.
 

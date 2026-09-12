@@ -40,6 +40,7 @@ class GFN(nn.Module):  # todo add seeding
                  zero_init: bool = False, device=torch.device('cuda'),
                  max_z_prime: int = 1,
                  full_flow: bool = False,
+                 scalar_flow: bool = False,
                  do_periodic_angles: bool = True,
                  angular_mask: Optional[Sequence[bool]] = None,
                  periodic_centroids: bool = False,
@@ -77,6 +78,7 @@ class GFN(nn.Module):  # todo add seeding
         self.max_z_prime = max_z_prime
         self.conditions_type = conditions_type
         self.full_flow = full_flow
+        self.scalar_flow = scalar_flow
 
         # diagonal-plus-low-rank (DPLR) forward covariance: C = diag(d) + V V^T,
         # with (d, V) built from a fixed per-dim marginal-variance budget s^2,
@@ -125,7 +127,8 @@ class GFN(nn.Module):  # todo add seeding
                               dropout, norm)
 
         self.init_flow_model(condition_embedding_dim, dropout, flow_hidden_dim, flow_layers,
-                             norm, self.full_flow, s_emb_dim, t_dim)
+                             norm, self.full_flow, s_emb_dim, t_dim,
+                             scalar_flow=self.scalar_flow)
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, t_hidden_dim,
                                     norm=norm, dropout=dropout)
@@ -223,7 +226,8 @@ class GFN(nn.Module):  # todo add seeding
             self.conditions_embedding_model = NoneModule()
 
     def init_flow_model(self, condition_embedding_dim, dropout, flow_hidden_dim, flow_layers, norm,
-                        full_flow, s_emb_dim, t_emb_dim):
+                        full_flow, s_emb_dim, t_emb_dim,
+                        scalar_flow: bool = False):
         if full_flow:  # time and state-dependent flow model
             if self.conditional:
                 self.flow_model = scalarMLP(layers=flow_layers,
@@ -242,7 +246,7 @@ class GFN(nn.Module):  # todo add seeding
                                             dropout=dropout,
                                             )
         else:
-            if self.conditional:
+            if self.conditional and not scalar_flow:
                 self.flow_model = scalarMLP(layers=flow_layers,
                                             filters=flow_hidden_dim,
                                             input_dim=condition_embedding_dim,
@@ -251,6 +255,14 @@ class GFN(nn.Module):  # todo add seeding
                                             dropout=dropout,
                                             )
             else:
+                # `scalar_flow` forces this branch on a CONDITIONAL run, for the one case
+                # where log Z is genuinely a single number: a condition set of size one.
+                # It is not a convenience -- `z_level_fill`, which is the only thing pinning
+                # log Z once the servo is off and the fwd branch carries no loss weight,
+                # writes `flow_model.scalar.data.fill_(...)`. A scalarMLP has no `.scalar`,
+                # so that path raises at the first fill (and at bootstrap_z_by_rollout,
+                # which brackets its own call with the same read). DERIVED from the
+                # condition set rather than configured, so it cannot disagree with the data.
                 self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
     def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,

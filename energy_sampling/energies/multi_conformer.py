@@ -21,14 +21,18 @@ WHAT MAKES THIS CHEAP. `ConformerTorsions.energy` never reads `mol_batch`; it co
 `x` and its own chart. So dispatch is a grouping, not a rewrite: split the rows by molecule,
 call each member on its own rows, and gather the results back into batch order.
 
-ONE k FOR THE WHOLE SET, enforced at construction. The GFN's state dimension is fixed when it
-is built, and `collate_conditions` already refuses a mixed-k file; asserting it here too means
-the energy cannot be assembled into a state the policy could not have produced.
+ONE STATE WIDTH FOR THE WHOLE SET. The GFN's state dimension is fixed when it is built. A set
+whose members share their block layout uses the reference chart's state unchanged. A MIXED-k
+set uses the width-K CARRIER (energies/conformer_carrier.py): each member's columns are placed
+in fixed r | theta | phi blocks, pads are pinned to 0, and each row is sliced back to its own
+member's columns before scoring -- with a positive check that the pads really are 0 and that
+the batch's `state_mask` matches the layout, rather than a removed assertion.
 """
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from energies.conformer_torsions import ConformerTorsions
@@ -60,23 +64,40 @@ class MultiConformerTorsions(ConformerTorsions):
         self._members: Dict[str, ConformerTorsions] = {}
         self._by_mol_id: Dict[int, str] = {}
         self._member_smiles: Dict[str, str] = {}
+        self._carrier = None
         super().__init__(smiles=smiles[0], **kw)
         for smi, ident in zip(smiles, idents):
             if ident in self._members:
                 continue
             member = (self if smi == smiles[0] and ident == idents[0]
                       else ConformerTorsions(smiles=smi, **kw))
-            if int(member.data_ndim) != int(self.data_ndim):
-                raise ValueError(
-                    f'{smi} has state dimension {member.data_ndim} but the set is '
-                    f'{self.data_ndim}; one energy is ONE k, because the GFN fixes its state '
-                    f'dimension at construction')
-            if list(member.periodic_dims) != list(self.periodic_dims):
-                raise ValueError(
-                    f'{smi} has periodic_dims {list(member.periodic_dims)} against the set\'s '
-                    f'{list(self.periodic_dims)}; the policy wraps a single mask')
             self._members[ident] = member
             self._member_smiles[ident] = smi
+
+        # ONE LAYOUT FOR THE WHOLE SET. Members whose state columns fall in the same blocks
+        # share the reference chart's layout exactly (identity carrier) and nothing below
+        # changes. Otherwise the state becomes the width-K CARRIER (energies/conformer_carrier):
+        # this object stops being a chart and becomes a dispatcher, so the reference member is
+        # rebuilt as its own instance and every chart method on `self` is refused.
+        from energies.conformer_carrier import CarrierLayout
+        layout = CarrierLayout(self._members)
+        if not layout.is_identity:
+            ref_ident = idents[0]
+            self._members[ref_ident] = ConformerTorsions(smiles=smiles[0], **kw)
+            self._carrier = layout
+            self.data_ndim = layout.K
+            self._free_block = layout.free_block
+            self._lin_free_idx = torch.as_tensor(np.flatnonzero(layout.free_block != 2),
+                                                 dtype=torch.long, device=self.device)
+
+    @property
+    def is_carrier(self) -> bool:
+        """True when the state is the width-K carrier rather than the reference chart."""
+        return self._carrier is not None
+
+    @property
+    def carrier(self):
+        return self._carrier
     # ------------------------------------------------------------------ dispatch
 
     def bind_identifier_registry(self, registry) -> None:
@@ -155,8 +176,9 @@ class MultiConformerTorsions(ConformerTorsions):
                 f'about how many samples there are')
         return idents
 
-    def _groups(self, mol_batch, n: int, device) -> List[Tuple[ConformerTorsions, torch.Tensor]]:
-        """`(member, row indices)` for each molecule present, in first-appearance order."""
+    def _groups(self, mol_batch, n: int, device
+                ) -> List[Tuple[str, ConformerTorsions, torch.Tensor]]:
+        """`(identifier, member, row indices)` per molecule present, first-appearance order."""
         idents = self._row_identifiers(mol_batch, n)
         order: Dict[str, List[int]] = {}
         for i, ident in enumerate(idents):
@@ -167,8 +189,39 @@ class MultiConformerTorsions(ConformerTorsions):
                 f'batch carries {len(unknown)} molecule(s) this energy was not built for, '
                 f'e.g. {unknown[0]!r}. The energy set and the condition set must be built '
                 f'from the same molecule list.')
-        return [(self._members[k], torch.as_tensor(v, dtype=torch.long, device=device))
+        return [(k, self._members[k], torch.as_tensor(v, dtype=torch.long, device=device))
                 for k, v in order.items()]
+
+    def _member_rows(self, ident: str, x: torch.Tensor, mol_batch,
+                     idx: torch.Tensor) -> torch.Tensor:
+        """Rows `idx` of a carrier state, read through member `ident`'s own columns.
+
+        The identity layout returns the rows unchanged. On a real carrier, two POSITIVE
+        checks before the slice, because a wrong one returns a plausible energy:
+          * every PAD column is exactly 0 -- pads are pinned, so a nonzero pad means the row
+            was produced for a different member's layout;
+          * when the batch carries `state_mask`, each row's mask IS this member's.
+        """
+        xi = x.index_select(0, idx)
+        if self._carrier is None:
+            return xi
+        lay = self._carrier
+        pads = torch.as_tensor(lay.pad_cols(ident), dtype=torch.long, device=x.device)
+        if pads.numel() and bool((xi.index_select(1, pads) != 0).any()):
+            worst = float(xi.index_select(1, pads).abs().max())
+            raise RuntimeError(
+                f'{ident}: carrier rows carry nonzero PAD columns (max |x| {worst:.3g}). Pads '
+                f'are pinned to 0 along the whole trajectory, so this row was not produced in '
+                f'{ident}\'s layout; scoring it would read another chart\'s coordinates.')
+        mask = getattr(mol_batch, 'state_mask', None) if mol_batch is not None else None
+        if mask is not None:
+            want = torch.as_tensor(lay.valid(ident), device=mask.device)
+            got = mask.reshape(-1, lay.K).index_select(0, idx.to(mask.device)).bool()
+            if not bool((got == want).all()):
+                raise RuntimeError(
+                    f'{ident}: the batch\'s state_mask disagrees with this energy\'s carrier '
+                    f'layout -- the conditions file was built against a different member set')
+        return lay.from_carrier(ident, xi)
 
     @staticmethod
     def _regroup(parts: Sequence[torch.Tensor], index: Sequence[torch.Tensor],
@@ -190,6 +243,10 @@ class MultiConformerTorsions(ConformerTorsions):
                keep_grads: bool = False, internal_oom_recovery=None):
         """E/T per sample, each row through ITS OWN chart. See `ConformerTorsions.energy`."""
         n = int(x.shape[0])
+        if self._carrier is not None and mol_batch is None:
+            raise RuntimeError(
+                'a carrier-state energy needs mol_batch to know which member owns each row; '
+                'without it there is no chart to score against')
         if self.n_charts <= 1 or mol_batch is None:
             # the single-molecule case is the parent's, byte for byte -- no grouping, no
             # gather, and no behaviour to diverge
@@ -206,8 +263,8 @@ class MultiConformerTorsions(ConformerTorsions):
 
         es, bakes, idxs = [], [], []
         one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
-        for member, idx in groups:
-            xi = x[idx]
+        for ident, member, idx in groups:
+            xi = self._member_rows(ident, x, mol_batch, idx)
             es.append(member.energy(xi, None, log_T[idx], return_exp=False,
                                     keep_grads=keep_grads))
             idxs.append(idx)
@@ -269,8 +326,8 @@ class MultiConformerTorsions(ConformerTorsions):
                     f'{state.shape[0]} baked states against {n} baked energies; the prebuilt '
                     f'rows disagree with themselves')
             parts, idxs = [], []
-            for member, idx in self._groups(mols, n, state.device):
-                xi = state.index_select(0, idx)
+            for ident, member, idx in self._groups(mols, n, state.device):
+                xi = self._member_rows(ident, state, mols, idx)
                 r, th, ph = member.dof_from_state(xi)
                 tree, _ = member._batch(int(xi.shape[0]))
                 # the CHART term is per member too: it is sum(log scale) over that molecule's
@@ -293,7 +350,52 @@ class MultiConformerTorsions(ConformerTorsions):
     # ------------------------------------------------------------------ reporting
 
     def describe(self) -> str:
+        if self._carrier is not None:
+            # the parent's describe reads THIS object's chart, which on a carrier is a
+            # dispatcher's layout, not a molecule -- so describe each member instead
+            return '\n'.join([f'MOLECULE SET: {self.n_charts} charts on a CARRIER state'] +
+                             [m.describe() for m in self._members.values()] +
+                             [self._carrier.describe()])
         head = super().describe()
         return (f'{head}\n   MOLECULE SET: {self.n_charts} charts, k = {self.data_ndim}, '
                 f'each row scored through its own; reference member '
                 f'{self._member_smiles[next(iter(self._members))]!r}')
+
+
+# ---------------------------------------------------------------- carrier guards
+#
+# On a carrier `self` is a DISPATCHER: `data_ndim`, `_free_block` and `_lin_free_idx` describe
+# the width-K layout, while `_M`, `spec`, `r0` and the force field are still the reference
+# member's. Every inherited method below reads the latter, so on a carrier it would compute the
+# reference molecule's answer for a state that is not in its chart -- a shape error at best,
+# and at worst (K equal to the reference's k) a plausible wrong number. Refused by name; the
+# per-member version is `self._members[ident].<method>` on `carrier.from_carrier(ident, x)`.
+_CHART_METHODS = (
+    'dof_from_state', 'build_positions', 'bounding_energy', '_transverse_rho2',
+    'transverse_crossings', 'state_from_dof', 'prior_dof_types', 'torsion_groups',
+    'improper_phi_rows', 'improper_phi_sigma', 'sibling_jitter_sigma', 'ring_blocks',
+    'ring_frame_groups', 'prior_log_prob', 'thermal_rtheta_sigma', 'sample_prior_states',
+    'potential_energy', 'jacobian_energy', 'brute_force_log_z', 'sample', '_batch',
+    '_log_jac', '_tiled_transverse',
+)
+
+
+def _guard(name):
+    parent = getattr(ConformerTorsions, name)
+
+    def method(self, *args, **kwargs):
+        if getattr(self, '_carrier', None) is not None:
+            raise NotImplementedError(
+                f'MultiConformerTorsions.{name} on a CARRIER state: this object is a '
+                f'dispatcher over {self.n_charts} charts, not a chart. Call it on the member, '
+                f'self._members[ident].{name}, with carrier.from_carrier(ident, x).')
+        return parent(self, *args, **kwargs)
+
+    method.__name__ = name
+    method.__doc__ = parent.__doc__
+    return method
+
+
+for _name in _CHART_METHODS:
+    setattr(MultiConformerTorsions, _name, _guard(_name))
+del _name

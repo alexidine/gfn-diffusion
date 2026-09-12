@@ -1,10 +1,15 @@
-"""The two per-row buffer columns: `birth_log_pf` and `is_val`.
+"""The three per-row buffer columns: `birth_log_pf`, `is_val` and `origin`.
 
-Both are per-row side arrays, which is a shape with exactly one interesting
+All are per-row side arrays, which is a shape with exactly one interesting
 failure mode: a column that survives the pickle but not the REINDEX. It passes
 every count check and then silently reports another row's value -- the lesson
 the lj stamp taught on 2026-09-02. So the tests here check alignment BY MARKER
 across add and purge, not by length.
+
+`origin` is a LABEL -- it changes no admission, eviction or draw decision -- so
+its whole value is that the code a row was admitted under is still the code it
+reads back with. Its tests are therefore the alignment and persistence ones, plus
+the call-site tagging in tests/protocol/test_eval_admission_gate.py.
 
 `is_val` additionally makes a row structurally undrawable, and there are four
 draw paths through CrystalBuffer plus three degenerate fallbacks inside
@@ -29,7 +34,9 @@ for p in (_here, os.path.dirname(_here),
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from energy_sampling.buffer import BufferColumnError, CrystalBuffer  # noqa: E402
+from energy_sampling.buffer import (  # noqa: E402
+    ORIGIN_BOOTSTRAP, ORIGIN_EVAL, ORIGIN_NAMES, ORIGIN_ROLLOUT,
+    BufferColumnError, CrystalBuffer)
 
 _spec = importlib.util.spec_from_file_location(
     'lj_carried_helpers', os.path.join(os.path.dirname(__file__), 'test_lj_coeff_carried.py'))
@@ -58,12 +65,12 @@ def _traj(n, offset=0):
             .expand(n, TRAJ_LEN, TRAJ_DIM).contiguous())
 
 
-def _buffer(n, birth_log_pf=None, is_val=None, with_traj=True, seed=0):
+def _buffer(n, birth_log_pf=None, is_val=None, origin=None, with_traj=True, seed=0):
     return CrystalBuffer(_built(n, seed), device=CPU, y_fn='elj',
                          traj=_traj(n) if with_traj else None,
                          init_loss=torch.arange(1, n + 1, dtype=torch.float32),
                          birth_step=0,
-                         birth_log_pf=birth_log_pf, is_val=is_val)
+                         birth_log_pf=birth_log_pf, is_val=is_val, origin=origin)
 
 
 def _pickle_round_trip(state):
@@ -82,20 +89,41 @@ def test_absent_columns_default_to_unknown_and_trainable():
     assert buf.birth_log_pf.dtype == torch.float32 and buf.is_val.dtype == torch.bool
 
 
+def test_origin_defaults_to_rollout_as_int8():
+    """The ordinary admission is the fused step's own forward rollout, so that
+    is what an unstated origin means; eval/bootstrap say so at their call site."""
+    buf = _buffer(4)
+    assert buf.origin.dtype == torch.int8
+    assert torch.equal(buf.origin, torch.full((4,), ORIGIN_ROLLOUT, dtype=torch.int8))
+
+
+def test_the_origin_codes_are_distinct_and_all_named():
+    """A code with no name emits no metric; two codes sharing one name merge two
+    populations into one number. Both are silent."""
+    codes = (ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP)
+    assert len(set(codes)) == 3
+    assert set(ORIGIN_NAMES) == set(codes)
+    assert len(set(ORIGIN_NAMES.values())) == 3
+    assert all(isinstance(v, str) and v for v in ORIGIN_NAMES.values())
+
+
 # ----------------------------------------------------------------- round trip
 
 def test_columns_round_trip_through_a_real_pickle():
     pf = torch.tensor([-1.5, float('nan'), 3.25, -8.0])
     val = torch.tensor([False, True, False, True])
-    buf = _buffer(4, birth_log_pf=pf, is_val=val)
+    org = torch.tensor([ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_EVAL])
+    buf = _buffer(4, birth_log_pf=pf, is_val=val, origin=org)
     back = CrystalBuffer.from_state_dict(_pickle_round_trip(buf.state_dict()), device=CPU)
     assert torch.equal(back.is_val, val)
+    assert back.origin.dtype == torch.int8
+    assert torch.equal(back.origin, org.to(torch.int8))
     ok = ~torch.isnan(pf)
     assert torch.allclose(back.birth_log_pf[ok], pf[ok])
     assert torch.isnan(back.birth_log_pf[~ok]).all(), 'a NaN row must stay NaN, not become 0'
 
 
-@pytest.mark.parametrize('column', ['birth_log_pf', 'is_val'])
+@pytest.mark.parametrize('column', ['birth_log_pf', 'is_val', 'origin'])
 def test_a_traj_carrying_store_without_a_column_is_refused(column):
     """The load-bearing refusal: a replay sidecar written before the column
     existed must fail at RESTORE, not fill a default and detonate at a draw."""
@@ -105,7 +133,7 @@ def test_a_traj_carrying_store_without_a_column_is_refused(column):
         CrystalBuffer.from_state_dict(state, device=CPU)
 
 
-@pytest.mark.parametrize('column', ['birth_log_pf', 'is_val'])
+@pytest.mark.parametrize('column', ['birth_log_pf', 'is_val', 'origin'])
 def test_a_traj_free_store_without_the_columns_still_loads(column):
     """Prior/anchor/dataset stores never had a generating policy or a held-out
     split, so the defaults there are the true values -- refusing them would
@@ -114,6 +142,7 @@ def test_a_traj_free_store_without_the_columns_still_loads(column):
     state.pop(column)
     back = CrystalBuffer.from_state_dict(state, device=CPU)
     assert torch.isnan(back.birth_log_pf).all() and not bool(back.is_val.any())
+    assert torch.equal(back.origin, torch.full((4,), ORIGIN_ROLLOUT, dtype=torch.int8))
 
 
 # ------------------------------------------------------------------ alignment
@@ -138,10 +167,32 @@ def test_add_and_purge_keep_the_columns_aligned():
 
 def test_add_defaults_the_columns_for_the_new_rows_only():
     buf = _buffer(3, birth_log_pf=torch.tensor([0.0, 1.0, 2.0]),
-                  is_val=torch.tensor([True, True, True]))
+                  is_val=torch.tensor([True, True, True]),
+                  origin=torch.full((3,), ORIGIN_EVAL))
     buf.add(_built(2, seed=1), traj=_traj(2, offset=3), init_loss=torch.ones(2))
     assert torch.isnan(buf.birth_log_pf[3:]).all()
     assert torch.equal(buf.is_val, torch.tensor([True, True, True, False, False]))
+    assert torch.equal(buf.origin, torch.tensor(
+        [ORIGIN_EVAL] * 3 + [ORIGIN_ROLLOUT] * 2, dtype=torch.int8))
+
+
+def test_origin_survives_add_and_purge_by_marker():
+    """The eviction the whole column exists to survive: a cohort admitted as
+    eval rows must still read as eval rows after arbitrary rows around them are
+    purged. A column carried but not reindexed passes every length check here."""
+    buf = _buffer(4, origin=torch.tensor(
+        [ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_ROLLOUT]))
+    buf.add(_built(2, seed=1), traj=_traj(2, offset=4), init_loss=torch.ones(2),
+            origin=ORIGIN_EVAL)     # a scalar seeds the whole admission batch
+    assert torch.equal(buf.origin, torch.tensor(
+        [ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_ROLLOUT,
+         ORIGIN_EVAL, ORIGIN_EVAL], dtype=torch.int8))
+
+    buf.purge_by_index([0, 3, 4])
+    assert torch.equal(buf.origin, torch.tensor(
+        [ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_EVAL], dtype=torch.int8))
+    # the trajectory names its own row, so this pins origin to the SAME rows
+    assert torch.allclose(buf.traj[:, 0, 0], torch.tensor([1.0, 2.0, 5.0]))
 
 
 # ----------------------------------------------------------------- the draw

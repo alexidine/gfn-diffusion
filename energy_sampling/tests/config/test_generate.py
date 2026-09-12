@@ -166,6 +166,24 @@ def test_an_unknown_problem_names_the_ones_that_exist():
         generate.arm('x', problem='no_such_problem')
 
 
+@pytest.mark.parametrize('problem', sorted(generate.problems()))
+def test_every_registry_problem_generates_a_launchable_arm(problem):
+    """THE REGRESSION. Until 2026-09-09 `latent_gaussian` declared
+    `prior_path: null`, `molecules_path: null` and an anchor `seed_source` that
+    reads the prior dataset. Generation validated it clean; the run died in
+    startup on `torch.load(None)` with `'NoneType' object has no attribute
+    'seek'`, which names neither the key nor the file.
+
+    Parametrised over the WHOLE registry rather than over that one entry: a
+    registry is a list of problems a generator can express, and an entry that
+    generates an unlaunchable config is documentation of a route nobody can
+    take. `config_invariants.errors` is what `generate.validate` treats as
+    fatal, so this asserts exactly the bar emission applies."""
+    arm = generate.arm(f'reg_{problem}', problem=problem)
+    assert config_invariants.errors(arm) == [], '\n'.join(
+        str(v) for v in config_invariants.errors(arm))
+
+
 # ------------------------------------------------------------- merge semantics
 
 def test_an_override_beats_the_problem_block():

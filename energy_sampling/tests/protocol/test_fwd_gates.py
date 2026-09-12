@@ -323,3 +323,95 @@ def test_the_cadence_readout_is_cumulative_not_per_window():
     m.step_ind = 200
     m._fwd_gates(THRESH, False)
     assert m._rollout_total == 1 and m._rollout_total_from == 200
+
+
+# ---------------------------------------------------------------------------
+# REPLAY WARM-UP (stage.replay_warmup_rows): every step rolls out until the
+# replay buffer holds that many TRAINABLE rows, then it latches off for the stage.
+# ---------------------------------------------------------------------------
+
+class _Buf:
+    def __init__(self, n, n_val=0):
+        import torch
+        self.n = n
+        self.is_val = torch.zeros(n, dtype=torch.bool)
+        self.is_val[:n_val] = True
+
+    def __len__(self):
+        return self.n
+
+
+def _warm(rows, n, every=20, n_val=0, **kw):
+    m = _m(every=every, **kw)
+    m.protocol.stage.replay_warmup_rows = rows
+    m.replay_buffer = _Buf(n, n_val)
+    return m
+
+
+def _run(m, steps):
+    ran = []
+    for step in steps:
+        m.step_ind = step
+        if m._fwd_gates(THRESH, False)[0]:
+            ran.append(step)
+    return ran
+
+
+def test_warmup_rolls_out_every_step_and_counts_them():
+    m = _warm(rows=100, n=10)
+    assert _run(m, range(1, 20)) == list(range(1, 20))
+    assert m._rollout_count == 19, 'a warm-up rollout IS an energy call'
+    assert m._warmup_count == 19
+
+
+def test_warmup_releases_at_the_threshold_and_never_re_arms():
+    """Deliberately unlike occupancy_min_batches: a purge that shrinks the
+    buffer after the release must not put the stage back on every-step rollouts."""
+    m = _warm(rows=100, n=10)
+    _run(m, range(1, 5))
+    m.replay_buffer = _Buf(100)
+    assert _run(m, range(5, 20)) == [], 'released: back on the 1-in-20 cadence'
+    m.replay_buffer = _Buf(3)
+    assert _run(m, range(21, 40)) == [], 'a shrinking buffer does not re-arm it'
+    assert _run(m, [40]) == [40]
+
+
+def test_held_out_rows_do_not_count():
+    m = _warm(rows=100, n=150, n_val=60)
+    assert _run(m, [1, 2]) == [1, 2]
+
+
+def test_a_new_stage_warms_again():
+    m = _warm(rows=100, n=150)
+    assert _run(m, [1]) == []
+    m.protocol.stage.name = 'next_stage'
+    m.replay_buffer = _Buf(5)
+    m.step_ind = 40
+    m._fwd_gates(THRESH, False)                 # the new stage's cadence anchor
+    assert _run(m, [41, 42]) == [41, 42]
+
+
+def test_no_buffer_yet_reads_as_empty():
+    m = _warm(rows=100, n=0)
+    m.replay_buffer = None
+    assert _run(m, [1]) == [1]
+
+
+def test_a_warmup_step_is_a_real_rollout_not_a_z_pin():
+    m = _warm(rows=100, n=0)
+    m.protocol.stage.z_pin_rollout_every = 10
+    m.step_ind = 10
+    assert m._fwd_gates(THRESH, False) == (True, False, False)
+    assert getattr(m, '_z_pin_count', 0) == 0
+
+
+def test_warmup_pre_empts_the_triggers():
+    """A step that rolls out anyway must not also report a trigger reason."""
+    m = _warm(rows=100, n=0, triggers={'drift_std_max': 0.3}, drift_std=9.0)
+    assert _run(m, range(1, 6)) == [1, 2, 3, 4, 5]
+    assert _trig(m) == {}
+
+
+def test_zero_rows_is_the_plain_cadence():
+    m = _warm(rows=0, n=0)
+    assert _run(m, range(0, 41)) == [0, 20, 40]

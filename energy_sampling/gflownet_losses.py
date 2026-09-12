@@ -71,24 +71,33 @@ def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_
     return log_z_target.to(device), target_mask.to(device)
 
 
-def update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor):
+def update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor,
+                                 crystal_batch=None, anchor_energy_fn=None):
     """
     Feed this step's implied energy back to ConditionLogZTracker's running
     per-condition minimum (see ConditionLogZTracker.update_best_energy).
-    log_r is exactly -E/T by construction (MolecularCrystal.energy()
-    divides by temperature before base_set.py's log_reward() negates it,
-    and prebuilt_sample_to_reward follows the identical convention), so
-    recovering E = -log_r * T here is exact, not an approximation, and
-    free -- no extra energy computation or crystal_batch materialization
-    beyond what the loss already computed. No-op when no tracker/
-    condition_id is provided.
+    log_r is -E/T by construction (MolecularCrystal.energy() divides by
+    temperature before base_set.py's log_reward() negates it, and
+    prebuilt_sample_to_reward follows the identical convention), so the
+    mixture's minimum is recovered as E = -log_r * T -- up to float32
+    rounding of the round trip, which is the currency this minimum has
+    always been kept in.
+
+    The physical (anchor) minimum needs the scored batch: anchor_energy_fn
+    (Modeller._anchor_energy_phys) reads E_anchor off `crystal_batch`, or
+    returns None on a run with no prior_flow, where the tracker aliases the
+    two minima. With a prior_flow and no batch (return_exp=False) it raises.
+    anchor_energy_fn=None passes no physical leg at all, which the tracker
+    refuses on a run with a prior_flow. No-op when no tracker/condition_id is
+    provided.
     """
     if condition_log_z is None or condition_id is None:
         return
 
     temperature = 10 ** log_T_tensor.detach()
     energy = -log_r.detach() * temperature
-    condition_log_z.update_best_energy(condition_id, energy)
+    energy_phys = anchor_energy_fn(crystal_batch) if anchor_energy_fn is not None else None
+    condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
 
 def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
@@ -176,8 +185,13 @@ def get_gfn_forward_loss(loss_coeffs,
                          condition_id=None,
                          tb_z_source: str = 'learned',
                          step: int = 0,
+                         anchor_energy_fn=None,
                          ):
     """
+    anchor_energy_fn: reads the per-row anchor currency off the scored batch for
+    condition_log_z's physical minimum -- see update_condition_best_energy. Needs
+    return_exp=True whenever the energy function carries a prior_flow.
+
     freeze_policy/freeze_z (read from loss_coeffs, the single source of
     truth -- scheduled per phase like every other coefficient): forcibly
     detach log_pf/log_pb (all downstream loss terms) or log_Z_learned/
@@ -252,13 +266,17 @@ def get_gfn_forward_loss(loss_coeffs,
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
         log_Z_learned=log_Z_learned, mode_level_stream='fwd')
-    update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor)
+    update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor,
+                                 crystal_batch=crystal_batch, anchor_energy_fn=anchor_energy_fn)
 
     # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
     # branches' log-weights in one scope. Stashed on the model rather than
     # returned because loss_dict is built only under report_losses and its
     # copies are detached; consumed and CLEARED by fused_train_step each step,
-    # so a stale pair can never be read (pooled_condition_vargrad).
+    # so a stale pair can never be read (pooled_condition_vargrad). This is one
+    # of three slots (_live_fwd here; _live_bwd / _live_replay are written by
+    # get_gfn_backward_loss); fwd_loss_coeffs.pooled_source picks which of
+    # fwd and replay pairs with bwd.
     # OFF unless the cross-branch term is actually armed -- see the gate in
     # init_train_constants. These tensors carry grad_fn and the model is an
     # nn.Module, so while they are parked here anything that walks the module
@@ -453,12 +471,20 @@ def get_gfn_backward_loss(loss_coeffs,
                           scramble_condition_tiles: int = 0,
                           mode_level_stream: Optional[str] = None,
                           sample_weights: Optional[torch.Tensor] = None,
+                          live_stash: Optional[str] = 'bwd',
                           ):
     """
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
     docstring -- same contract, applied here right after log_pf/log_pb/
     log_Z_learned are computed, and freeze_policy threaded into the traj
     sampler so the conditioner->flow path is detached too.
+
+    live_stash: which slot on the model this call's live tensors go into when
+    the stash is armed -- 'bwd' (gfn._live_bwd), 'replay' (gfn._live_replay),
+    or None for a call that must not be seen by the pooled term at all (the
+    held-out probe, z_calibration's replay mode, the ray probe's re-score).
+    The bwd and replay branches both come through here, so one slot shared
+    between them is overwritten by whichever ran last.
 
     scramble_condition_tiles: passed straight through to the traj sampler --
     unconditional-prior phase-1 MLE detaches and tile-permutes the condition
@@ -516,9 +542,15 @@ def get_gfn_backward_loss(loss_coeffs,
     # fwd_loss_coeffs and arms BOTH branches, so a backward-local test would
     # read 0 on a pooled-only arm and silently leave the term half-fed. That
     # exact omission has shipped twice (see _runs_grouped_vargrad).
-    if getattr(gfn, '_stash_live_branches', False):
-        gfn._live_bwd = {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
-                         'condition_id': condition_id}
+    # ONE SLOT PER CALLER, named by `live_stash`: replay_train_step runs after
+    # bwd_train_step in the fused step and comes through this same function, so
+    # a single `_live_bwd` slot was silently overwritten by the replay rows.
+    if live_stash not in (None, 'bwd', 'replay'):
+        raise ValueError(f"live_stash must be None, 'bwd' or 'replay', got {live_stash!r}")
+    if live_stash is not None and getattr(gfn, '_stash_live_branches', False):
+        setattr(gfn, f'_live_{live_stash}',
+                {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
+                 'condition_id': condition_id})
 
     losses = []
     """VarGrad losses"""

@@ -8,6 +8,8 @@ works, and the proposed conditional architecture. The ladder of DoF levels and t
 chirality decision are argued in [`internal_dof_ladder.md`](internal_dof_ladder.md) and
 not repeated here.
 
+> **Chart specification and build state now live in [`conformer_parameterisation.md`](conformer_parameterisation.md)**, written 2026-09-08 against code. Where this file and that one disagree about what is built, that one is newer.
+
 ---
 
 ## 1. The pipeline

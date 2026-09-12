@@ -377,5 +377,9 @@ class LarderScorer:
             step=self.m.step_ind,
             scramble_condition_tiles=int(rec.scramble_tiles or 0),
             mode_level_stream=None,
-            sample_weights=to_device(rec.sample_weights, dev))
+            sample_weights=to_device(rec.sample_weights, dev),
+            # a probe re-score runs AFTER fused_train_step clears the live
+            # slots; stashing it would hand the next step's pooled term a
+            # no-grad row set from another parameter point
+            live_stash=None)
         return float(loss.detach())

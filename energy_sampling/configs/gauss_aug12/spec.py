@@ -35,18 +35,52 @@ Rows HELD (hold_dead_latent_rows: true) -- dead rows are not coordinates:
 
     log Z = (n_live / 2) * log(2 * pi * T)  +  n_live * log w
 
-Rows LIVE (false) -- each dead row is an ordinary SDE dim. The gaussian still
-cannot see it (the crystal build clobbers it), but bounding_energy reads
-raw_latents, so its marginal is exp(-k * relu(|x|-1)^2) and it contributes its
-own normaliser:
+Rows LIVE (false) -- each dead row is an ordinary SDE dim, and what it then
+contributes depends on WHICH KIND of dead row it is. The two kinds are dead for
+different reasons and only one of them is invisible to the gaussian:
 
-    log Z = <above>  +  n_dead * log(2 + sqrt(pi / k))
+  * a CLOBBERED ANGLE (enforce_crystal_system overwrites it) round-trips to the
+    canonical 0.0, so the gaussian cannot see it. Only bounding_energy can, since
+    that reads raw_latents, and its marginal exp(-k * relu(|x|-1)^2) contributes
 
-That second term is the FICTITIOUS VOLUME D33 removes. Note it is NOT n_dead*log 2:
-the wall is soft (quadratic, zero-slope onset), so the reachable volume exceeds the
-[-1,1] box by sqrt(pi/k). At k=1 the leak is nearly as large as the box itself
-(3.77 vs 2). The log-2 form was the first prediction and it is wrong by +0.63/dim
-at k=1; the sweep in verify_latent_gaussian.py refutes it across a 20x range of k.
+        log(2 + sqrt(pi / k))       per angle row
+
+    the FICTITIOUS VOLUME D33 removes. Note it is NOT log 2: the wall is soft
+    (quadratic, zero-slope onset), so the reachable volume exceeds the [-1,1] box
+    by sqrt(pi/k). At k=1 the leak is nearly as large as the box itself (3.77 vs
+    2). The log-2 form was the first prediction and is wrong by +0.63/dim at k=1;
+    the sweep in verify_latent_gaussian.py refutes it across a 20x range of k.
+
+  * a FREE AXIS (a centroid row canonicalize_free_axes would pin) does NOT
+    round-trip to 0, because latent_harmonic_en reads
+    latent_params(gauge_fix_free_axes=False) -- deliberately, since on a
+    latent-scored batch the centroid dims are real data and the default call
+    MUTATES the batch. So the gaussian sees the row exactly as emitted, and it is
+    an ORDINARY GAUSSIAN DIMENSION contributing the plain normaliser
+
+        0.5 * log(2 * pi * T) + log w    per free-axis row
+
+    -- the same as any live row. There is no fictitious volume here at all.
+
+So:
+
+    log Z = (n_live + n_free) / 2 * log(2 * pi * T)
+          + (n_live + n_free) * log w
+          + n_angle * log(2 + sqrt(pi / k))
+
+CORRECTED 2026-09-09. The formula previously gave every dead row the soft-wall
+term, which is right only for the angle-only groups (2, 14, 19) it was checked on.
+On sg 4 it was wrong by -2.68 nats and on sg 1 by -7.87. The structural argument
+needs no run: sg 1 with rows LIVE has 9 live rows plus 3 free axes = 12 ordinary
+gaussian dimensions, which is exactly sg 2, a group with no dead rows at all. The
+old formula gave those two -8.47 and -16.60. Both cannot be right. Measurement
+agrees with the corrected form to +0.03 (sg 4) and +0.26 (sg 1, where
+Var(log w) ~ 1.2e3 makes the IS estimate that noisy).
+
+CONSEQUENCE FOR THE BATTERY. The `_off` (rows-live) arms of sg 4 and sg 1 do not
+measure fictitious volume, because under this energy a free axis is not fictitious.
+Only sg 14 and sg 19 test the D33 claim; sg 4 and sg 1 test that a free axis is a
+full gaussian dimension when nothing gauge-fixes it, which is a different question.
 """
 
 # ------------------------------------------------------------------ constants
@@ -108,14 +142,31 @@ def target_c(sg, dim=DIM, mode=MODE):
     return c
 
 
+def free_rows(sg):
+    """The dead rows that are FREE AXES rather than clobbered angles.
+
+    Delegates to the shipping resolver, like dead_rows -- never a second table.
+    The distinction is load-bearing for the rows-LIVE closed form: only a
+    clobbered angle is invisible to the gaussian."""
+    from energy_sampling.models.dead_latent_rows import free_centroid_rows
+    return tuple(free_centroid_rows(int(sg), 1))
+
+
 def analytic_log_z(sg, hold, temperature=T, width=WIDTH, k=BOUNDING_COEFF, dim=DIM):
     """The number the run must reproduce. See the module docstring for the derivation."""
     import math
-    n_dead = len(dead_rows(sg))
-    n_live = int(dim) - n_dead
-    z = (n_live / 2) * math.log(2 * math.pi * temperature) + n_live * math.log(width)
+    dead = set(dead_rows(sg))
+    free = set(free_rows(sg)) & dead
+    angle = dead - free
+    n_live = int(dim) - len(dead)
+    per_dim = 0.5 * math.log(2 * math.pi * temperature) + math.log(width)
+    z = n_live * per_dim
     if not hold:
-        z += n_dead * math.log(2.0 + math.sqrt(math.pi / float(k)))
+        # a clobbered angle reads back the canonical 0.0, so only the soft wall
+        # contributes; a free axis reads back what was emitted and is a full
+        # gaussian dimension
+        z += len(angle) * math.log(2.0 + math.sqrt(math.pi / float(k)))
+        z += len(free) * per_dim
     return z
 
 

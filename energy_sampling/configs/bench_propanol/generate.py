@@ -46,65 +46,80 @@ ARMS = {
 }
 
 PROTOCOL = """protocols:
-  # THE SIMPLEST PROTOCOL THAT TRAINS THIS PROBLEM, and nothing else. Every controller the
-  # richer conformer protocols switch on -- balance, annealing, replay, VarGrad, the lambda
-  # path -- is deliberately absent: in a paired benchmark each one is another way the two
-  # arms could diverge for a reason that is not the architecture.
+  # A SIMPLIFICATION OF THE CRYSTAL `unconditional_tb` PROTOCOL, not a fresh one. That
+  # protocol is the reference for this problem shape, and a hand-rolled substitute was
+  # measurably worse: a warm start of pure MLE followed by TB on both branches DETONATED at
+  # step 61 -- four rewinds, FrozenTrainingState, unrecoverable -- because log Z was still at
+  # its initial value when TB engaged and the policy and Z then fought in one gradient.
+  #
+  # WHAT IS KEPT from the reference, because removing it is what broke:
+  #   * the warm start trains `mle + tbc`, not MLE alone. `tbc` is a TB-consistency residual
+  #     over K same-terminal backward rollouts (hence repeats: 2), so log Z trains DURING the
+  #     warm start. This is the mechanism; `bootstrap_z` is not an alternative here -- it was
+  #     dead on every route until this branch fixed it, and even fixed it anchors on tracker
+  #     evidence that a pure-MLE stage never accumulates (measured: "0 conditions").
+  #   * the terminal stage SPLITS ROLES rather than pointing TB at everything. fwd trains
+  #     Z only (freeze_policy); bwd trains the policy only (freeze_z, inherited). Each
+  #     parameter group gets exactly one trainer, which is what keeps the two from fighting.
+  #
+  # WHAT IS DROPPED, because a paired benchmark wants the fewest moving parts:
+  #   the replay branch, the ratio balance controller, the ray LR sensor, z_calibration,
+  #   rebuild_prior_by_churn on entry, and the adaptive multi-term exit. Each is another way
+  #   the two arms could diverge for a reason that is not the architecture.
   bench_propanol_tb:
     stages:
-      # -- WARM START. Backward MLE from the prior dataset. TB is not fired here at all: a
-      # cold TB start on a 30-dimensional chart spends its first thousands of steps moving
-      # log Z rather than the policy, and that transient is not what this benchmark is about.
-      - name: mle
-        train_mode: fused
+      # -- WARM START. Backward MLE from the prebuilt prior, with tbc keeping log Z honest.
+      - name: warm_start
+        train_mode: bwd
         bwd_sampling_mode: dataset
         flags:
-          update_log_z: true
+          update_log_z: true          # accumulate ema_logw / best_energy evidence
           buffers_active: true
-        # NO min_fracs. It is a FLOOR the balance controller may not go below (and must be
-        # < 1/3); it is not the value. `fracs` sets the mixture, and with no `balance` block
-        # in this protocol nothing nudges it, so 0/1/0 is what runs.
-        fracs: { fwd: 0.0, bwd: 1.0, replay: 0.0 }
+        # DECLARED FOR THE DIAGNOSTIC, NOT FOR THE EXIT. This publishes gates/mle_flat, so
+        # after the fact we can see whether __MLE_STEPS__ steps was actually long enough --
+        # without letting an adaptive gate decide it, which would let the two arms warm-start
+        # for DIFFERENT lengths and confound the comparison with the architecture.
+        mle_gate:
+          slope_t: 2.0
+          min_rate: 0.05
+          window: 300
         loss_coeffs:
-          # tb_z_source EXPLICIT AND IDENTICAL IN BOTH ARMS. `persistent` adds a second,
-          # per-condition log Z bookkeeping system alongside the flow head; every past
-          # CONDITIONAL battery used it, and config_invariants says so. It is deliberately
-          # NOT used here: the benchmark compares log Z between the arms, so both must take
-          # it from the same place -- the flow head, which on the conditional route already
-          # IS Z_MLP(condition embedding). Using `persistent` on one arm only would make the
-          # log Z comparison a comparison of Z mechanisms. If the conditional arm
-          # underperforms, `persistent` is the first thing to try.
-          bwd: { mle: 1.0, tb: 0.0, tb_z_source: learned }
-        # A STEP COUNTER. `bwd/loss` is written every tick and is always above -1e9, so this
-        # term is satisfied on every tick and `patience` alone decides the length: 10 steps
-        # per tick x __PATIENCE__ = __MLE_STEPS__ steps, identically in both arms. See the
-        # docstring for why this is a counter and not `mle_gate`.
+          # repeats > 1 is REQUIRED by tbc: the consistency residual is defined over K
+          # same-terminal backward rollouts, and get_tbc_loss asserts it.
+          bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0, tb_z_source: learned }
+        # A STEP COUNTER. `bwd/loss` is written every tick and is always above -1e9, so the
+        # term passes on every tick and `patience` alone sets the length: 10 steps per tick
+        # x __PATIENCE__ = __MLE_STEPS__ steps, IDENTICALLY in both arms.
         exit:
           - { metric: bwd/loss, above: -1.0e+9, patience: __PATIENCE__ }
+        # NOT `snapshot_prior`. The crystal route freezes the MLE-trained policy as THE prior
+        # model because its prior has to be learned; this route already has a fitted
+        # InternalPrior drawing r/theta at the force field's own thermal widths.
         on_exit: [ 'snapshot:phase1_exit' ]
 
       # -- TB, 50:50 fwd:bwd, fused. Terminal: no exit block, runs to `epochs`.
-      # `fracs` ARE LOSS WEIGHTS ON FULL BATCHES, not a sampling split -- both branches run
-      # every step and each contributes half the gradient.
+      # `fracs` ARE LOSS WEIGHTS ON FULL BATCHES, not a sampling split: both branches run
+      # every step and each contributes half the gradient. replay at 0 falls below the 0.01
+      # deactivate_threshold and is skipped entirely.
       - name: tb
         train_mode: fused
         bwd_sampling_mode: dataset
-        # ANCHOR log Z ON ENTRY. The MLE stage runs tb: 0.0, so nothing trains the flow head
-        # there and log Z sits at its initial value for the whole warm start -- the run says
-        # so ("no mode trains the flow (Z) head"). Without this the TB stage's first
-        # thousands of steps are spent moving log Z rather than the policy, which is exactly
-        # the transient the warm start exists to avoid, and it would be spent DIFFERENTLY by
-        # the two arms (their Z heads differ: a scalar against Z_MLP(condition)). Anchoring
-        # both on the tracker's ema_logw is what makes the log Z comparison start level.
-        on_enter: [ 'bootstrap_z' ]
         flags:
           update_log_z: true
           buffers_active: true
-        # 50:50, and it STAYS 50:50: no `balance` block, so nothing moves it. replay at 0
-        # falls below the 0.01 deactivate_threshold and is skipped entirely.
         fracs: { fwd: 0.5, bwd: 0.5, replay: 0.0 }
         loss_coeffs:
-          fwd: { tb: 1.0, tb_z_source: learned }
+          # ONE TRAINER PER PARAMETER GROUP, the reference protocol's arrangement:
+          #   fwd -> Z only, on-policy, policy detached at the source
+          #   bwd -> policy only, from the prebuilt prior (freeze_z inherited from the base)
+          # tb_z_source EXPLICIT AND IDENTICAL IN BOTH ARMS. `persistent` adds a second,
+          # per-condition log Z bookkeeping system alongside the flow head; every past
+          # CONDITIONAL battery used it and config_invariants says so. Deliberately not used:
+          # this benchmark compares log Z BETWEEN the arms, so both must take it from the same
+          # place -- the flow head, which on the conditional route already IS
+          # Z_MLP(condition embedding). Using `persistent` on one arm only would make the log Z
+          # comparison a comparison of Z mechanisms.
+          fwd: { tb: 1.0, freeze_policy: 1.0, tb_z_source: learned }
           bwd: { tb: 1.0, mle: 0.0, tb_z_source: learned }
 """
 

@@ -89,6 +89,13 @@ LAST -- the boundary/reduction penalty only firms back up to full strength
 once that stage's whole balance has converged, never in place of chasing an
 active violation.
 
+balance.anneal_cooldown_steps (lexicographic only; train steps; 0 = off)
+spaces those events. From the stage's first tick until the first anneal
+fires, the rules are not evaluated at all -- no running best is seeded from
+the entry transient -- and the nudge takes default_boost; for N steps after
+each anneal event the rules are evaluated but the clean streak is held at 0.
+Refused on any other kind, and above 0 on a stage with nothing to anneal.
+
 Frac floors are EXPLICIT per stage: min_fracs {mode: floor} (fallback
 controller.min_mode_frac) and an optional per-stage deactivate_threshold. A
 floor at or above the deactivate threshold means that branch is always
@@ -131,6 +138,7 @@ progress silently reset on every resume.
 """
 
 import math
+import numbers
 import os
 from copy import deepcopy
 
@@ -139,7 +147,16 @@ import numpy as np
 MODES = ('fwd', 'bwd', 'replay')
 TRAIN_MODES = ('bwd', 'fused')
 BWD_SAMPLING_MODES = ('dataset', 'prior')
-STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
+# fwd_loss_coeffs.pooled_source: which branch's live rows pair with bwd's in the
+# cross-branch pooled VarGrad term (train.py fused_train_step)
+POOLED_SOURCES = ('fwd', 'replay')
+# stage condition_draw.pick: how the aligned per-condition draw chooses its C
+# conditions among the eligible ones (train.py _choose_draw_conditions)
+CONDITION_DRAW_PICKS = ('uniform', 'weighted')
+# condition_log_z.rollout_condition_draw: how a forward rollout chooses its
+# mol_dataset rows (train.py _rollout_mol_batch). 'iid' is the draw before the key.
+ROLLOUT_CONDITION_DRAWS = ('iid', 'cycle', 'under_drawn')
+STAGE_FLAGS =('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
                'buffers_active', 'weighted_bwd_sampling', 'z_calibration')
 
 # `mle_gate` is a BLOCK, not a flag. It was a flag on the stage while its three
@@ -188,6 +205,45 @@ RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift',
              'abs', 'if_missing', 'lookahead', 'anneal'}
 TERM_KEYS = {'metric', 'above', 'below', 'abs', 'patience'}
 
+#: Appended to a numeric-field error when the offending value is a string.
+#: PyYAML resolves YAML 1.1 floats: a dot AND a signed exponent are required,
+#: so `1.0e6` and `1e+6` both load as STRINGS and only `1.0e+6` is a float.
+_YAML_FLOAT_HINT = (" If this was meant as a number in scientific notation: PyYAML "
+                    "only reads it as a float with a dot and a SIGNED exponent -- "
+                    "write 1.0e+6, not 1.0e6 or 1e6 (both load as strings).")
+
+
+def _require_real(value, where: str):
+    """`value` if it is a real int/float, else ValueError naming `where`.
+
+    Refuses bool (an int subclass: `above: yes` would compare as 1) and every
+    string, including numeric-looking ones -- a string here means the YAML did
+    not resolve it as a number, and comparing against it fails mid-run with a
+    TypeError that names neither the stage nor the key. NaN is refused too: no
+    comparison against it is ever true, so a NaN bar is a term that can never
+    pass while reading as one that gates."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or value != value:
+        hint = _YAML_FLOAT_HINT if isinstance(value, str) else ''
+        raise ValueError(f"{where} must be a number, got {value!r} "
+                         f"({type(value).__name__}).{hint}")
+    return value
+
+
+def _is_number(value) -> bool:
+    """`_require_real`'s test as a predicate: a real int/float, not bool, not NaN."""
+    return (not isinstance(value, bool) and isinstance(value, numbers.Real)
+            and value == value)
+
+
+def _require_count(value, where: str, minimum: int = 0):
+    """`value` as an int if it is an integer (not bool) >= `minimum`, else
+    ValueError naming `where`. A float is refused rather than truncated:
+    `patience: 2.5` states a streak length no integer counter reaches."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < minimum:
+        raise ValueError(f"{where} must be an integer >= {minimum}, got {value!r} "
+                         f"({type(value).__name__}).")
+    return int(value)
+
 
 def fresh_stage_ctrl():
     """The per-stage mutable engine state, reset at every transition and
@@ -207,6 +263,12 @@ def fresh_stage_ctrl():
         # metric tracker's.
         'gate_written': {},
         'anneal_streak': 0,
+        # lexicographic balance.anneal_cooldown_steps: the step of the stage's
+        # last anneal event (None = none yet), the stage's event count, and
+        # whether the last tick sat inside a cooldown. See _balance_tick.
+        'last_anneal_step': None,
+        'anneal_events': 0,
+        'anneal_cooling': 0.0,
         'boost': None,      # last chosen boost mode (logging)
         'exit_armed': False,
         'request_eval': False,
@@ -254,6 +316,8 @@ class Stage:
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
                                'fwd_rollout_triggers', 'z_pin_rollout_every',
+                               'fwd_z_sidecar', 'replay_warmup_rows',
+                               'condition_draw',
                                # accepted here ONLY so Stage.__init__'s own check
                                # reports the rename; the generic unknown-key error
                                # would otherwise fire first and say nothing useful
@@ -419,7 +483,210 @@ class Stage:
         if self.skip_if is not None and self.skip_if not in SKIP_CONDITIONS:
             raise ValueError(f"stage '{self.name}': skip_if must be one of {SKIP_CONDITIONS}")
 
+        # after balance/fracs/loss_coeffs: every check below reads them
+        self._parse_replay_seat(spec)
+        self._parse_condition_draw(spec)
+
     # ------------------------------------------------------------ sub-parsers
+
+    def _parse_replay_seat(self, spec):
+        """The three keys that let the REPLAY branch take the forward branch's
+        seat on a cadenced fused stage (train.py fused_train_step / _fwd_gates):
+
+          loss_coeffs.fwd.pooled_source  which branch's live rows pair with bwd's
+                                         in the pooled VarGrad term
+          fwd_z_sidecar                  the forward loss on rollout steps, added
+                                         at weight 1 outside the frac mix
+          replay_warmup_rows             roll out every step until the replay
+                                         buffer holds this many trainable rows
+
+        Refused here on what the STAGE declares, because this parse is the only
+        check that runs on every protocol in the library, selected or not. What
+        depends on the base loss-coefficient blocks or on global keys is refused
+        on the RESOLVED config by config_invariants.replay_seat_problems, which
+        Modeller.set_loss_coeffs raises on."""
+        for mode in ('bwd', 'replay'):
+            if 'pooled_source' in self.loss_coeffs.get(mode, {}):
+                raise ValueError(
+                    f"stage '{self.name}': loss_coeffs.{mode}.pooled_source -- the "
+                    f"key lives on the fwd block, beside pooled_vg; on {mode} nothing "
+                    f"reads it.")
+        fwd_lc = self.loss_coeffs.get('fwd', {})
+        src = fwd_lc.get('pooled_source')
+        if src is not None:
+            if src not in POOLED_SOURCES:
+                raise ValueError(f"stage '{self.name}': loss_coeffs.fwd.pooled_source="
+                                 f"{src!r}; must be one of {POOLED_SOURCES}")
+            if src == 'replay':
+                if not self.replay_trains:
+                    raise ValueError(
+                        f"stage '{self.name}': pooled_source 'replay' on a stage whose "
+                        f"replay branch can never carry weight (train_mode "
+                        f"{self.train_mode!r}, balance cannot raise replay, or replay "
+                        f"pinned at 0). The pooled term would find no replay rows on "
+                        f"any step and read INERT.")
+                pv = fwd_lc.get('pooled_vg')
+                if pv is not None and not (_is_number(pv) and pv > 0):
+                    raise ValueError(
+                        f"stage '{self.name}': pooled_source 'replay' with pooled_vg="
+                        f"{pv!r}. The source only picks the pooled term's first side; "
+                        f"with the term off it is a dead key.")
+                # The pair needs CONDITION ALIGNMENT. bwd is aligned to the forward
+                # batch only under the fwd source, and replay runs after bwd, so
+                # without the aligned per-condition draw the replay and bwd rows
+                # share a condition only by chance collision.
+                if spec.get('condition_draw') is None:
+                    raise ValueError(
+                        f"stage '{self.name}': pooled_source 'replay' without "
+                        f"condition_draw. Only the aligned per-condition draw hands replay "
+                        f"and bwd the same conditions; without it the pooled groups mix by "
+                        f"chance collision only.")
+
+        # FORWARD Z SIDECAR. On every step the forward branch rolls out (cadence,
+        # warm-up or trigger; never a z-pin) its loss is added to the fused loss
+        # at weight 1, OUTSIDE the frac-normalised branch mix, the way the pooled
+        # term is. fwd therefore has no frac: every refusal below is a way the
+        # forward loss could also enter the mix (counted twice) or reach the
+        # policy rather than only Z(c). Declared on the stage, not inherited from
+        # the base block, because the claim "reaches only Z(c)" rests on them.
+        sidecar = spec.get('fwd_z_sidecar', False)
+        if not isinstance(sidecar, bool):
+            raise ValueError(f"stage '{self.name}': fwd_z_sidecar must be true or "
+                             f"false, got {sidecar!r}")
+        self.fwd_z_sidecar = sidecar
+        if sidecar:
+            if self.fwd_rollout_every <= 0:
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar needs fwd_rollout_every > 0. "
+                    f"The sidecar rides the cadenced rollouts; without a cadence the "
+                    f"forward branch is an ordinary frac-weighted branch.")
+            fp = fwd_lc.get('freeze_policy')
+            if not (_is_number(fp) and fp > 0.5):
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar needs loss_coeffs.fwd."
+                    f"freeze_policy > 0.5 declared on the stage, got {fp!r}. At weight "
+                    f"1 outside the mix the forward loss would otherwise train the "
+                    f"policy on every rollout.")
+            ez = fwd_lc.get('emp_z')
+            if not (_is_number(ez) and ez > 0):
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar needs loss_coeffs.fwd.emp_z > 0 "
+                    f"declared on the stage, got {ez!r}. emp_z is what pins Z(c) on "
+                    f"the rollout; the z_level_fill refuses a Z(c) head.")
+            reps = fwd_lc.get('repeats')
+            if reps is not None and not (_is_number(reps) and reps >= 2):
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar with loss_coeffs.fwd.repeats="
+                    f"{reps!r}. emp_z's per-condition target needs groups of >= 2 "
+                    f"forward rows; at repeats 1 every group is a singleton and the "
+                    f"sidecar trains nothing.")
+            deact = self.deactivate_threshold
+            if deact is None:
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar needs the stage to declare "
+                    f"deactivate_threshold. fwd must stay below it on every step, and "
+                    f"that cannot be judged against a global fallback here.")
+            if not self.fracs:
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar needs the stage to declare "
+                    f"fracs; without them the stage inherits the previous stage's fwd "
+                    f"share.")
+            total = float(sum(self.fracs.values()))
+            share = float(self.fracs.get('fwd', 0.0)) / total if total > 0 else 0.0
+            if share >= deact:
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar with an entry fwd share "
+                    f"{share:g} >= deactivate_threshold {deact:g}. The forward loss "
+                    f"would enter the frac mix AND the sidecar. Set fracs.fwd to 0.")
+            floor = self.min_fracs.get('fwd')
+            if floor is not None and floor >= deact:
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar with min_fracs.fwd {floor:g} >= "
+                    f"deactivate_threshold {deact:g}; the floor keeps fwd in the mix.")
+            if self.balance_can_raise('fwd', deact):
+                raise ValueError(
+                    f"stage '{self.name}': fwd_z_sidecar on a stage whose balance can "
+                    f"raise fwd to deactivate_threshold {deact:g} (a boost, a split "
+                    f"metric or a pin naming fwd). fwd has no frac under the sidecar.")
+
+        # REPLAY WARM-UP. While the stage's replay buffer holds fewer trainable
+        # rows than this, every fused step rolls out; the first step it holds
+        # enough latches the warm-up OFF for the rest of the stage.
+        rows = spec.get('replay_warmup_rows', 0)
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+            raise ValueError(f"stage '{self.name}': replay_warmup_rows must be an "
+                             f"integer >= 0 (0 = off), got {rows!r}")
+        self.replay_warmup_rows = rows
+        if rows > 0:
+            if self.fwd_rollout_every <= 0:
+                raise ValueError(
+                    f"stage '{self.name}': replay_warmup_rows={rows} needs "
+                    f"fwd_rollout_every > 0. Without a cadence every step already "
+                    f"rolls out, and the key would silently do nothing.")
+            if not self.replay_trains:
+                raise ValueError(
+                    f"stage '{self.name}': replay_warmup_rows={rows} on a stage whose "
+                    f"replay branch can never carry weight. Nothing draws the rows it "
+                    f"waits for.")
+
+    def _parse_condition_draw(self, spec):
+        """`condition_draw: {conditions: C, replay_rows: X, prior_rows: Y, pick}`
+        -- the ALIGNED PER-CONDITION DRAW of a fused step (train.py
+        _choose_draw_conditions). Once per step C conditions are chosen among
+        those holding >= X trainable replay rows and >= Y prior-buffer rows, and
+        the replay and bwd branches draw EXACTLY X and Y distinct rows of each
+        (batches C*X and C*Y). conditions 0 = derive C from the live batch.
+
+        Absent (or null) = off = today's draws. A present block declares all
+        three numbers: a partial block is refused rather than read as off.
+        Refused here on what the STAGE declares; the prioritised replay draw and
+        an inherited condition_block_m are judged on the resolved config by
+        config_invariants.condition_draw_problems."""
+        node = spec.get('condition_draw')
+        self.condition_draw = None
+        if node is None:
+            return
+        where = f"stage '{self.name}': condition_draw"
+        if not isinstance(node, dict):
+            raise ValueError(f"{where} must be a mapping of conditions / replay_rows / "
+                             f"prior_rows / pick, got {type(node).__name__}")
+        unknown = set(node) - {'conditions', 'replay_rows', 'prior_rows', 'pick'}
+        if unknown:
+            raise ValueError(f"{where} has unknown keys {sorted(unknown)}; known are "
+                             f"conditions, replay_rows, prior_rows, pick")
+        missing = {'conditions', 'replay_rows', 'prior_rows'} - set(node)
+        if missing:
+            raise ValueError(f"{where} is missing {sorted(missing)}. Declare conditions, "
+                             f"replay_rows and prior_rows, or omit the block (= off).")
+        conditions = _require_count(node['conditions'], f"{where}.conditions", 0)
+        # a condition's group needs a partner: one row carries no grouped signal
+        replay_rows = _require_count(node['replay_rows'], f"{where}.replay_rows", 2)
+        prior_rows = _require_count(node['prior_rows'], f"{where}.prior_rows", 2)
+        pick = node.get('pick', 'uniform')
+        if pick not in CONDITION_DRAW_PICKS:
+            raise ValueError(f"{where}.pick={pick!r}; must be one of {CONDITION_DRAW_PICKS}")
+        if self.train_mode != 'fused':
+            raise ValueError(f"{where} needs train_mode 'fused' (the fused step chooses the "
+                             f"condition set), got {self.train_mode!r}.")
+        if self.bwd_sampling_mode != 'prior':
+            raise ValueError(f"{where} needs bwd_sampling_mode 'prior' (the bwd rows come "
+                             f"from prior_buffer), got {self.bwd_sampling_mode!r}.")
+        if not self.replay_trains:
+            raise ValueError(f"{where} on a stage whose replay branch can never carry "
+                             f"weight; it would choose conditions for a draw that never runs.")
+        if bool(self.flags.get('weighted_bwd_sampling', False)):
+            raise ValueError(f"{where} with flags.weighted_bwd_sampling: the aligned draw "
+                             f"bypasses the loss-weighted bwd draw, so the flag would read "
+                             f"as armed while doing nothing. Set it false.")
+        for mode in ('bwd', 'replay'):
+            cbm = self.loss_coeffs.get(mode, {}).get('condition_block_m')
+            if cbm is not None and not (_is_number(cbm) and cbm == 0):
+                raise ValueError(
+                    f"{where} with loss_coeffs.{mode}.condition_block_m={cbm!r}. Both set "
+                    f"how many rows each condition contributes -- one switch only. Set "
+                    f"it 0.")
+        self.condition_draw = {'conditions': conditions, 'replay_rows': replay_rows,
+                               'prior_rows': prior_rows, 'pick': pick}
 
     def _normalize_boost(self, raw, where):
         """A boost value: a single mode name, or a {mode: weight} mix (positive
@@ -590,10 +857,12 @@ class Stage:
             raise ValueError(f"stage '{self.name}': unknown hot_lr_sensor keys "
                              f"{sorted(bad)} (known: {sorted(self._HOT_KEYS)})")
 
+        where = f"stage '{self.name}': hot_lr_sensor"
         out = {'action': node.get('action', 'report'),
                'form': node.get('form', 'log'),
-               'row_steps': int(node.get('row_steps', 10)),
-               'floor_percentile': float(node.get('floor_percentile', 10.0))}
+               'row_steps': _require_count(node.get('row_steps', 10), f"{where}.row_steps"),
+               'floor_percentile': float(_require_real(node.get('floor_percentile', 10.0),
+                                                       f"{where}.floor_percentile"))}
 
         # ACTION IS A CLOSED VOCABULARY OF ONE. Report-only is not a default to
         # be overridden -- making this actuate is a code change with a review,
@@ -622,7 +891,7 @@ class Stage:
                 f"channel name across branches is a bug.")
         out['channel'] = channel
 
-        out['rows'] = int(node.get('rows', 0))
+        out['rows'] = _require_count(node.get('rows', 0), f"{where}.rows")
         if out['rows'] < 3:
             raise ValueError(
                 f"stage '{self.name}': hot_lr_sensor.rows must be >= 3, got "
@@ -635,7 +904,7 @@ class Stage:
                              f">= 1, got {out['row_steps']}")
 
         above = node.get('above')
-        out['above'] = float('nan') if above is None else float(above)
+        out['above'] = float('nan') if above is None else float(_require_real(above, f"{where}.above"))
         if not math.isfinite(out['above']) or out['above'] <= 0:
             raise ValueError(
                 f"stage '{self.name}': hot_lr_sensor.above must be a positive "
@@ -818,6 +1087,11 @@ class Stage:
             return None
         node = dict(node)
         kind = node.get('kind', 'lexicographic')
+        if 'anneal_cooldown_steps' in node and kind != 'lexicographic':
+            # a cooldown nothing reads would read as an armed one
+            raise ValueError(f"stage '{self.name}': balance.anneal_cooldown_steps needs kind: "
+                             f"lexicographic (it spaces the lexicographic clean-streak "
+                             f"anneal); kind {kind!r} never reads it")
         if kind == 'lexicographic':
             rules = node.get('rules') or []
             for i, r in enumerate(rules):
@@ -832,6 +1106,19 @@ class Stage:
                                      f"calibration gate), or 'relative: best' is required")
                 if 'relative' in r and r['relative'] != 'best':
                     raise ValueError(f"stage '{self.name}' rule {i}: only 'relative: best' is supported")
+                # consumed via float() at tick time, so a bad value otherwise
+                # surfaces mid-run (or, for a numeric string, is silently coerced)
+                where = f"stage '{self.name}' rule {i} (metric {r.get('metric')!r})"
+                for key in ('above', 'below', 'margin', 'drift', 'floor'):
+                    if key in r:
+                        _require_real(r[key], f"{where}: '{key}'")
+                ann = r.get('anneal')
+                if isinstance(ann, dict):
+                    if 'rate' in ann:
+                        _require_real(ann['rate'], f"{where}: 'anneal.rate'")
+                    # min may name a metric (a live floor); only a non-string must be numeric
+                    if 'min' in ann and not isinstance(ann['min'], str):
+                        _require_real(ann['min'], f"{where}: 'anneal.min'")
                 if 'below' in r and r.get('anneal'):
                     raise ValueError(f"stage '{self.name}' rule {i}: 'below' rules don't anneal "
                                      f"(tightening would RAISE the bar -- set it where you mean it)")
@@ -865,7 +1152,23 @@ class Stage:
                 if bad:
                     raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} "
                                      f"unknown keys {sorted(bad)}")
+                for key in ('target', 'rate'):
+                    if key in spec:
+                        _require_real(spec[key], f"stage '{self.name}': anneal_coeffs.{name}.{key}")
             node['anneal_coeffs'] = anneal_coeffs
+            # ANNEAL COOLDOWN, in train steps (0 = off, the pre-cooldown
+            # behaviour); its two phases are in _balance_tick. Refused above 0
+            # where an anneal event changes nothing: no anneal_coeffs and no
+            # absolute rule carrying `anneal` (_anneal tightens only those).
+            cooldown = _require_count(node.get('anneal_cooldown_steps', 0),
+                                      f"stage '{self.name}': balance.anneal_cooldown_steps")
+            if cooldown > 0 and not anneal_coeffs and not any(
+                    r.get('anneal') and 'above' in r for r in node['rules']):
+                raise ValueError(
+                    f"stage '{self.name}': balance.anneal_cooldown_steps={cooldown} on a "
+                    f"stage with nothing to anneal (no anneal_coeffs, no 'above' rule "
+                    f"carrying 'anneal'); it would space events that change nothing.")
+            node['anneal_cooldown_steps'] = cooldown
         elif kind == 'proportional':
             if node.get('anneal_coeffs'):
                 raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
@@ -895,16 +1198,18 @@ class Stage:
                 bad = set(anneal) - {'rate', 'patience', 'min_scale'}
                 if bad:
                     raise ValueError(f"stage '{self.name}': proportional anneal unknown keys {sorted(bad)}")
-                rate = float(anneal.get('rate', 0.98))
+                rate = float(_require_real(anneal.get('rate', 0.98),
+                                           f"stage '{self.name}': proportional anneal.rate"))
                 if not 0.0 < rate < 1.0:
                     raise ValueError(f"stage '{self.name}': proportional anneal.rate must be in (0, 1), got {rate}")
-                min_scale = float(anneal.get('min_scale', 0.25))
+                min_scale = float(_require_real(anneal.get('min_scale', 0.25),
+                                                f"stage '{self.name}': proportional anneal.min_scale"))
                 if not 0.0 < min_scale <= 1.0:
                     raise ValueError(f"stage '{self.name}': proportional anneal.min_scale "
                                      f"must be in (0, 1], got {min_scale}")
-                patience = int(anneal.get('patience', 20))
-                if patience < 1:
-                    raise ValueError(f"stage '{self.name}': proportional anneal.patience must be >= 1")
+                patience = _require_count(anneal.get('patience', 20),
+                                          f"stage '{self.name}': proportional anneal.patience",
+                                          minimum=1)
                 anneal = {'rate': rate, 'patience': patience, 'min_scale': min_scale}
             node['anneal'] = anneal
             # per-mode SOFT reference levels subtracted before the split (see
@@ -1111,7 +1416,17 @@ class Stage:
                                  f"(it anneals off the lexicographic clean-streak event)")
             bad = set(node) - {'kind', 'ramp', 'guard', 'metric', 'bar', 'up', 'down',
                                'pinned', 'bounds', 'ratchet_metric', 'ratchet_tol',
-                               'ratchet_release_tol'}
+                               'ratchet_release_tol', 'ratchet_cooldown_steps'}
+            if 'ratchet_z_bar' in node:
+                # RETIRED. It gated the gr_best write on the FWD branch's clipped TB
+                # residual while the ratchet's level is a BWD quantity; the two
+                # branches' log Z reach their fixed points at different times, so the
+                # proxy could not see the lag that actually contaminates the level.
+                # `ratchet_cooldown_steps` covers the same transient directly.
+                # Refused rather than ignored -- a dead gate key reads as an armed gate.
+                raise ValueError(f"stage '{self.name}': gated_ramp ratchet_z_bar is retired; "
+                                 f"use ratchet_cooldown_steps (it freezes the fracs and defers "
+                                 f"the first gr_best for N steps after stage entry)")
             if bad:
                 raise ValueError(f"stage '{self.name}': gated_ramp balance unknown keys {sorted(bad)}")
             ramp, guard = node.get('ramp'), node.get('guard')
@@ -1194,6 +1509,25 @@ class Stage:
                                      f"releases the instant it fires")
                 node['ratchet_release_tol'] = float(rel)
             node['ratchet_metric'] = rm
+            # COOLDOWN: train steps after stage entry during which the ramp is
+            # FROZEN and no `gr_best` is recorded. The ratchet's reference is a
+            # running MINIMUM, so a value read while the stage is still settling
+            # -- log Z walking to its fixed point, the buffer reaching its
+            # churned mix -- is a level no later state can return to, and the
+            # trip latches for the whole stage. Freezing the fracs too (rather
+            # than only the capture) is what makes the length uncritical: a
+            # cooldown that is too long costs nothing, so err long.
+            cd = node.get('ratchet_cooldown_steps', 0) or 0
+            try:
+                cd = int(cd)
+            except (TypeError, ValueError):
+                raise ValueError(f"stage '{self.name}': gated_ramp "
+                                 f"ratchet_cooldown_steps must be an integer >= 0, "
+                                 f"got {node.get('ratchet_cooldown_steps')!r}")
+            if cd < 0:
+                raise ValueError(f"stage '{self.name}': gated_ramp "
+                                 f"ratchet_cooldown_steps must be >= 0, got {cd}")
+            node['ratchet_cooldown_steps'] = cd
         else:
             raise ValueError(f"stage '{self.name}': balance.kind must be "
                              f"lexicographic|proportional|constraint|ratio|gated_ramp")
@@ -1235,6 +1569,19 @@ class Stage:
             if ('above' in t) == ('below' in t):
                 raise ValueError(f"stage '{self.name}' exit term {i}: exactly one of "
                                  f"'above'/'below' is required")
+            metric = t.get('metric')
+            if not isinstance(metric, str) or not metric:
+                raise ValueError(f"stage '{self.name}' exit term {i}: 'metric' must be a "
+                                 f"non-empty string, got {metric!r}")
+            # checked HERE, not left to _term_passes: a non-number bar used to
+            # load cleanly and raise a context-free TypeError at the first tick
+            # that resolved the metric, i.e. mid-run
+            side = 'above' if 'above' in t else 'below'
+            where = f"stage '{self.name}' exit term {i} (metric {metric!r}): '{side}'"
+            _require_real(t[side], where)
+            if 'patience' in t:
+                _require_count(t['patience'], f"stage '{self.name}' exit term {i} "
+                                              f"(metric {metric!r}): 'patience'")
             terms.append(dict(t))
         return terms
 
@@ -1331,6 +1678,46 @@ class Stage:
         default = self.balance['default_boost']
         out.update(default if isinstance(default, dict) else {default})
         return out
+
+    def balance_can_raise(self, mode, threshold) -> bool:
+        """Can this stage's balance move `mode`'s frac to `threshold` or above?
+
+        Sharper than `mode in active_modes`, which counts a PINNED mode by the
+        presence of its key: `pinned: {fwd: 0.0}` holds fwd at zero and is not a
+        way for it to rise. The entry frac and min_fracs are the caller's to
+        judge; this reads the balance only. No balance = the fracs stay at their
+        entry values, so nothing raises them."""
+        b = self.balance
+        if b is None:
+            return False
+        if b['kind'] in ('proportional', 'constraint', 'ratio', 'gated_ramp'):
+            if mode in b['metrics']:
+                return True
+            pinned = b.get('pinned') or {}
+            return mode in pinned and float(pinned[mode]) >= threshold
+        return mode in self.active_modes
+
+    @property
+    def replay_trains(self) -> bool:
+        """Can the fused REPLAY branch ever carry weight on this stage?
+
+        The stage half of train.py's replay_in_play (fused, and the balance can
+        raise replay off the floor), with a pin read by VALUE under every split
+        kind. A stage without balance holds its entry fracs, so it trains replay
+        iff that entry share is nonzero (or it declares no fracs and inherits)."""
+        if self.train_mode != 'fused':
+            return False
+        b = self.balance
+        if b is None:
+            return not self.fracs or float(self.fracs.get('replay', 0.0)) > 0.0
+        if b['kind'] in ('proportional', 'constraint', 'ratio', 'gated_ramp'):
+            if 'replay' in b['metrics']:
+                return True
+            pinned = b.get('pinned') or {}
+            if 'replay' in pinned:
+                return float(pinned['replay']) > 0.0
+            return float(self.fracs.get('replay', 0.0)) > 0.0
+        return 'replay' in self.active_modes
 
     @property
     def read_modes(self):
@@ -1464,6 +1851,18 @@ class StageProtocol:
         """Live loss coefficients for `mode`: the base config block (captured
         once, pristine) overlaid with the current stage's overrides. Unknown
         override keys are a config error, not a silent no-op."""
+        base = self.base_coeffs(mode)
+        overrides = self.stage.loss_coeffs.get(mode, {})
+        unknown = set(overrides) - set(base)
+        if unknown:
+            raise ValueError(f"stage '{self.stage.name}' {mode} loss_coeffs override unknown "
+                             f"keys {sorted(unknown)} -- add them to the base "
+                             f"{mode}_loss_coeffs block first")
+        return {**base, **overrides}
+
+    def base_coeffs(self, mode: str) -> dict:
+        """The pristine base `{mode}_loss_coeffs` block, captured on first use --
+        before set_loss_coeffs has overwritten args with any stage's overlay."""
         if self._coeff_defaults is None:
             # str is admitted alongside the numbers because not every entry in a
             # loss_coeffs block is a weight -- tb_z_source is 'learned'/'persistent'
@@ -1475,14 +1874,7 @@ class StageProtocol:
                 m: {k: v for k, v in vars(getattr(self.m.args, f'{m}_loss_coeffs')).items()
                     if isinstance(v, (int, float, str))}
                 for m in MODES}
-        base = self._coeff_defaults[mode]
-        overrides = self.stage.loss_coeffs.get(mode, {})
-        unknown = set(overrides) - set(base)
-        if unknown:
-            raise ValueError(f"stage '{self.stage.name}' {mode} loss_coeffs override unknown "
-                             f"keys {sorted(unknown)} -- add them to the base "
-                             f"{mode}_loss_coeffs block first")
-        return {**base, **overrides}
+        return self._coeff_defaults[mode]
 
     def energy_coeffs(self) -> dict:
         """Live values for whichever energy_config coefficients the CURRENT
@@ -2226,26 +2618,59 @@ class StageProtocol:
             return
         ctrl = self.m.args.controller
 
-        chosen = None
-        for i, rule in enumerate(bal['rules']):
-            rs = self._rule_state(i)
-            v = self._rule_value(rule, rs)
-            # every rule is evaluated EVERY tick, even once a higher rule has
-            # already won: a relative rule's running best must keep tracking
-            # while it is outranked (the legacy controllers computed every
-            # elevation unconditionally), or it would re-baseline at whatever
-            # level the metric drifted to during the excursion and mask the
-            # degradation the detector exists to catch
-            if self._rule_violated(rule, rs, v) and chosen is None:
-                chosen = rule['boost']
-        if chosen is None:
+        # ANNEAL COOLDOWN (balance.anneal_cooldown_steps; 0 = off). Measured
+        # from the LATER of the stage's first tick and its last anneal event.
+        # Both are stage_ctrl stamps, so a resume keeps them; the entry stamp
+        # is the one gated_ramp's ratchet_cooldown_steps anchors on.
+        #   entry        (no anneal yet this stage) the rules are NOT evaluated:
+        #                no running best is captured from the entry transient
+        #                (the gated_ramp latch -- a minimum read while the stage
+        #                settles is a level no later state returns to). The
+        #                nudge takes default_boost and the streak stays 0.
+        #   post-anneal  the rules ARE evaluated, so the running bests keep
+        #                tracking, but the clean streak is held at 0: no anneal.
+        cooldown = int(bal.get('anneal_cooldown_steps', 0) or 0)
+        step = int(getattr(self.m, 'step_ind', 0) or 0)
+        cooling = entry_cooling = False
+        if cooldown > 0:
+            entry = self.ctrl.get('gr_entry_step')
+            if entry is None:
+                entry = self.ctrl['gr_entry_step'] = step
+            last = self.ctrl.get('last_anneal_step')
+            since = step - (int(entry) if last is None else max(int(entry), int(last)))
+            cooling = since < cooldown
+            entry_cooling = cooling and last is None
+        self.ctrl['anneal_cooling'] = 1.0 if cooling else 0.0
+
+        if entry_cooling:
             chosen = bal['default_boost']
-            self.ctrl['anneal_streak'] += 1
-            if self.ctrl['anneal_streak'] >= getattr(ctrl, 'anneal_patience', 5):
-                self._anneal()
-                self.ctrl['anneal_streak'] = 0
-        else:
             self.ctrl['anneal_streak'] = 0
+        else:
+            chosen = None
+            for i, rule in enumerate(bal['rules']):
+                rs = self._rule_state(i)
+                v = self._rule_value(rule, rs)
+                # every rule is evaluated EVERY tick, even once a higher rule has
+                # already won: a relative rule's running best must keep tracking
+                # while it is outranked (the legacy controllers computed every
+                # elevation unconditionally), or it would re-baseline at whatever
+                # level the metric drifted to during the excursion and mask the
+                # degradation the detector exists to catch
+                if self._rule_violated(rule, rs, v) and chosen is None:
+                    chosen = rule['boost']
+            if chosen is None:
+                chosen = bal['default_boost']
+                if cooling:
+                    self.ctrl['anneal_streak'] = 0      # post-anneal: held
+                else:
+                    self.ctrl['anneal_streak'] += 1
+                    if self.ctrl['anneal_streak'] >= getattr(ctrl, 'anneal_patience', 5):
+                        self._anneal()
+                        self.ctrl['anneal_streak'] = 0
+                        self.ctrl['last_anneal_step'] = step
+                        self.ctrl['anneal_events'] = int(self.ctrl.get('anneal_events', 0)) + 1
+            else:
+                self.ctrl['anneal_streak'] = 0
 
         # the boost's NAME for logging: a mix default counts as its dominant
         # mode, while the nudge below receives the full mix
@@ -2474,6 +2899,25 @@ class StageProtocol:
         pair = frac_r + frac_g
         if pair <= 0:
             return
+
+        # COOLDOWN. Anchored on the FIRST TICK of the stage rather than on a step
+        # number, so it is correct on a resume (stage_ctrl is fresh at every
+        # transition and rides the checkpoint). While it runs, the fracs are held
+        # at their entry values and no `gr_best` is recorded -- the stage is still
+        # settling and any minimum read here is one no later state can return to.
+        step = int(getattr(m, 'step_ind', 0) or 0)
+        entry = self.ctrl.get('gr_entry_step')
+        if entry is None:
+            entry = self.ctrl['gr_entry_step'] = step
+        cooling = (step - int(entry)) < int(bal.get('ratchet_cooldown_steps', 0) or 0)
+        self.ctrl['gr_cooling'] = 1.0 if cooling else 0.0
+        if cooling:
+            # report the level so the series is continuous through the window,
+            # but record nothing and move nothing
+            lv = self._resolve(bal.get('ratchet_metric')) if bal.get('ratchet_metric') else None
+            if lv is not None and math.isfinite(lv):
+                self.ctrl['gr_level'] = float(lv)
+            return
         s_lo, s_hi = 0.0, 1.0
         bounds = bal.get('bounds') or {}
         if ramp in bounds:
@@ -2496,10 +2940,21 @@ class StageProtocol:
         held = 0.0
         level = self._resolve(bal.get('ratchet_metric')) if bal.get('ratchet_metric') else None
         if level is not None and math.isfinite(level):
+            # THE Z-CURRENCY GATE, on the WRITE and not the read. A Z-anchored
+            # ratchet_metric (bwd/under_coverage scores resid = log_pf + log_Z -
+            # log_pb - log_r) moves ~1:1 in nats with log_Z, so a best recorded
+            # while Z is off its fixed point is a level no amount of policy
+            # improvement can return to: the trip latches for the rest of the
+            # stage and the guard rails. Suppress the RECORD while Z is off, but
+            # keep enforcing whatever best already exists -- an excursion must
+            # not disable the ratchet, only stop it believing a contaminated low.
             best = self.ctrl.get('gr_best')
             if best is None or level < best:
                 best = level
             self.ctrl['gr_best'] = best
+        else:
+            best = None
+        if best is not None:
             # A SCHMITT TRIGGER, not a threshold. Trip on a real excursion
             # (best + ratchet_tol), and stay tripped until the level is genuinely
             # repaired (best + ratchet_release_tol) rather than merely until it
@@ -2781,6 +3236,14 @@ class StageProtocol:
             # emitting it unconditionally publishes a constant 0 on every other
             # kind -- a flat series that looks like a reading
             out['protocol/anneal_streak'] = self.ctrl.get('anneal_streak', 0)
+            # anneal events so far, cumulative over the stage (stage_ctrl resets
+            # at every transition)
+            out['protocol/anneal_events'] = int(self.ctrl.get('anneal_events', 0))
+            if int(stage.balance.get('anneal_cooldown_steps', 0) or 0) > 0:
+                # 1 while balance.anneal_cooldown_steps holds the anneal (entry
+                # or post-anneal phase). Only where a cooldown is set, for the
+                # same flat-series reason as anneal_streak.
+                out['protocol/anneal_cooling'] = float(self.ctrl.get('anneal_cooling', 0.0))
         if stage.balance is not None and stage.balance['kind'] == 'proportional':
             # the split the controller is steering toward (share of the two
             # modes' COMBINED mass going to the first), alongside each side's
@@ -2836,6 +3299,10 @@ class StageProtocol:
             # growing" without inference, and gr_best is the high-water mark the
             # veto is measured against
             out['protocol/gr_held'] = float(self.ctrl.get('gr_held', 0.0))
+            # 1 while the entry cooldown holds the fracs and defers the first
+            # gr_best capture -- so a flat share early reads as 'by design'
+            # rather than as a railed controller.
+            out['protocol/gr_cooling'] = float(self.ctrl.get('gr_cooling', 0.0))
             # the LATCH state, distinct from gr_held only while the two
             # thresholds differ: it says the arm is inside an excursion it has
             # not yet repaired, which is why the ramp is vetoed even on a tick

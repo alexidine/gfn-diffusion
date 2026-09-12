@@ -414,6 +414,77 @@ def test_the_rule_abstains_when_periodic_centroids_is_off(canonical):
 
 
 # ---------------------------------------------------------------------------
+# NULL DATA PATHS. `configs/problems.yaml`'s `latent_gaussian` entry carried
+# `prior_path: null` and `molecules_path: null` while declaring an anchor
+# seed_source that reads the prior dataset. Arms generated from it validated
+# clean and died at startup on `torch.load(None)`.
+# ---------------------------------------------------------------------------
+
+RULE_NULL_PATHS = 'loaded_data_paths_are_not_null'
+
+
+@pytest.mark.parametrize('key', ['prior_path', 'molecules_path'])
+def test_a_null_data_path_is_an_error(canonical, key):
+    """Both are torch.loaded with no null branch, so both are fatal alone."""
+    assert _fires(broken(canonical, **{key: None}), RULE_NULL_PATHS)
+
+
+def test_the_null_path_rule_does_not_depend_on_the_anchor_seed_source(canonical):
+    """THE REASON THE RULE IS NOT WRITTEN ON `seed_source`. Both loads are
+    unconditional, so `generated` with a null prior_path is equally fatal -- a
+    rule anchored on the seed source would have passed this config."""
+    cfg = broken(canonical, prior_path=None)
+    cfg['buffers']['anchor_buffer']['seed_source'] = 'generated'
+    assert _fires(cfg, RULE_NULL_PATHS)
+
+
+def test_the_seed_source_contradiction_is_reported_as_its_own_statement(canonical):
+    """...and when the seed source IS `prior_dataset`, that is a second,
+    independent thing wrong with the same config: it names a dataset the run was
+    never given a file to build."""
+    cfg = broken(canonical, prior_path=None)
+    cfg['buffers']['anchor_buffer']['seed_source'] = 'prior_dataset'
+    details = [v.detail for v in check(cfg) if v.rule == RULE_NULL_PATHS]
+    assert len(details) == 2, details
+    assert any('seed_source' in d for d in details)
+
+
+def test_the_conformer_route_may_declare_null_data_paths(canonical):
+    """`ConformerModeller` overrides both data-init methods -- `init_mol_dataset`
+    branches on `if path:` and `init_prior_dataset` samples the fitted prior -- so
+    a null path there is a declared configuration, not a defect. 21 of the 26
+    configs in the corpus carrying one are this energy function."""
+    cfg = broken(canonical, prior_path=None, molecules_path=None,
+                 energy_function='conformer_torsions')
+    assert not _fires(cfg, RULE_NULL_PATHS)
+
+
+def test_an_absent_data_path_is_not_a_null_one(canonical):
+    """Mutation guard on this module's absence policy: generation and migration
+    both produce partial dicts, and `null` is an assertion while a missing key is
+    not. A rule that conflated them would fire on every partial config."""
+    cfg = broken(canonical, prior_path=None)
+    del cfg['prior_path']
+    del cfg['molecules_path']
+    assert not _fires(cfg, RULE_NULL_PATHS)
+
+
+def test_the_null_path_rule_abstains_without_an_energy_function(canonical):
+    """Which loader runs is not provable from a config that does not name its
+    energy function, and a rule that cannot prove it has nothing to say."""
+    cfg = broken(canonical, prior_path=None)
+    del cfg['energy_function']
+    assert not _fires(cfg, RULE_NULL_PATHS)
+
+
+# The regression itself -- that an arm generated from the `latent_gaussian`
+# registry entry now passes -- lives in test_generate.py. It needs `generate`,
+# which transitively imports torch, and this file is a KNOWN_CHEAP tier floor
+# (tests/config/test_tiering.py): a test that keeps the fast lane's source scan
+# happy while pulling torch behind it is how the lane stops being fast.
+
+
+# ---------------------------------------------------------------------------
 # Exit triggers -- the two dead-gate shapes from the 2026-08-16 audit
 # (docs/design/next_battery.md 1.1a and 1.3)
 # ---------------------------------------------------------------------------
@@ -422,6 +493,17 @@ def test_the_rule_abstains_when_periodic_centroids_is_off(canonical):
 #: `fwd/logw_std_within` is the one metric MEASURED_METRIC_RANGES covers, so it is
 #: the only one that can exercise the rule at all.
 _LOGW_TERM = {'metric': 'fwd/logw_std_within', 'below': 6.0}
+
+
+def _conditional_route_globals(cfg):
+    """The one GLOBAL a switch onto conditional_vargrad must hand-edit for the
+    route to start at all: its var_conditioning (pooled_source 'replay',
+    condition_draw) refuses a prioritised replay draw, which mk_dev keeps on for
+    the unconditional route. The route's other globals are tuning, not
+    refusals (docs/module_protocol.md §2, second table), so they stay at
+    mk_dev's values."""
+    cfg['buffers']['replay_buffer']['prioritise']['enabled'] = False
+    return cfg
 
 
 def _exit_term(canonical, protocol, stage_index, term_index, **keys):
@@ -439,6 +521,8 @@ def _exit_term(canonical, protocol, stage_index, term_index, **keys):
     such a bar -- and stop depending on the canonical config carrying a fault."""
     cfg = copy.deepcopy(canonical)
     cfg['protocol'] = protocol
+    if protocol == 'conditional_vargrad':
+        _conditional_route_globals(cfg)
     stage = cfg['protocols'][protocol]['stages'][stage_index]
     if not stage.get('exit'):
         assert term_index == 0, 'only term 0 can be installed into an empty exit block'
@@ -605,12 +689,14 @@ def _conditional(canonical, **dotted):
     (the flag, omitted) with it. Setting them here again would test this helper
     rather than the config: the rule would pass even if mk_dev's stages lost them,
     which is the regression these tests exist to catch. `half_life_visits` is
-    global, so it stays -- it is the one key a mode switch still hand-edits."""
+    global, so it stays -- it is the one key a mode switch still hand-edits --
+    and so is the replay draw's prioritise switch (_conditional_route_globals),
+    which the route refuses to start without."""
     cfg = broken(canonical, **dotted)
     cfg['embedding_conditioning'] = True
     cfg['protocol'] = 'conditional_vargrad'
     cfg['condition_log_z']['half_life_visits'] = 28.0
-    return cfg
+    return _conditional_route_globals(cfg)
 
 
 def _fired(cfg, rule_name):
@@ -629,10 +715,10 @@ def test_inherited_half_life_fires(canonical):
     assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
 
 
-# `var_conditioning` ships fracs.replay = 0.0, so the replay branch is not
-# trained there and the rule deliberately skips it -- see the `live` computation.
-# Only the two LIVE branches are expected to fire.
-@pytest.mark.parametrize('branch', ['fwd', 'bwd'])
+# `var_conditioning` ships fracs.fwd = 0.0 -- fwd trains only as the Z sidecar,
+# outside the frac mix -- and the rule reads the frac, so it skips fwd there (see
+# the `live` computation). Only the two LIVE branches, bwd and replay, fire.
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
 def test_inherited_tb_z_source_fires_at_its_state6_home(canonical, branch):
     """A stage that resolves to `learned` on the conditional route -- F-042's
     second key, checked where state 6 put it."""
@@ -643,19 +729,21 @@ def test_inherited_tb_z_source_fires_at_its_state6_home(canonical, branch):
 
 
 def test_a_branch_the_stage_does_not_train_is_not_flagged(canonical):
-    """The narrowness is load-bearing, not incidental. `var_conditioning` zeroes
-    the replay frac, so its Z source is never read there; flagging it would add a
-    violation to every correct conditional config, and a BASELINE rule that cries
-    wolf is one people learn to skip. Guarded in both directions -- wrong value
-    AND absent -- because the absence branch is the newer one."""
+    """The narrowness is load-bearing, not incidental. The rule judges only the
+    branches a stage's fracs train, and `var_conditioning` zeroes the fwd frac
+    (fwd enters as the Z sidecar, outside the mix); flagging a zero-frac branch
+    would add a violation to every correct conditional config, and a BASELINE
+    rule that cries wolf is one people learn to skip. Guarded in both
+    directions -- wrong value AND absent -- because the absence branch is the
+    newer one."""
     cfg = _conditional(canonical)
-    assert _vg_stage(cfg)['fracs']['replay'] == 0.0, 'precondition: replay is not trained'
-    _vg_stage(cfg)['loss_coeffs']['replay']['tb_z_source'] = 'learned'
+    assert _vg_stage(cfg)['fracs']['fwd'] == 0.0, 'precondition: fwd has no frac'
+    _vg_stage(cfg)['loss_coeffs']['fwd']['tb_z_source'] = 'learned'
     assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
 
     cfg = _conditional(canonical)
-    _vg_stage(cfg)['loss_coeffs']['replay'].pop('tb_z_source', None)
-    cfg['replay_loss_coeffs'].pop('tb_z_source', None)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('tb_z_source', None)
+    cfg['fwd_loss_coeffs'].pop('tb_z_source', None)
     assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
 
 
@@ -673,7 +761,7 @@ def test_z_calibration_flag_on_a_conditional_stage_fires(canonical):
 # the config trains in the detonation regime while reading as correct. Judging
 # only present values made the rule blind to exactly this.
 
-@pytest.mark.parametrize('branch', ['fwd', 'bwd'])
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
 def test_absent_tb_z_source_fires(canonical, branch):
     """Unset everywhere -> train.py:1105 falls back to `learned`."""
     cfg = _conditional(canonical)
@@ -688,12 +776,12 @@ def test_absent_tb_z_source_names_the_pre_migration_home_when_carried(canonical)
     dead `condition_log_z.*_tb_z_source` is the case this rule was blind to, and
     the message has to say where the value actually is."""
     cfg = _conditional(canonical)
-    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('tb_z_source', None)
-    cfg['fwd_loss_coeffs'].pop('tb_z_source', None)
-    cfg['condition_log_z']['fwd_tb_z_source'] = 'persistent'
+    _vg_stage(cfg)['loss_coeffs']['bwd'].pop('tb_z_source', None)
+    cfg['bwd_loss_coeffs'].pop('tb_z_source', None)
+    cfg['condition_log_z']['bwd_tb_z_source'] = 'persistent'
     vs = _fired(cfg, 'conditional_z_settings_are_conditional')
     assert len(vs) == 1, [str(v) for v in vs]
-    assert 'condition_log_z.fwd_tb_z_source' in str(vs[0]), str(vs[0])
+    assert 'condition_log_z.bwd_tb_z_source' in str(vs[0]), str(vs[0])
 
 
 def test_absent_half_life_is_now_safe(canonical):
@@ -764,33 +852,48 @@ def test_fwd_vargrad_singleton_group_fires(canonical):
 def test_bwd_vargrad_fires_only_when_BOTH_group_sources_are_absent(canonical):
     """The backward condition is a DISJUNCTION, and it must stay one: aug14 and
     aug11 satisfy it with repeats 2 at condition_block_m 1, aug13 with
-    condition_block_m 2 at repeats 1. A conjunction rejects two configs that ran."""
+    condition_block_m 2 at repeats 1. A conjunction rejects two configs that ran.
+
+    `var_conditioning` now ships the THIRD source -- condition_draw's prior_rows
+    2 at repeats 1 and condition_block_m 0 -- so every case below that tests the
+    first two drops the block, and the shipped stage is the positive case for
+    the third."""
+    def _stage(cfg, **bwd):
+        st = _vg_stage(cfg)
+        st.pop('condition_draw', None)
+        st['loss_coeffs']['bwd'].update(bwd)
+        return cfg
+
     # SET IT ON THE STAGE, not just the base. Since state 6 condition_block_m is
-    # a loss coefficient, and `var_conditioning` overrides it to 2.0 -- so a base
-    # of 1 is shadowed and this arm was silently testing the passing case.
-    both_absent = _conditional(canonical, bwd_loss_coeffs__condition_block_m=1)
-    _vg_stage(both_absent)['loss_coeffs']['bwd']['condition_block_m'] = 1.0
-    _vg_stage(both_absent)['loss_coeffs']['bwd']['repeats'] = 1.0
+    # a loss coefficient, and `var_conditioning` overrides it -- so a base value
+    # alone is shadowed and the case would silently test the stage's value.
+    both_absent = _stage(_conditional(canonical, bwd_loss_coeffs__condition_block_m=1),
+                         condition_block_m=1.0, repeats=1.0)
     vs = _fired(both_absent, 'vargrad_needs_groups')
     assert len(vs) == 1 and vs[0].severity == ERROR
 
     # aug13's spelling: repeats 1 but blocked draws -- must NOT fire
-    via_blocks = _conditional(canonical, bwd_loss_coeffs__condition_block_m=2)
-    _vg_stage(via_blocks)['loss_coeffs']['bwd']['repeats'] = 1.0
+    via_blocks = _stage(_conditional(canonical), condition_block_m=2.0, repeats=1.0)
     assert _fired(via_blocks, 'vargrad_needs_groups') == []
 
     # aug14's spelling: repeats 2, blocking off -- must NOT fire
-    via_repeats = _conditional(canonical, bwd_loss_coeffs__condition_block_m=1)
-    _vg_stage(via_repeats)['loss_coeffs']['bwd']['repeats'] = 2.0
+    via_repeats = _stage(_conditional(canonical), condition_block_m=1.0, repeats=2.0)
     assert _fired(via_repeats, 'vargrad_needs_groups') == []
 
     # ...and the STAGE override is what the rule reads, not just the base block:
     # a base of 2 with the stage turning blocking off must fire.
-    stage_off = _conditional(canonical, bwd_loss_coeffs__condition_block_m=2)
-    _vg_stage(stage_off)['loss_coeffs']['bwd']['repeats'] = 1.0
-    _vg_stage(stage_off)['loss_coeffs']['bwd']['condition_block_m'] = 0
+    stage_off = _stage(_conditional(canonical, bwd_loss_coeffs__condition_block_m=2),
+                       condition_block_m=0, repeats=1.0)
     vs = _fired(stage_off, 'vargrad_needs_groups')
     assert len(vs) == 1 and vs[0].severity == ERROR
+
+    # the shipped spelling: the aligned draw's prior_rows at repeats 1 and
+    # condition_block_m 0 -- must NOT fire
+    shipped = _conditional(canonical)
+    assert _vg_stage(shipped)['condition_draw']['prior_rows'] >= 2
+    assert _vg_stage(shipped)['loss_coeffs']['bwd']['condition_block_m'] == 0
+    assert _vg_stage(shipped)['loss_coeffs']['bwd']['repeats'] == 1.0
+    assert _fired(shipped, 'vargrad_needs_groups') == []
 
 
 def test_vargrad_rule_abstains_off_the_vargrad_route(canonical):
@@ -882,6 +985,38 @@ def test_batch_root_is_forward_only_and_needs_a_cadence(canonical):
         {'tb_z_source': 'batch_root', 'freeze_policy': 0.0})
     assert not _fires(cfg, 'batch_root_forward_is_well_formed')
     assert not _fires(canonical, 'batch_root_forward_is_well_formed')
+
+
+def test_replay_seat_keys_are_judged_on_the_resolved_config(canonical):
+    """The full case table is tests/config/test_replay_seat_invariants.py; this is
+    the rule's mutation test in the registry's own file."""
+    # a base pooled_source nothing understands: refused on every stage
+    assert _fires(broken(canonical, fwd_loss_coeffs__pooled_source='bwd'),
+                  'replay_seat_is_well_formed')
+    # a warm-up the buffer's cap can never satisfy: it would never release
+    cfg = copy.deepcopy(canonical)
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
+                 if (s.get('fwd_rollout_every') or 0) > 0)
+    stage['replay_warmup_rows'] = int(cfg['buffers']['replay_buffer']['max_size'])
+    assert _fires(cfg, 'replay_seat_is_well_formed')
+    stage['replay_warmup_rows'] = 1000
+    assert not _fires(cfg, 'replay_seat_is_well_formed')
+    assert not _fires(canonical, 'replay_seat_is_well_formed')
+
+
+def test_condition_draws_are_judged_on_the_resolved_config(canonical):
+    """The full case table is tests/config/test_condition_draw_invariants.py; this
+    is the rule's mutation test in the registry's own file."""
+    # a rollout draw nothing implements
+    assert _fires(broken(canonical, condition_log_z__rollout_condition_draw='stratified'),
+                  'condition_draw_is_well_formed')
+    # a power only 'under_drawn' reads, moved under the iid draw: a dead key
+    assert _fires(broken(canonical, condition_log_z__rollout_under_drawn_power=2.0),
+                  'condition_draw_is_well_formed')
+    assert not _fires(broken(canonical, condition_log_z__rollout_condition_draw='under_drawn',
+                             condition_log_z__rollout_under_drawn_power=2.0),
+                      'condition_draw_is_well_formed')
+    assert not _fires(canonical, 'condition_draw_is_well_formed')
 
 
 def test_every_rule_is_mutation_tested():

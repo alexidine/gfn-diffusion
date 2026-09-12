@@ -15,11 +15,12 @@ LR_SENSOR_KINDS, and the clause went dead: a gate on a retired key can never
 fire, so it read as "this is handled" while handling nothing. This test is what
 stops the replacement clause dying the same way.
 
-The stage spec is REAL -- conditional_vargrad's var_conditioning, transcribed
-from configs/mk_dev.yaml -- and it is the right one because its balance rules
-read {fwd, bwd} only. On mk_dev today all four declared channels already sit in
-read_modes through those rules, so the clause is a no-op on the live configs;
-this stage is where the coincidence runs out.
+The stage spec is REAL -- conditional_vargrad's var_conditioning as an earlier
+configs/mk_dev.yaml carried it (a proportional fwd/bwd split; mk_dev's stage has
+since moved to the replay seat) -- and it is the right one because its balance
+reads {fwd, bwd} only. On the shipped configs every declared channel already
+sits in read_modes through the balance, so the clause is a no-op there; this
+stage is where the coincidence runs out.
 
 Mutation check (re-introduces the bug and requires a FAILURE):
   - drop the hot_lr_sensor clause from read_modes -> test_a_replay_sensor_keeps
@@ -37,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 from protocol import Stage
 
 
-#: conditional_vargrad / var_conditioning, verbatim from configs/mk_dev.yaml.
+#: conditional_vargrad / var_conditioning, as an earlier configs/mk_dev.yaml had it.
 #: Its balance metrics are fwd/* and bwd/* only, so `replay` is dormant here.
 VAR_CONDITIONING = {
     'name': 'var_conditioning',

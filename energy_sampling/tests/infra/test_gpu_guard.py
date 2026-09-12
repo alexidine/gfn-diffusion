@@ -16,8 +16,19 @@ import time
 
 _here = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))   # tests/<area>/x.py -> energy_sampling/
-if _here not in sys.path:
-    sys.path.insert(0, _here)
+# THREE entries, because this file needs all three: `import gpu_guard` wants
+# energy_sampling itself, test_signature_agrees_across_dict_and_namespace does
+# `from energy_sampling.utils import ...` which wants its PARENT, and utils pulls
+# mxtaltools from the sibling repo. pytest.ini's `pythonpath = . ..` supplies the
+# first two under pytest and the venv finds the third, which is why only the
+# standalone run in this module's docstring saw the gap -- it reported
+# `ModuleNotFoundError` as a FAILED check, in a file whose whole point is that its
+# verdict can be trusted.
+for _p in (_here, os.path.dirname(_here),
+           os.path.join(os.path.dirname(_here), '..', 'mxtaltools')):
+    _p = os.path.abspath(_p)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import gpu_guard as G
 
@@ -451,11 +462,57 @@ def test_free_gpu_passes():
               'if this fails with no run active, the guard would block every launch')
 
 
+def test_the_room_check_message_says_what_the_code_did():
+    """
+    `detail['room_check']` is what `describe()` prints, and it is the only account of
+    the room check anybody reads after the fact. It used to be a LITERAL written in the
+    skip branch -- "the projection is a declared CAP, not a measurement" -- in a branch
+    that also ran for projections which WERE measurements. So on the one path where the
+    guard was wrong (sole tenant, measured need, no room) the log stated a reason the
+    code had never checked, and confirmed the bug instead of showing it.
+
+    The message is now derived from the same value that decides the skip, so this pins
+    the agreement rather than the wording: SKIPPED must imply nothing was contested and
+    the basis was not a measurement, and APPLIED must name a condition that holds.
+    """
+    print("\n9. the room-check message agrees with the decision")
+    cfg = {'energy_function': 'zzz_msg', 'batch_size': 100, 'max_batch_size': 100,
+           'cuda_memory_fraction': 0.5, 'z_primes': [1],
+           'model': {'s_emb_dim': 8, 'dplr_rank': 0}, 'integrator': {'T': 4}}
+    sig = G.config_signature(cfg)
+    tenant = [(999, 'python train.py --config x.yaml')]
+    real_mem, real_proc, real_reg = G.gpu_memory, G.training_processes, G.load_registry
+    try:
+        G.gpu_memory = lambda: (15000, 500, 16000, 99)
+        for name, procs, reg, cot in (
+                ('sole tenant + cap', [], {}, 1),
+                ('sole tenant + measurement that fits', [], {sig: {'peak_reserved_mb': 100}}, 1),
+                ('sole tenant + measurement that does not', [], {sig: {'peak_reserved_mb': 8000}}, 1),
+                ('tenant present + cap', tenant, {}, 1),
+                ('declared co-tenancy + cap', [], {}, 2)):
+            G.training_processes = lambda *a, **k: procs
+            G.load_registry = lambda: reg
+            _, _, detail = G.check(cotenants=cot, cfg=cfg)
+            msg = detail.get('room_check', '')
+            measured = str(detail.get('basis', '')).startswith(('measured', 'scaled'))
+            contested = bool(procs) or cot > 1
+            if msg.startswith('skipped'):
+                agrees = (not contested) and (not measured)
+            elif msg.startswith('applied'):
+                agrees = contested or measured
+            else:
+                agrees = False
+            check(f"{name}: message matches state", agrees, msg)
+    finally:
+        G.gpu_memory, G.training_processes, G.load_registry = real_mem, real_proc, real_reg
+
+
 def main():
     for fn in (test_cmdline_matching, test_self_not_detected,
                test_detects_a_real_other_process,
                test_cpu_only_run_is_not_judged, test_unknown_gpu_is_not_free,
                test_room_check_only_where_it_belongs,
+               test_the_room_check_message_says_what_the_code_did,
                test_signature_agrees_across_dict_and_namespace,
                test_projection_prefers_measurement_and_is_labelled,
                test_measured_config_relaunches_on_an_empty_card,

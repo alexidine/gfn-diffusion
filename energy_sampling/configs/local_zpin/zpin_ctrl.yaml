@@ -8,8 +8,8 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: D:/crystal_datasets/gfn_checkpoints
-checkpoint_name: dev_elj_p2_cruise_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-e01bd1_phase1_exit.pt
-prior_model_name: dev_elj_p2_cruise_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-e01bd1_prior.pt
+checkpoint_name: dev_race_L2_transition_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-e01bd1_phase1_exit.pt
+prior_model_name: dev_race_L2_transition_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-e01bd1_prior.pt
 load_weights_only: true
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
@@ -121,13 +121,13 @@ model:
   dplr_mask_angular: true
   pb_exact_reversal: true
 buffer_device: cuda
-batch_size: 400
+batch_size: 1000
 grow_batch_size: true
-max_batch_size: 400
+max_batch_size: 1000
 eval_num_samples: 500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 4000
+epochs: 2000
 eval_period: 200
 figs_period: 1000
 batch_growth_factor: 1.6
@@ -228,13 +228,17 @@ z_calibration:
   grace: 0.8
   gain: 1.0
   max_steps_per_step: 100.0
-  fill_threshold: 20.0
-  fill_se: 5.0
-  fill_cooldown_steps: 200
+  fill_threshold: 0.5
+  fill_se: 3
+  fill_cooldown_steps: 0
   min_visits: null
   freshness_half_life_steps: 300.0
   se2_floor: 0.25
   holdout_modulus: 8
+  fill_mode: absorb
+  fill_process_var: 0.01
+  fill_moment_reset: 0.5
+  fill_from_eval: report
 conditional_worst_quantile: 0.25
 protocol: prod_eq
 protocols:
@@ -274,7 +278,7 @@ protocols:
       flags:
         update_log_z: true
         buffers_active: true
-        z_calibration: false
+        z_calibration: true
       on_enter:
       - rebuild_prior_by_churn
       - bootstrap_z:train_conditioner
@@ -316,7 +320,6 @@ protocols:
           - 0.02
           - 0.93
         converge_floor: 1.0
-      fwd_rollout_every: 20
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -356,7 +359,6 @@ protocols:
         buffers_active: true
         weighted_bwd_sampling: true
         weighted_condition_sampling: true
-        z_calibration: false
       on_enter:
       - rebuild_prior_by_churn
       - set_lr_flow:1.0e-4
@@ -407,7 +409,6 @@ protocols:
           lambda_mix:
             target: 1.0
             rate: 0.93
-      fwd_rollout_every: 20
   prod_eq:
     stages:
     - name: train_prior
@@ -444,9 +445,9 @@ protocols:
       on_enter:
       - rebuild_prior_by_churn
       fracs:
-        fwd: 0.05
-        bwd: 0.475
-        replay: 0.475
+        fwd: 0.0
+        bwd: 0.5
+        replay: 0.5
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd:
@@ -486,7 +487,7 @@ buffers:
     ramp_floor: 100
     ramp_width: 50
   replay_buffer:
-    churn_rate: 400
+    churn_rate: 1000
     mean_residence_steps: 80
     max_size: 12000
     admit_reward_min: -200
@@ -495,6 +496,7 @@ buffers:
       kappa: 1.0
       floor_frac: 0.25
       symmetric: true
+    val_cap: 1000
     val_frac: 0.1
   anchor_buffer:
     frozen: true

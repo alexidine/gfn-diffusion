@@ -32,7 +32,15 @@ CPU = torch.device('cpu')
 
 _here = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))   # tests/<area>/x.py -> energy_sampling/
-for p in (os.path.dirname(_here), os.path.join(os.path.dirname(_here), '..', 'mxtaltools')):
+# `_here` itself is in the list, and it is what makes the standalone invocation in
+# the docstring work. `energy_sampling.energies` imports `profiling` by its bare
+# name, so energy_sampling must be ON the path, not merely reachable as a package
+# from its parent. Under pytest that comes free from pytest.ini's `pythonpath = . ..`,
+# which is why the omission was invisible: the file ran under pytest and died on
+# `ModuleNotFoundError: No module named 'profiling'` the moment anyone ran it the
+# way its own docstring says to.
+for p in (_here, os.path.dirname(_here),
+          os.path.join(os.path.dirname(_here), '..', 'mxtaltools')):
     p = os.path.abspath(p)
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -40,7 +48,8 @@ for p in (os.path.dirname(_here), os.path.join(os.path.dirname(_here), '..', 'mx
 from mxtaltools.dataset_utils.utils import collate_data_list  # noqa: E402
 from energy_sampling.energies.molecular_crystal import MolecularCrystal  # noqa: E402
 from energy_sampling.models.gfn import GFN  # noqa: E402
-from energy_sampling.models.dead_latent_rows import resolve_dead_rows  # noqa: E402
+from energy_sampling.models.dead_latent_rows import (  # noqa: E402
+    free_centroid_rows, resolve_dead_rows)
 
 DATASET = os.path.abspath(os.path.join(_here, '..', '..', 'mxtaltools',
                                        'mini_datasets', 'mini_new_csd.pt'))
@@ -65,12 +74,29 @@ def target_c(sg):
     return c
 
 
+def free(sg):
+    """Dead rows that are FREE AXES (centroid rows) rather than clobbered angles."""
+    return tuple(r for r in free_centroid_rows(int(sg), 1) if r in dead(sg))
+
+
+def clobbered(sg):
+    """Dead rows enforce_crystal_system overwrites -- the ones the gaussian is blind to."""
+    return tuple(r for r in dead(sg) if r not in free(sg))
+
+
 def analytic(sg, hold, k=K, width=WIDTH, temperature=T):
-    n_dead = len(dead(sg))
-    n_live = DIM - n_dead
-    z = (n_live / 2) * math.log(2 * math.pi * temperature) + n_live * math.log(width)
+    """The closed form. See configs/gauss_aug12/spec.py for the derivation.
+
+    THE TWO KINDS OF DEAD ROW DIVERGE ONCE THEY ARE LIVE. A clobbered angle
+    round-trips to the canonical 0.0, so only the soft wall sees it. A free axis
+    does not -- `latent_harmonic_en` reads `gauge_fix_free_axes=False` on purpose --
+    so it is an ordinary gaussian dimension with no fictitious volume at all."""
+    n_live = DIM - len(dead(sg))
+    per_dim = 0.5 * math.log(2 * math.pi * temperature) + math.log(width)
+    z = n_live * per_dim
     if not hold:
-        z += n_dead * math.log(2.0 + math.sqrt(math.pi / k))
+        z += len(clobbered(sg)) * math.log(2.0 + math.sqrt(math.pi / k))
+        z += len(free(sg)) * per_dim
     return z
 
 
@@ -127,11 +153,50 @@ _RESULTS = []
 
 
 def check(name, ok, detail=''):
+    """Record a check and print it. Does NOT raise, in either mode.
+
+    That is not the same as being unable to fail. `_RESULTS` is read twice: by
+    `main()` below, for the standalone run, and by the repo conftest's
+    `pytest_pyfunc_call` wrapper, which fails the test that appended a False
+    entry. Not raising here is what lets every check in a test run and print
+    before the verdict is taken, so a partial failure stays readable."""
     _RESULTS.append((name, bool(ok), detail))
     print(f"  {'PASS' if ok else 'FAIL'}  {name}   {detail}")
 
 
 # ------------------------------------------------------------------- tests
+def test_the_registry_entry_puts_its_zeros_on_the_real_dead_rows():
+    """`configs/problems.yaml`'s `latent_gaussian` entry carries the target's `c`
+    as a literal list, and the zeros in it must land on the rows
+    `resolve_dead_rows` actually reports for the space group the same entry
+    declares. A literal cannot re-derive itself, and this is the one assertion
+    about that entry that needs the resolver -- test_problems.py checks the rest
+    from the YAML alone, without paying for torch.
+
+    WHY A MISPLACED ZERO IS NOT COSMETIC: the crystal build clobbers dead rows
+    back to 0.0, so a live row given c=0 is a dimension whose target the policy
+    can reach but is scored away from, and a dead row given c=MODE is a
+    dimension chasing a value the build discards. Both stay finite and plausible
+    and both change log Z. `MODE = 0.5` exists precisely so the two are
+    distinguishable at all.
+
+    ASSERTS RATHER THAN `check()`: the reporting helper this module uses records
+    into `_RESULTS`, which only `main()` reads, so a `check` that fails is
+    invisible under pytest."""
+    import yaml
+    reg = yaml.safe_load(
+        open(os.path.join(_here, 'configs', 'problems.yaml'), encoding='utf-8'))
+    entry = reg['problems']['latent_gaussian']
+    sgs = entry['space_groups']
+    assert len(sgs) == 1, sgs
+    c = entry['analyze_kwargs']['c']
+    assert c == target_c(sgs[0]), (
+        f"registry c={c}\nresolver c={target_c(sgs[0])} "
+        f"(sg {sgs[0]}, dead rows {dead(sgs[0])})")
+    assert entry['analyze_kwargs']['width'] == WIDTH
+    print(f"\n0. registry c matches sg{sgs[0]} dead rows {dead(sgs[0])}")
+
+
 def test_flags_and_computes():
     """
     The two-flag split is the whole design: is_crystal True (crystal layout, dead
@@ -180,14 +245,24 @@ def test_dead_rows_do_not_move_the_gaussian():
     """
     THE MECHANISM BEHIND THE WHOLE DELTA PREDICTION, checked directly.
 
-    Perturb only the dead rows. The gaussian term must not move at all (the crystal
-    build discards those rows, so latent_params reads back the canonical 0.0), while
-    the TOTAL energy must move by exactly the bounding term the perturbation creates.
-    If the first half failed, the energy would be secretly 12-dimensional; if the
-    second half failed, the rows-live arm's fictitious volume would not be
-    log(2 + sqrt(pi/k)) and the A/B would be measuring something else.
+    Perturb only the dead rows and watch which terms move.
+
+      * a CLOBBERED ANGLE must move the gaussian by NOTHING -- the crystal build
+        discards it, so latent_params reads back the canonical 0.0 -- and must move
+        the TOTAL by exactly the bounding term the perturbation creates. If the
+        first half failed the energy would be secretly 12-dimensional; if the second
+        failed, that arm's fictitious volume would not be log(2 + sqrt(pi/k)) and
+        the A/B would be measuring something else.
+      * a FREE AXIS moves BOTH. `latent_harmonic_en` reads
+        `latent_params(gauge_fix_free_axes=False)` on purpose, so nothing pins the
+        row and the gaussian sees it exactly as emitted.
+
+    THE SECOND CASE USED TO BE ASSERTED AS THE FIRST, which is how sg 4 and sg 1
+    came to be scored against a closed form that gave every dead row the soft-wall
+    term. It read as an invariance failure in the energy; it was the prediction
+    that was wrong. See configs/gauss_aug12/spec.py.
     """
-    print("\n3. dead-row perturbation moves ONLY the bounding term")
+    print("\n3. dead-row perturbation: angles move bounding only, free axes move both")
     for sg in SGS:
         d = dead(sg)
         if not d:
@@ -200,10 +275,24 @@ def test_dead_rows_do_not_move_the_gaussian():
         for r in d:
             base[:, r] = 0.0
         pert = base.clone()
-        # deliberately OUTSIDE the box so the bounding term is nonzero and measurable
-        offs = torch.tensor([1.7, -2.3, 0.6][:len(d)])
-        for i, r in enumerate(d):
-            pert[:, r] = offs[i]
+        free_rows = free(sg)
+        # THE OFFSET IS CHOSEN BY ROW KIND, and it has to be.
+        #   clobbered angle -> OUTSIDE the box, so the bounding term is nonzero and
+        #     measurable. Its own value never reaches the gaussian anyway.
+        #   free axis -> INSIDE the box, because here the gaussian IS the prediction
+        #     and it is computed from what the build reads back, not from what was
+        #     emitted. A centroid row pushed to 1.7 reads back 1.0, so an out-of-box
+        #     offset would test the build's clamp/wrap rule rather than this
+        #     mechanism. That rule is real and is NOT characterised here.
+        outside, inside = [1.7, -2.3, 3.1], [0.6, -0.4, 0.8]
+        offs, n_out, n_in = {}, 0, 0
+        for r in d:
+            if r in free_rows:
+                offs[r], n_in = inside[n_in], n_in + 1
+            else:
+                offs[r], n_out = outside[n_out], n_out + 1
+        for r, o in offs.items():
+            pert[:, r] = o
 
         mb = mol_batch(sg, n)
         e_base = ef.energy(base.clone(), mb, log_T_of(n)).reshape(-1)
@@ -217,14 +306,26 @@ def test_dead_rows_do_not_move_the_gaussian():
                                  c=target_c(sg), width=WIDTH)
             return out['latent_gaussian']
 
+        # WHAT THE GAUSSIAN SHOULD MOVE BY: nothing from the clobbered angles, and
+        # the full 0.5*((x-c)/w)^2 from each free axis, whose c is the canonical 0.0.
+        # Predicted per row rather than asserted as zero, so the two kinds are
+        # distinguished instead of averaged into one claim that fits neither.
+        expect_gauss = sum(0.5 * (offs[r] / WIDTH) ** 2 for r in free_rows)
         g_base, g_pert = gauss_only(base), gauss_only(pert)
-        dg = (g_pert - g_base).abs().max().item()
-        check(f"sg{sg} gaussian term invariant", dg < 1e-4, f"max |dE_gauss| = {dg:.2e}")
+        dg = (g_pert - g_base).mean().item()
+        label = ('gaussian term invariant' if not free_rows
+                 else f'gaussian moves by its {len(free_rows)} free axis/axes')
+        check(f"sg{sg} {label}", abs(dg - expect_gauss) < max(1e-4, 1e-4 * expect_gauss),
+              f"measured {dg:.4f}  predicted {expect_gauss:.4f}")
 
-        # and the total must move by exactly k * sum relu(|x|-1)^2 over the dead rows
-        expect = K * sum(max(abs(float(o)) - 1.0, 0.0) ** 2 for o in offs)
+        # ...and the total moves by the bounding term the perturbation creates PLUS
+        # whatever the gaussian just moved by. Bounding reads raw_latents, so it sees
+        # the emitted offsets for every row, free or not.
+        expect = (K * sum(max(abs(o) - 1.0, 0.0) ** 2 for o in offs.values())
+                  + expect_gauss)
         got = (e_pert - e_base).mean().item()
-        check(f"sg{sg} total moves by the bounding term", abs(got - expect) < 2e-3,
+        check(f"sg{sg} total moves by bounding + gaussian",
+              abs(got - expect) < max(2e-3, 1e-4 * abs(expect)),
               f"measured {got:.6f}  predicted {expect:.6f}")
 
 
@@ -236,11 +337,21 @@ def test_analytic_log_z():
     an untrained P_F on a sigma-0.1 target has enormous weight variance, which would
     measure convergence rather than correctness (feedback: never certify log Z from
     a trained comparison).
+
+    THE PROPOSAL FOR A LIVE-BUT-DEAD ROW DEPENDS ON WHICH KIND IT IS, for the same
+    reason the closed form does. On a clobbered angle the target is the soft-wall
+    box, so a wide N(0, 1.2) covers it. On a FREE AXIS the target is the narrow
+    N(0, w) the gaussian actually applies, and proposing 1.2 against sigma 0.1 gave
+    Var(log w) ~ 1.2e3 -- a standard error of sqrt(1230/20000) = 0.25 nats against a
+    0.05 bar, i.e. an estimate that could not meet the bar however right the value
+    was. Proposing the target collapses it, which is what makes a tight bar honest
+    here rather than lucky.
     """
     print("\n4. analytic log Z, real energy, both arms")
     n_draw, batch = 20000, 500
     for sg in SGS:
         d = dead(sg)
+        free_rows = free(sg)
         ef = energy_fn(sg)
         for hold in (True, False):
             live_dead = () if hold else d
@@ -248,7 +359,8 @@ def test_analytic_log_z():
             mean = torch.full((DIM,), MODE)
             std = torch.full((DIM,), WIDTH * math.sqrt(T))
             for r in live_dead:
-                mean[r], std[r] = 0.0, 1.2
+                mean[r] = 0.0
+                std[r] = WIDTH * math.sqrt(T) if r in free_rows else 1.2
             held = [r for r in d if hold]
 
             logw = []

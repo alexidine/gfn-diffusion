@@ -63,6 +63,65 @@ terms are checked every 10 steps; when all reach patience the next eval is
 inside `evaluation()` with fresh eval metrics in hand. This is also what lets a
 reloaded pre-transition snapshot replay its transition through the normal path.
 
+### Switching route
+
+Moved out of `configs/mk_dev.yaml` 2026-09-10, where it had gone stale in place.
+
+`protocol: <name>` selects a stage list, and everything a stage *declares* comes
+across with it automatically — loss coefficients, fracs, sensors, balance,
+`on_enter`. Four settings do not, because they sit outside the stage list.
+Inheriting the unconditional column is what detonates `var_conditioning` within
+~30 steps of entry.
+
+| key | unconditional | conditional |
+|---|---|---|
+| `{fwd,bwd,replay}_loss_coeffs.tb_z_source` | `learned` | `persistent` |
+| stage flag `z_calibration` | `true` | absent |
+| `lr_flow` | `0.1` | `1.0e-4` |
+| `embedding_conditioning` (+`_dim`) | `false` | `true` (molecule route) |
+
+The first two are enforced at load by
+`config_invariants.conditional_z_settings_are_conditional`. It resolves
+`tb_z_source` through the **selected protocol's stage overrides**, not the base
+value — the base is deliberately `learned` and the conditional stages override it,
+so checking the base alone would fail every conditional config. `tb_z_source`
+used to live on `condition_log_z` as `{fwd,bwd,replay}_tb_z_source`; that is where
+the pre-2026-09 comments name it.
+
+The last two are **not** enforced: `lr_flow` is a rate the invariants cannot infer
+intent for, and an absent `embedding_conditioning` reads as `false`, not as an
+error.
+
+`half_life_visits` left this table 2026-08-17. The old split was 7.0
+unconditional / 28.0 conditional, but 7 is wrong on *both* routes — it makes
+`ema_logw` little more than the last few batches everywhere, and only on the
+conditional route is the consequence a detonation rather than a noisy target.
+Both are now 200.0, matching `buffer.DEFAULT_HALF_LIFE_VISITS`, so there is
+nothing left here for a mode switch to get wrong. `config_invariants` still
+refuses an explicit value below 28 on a conditional route, which is the case that
+remains reachable by hand.
+
+The replay-seat `var_conditioning` (2026-09-11) needs more globals than the four
+above. Each is marked `CONDITIONAL ARM:` beside its key in `configs/mk_dev.yaml`,
+and `configs/qm9c_anneal/make.py` sets them:
+
+| key | mk_dev | conditional arm |
+|---|---|---|
+| `buffers.replay_buffer.prioritise.enabled` | `true` | `false` |
+| `buffers.replay_buffer.{churn_rate, mean_residence_steps, max_size, val_frac}` | `0, 240, 50000, 0` | `0, 1200, 150000, 0` |
+| `buffers.anchor_buffer.{frozen, thin_every_n_evals, refresh_every_n_evals, topup_admit_record_breakers}` | `true, 0, 0, true` | `false, 0, 0, true` |
+| `buffers.prior_buffer.source` | `prior_model` | `anchors` |
+| `condition_log_z.rollout_condition_draw` | `iid` | `cycle` |
+| `batch_size`, `grow_batch_size`, `batch_util_target` | `1000, false, 0.0` | `1000, false, 0.0` (pinned; the arm's base grows to 8000) |
+| `z_calibration.{fill_threshold, fill_from_eval}` | `0.5, fill` | `0.0, off` |
+
+Only `prioritise.enabled` is enforced: `Modeller.set_loss_coeffs` raises at step 0
+while it is `true` beside `pooled_source: replay` or a `condition_draw` block, and
+`config_invariants.replay_seat_is_well_formed` / `condition_draw_is_well_formed`
+report it at load. On the stage itself, `pooled_source: replay` is refused without
+a `condition_draw` block (the Stage parse, and the same check on the resolved
+config at step 0): nothing else aligns the replay rows' conditions with bwd's.
+
 ## 3. The live route
 
 | | `train_prior` | `equilibration` |

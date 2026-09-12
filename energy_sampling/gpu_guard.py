@@ -573,13 +573,25 @@ def check(cotenants=None, config_path=None, cfg=None):
         # So the room check applies only where memory is genuinely contested or where
         # the need is a MEASUREMENT rather than a cap:
         #   - other tenants present, or a co-tenancy declared -> contested, check it
-        #   - sole tenant -> ALLOW, measured or not. The run's own cap is its own
+        #   - sole tenant with a DECLARED CAP -> allow. The run's own ceiling is its own
         #     business; if it does not fit it will OOM alone, which is not the failure
-        #     mode this module exists to prevent. A measured peak marginally above free
-        #     VRAM is the desktop having grown since the measurement, and it refuses a
-        #     launch whose only risk is a recoverable solo OOM that the batch controller
-        #     already handles.
-        contested = bool(others) or cotenants > 1
+        #     mode this module exists to prevent.
+        #   - sole tenant with a MEASUREMENT -> check it. A measured peak is not an
+        #     opinion about how big the run is allowed to get, it is how big it got.
+        #
+        # THE THIRD BULLET USED TO SAY "sole tenant -> ALLOW, measured or not", and the
+        # justification given was that a measured peak marginally above free VRAM is
+        # just the desktop having grown since the measurement. That justification was
+        # really about the MARGIN, and the margin is separately fixed immediately below
+        # (`room_need` uses the raw peak, not the margined figure). Keeping the blanket
+        # skip on top of that fix made the fix unreachable: on the sole-tenant path the
+        # room check never ran at all, so `room_need` was computed and discarded, and a
+        # config measured at 13968 MiB cleared a card with 4000 MiB free. Two guards
+        # against the same false positive, and the cruder one hid the precise one.
+        #
+        # The three cases are spelled out in the `why` chain below rather than collapsed
+        # into a `contested` boolean, because each one has to be NAMED in the log.
+        #
         # THE ROOM FIGURE IS NOT THE BUDGETING FIGURE.
         #
         # `peak_reserved` ALREADY contains whatever fragmentation the run suffered -- it
@@ -593,7 +605,29 @@ def check(cotenants=None, config_path=None, cfg=None):
         # is the evidence -- and the margin is kept only for co-tenancy budgeting, where
         # slack is being reserved for somebody else's growth.
         room_need = detail.get('raw_need_mb') if measured else need
-        if contested:
+
+        # ONE DECISION, ONE DESCRIPTION. `why` decides whether the room check runs AND
+        # supplies the words `describe()` prints, so the two cannot say different
+        # things. They did: the skip message was a literal reading "the projection is a
+        # declared CAP, not a measurement", written in a branch that also ran for
+        # projections which WERE measurements. It stated a reason the code had not
+        # checked, on the one path where the guard was wrong, so the log confirmed the
+        # bug instead of showing it.
+        if others:
+            why = f'{len(others)} other training run(s) on the card'
+        elif cotenants > 1:
+            why = f'cotenants={cotenants} declared, so the card is shared on purpose'
+        elif measured:
+            why = 'the projection is a MEASUREMENT, not this run\'s declared ceiling'
+        else:
+            why = None
+
+        if why is None:
+            detail['room_check'] = (f'skipped: sole tenant and the projection is not a '
+                                    f'measurement [{basis}]')
+        else:
+            detail['room_check'] = (f'applied ({why}): need {room_need} MiB against '
+                                    f'{free_mb} MiB free [{basis}]')
             if room_need is None:
                 if mem[0] > DESKTOP_BASELINE_MB:
                     reasons.append(
@@ -602,9 +636,6 @@ def check(cotenants=None, config_path=None, cfg=None):
             elif room_need > free_mb:
                 reasons.append(f"projected need {room_need} MiB exceeds {free_mb} MiB "
                                f"free [{basis}]")
-        else:
-            detail['room_check'] = ('skipped: sole tenant and the projection is a '
-                                    'declared CAP, not a measurement')
 
         # A co-tenancy claim has to be arithmetically possible. This is the check that
         # catches the misconfiguration that would crash the box even WITH the flag set:

@@ -49,11 +49,14 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
-    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params
+    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
+    ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
+    ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling.grad_clip_guard import GradClipGuard
-from energy_sampling.protocol import StageProtocol, TRAIN_MODES
+from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
+    ROLLOUT_CONDITION_DRAWS
 from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
@@ -225,6 +228,23 @@ def _val_flags(k: int, val_frac: float):
     return torch.rand(int(k)) < float(val_frac)
 
 
+def _origin_fracs(origin, prefix: str):
+    """Composition by admission origin, one `{prefix}/{name}` share per code.
+
+    EMPTY when the column is absent or the population is, so a store written
+    before `origin` existed emits no key at all rather than a fabricated
+    all-rollout composition. Every name in ORIGIN_NAMES is emitted when it is
+    emitted at all -- a share that drops to zero is a reading, and a key that
+    vanishes when its cohort empties would render that as a gap in the plot.
+    """
+    if origin is None or not len(origin):
+        return {}
+    codes = origin.cpu()
+    n = float(codes.numel())
+    return {f'{prefix}/{name}': float((codes == code).sum()) / n
+            for code, name in ORIGIN_NAMES.items()}
+
+
 class Modeller:
     def __init__(self, args=None):
         self.step_ind = None
@@ -299,7 +319,6 @@ class Modeller:
             self.args.gradient_norm_clip, getattr(self.args, 'grad_clip_guard', None))
         self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
-        self._check_ray_wiring()
         self.init_train_constants()
 
     #: Consecutive telemetry failures tolerated before the run is torn down. A
@@ -353,9 +372,9 @@ class Modeller:
 
         A stage with NO lr_sensor block used to arm it anyway, governed by the
         global ray_calibration.enabled. That default is retired: omitting the
-        block now means NO LR sensor, which is what it reads like.
-        _check_ray_wiring reports the one way a config can still disagree with
-        that, at startup rather than here.
+        block now means NO LR sensor, which is what it reads like. `_ray_askers`
+        is the whole switch, and its docstring carries why no startup check
+        stands beside it.
 
         arm() is called ONLY on the armed path: it clones every policy parameter,
         which is not something to spend on a stage that will not measure. So the
@@ -425,7 +444,26 @@ class Modeller:
         return None
 
     def _ray_askers(self):
-        """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch."""
+        """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch.
+
+        THE ONLY ONE, and that is why there is no startup coherence check beside
+        it. The probe used to arm by OMISSION -- any stage with no lr_sensor
+        block ran it whenever a separate `ray_calibration.enabled` flag was true
+        -- which is backwards for a probe that has to be coherent with what a
+        stage trains. A stage could then ask for `ray` while the flag said
+        false, and train at its seed LR with the config claiming a sensor.
+
+        That flag is GONE (utils._RETIRED_KEYS carries all three spellings) and
+        `enabled` is DERIVED from this list, so the disagreement is
+        unrepresentable rather than caught: `_check_ray_wiring` used to raise on
+        that pair, then survived the retirement as a NOTE saying the block was
+        inert, and was deleted 2026-09-10. Nothing acted on the NOTE, and a
+        `ray_calibration` block with no asker is a legitimate configuration --
+        the parameters are shared storage that any stage opting in still reads.
+
+        Whether a config may declare `ray` at all is decided upstream, at
+        protocol.LR_SENSOR_KINDS: drop it from that tuple and `_parse_lr_sensor`
+        refuses the stage by name at load."""
         return [s.name for s in self.protocol.stages
                 if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
 
@@ -460,30 +498,6 @@ class Modeller:
             repeats=int(repeats),
             scramble_tiles=int(scramble_tiles or 0),
             sample_weights=to_host(sample_weights)))
-
-    def _check_ray_wiring(self):
-        """The ray probe is OPT-IN per stage: it runs where and only where a
-        stage declares `lr_sensor: {kind: ray}` (see the gate in train_step).
-
-        It used to arm by OMISSION -- any stage with no lr_sensor block ran it
-        whenever a separate `ray_calibration.enabled` flag was true. That is
-        backwards for a probe that has to be coherent with what a stage trains.
-
-        That flag is now GONE and `enabled` is derived from these askers, which
-        removes the disagreement it made possible -- a stage asking for `ray`
-        while the flag said false used to train at its seed LR with the config
-        claiming a sensor. That case is unrepresentable now, so the check that
-        caught it is gone with it.
-
-        What remains is the other direction, which derivation cannot rule out:
-        the block's parameters are present and nothing asks. Not an error -- the
-        parameters are shared storage, and a run with no replay-TB stage is a
-        legitimate configuration -- but worth saying, so the block does not read
-        as an active sensor."""
-        if self.protocol.stages and not self._ray_askers():
-            print("NOTE: no stage declares lr_sensor kind 'ray', so the "
-                  "ray_calibration block is inert (parameters only). It still "
-                  "supplies alphas/n_sub/period to any stage that opts in.")
 
     def init_train_constants(self):
         for k, v in MODELLER_STATE_DEFAULTS.items():
@@ -665,6 +679,77 @@ class Modeller:
             return phys  # lambda-free run: no leg to mix in
         lam = float(getattr(self.energy_function, 'lambda_mix', 1.0))
         return (1.0 - lam) * flow.detach().cpu().flatten() + lam * phys
+
+    def _anchor_energy_phys(self, batch):
+        """Per-row ANCHOR CURRENCY E_anchor on a run with a prior_flow; None without one.
+
+        E_anchor is the training total at lambda = 1: the physical leg plus
+        bounding, the composition generator_energy returns as `total_energy` at
+        lambda=1,
+
+            physical_energy + bounding_energy * bounding_coeff
+
+        read off a batch scored through analyze_crystal_batch (which copies every
+        ens_dict key onto it). Neither term depends on lambda, so a row's E_anchor
+        frozen at admission stays valid as lambda moves.
+
+        ⚠ NOT `_prior_row_energy` at lambda=1: that one leaves bounding out (a
+        stored prior row re-scores with none), so it is the physical leg alone.
+
+        ⚠ None WITHOUT A FLOW, rather than the same formula, for two reasons:
+          1. the lambda-free anchor currency has always been the site's
+             -log_r * T, and the round trip through log_r = -E/T rounds, so the
+             leg sum is NOT bit-identical to it (7 of 64 rows differed, T=2.5);
+          2. on the energy_clip branch bounding is sealed inside physical_energy
+             while `bounding_energy` is still published, so the formula would
+             count it twice. The clip cannot co-occur with a flow
+             (generator_energy raises), so the formula is exact wherever it runs.
+        Callers use the site's own energy instead -- see _anchor_energy.
+
+        Raises when a flow exists and the rows cannot supply the legs, the same
+        shape as _prior_row_energy: a row without them is not silently scored.
+        """
+        ef = self.energy_function
+        if getattr(ef, 'prior_flow', None) is None:
+            return None
+        if batch is None:
+            raise ValueError(
+                "the anchor currency needs the scored batch on a run with a prior_flow, "
+                "and none was materialised (return_exp=False). The mixture's -log_r * T "
+                "is a different quantity there and cannot stand in for it.")
+        phys = getattr(batch, 'physical_energy', None)
+        bounding = getattr(batch, 'bounding_energy', None)
+        if phys is None or bounding is None:
+            raise AttributeError(
+                "rows carry no `physical_energy`/`bounding_energy`, so their anchor "
+                "currency (the total at lambda=1) cannot be formed. Every batch scored "
+                "through analyze_crystal_batch carries both; these rows were built some "
+                "other way. Score them before comparing them against best_energy_phys.")
+        return (phys.detach().cpu().flatten()
+                + bounding.detach().cpu().flatten() * ef.bounding_coeff)
+
+    def _anchor_energy(self, batch, energy):
+        """(E_anchor, energy_phys) for a scored batch whose per-row total is `energy`.
+
+        E_anchor is the number every anchor decision compares against
+        condition_log_z.best_energy_phys, and the one AnchorBuffer.energy stores;
+        energy_phys is what update_best_energy takes.
+
+          no prior_flow  E_anchor IS `energy` (the same tensor, so every anchor
+                         site is bit-identical to a run without this helper) and
+                         energy_phys is None (the tracker keeps its alias).
+          prior_flow     both are _anchor_energy_phys(batch); E_anchor is moved
+                         onto `energy`'s device and shape.
+        """
+        energy_phys = self._anchor_energy_phys(batch)
+        if energy_phys is None:
+            return energy, None
+        energy = torch.as_tensor(energy)
+        if energy_phys.numel() != energy.numel():
+            raise ValueError(
+                f"the batch carries {energy_phys.numel()} rows of legs but the site's "
+                f"energy has {energy.numel()}; they must be the same rows")
+        return energy_phys.to(energy.device).reshape(energy.shape), energy_phys
 
     def _buffer_y_fn(self):
         """The batch KEY a churned buffer reads its scalar `y` from.
@@ -1466,6 +1551,18 @@ class Modeller:
         # `auto`. There is no separate legacy scheduler path to fall back to.
         return self.lr_controller.step()
 
+    def _lambda_metrics(self):
+        """energy/lambda_mix: the lambda the energy function is USING, read back
+        off it rather than off the controller's stored target
+        (protocol/coeff_lambda_mix), and written on every run that carries a
+        prior flow -- including one that holds lambda fixed, where no stage names
+        it in anneal_coeffs and the controller logs nothing. Empty without a
+        flow, where there is no mixture and lambda_mix does nothing."""
+        ef = self.energy_function
+        if getattr(ef, 'prior_flow', None) is None:
+            return {}
+        return {'energy/lambda_mix': float(ef.lambda_mix)}
+
     def ten_step_reporting(self):
         metrics = {}
         metrics.update(self.metric_tracker.snapshot(changed_only=True))
@@ -1510,6 +1607,17 @@ class Modeller:
         # filled", and `raycal/deferred` with reason 'larder_filling' answers
         # that from the sensor's side, where a reader is already looking.
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
+        # The aligned per-condition draw (stage.condition_draw): the last step's
+        # decision, plus the steps it skipped for want of an eligible condition
+        # since the last report (drained on read). ABSENT on a stage without it.
+        # no_grad_steps: those of the skipped steps that were left with no
+        # gradient at all and so took no optimizer step (train_step).
+        if getattr(self.protocol.stage, 'condition_draw', None):
+            metrics.update(getattr(self, '_cond_draw_stats', {}) or {})
+            metrics['cond_draw/skipped_steps'] = float(getattr(self, '_cond_draw_skips', 0))
+            self._cond_draw_skips = 0
+            metrics['cond_draw/no_grad_steps'] = float(getattr(self, '_gradless_fused_steps', 0))
+            self._gradless_fused_steps = 0
         # Extra rollouts bought by the policy-drift trigger since the last
         # report -- a window rate, drained on read, and ABSENT while the
         # trigger is off (which is how it ships). Raw rather than tracked: an
@@ -1537,9 +1645,20 @@ class Modeller:
             # the z-pin share of those calls, so the extra energy this knob buys
             # is read rather than inferred from the configured cadences
             metrics['rollout/n_z_pin'] = float(getattr(self, '_z_pin_count', 0))
+            # ABSENT on a stage without the key, like the trigger counts above.
+            # warmup = rollouts replay_warmup_rows ADDED (a cadence step inside
+            # the warm-up is not one); n_sidecar = rollouts whose forward loss
+            # entered the fused loss as the Z sidecar.
+            _st = self.protocol.stage
+            if int(getattr(_st, 'replay_warmup_rows', 0) or 0) > 0:
+                metrics['rollout/warmup'] = float(getattr(self, '_warmup_count', 0))
+            if getattr(_st, 'fwd_z_sidecar', False):
+                metrics['rollout/n_sidecar'] = float(getattr(self, '_sidecar_count', 0))
         self._rollout_report_step = self.step_ind
         self._rollout_count = 0
         self._z_pin_count = 0
+        self._warmup_count = 0
+        self._sidecar_count = 0
         # CUMULATIVE SINCE STAGE ENTRY, not per window. A per-window figure
         # cannot measure an interval longer than the window: at N=20 against a
         # 10-step report cadence, every window holds 0 or 1 rollouts, and
@@ -1661,6 +1780,7 @@ class Modeller:
                 energy_timing['energy/frac_outside_step'] = max(
                     0.0, energy_timing['energy/seconds'] - in_step) / self._throughput['seconds']
         metrics.update(energy_timing)
+        metrics.update(self._lambda_metrics())
         # GPU occupancy. Two consumers now: these metrics, and select_batch_size --
         # which reads RAW per-rung samples during calibration and the policy-window
         # mean once for its S2 audit, never these windows as a control input. The
@@ -1809,8 +1929,9 @@ class Modeller:
 
         # ARMS THE LIVE-BRANCH STASH, and nothing else should.
         # get_gfn_forward_loss/get_gfn_backward_loss park their live log-weights
-        # on the model (`gfn._live_fwd` / `_live_bwd`) so the cross-branch pooled
-        # VarGrad term can see both branches in one scope. Those tensors carry
+        # on the model (`gfn._live_fwd` / `_live_bwd` / `_live_replay`) so the
+        # cross-branch pooled VarGrad term can see two branches in one scope
+        # (fwd_loss_coeffs.pooled_source picks fwd or replay). Those tensors carry
         # grad_fn, and the model is an nn.Module, so they sit in __dict__ beside
         # _parameters and _buffers -- where anything that walks the module finds
         # them. `_snapshot_prior`'s deepcopy(ema_model) does exactly that and
@@ -1826,6 +1947,34 @@ class Modeller:
         _fwd = getattr(self.args, 'fwd_loss_coeffs', None)
         self.gfn_model._stash_live_branches = float(
             getattr(_fwd, CROSS_BRANCH_VARGRAD_COEFF, 0) or 0) > 0
+
+        # THE REPLAY-SEAT KEYS ON THE RESOLVED CONFIG (pooled_source,
+        # fwd_z_sidecar, replay_warmup_rows), for EVERY stage of the live
+        # protocol, so a bad later stage fails at step 0 rather than at its
+        # transition. Stage parsing refuses what a stage declares; what rides on
+        # the base coefficient blocks and the global keys is refused here,
+        # because config_invariants only REPORTS at load.
+        # The aligned per-condition draw (stage.condition_draw) and the rollout
+        # condition draw (condition_log_z.rollout_condition_draw) are refused the
+        # same way, on the same resolved config.
+        from config_invariants import (replay_seat_problems, condition_draw_problems,
+                                       rollout_condition_draw_problems, _member)
+
+        def _glob(dotted):
+            node = self.args
+            for part in dotted.split('.'):
+                node = _member(node, part)
+            return node
+        problems = rollout_condition_draw_problems(_glob)
+        if problems:
+            raise ValueError(' '.join(problems))
+        for _st in self.protocol.stages:
+            _coeff = (lambda mode, key, _st=_st: _st.loss_coeffs.get(mode, {}).get(
+                key, self.protocol.base_coeffs(mode).get(key)))
+            problems = (replay_seat_problems(_st, _coeff, _glob)
+                        + condition_draw_problems(_st, _coeff, _glob))
+            if problems:
+                raise ValueError(f"stage '{_st.name}': " + ' '.join(problems))
 
         # SubTB coefficient matrix: a pure function of (subtb_lambda, T), both
         # static for the run, so build each distinct one once and hand out the
@@ -1987,6 +2136,9 @@ class Modeller:
         fall back to ConditionLogZTracker's own defaults.
         """
         if hasattr(self, 'condition_log_z'):
+            # restored by load_full, whose from_state_dict rebuilds the tracker
+            # with the guard OFF -- so a full resume must re-arm it here too
+            self._arm_phys_energy_guard()
             return
 
         cfg = getattr(self.args, 'condition_log_z', None)
@@ -2010,14 +2162,51 @@ class Modeller:
             # every stage (see ConditionLogZTracker.clip_beta)
             clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', 10.0),
         )
-        # THE TRACKER CANNOT SEE LAMBDA, so it is told here whether a physical
-        # leg is a distinct quantity on this run. Without this, `phys_is_alias`
-        # would mean "no caller passed energy_phys" while claiming to mean "this
-        # run was lambda-free" -- and those diverge for exactly the runs the flag
-        # exists to protect, since a mixing run that never wires the argument
-        # would stamp `alias=True` into its checkpoint over MIXED energies.
-        self.condition_log_z.requires_phys_energy = (
-                getattr(self.energy_function, 'prior_flow', None) is not None)
+        self._arm_phys_energy_guard()
+
+    def _arm_restored_tracker(self):
+        """The guard on a full resume, run straight after load_full and so BEFORE
+        any tracker write. train() calls grow_prior_buffer ahead of
+        init_condition_log_z, and that pass's update_best_energy(energy_phys=...)
+        clears phys_is_alias -- a legacy alias restored with finite minima would
+        then pass the refusal below with its minima kept. A checkpoint without a
+        tracker has nothing to judge; init_condition_log_z builds and arms one."""
+        if hasattr(self, 'condition_log_z'):
+            self._arm_phys_energy_guard()
+
+    def _arm_phys_energy_guard(self):
+        """Tell condition_log_z whether this run's physical leg is a distinct
+        quantity, and refuse a tracker whose physical minimum nothing vouches for.
+        Run after EVERY construction or restore of the tracker: init_gfn right after
+        load_full (_arm_restored_tracker), init_condition_log_z (fresh, weights-only,
+        and full resume, where it is a no-op repeat) and the rewind path.
+
+        THE TRACKER CANNOT SEE LAMBDA. Without this, `phys_is_alias` would mean "no
+        caller passed energy_phys" while claiming to mean "this run was
+        lambda-free" -- and those diverge for exactly the runs the flag exists to
+        protect, since a mixing run with an unwired caller would stamp
+        `alias=True` into its checkpoint over MIXED energies.
+
+        REFUSED: a run with a prior_flow whose tracker holds finite minima under
+        phys_is_alias=True. Every update on such a run passes energy_phys (see
+        _anchor_energy), which clears the alias at its first call, so those minima
+        were written without one -- by a lambda-free run, or by a mixing run before
+        the anchor currency was wired, when they are MIXED. The tracker cannot tell
+        which, and best_energy_phys gates the irreversible anchor trim.
+        """
+        tracker = self.condition_log_z
+        has_flow = getattr(self.energy_function, 'prior_flow', None) is not None
+        if (has_flow and tracker.phys_is_alias
+                and bool(torch.isfinite(tracker.best_energy_phys).any())):
+            n = int(torch.isfinite(tracker.best_energy_phys).sum())
+            raise ValueError(
+                f"condition_log_z carries {n} finite per-condition minima under "
+                f"phys_is_alias=True into a run whose energy function carries a "
+                f"prior_flow. Nothing passed the physical leg when they were written, "
+                f"so best_energy_phys may be the lambda-MIXED minimum, and it gates the "
+                f"irreversible anchor trim. Start this run from a weights-only load, "
+                f"which builds a fresh tracker.")
+        tracker.requires_phys_energy = has_flow
 
     def bootstrap_log_z(self, max_steps: int = 1000, lr_ramp_steps: int = 200,
                         holdout_frac: float = 0.1, min_conditions_for_holdout: int = 50,
@@ -2407,6 +2596,233 @@ class Modeller:
         p /= p.sum()
         return p
 
+    # ------------------------------------------------------------------
+    # The forward rollout's condition draw (condition_log_z.rollout_condition_draw)
+    # ------------------------------------------------------------------
+
+    def _rollout_condition_mode(self) -> str:
+        """condition_log_z.rollout_condition_draw: 'iid' (absent = today's draw),
+        'cycle' or 'under_drawn'."""
+        cfg = getattr(self.args, 'condition_log_z', None)
+        mode = getattr(cfg, 'rollout_condition_draw', 'iid') or 'iid'
+        if mode not in ROLLOUT_CONDITION_DRAWS:
+            raise ValueError(f"condition_log_z.rollout_condition_draw={mode!r}; must be "
+                             f"one of {ROLLOUT_CONDITION_DRAWS}")
+        return mode
+
+    def _rollout_mol_batch(self, repeats):
+        """The forward rollout's mol_dataset rows: self.batch_size rows (one
+        condition each on a single-SG/Z' route), each tiled `repeats` times.
+        Every fwd_train_step draws here -- cadenced, warm-up, trigger, z-pin and
+        z_calibration rollouts alike.
+
+          iid          today's draw: uniform without replacement (while the batch
+                       fits the dataset), or the weighted_condition_sampling
+                       measure on a stage declaring that flag
+          cycle        uniform WITHOUT replacement ACROSS rollouts: a shuffled pass
+                       over every mol_dataset row, consumed batch_size rows per
+                       rollout and reshuffled when spent (_cycle_rows)
+          under_drawn  p(row) ~ (1 + n)^-power, n = the trainable replay rows its
+                       conditions hold now (_under_drawn_probs)
+        """
+        cfg = getattr(self.args, 'condition_log_z', None)
+        # weighted condition sampling is a stage flag (weighted_condition_sampling):
+        # it belongs to stages where forward trains the POLICY, so steering at
+        # badly-fit conditions reduces their Var(log w) -- it fixes the root
+        # cause. In a Z-only forward stage (policy frozen), high fit-error is
+        # exactly where per-trajectory TB gives Z the WORST gradient, and
+        # forward can't lower that variance anyway -- weighting there aims the
+        # weak lever at its worst conditions while starving the clean-gradient
+        # bulk. Declare the flag per-stage to A/B it.
+        weighted = bool(self.protocol.flag('weighted_condition_sampling')
+                        and getattr(cfg, 'weighted_condition_sampling', False))
+        mode = self._rollout_condition_mode()
+        if mode != 'iid':
+            if weighted:
+                raise ValueError(
+                    f"condition_log_z.rollout_condition_draw={mode!r} on stage "
+                    f"'{self.protocol.stage.name}', which declares "
+                    f"flags.weighted_condition_sampling: both set the rollout's "
+                    f"condition draw. Drop the flag or set the draw to 'iid'.")
+            if not getattr(self, '_rollout_draw_announced', False):
+                self._rollout_draw_announced = True
+                print(f"forward rollout condition draw: {mode} over "
+                      f"{len(self.mol_dataset)} mol_dataset rows", flush=True)
+            rows = self._rollout_condition_rows(int(self.batch_size), mode)
+            return self.mol_dataset.sample_graphs_at(rows, repeats=repeats)
+        p = None
+        if weighted:
+            p = self.weighted_condition_sampling(
+                temperature=getattr(cfg, 'weighted_condition_sampling_temperature', 0.5),
+                clip_quantile=getattr(cfg, 'weighted_condition_sampling_clip_quantile', 0.99))
+        return next(self.mol_dataset.loader(
+            self.batch_size, mode='graphs', repeats=repeats, p=p,
+            beta=getattr(cfg, 'weighted_condition_sampling_uniform_beta', 0.0) if p is not None else None))
+
+    def _rollout_condition_rows(self, n: int, mode: str) -> np.ndarray:
+        """`n` mol_dataset row indices for one rollout under a non-iid `mode`."""
+        n_rows = len(self.mol_dataset)
+        if n_rows == 0:
+            raise ValueError("mol_dataset is empty; there is no condition to roll out.")
+        if mode == 'cycle':
+            return self._cycle_rows(n, n_rows)
+        if mode == 'under_drawn':
+            cfg = getattr(self.args, 'condition_log_z', None)
+            power = float(getattr(cfg, 'rollout_under_drawn_power', 1.0))
+            p = self._under_drawn_probs(power)
+            # WITHOUT replacement while the batch fits, like the iid draw; handing
+            # p to the buffer's loader would flip it to with-replacement
+            return np.random.choice(n_rows, size=n, replace=n > n_rows, p=p).astype(np.int64)
+        raise ValueError(f"no row draw for rollout_condition_draw={mode!r}")
+
+    def _cycle_rows(self, n: int, n_rows: int) -> np.ndarray:
+        """The next `n` rows of a shuffled pass over all `n_rows` mol_dataset
+        rows; a spent pass is reshuffled. Every row is drawn once per pass.
+
+        A batch that runs past the end of a pass takes its remainder from the
+        head of a fresh one, with the rows this batch already holds moved to
+        the END of the new permutation -- so a batch no larger than the dataset
+        never repeats a row, and the new pass still holds every row once.
+
+        NOT CHECKPOINTED: a resume starts a fresh pass."""
+        out, need = [], int(n)
+        while need > 0:
+            perm = getattr(self, '_rollout_cycle', None)
+            pos = int(getattr(self, '_rollout_cycle_pos', 0))
+            if perm is None or perm.size != n_rows or pos >= perm.size:
+                perm = np.random.permutation(n_rows)
+                if out:
+                    held = np.isin(perm, np.concatenate(out))
+                    perm = np.concatenate([perm[~held], perm[held]])
+                self._rollout_cycle, pos = perm, 0
+            take = min(need, perm.size - pos)
+            out.append(perm[pos:pos + take])
+            pos += take
+            need -= take
+            self._rollout_cycle_pos = pos
+        return np.concatenate(out).astype(np.int64)
+
+    def _under_drawn_probs(self, power: float) -> np.ndarray:
+        """p over mol_dataset rows, proportional to (1 + n)^-power, where n is
+        the number of TRAINABLE replay rows (held-out excluded) the row's
+        conditions hold right now. A row's conditions are its whole SG/Z' block
+        (condition_id = mol_id * n_sg*n_zp + ...; one member on a single-SG/Z'
+        route), because the space group and Z' are drawn after the row. No
+        replay buffer yet = every n is 0 = uniform."""
+        mol_id = getattr(self.mol_dataset.batch, 'mol_id', None)
+        if mol_id is None:
+            raise ValueError(
+                "rollout_condition_draw 'under_drawn' needs mol_id on mol_dataset's "
+                "stored batch to map a row to its conditions; this one has none.")
+        n_combos = int(self.energy_function.n_sg * self.energy_function.n_zp)
+        block = (mol_id.detach().cpu().long().numpy().ravel()[:, None] * n_combos
+                 + np.arange(n_combos)[None, :])
+        rb = getattr(self, 'replay_buffer', None)
+        if rb is None or len(rb) == 0:
+            n_c = np.zeros(block.shape[0])
+        else:
+            n_c = rb.condition_row_counts(minlength=int(block.max()) + 1)[block].sum(axis=1)
+        w = (1.0 + n_c.astype(np.float64)) ** (-float(power))
+        return w / w.sum()
+
+    # ------------------------------------------------------------------
+    # The aligned per-condition draw (stage.condition_draw)
+    # ------------------------------------------------------------------
+
+    def _choose_draw_conditions(self, spec) -> np.ndarray:
+        """The condition set one fused step draws bwd and replay on
+        (stage.condition_draw = {conditions C, replay_rows X, prior_rows Y, pick}).
+
+        ELIGIBLE = conditions holding >= X TRAINABLE replay rows (held-out
+        excluded) AND >= Y prior-buffer rows. C = `conditions`, or, at 0,
+        batch_size // max(X, Y); a fixed C is also capped there, so an OOM cut to
+        batch_size still shrinks both branch batches (C*X and C*Y). `pick`
+        'uniform' takes min(C, eligible) conditions uniformly without
+        replacement; 'weighted' takes them by _weighted_draw_conditions.
+
+        Returns the chosen condition ids -- EMPTY when nothing is eligible, which
+        the caller turns into a skipped replay branch. Writes the step's
+        cond_draw/* stats and counts a skipped step."""
+        ef = self.energy_function
+        n_combos = int(getattr(ef, 'n_sg', 1) * getattr(ef, 'n_zp', 1))
+        if n_combos > 1:
+            # draw_bwd_sample and _finish_replay_draw re-run condition_samples,
+            # which redraws the space group and Z' -- the stored condition_id
+            # would no longer be the one the rows are trained under
+            raise ValueError(
+                f"condition_draw on a route with {n_combos} space-group/Z' combinations "
+                f"per molecule: every draw redraws them, so the rows it groups by "
+                f"stored condition_id are trained under different conditions.")
+        x, y = int(spec['replay_rows']), int(spec['prior_rows'])
+        lib = int(getattr(ef, 'condition_library_size', 0) or 0)
+        rb = getattr(self, 'replay_buffer', None)
+        n_rep = (rb.condition_row_counts(lib) if rb is not None and len(rb) > 0
+                 else np.zeros(lib, dtype=np.int64))
+        pb = getattr(self, 'prior_buffer', None)
+        n_pri = (pb.condition_row_counts(lib) if pb is not None and len(pb) > 0
+                 else np.zeros(lib, dtype=np.int64))
+        size = max(n_rep.size, n_pri.size)
+        n_rep = np.pad(n_rep, (0, size - n_rep.size))
+        n_pri = np.pad(n_pri, (0, size - n_pri.size))
+        ok_rep = n_rep >= x
+        eligible = np.flatnonzero(ok_rep & (n_pri >= y))
+
+        cap = max(1, int(self.batch_size) // max(x, y))
+        c = int(spec['conditions']) or cap
+        c = min(c, cap)
+        k = min(c, int(eligible.size))
+        stats = {}
+        if k == 0:
+            chosen = np.empty(0, dtype=np.int64)
+            self._cond_draw_skips = getattr(self, '_cond_draw_skips', 0) + 1
+        elif spec.get('pick', 'uniform') == 'weighted':
+            chosen, fell_back = self._weighted_draw_conditions(eligible, k)
+            stats['cond_draw/weighted_fallback'] = float(fell_back)
+        else:
+            chosen = np.random.choice(eligible, size=k, replace=False).astype(np.int64)
+        stats.update({
+            'cond_draw/n_conditions': float(chosen.size),
+            'cond_draw/target_conditions': float(c),
+            'cond_draw/eligible_replay': float(ok_rep.sum()),
+            'cond_draw/eligible_both': float(eligible.size),
+            # the share of the C conditions asked for that could not be served
+            'cond_draw/short_frac': 1.0 - float(chosen.size) / float(c),
+        })
+        self._cond_draw_stats = stats
+        return chosen
+
+    def _weighted_draw_conditions(self, eligible, k):
+        """(k eligible conditions without replacement, fell_back) for pick
+        'weighted'. The weight is weighted_condition_sampling's per-row fit-error
+        measure, at condition_log_z's weighted_condition_sampling_temperature and
+        _clip_quantile, mapped row -> condition by mol_id (condition_id == mol_id
+        here: _choose_draw_conditions refuses more than one SG/Z' combination).
+        weighted_condition_sampling_uniform_beta keeps its meaning as the
+        fraction of the draw taken UNIFORMLY: that many of the k conditions are
+        picked uniformly from the eligible ones the weighted part left. With no
+        measure yet (weighted_condition_sampling returns None) the pick is
+        uniform, and fell_back is True."""
+        cfg = getattr(self.args, 'condition_log_z', None)
+        p_row = self.weighted_condition_sampling(
+            temperature=getattr(cfg, 'weighted_condition_sampling_temperature', 0.5),
+            clip_quantile=getattr(cfg, 'weighted_condition_sampling_clip_quantile', 0.99))
+        if p_row is None:
+            return np.random.choice(eligible, size=k, replace=False).astype(np.int64), True
+        mol_id = self.mol_dataset.batch.mol_id.detach().cpu().long().numpy().ravel()
+        w = np.zeros(max(int(eligible.max()), int(mol_id.max())) + 1)
+        w[mol_id] = np.asarray(p_row, dtype=np.float64)
+        w_el = w[eligible]
+        # an eligible condition with no mol_dataset row takes the mean weight,
+        # the tracker's own fill for an unvisited condition, never zero
+        w_el = np.where(w_el > 0, w_el, w_el[w_el > 0].mean() if (w_el > 0).any() else 1.0)
+        beta = float(getattr(cfg, 'weighted_condition_sampling_uniform_beta', 0.0) or 0.0)
+        n_uniform = min(k, max(1, int(k * beta))) if beta > 0 else 0
+        first = np.random.choice(eligible.size, size=k - n_uniform, replace=False,
+                                 p=w_el / w_el.sum())
+        rest = np.setdiff1d(np.arange(eligible.size), first)
+        second = np.random.choice(rest, size=n_uniform, replace=False)
+        return eligible[np.concatenate([first, second])].astype(np.int64), False
+
     def _resolve_periodic_centroid_axes(self):
         """
         Which aunit centroid axes may be wrapped. Returns None when the feature is off.
@@ -2641,6 +3057,7 @@ class Modeller:
             else:
                 print(f"Loading model from checkpoint {reload_path}")
                 self.checkpointer.load_full(reload_path)
+                self._arm_restored_tracker()
 
         elif self.args.continue_from_checkpoint:
             reload_path = self.checkpointer.find_matching('running')
@@ -2648,6 +3065,7 @@ class Modeller:
                 print(f"Reloading automatically from prior checkpoint {reload_path}")
                 reload = True
                 self.checkpointer.load_full(reload_path)
+                self._arm_restored_tracker()
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
@@ -3933,10 +4351,8 @@ class Modeller:
                 # same reason: this is a fact about THIS run's energy function,
                 # not stored state. from_state_dict builds a fresh tracker with
                 # the False default, so without re-asserting it here the guard
-                # against an implicit physical alias would vanish on every resume
-                # -- and a resume is exactly when a half-wired run gets going.
-                self.condition_log_z.requires_phys_energy = (
-                        getattr(self.energy_function, 'prior_flow', None) is not None)
+                # against an implicit physical alias would vanish on every rewind.
+                self._arm_phys_energy_guard()
 
         # set_state_dict above restored lr_ctrl (the scale and the bracket's
         # phase) from the healthy checkpoint, so the cut below compounds off
@@ -4039,9 +4455,11 @@ class Modeller:
             assert False
 
         if step_type == 'fwd':
-            # churn on the fly
+            # churn on the fly -- the training policy's own rollout at the
+            # training grid, which is what ORIGIN_ROLLOUT names
             self.manage_replay_buffer(loss_dict,
-                                      crystal_batch)
+                                      crystal_batch,
+                                      origin=ORIGIN_ROLLOUT)
             del crystal_batch
 
         reported_loss = loss.cpu().detach().item()
@@ -4053,7 +4471,13 @@ class Modeller:
         # or mid-accumulation) tallies 'nostep' and returns without reading.
         probe_armed = self._ray_probe_armed()
 
-        if accumulating:
+        if step_type == 'fused' and getattr(self, '_fused_step_gradless', False):
+            # NO GRAPH (fused_train_step's zero-eligible fallback with no
+            # gradient-carrying term): no backward, no optimizer step, and the
+            # accumulation count is left where it was. An armed ray probe finds
+            # the parameters unmoved and defers ('deferred_no_step').
+            self._gradless_fused_steps = getattr(self, '_gradless_fused_steps', 0) + 1
+        elif accumulating:
             self.fused_accum_count += self.batch_size
             do_step = self.fused_accum_count >= accum_target
             self.step_loss(step_type, loss * (self.batch_size / accum_target), do_step=do_step)
@@ -4139,8 +4563,40 @@ class Modeller:
                 self._cadence_anchor_stage = self.protocol.stage.name
                 self._cadence_anchor = self.step_ind
             fwd_ran = ((self.step_ind - self._cadence_anchor) % rollout_every == 0)
+            # REPLAY WARM-UP (stage.replay_warmup_rows): while the replay buffer
+            # holds fewer TRAINABLE rows (held-out rows excluded) than this, every
+            # step rolls out. The first step it holds enough latches it OFF for
+            # the rest of the stage, and a shrinking buffer never re-arms it.
+            # Read on every step, cadence step or not, so it releases on the
+            # first step the count is met. Per-stage and NOT checkpointed: a
+            # resume with a restored buffer is satisfied on its first step, a
+            # weights-only start warms again.
+            warm_rows = int(getattr(self.protocol.stage, 'replay_warmup_rows', 0) or 0)
+            warmup = False
+            if warm_rows > 0:
+                if getattr(self, '_warmup_stage', None) != self.protocol.stage.name:
+                    self._warmup_stage = self.protocol.stage.name
+                    self._warmup_done = False
+                if not self._warmup_done:
+                    rb = getattr(self, 'replay_buffer', None)
+                    is_val = getattr(rb, 'is_val', None)
+                    n = 0 if rb is None else len(rb) - (int(is_val.sum()) if is_val is not None else 0)
+                    if n >= warm_rows:
+                        self._warmup_done = True
+                        print(f"replay warm-up released at step {self.step_ind}: {n} "
+                              f"trainable replay rows >= replay_warmup_rows {warm_rows}; "
+                              f"rollouts return to 1 in {rollout_every}", flush=True)
+                    else:
+                        warmup = True
             if fwd_ran:
                 self._last_rollout_step = self.step_ind
+            elif warmup:
+                # ahead of the triggers, so a bar never reports a reason for a
+                # step that was rolling out anyway. A real rollout: it admits,
+                # carries the sidecar, and is counted in the tally below.
+                fwd_ran = True
+                self._last_rollout_step = self.step_ind
+                self._warmup_count = getattr(self, '_warmup_count', 0) + 1
             elif self._rollout_trigger_fires(rollout_every):
                 fwd_ran = True
             # Z-PIN: an extra rollout purely to re-pin log Z, on its own cadence.
@@ -4310,20 +4766,61 @@ class Modeller:
         sub_losses = {}
         weights = {}
 
+        # THE LIVE SLOTS START EMPTY. They are cleared at the end of the step
+        # too, but writers can run between steps (the host loop's z_calibration
+        # tick, the ray probe), so a slot no branch refills this step must read
+        # as MISSING, never as another step's rows.
+        self.gfn_model._live_fwd = None
+        self.gfn_model._live_bwd = None
+        self.gfn_model._live_replay = None
+        # which branch's live rows pair with bwd's in the pooled term below
+        pooled_src = getattr(self.args.fwd_loss_coeffs, 'pooled_source', 'fwd') or 'fwd'
+        if pooled_src not in POOLED_SOURCES:
+            raise ValueError(f"fwd_loss_coeffs.pooled_source={pooled_src!r}; must be one "
+                             f"of {POOLED_SOURCES}")
+
         fwd_ran, fwd_active, fwd_z_pin = self._fwd_gates(deactivate_threshold,
                                                          force_refresh)
+        # FORWARD Z SIDECAR (stage.fwd_z_sidecar): on a rollout that is not a
+        # z-pin, the forward loss joins the fused loss at weight 1, OUTSIDE the
+        # frac mix (added beside the pooled term below). fwd has no frac on
+        # such a stage -- Stage refuses every way it could reach the mix -- so a
+        # weighted forward branch here would count the same loss twice.
+        sidecar = (bool(getattr(self.protocol.stage, 'fwd_z_sidecar', False))
+                   and fwd_ran and not fwd_z_pin)
+        if sidecar and fwd_active:
+            raise RuntimeError(
+                f"stage '{self.protocol.stage.name}': fwd_z_sidecar with the forward "
+                f"branch ACTIVE (fwd_frac {self.fwd_frac:g} >= {deactivate_threshold:g}); "
+                f"its loss would enter the frac mix and the sidecar both.")
         if fwd_ran:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
                 return_exp=True,
                 repeats=self.mode_repeats('fwd'),
                 report_losses=report_losses)
-            if not fwd_active:  # force-refresh only -- keep its graph out of the fused loss
+            if not (fwd_active or sidecar):  # force-refresh only -- keep its graph out of the fused loss
                 fwd_loss = fwd_loss.detach()
             sub_losses['fwd'] = (fwd_loss, fwd_loss_dict, fwd_active)
             weights['fwd'] = self.fwd_frac if fwd_active else 0.0
             # this branch's own logw, for the free Z re-level -- see z_level_fill
             self._stash_z_fill_logw(fwd_loss_dict)
+
+        # ALIGNED PER-CONDITION DRAW (stage.condition_draw). ONE condition set
+        # per step, chosen after the rollout and before either buffer is drawn
+        # (this step's admission lands at the end of the step, so its rows are
+        # not in it); bwd then draws prior_rows and replay replay_rows rows per
+        # chosen condition. With no eligible condition (e.g. an empty replay
+        # buffer at stage entry) replay is skipped -- its share folds into bwd
+        # below, as for an unpopulated buffer -- and bwd draws as it does today.
+        cond_draw = None
+        cond_spec = getattr(self.protocol.stage, 'condition_draw', None)
+        if cond_spec:
+            cids = self._choose_draw_conditions(cond_spec)
+            if cids.size:
+                cond_draw = dict(cond_spec, cids=cids)
+            else:
+                replay_available = False
 
         # a DORMANT mode (protocol.mode_dormant: nothing in this stage's rules
         # or exit trigger reads its rolling stats) skips its force-refresh
@@ -4339,9 +4836,13 @@ class Modeller:
             # (212 of 5265 measured, ~19% of rows) and the cross-branch pooled
             # term degenerates to each branch's own on the other 81%. Only
             # requested when that term is actually on, so every other stage
-            # keeps the broad independent draw it was tuned for.
+            # keeps the broad independent draw it was tuned for. Forward source
+            # only: replay runs AFTER bwd, so bwd cannot be aligned to it here.
+            # Not on a step the aligned draw serves: its condition set is the
+            # alignment there.
             _tgt = None
-            if float(getattr(self.args.fwd_loss_coeffs, 'pooled_vg', 0.0) or 0.0) > 0:
+            if cond_draw is None and pooled_src == 'fwd' and \
+                    float(getattr(self.args.fwd_loss_coeffs, 'pooled_vg', 0.0) or 0.0) > 0:
                 _lf = getattr(self.gfn_model, '_live_fwd', None)
                 if _lf is not None and _lf.get('condition_id') is not None:
                     _tgt = _lf['condition_id'].detach().cpu().numpy()
@@ -4349,7 +4850,8 @@ class Modeller:
                 discretizer,
                 repeats=self.mode_repeats('bwd'),
                 report_losses=report_losses,
-                target_cids=_tgt)
+                target_cids=_tgt,
+                **({'condition_draw': cond_draw} if cond_draw is not None else {}))
             if not bwd_active:
                 bwd_loss = bwd_loss.detach()
             sub_losses['bwd'] = (bwd_loss, bwd_loss_dict, bwd_active)
@@ -4361,7 +4863,8 @@ class Modeller:
                 replay_loss, replay_loss_dict = self.replay_train_step(
                     discretizer,
                     repeats=self.mode_repeats('replay'),
-                    report_losses=report_losses)
+                    report_losses=report_losses,
+                    **({'condition_draw': cond_draw} if cond_draw is not None else {}))
                 if not replay_active:
                     replay_loss = replay_loss.detach()
                 sub_losses['replay'] = (replay_loss, replay_loss_dict, replay_active)
@@ -4386,34 +4889,70 @@ class Modeller:
             self._pooled_coeff_announced = True
             print('pooled VarGrad: resolved pooled_vg = %r (0 = term OFF)' % pooled_coeff, flush=True)
         if pooled_coeff > 0:
+            # FIRST SIDE = pooled_source's slot. The estimator calls it "f"
+            # throughout: pooled_ratio is then bwd's share against it, and
+            # pooled_within_f is within-first -- replay's rows under 'replay'.
+            first = getattr(self.gfn_model, f'_live_{pooled_src}', None)
             pooled_rows, pooled_stats = pooled_condition_vargrad(
-                getattr(self.gfn_model, '_live_fwd', None),
+                first,
                 getattr(self.gfn_model, '_live_bwd', None),
                 beta=float(getattr(self.args.fwd_loss_coeffs, 'pooled_beta', 40.0)),
                 ratio=float(getattr(self.args.fwd_loss_coeffs, 'pooled_ratio', 0.5)),
                 bridge_only=float(getattr(
                     self.args.fwd_loss_coeffs, 'pooled_bridge_only', 0.0) or 0.0) > 0.5)
-            if not getattr(self, '_pooled_announced', False):
-                self._pooled_announced = True
-                lf = getattr(self.gfn_model, '_live_fwd', None)
+            # ANNOUNCED ONCE PER STATE, not once per process: at a stage entry the
+            # aligned draw has no eligible condition (the replay buffer's first
+            # rows land at the end of step 0), so a once-only line reads INERT
+            # for a term that is ACTIVE from step 1. At most two lines, so a
+            # cadenced fwd source that flips every rollout does not print each flip.
+            state = 'ACTIVE' if pooled_rows is not None else 'INERT'
+            announced = getattr(self, '_pooled_announced', set())
+            if state not in announced:
+                self._pooled_announced = announced | {state}
                 lb = getattr(self.gfn_model, '_live_bwd', None)
+                why = (' (cond_draw: no eligible condition this step)'
+                       if state == 'INERT' and cond_spec and cond_draw is None else '')
                 print(f"pooled VarGrad: coeff {pooled_coeff} beta "
                       f"{getattr(self.args.fwd_loss_coeffs, 'pooled_beta', None)} ratio "
                       f"{getattr(self.args.fwd_loss_coeffs, 'pooled_ratio', None)} "
                       f"bridge_only "
                       f"{getattr(self.args.fwd_loss_coeffs, 'pooled_bridge_only', None)} | "
-                      f"live_fwd {'ok' if lf else 'MISSING'} "
+                      f"source {pooled_src}: live_{pooled_src} {'ok' if first else 'MISSING'} "
                       f"live_bwd {'ok' if lb else 'MISSING'} | "
-                      f"term {'ACTIVE' if pooled_rows is not None else 'INERT'}",
+                      f"term {state}{why} at step {getattr(self, 'step_ind', None)}",
                       flush=True)
             if pooled_rows is not None:
                 fused_loss = fused_loss + pooled_coeff * pooled_rows.mean()
                 pooled_stats['pooled_vg'] = pooled_rows.mean().detach()
                 self._pooled_stats = {k: float(v.detach().cpu())
                                       for k, v in pooled_stats.items()}
+            # published whenever the term is ON, active or inert, so a run says
+            # which branch it paired with bwd
+            self._pooled_stats['pooled_source_replay'] = float(pooled_src == 'replay')
+        if sidecar:
+            fused_loss = fused_loss + sub_losses['fwd'][0]
+            self._sidecar_count = getattr(self, '_sidecar_count', 0) + 1
+        # NOTHING TO DESCEND. The aligned draw's zero-eligible fallback on a stage
+        # whose bwd and replay blocks carry no term of their own (the pooled term
+        # and the sidecar are the whole gradient -- var_conditioning): off the
+        # rollout cadence such a step runs bwd alone, its loss is
+        # get_gfn_backward_loss's zeros fallback, and there is no graph to
+        # backpropagate. train_step takes no optimizer step on it (counted as
+        # cond_draw/no_grad_steps) rather than let backward() raise. THAT FALLBACK
+        # ONLY: a grad-free fused loss on any other step is a wiring fault and
+        # still raises in step_loss.
+        self._fused_step_gradless = (bool(cond_spec) and cond_draw is None
+                                     and torch.is_tensor(fused_loss)
+                                     and not fused_loss.requires_grad)
+        if self._fused_step_gradless and not getattr(self, '_gradless_announced', False):
+            self._gradless_announced = True
+            print(f"fused step {getattr(self, 'step_ind', None)}: no condition eligible for "
+                  f"the aligned draw and no gradient-carrying term -- no optimizer step "
+                  f"(counted as cond_draw/no_grad_steps; printed once)", flush=True)
         # never let a later step read this step's tensors
         self.gfn_model._live_fwd = None
         self.gfn_model._live_bwd = None
+        self.gfn_model._live_replay = None
         # THE COMPOSITE THE STEP DESCENDS, handed to the ray sensor exactly as
         # formed rather than reconstructed from the fracs. Reconstruction would
         # miss both corrections above: an unavailable replay branch folds its
@@ -4429,9 +4968,10 @@ class Modeller:
             # rollouts back into the buffer and re-couple pin frequency to buffer
             # freshness -- the exact confound the key exists to break.
             if not fwd_z_pin:
-                # churn on the fly
+                # churn on the fly -- the fused step's own forward rollout
                 self.manage_replay_buffer(fwd_loss_dict,
-                                          crystal_batch)
+                                          crystal_batch,
+                                          origin=ORIGIN_ROLLOUT)
             del crystal_batch
 
         return fused_loss, sub_losses
@@ -5457,8 +5997,13 @@ class Modeller:
         # churn BEFORE the requires_grad bail: the reward call is paid either
         # way, and these samples are on-policy regardless of whether this step
         # can train Z. Everything the buffer reads is already detached.
+        # ORIGIN_ROLLOUT, not a measurement tag: fwd_train_step above ran the
+        # TRAINING policy at the training discretizer (freeze_policy zeroes the
+        # policy's gradient, not its forward pass), so these rows are the same
+        # sample the fused step admits -- only the loss they were taken for
+        # differs, and the buffer does not store that.
         if loss_dict is not None and self.protocol.flag('buffers_active'):
-            self.manage_replay_buffer(loss_dict, crystal_batch)
+            self.manage_replay_buffer(loss_dict, crystal_batch, origin=ORIGIN_ROLLOUT)
         del crystal_batch
 
         if not loss.requires_grad:
@@ -5618,24 +6163,7 @@ class Modeller:
                        repeats: int = 1,
                        report_losses: bool = False,
                        ):
-        cfg = getattr(self.args, 'condition_log_z', None)
-        p = None
-        # weighted condition sampling is a stage flag (weighted_condition_sampling):
-        # it belongs to stages where forward trains the POLICY, so steering at
-        # badly-fit conditions reduces their Var(log w) -- it fixes the root
-        # cause. In a Z-only forward stage (policy frozen), high fit-error is
-        # exactly where per-trajectory TB gives Z the WORST gradient, and
-        # forward can't lower that variance anyway -- weighting there aims the
-        # weak lever at its worst conditions while starving the clean-gradient
-        # bulk. Declare the flag per-stage to A/B it.
-        if (self.protocol.flag('weighted_condition_sampling')
-                and getattr(cfg, 'weighted_condition_sampling', False)):
-            p = self.weighted_condition_sampling(
-                temperature=getattr(cfg, 'weighted_condition_sampling_temperature', 0.5),
-                clip_quantile=getattr(cfg, 'weighted_condition_sampling_clip_quantile', 0.99))
-        mol_batch = next(self.mol_dataset.loader(
-            self.batch_size, mode='graphs', repeats=repeats, p=p,
-            beta=getattr(cfg, 'weighted_condition_sampling_uniform_beta', 0.0) if p is not None else None))
+        mol_batch = self._rollout_mol_batch(repeats)
         mol_batch = mol_batch.to(self.device)
         mol_batch.orient_molecule(mode='std')
         init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
@@ -5658,6 +6186,7 @@ class Modeller:
                                    condition_id=condition_id,
                                    tb_z_source=self.tb_z_source('fwd'),
                                    step=self.step_ind,
+                                   anchor_energy_fn=self._anchor_energy_phys,
                                    )
         self._stash_z_cal_cache(condition_id)
         if report_losses:
@@ -5668,8 +6197,16 @@ class Modeller:
     def _z_fill_head_is_fillable(self):
         """Can this step's forward batch legitimately set the log Z level?
 
-        Under a conditional or full_flow head there is no single scalar to fill
-        -- the level is a field, not a number -- so never.
+        TESTED ON THE HEAD, NOT ON `conditional`. Under a full_flow head, or a
+        conditional one carrying a scalarMLP over the condition embedding, there
+        is no single scalar to fill -- the level is a field, not a number. But a
+        CONDITIONAL run over a single condition keeps a LearnableScalar
+        (GFN(scalar_flow=...), derived from the condition set), and there the
+        level is a number again. Asking the head whether it has the attribute
+        `z_level_fill` actually writes (`flow_model.scalar.data`) cannot disagree
+        with the actuator; asking `self.gfn_model.conditional` did, and silently
+        -- the fill was refused for the whole run, log Z sat frozen at its
+        bootstrap value, and the only trace was `z_fill/eval_refused_head`.
 
         Otherwise the requirement is that the forward branch is not itself
         training the policy against this batch, because then the level and the
@@ -5685,7 +6222,7 @@ class Modeller:
                                        policy-training batch may set the level.
         The second clause is inert today: nothing sets tb_z_source 'batch_root'.
         """
-        if self.gfn_model.conditional or self.gfn_model.full_flow:
+        if self.gfn_model.full_flow or not hasattr(self.gfn_model.flow_model, 'scalar'):
             return False
         if float(getattr(self.args.fwd_loss_coeffs, 'freeze_policy', 0.0) or 0.0):
             return True
@@ -5930,7 +6467,12 @@ class Modeller:
         print(f"bootstrap_z_by_rollout: log Z {before:.3f} -> {after:.3f} "
               f"from {logw.numel()} forward samples")
         if self.protocol.flag('buffers_active'):
-            self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=True)
+            # on_policy: the live gfn_model, so log_pf is the training policy's
+            # own score. ORIGIN_BOOTSTRAP all the same -- this is a one-off
+            # entry draw at eval_num_samples on the eval_T grid, so a stage
+            # whose buffer is mostly bootstrap rows is reading one instant.
+            self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=True,
+                                      origin=ORIGIN_BOOTSTRAP)
 
     def _eval_z_fill(self, fwd_stats):
         """Feed the eval rollout's log w to z_level_fill (z_calibration.fill_from_eval).
@@ -6040,10 +6582,13 @@ class Modeller:
                        discretizer,
                        repeats: int,
                        report_losses: bool = False,
-                       target_cids=None):
-
+                       target_cids=None,
+                       condition_draw=None):
+        # condition_draw: the fused step's aligned per-condition decision
+        # (_choose_draw_conditions), or None for today's draw
         condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_bwd_sample(
-            repeats, target_cids=target_cids)
+            repeats, target_cids=target_cids,
+            **({'condition_draw': condition_draw} if condition_draw is not None else {}))
 
         # unconditional-prior training: the scramble lives INSIDE the model, at the
         # conditioner->trunk seam (see GFN._maybe_scramble_condition_embedding) --
@@ -6119,8 +6664,12 @@ class Modeller:
                           repeats: int,
                           report_losses: bool = False,
                           side_effects: bool = True,
-                          val_rows: int = 0):
-        """side_effects=False draws and scores WITHOUT writing back to the
+                          val_rows: int = 0,
+                          condition_draw=None):
+        """condition_draw is the fused step's aligned per-condition decision
+        (_choose_draw_conditions); None = today's draw.
+
+        side_effects=False draws and scores WITHOUT writing back to the
         buffer or the metric tracker. Used by z_calibration's replay mode, which
         fires at its own rate and must not be mistaken for training, and by the
         held-out probe (_replay_val_stats) via val_rows > 0 -- which draws the
@@ -6137,7 +6686,9 @@ class Modeller:
         memorisation signal manufactured by the instrument watching for it."""
 
         condition, condition_id, inds, latents, log_reward, mol_batch, traj = \
-            self.draw_replay_sample(repeats, val_rows=val_rows)
+            self.draw_replay_sample(
+                repeats, val_rows=val_rows,
+                **({'condition_draw': condition_draw} if condition_draw is not None else {}))
 
         loss, loss_dict = get_gfn_backward_loss(self.args.replay_loss_coeffs,
                                                 latents.to(self.device),
@@ -6159,7 +6710,13 @@ class Modeller:
                                                               and not val_rows),
                                                 step=self.step_ind,
                                                 sample_weights=(None if val_rows
-                                                                else self._replay_is_w))
+                                                                else self._replay_is_w),
+                                                # its OWN slot: this runs after bwd
+                                                # in the fused step. The probe and
+                                                # the z_calibration tick stash nothing.
+                                                live_stash=('replay' if (side_effects
+                                                                         and not val_rows)
+                                                            else None))
 
         if not side_effects:
             return loss, loss_dict
@@ -6377,9 +6934,10 @@ class Modeller:
         k = self._replay_val_size()
         if k <= 0:
             return {}
-        # get_gfn_backward_loss overwrites gfn._live_bwd under this flag, and
+        # get_gfn_backward_loss writes gfn._live_replay under this flag, and
         # fused_train_step's pooled-VarGrad block reads it later in the SAME
-        # step -- the probe must not be what that term sees.
+        # step -- the probe must not be what that term sees. (val_rows > 0
+        # already stashes nothing; the flag is the second guard.)
         stash = getattr(self.gfn_model, '_stash_live_branches', False)
         try:
             self.gfn_model._stash_live_branches = False
@@ -6428,9 +6986,26 @@ class Modeller:
         return out
 
     @torch.no_grad()
-    def draw_bwd_sample(self, repeats, target_cids=None):
+    def draw_bwd_sample(self, repeats, target_cids=None, condition_draw=None):
         traj = None
-        if self.bwd_sampling_mode == 'dataset':
+        if condition_draw is not None:
+            # THE ALIGNED PER-CONDITION DRAW: exactly prior_rows distinct rows for
+            # each condition the fused step chose, then `repeats` tiling. No
+            # blocking, no loss weighting, no forward alignment: the condition
+            # set and the rows per condition are fixed by the decision.
+            if self.bwd_sampling_mode != 'prior':
+                raise ValueError(
+                    f"condition_draw needs bwd_sampling_mode 'prior' (it draws from "
+                    f"prior_buffer), got {self.bwd_sampling_mode!r}.")
+            cids, rows = condition_draw['cids'], int(condition_draw['prior_rows'])
+            mol_batch, inds = next(
+                self.prior_buffer.loader(
+                    batch_size=int(cids.size) * rows, mode='graphs',
+                    repeats=repeats, return_inds=True,
+                    draw_cids=cids, rows_per_condition=rows))
+            latents = self._batch_latents(mol_batch)
+            latents = latents.to(self.device)
+        elif self.bwd_sampling_mode == 'dataset':
             mol_batch, inds = next(
                 self.prior_dataset.loader(
                     batch_size=self.batch_size, mode='graphs',
@@ -6565,7 +7140,7 @@ class Modeller:
             return 0
         return int(min(int(getattr(cfg, 'val_cap', 256) or 0), self.batch_size, n_val))
 
-    def draw_replay_sample(self, repeats, val_rows: int = 0):
+    def draw_replay_sample(self, repeats, val_rows: int = 0, condition_draw=None):
         # val_rows > 0 draws that many HELD-OUT rows instead of a training
         # batch (the generalisation probe, _replay_val_stats). It deliberately
         # skips the prioritised machinery: the held-out rows have no residual
@@ -6574,6 +7149,24 @@ class Modeller:
         # training draw of this same step still owns.
         if val_rows > 0:
             mol_batch, traj, inds = self.replay_buffer.sample_val_graphs(val_rows)
+            return self._finish_replay_draw(mol_batch, traj, inds, repeats)
+
+        # THE ALIGNED PER-CONDITION DRAW (fused step, stage.condition_draw):
+        # exactly replay_rows distinct TRAINABLE rows for each chosen condition.
+        # Unweighted, so no IS weights: the prioritised measure and the blocked
+        # draw are refused with it at load, and both are cleared here so neither
+        # this step's loss nor the logged ESS reads a draw that did not run.
+        if condition_draw is not None:
+            self._replay_is_w = None
+            self._replay_is_stats = {}
+            cids, rows = condition_draw['cids'], int(condition_draw['replay_rows'])
+            mol_batch, traj, inds = next(
+                self.replay_buffer.loader(
+                    batch_size=int(cids.size) * rows, mode='graphs',
+                    repeats=repeats, return_inds=True,
+                    return_traj=True,
+                    draw_cids=cids, rows_per_condition=rows))
+            self._note_replay_draw_origins(inds)
             return self._finish_replay_draw(mol_batch, traj, inds, repeats)
 
         # Condition-blocked draw (C conditions x up to M distinct terminals
@@ -6676,7 +7269,21 @@ class Modeller:
                 'replay/is_elig_frac': float((np.asarray(p) > 0).mean()),
             }
 
+        self._note_replay_draw_origins(inds)
         return self._finish_replay_draw(mol_batch, traj, inds, repeats)
+
+    def _note_replay_draw_origins(self, inds):
+        """Stash the TRAINING draw's origin composition for the next log.
+
+        Called from the two training draws only -- never from the held-out
+        probe, whose rows are by construction never trained on, so folding them
+        in would make the key answer a different question from the one it names.
+        Empty (and the keys absent) on a buffer with no `origin` column."""
+        origin = getattr(self.replay_buffer, 'origin', None)
+        if origin is not None:
+            rows = torch.as_tensor(np.asarray(inds).ravel(), dtype=torch.long)
+            origin = origin[rows]
+        self._replay_draw_origin = _origin_fracs(origin, 'replay_draw_origin_frac')
 
     def _finish_replay_draw(self, mol_batch, traj, inds, repeats):
         """Shared tail of every replay draw: latents, conditions, rewards.
@@ -7932,11 +8539,7 @@ class Modeller:
         self.protocol.maybe_advance(metrics)
 
         if self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
-            self.manage_prior_buffer(sample_batch)
-            # on_policy=False: these fwd_stats come from the EMA model on the
-            # eval_T grid, so their log_pf is not comparable to a later
-            # get_traj_replay score under the training policy
-            self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=False)
+            self._admit_eval_rollout(fwd_stats, sample_batch)
 
         if hasattr(self, 'anchor_buffer'):
             self.anchor_eval_cycle_count = getattr(self, 'anchor_eval_cycle_count', 0) + 1
@@ -7952,8 +8555,9 @@ class Modeller:
             thin_every = int(getattr(cfg, 'thin_every_n_evals', 0) or 0)
             refresh_every = int(getattr(cfg, 'refresh_every_n_evals', 0) or 0)
             if thin_every > 0 and self.anchor_eval_cycle_count % thin_every == 0:
+                # the anchor currency on both sides: rows store E_anchor
                 self.anchor_buffer.thin(
-                    self.condition_log_z.best_energy,
+                    self.condition_log_z.best_energy_phys,
                     energy_window=cfg.thin_energy_window,
                     max_size=cfg.max_size,
                 )
@@ -8068,6 +8672,15 @@ class Modeller:
             # resident HELD-OUT rows: read against replay/val_n to see whether
             # the probe is scoring a sample of the pool or the whole of it
             metrics['replay_buffer_val_rows'] = float(self.replay_buffer.is_val.sum())
+            # RESIDENT composition by admission origin, and the composition of
+            # the last training draw beside it. Absent on a store with no
+            # `origin` column, so nothing appears on a run that predates it --
+            # see _origin_fracs. The pair separates two different questions: an
+            # eval share here is what the buffer HOLDS, the same share in the
+            # draw is what the gradient SAW.
+            metrics.update(_origin_fracs(getattr(self.replay_buffer, 'origin', None),
+                                         'replay_buffer_origin_frac'))
+            metrics.update(getattr(self, '_replay_draw_origin', None) or {})
             replay_age = (self.step_ind - self.replay_buffer.birth_step).float()
             metrics.update({
                 'replay_buffer_mean_age': replay_age.mean().item(),
@@ -8141,6 +8754,15 @@ class Modeller:
                                   'expired': 0, 'expired_undrawn': 0,
                                   'expired_drawn': 0, 'expired_draws_sum': 0,
                                   'expired_delta_sum': 0.0, 'expired_delta_n': 0}
+
+        # screen_and_admit_anchors' funnel counts since the last read, drained
+        # like the *_last_n counters below. Outside the anchor_buffer block:
+        # with seed_source 'generated' the buffer does not exist until the first
+        # admission, and a funnel that never admits is the case it reads out
+        if hasattr(self, '_anchor_funnel'):
+            for key, n in self._anchor_funnel.items():
+                metrics[f'anchor_funnel/{key}'] = n
+                self._anchor_funnel[key] = 0
 
         if hasattr(self, 'anchor_buffer'):
             metrics['anchor_buffer_length'] = len(self.anchor_buffer)
@@ -8268,6 +8890,15 @@ class Modeller:
             metrics['condition_tb_err_median'] = float(np.nanmedian(tb_err))
         if best_energy.size:
             metrics['condition_best_energy_median'] = float(np.median(best_energy))
+        # the lambda=1 (anchor currency) minimum over the same conditions. Only
+        # when it is its own stream: under phys_is_alias it is a clone of
+        # best_energy, so a lambda-free run logs no extra keys
+        if not tracker.phys_is_alias:
+            best_phys = tracker.best_energy_phys[valid].cpu().numpy()
+            best_phys = best_phys[np.isfinite(best_phys)]
+            metrics['condition_best_energy_phys_hist'] = safe_histogram(best_phys, num_bins=128)
+            if best_phys.size:
+                metrics['condition_best_energy_phys_median'] = float(np.median(best_phys))
         return metrics
 
     def energy_stats(self, prefix, energy=None, reward=None):
@@ -8835,15 +9466,20 @@ class Modeller:
 
         temperature = 10 ** log_T_tensor
         energy = -reward.detach() * temperature
+        # E_anchor feeds only the record-breaker block below; the prior-buffer
+        # admission gate stays on the mixture `energy`
+        energy_anchor, energy_phys = self._anchor_energy(anchor_batch, energy)
 
         old_best = None
         if hasattr(self, 'condition_log_z'):
             # the one buffer-fill path that doesn't route through fwd_eval_sampling
             # (it noises+rescores stored anchors directly), so it needs its own hook.
-            # Emin(c) is snapshotted first so the record-breaker admission block
-            # below can identify which children strictly improved it.
-            old_best = self.condition_log_z.best_energy[condition_id.detach().cpu().flatten()].clone()
-            self.condition_log_z.update_best_energy(condition_id, energy)
+            # Emin(c) is snapshotted first, in the anchor currency the record
+            # breakers are judged in, so the record-breaker admission block below
+            # can identify which children strictly improved it.
+            old_best = self.condition_log_z.best_energy_phys[
+                condition_id.detach().cpu().flatten()].clone()
+            self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
         energy_floor = self._condition_energy_floor(condition_id)
         if energy_floor is not None:
@@ -8878,8 +9514,8 @@ class Modeller:
         # Emin(c) but never stand for admission).
         self.last_anchor_topup_admitted = getattr(self, 'last_anchor_topup_admitted', 0)
         if getattr(cfg, 'topup_admit_record_breakers', False) and old_best is not None:
-            energy_cpu = energy.detach().cpu().flatten()
-            improved = torch.nonzero(energy_cpu < old_best, as_tuple=False).flatten()
+            anchor_cpu = energy_anchor.detach().cpu().flatten()
+            improved = torch.nonzero(anchor_cpu < old_best, as_tuple=False).flatten()
             if improved.numel() > 0:
                 parent_inds = torch.as_tensor(anchor_inds, dtype=torch.long).flatten().cpu()
                 parent_surprise = self.anchor_buffer.original_surprise[parent_inds[improved]].clone()
@@ -8888,13 +9524,13 @@ class Modeller:
                 self.last_anchor_topup_admitted += self.anchor_buffer.admit(
                     admit_batch,
                     reward.detach().cpu().flatten()[improved],
-                    energy_cpu[improved],
+                    anchor_cpu[improved],
                     dup_cutoff=cfg.dup_cutoff, admit_range=None,
                     original_surprise=parent_surprise,
                 )
                 if len(self.anchor_buffer) > cfg.max_size:
                     self.anchor_buffer.thin(
-                        self.condition_log_z.best_energy,
+                        self.condition_log_z.best_energy_phys,
                         energy_window=cfg.thin_energy_window,
                         max_size=cfg.max_size,
                     )
@@ -8951,7 +9587,8 @@ class Modeller:
         energy = -reward.detach() * temperature
 
         if hasattr(self, 'condition_log_z'):
-            self.condition_log_z.update_best_energy(condition_id, energy)
+            _, energy_phys = self._anchor_energy(seed_batch, energy)
+            self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
         good_inds = torch.argwhere(torch.isfinite(energy)).flatten()
         if good_inds.numel() > 0:
@@ -9116,7 +9753,8 @@ class Modeller:
                 return float(pinned['replay']) > 0.0
         return True
 
-    def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True):
+    def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True,
+                             origin: int = ORIGIN_ROLLOUT):
         """
         Store the full forward trajectory of on-policy samples with strongly
         over- or under-weighted terminals, so they can be replayed exactly
@@ -9166,7 +9804,7 @@ class Modeller:
         BADNESS criterion, so without a reward floor the buffer's energy
         distribution is unbounded above.
 
-        ADMISSION ALSO WRITES THE TWO PER-ROW COLUMNS, and this is the only
+        ADMISSION ALSO WRITES THE THREE PER-ROW COLUMNS, and this is the only
         place replay rows are born. `birth_log_pf` records the generating
         policy's own score for the row -- but only when `on_policy`: the
         eval-site call scores with the EMA model on the eval grid, which is not
@@ -9175,7 +9813,11 @@ class Modeller:
         `is_val` flags the held-out split (buffers.replay_buffer.val_frac); it
         is orthogonal to prioritisation because the flag is drawn uniformly and
         eviction is residual-independent, so p_survive still drops out of the
-        IS weight.
+        IS weight. `origin` records WHICH ROLLOUT the row came off (ORIGIN_* in
+        buffer.py); it is the caller's to state, because this function cannot
+        tell an eval rollout from a fused-step one -- both arrive as fwd_stats
+        plus a batch. It is a label, read only by the composition metrics, and
+        changes no admission or eviction decision.
         """
         in_play = self.replay_in_play()
         if in_play is not self._replay_managed:
@@ -9236,6 +9878,7 @@ class Modeller:
                 # here too is what stops the whole first buffer being trainable
                 birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
                 is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
+                origin=int(origin),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
             return
@@ -9351,12 +9994,23 @@ class Modeller:
         # Predicted 7.5/18.75/37.5/75 against measured 7.5/18.3/33.1/72.9.
         #
         # Scaling by the ratio preserves what the config MEANT at any live batch:
-        # store-all where churn == batch (the rr07 contract asserts it), and a
+        # batch_size rows per call where churn == batch (the rr07 contract), and a
         # deliberate fraction where it is less -- the conformer route ships churn 80
         # against batches of 16-1000 and keeps that fraction rather than being
         # silently promoted to store-all.
-        entry_b = max(1, int(getattr(self.args, 'batch_size', self.batch_size) or 1))
-        churn_live = int(round(float(rb_cfg.churn_rate) * self.batch_size / entry_b))
+        # churn_rate 0 = batch_size rows per call, the LIVE batch_size, so growth
+        # needs no ratio. That is `churn_rate == batch_size` stated as one value.
+        # STORE-ALL ONLY AT fwd repeats 1: a rollout carries batch_size x repeats
+        # rows, so at repeats R each call keeps a uniform 1/R of them (at R = 2 a
+        # condition keeps both its rows ~1/4 of the time).
+        # MUST be tested before the ratio below:
+        # 0 * B/entry_b is 0, which would fall through to the max(1, ...) floor
+        # and admit a single row per call.
+        if float(rb_cfg.churn_rate) <= 0:
+            churn_live = int(self.batch_size)
+        else:
+            entry_b = max(1, int(getattr(self.args, 'batch_size', self.batch_size) or 1))
+            churn_live = int(round(float(rb_cfg.churn_rate) * self.batch_size / entry_b))
         n_admit = min(elig.numel(), max(1, churn_live))
         add_inds = elig[_uniform_draw(elig.numel(), n_admit)]
 
@@ -9384,8 +10038,41 @@ class Modeller:
                 birth_step=self.step_ind,
                 birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
                 is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
+                origin=int(origin),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
+
+    def _admit_eval_rollout(self, fwd_stats, sample_batch):
+        """The eval rollout's two buffer admissions, together because only one
+        of them is optional.
+
+        The PRIOR buffer always takes it: that store is off-policy by design and
+        an eval batch is exactly what it wants.
+
+        The REPLAY buffer takes it only under buffers.replay_buffer
+        .admit_from_eval (default true = the behaviour every route shipped
+        with). What it admits is a DIFFERENT SAMPLE from the fused step's: the
+        EMA model, at eval_T, at eval_num_samples. Admission is capped at
+        churn_rate, so at eval_num_samples 10000 with churn_rate = batch 1000 it
+        admits 1000 rows per eval against a rollout intake of 1000 per
+        fwd_rollout_every steps -- ~17% of the buffer at every 20. Those rows
+        are born with a NaN birth_log_pf (on_policy=False below) and are
+        excluded from the drift statistic, so the contamination shows up only as
+        `replay/policy_drift_covered_frac` sitting at 0.84 rather than 1.
+
+        Gated rather than removed because on the unconditional routes the eval
+        rows are a small, deliberately off-policy share of a buffer whose loss
+        weight is small; on the conditional route replay carries half the loss
+        and the same rows are half a different model's distribution.
+        """
+        self.manage_prior_buffer(sample_batch)
+        if not bool(getattr(self.args.buffers.replay_buffer, 'admit_from_eval', True)):
+            return
+        # on_policy=False: these fwd_stats come from the EMA model on the
+        # eval_T grid, so their log_pf is not comparable to a later
+        # get_traj_replay score under the training policy
+        self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=False,
+                                  origin=ORIGIN_EVAL)
 
     def init_prior_buffer_seed(self):
         """
@@ -9511,6 +10198,23 @@ class Modeller:
         buf = getattr(self, 'anchor_buffer', None)
         if buf is None:
             return
+        # THE STORED ENERGY MUST BE E_anchor on a run with a prior_flow. A store
+        # without the stamp was written before the anchor currency existed and
+        # holds each row's MIXED energy at its admission-time lambda, which thin and
+        # admit would compare against the lambda=1 minimum; nothing on the row says
+        # which lambda it was. A lambda-free run is unaffected: its stored energy
+        # always was E_anchor. Both constructors stamp, so this can only fire on a
+        # sidecar restore.
+        currency = getattr(buf, 'energy_currency', None)
+        if (getattr(getattr(self, 'energy_function', None), 'prior_flow', None) is not None
+                and currency != ANCHOR_ENERGY_CURRENCY):
+            raise BufferCurrencyError(
+                f"anchor_buffer [{source}] ({len(buf)} rows) records energy_currency="
+                f"{currency!r}, not {ANCHOR_ENERGY_CURRENCY!r}, on a run whose energy "
+                f"function carries a prior_flow: its stored energies are lambda-mixed "
+                f"totals at each row's admission-time lambda, not the lambda=1 anchor "
+                f"currency best_energy_phys is kept in. Start from a weights-only load "
+                f"(the anchor buffer is re-seeded), or delete the sidecar's anchor store.")
         cfg = self.args.buffers.anchor_buffer
         buf.frozen = bool(getattr(cfg, 'frozen', False))
 
@@ -9616,14 +10320,25 @@ class Modeller:
         seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             seed_batch, sg_inds=getattr(seed_batch, 'sg_ind', None), z_primes=getattr(seed_batch, 'z_prime', None))
         temperature = 10 ** log_T_tensor
-        reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
+        if getattr(self.energy_function, 'prior_flow', None) is not None:
+            # _anchor_energy below reads the legs off the rows, so they must be the
+            # legs of THIS rescore (at each row's conditioned temperature), not the
+            # ones the source batch was analysed with. Written back the same way
+            # analyze_crystal_batch attaches every ens_dict key.
+            reward, ens_dict = self.energy_function.prebuilt_sample_to_reward(
+                seed_batch, temperature, return_ens_dict=True)
+            for key in ens_dict.keys():
+                setattr(seed_batch, key, ens_dict[key].cpu().detach())
+        else:
+            reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
         energy = -reward.detach() * temperature
+        energy_anchor, energy_phys = self._anchor_energy(seed_batch, energy)
 
         # Warm each seeded condition's Emin(c) from these on-target seed
         # energies. The anchor buffer and condition_log_z are distinct objects:
         # seeding the former does NOT inform the latter, and BOTH the admission
         # plausibility gate (screen_and_admit_anchors) and thin()'s purge gate
-        # calibrate against best_energy(c), not against the anchor buffer's own
+        # calibrate against best_energy_phys(c), not against the anchor buffer's own
         # energies. Without this, best_energy(c) stays inf until the terminal stage's prior
         # churn warms it from broad, high-energy prior-model samples -- which
         # then admits (and can't purge) those bad samples as each condition's
@@ -9631,7 +10346,7 @@ class Modeller:
         # to pre-empt. best_energy is a protocol-independent running min, so
         # folding in real scored seed samples is always valid.
         if hasattr(self, 'condition_log_z'):
-            self.condition_log_z.update_best_energy(condition_id, energy)
+            self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
         # Generated candidates arrive without the string keys (sample_graphs
         # drops them at draw time), and append_batch demands key parity, so the
@@ -9645,7 +10360,7 @@ class Modeller:
             seed_batch,  # function-owned transient; the buffer moves it to buffer_device itself
             device=self.buffer_device,
             reward=reward.cpu(),
-            energy=energy.cpu(),
+            energy=energy_anchor.cpu(),
             **self._buffer_kwargs(),
             exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
         )
@@ -9705,6 +10420,15 @@ class Modeller:
         # gate correctly rejects, making the logged count read 0 while the
         # buffer grows
         self.last_anchor_admitted = getattr(self, 'last_anchor_admitted', 0)
+        # admission funnel, same accumulate-then-drain contract as the count
+        # above (log_buffer_stats reads and zeroes it): calls, calls stopped at
+        # the health gate, then rows surviving each gate in order
+        if not hasattr(self, '_anchor_funnel'):
+            self._anchor_funnel = dict.fromkeys(
+                ('calls', 'health_blocked', 'candidates', 'in_window', 'warm',
+                 'screened', 'confirmed'), 0)
+        funnel = self._anchor_funnel
+        funnel['calls'] += 1
         # Policy-health gate: refuse to adjudicate novelty while the ruler is
         # broken. Surprise is measured THROUGH the live policy's log_pf, so a
         # damaged policy reads its own log_pf collapse as fake surprise on
@@ -9731,20 +10455,25 @@ class Modeller:
         ceil_val = self.metric_tracker.get('fwd', ceil_name) if ceil_bar is not None else None
         if ((floor_val is not None and floor_val < float(floor_bar))
                 or (ceil_val is not None and abs(ceil_val) > float(ceil_bar))):
+            funnel['health_blocked'] += 1
             return
         log_r = torch.as_tensor(log_r).detach().to(self.device).flatten()
         energy = torch.as_tensor(energy).detach().to(self.device).flatten()
         log_pf_est = torch.as_tensor(log_pf_est).detach().to(self.device).flatten()
         if energy.numel() == 0:
             return
+        # the anchor currency, for the screen window and the energy stored on
+        # admission; the surprise terms below stay on log_r (the TB residual
+        # against the target actually being sampled)
+        energy_anchor, _ = self._anchor_energy(sample_batch, energy)
 
         sample_batch = sample_batch.clone().to(self.device)
         condition = sample_batch.conditions.detach().to(self.device)
         condition_id = sample_batch.condition_id.detach().to(self.device).flatten()
 
-        best_energy = self.condition_log_z.best_energy.to(self.device)[condition_id]
-        visited = torch.isfinite(best_energy)
-        plausible = visited & (energy < best_energy + cfg.screen_energy_window)
+        best_phys = self.condition_log_z.best_energy_phys.to(self.device)[condition_id]
+        visited = torch.isfinite(best_phys)
+        plausible = visited & (energy_anchor < best_phys + cfg.screen_energy_window)
 
         # per-condition log Z (stable ema_logw target) anchoring the TB-residual
         # axis; z_mask is False for conditions not yet warmed up, where the
@@ -9752,6 +10481,11 @@ class Modeller:
         log_Z_c, z_mask = self.condition_log_z.lookup(condition_id)
         log_Z_c = log_Z_c.to(self.device)
         z_mask = z_mask.to(self.device)
+        # one host sync for both mask counts
+        in_window, warm = torch.stack([plausible.sum(), (plausible & z_mask).sum()]).tolist()
+        funnel['candidates'] += energy.numel()
+        funnel['in_window'] += in_window
+        funnel['warm'] += warm
 
         # TB residual from the free k=1 forward-path estimate of log_pf - log_pb.
         # No backward rollout spent screening; confirm below re-checks
@@ -9761,6 +10495,7 @@ class Modeller:
         screen_idx = torch.nonzero(
             plausible & z_mask & (screen_surprise < cfg.surprise_cutoff),
             as_tuple=False).flatten()
+        funnel['screened'] += screen_idx.numel()
         if screen_idx.numel() == 0:
             return
 
@@ -9769,9 +10504,12 @@ class Modeller:
 
         K = cfg.confirm_k
         n_cand = screen_idx.numel()
-        confirm_batch = sample_batch.subsample_new_batch(screen_idx)
+        # ONE subsample, not two. With a single screened candidate the intermediate batch has
+        # one graph, whose per-graph [1, X] tensors every batch op reads as SHARED metadata --
+        # so the second subsample passed them through untiled and the K-row batch carried one
+        # row of dof_atoms / state_mask for K graphs.
         tile = torch.arange(n_cand, device=self.device).repeat_interleave(K)
-        tiled_batch = confirm_batch.subsample_new_batch(tile)
+        tiled_batch = sample_batch.subsample_new_batch(screen_idx[tile])
 
         _, c_log_pfs, c_log_pbs, _ = self.ema_model.get_traj_bwd(
             latents[screen_idx][tile], eval_discretizer,
@@ -9783,6 +10521,7 @@ class Modeller:
         # k=1 screen estimate.
         confirm_surprise = log_Z_c[screen_idx] + log_p_hat - log_r[screen_idx]
         confirmed_local = torch.nonzero(confirm_surprise < cfg.confirm_cutoff, as_tuple=False).flatten()
+        funnel['confirmed'] += confirmed_local.numel()
         if confirmed_local.numel() == 0:
             return
         confirmed_idx = screen_idx[confirmed_local]
@@ -9795,7 +10534,7 @@ class Modeller:
         original_surprise = (-confirm_surprise[confirmed_local]).cpu()
         admit_batch = sample_batch.subsample_new_batch(confirmed_idx).cpu()
         admit_reward = log_r[confirmed_idx].cpu()
-        admit_energy = energy[confirmed_idx].cpu()
+        admit_energy = energy_anchor[confirmed_idx].cpu()
 
         if not hasattr(self, 'anchor_buffer'):
             self.anchor_buffer = self.anchor_buffer_cls(
@@ -9817,7 +10556,7 @@ class Modeller:
 
         if len(self.anchor_buffer) > cfg.max_size:
             self.anchor_buffer.thin(
-                self.condition_log_z.best_energy,
+                self.condition_log_z.best_energy_phys,
                 energy_window=cfg.thin_energy_window,
                 max_size=cfg.max_size,
             )
@@ -10006,7 +10745,11 @@ class Modeller:
             # separate hook needed at either of those call sites. Runs before
             # screen_and_admit_anchors below, so this batch's own energies are
             # already folded into Emin(c) by the time it screens against it.
-            self.condition_log_z.update_best_energy(pooled['condition_id'], energy)
+            # E_anchor is read off sample_batch, appended in the same loop order as
+            # every pooled tensor (_anchor_energy refuses a row-count mismatch).
+            _, energy_phys = self._anchor_energy(sample_batch, energy)
+            self.condition_log_z.update_best_energy(pooled['condition_id'], energy,
+                                                    energy_phys=energy_phys)
 
         # covers both evaluation()'s on-policy eval sampling and sample_from_prior's
         # prior-model sampling (itself called from manage_prior_buffer's churn and

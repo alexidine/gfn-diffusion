@@ -20,13 +20,22 @@ import pytest
 from energy_sampling.train import Modeller
 
 
-def _m(freeze_policy=1.0, tb_z_source=None, every=0, conditional=False, full_flow=False):
+def _m(freeze_policy=1.0, tb_z_source=None, every=0, conditional=False, full_flow=False,
+       scalar_head=None):
+    """`scalar_head` defaults to "whatever this head type would really build":
+    a LearnableScalar (has `.scalar`) unless the run is conditional or full_flow.
+    Pass it explicitly for the single-condition case, where a CONDITIONAL model
+    keeps the scalar head (GFN(scalar_flow=...))."""
     coeffs = SimpleNamespace(freeze_policy=freeze_policy)
     if tb_z_source is not None:
         coeffs.tb_z_source = tb_z_source
+    if scalar_head is None:
+        scalar_head = not (conditional or full_flow)
+    flow = SimpleNamespace(scalar=object()) if scalar_head else SimpleNamespace()
     m = SimpleNamespace(
         args=SimpleNamespace(fwd_loss_coeffs=coeffs),
-        gfn_model=SimpleNamespace(conditional=conditional, full_flow=full_flow),
+        gfn_model=SimpleNamespace(conditional=conditional, full_flow=full_flow,
+                                  flow_model=flow),
         protocol=SimpleNamespace(stage=SimpleNamespace(fwd_rollout_every=every)))
     m.tb_z_source = MethodType(Modeller.tb_z_source, m)
     m._z_fill_head_is_fillable = MethodType(Modeller._z_fill_head_is_fillable, m)
@@ -48,6 +57,21 @@ def test_a_field_valued_head_is_never_fillable(head):
     assert _m(freeze_policy=1.0, every=7, **{head: True})._z_fill_head_is_fillable() is False
     assert _m(freeze_policy=0.0, tb_z_source='batch_root', every=7,
               **{head: True})._z_fill_head_is_fillable() is False
+
+
+def test_a_conditional_run_over_ONE_condition_keeps_a_fillable_head():
+    """THE REGRESSION. The predicate used to read `gfn_model.conditional`, but a
+    conditional model over a single condition builds a LearnableScalar
+    (GFN(scalar_flow=...)), so the level IS a number and z_level_fill can write it.
+    Reading the flag refused the fill for the whole run: log Z sat frozen at its
+    bootstrap value and the only trace was a `z_fill/eval_refused_head` counter.
+    The predicate must ask the HEAD, which is what the actuator writes."""
+    assert _m(freeze_policy=1.0, every=7, conditional=True,
+              scalar_head=True)._z_fill_head_is_fillable() is True
+    # ...and full_flow still refuses even with a scalar attribute present, because
+    # there the level is per state/time regardless of the head's parameterisation.
+    assert _m(freeze_policy=1.0, every=7, full_flow=True,
+              scalar_head=True)._z_fill_head_is_fillable() is False
 
 
 def test_batch_root_under_a_cadence_is_fillable():

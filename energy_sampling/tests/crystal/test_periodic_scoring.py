@@ -84,9 +84,9 @@ def test_representative_invariance(pb_exact_reversal):
     shift[:, gfn.ang_idx[0]] = PERIOD
     shift[:, gfn.ang_idx[1]] = -PERIOD
 
-    _, _, logpb = gfn._eval_pb_logprob(None, i, current, nxt, dts, ts, None)
-    _, _, logpb_s1 = gfn._eval_pb_logprob(None, i, current, nxt + shift, dts, ts, None)
-    _, _, logpb_s2 = gfn._eval_pb_logprob(None, i, current - shift, nxt, dts, ts, None)
+    _, _, logpb = gfn._eval_pb_logprob(None, current, nxt, dts, ts[:, i], ts[:, i + 1], False, None)
+    _, _, logpb_s1 = gfn._eval_pb_logprob(None, current, nxt + shift, dts, ts[:, i], ts[:, i + 1], False, None)
+    _, _, logpb_s2 = gfn._eval_pb_logprob(None, current - shift, nxt, dts, ts[:, i], ts[:, i + 1], False, None)
     assert torch.allclose(logpb, logpb_s1, atol=1e-5), \
         f"logpb not invariant to next-state shift: {(logpb - logpb_s1).abs().max():.2e}"
     assert torch.allclose(logpb, logpb_s2, atol=1e-5), \
@@ -184,7 +184,7 @@ def test_seam_continuity():
     nxt[1, gfn.ang_idx[0]] = -(1.0 - eps)
 
     def gap():
-        _, _, logpb = gfn._eval_pb_logprob(None, i, prev, nxt, dts, ts, None)
+        _, _, logpb = gfn._eval_pb_logprob(None, prev, nxt, dts, ts[:, i], ts[:, i + 1], False, None)
         return (logpb[0] - logpb[1]).abs().item()
 
     mix_gap = gap()

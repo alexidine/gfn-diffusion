@@ -22,10 +22,19 @@ BETA = 10.0
 
 
 def _stub(logw, current_z=0.0, step=1000, conditional=False, full_flow=False,
-          freeze_policy=1.0, **fill_cfg):
+          freeze_policy=1.0, scalar_head=None, **fill_cfg):
+    """`scalar_head` defaults to what the head type would REALLY build: a
+    LearnableScalar unless conditional or full_flow, either of which gives a
+    scalarMLP with no `.scalar`. Pass it True for the single-condition case,
+    where a conditional model keeps the scalar head (GFN(scalar_flow=...))."""
     cfg = types.SimpleNamespace(
         **{'fill_threshold': 20.0, 'fill_se': 5.0, 'fill_cooldown_steps': 200, **fill_cfg})
-    flow, ema_flow = LearnableScalar(current_z), LearnableScalar(current_z)
+    if scalar_head is None:
+        scalar_head = not (conditional or full_flow)
+    if scalar_head:
+        flow, ema_flow = LearnableScalar(current_z), LearnableScalar(current_z)
+    else:                      # a field-valued head: nothing for the fill to write
+        flow, ema_flow = types.SimpleNamespace(), types.SimpleNamespace()
     tracker = types.SimpleNamespace(
         clip_beta=BETA,
         z_bias_ema=torch.tensor([4.0, float('nan')]),
@@ -204,10 +213,20 @@ def test_stash_refuses_a_training_policy():
     assert _stash(freeze_policy=0.0) is None
 
 
-def test_stash_refuses_conditional_and_full_flow_heads():
+def test_stash_refuses_field_valued_heads():
     """Neither has a single scalar to fill -- the level is a field."""
     assert _stash(conditional=True) is None
     assert _stash(full_flow=True) is None
+
+
+def test_stash_arms_on_a_conditional_run_over_ONE_condition():
+    """THE REGRESSION. A conditional model over a single condition keeps a
+    LearnableScalar, so the level IS a number and the stash must arm. The
+    predicate used to read `gfn_model.conditional` and refused it for the whole
+    run -- log Z frozen at its bootstrap value, visible only as a
+    `z_fill/eval_refused_head` counter."""
+    got = _stash(conditional=True, scalar_head=True)
+    assert got is not None and got.shape == (128,)
 
 
 def test_z_calibration_reports_what_it_costs():

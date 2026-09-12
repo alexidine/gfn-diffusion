@@ -228,28 +228,29 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return base
 
 
-#: Keys in a `configs/problems.yaml` entry that describe the problem to a READER
-#: rather than to the trainer. Merging them in would inject unknown top-level
-#: keys into the config; they are prose, not settings.
-_PROBLEM_PROSE_KEYS = ('description', 'domain', 'conditioning')
-
-
 def problem_overlay(problem: str = PROBLEM) -> dict:
-    """The problem-intrinsic settings, from `configs/problems.yaml`.
+    """The problem-intrinsic settings, from `configs/problems.yaml`, TRANSLATED.
 
-    That file is Phase 1.4's replacement for `mode_presets.yaml` and is the
-    declared home for exactly this. It is NOT yet read by `train.py` -- nothing
-    outside its own tests loads it -- so this harness reads it directly."""
-    path = os.path.join(HERE, 'configs', 'problems.yaml')
-    with open(path, 'r', encoding='utf-8') as f:
-        doc = yaml.safe_load(f)
-    problems = doc.get('problems', doc)
-    if problem not in problems:
-        raise KeyError(f'no problem {problem!r} in {path}; have {sorted(problems)}')
-    entry = dict(problems[problem])
-    for k in _PROBLEM_PROSE_KEYS:
-        entry.pop(k, None)
-    return entry
+    Delegated to `configs.generate.problem_block` rather than read here, and the
+    translation is the whole reason. The registry is written FLAT, because a
+    problem is described flat -- "this problem runs at T=1, scored against this
+    centre" -- while the config groups by consumer, so `temperature` and
+    `analyze_kwargs` belong under `energy_config` and nowhere else.
+
+    This function used to `yaml.safe_load` the file and merge the entry as it
+    stood, which put both keys at TOP LEVEL, where nothing reads them. It was
+    invisible because `problem_gap_fill` below supplied `energy_config.temperature`
+    and `energy_config.analyze_kwargs` explicitly and so masked it -- until
+    2026-09-09, when the registry stopped carrying `analyze_kwargs: {}` and
+    started carrying the real centre. A harness still reading the file directly
+    would then have merged that centre into a dead key and scored the run against
+    `latent_harmonic_en`'s default centre of 0, against a prior drawn at 0.5.
+    One translation, owned by the generator, makes that unrepresentable."""
+    cfg_dir = os.path.join(HERE, 'configs')
+    if cfg_dir not in sys.path:
+        sys.path.insert(0, cfg_dir)
+    import generate                                          # noqa: E402
+    return generate.problem_block(problem)
 
 
 def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
@@ -259,20 +260,48 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
     quietly: this is a gap in the Phase 1.4 registry, and a harness that patches
     it invisibly is a harness that stops the gap from ever being closed.
 
-    Two keys, both fatal as they stand:
+    WHAT THE REGISTRY NOW COVERS AND USED NOT TO. Until 2026-09-09 the entry
+    carried `prior_path: null`, `molecules_path: null` and `analyze_kwargs: {}`,
+    so this function supplied all three and the problem could not be launched by
+    anyone who did not call it -- generation validated clean and the run died at
+    startup on `torch.load(None)`. It now carries the sg-1 prior under both path
+    keys and the target's `c` and `width`, and
+    `config_invariants.loaded_data_paths_are_not_null` refuses a null data path at
+    generation, so those three have left this fill.
 
-      * `prior_path: null` -- `Modeller.init_prior_dataset` opens it with
-        `torch.load(self.args.prior_path)`, which raises on None. There is no
-        null branch.
-      * `analyze_kwargs: {}` -- the analytic gaussian needs its centre `c` and
-        width `w`; without them the target is not the target the closed form
-        describes.
+    WHAT IS STILL MISSING, AND WHY IT IS NOT SIMPLY ADDED TO THE REGISTRY. Three
+    settings deform the target away from the closed form, and each is a
+    legitimate tuning knob on the eLJ route:
 
-    The values come from `configs/gauss_aug12/spec.py`, which is the single
-    source of truth for this target (prior generation, config generation and the
-    closed-form check all import it), rather than being retyped here. A prior
-    drawn at one width and scored at another trains perfectly well and reports a
-    wrong log Z, with nothing to see in either file on its own."""
+      * `reward_range: 250` -- an active `energy_clip` is a NONLINEAR rescale of
+        the energy, so what is sampled is no longer the gaussian the closed form
+        describes. `configs/gauss_aug12/make.py` sets null, commenting "never
+        deform an analytic target".
+      * `log_temperature_range: [0, 0.693147]` -- T sampled over [1, 2] makes the
+        target a MIXTURE, while log Z is stated at a single T.
+      * `bounding_coeff: 10.0` -- k enters the rows-live closed form directly, as
+        n_dead * log(2 + sqrt(pi/k)).
+
+    `test_problems.py::test_no_tuning_knobs_have_leaked_in` whitelists the keys a
+    problem entry may carry, and admitting three coefficient names to that list
+    to serve one problem would weaken the guard the registry exists for. Whether
+    the registry should be able to say "this problem's energy has these terms" is
+    a design question for the registry, not one to settle by widening a whitelist
+    from here -- so the gap stays DECLARED.
+
+    The rest of the `energy_config` fill (`reduction_coeff`, `density_coeff`,
+    `lj_coeff`, `lj_rescale`, `internal_oom_recovery`) is parity with the
+    gauss_aug12 arms and is INERT here: `molecular_crystal.py` zeroes
+    `reduction_energy` structurally on a latent-scored problem and forms no
+    density or LJ term at all. `hold_dead_latent_rows` is pinned because it is the
+    knob gauss_aug12 varies and the closed form differs between its settings;
+    True is also `GFN`'s constructor default, so an arm omitting it lands on the
+    rows-held number anyway -- pinned so that is a statement rather than luck.
+
+    Values come from `configs/gauss_aug12/spec.py`, the single source of truth for
+    this target, rather than retyped: a prior drawn at one width and scored at
+    another trains perfectly well and reports a wrong log Z, with nothing to see
+    in either file on its own."""
     if problem != 'latent_gaussian':
         return {}, []
     sys.path.insert(0, os.path.join(HERE, 'configs', 'gauss_aug12'))
@@ -281,12 +310,8 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
     finally:
         sys.path.pop(0)
 
-    sg = 1                       # problems.yaml declares space_groups: [1]
     fill = {
-        'prior_path': spec.prior_path(sg),
-        'molecules_path': spec.prior_path(sg),
         'energy_config': {
-            'temperature': spec.T,
             'log_temperature_range': [0.0, 0.0],
             'bounding_coeff': spec.BOUNDING_COEFF,
             'reduction_coeff': spec.REDUCTION_COEFF,
@@ -295,17 +320,18 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
             'lj_rescale': None,
             'reward_range': None,
             'internal_oom_recovery': False,
-            'analyze_kwargs': {'c': spec.target_c(sg), 'width': spec.WIDTH},
         },
         'model': {'hold_dead_latent_rows': True, 'periodic_centroids': False},
     }
     notes = [
-        f'problems.yaml:{problem}.prior_path is null; init_prior_dataset '
-        f'torch.loads it unconditionally -> supplied {spec.PRIOR_STEM.format(sg=sg)}.pt '
-        f'from gauss_aug12/spec.py',
-        f'problems.yaml:{problem}.analyze_kwargs is empty; the analytic target '
-        f'needs c and width -> supplied from gauss_aug12/spec.py '
-        f'(MODE={spec.MODE}, WIDTH={spec.WIDTH}, k={spec.BOUNDING_COEFF})',
+        f'problems.yaml:{problem} cannot express reward_range / '
+        f'log_temperature_range / bounding_coeff -- all three deform the analytic '
+        f'target, and all three are tuning knobs elsewhere, so the registry '
+        f'whitelist rejects them -> supplied null, [0, 0] and '
+        f'k={spec.BOUNDING_COEFF} from gauss_aug12/spec.py',
+        f'model.hold_dead_latent_rows pinned True (the knob gauss_aug12 varies; '
+        f'the closed form differs between its settings) -> analytic log Z '
+        f'{spec.analytic_log_z(1, hold=True):.4f} at T={spec.T}, w={spec.WIDTH}',
     ]
     return fill, notes
 

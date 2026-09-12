@@ -399,3 +399,91 @@ def test_release_above_trip_is_refused():
 def test_a_negative_release_is_refused():
     with pytest.raises(ValueError, match='ratchet_release_tol'):
         _stage(balance=dict(RATCHET, ratchet_tol=0.5, ratchet_release_tol=-0.1))
+
+
+# ---------------------------------------------------------------------------
+# THE ENTRY COOLDOWN on the ratchet's WRITE.
+#
+# `gr_best` is a running MINIMUM, so a level read while the stage is still
+# settling is one no later state can return to: the Schmitt trigger latches for
+# the rest of the stage and the guard rails at its cap. Measured across three
+# propanol runs, bwd/under_coverage entered at ~0.5 and rose to an operating
+# ~4.4-5.1 over ~200-430 steps, so the first eval's level was ~10x too low.
+#
+# This REPLACES ratchet_z_bar, which gated the same write on
+# |fwd/tb_resid_clipped|. That proxy could not see the lag that matters: the
+# ratchet's level is a BWD quantity and the two branches' log Z reach their
+# fixed points at different times (measured: fwd residual -0.079 with
+# bwd/jensen_z_err at 42.5 and the level still at 0.49).
+# ---------------------------------------------------------------------------
+
+CD = dict(RATCHET, ratchet_cooldown_steps=250)
+
+
+def _c(level, step, proto=None, share=0.5):
+    """One tick at a given level and step-into-stage, slope sensor quiet."""
+    p = proto or _proto(_stage(balance=dict(CD)),
+                        _Tracker(**{'bwd/under_coverage_rise150': -1.0}), share=share)
+    p.tracker.values['bwd/under_coverage'] = level
+    p.m.step_ind = step
+    p._gated_ramp_tick(p.stage.balance)
+    return p
+
+
+def test_cooldown_parses_and_defaults_to_zero():
+    assert _stage(balance=dict(CD)).balance['ratchet_cooldown_steps'] == 250
+    assert _stage(balance=dict(RATCHET)).balance['ratchet_cooldown_steps'] == 0
+    with pytest.raises(ValueError, match='ratchet_cooldown_steps'):
+        _stage(balance=dict(CD, ratchet_cooldown_steps=-1))
+
+
+def test_ratchet_z_bar_is_retired_and_refused_not_ignored():
+    """A dead gate key reads as an armed gate, so it must fail at parse."""
+    with pytest.raises(ValueError, match='ratchet_z_bar is retired'):
+        _stage(balance=dict(RATCHET, ratchet_z_bar=0.5))
+
+
+def test_the_startup_transient_does_not_become_the_best():
+    """THE BUG. The stage enters at a level of 0.5 that it never returns to;
+    the honest operating level is 5.0. Pre-fix, best latched at 0.5 and the
+    ramp was vetoed for the rest of the stage."""
+    p = _c(level=0.5, step=0)
+    assert p.ctrl['gr_cooling'] == 1.0
+    assert p.ctrl['gr_best'] is None, 'a settling level must not be recorded'
+    for st in (100, 200):
+        _c(level=0.5, step=st, proto=p)
+    assert p.ctrl['gr_best'] is None, 'still inside the cooldown'
+    _c(level=5.0, step=250, proto=p)
+    assert p.ctrl['gr_cooling'] == 0.0
+    assert p.ctrl['gr_best'] == pytest.approx(5.0), 'captures the operating level'
+    assert p.ctrl['gr_tripped'] is False
+
+
+def test_the_cooldown_freezes_the_fracs_not_just_the_capture():
+    """Freezing the split too is what makes the length uncritical: a cooldown
+    that overruns costs nothing, so it can be set long."""
+    p = _c(level=0.5, step=0, share=0.5)
+    entry = p.m.replay_frac
+    for st in (50, 100, 150, 200):
+        _c(level=0.5, step=st, proto=p)
+    assert p.m.replay_frac == pytest.approx(entry), 'no motion during the cooldown'
+    _c(level=5.0, step=260, proto=p)
+    assert p.m.replay_frac > entry, 'and it ramps once released'
+
+
+def test_the_cooldown_is_anchored_on_the_first_tick_not_on_step_zero():
+    """Stage entry is not step 0 on a resume -- stage_ctrl is fresh at every
+    transition, so the window has to start from the first tick it sees."""
+    p = _c(level=0.5, step=6510)                 # a resumed run's entry step
+    assert p.ctrl['gr_cooling'] == 1.0 and p.ctrl['gr_best'] is None
+    _c(level=0.5, step=6700, proto=p)
+    assert p.ctrl['gr_cooling'] == 1.0, 'still inside 250 of the FIRST tick'
+    _c(level=5.0, step=6761, proto=p)
+    assert p.ctrl['gr_cooling'] == 0.0 and p.ctrl['gr_best'] == pytest.approx(5.0)
+
+
+def test_zero_cooldown_is_the_pre_cooldown_behaviour():
+    p = _c(level=2.0, step=0,
+           proto=_proto(_stage(balance=dict(RATCHET)),
+                        _Tracker(**{'bwd/under_coverage_rise150': -1.0})))
+    assert p.ctrl['gr_best'] == pytest.approx(2.0)

@@ -2093,6 +2093,9 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
         'intercept_err': intercept.abs().item(),
         'scatter_err': resid.std(unbiased=False).item(),
         'r2': r2.item(),
+        # 1 - r2: the UNEXPLAINED fraction of the target's own per-condition spread,
+        # lower-is-better so the balance rules' running-best form can gate on it
+        'r2_unexplained': (1.0 - r2).item(),
         'tb_resid': resid.mean().item(),
         'tb_err': resid.pow(2).mean().sqrt().item(),
         'jensen_z_err': (log_w - log_Z.detach()).abs().mean().item(),

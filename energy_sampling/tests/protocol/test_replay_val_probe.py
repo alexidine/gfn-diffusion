@@ -3,8 +3,8 @@
 replay/val_gap is a DIFFERENCE of two means taken inside one step, so what has
 to be true of the probe is that it changes nothing the training step then reads.
 Two ways it could: by leaving `_stash_live_branches` on (get_gfn_backward_loss
-overwrites gfn._live_bwd under that flag, and fused_train_step's pooled-VarGrad
-block reads it later in the SAME step), and by letting an OOM reach
+writes the replay slot gfn._live_replay under that flag, and fused_train_step's
+pooled-VarGrad block reads it later in the SAME step), and by letting an OOM reach
 handle_train_epoch_error, which would cut the global batch size off a diagnostic.
 
 The size rule is the other half: the probe is clipped to the live batch_size as
@@ -85,7 +85,7 @@ def test_the_gap_is_val_minus_the_step_s_own_training_loss():
 def test_the_probe_does_not_leak_into_the_pooled_vargrad_term():
     m = _m(losses=[1.0], stash=True)
     m._replay_val_stats(discretizer=None, train_loss=0.0)
-    assert m.seen['stash_during'] is False, 'gfn._live_bwd would carry the probe'
+    assert m.seen['stash_during'] is False, 'gfn._live_replay would carry the probe'
     assert m.gfn_model._stash_live_branches is True, 'and it must be restored'
 
 

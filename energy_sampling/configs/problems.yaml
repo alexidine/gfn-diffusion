@@ -41,6 +41,9 @@ schema: 1
 #     samples, so anchors seed from the conditions file -- handing over the
 #     answer set deliberately, because these runs study convergence dynamics
 #     rather than mode discovery.
+#   latent_gaussian: its prior IS the target -- drawn from the gaussian it is
+#     scored by -- so the prior dataset already holds target-distribution samples
+#     and anchors seed from it. One file serves as prior and conditions both.
 #   unconditional molecule: the prior is already high quality (not the target),
 #     so anchors seed from it.
 #   conditional molecule: seed from reasonable samples; per-condition coverage
@@ -111,6 +114,13 @@ problems:
     buffers:
       anchor_buffer:
         seed_source: prior_dataset
+      # REQUIRED BY THE PROTOCOL ABOVE, not tuned: its var_conditioning
+      # (pooled_source 'replay', condition_draw) is refused at step 0 beside a
+      # prioritised replay draw, and mk_dev keeps that draw on for the
+      # unconditional route. The route's other globals are tuning and live in
+      # the arm generator (configs/qm9c_anneal/make.py).
+      replay_buffer:
+        prioritise: { enabled: false }
 
   # ---- conditional toy --------------------------------------------------
   toy_big_unif:
@@ -190,11 +200,20 @@ problems:
     z_primes: [ 1 ]
     vector_conditioning: false
     molecule_conditioning: false
-    prior_path: null
-    molecules_path: null
+    # One file, both keys: the prior is the target, and prep_prior.py stores the
+    # one batch under both 'prior' and 'equalized_prior'. Tied to space_groups
+    # above -- the dead rows are baked into the file at draw time.
+    prior_path: 'D:\crystal_datasets\conditional\priors\gauss_latent_sg1_zp1_prior.pt'
+    molecules_path: 'D:\crystal_datasets\conditional\priors\gauss_latent_sg1_zp1_prior.pt'
     test_molecules_path: null
     temperature: 1.0
-    analyze_kwargs: { }
+    # The gaussian's centre and sigma. `c` is the mode on live rows and the
+    # canonical 0.0 on this space group's dead rows; `width` is the sigma the
+    # prior above was drawn at. Both from configs/gauss_aug12/spec.py, which the
+    # prior generator and the closed form also read.
+    analyze_kwargs:
+      c: [ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5 ]
+      width: 0.1
     model:
       periodic_centroids: false
     buffers:

@@ -82,6 +82,10 @@ def main():
     ap.add_argument("--scale-14", type=float, default=0.5)
     ap.add_argument("--lj-k-factor", type=float, default=2.5)
     ap.add_argument("--include-trivial-rotations", action="store_true")
+    ap.add_argument("--force-field", default=None,
+                    help="pass the run's energy_config.force_field. It selects how linear "
+                         "centres are flagged, which can change the chart -- a file built "
+                         "under a different one can disagree with the run's energy")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--no-check", action="store_true",
@@ -95,6 +99,10 @@ def main():
                     help="keep only molecules with this state dimension. Default: take k from "
                          "the first molecule that builds. A conditions file is ONE k, and k is "
                          "not a stable property of the SMILES -- see known gap 2")
+    ap.add_argument("--carrier", action="store_true",
+                    help="write a MIXED-k set in the width-K carrier layout "
+                         "(energies/conformer_carrier.py) instead of filtering to one k. "
+                         "The run builds the same layout from the same member set")
     ap.add_argument("--encoder-ckpt", type=Path, default=None,
                     help="bake a frozen molecular embedding onto every entry, so the policy "
                          "can be conditioned on molecular identity. Writes per-graph "
@@ -121,6 +129,8 @@ def main():
     ff = dict(epsilon=args.epsilon, min_separation=args.min_separation,
               scale_14=args.scale_14, lj_k_factor=args.lj_k_factor,
               include_trivial_rotations=args.include_trivial_rotations, seed=args.seed)
+    if args.force_field:
+        ff['force_field'] = args.force_field
 
     bundle = None
     if args.encoder_ckpt is not None:
@@ -187,7 +197,7 @@ def main():
         k_here = int(energy.data_ndim)
         if want_k is None:
             want_k = k_here
-        if k_here != want_k:
+        if k_here != want_k and not args.carrier:
             skipped.append((smiles, f"k={k_here}, file is k={want_k}"))
             continue
         print(energy.describe())
@@ -209,6 +219,29 @@ def main():
         conditions.append(mol)
         energies.append(energy)
         kept.append(ident)
+
+    layout = None
+    if args.carrier and conditions:
+        # THE SAME LAYOUT THE RUN WILL BUILD: CarrierLayout is a pure function of the members'
+        # block counts, and MultiConformerTorsions builds it from the same member set read off
+        # this file. Every graph is re-expressed in it, and the reconstruction is checked
+        # against each member's own chart after padding, not only before.
+        from energies.conformer_carrier import (CarrierLayout, carrier_pad_condition,
+                                                check_carrier_convention)
+        layout = CarrierLayout(dict(zip(kept, energies)))
+        print(layout.describe())
+        R = max((a.shape[1] for _, a, _ in dof_rows), default=1)
+        frames = {id(mol): (a, msk) for mol, a, msk in dof_rows}
+        padded = []
+        for mol, energy, ident in zip(conditions, energies, kept):
+            a, msk = frames.get(id(mol), (None, None))
+            pm = carrier_pad_condition(mol, layout, ident, energy, atoms=a, mask=msk, R=R)
+            if not args.no_check:
+                err = check_carrier_convention(pm, layout, ident, energy)
+                print(f"   {ident}: carrier graph and member chart agree to {err:.2e} A")
+            padded.append(pm)
+        conditions = padded
+        dof_rows = []            # dof_atoms / dof_mask already written in carrier form
 
     if dof_rows:
         # R IS GLOBAL ACROSS THE FILE, not per molecule. A state column at level='torsion' is
@@ -266,12 +299,15 @@ def main():
         # RAW energy, T = 1: prebuilt_sample_to_reward divides by the sampling
         # temperature itself (see conformer_data.bake_energies)
         e = bake_energies(energy, states)
+        periodic = energy.periodic_dims
+        if layout is not None:
+            states = layout.to_carrier(ident, states)
+            periodic = [b == 2 for b in layout.free_block]
         print(f"  {ident}: E median {e.median():+8.3f}  p10 {torch.quantile(e, 0.1):+8.3f}"
               f"  p90 {torch.quantile(e, 0.9):+8.3f}")
         # the mask is NOT optional: at `flex` and above the state carries linear r/theta
         # columns, and wrapping one folds a bond length to the opposite corner of the box
-        parts.append(attach_states(mol, states, e, identifier=ident,
-                                   periodic=energy.periodic_dims))
+        parts.append(attach_states(mol, states, e, identifier=ident, periodic=periodic))
 
     prior = parts[0]
     for part in parts[1:]:

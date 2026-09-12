@@ -1,16 +1,21 @@
+# todo MISSING LIVE KEYS (docs/TODO.md #6b). These are read with a silent code
+# default and appear in no config: energy_config.{energy_clip, prior_dataset_path,
+# prior_relax_steps, seed_relax_steps} and top-level {num_threads, wandb_mode}.
+# Open question: does "mk_dev carries the codebase in miniature" make THIS file the
+# conformer route's own mk_dev, or does mk_dev carry these too?
 # The live config-schema state this operational surface is written against.
 # Generated runs record the state they were spawned from so a mismatch fails
 # visibly. This is not a promise to migrate historical configs: add a transition
 # only when an explicitly active config or checkpoint still needs one.
 # This is a migration identifier, NOT a release version, and it is separate from
 # the checkpoint problem_def's schema_version (which versions problem identity).
-project_state_version: 9
+project_state_version: 10
 
-run_name: 'conformer_protocol_aug20f'  # ConformerModeller + full sample-side eval statistics incl. basin coupling
+run_name: 'propanol_uncond_sep10h'  # propanol CCCO at `full`, unconditional, protocol conformer_unconditional. A run_name is a checkpoint IDENTITY: relaunching under an existing one overwrites that identity's _best / _phase1_exit / _buffers, so a new leg needs a new name.
 tag: 'conformer'
 seed: 12345
 device: 'cuda'
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.75  # hard cap on this process's share of the card, applied before the first allocation. PER-PROCESS: the desktop's own GPU clients hold ~2.5 GB on this box, so a fraction that leaves less than that lets the process sit inside its cap while the CARD fills, and Windows then backs allocations with host RAM instead of raising OOM -- no error, no throttle flag, several times slower
 anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
@@ -20,7 +25,7 @@ mlip_path: null  # MLIP weights, for energy_function uma/mace only. Unused on el
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
-checkpoint_name: null  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run  |  fresh run
+checkpoint_name: 'conformer_propanol_uncond_sep10c_conformer_torsions-noprior-T1-befbab_phase1_exit.pt'  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
 prior_model_name: null  # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only  |  the prior is an InternalPrior (energy_config.internal_prior_path), not a GFN
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
 prior_path: null  # seeds the prior buffer, and the anchor buffer on molecule routes  |  no prior dataset file; init_prior_dataset samples the fitted prior instead
@@ -47,76 +52,109 @@ lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1                 # PINNED: exempt from envelope and servo alike, since alpha* is measured over policy params only. Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
 min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. At 1.0e-6 it sat barely below the conditional VarGrad quality optimum (~2e-6 to 2e-5), so a controller asking to go lower was refused silently, and it would clamp the BOTTOM OF THE RAMP for any stage whose base is set low (5e-6 at lr_warmup_ratio 10 starts at 5e-7). lr_ctrl/lr_floored_groups reports when it binds
-lr_warmup_ratio: 10          # the ramp starts at peak / this and reaches peak over adaptive_lr.warmup_steps, floored at min_lr. A deeper ratio spends more of warmup far below the operating rate; every sensor holds through warmup anyway, so the ramp is dead time the run pays at each stage transition
-adaptive_lr:
-  control_flow_lr: false     # true = the flow/Z groups also take envelope and peak_scale
+# lr_warmup_ratio: DELETED with the warmup envelope (state 10). The envelope was a
+# continuous ramp underneath the operating rate; burn-in replaces it and is a different
+# object -- a FIXED scale held for a FIXED number of steps. The ramp had to go because a
+# multiplier underneath a candidate rung means the rate under test is not the rate applied,
+# which is exactly how a too-hot rung survives its trial.
 
-  # ---- 1. WARMUP ENVELOPE ------------------------------------------------
-  # Fixed exponential ramp, no sensor: 1/lr_warmup_ratio -> 1.0, then held.
-  # Restarted at every stage transition -- the optimizers were just rebuilt onto
-  # a surface with different curvature.
-  warmup_steps: 1000
-  # The ramp is DETERMINISTIC and the sensors decide only when it ENDS -- during
-  # warmup neither `hyper` nor `ray` moves peak_scale, because the envelope is
-  # holding the rate down on purpose and a reading taken through that suppression
-  # says "too cold" whatever the operating point is. Each stops the ramp on the
-  # cadence it can support: `hyper` speaks every step, so it averages this many
-  # of them and freezes when the mean error reaches its setpoint; `ray` gets two
-  # readings in a 1000-step ramp, so it cannot average and freezes on the first
-  # alpha* below alpha_target. Freezing early costs some warmup, not the
-  # operating point -- which is what licenses the one-reading rule.
-  # Too short and single noisy readings end the ramp (cos swings -0.2 to +0.4
-  # through a live warmup); too long and it cannot turn in time to be an interlock.
-  warmup_freeze_cos_window: 25
-  # Whether the ramp may be frozen early at all. A BOOLEAN since state 7:
-  # what used to be a per-sensor threshold on how far peak_scale had fallen
-  # measured noise the freeze no longer sees, because no sensor moves
-  # peak_scale during a ramp -- only on_divergence, which needs no bar to be
-  # believed. false = ramp to hold regardless.
-  envelope_freeze: true
-  seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
-  bounds: [ 0.01, 2000.0 ]   # how far the sensors may move the rate from its seed, as a multiplier. Wide on purpose: it is a sanity rail, not a tuning range
+# ---- LEARNING-RATE CONTROL (state 10) -----------------------------------------
+# REPLACES the `adaptive_lr` block, which is retired whole: preflight_config refuses any
+# config still carrying it. The adaptive controller it named no longer exists. `ray` was
+# killed 2026-08-23 by its own acceptance test -- alpha* is defined as s*/lr, so the slope of
+# log(alpha*) against log(lr) must be -1, and it measured 0.00 +/- 0.2 across twelve runs, two
+# stages and 2.7 decades of rate. The sensor was uncorrelated with the variable it steered,
+# and the pool, the sweep, the rung ladder and alpha_target all inherited that.
+#
+# Rates are now set by a BRUTE-FORCE BRACKET: burn in at a conservative fixed rate,
+# checkpoint, run a grid of fixed-LR trials from that checkpoint, and keep the highest rung a
+# safety margin below the lowest one that detonated.
+#
+# RETIRED WITH THE BLOCK, recorded here so the rationale is not simply lost:
+#   warmup_steps / warmup_freeze_cos_window / envelope_freeze -- the whole freeze-the-ramp
+#     mechanism, moot once there is no ramp.
+#   bounds -- the candidate grid IS the range.
+#   calibration.* (alpha_target, eta_up, eta_down) -- read by `ray` only.
+#   divergence_cut -- a hard failure no longer cuts the rate: the rate was chosen by a
+#     bracket, and a silent cut hides that selection error.
+#   divergence_loss_rel -- superseded by a bar derived from the root's own loss SPAN, which
+#     unlike a ratio is well defined on the signed MLE channel.
+#   restart_after, ramp.*.
+# THE PHASE-1 EXIT CRITERION. Emitted by Modeller.progress_metrics, which is ROUTE-AGNOSTIC
+# by construction (it reads `_batch_latents` -- latent_params() on a crystal, the torsion
+# state on a conformer) and was in fact first written on the conformer subclass. Values are
+# mk_dev's. Without this block `gates/progress_done` is never published and the stage that
+# exits on it never exits.
+progress_gate:
+  mode: level
+  level_window: 2500       # trailing-median smoothing: one noisy eval dipping under the bar
+                           # is not a convergence verdict
+  min_history: 2000
+  metrics:
+    - { key: 'w1r/median', bar: 5.0 }
+    - { key: 'w1r/worst',  bar: 10.0 }
 
-  # ---- 2. CALIBRATION -> LR ----------------------------------------------
-  # Read by the `ray` sensor only:  peak_scale *= (alpha_hat / alpha_target)^eta
-  calibration:
-    alpha_target: 4.0        # the alpha* the loop steers to. HIGHER = more conservative: alpha* is the one-step optimum along a frozen ray, and the rate a run survives sits well BELOW it, because a fixed-theta probe cannot see the gradient-noise term. Below ~1 asks for more than the one-step optimum and is not expected to hold. Re-measure per route
-    eta_up: 0.25             # exponent when raising. Deliberately the smaller one: a raise is licensed only by a one-step measurement that cannot see multi-step damage
-    eta_down: 0.5            # exponent when lowering -- the safe direction, so it moves faster. Undertraining is recoverable, a detonation is not
 
-  # ---- 3. DIVERGENCE (the only between-calibration guard) -----------------
-  # Non-finite loss/grad, or either past these bars -> reload the checkpoint AND
-  # cut peak_scale. Bars below 1e5 are refused at construction: anything that
-  # fires on ordinary training is a graduated cut tier, which v8 deleted on
-  # evidence. A loss-based "too hot" indicator is deliberately NOT attempted --
-  # on this problem it fires too late to steer an LR.
-  divergence_loss_abs: 1.0e+9
-  divergence_grad_abs: 1.0e+9
-  # RELATIVE bar, as a multiple of the QUIETEST loss the CURRENT STAGE has
-  # produced on that branch. The absolute bars above are a backstop against
-  # numerical death, not a statement about training: a route whose loss lives at
-  # O(1) can go up a hundredfold -- which destroys the run -- and never approach
-  # 1e9. On a stage that is well behaved in general, that excursion IS the event
-  # worth rewinding from. Per stage and per branch, because loss SCALE differs by
-  # orders of magnitude between the two (cleared in LRController.rearm_warmup);
-  # inert for the first 50 observations on a branch so the opening reading cannot
-  # become the reference; and floored, so a loss that legitimately approaches zero
-  # cannot drag the bar down with it. null/0 = off, absolute bars only.
-  divergence_loss_rel: 100.0
-  divergence_cut: 0.5        # peak_scale multiplier per divergence; compounds
+lr_control:
+  # `fixed`, NOT `bracket`. The migration tool defaults to bracket and then leaves
+  # candidate_scales empty, which config_invariants correctly refuses ("0 rungs cannot
+  # support safety_rungs 1"). Bracket is an LR-SELECTION procedure -- burn-in plus a grid of
+  # trials -- and this config's immediate job is to find out whether `equilibration` runs at
+  # all now that `bootstrap_z` is no longer dead. Selecting a rate is a separate question,
+  # and running the two together would confound them. Switch to bracket and supply
+  # candidate_scales (see configs/mk_dev.yaml) once the stage is known to work.
+  mode: fixed
+  seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts
+                             # from. CARRIED OVER UNCHANGED from adaptive_lr.seed_lr, so this
+                             # migration does not retune the run -- only relocates the key
+  fixed_scale: 0.2           # x seed_lr = 2.5e-5. mk_dev's value. NOT 1.0 (= 1.25e-4, the
+                             # rate this config declared pre-migration): that rate detonated
+                             # TWICE in one run, both times within 3 steps of the burn-in
+                             # release -- loss_excursion_bwd 95.21 over -0.69 at step 1003,
+                             # then loss_excursion_fused 400.8 over bar 204.3 at step 2073
+  control_flow_lr: false     # true = the flow/Z groups also take the bracket's scale. Kept
+                             # false: lr_flow stays pinned at 0.1, and on THIS route the
+                             # unconditional flow_model is a LearnableScalar (convex 1-D)
+  burn_in_steps: 3000        # mk_dev's value: ~0.975 Adam bias correction at beta2 0.999, so
+                             # the rate is released only once the second-moment estimate has
+                             # settled. 1000 was not enough -- the release fired immediately
+  burn_in_scale: 0.05        # mk_dev's value. WHAT ACTUALLY MATTERS IS THE RELEASE RATIO:
+                             # 0.05 -> 0.2 is a 4x step, where 0.1 -> 1.0 was 10x, and the
+                             # measured failure was at the release both times. The excursion
+                             # bars are fitted DURING burn-in and then held live across the
+                             # promotion, so a large jump is judged against a bar measured at
+                             # a rate the run is no longer using
+  min_root_bias_correction: 0.9   # at burn_in_steps 3000 the factor is ~0.975, so this
+                             # cannot fire; lower burn_in_steps far enough and it does
 
-  # Shared parameters for the `ray` sensor. There is no `enabled` flag: a stage
-  # declaring `lr_sensor: {kind: ray}` IS the switch, and a second one could
-  # disagree with it. `hyper` needs no block at all -- it declares itself inline
-  # at the stage -- so this block exists only because seven parameters are worth
-  # storing once.
+  # NOT COPIED FROM mk_dev: `fire_cut_factor: 1.0`. That is mk_dev's default and it means a
+  # fire NEVER cuts the rate. A fire restores WEIGHTS but deliberately keeps the LIVE
+  # BUFFERS, and `last_ok` cannot advance because the run never survives far enough past the
+  # rewind point to write a newer one -- so with no cut every cycle is identical and the only
+  # exit is the reload budget aborting the run (measured on lp02_hot2, 2026-09-02). mk_dev can
+  # afford it because its rate is bracket-selected; this route has not been bracketed, so the
+  # cut stays live as the escape hatch. Revisit once a bracket has actually chosen the rate.
+  verbose: true
+
+  # Bars for a hard failure. `loss_abs` was `adaptive_lr.divergence_loss_abs: 1.0e+9`, which
+  # is no longer loadable -- anything >= 1e8 is refused, on the grounds that a numerical
+  # backstop that large has stopped being a backstop. 1e6 is mk_dev's value.
+  hard_failure:
+    loss_excursion_k: 10.0   # bar = root_hi + k x (root_hi - root_lo), per branch
+    grad_excursion_x: 100.0  # bar = x  x  the largest pre-clip grad norm seen at the root
+    loss_abs: 1.0e+6         # numerical backstop only; >= 1e8 is refused at load
+    cruise_rederive: true
+    cruise_settle_steps: 200
+
+  # DIAGNOSTIC ONLY, and off unless a stage explicitly declares `lr_sensor: {kind: ray}`.
+  # Moved here verbatim from adaptive_lr.ray_calibration; it reaches no learning rate.
   ray_calibration:
-    period: 500              # train steps between calibrations
-    n_sub: 8                 # paired sub-batches -- the replicates every confidence interval is built from. Higher = a tighter bracket on alpha* per calibration, at a proportional cost in probe compute; lower risks a bracket too wide to move peak_scale at all
-    # MUST be closed under doubling -- testing "alpha* > a" needs the loss at 2a.
-    # Log-spaced, so the response is proportional to log-distance from target and
-    # saturates at the grid edge rather than extrapolating a bound.
-    alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]  # the probe grid, spanning 64x around the target so a badly mis-set rate is still bracketed rather than pinned at an edge. 0 is the no-step reference
+    period: 500
+    n_sub: 8
+    alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]
+
+  logz_detour_nats: 2.0      # a candidate FAILS if its batch-mean log_Z_learned falls more than this many nats BELOW the root's -- one-sided, so a dip-and-recover survives and a detour does not. Catches a minority-branch destabilization the frac-weighted composite bar is blind to under a dominant bwd frac. Judged outside the settle window; inert wherever Z does not train. null/0 = off
+  trial_settle_steps: 10     # head of each trial where the BAR verdicts are not judged -- trials jump burn-in -> candidate instantly, and that jump alone produced few-step excursions past k x span on a quiet root. Non-finite values and exceptions still fail inside it. Refused at load if >= trial_steps
 weight_decay: 1.0e-4
 use_weight_decay: false
 # GPU region timing (profiling.py). OFF, and off is the normal state: with no
@@ -136,11 +174,11 @@ profiling:
   # length, and once written the window latches shut for the rest of the run.
   # start_step is deliberately late: the opening steps are CUDA context creation,
   # autotuning and cold caches, so profiling them measures startup, not training.
-  trace:  # todo these need comments
+  trace:
     enabled: false
-    start_step: 1500
-    active_steps: 8
-    outdir: profiling_results
+    start_step: 1500         # train step the window opens at
+    active_steps: 8          # steps profiled, after which the window latches shut for the rest of the run
+    outdir: profiling_results  # written beside the run as files, never to wandb
     write_trace: false       # also write the chrome timeline JSON. OFF: measured 748 MB for 8 steps (~93 MB/step) on ELJ with shapes and stacks both off, which is unopenable and is what pins active_steps to single digits. The *_table.txt beside it is 9 KB and carries the op breakdown; turn this on only when a TIMELINE is the question
     record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
     with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
@@ -210,11 +248,12 @@ model:
   dplr_mask_angular: true      # zero the correlated fraction on wrapped dims (angular, plus any periodic_centroids ones); correlations then only couple non-wrapped dims. Required true when DPLR runs with periodic dims (asserted at construction)
   pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
 
+  hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system
 # training params
 ################################################################
 buffer_device: cuda  # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
-batch_size: 512  # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
-grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
+batch_size: 1024  # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling). At/above fused_grad_accum_min_samples a fused step is one plain unscaled step, with no micro-accumulation
+grow_batch_size: false         # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 20000  # matched to mk_dev; the sizer stops where OCCUPANCY says, and a low cap silently becomes the binding bound (it reported exactly that at 1024)
 eval_num_samples: 4096  # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
@@ -234,8 +273,8 @@ figs_period: 1000  # how often to log custom figures EXPENSIVE # must be multipl
 batch_growth_factor: 1.6       # ladder rung spacing below the cap (torch.compile treats each distinct size as a recompile, so rungs are few)
 batch_growth_cap: 1000          # rung step ceiling in samples: grow geometrically until batch*(factor-1) reaches this, then climb linearly at it. Bounds the held rung's overshoot past the true occupancy crossing to one accum quantum -- at large batch a factor-f overshoot costs up to ~40% of update rate, a 1000-sample one <=10%. The price is more compile shapes on a high climb. 0 = uncapped geometric
 batch_growth_interval: 50       # minimum per-rung calibration dwell, in steps. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
-batch_util_target: 0.6          # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
-gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric  # todo is this steps or seconds?
+batch_util_target: 0            # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Occupancy is a cluster scheduling constraint; off is the shipping default
+gpu_util_window_s: 900  # trailing WALL-CLOCK SECONDS averaged into gpu/util_recent -- seconds, not steps, and the _s suffix on all three of these says so
 gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
 gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy -- but NB the in-process reading disagrees with the out-of-process samplers by a batch-dependent, sign-flipping error (phase6_handoff.md section 2); the scheduler judges the out-of-process number  # todo simplify this comment and align with our rules
 max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only once the median step exceeds this. Stands down for the stage if a cut does not actually move step time (a fixed per-step cost is not batch-driven, and cutting further only shrinks the gradient). 0 = off
@@ -340,6 +379,7 @@ fwd_loss_coeffs:
   repeats: 1.0            # fwd tiles share a condition and land on DISTINCT terminals -- the cross-terminal group VarGrad needs
   loss_clip: 1.0E+9
   beta: 10.0
+  pooled_bridge_only: 0.0 # > 0.5 = restrict the buffer side of the draw to rows whose CONDITION the forward batch also holds. A kept row with no forward partner forms a single-source group, where the term degenerates to the backward branch's own and buys dilution instead of bridge. Read pooled_pairable_frac for the ceiling and pooled_lambda_b for what the ratio actually got
 bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
@@ -419,6 +459,14 @@ z_calibration:
   #   calibrated to the buffer's measure, which lags the policy by ~tau steps.
   # 'regression': least squares onto the tracker's ema_logw.
   mode: rollout
+  # --- z_level_fill: the log-Z pin once flags.z_calibration is off ---------
+  fill_mode: absorb          # 'absorb' = a 1-D Kalman filter on log Z: every measurement moves it by its own precision share K = P/(P+se^2). 'snap' = the gated overwrite, which is what fill_threshold/fill_se/fill_cooldown_steps below are the gates FOR -- under absorb all three are inert bar the notes on each
+  fill_process_var: 0.01     # absorb only. Nats^2 per step added to P between applied measurements: how fast the level is assumed to drift while unmeasured. Larger = later measurements count for more
+  fill_moment_reset: 0.5     # absorb only. Nats of |dz| above which the flow parameter's Adam moments are dropped; a small absorbed step leaves them meaningful
+  fill_from_eval: fill       # off|report|fill. The eval rollout is 2500-10000 samples, so its se is the lowest the run ever measures and the absorber gives it a K near 1
+  fill_threshold: 0.5        # nats. Under ABSORB this is only the enable switch: any value > 0 arms the fill, 0 or null disables it. Under snap it is the deadband -- |log_Z - the batch's TB fixed point| must exceed it -- defaulted there at 2x fwd_loss_coeffs.beta, where the clipped dL/dZ the servo reads is fully saturated and the fill is the only instrument left
+  fill_se: 5.0               # SNAP only: the gap must also exceed this many standard errors of the fixed point. Under absorb the se enters the Kalman gain instead of a gate, and only a non-finite se (no unclipped row) blocks
+  fill_cooldown_steps: 0     # train steps before another fill may fire. 0 under absorb: the cooldown exists because a snap re-arms off fwd/tb_resid_clipped, an EMA still reporting the pre-fill level; the absorber reads the batch root directly and weights repeat measurements by precision
   sensor: pooled             # |EMA fwd/tb_resid_clipped|, clipped at fwd_loss_coeffs.beta => exactly dL/dZ of the fused loss. rms/worst are per-condition dispersion and read identically zero on a single-condition (unconditional) run
   sensor_quantile: 0.5       # sensor: worst only -- the upper-tail quantile over conditions that worst_z_bias reads. Inert on the other three sensors
   threshold: 0.5             # nats. Same bar as buffers.anchor_buffer.health_gate_ceiling. Must stay above the flow head's own jitter floor (O(lr_flow) = 0.1 here)
@@ -470,80 +518,132 @@ conditional_worst_quantile: 0.25  # fraction of conditions allowed to sit beyond
 # absent embedding_conditioning reads as false rather than as an error.
 protocol: conformer_unconditional
 
+checkpoint_read_only: false  # suppress ALL checkpoint WRITES ('running', 'best', archives, 'final'); loading stays active. For smoke tests and refactor validation, which resume real state but must not rewrite the run they resumed from
+freeze_backward_policy: false  # freeze P_B from step 0 of THIS process. false | true (= 'full') | a mode string. The stage actions freeze_pb / unfreeze_pb are how to switch it at a boundary; a checkpoint carrying a snapshot has already restored it and is not overwritten
+max_lr: null                 # hard ceiling on every group's rate, applied AFTER the bracket's scale. null = no cap. Refused at load if <= 0 or <= min_lr -- clamp order decides which bound wins, so the pair must not cross
+nonfinite_abort_streak: 50   # consecutive steps with a non-finite gradient before the run aborts outright. check_spike cannot catch this -- it reads last_grad_norm_pre_clip, which the non-finite path leaves at its last FINITE value. 0 = never abort
+nonthermal_cond_bar: 0.1     # a condition FAILS when more than this fraction of its rows sit above u_star (higher is worse)
+nonthermal_entropy_per_dim: 4.0  # nats/DoF defining the excess-energy bar u_star, against each condition's own energy floor. Publishes Excess Energy Nats {Mean,P50,P90,P99,Max} and Nonthermal fractions. 0 or null = the whole excess-energy channel is off
+per_step_probe_steps: 0      # log this many RAW per-step fwd values after arming -- no EMA, no tracker, which is the point: the tracker's smoothing destroys a 2-step mode. 0 = off
+reasonable_cond_bar: 0.5     # a condition FAILS when fewer than this fraction of its rows pass _reasonable_sample_mask (higher is better)
+rewind_tolerance: 0.25       # 'last_ok' is relinked whenever the combo loss is within this FRACTION of the running best, additively in the metric's own scale (so it holds for negative metrics such as bwd/mle). 0 = only a new best relinks
+traj_checkpoint_modes: null    # null | a list from [fwd, bwd, replay]
+warm_start_ignore_problem_keys: null  # list of problem-definition keys a warm start may differ on. Only the keys in checkpointing.WARM_START_EXEMPTIBLE are nameable; the rest change what the target IS, and are refused at load. Every exemption is printed
+
 protocols:
   conformer_unconditional:
+    # mk_dev.yaml's `unconditional_tb`, which is the current form. THREE DEVIATIONS, all
+    # forced by the route and marked FORCED where they occur; everything else is mk_dev's.
     stages:
-      # -- PHASE 1: MLE warm start. Broadens the policy on prior draws.
       - name: train_prior
         train_mode: bwd
         bwd_sampling_mode: dataset
-        skip_if: prior_loaded
-        # `hyper`, not `ray` -- and here that is forced rather than preferred. The ray
-        # probe draws from replay and scores replay_loss_coeffs, so it is incoherent in a
-        # bwd stage that trains neither. The hypergradient reads no loss at all
-        # (peak_scale *= exp(beta*cos) over the angle between the current gradient and the
-        # direction the last step actually moved the policy), so it stays coherent
-        # whatever a stage trains.
-        #
-        # beta is a BANDWIDTH with no universal value -- the per-cell optimum spans 20x,
-        # which is why the parser refuses to default it. 0.1 is the best WORST-CASE beta
-        # measured on the bench over 12 cells, and that sweep covered MLE surfaces, which
-        # is what this stage trains.
-        lr_sensor: { kind: hyper, beta: 0.1 }
+        skip_if: prior_loaded          # a prior loaded by path IS this stage's product
+        # Cuts the rate when the MLE channel sits hot, rather than waiting for an excursion
+        # to fire and rewind. mk_dev's channel and bars.
+        hot_lr_sensor: { channel: bwd/mle, form: absolute, rows: 31, above: 5.0 }
         flags:
-          update_log_z: true
-        mle_gate:
-          slope_t: 2.0
-          min_rate: 0.30   # was 0.05, which sits BELOW the measured noise floor
-                           # (2*se ~ 0.21 at 72 DoF) and so could only fire on a
-                           # REGRESSION -- 12,050 steps on phenyl-THP for a warm
-                           # start that had plateaued by ~1,500
-          window: 300
+          update_log_z: true           # accumulate ema_logw / best_energy evidence
+          # FORCED (1/3): no `scramble_conditions`. It is an intent flag that applies only on
+          # conditional problems, and it is what licenses `bootstrap_z:train_conditioner`
+          # below -- the suffix is only valid after a stage that scrambled conditions.
         loss_coeffs:
-          bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+          # tbc: 0.0 and repeats: 1.0 -- mk_dev's current values. This stage used to run
+          # `tbc: 1.0, repeats: 2.0`, which doubled the backward cost for a consistency
+          # residual no longer in use. NOTE tbc and the old exit went together: `bwd/tbc` is
+          # not published when the coefficient is zero, so the old `bwd/tbc < 2.0` exit term
+          # could never have fired under these coefficients.
+          bwd: { mle: 1.0, tbc: 0.0, repeats: 1.0 }
+        # Replaces the mle_gate + bwd/tbc pair. The mle_gate block is gone with it: it
+        # existed only to publish gates/mle_flat for that exit, and a gate whose output
+        # nothing reads is a cost with no consumer.
         exit:
-          - { metric: gates/mle_flat, above: 0.5, patience: 5 }
-          - { metric: bwd/tbc, below: 2.0 }
-        # OWNER DECISION 2026-08-20 -- `snapshot_prior` is DELIBERATELY ABSENT.
-        #
-        # The crystal route ends this stage with [ 'snapshot:phase1_exit',
-        # 'snapshot_prior' ], the second of which freezes the MLE-trained policy as THE
-        # prior model. That is right when the prior has to be learned. It is wrong here:
-        # the conformer track already has a fitted InternalPrior that draws r/theta at the
-        # force field's own thermal widths and torsions jointly per group, benchmarked
-        # against uniform-on-box at 32x-87000x on median energy excess. Phase 1 is being
-        # run ONLY to broaden the policy space, not to produce a prior -- so the trained
-        # model must not displace one that is already good.
-        #
-        # Consequence to keep in view: phase 2 therefore draws backward terminals from the
-        # SAME fitted prior phase 1 trained against, rather than from a policy that has
-        # moved. Whether that costs anything is measurable and unmeasured.
+          - { metric: gates/progress_done, above: 0.5, patience: 1 }
+        # FORCED (2/3): no `snapshot_prior`. It freezes the MLE policy as THE prior model and
+        # deletes best.pt on that premise; this route draws from a fitted InternalPrior and
+        # never reads prior_model, so the action now refuses outright (protocol.py).
         on_exit: [ 'snapshot:phase1_exit' ]
 
-      # -- PHASE 2: the always-on terminal stage. No exit block; runs to `epochs`.
       - name: equilibration
         train_mode: fused
-        bwd_sampling_mode: prior
-        # OWNER DECISION 2026-08-20: hyper is the DEFAULT sensor, not ray. On the crystal
-        # route this stage runs `ray` because it is the one place ray is coherent -- the
-        # probe needs a fused stage that trains replay TB, which this is. Overriding it to
-        # hyper is a deliberate default change, so the ray option stays available and the
-        # switch is one key.
-        lr_sensor: { kind: hyper, beta: 0.1 }
+        bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
+        hot_lr_sensor: { channel: fwd/scatter_err, rows: 11, above: 2.0 }
         flags:
           update_log_z: true
           buffers_active: true
-          z_calibration: true
-        # `rebuild_prior_by_churn` carried over from the crystal route: it swaps the
-        # dataset-seeded buffer for one built through the online admission gate.
-        on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z' ]
-        fracs: { fwd: 0.05, bwd: 0.45, replay: 0.5 }
-        min_fracs: { fwd: 0.02, bwd: 0.02, replay: 0.02 }
+          z_calibration: false         # OFF under a rollout cadence: the servo makes its own energy call per Z step off a sensor frozen between rollouts, so it would fire on every skipped step. z_level_fill pins log Z instead
+        # FORCED (3/3): plain `bootstrap_z`, not `bootstrap_z:train_conditioner` -- the
+        # suffix requires a preceding stage with scramble_conditions, which this route does
+        # not set. NOTE this action was DEAD on every route until 7096a0a (it unpacked six
+        # values from a four-value call), so this entry has never actually executed.
+        on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z:rollout:4000' ]
+        # ENTRY POINT ONLY: `balance` below seeds its share from these and walks the
+        # split from here. Both modes enter strictly inside their `bounds`, so the
+        # ramp has room in both directions from step one.
+        fracs: { fwd: 0.0, bwd: 0.9, replay: 0.1 }
         deactivate_threshold: 0.01
+        # --- RARE FORWARD ROLLOUTS (docs/design/rarer_rollouts.md) ----------------
+        # The forward branch is the only branch that calls the energy function, so this
+        # cadence IS the energy-cost axis of a training step.
+        # ACTIVATING IT REQUIRES TWO OTHER KEYS TO MOVE. Both are refused at load, not
+        # silently ignored:
+        #   flags.z_calibration -> false      that servo's rollout mode makes its own
+        #                                     energy call per Z step, off a sensor frozen
+        #                                     between rollouts, so it fires on every
+        #                                     SKIPPED step and restores the cost removed
+        #   z_calibration.fill_threshold > 0  z_level_fill is then the ONLY thing pinning
+        #                                     log Z at each rollout; absent or 0 disables
+        #                                     it and leaves log Z unpinned between them
+        fwd_rollout_every: 20                # run fwd on 1 step in N; 0 = every step. This is
+                                             # the BACKSTOP period -- the triggers below are
+                                             # what set the cadence in practice
+        z_pin_rollout_every: 0               # an extra rollout whose only product is the
+                                             # z_fill stash: carries no gradient and its rows
+                                             # do not enter the replay buffer. Must be > 0 AND
+                                             # strictly less than fwd_rollout_every, or it
+                                             # fires on no step at all. 0 = off
+        fwd_rollout_triggers:                # off-cadence bars: fire a rollout EARLY when the
+                                             # state says one is needed, each reported under
+                                             # its own name. 0 = that bar off. The whole block
+                                             # is inert while fwd_rollout_every is 0
+          occupancy_min_batches: 2.0         # fires BELOW: len(replay_buffer) / live batch_size.
+                                             # NB the reading uses the LIVE batch while
+                                             # admissions are capped at buffers.replay_buffer
+                                             # .churn_rate -- if the batch grows past the value
+                                             # churn was sized for, this bar cannot be cleared
+                                             # by the actuator and fires continuously
+          val_gap_max: 0.0                   # fires ABOVE: replay/val_gap_nats
+          drift_std_max: 0.0                 # fires ABOVE: nats the policy has moved off the
+                                             # rows it stored
+          ess_min: 0.0                       # fires BELOW: replay/policy_drift_ess_frac. LEAVE
+                                             # AT 0 -- at an ordinary learning rate no reachable
+                                             # admission rate satisfies a useful bar, so the
+                                             # trigger latches on and holds the rollout rate at
+                                             # maximum, which inverts what this block is for
         loss_coeffs:
-          fwd: { tb: 1.0, freeze_policy: 1.0 }
-          bwd: { tb: 1.0, beta: 80 }
-          replay: { tb: 1.0, beta: 80 }
+          fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z ONLY: policy detached at the source
+          bwd: { tb: 1.0, beta: 80 }             # freeze_z stays 1 from base: policy only
+          replay: { tb: 1.0, beta: 80 }          # freeze_z stays 1 from base: policy only
+        # ONE SENSOR, TWO MOTIONS. replay's share drifts UP by `up` per tick while the
+        # guard sensor is at or below `bar` AND the ratchet says the level is at a
+        # recent best; it moves DOWN by `down` otherwise. The rails are absolute frac
+        # bounds, so bwd's floor is a guarantee rather than an equilibrium. Both
+        # sensor metrics come from the route-agnostic quick_tb_stats.
+        balance:
+          kind: gated_ramp
+          ramp: replay                       # the mode whose share drifts up when the guard is satisfied
+          guard: bwd                         # the mode that owns the sensor and takes back share when it deteriorates
+          pinned: { fwd: 0.0 }               # must equal fracs.fwd
+          metric: bwd/under_coverage_rise150 # the guard sensor: the 150-step rise in bwd's coverage residual
+          bar: 0.0                           # sensor level above which the ramp is vetoed. 0 = veto on ANY deterioration
+          ratchet_metric: bwd/under_coverage # the LEVEL the ratchet tracks; its stage minimum is the reference
+          ratchet_tol: 0.5                   # nats of slack above the running minimum that still counts as 'at a best'
+          ratchet_release_tol: 0.25          # tighter re-arm level, so the ratchet is a Schmitt trigger and not a chattering comparator
+          ratchet_cooldown_steps: 250      # train steps after stage entry during which the fracs are FROZEN at their entry values and no gr_best is recorded. The reference is a running minimum, so a level read while the stage is still settling (log Z walking to its fixed point, the buffer reaching its churned mix) is one no later state can return to, and the trip then latches for the whole stage
+          up: 0.004                          # share added per tick when the ramp is earned
+          down: 0.006                        # share removed per tick when guarded. > up, so a deterioration is undone faster than it was bought
+          bounds: { bwd: [ 0.25, 0.9 ], replay: [ 0.1, 0.75 ] } # ABSOLUTE frac bounds; a ceiling on one is a floor on the other. bwd's 0.25 floor is a hard rail against starving the branch that owns spread
+
 
 #        exit: # no exit condition, this is the terminal phase
 #          - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
@@ -595,6 +695,7 @@ buffers:
     ramp_floor: 100
     ramp_width: 50
 
+    source: 'prior_model'   # 'prior_model' | 'anchors'. WHERE top-ups come from. Under 'anchors', snapshot_prior and prior_model_name are unnecessary and the resume gap they create (no prior_model after a restart) does not exist -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only
   # FAST store: full forward trajectories of the policy's own samples, kept so
   # they can be exactly replayed. Its three size knobs are three handles on ONE
   # steady state and must not be moved independently:
@@ -605,10 +706,15 @@ buffers:
   # moves churn_rate and mean_residence_steps together (x B and / B), which
   # leaves occupancy exactly invariant and changes only reuse and policy lag.
   replay_buffer:
-    churn_rate: 80  # admission attempts budgeted per manage call; SUPPLY-side
-    mean_residence_steps: 50  # memoryless hazard, so residence is exponential (CV ~ 1) -- a WIDE lag distribution, which is a strong lowpass on the policy -> buffer -> gradient path. A hard age cap would concentrate the phase lag at one frequency, and this codebase has a documented phase-2 limit cycle
-    max_size: 12000  # 3x the churn_rate x mean_residence_steps equilibrium of 4000, so the cap is HEADROOM and the hazard sets occupancy. At exactly 4000 the cap binds instead, and eviction becomes displacement -- which is residual-dependent and breaks birth_loss as an unbiased intake baseline
+    churn_rate: 0  # admission attempts budgeted per manage call; SUPPLY-side. For 0, always equals live batch size
+    mean_residence_steps: 80  # memoryless hazard, so residence is exponential (CV ~ 1) -- a WIDE lag distribution, which is a strong lowpass on the policy -> buffer -> gradient path. A hard age cap would concentrate the phase lag at one frequency, and this codebase has a documented phase-2 limit cycle
+    max_size: 50000  # hard cap. Meant as HEADROOM over the churn_rate x mean_residence_steps equilibrium, so the hazard sets occupancy; where the cap binds instead, eviction becomes displacement -- residual-dependent, which breaks birth_loss as an unbiased intake baseline
     admit_reward_min: -200  # hard exclusion, applied UPSTREAM of admission unconditionally: admission scores badness, so without a floor the energy distribution is unbounded above
+    backstop_mult: 5.0      # hard age cap as a multiple of mean_residence_steps -- a MEMORY GUARD on the exponential hazard's tail, not a target. 0 = no cap. Rows it claims are excluded before the hazard budget is spent
+    # --- held-out split: the only direct read on replay MEMORISATION ---
+    val_frac: 0.0           # fraction of each ADMISSION batch flagged held-out and never trained on. 0 = off, and every draw path is then bit-identical to before the split existed (no row is flagged, so no mask is built)
+    val_min: 64             # fewer held-out rows than this and the measurement is skipped -- the mean would be noise, and writing it poisons the EMA it is read on
+    val_cap: 256            # most held-out rows scored per measurement. Also clipped to the LIVE batch_size, so an OOM-cut batch shrinks the probe instead of reproducing the OOM
     # --- prioritised replay (to_do_rebuild.md B5/B7b) ---
     # Admission is unconditionally uniform (D5); purge is hazard+backstop only
     # (floor/stalled retired -- exactly redundant with hazard+backstop once

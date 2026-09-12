@@ -217,6 +217,11 @@ class ConditionalSetPolicy(SetPolicy):
     zeroing the correlator rather than by rebuilding the model.
     """
 
+    #: Read by `ConformerGFN.predict_next_state`, the same duck-typing `wants_raw_state` uses.
+    #: A GFN that does not know this attribute simply never binds the tensors, so the crystal
+    #: route and the unconditional conformer route are untouched.
+    wants_molecular_conditioning = True
+
     def __init__(self, static_features, angular_mask: Sequence[bool], t_dim: int,
                  enc_dim: int, mol_dim: int, corr_dim: int = 32,
                  frame_size: int = 4, **kw):
@@ -259,3 +264,20 @@ class ConditionalSetPolicy(SetPolicy):
         pooled = torch.cat([(a * h).sum(dim=1), h.sum(dim=1)], dim=-1)   # [B, 2H]
         ctx = torch.cat([pooled, t_emb, mol_emb], dim=-1).unsqueeze(1).expand(-1, self.dim, -1)
         return self._to_blocks(self.rho(torch.cat([h, ctx], dim=-1)))
+
+
+def conditional_set_policy_for(energy, t_dim: int, mol_dim: int, prior=None,
+                               **kw) -> ConditionalSetPolicy:
+    """Build a `ConditionalSetPolicy` against the layout the ENERGY declares.
+
+    `enc_dim` is derived as ``mol_dim // 2`` and not passed separately, because the pooled
+    readout is ``[softmax-weighted sum || unnormalised sum]`` -- two blocks of the per-atom
+    width. Deriving it keeps one number in the config (`embedding_conditioning_dim`) instead
+    of two that can disagree; a mismatch against the actual embeddings then fails on the
+    correlator's first matmul rather than training quietly on garbage.
+    """
+    from energies.dof_features import state_features
+    if mol_dim % 2:
+        raise ValueError(f'mol_dim {mol_dim} is odd; the pooled readout is two equal blocks')
+    return ConditionalSetPolicy(state_features(energy, prior), energy.periodic_dims, t_dim,
+                                enc_dim=mol_dim // 2, mol_dim=mol_dim, **kw)

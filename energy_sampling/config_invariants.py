@@ -614,6 +614,84 @@ def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violatio
     return out
 
 
+#: The conformer route is the one place a null data path is a DECLARED
+#: configuration rather than a defect. It runs `ConformerModeller`, launched from
+#: conformer_modeller.py rather than train.py, and that subclass overrides both
+#: data-init methods: `init_mol_dataset` branches on `if path:` and falls back to
+#: a condition built from the energy function, and `init_prior_dataset` SAMPLES
+#: the fitted internal prior instead of loading a file. Measured over the config
+#: corpus on 2026-09-09: 21 of the 26 configs carrying a null data path are this
+#: energy function, and every one of them is legitimate.
+_CONFORMER_ENERGY_FUNCTIONS = frozenset({'conformer_torsions'})
+
+#: The paths `train.py` torch.loads with NO null branch, and the method that does
+#: it. Both run during startup, before the first training step, in this order.
+_UNCONDITIONALLY_LOADED_PATHS = (
+    ('molecules_path', 'Modeller._load_condition_file, called from init_mol_dataset'),
+    ('prior_path', 'Modeller.init_prior_dataset'),
+)
+
+
+def loaded_data_paths_are_not_null(cfg: dict) -> list[Violation]:
+    """A null data path on the crystal route is a run that cannot start.
+
+    `torch.load(None)` does not raise a path error. It raises
+
+        AttributeError: 'NoneType' object has no attribute 'seek'. You can only
+        torch.load from a file that is seekable.
+
+    which names neither the key nor the config, and arrives after the energy
+    function and the model have been built -- on an MLIP route, after the
+    predictor has loaded. Nothing between generation and that line looks at the
+    value, so the config validates clean, gets written, gets queued, and dies at
+    startup.
+
+    THE CASE THIS WAS WRITTEN FROM. `configs/problems.yaml`'s `latent_gaussian`
+    entry carried `prior_path: null`, `molecules_path: null` AND
+    `buffers.anchor_buffer.seed_source: prior_dataset` -- a self-contradiction
+    provable from the file, since that seed source reads `self.prior_dataset`,
+    which only exists if `prior_path` loaded. Every arm generated from it carries
+    both nulls -- `configs/utilphase_sep09/lgauss.yaml` is one, generated the same
+    day the fault was reported. The registry's own docstring calls that problem
+    the reference workload for exact before/after comparison, so the entry that
+    could not launch was the one a comparison was supposed to stand on.
+
+    THE RULE IS NOT WRITTEN ON THE SEED SOURCE, deliberately. Anchoring it there
+    would state a true relation and still miss most of the fault: both loads are
+    UNCONDITIONAL, so `seed_source: generated` with a null `prior_path` is
+    equally fatal and would have passed. What is provable from the file is the
+    stronger and simpler claim -- these two keys are read by a `torch.load` with
+    no null branch, so null is never a valid value for them here.
+
+    ABSENT IS NOT NULL. A key that is simply missing is a partial dict, which is
+    what generation and migration both produce, and this module's policy is that
+    no rule fires on absence. `null` is an assertion, and it is the assertion
+    that is wrong."""
+    ef = _get(cfg, 'energy_function')
+    if ef is None or ef in _CONFORMER_ENERGY_FUNCTIONS:
+        # No energy_function means the route cannot be established from the file,
+        # and a rule that cannot prove which loader runs has nothing to say.
+        return []
+    out = []
+    for key, site in _UNCONDITIONALLY_LOADED_PATHS:
+        if key in cfg and cfg[key] is None:
+            out.append(Violation(
+                ERROR, 'loaded_data_paths_are_not_null',
+                f'{key} is null, but {site} torch.loads it with no null branch '
+                f'on the {ef!r} route -- the run dies at startup with '
+                f"AttributeError: 'NoneType' object has no attribute 'seek'."))
+    # `prior_path` present-and-null already produced a violation above, so this
+    # adds a SECOND statement about the same config rather than re-detecting it.
+    if (_get(cfg, 'prior_path', 'ABSENT') is None
+            and _get(cfg, 'buffers.anchor_buffer.seed_source') == 'prior_dataset'):
+        out.append(Violation(
+            ERROR, 'loaded_data_paths_are_not_null',
+            'buffers.anchor_buffer.seed_source is prior_dataset, which seeds from '
+            'self.prior_dataset -- an object that exists only if prior_path loaded. '
+            'Point prior_path at a prior, or set seed_source: generated.'))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # EXIT TRIGGERS. Two ways a declared exit condition ships dead, both found in
 # the 2026-08-16 audit of prod0810 / qm9anchor_aug14 (docs/design/next_battery.md
@@ -941,7 +1019,11 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
         if _runs_vargrad(cfg, st, 'bwd'):
             reps = _coeff(cfg, st, 'bwd', 'repeats')
             cbm = _coeff(cfg, st, 'bwd', 'condition_block_m') or 0.0
-            if reps is not None and reps < 2 and cbm < 2:
+            # a third source: the aligned per-condition draw (stage condition_draw)
+            # serves prior_rows distinct same-condition terminals per condition
+            cd = st.get('condition_draw')
+            drawn = (_num(cd.get('prior_rows')) or 0.0) if isinstance(cd, dict) else 0.0
+            if reps is not None and reps < 2 and cbm < 2 and drawn < 2:
                 out.append(Violation(
                     ERROR, 'vargrad_needs_groups',
                     f"stage {name!r} runs bwd VarGrad at bwd repeats={reps:g} AND "
@@ -1231,7 +1313,12 @@ def fwd_rollout_cadence_is_well_formed(cfg: dict) -> list[Violation]:
                                  f"{st.get('fwd_rollout_every')} with flags.z_calibration "
                                  f"true; the servo would call the energy function on every "
                                  f"skipped step. Set it false."))
-    if cadenced:
+    # A stage declaring fwd_z_sidecar pins Z(c) with the forward emp_z on every
+    # rollout instead (Stage refuses the sidecar without emp_z > 0), and the fill
+    # refuses a Z(c) head anyway (_z_fill_head_is_fillable), so the fill
+    # requirement is waived there. The z_calibration refusal above is not.
+    fill_pinned = [st for st in cadenced if not st.get('fwd_z_sidecar')]
+    if fill_pinned:
         ft = _num(_get(cfg, 'z_calibration.fill_threshold'))
         if ft is None or ft <= 0:
             out.append(Violation(ERROR, 'fwd_rollout_cadence_is_well_formed',
@@ -1301,6 +1388,236 @@ def batch_root_forward_is_well_formed(cfg: dict) -> list[Violation]:
     return out
 
 
+def replay_seat_problems(stage, coeff, glob) -> list[str]:
+    """What the replay-seat keys need from the RESOLVED config: the part a stage
+    parse cannot see. protocol.Stage._parse_replay_seat refuses what the stage
+    itself declares; this judges the stage's effective loss coefficients (its
+    override, else the base block) and the global keys.
+
+      pooled_source 'replay'  needs the pooled term on (else a dead key), a stage
+                              whose replay branch can carry weight, an
+                              UNprioritised replay draw (the pooled term uses the
+                              replay rows unweighted, so a prioritised draw would
+                              hand it rows from p with no IS correction), and the
+                              stage's condition_draw: nothing else aligns replay's
+                              conditions with bwd's.
+      fwd_z_sidecar           needs the forward branch Z-only (freeze_policy >
+                              0.5), emp_z > 0, and forward groups of >= 2 rows
+                              (repeats >= 2 AND a condition- or tile-grouped
+                              estimate to centre on; with vg_by_condition 0 and
+                              no vg flavour on, emp_z has no log Z estimate at
+                              all). The fwd frac floor (min_fracs.fwd, else
+                              controller.min_mode_frac) must sit below the
+                              deactivate threshold, or fwd trains in the mix too.
+      replay_warmup_rows      must be below buffers.replay_buffer.max_size, or the
+                              warm-up can never release and every step rolls out.
+
+    Written over GETTERS, like runs_grouped_vargrad, so this rule and the
+    trainer's refusal in Modeller.set_loss_coeffs share one implementation:
+      stage   a parsed protocol.Stage
+      coeff   (mode, key) -> the effective coefficient, raw (strings kept)
+      glob    dotted global key -> its value, or None when absent
+    Returns one message per problem; [] = clean."""
+    from protocol import POOLED_SOURCES   # local: protocol imports this module back
+    out = []
+
+    src = coeff('fwd', 'pooled_source')
+    src = 'fwd' if src is None else src
+    pooled_on = (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0
+    if src not in POOLED_SOURCES:
+        out.append(f"fwd pooled_source={src!r}; must be one of {POOLED_SOURCES}.")
+    elif src == 'replay':
+        if not pooled_on:
+            out.append(f"fwd pooled_source 'replay' with {CROSS_BRANCH_VARGRAD_COEFF} "
+                       f"off; the source only picks the pooled term's first side, so "
+                       f"it is a dead key here. Set it on the stage that runs the term.")
+        if not getattr(stage, 'replay_trains', True):
+            out.append("fwd pooled_source 'replay' on a stage whose replay branch can "
+                       "never carry weight; the pooled term would read INERT every step.")
+        if bool(glob('buffers.replay_buffer.prioritise.enabled')):
+            out.append("fwd pooled_source 'replay' with buffers.replay_buffer.prioritise"
+                       ".enabled true. The pooled term takes the replay rows unweighted, "
+                       "so its groups would be drawn from the prioritised p with no IS "
+                       "correction. Turn prioritise off for this route.")
+        if not getattr(stage, 'condition_draw', None):
+            out.append("fwd pooled_source 'replay' on a stage without condition_draw. bwd "
+                       "is aligned to the forward batch only under the fwd source and "
+                       "replay runs after bwd, so without the aligned per-condition draw "
+                       "the pooled groups share a condition by chance collision only.")
+
+    if getattr(stage, 'fwd_z_sidecar', False):
+        fp = _num(coeff('fwd', 'freeze_policy'))
+        if fp is None or fp <= 0.5:
+            out.append(f"fwd_z_sidecar with fwd freeze_policy={fp}; at weight 1 outside "
+                       f"the frac mix the forward loss would train the policy.")
+        ez = _num(coeff('fwd', 'emp_z'))
+        if ez is None or ez <= 0:
+            out.append(f"fwd_z_sidecar with fwd emp_z={ez}; emp_z is the only Z(c) pin "
+                       f"on the sidecar.")
+        reps = _num(coeff('fwd', 'repeats'))
+        grouped = ((_num(coeff('fwd', 'vg_by_condition')) or 0.0) > 0.5
+                   or any((_num(coeff('fwd', k)) or 0.0) > 0 for k in BRANCH_VARGRAD_COEFFS))
+        if reps is None or reps < 2 or not grouped:
+            out.append(f"fwd_z_sidecar with fwd repeats={reps} and "
+                       f"{'a' if grouped else 'NO'} grouped estimate (vg_by_condition or a "
+                       f"vg flavour). emp_z's target needs forward groups of >= 2 rows: at "
+                       f"repeats 1 every group is a singleton and the sidecar trains "
+                       f"nothing, and with no grouped estimate emp_z has no log Z target.")
+        deact = getattr(stage, 'deactivate_threshold', None)
+        if deact is None:
+            deact = _num(glob('controller.deactivate_threshold'))
+        floor = (getattr(stage, 'min_fracs', None) or {}).get('fwd')
+        if floor is None:
+            floor = _num(glob('controller.min_mode_frac'))
+        if deact is not None and floor is not None and floor >= deact:
+            out.append(f"fwd_z_sidecar with a fwd frac floor {floor:g} >= deactivate "
+                       f"threshold {deact:g}; fwd would train in the mix AND as the sidecar.")
+
+    rows = int(getattr(stage, 'replay_warmup_rows', 0) or 0)
+    if rows > 0:
+        cap = _num(glob('buffers.replay_buffer.max_size'))
+        if cap is not None and rows >= cap:
+            out.append(f"replay_warmup_rows={rows} >= buffers.replay_buffer.max_size="
+                       f"{cap:g}; the buffer can never hold that many trainable rows, so "
+                       f"the warm-up never releases and every step rolls out.")
+    return out
+
+
+def _coeff_raw(cfg: dict, stage: dict, mode: str, key: str):
+    """`_coeff` without the numeric filter, so string coefficients survive."""
+    override = ((stage.get('loss_coeffs') or {}).get(mode) or {})
+    if key in override:
+        return override[key]
+    return _get(cfg, f'{mode}_loss_coeffs.{key}')
+
+
+def replay_seat_is_well_formed(cfg: dict) -> list[Violation]:
+    """The audit-path twin of Modeller.set_loss_coeffs' refusal: every active
+    stage's replay-seat keys against the resolved config (replay_seat_problems).
+    A stage that does not parse is skipped here -- every_protocol_parses
+    reports it."""
+    from protocol import Stage           # local: protocol imports this module back
+    out = []
+    for i, st in enumerate(active_stages(cfg)):
+        if not isinstance(st, dict):
+            continue
+        try:
+            parsed = Stage(st, i)
+        except Exception:
+            continue
+        for msg in replay_seat_problems(
+                parsed, lambda mode, key, st=st: _coeff_raw(cfg, st, mode, key),
+                lambda dotted: _get(cfg, dotted)):
+            out.append(Violation(ERROR, 'replay_seat_is_well_formed',
+                                 f"stage {parsed.name!r}: {msg}"))
+    return out
+
+
+def condition_draw_problems(stage, coeff, glob) -> list[str]:
+    """What one stage's condition draws need from the RESOLVED config: the part
+    protocol.Stage._parse_condition_draw cannot see.
+
+      condition_draw          (the aligned per-condition draw) needs an
+                              UNprioritised replay draw -- its rows are drawn
+                              uniformly within the chosen conditions, so IS
+                              weights from buffers.replay_buffer.prioritise would
+                              divide by a measure the draw never used; an
+                              effective condition_block_m of 0 on bwd AND replay
+                              (the stage override, else the base block -- mk_dev's
+                              base bwd value is 2), since both set the rows per
+                              condition; and one space group x Z' per molecule,
+                              because every draw re-runs condition_samples, which
+                              redraws both, so the stored condition_id it groups
+                              by would not be the one the rows train under.
+      rollout_condition_draw  (global) a non-'iid' value refuses a stage declaring
+                              flags.weighted_condition_sampling: both set the
+                              forward rollout's condition draw.
+
+    Written over getters, like replay_seat_problems (same arguments), so this
+    rule and Modeller.set_loss_coeffs' refusal share one implementation. [] = clean."""
+    out = []
+    if getattr(stage, 'condition_draw', None):
+        if bool(glob('buffers.replay_buffer.prioritise.enabled')):
+            out.append("condition_draw with buffers.replay_buffer.prioritise.enabled true. "
+                       "The aligned draw is uniform within its conditions, so the "
+                       "prioritised IS weights would divide by a measure it never used. "
+                       "Turn prioritise off for this route.")
+        for mode in ('bwd', 'replay'):
+            cbm = coeff(mode, 'condition_block_m')
+            if cbm is not None and _num(cbm) != 0.0:
+                out.append(f"condition_draw with an effective {mode} condition_block_m="
+                           f"{cbm!r} (the stage's override, else the base block). Both set "
+                           f"the rows per condition -- one switch only; set it 0 on the "
+                           f"stage.")
+        sgs, zps = glob('space_groups'), glob('z_primes')
+        n_combos = (len(sgs) if isinstance(sgs, (list, tuple)) else 1) * \
+                   (len(zps) if isinstance(zps, (list, tuple)) else 1)
+        if n_combos > 1:
+            out.append(f"condition_draw on a route with {n_combos} space-group x Z' "
+                       f"combinations per molecule. Every draw re-runs condition_samples, "
+                       f"which redraws them, so rows grouped by stored condition_id train "
+                       f"under different conditions.")
+    mode = glob('condition_log_z.rollout_condition_draw')
+    if mode not in (None, 'iid') and bool((getattr(stage, 'flags', None) or {}).get(
+            'weighted_condition_sampling', False)):
+        out.append(f"condition_log_z.rollout_condition_draw={mode!r} with "
+                   f"flags.weighted_condition_sampling: both set the forward rollout's "
+                   f"condition draw. Drop the flag or set the draw to 'iid'.")
+    return out
+
+
+def rollout_condition_draw_problems(glob) -> list[str]:
+    """condition_log_z.rollout_condition_draw is one of protocol's
+    ROLLOUT_CONDITION_DRAWS (absent = 'iid'), and rollout_under_drawn_power is a
+    finite number: > 0 under 'under_drawn' (0 would be 'iid' spelled another
+    way), and at its default 1.0 under any other draw, where nothing reads it.
+    `glob` as in condition_draw_problems. [] = clean."""
+    from protocol import ROLLOUT_CONDITION_DRAWS   # local: protocol imports this module back
+    out = []
+    mode = glob('condition_log_z.rollout_condition_draw')
+    if mode is not None and mode not in ROLLOUT_CONDITION_DRAWS:
+        out.append(f"condition_log_z.rollout_condition_draw={mode!r}; must be one of "
+                   f"{ROLLOUT_CONDITION_DRAWS}.")
+    power = glob('condition_log_z.rollout_under_drawn_power')
+    if power is not None:
+        p = _num(power)
+        if p is None or not math.isfinite(p):
+            out.append(f"condition_log_z.rollout_under_drawn_power={power!r}; must be a "
+                       f"finite number.")
+        elif mode == 'under_drawn' and p <= 0:
+            out.append(f"condition_log_z.rollout_under_drawn_power={p:g} under "
+                       f"'under_drawn'; must be > 0 (0 weights every condition equally, "
+                       f"which is the 'iid' draw).")
+        elif mode != 'under_drawn' and p != 1.0:
+            out.append(f"condition_log_z.rollout_under_drawn_power={p:g} with "
+                       f"rollout_condition_draw={mode or 'iid'!r}; only 'under_drawn' reads "
+                       f"it, so a non-default value is a dead key.")
+    return out
+
+
+def condition_draw_is_well_formed(cfg: dict) -> list[Violation]:
+    """The audit-path twin of Modeller.set_loss_coeffs' refusal of the two
+    condition draws: rollout_condition_draw_problems once, and
+    condition_draw_problems for every active stage. A stage that does not parse
+    is skipped here -- every_protocol_parses reports it."""
+    from protocol import Stage           # local: protocol imports this module back
+    glob = lambda dotted: _get(cfg, dotted)   # noqa: E731
+    out = [Violation(ERROR, 'condition_draw_is_well_formed', msg)
+           for msg in rollout_condition_draw_problems(glob)]
+    for i, st in enumerate(active_stages(cfg)):
+        if not isinstance(st, dict):
+            continue
+        try:
+            parsed = Stage(st, i)
+        except Exception:
+            continue
+        for msg in condition_draw_problems(
+                parsed, lambda mode, key, st=st: _coeff_raw(cfg, st, mode, key), glob):
+            out.append(Violation(ERROR, 'condition_draw_is_well_formed',
+                                 f"stage {parsed.name!r}: {msg}"))
+    return out
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
@@ -1310,6 +1627,7 @@ RULES = (
     lr_bracket_is_well_formed,
     burn_in_reaches_adam_steady_state,
     periodic_centroids_needs_one_crystal_space_group,
+    loaded_data_paths_are_not_null,
     lr_probe_is_retired,
     exit_patience_is_reachable,
     exit_bar_is_within_measured_range,
@@ -1323,6 +1641,8 @@ RULES = (
     fwd_rollout_cadence_is_well_formed,
     z_fill_mode_is_well_formed,
     batch_root_forward_is_well_formed,
+    replay_seat_is_well_formed,
+    condition_draw_is_well_formed,
 )
 
 

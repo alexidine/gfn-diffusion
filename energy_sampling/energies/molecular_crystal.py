@@ -1078,11 +1078,13 @@ class MolecularCrystal(BaseSet):
         return crystal_energy
 
     @torch.no_grad()
-    def prebuilt_sample_to_reward(self, crystals, temperature):
+    def prebuilt_sample_to_reward(self, crystals, temperature, return_ens_dict: bool = False):
         """
         For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
         :param temperature: per-sample torch float tensor containing temperature for each sample to be rewarded
         :param crystals:
+        :param return_ens_dict: also return generator_energy's ens_dict (the live legs,
+            physical_energy / bounding_energy / flow_energy) as a second value
         :return:
         """
         if isinstance(crystals, list):
@@ -1090,7 +1092,7 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = crystals
 
-        energy, _ = self.generator_energy(crystal_batch, temperature)
+        energy, ens_dict = self.generator_energy(crystal_batch, temperature)
 
         if torch.is_tensor(temperature):
             sample_temperature = temperature.to(crystal_batch.device)
@@ -1099,6 +1101,8 @@ class MolecularCrystal(BaseSet):
         else:
             assert False
 
+        if return_ens_dict:
+            return -energy / sample_temperature, ens_dict
         return -energy / sample_temperature
 
     def energy(self,

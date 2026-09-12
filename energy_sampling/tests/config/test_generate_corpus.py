@@ -123,6 +123,17 @@ CANONICAL_DRIFT = {
     'config.protocols.conditional_vargrad.stages[0].loss_coeffs.bwd.repeats',
     'stages[0].effective_loss_coeffs.bwd.tbc',
     'stages[0].effective_loss_coeffs.bwd.repeats',
+    # Two EXECUTION knobs canonical moved in September, neither of which any arm
+    # chose. Both describe how the machine runs the job, not what the job is, so
+    # a historical arm carrying the old value is drift by definition.
+    #   compile_policy   'auto' -> false. There is no inductor on native Windows,
+    #     so `auto` resolved to eager here anyway and the flag read as armed while
+    #     reaching nothing; false says so.
+    #   gpu_util_sample_period_s   60 -> 2. Occupancy is bimodal (measured sd ~19
+    #     points over a 2..83 range, autocorrelation ~24 s), so a 60 s period put
+    #     15 point samples in a 900 s window and carried ~3 points of pure sampling
+    #     phase against a 5.4 point cancellation bracket.
+    'config.compile_policy', 'config.gpu_util_sample_period_s',
 }
 
 
@@ -203,15 +214,35 @@ def _spec_qm9_conditional():
            'protocols.conditional_vargrad.stages[0].mle_gate.min_rate': 5.0,
            'protocols.conditional_vargrad.stages[0].mle_gate.window': 100,
            # var_conditioning's DEFAULT SHAPE MOVED after this arm was recorded:
-           # the stage now runs pooled cross-branch VarGrad only, and its balance
-           # is lexicographic so that anneal_coeffs can ramp lambda_mix off the
-           # all-rules-clean streak. This arm predates all of it and ran branch
-           # VarGrad on both sides under a proportional split, so reaching it now
-           # means asking for the old shape. `balance` is replaced WHOLE rather
-           # than by `.kind`: a proportional block needs `metrics`, and carrying
-           # the lexicographic block's `rules`/`anneal_coeffs` across would fail
-           # to parse. The fracs need no override -- this arm was already 50:50,
-           # which is where the new default puts them.
+           # the stage now runs pooled VarGrad between REPLAY and bwd over an
+           # aligned per-condition draw, with fwd a Z-only sidecar on 1 rollout in
+           # 20 and a lexicographic balance so that anneal_coeffs can ramp
+           # lambda_mix off the all-rules-clean streak. This arm predates all of
+           # it and ran branch VarGrad on fwd and bwd, every step, under a
+           # proportional split, so reaching it now means asking for the old
+           # shape. `balance` and `loss_coeffs` are replaced WHOLE rather than key
+           # by key: a proportional block needs `metrics`, carrying the
+           # lexicographic block's `rules`/`anneal_coeffs` across would fail to
+           # parse, and the new loss blocks carry keys (tb 0, freeze_policy,
+           # pooled_source 'replay') the old shape refuses or never ran.
+           'protocols.conditional_vargrad.stages[1].flags': {
+               'update_log_z': True, 'buffers_active': True,
+               'weighted_bwd_sampling': True, 'weighted_condition_sampling': True},
+           'protocols.conditional_vargrad.stages[1].on_enter': [
+               'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4'],
+           'protocols.conditional_vargrad.stages[1].fracs': {
+               'fwd': 0.5, 'bwd': 0.5, 'replay': 0.0},
+           'protocols.conditional_vargrad.stages[1].min_fracs': {},
+           # the replay-seat keys, off: absent from the historical file, so each
+           # lands in `added` -- set so the reproduction runs none of them
+           'protocols.conditional_vargrad.stages[1].fwd_rollout_every': 0,
+           'protocols.conditional_vargrad.stages[1].fwd_rollout_triggers': {},
+           'protocols.conditional_vargrad.stages[1].fwd_z_sidecar': False,
+           'protocols.conditional_vargrad.stages[1].replay_warmup_rows': 0,
+           'protocols.conditional_vargrad.stages[1].condition_draw': None,
+           # the arm's own draw, which the old shape accepts; the registry turns it
+           # off because the new stage refuses it
+           'buffers.replay_buffer.prioritise.enabled': True,
            'protocols.conditional_vargrad.stages[1].balance': {
                'kind': 'proportional',
                'pinned': {'replay': 0.0},
@@ -220,13 +251,15 @@ def _spec_qm9_conditional():
                'targets': {'fwd': 1.0, 'bwd': 1.0},
                'default_boost': {'fwd': 0.5, 'bwd': 0.5},
                'floor': 0.1, 'alpha': 0.01},
-           'protocols.conditional_vargrad.stages[1].loss_coeffs.fwd.vg_lb': 1.0,
-           'protocols.conditional_vargrad.stages[1].loss_coeffs.bwd.vg_lb': 1.0,
-           # not needed to make the comparison pass (the historical file has no
-           # such key, so it lands in `added`, which this test does not assert
-           # on) -- but leaving it at the new default would silently give the
-           # reproduction a cross-branch term the original never ran.
-           'protocols.conditional_vargrad.stages[1].loss_coeffs.fwd.pooled_vg': 0.0,
+           # pooled_vg 0: the historical file has no such key, so it lands in
+           # `added` either way -- but leaving it at the new default would
+           # silently give the reproduction a cross-branch term it never ran.
+           'protocols.conditional_vargrad.stages[1].loss_coeffs': {
+               'fwd': {'vg_lb': 1.0, 'vg_by_condition': 1.0, 'emp_z': 1.0,
+                       'repeats': 2.0, 'pooled_vg': 0.0, 'tb_z_source': 'persistent'},
+               'bwd': {'vg_lb': 1.0, 'condition_block_m': 2.0, 'repeats': 1.0,
+                       'level_gap': 0.0, 'tb_z_source': 'persistent'},
+               'replay': {'tb_z_source': 'persistent'}},
            # the anchor-buffer default move, as in _BSZ_COMMON
            'buffers.anchor_buffer.thin_every_n_evals': 5,
            'buffers.anchor_buffer.refresh_every_n_evals': 3,

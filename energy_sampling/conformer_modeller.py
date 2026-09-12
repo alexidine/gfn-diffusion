@@ -296,6 +296,19 @@ class ConformerModeller(Modeller):
         """
         n = sample_batch.num_graphs
         en = self.energy_function
+        if getattr(en, 'is_carrier', False):
+            # per ROW, from each row's own member -- the case this block was wired for
+            from energies.ring_metrics import ring_cycles
+            idents = en._row_identifiers(sample_batch, n)
+            size = {i: float(np.asarray(m.spec.z).shape[0]) for i, m in en._members.items()}
+            rings = {}
+            for i, m in en._members.items():
+                try:
+                    rings[i] = float(len(ring_cycles(m)))
+                except Exception:
+                    rings[i] = 0.0
+            return {'size': np.array([size[i] for i in idents]),
+                    'n_rings': np.array([rings[i] for i in idents])}
         n_atoms = float(np.asarray(en.spec.z).shape[0])
         n_rings = float(len(getattr(en, 'ring_cycles_cache', []) or []))
         try:
@@ -332,6 +345,16 @@ class ConformerModeller(Modeller):
         import energies.conformer_eval_metrics as cm
 
         en = self.energy_function
+        if getattr(en, 'is_carrier', False):
+            # EVERY call below reads ONE chart (spec, _M, the force field, the basin table)
+            # against the whole state block. On a carrier there is no such chart; the
+            # per-member versions are not written yet, so the block is ABSENT rather than
+            # computed against the wrong molecule.
+            if not getattr(self, '_carrier_eval_notice', False):
+                self._carrier_eval_notice = True
+                print('eval: CARRIER set -- per-molecule physical stats (energy components, '
+                      'geometry, dof classes, rings, basin coverage) are not computed yet')
+            return
         prior_x = getattr(getattr(self, 'prior_dataset', None), 'x', None)
         prior_y = getattr(getattr(self, 'prior_dataset', None), 'y', None)
 
@@ -476,6 +499,19 @@ class ConformerModeller(Modeller):
         """
         cfg = super()._build_gfn_config()
         cfg['angular_mask'] = self.energy_function.periodic_dims
+        # SINGLE-CONDITION RUNS KEEP THE SCALAR FLOW HEAD. A conditional model normally
+        # gets a scalarMLP over the condition embedding, but log Z is then a function
+        # rather than a number -- and `z_level_fill`, the only thing pinning it once the
+        # servo is off and fwd carries no loss weight, writes `flow_model.scalar.data`.
+        # With one condition there is exactly one log Z, so the scalar is not a
+        # simplification, it is the correct object. DERIVED from the conditions file,
+        # never configured: a flag could disagree with the data it describes.
+        _, _idents = self._condition_set_molecules()
+        n_cond = len(set(_idents)) if _idents else 0
+        cfg['scalar_flow'] = bool(cfg.get('conditional')) and n_cond == 1
+        if cfg['scalar_flow']:
+            print('flow head: LearnableScalar despite conditional=True -- the condition set '
+                  'has exactly one member, so log Z is a single number')
         # POPPED, not passed. The base builder splats **vars(args.model) straight into GFN,
         # whose signature is explicit -- an unrecognised key is a TypeError at construction.
         self._policy_spec = {k: cfg.pop(k) for k in self._SET_POLICY_KEYS if k in cfg}
@@ -552,7 +588,18 @@ class ConformerModeller(Modeller):
         """
         spec = getattr(self, '_policy_spec', {})
         kind = str(spec.get('policy_kind', 'flat')).lower()
+        carrier = bool(getattr(getattr(self, 'energy_function', None), 'is_carrier', False))
         if kind == 'flat':
+            if carrier:
+                # a flat policy runs on the carrier unchanged, but the log-probs must still be
+                # masked per row, which only ConformerGFN does. Both copies are re-classed: the
+                # EMA model was already deep-copied by the base init_gfn.
+                from models.conformer_gfn import ConformerGFN
+                for m in (self.gfn_model, self.ema_model):
+                    m.__class__ = ConformerGFN
+                    m._mol_cond, m._state_mask, m._carrier = None, None, True
+                print(f'policy: FLAT on a {self.energy_function.data_ndim}-wide CARRIER '
+                      f'state; log-probs masked per row')
             return
         if kind != 'set':
             raise ValueError(
@@ -583,12 +630,31 @@ class ConformerModeller(Modeller):
                       layers=int(spec.get('set_policy_layers', 4)),
                       out_per_token=2)
         conditional = bool(getattr(self.args, 'embedding_conditioning', False))
+        if carrier and not conditional:
+            raise NotImplementedError(
+                'policy_kind: set on a CARRIER state needs embedding_conditioning: the '
+                'per-column features come from the molecule, and an unconditional set head '
+                'bakes one molecule\'s features in at construction')
         if conditional:
             mol_dim = int(getattr(self.args, 'embedding_conditioning_dim', 0) or 0)
             if not mol_dim:
                 raise ValueError(
                     'embedding_conditioning is on but embedding_conditioning_dim is unset; '
                     'the set policy needs the width to build its context input')
+        if carrier:
+            # RAGGED OVER VALID COLUMNS, dense [B, 2K] out -- see RaggedConditionalSetPolicy.
+            # Per-column static features ride on the batch (`dof_static`), so nothing here is
+            # bound to one member.
+            from energies.dof_features import state_feature_names
+            from models.ragged_set_policy import RaggedConditionalSetPolicy
+            if mol_dim % 2:
+                raise ValueError(f'mol_dim {mol_dim} is odd; the pooled readout is two '
+                                 f'equal blocks')
+            policy = RaggedConditionalSetPolicy(
+                len(state_feature_names()), self.energy_function.periodic_dims,
+                int(self.gfn_config['t_dim']), enc_dim=mol_dim // 2, mol_dim=mol_dim,
+                corr_dim=int(spec.get('set_policy_corr_dim', 32)), **common).to(self.device)
+        elif conditional:
             policy = conditional_set_policy_for(
                 self.energy_function, int(self.gfn_config['t_dim']), mol_dim,
                 corr_dim=int(spec.get('set_policy_corr_dim', 32)), **common).to(self.device)
@@ -607,6 +673,8 @@ class ConformerModeller(Modeller):
             from models.conformer_gfn import ConformerGFN
             self.gfn_model.__class__ = ConformerGFN
             self.gfn_model._mol_cond = None
+            self.gfn_model._state_mask = None
+            self.gfn_model._carrier = carrier
 
         self.ema_model = deepcopy(self.gfn_model)
         self.init_schedulers_optimizers()
@@ -663,6 +731,12 @@ class ConformerModeller(Modeller):
         lin = self.energy_function._lin_free_idx.to(noised.device)
         if lin.numel():
             noised[:, lin] = noised[:, lin].clip(min=-1, max=1)
+        # CARRIER PADS STAY 0. They are not coordinates, and the energy refuses a row whose
+        # pads are nonzero, so jittering them would fail the first anchor scan.
+        smask = getattr(batch, 'state_mask', None)
+        if smask is not None:
+            smask = smask.reshape(noised.shape).bool().to(noised.device)
+            noised = torch.where(smask, noised, torch.zeros_like(noised))
         set_batch_states(batch, noised, periodic=self.energy_function.periodic_dims)
 
         batch, log_T_tensor, condition, condition_id =             self.energy_function.condition_samples(batch)
@@ -683,7 +757,46 @@ class ConformerModeller(Modeller):
         """
         return self.internal_prior is not None
 
-    def _draw_prior_states(self, n, rng, report=False, chunk: int = 4096, steps=None):
+    def _draw_carrier_prior(self, n, rng, report=False, steps=None):
+        """``(batch, energies)`` -- ``n`` prior rows split evenly over a CARRIER set's members.
+
+        Each member draws in ITS OWN chart (sample_prior_states, the optional relax and the
+        bake all go through the member), and the states are then placed in the carrier. The
+        condition graph is the file's carrier-padded one, so `state_mask`, the embeddings and
+        the remapped reconstruction map ride along. Equal counts per member: the buffer is
+        supposed to represent the SET, not whichever molecule drew first.
+        """
+        from energies.conformer_data import attach_states, bake_energies
+
+        en = self.energy_function
+        lay = en.carrier
+        idents = list(en._members)
+        per = max(-(-int(n) // len(idents)), 2)       # ceil, and attach_states needs >= 2
+        parts, es = [], []
+        for ident in idents:
+            member = en._members[ident]
+            states, _ = self._draw_prior_states(per, rng, report=report, steps=steps,
+                                                en=member)
+            e = bake_energies(member, states)
+            x = lay.to_carrier(ident, torch.as_tensor(states).cpu())
+            part = attach_states(self._condition_template(ident), x, e.cpu(),
+                                 identifier=ident, periodic=en.periodic_dims)
+            if hasattr(self, 'identifier_registry'):
+                part.add_graph_attr(torch.full((part.num_graphs,),
+                                               self.identifier_registry[ident],
+                                               dtype=torch.long), 'mol_id')
+            parts.append(part)
+            es.append(e.cpu())
+            if report:
+                print(f'  {ident}: {per} prior rows, median E {float(e.median()):.2f} '
+                      f'kcal/mol, k = {lay.k(ident)} of K = {lay.K}')
+        batch = parts[0]
+        for part in parts[1:]:
+            batch = batch.append_batch(part)
+        return batch, torch.cat(es)
+
+    def _draw_prior_states(self, n, rng, report=False, chunk: int = 4096, steps=None,
+                           en=None):
         """Draw from the fitted prior, then REPAIR steric clashes if configured.
 
         A product-of-marginals prior draws each torsion independently, so a long chain
@@ -715,7 +828,10 @@ class ConformerModeller(Modeller):
         that overshoots cannot land worse than the draw. Chunked because ``descend`` holds
         an autograd graph over the whole batch, and the seed draw is 50,000 rows.
         """
-        states, stats = self.energy_function.sample_prior_states(
+        # `en` is a carrier MEMBER when drawing per member (see _draw_carrier_prior); a draw
+        # always happens in one molecule's own chart
+        en = self.energy_function if en is None else en
+        states, stats = en.sample_prior_states(
             self.internal_prior, n, rng, report=report)
         if steps is None:
             steps = getattr(self.args.energy_config, 'prior_relax_steps', 0)
@@ -725,7 +841,6 @@ class ConformerModeller(Modeller):
 
         from energies.prior_baselines import descend
 
-        en = self.energy_function
         x = torch.as_tensor(states, dtype=en.dtype, device=en.device)
         before = en.potential_energy(x, float(en.temperature)).detach()
         out = []
@@ -760,6 +875,17 @@ class ConformerModeller(Modeller):
                                              condition_from_energy)
 
         n = max(int(num_samples), 2)      # attach_states refuses a single row
+
+        if getattr(self.energy_function, 'is_carrier', False):
+            # PER-MEMBER draws, which is what the refusal below asks for on a heterogeneous
+            # set; the carrier makes it possible because every member's rows share one width
+            batch, _ = self._draw_carrier_prior(n, self._prior_rng, report=False)
+            batch = batch.to(self.device)
+            batch, log_T_tensor, condition, condition_id = \
+                self.energy_function.condition_samples(batch)
+            log_r = self.energy_function.prebuilt_sample_to_reward(batch, 10 ** log_T_tensor)
+            return {'log_r': log_r.detach(), 'log_T_tensor': log_T_tensor,
+                    'condition_id': condition_id}, batch
 
         # LABEL BY IDENTIFIER, NOT BY SMILES. Everything downstream -- the buffers, the
         # mol_id registry, the per-molecule energy table -- keys on the identifier, and a
@@ -1122,6 +1248,25 @@ class ConformerModeller(Modeller):
 
         path = getattr(self.args.energy_config, 'prior_dataset_path', None)
         n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
+        if getattr(self.energy_function, 'is_carrier', False):
+            if path:
+                raise SystemExit('prior_dataset_path is a single-molecule state file; a '
+                                 'CARRIER set draws its prior per member from the fitted '
+                                 'InternalPrior. Unset prior_dataset_path.')
+            if self.internal_prior is None:
+                raise SystemExit('a CARRIER set draws its prior per member from the fitted '
+                                 'InternalPrior, and energy_config.internal_prior_path is unset')
+            print(f'prior dataset: CARRIER set, {n} rows split over '
+                  f'{self.energy_function.n_charts} members')
+            batch, energies = self._draw_carrier_prior(n, self._prior_rng, report=True)
+            self.prior_dataset = ConformerBuffer(batch,
+                                                 device=self.buffer_device,
+                                                 **self._buffer_kwargs(),
+                                                 x_fn=None,
+                                                 y_fn=self._buffer_y_fn(),
+                                                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
+                                                 )
+            return
         if path:
             states, energies = self._load_prior_dataset(path)
             stats = {}
@@ -1135,10 +1280,18 @@ class ConformerModeller(Modeller):
             states, stats = self._draw_prior_states(n, rng, report=True)
             energies = bake_energies(self.energy_function, states)
 
-        cond = condition_from_energy(self.energy_function,
-                                     identifier=self.energy_function.smiles)
+        # THE CONDITION IS THE FILE'S, when there is one -- the THIRD site of this same
+        # defect, after init_mol_dataset (eval batch) and sample_from_prior (churn path).
+        # `condition_from_energy` rebuilds a BARE graph: no `embedding`, no
+        # `atom_embedding`, no `dof_atoms`. The prior dataset seeds the prior BUFFER
+        # (init_prior_buffer_seed -> _prior_dataset_seed_batch -> condition_samples), so on
+        # a conditional route a bare condition here is refused before the first train step.
+        # `_condition_template` falls back to condition_from_energy when there is no
+        # condition set, so the unconditional route is unchanged.
+        ident = getattr(self.energy_function, 'reference_identifier', None)             or self.energy_function.smiles
+        cond = self._condition_template(ident)
         batch = attach_states(cond, states.cpu(), energies.cpu(),
-                              identifier=self.energy_function.smiles,
+                              identifier=ident,
                               periodic=self.energy_function.periodic_dims)
         # SAME CONSTRUCTION ARGS AS THE CRYSTAL prior_dataset. y_fn in particular is not
         # optional: log_buffer_stats reads `buff.y` for the energy readout, and during the

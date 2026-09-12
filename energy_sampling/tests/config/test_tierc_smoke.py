@@ -444,16 +444,65 @@ def test_the_problem_overlay_is_read_from_problems_yaml():
     assert 'description' not in ov, 'prose would be injected as a config key'
 
 
-def test_the_problems_yaml_gap_is_declared_rather_than_patched_quietly():
-    """`problems.yaml` cannot run `latent_gaussian` as it stands: `prior_path`
-    is null and `init_prior_dataset` torch.loads it unconditionally, and
-    `analyze_kwargs` is empty so the analytic target has no centre or width. The
-    harness fills both, and the fill is REPORTED -- a gap patched invisibly is a
-    gap that never gets closed."""
-    raw = T.problem_overlay('latent_gaussian')
-    assert raw['prior_path'] is None
-    assert raw['analyze_kwargs'] == {}
+def test_the_problem_overlay_is_translated_not_merged_flat():
+    """THE TRAP THIS HARNESS SAT ON. The registry is written flat, so
+    `temperature` and `analyze_kwargs` name TOP-LEVEL keys there and
+    `energy_config` ones in a config. Merging the entry as it stands puts both
+    somewhere nothing reads.
+
+    It was invisible while the registry carried `analyze_kwargs: {}` -- the gap
+    fill supplied the real value under the real path and masked it. The day the
+    registry started carrying the target's true centre (2026-09-09), a flat merge
+    would have put 0.5 into a dead key and scored the run against
+    `latent_harmonic_en`'s default centre of 0, against a prior drawn at 0.5:
+    finite, plausible, and a wrong log Z. Delegating to
+    `generate.problem_block` is what removes the second translation."""
+    ov = T.problem_overlay('latent_gaussian')
+    assert 'temperature' not in ov, 'flat key left where nothing reads it'
+    assert 'analyze_kwargs' not in ov, 'flat key left where nothing reads it'
+    assert ov['energy_config']['temperature'] == 1.0
+    assert math.isclose(ov['energy_config']['analyze_kwargs']['width'], 0.1)
+
+
+def test_the_registry_now_supplies_what_it_used_to_leave_null():
+    """`prior_path`, `molecules_path` and `analyze_kwargs` were the gap until
+    2026-09-09 -- an entry that generated a config which validated clean and died
+    at startup on `torch.load(None)`. They come from the registry now, so they
+    must NOT be in the fill: a fill that keeps supplying them would mask the
+    registry regressing back to null."""
+    ov = T.problem_overlay('latent_gaussian')
+    assert ov['prior_path'] and ov['molecules_path']
+    assert ov['energy_config']['analyze_kwargs']['c']
+    fill, _ = T.problem_gap_fill('latent_gaussian')
+    assert 'prior_path' not in fill and 'molecules_path' not in fill
+    assert 'analyze_kwargs' not in fill['energy_config']
+
+
+def test_the_remaining_gap_is_declared_rather_than_patched_quietly():
+    """What is left is the three settings that deform the analytic target and are
+    tuning knobs elsewhere, so `test_problems.py`'s whitelist rejects them:
+    `reward_range` (an active clip is a nonlinear rescale), a non-degenerate
+    `log_temperature_range` (T over a range makes the target a mixture), and
+    `bounding_coeff` (k is in the rows-live closed form). The harness fills them
+    and REPORTS the fill -- a gap patched invisibly is a gap that never gets
+    closed."""
     fill, notes = T.problem_gap_fill('latent_gaussian')
-    assert fill['prior_path'] and fill['energy_config']['analyze_kwargs']['c']
+    ec = fill['energy_config']
+    assert ec['reward_range'] is None
+    assert ec['log_temperature_range'] == [0.0, 0.0]
+    assert math.isclose(ec['bounding_coeff'], 1.0)
+    assert fill['model']['hold_dead_latent_rows'] is True
     assert len(notes) == 2
-    assert math.isclose(fill['energy_config']['analyze_kwargs']['width'], 0.1)
+    assert any('reward_range' in n for n in notes)
+
+
+def test_the_built_config_carries_the_target_at_the_path_that_scores_it():
+    """The end-to-end statement the two layers exist to make: whatever supplies
+    it, the config the harness runs must score at the width and centre the prior
+    on disk was drawn at."""
+    cfg, _ = T.build_config('configs/mk_dev.yaml', steps=30)
+    kwargs = cfg['energy_config']['analyze_kwargs']
+    assert math.isclose(kwargs['width'], 0.1)
+    assert set(kwargs['c']) == {0.5, 0.0}
+    assert cfg['prior_path'] and cfg['molecules_path']
+    assert cfg['energy_config']['reward_range'] is None

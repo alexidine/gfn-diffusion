@@ -1,6 +1,6 @@
 """
 CPU tests for the two opt-in gates: replay-buffer management (replay_in_play,
-manage_replay_buffer) and the ray probe (_ray_probe_armed, _check_ray_wiring).
+manage_replay_buffer) and the ray probe's arming gate (_ray_probe_armed).
 
 WHAT THE CLAIM IS. A VarGrad-only protocol -- var_conditioning all the way down,
 no stage training replay TB -- has no consumer for the replay buffer, so it
@@ -21,11 +21,30 @@ The stage specs are REAL: transcribed from configs/qm9anchor_aug14/base.yaml and
 parsed by the real protocol.Stage, not hand-built objects. A fake stage would
 test the predicate against my own idea of the config's shape.
 
+EVERY VERDICT REACHES PYTEST BY `assert`. It did not used to: each test ended
+`return ok`, pytest discarded the value, and the file passed green for months
+while three of its checks reported FAIL. `Checks` below prints every sub-check
+(so a partial failure stays readable) and then asserts ONCE naming all of them,
+which is the property a bare `assert` per check would give up.
+
+WHAT THIS FILE NO LONGER COVERS, AND WHY. The ray sensor reaches no learning
+rate: LRs come from the run-level brute-force bracket (lr_control), and
+`configs/mk_dev.yaml` keeps `ray` and `hyper` only as opt-in DIAGNOSTICS, priced
+at ~4.8% of step time. So the probe ARMING is not worth a fixture that has to
+stock a larder to reach it, and `_check_ray_wiring` was DELETED on 2026-09-10:
+it only printed a NOTE once `enabled` became derived from the askers, and
+nothing acted on it. `_ray_askers` carries why no check stands in its place.
+What survives is the direction that still costs something on a run nobody
+intends to probe: a stage that did not ask must build no ray apparatus and must
+not arm. The old omission default is exactly that bug, so those cases stay.
+
 Mutation checks (each re-introduces the bug and requires a FAILURE):
   - read the pin by presence instead of value    -> var_conditioning churns again
   - drop the early return from manage_replay_buffer -> the poisoned fwd_stats it
     is handed here get touched, and the call raises
   - arm the probe on a stage with no lr_sensor  -> the old omission default
+  - build a larder / enable ray_cal for a stage that never asked -> the probe's
+    apparatus is back on every run, whether or not it ever fires
 
     python test_replay_gating.py
 """
@@ -43,6 +62,7 @@ for p in (_here, os.path.dirname(_here),
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from lr_larder import Larder  # noqa: E402
 from protocol import Stage, StageProtocol  # noqa: E402
 from ray_calibration import RayCalibration  # noqa: E402
 from train import Modeller  # noqa: E402
@@ -95,18 +115,39 @@ TRAIN_PRIOR = {
     'bwd_sampling_mode': 'dataset',
 }
 
+#: The probe's clock, small enough to read twice inside one test. Production
+#: takes these from the stage's own lr_sensor block or the shared one.
+N_SUB, PERIOD = 2, 10
+
 
 def stage(spec, index=0, **patch):
     """Parse a stage spec with the REAL parser, optionally patched."""
     return Stage({**spec, **patch}, index)
 
 
-def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
+def modeller(stg, z_calibration=None, step_ind=0):
     """A stub carrying only what these gates read, with the REAL methods bound.
 
     protocol.mode_boostable is the real StageProtocol method too -- it is the
     predicate replay_in_play corrects, so faking it would test the correction
     against a copy of the thing being corrected.
+
+    THE RAY APPARATUS IS DERIVED, NOT PASSED. This used to take `ray_enabled=`,
+    from when a `ray_calibration.enabled` config flag governed the probe
+    independently of what stages asked for. That flag is gone:
+    init_model_and_optimizers builds `RayCalibration(enabled=bool(
+    self._ray_askers()))` and keeps a larder on exactly the same condition, so
+    `enabled` IS the askers and the two cannot disagree. Deriving it here the
+    same way holds the stub to the shipping contract -- passing it separately is
+    how this fixture came to model a run that can no longer exist, and to answer
+    False for its own reasons on every ray case while the file asked for True.
+
+    THE LARDER IS BUILT BUT NOT STOCKED, deliberately. Whether the probe ARMS is
+    no longer tested (see the module docstring: the sensor reaches no learning
+    rate), and reaching `arm()` costs a fixture that has to fabricate a harvest.
+    What IS tested is that a stage which never asked gets no larder at all --
+    for which an empty one on the asking side is the right contrast, and an
+    honest one: nothing here scores a record.
     """
     proto = SimpleNamespace(stage=stg, stages=[stg])
     proto.mode_boostable = MethodType(StageProtocol.mode_boostable, proto)
@@ -124,30 +165,26 @@ def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
         # the shipping predicate currently refuses nothing (freeze-only warmup
         # reversal), so None is the faithful stub
         lr_controller=SimpleNamespace(calibration_refusal=lambda: None),
-        args=SimpleNamespace(
-            z_calibration=z_calibration,
-            ray_calibration=SimpleNamespace(enabled=ray_enabled, period=500,
-                                            n_sub=8, alphas=(0.0, 1.0, 2.0)),
-        ),
-        ray_cal=RayCalibration([torch.zeros(4, requires_grad=True)],
-                               alphas=(0.0, 1.0, 2.0), n_sub=2, period=10,
-                               enabled=ray_enabled),
+        args=SimpleNamespace(z_calibration=z_calibration),
     )
-    # _probe_refusal is bound too, and its state stubbed: _ray_probe_armed calls
-    # it on any stage that DOES declare a ray sensor, so without it this suite
-    # could only ever exercise the early-return cases (no sensor / none / hyper)
-    # and would raise on the one case the test is named for.
-    #
-    # `larder=None` is the faithful stub here: these tests are about whether the
-    # probe ARMS, and a run with no larder refuses structurally -- which is a
-    # verdict, not an error.
-    m.larder = None
-    m._probe_weights = {}
-    m._probe_refusals_seen = set()
-    m._probe_exclude_from = None
     for name in ('replay_in_play', 'manage_replay_buffer', '_probe_refusal',
-                 '_ray_probe_armed', '_check_ray_wiring', '_ray_askers'):
+                 '_ray_probe_armed', '_ray_askers'):
         setattr(m, name, MethodType(getattr(Modeller, name), m))
+
+    asks_ray = bool(m._ray_askers())
+    m.ray_cal = RayCalibration([torch.zeros(4, requires_grad=True)],
+                               alphas=(0.0, 1.0, 2.0), n_sub=N_SUB,
+                               period=PERIOD, enabled=asks_ray)
+    m.larder = Larder(depth=8) if asks_ray else None
+    m.larder_scorer = None
+    # The composite the last optimizer step actually descended, stashed by the
+    # step that formed it (fused_train_step, or the single-branch dispatch) and
+    # never recomputed. Empty means no step has formed one yet.
+    m._probe_weights = {}
+    # Lowest step_ind whose batches fed the pending optimizer step; records at
+    # or after it are the step's own data and are held out of the ray.
+    m._probe_exclude_from = int(step_ind)
+    m._probe_refusals_seen = set()
     return m
 
 
@@ -165,17 +202,59 @@ class Poisoned(dict):
         return self.__getitem__(key)
 
 
-def check(name, got, want):
-    ok = got == want
-    print(f"  {'PASS' if ok else 'FAIL'}  {name}: got {got!r}, want {want!r}")
-    return ok
+#: Read by the conftest hook (pytest_pyfunc_call) under the `_R` spelling it
+#: already honours. Belt and braces only: every test below asserts its own
+#: verdict, so this matters if a `verdict()` call is ever dropped -- which is
+#: precisely the hole this file sat in.
+_R = []
+
+
+class Checks:
+    """Run and PRINT every sub-check, then fail once naming all the failures.
+
+    Asserting per check would stop at the first bad case, and a partial failure
+    that hides the ones after it is most of what makes a report unreadable."""
+
+    def __init__(self, title):
+        print(title)
+        self.title = title
+        self.n = 0
+        self.failed = []
+
+    def __call__(self, name, got, want):
+        ok = got == want
+        detail = f'got {got!r}, want {want!r}'
+        self.n += 1
+        _R.append((name, ok, detail))
+        if not ok:
+            self.failed.append(f'{name}: {detail}')
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+        return ok
+
+    def verdict(self):
+        assert not self.failed, (
+            f'{self.title}: {len(self.failed)} of {self.n} checks failed:\n  '
+            + '\n  '.join(self.failed))
+
+
+def armed_next_bucket(m):
+    """`_ray_probe_armed` in the period bucket AFTER the one it first sees.
+
+    RayCalibration.due latches the bucket on first sight and fires on the next
+    one, so reading a stage once would answer False for the clock's reasons
+    rather than the gate's. Belt and braces on a non-asker, whose ray_cal is
+    disabled and so never comes due at all -- which is the point, and is
+    asserted separately below rather than left as the reason this says False."""
+    m._ray_probe_armed()
+    m.step_ind = PERIOD + 5
+    return m._ray_probe_armed()
 
 
 # ------------------------------------------------------------------- the gates
 
 def test_replay_in_play():
-    """The predicate, over the real protocol's stages and the three consumers."""
-    print('replay_in_play')
+    """The predicate, over the real protocol's stages and its two consumers."""
+    c = Checks('replay_in_play')
     # The block says HOW the sidecar runs; the stage flag says WHETHER. Both
     # axes are exercised, because the clause under test needs both.
     zc_replay = SimpleNamespace(mode='replay')
@@ -188,8 +267,16 @@ def test_replay_in_play():
          modeller(stage(TRAIN_PRIOR), zc_rollout), False),
         ('naive (replay frac 0.05, ratio on replay)',
          modeller(stage(NAIVE), zc_rollout), True),
-        ('var_conditioning + lr_sensor ray',
-         modeller(stage(VAR_CONDITIONING, lr_sensor={'kind': 'ray'}), zc_rollout), True),
+        # RETIRED CONSUMER, kept as a pin in the opposite direction. This case
+        # wanted True: the ray probe drew its sub-batches from the replay
+        # buffer, so declaring the sensor forced a buffer the stage might never
+        # train. It draws from the larder now (_larder_harvest tees whatever
+        # branches the stage runs), and replay_in_play's docstring names only
+        # two consumers. A stage's SENSOR must not put the buffer back in play,
+        # or a diagnostic nobody reads costs per-step churn and a flow_states
+        # D2H on every run that declares it.
+        ('var_conditioning + lr_sensor ray: NOT a consumer any more',
+         modeller(stage(VAR_CONDITIONING, lr_sensor={'kind': 'ray'}), zc_rollout), False),
         ('var_conditioning + z_calibration mode replay, stage FLAGGED',
          modeller(stage(VAR_CONDITIONING, flags={'z_calibration': True}),
                   zc_replay), True),
@@ -205,101 +292,103 @@ def test_replay_in_play():
                         balance={**VAR_CONDITIONING['balance'],
                                  'pinned': {'replay': 0.2}}), zc_rollout), True),
     ]
-    return all(check(name, m.replay_in_play(), want) for name, m, want in cases)
+    for name, m, want in cases:
+        c(name, m.replay_in_play(), want)
+    c.verdict()
 
 
 def test_pin_is_load_bearing():
     """MUTATION. Reading the pin by presence -- what Stage.active_modes does --
     must give the WRONG answer on var_conditioning, or this suite is blind."""
-    print('pin read by value, not presence (mutation)')
+    c = Checks('pin read by value, not presence (mutation)')
     m = modeller(stage(VAR_CONDITIONING), SimpleNamespace(mode='rollout'))
-    ok = check('engine says replay is boostable (the trap)',
-               m.protocol.mode_boostable('replay'), True)
-    ok &= check('replay_in_play corrects it', m.replay_in_play(), False)
-    ok &= check('and the correction is the only difference',
-                'replay' in (m.protocol.stage.balance.get('pinned') or {}), True)
-    return ok
+    c('engine says replay is boostable (the trap)',
+      m.protocol.mode_boostable('replay'), True)
+    c('replay_in_play corrects it', m.replay_in_play(), False)
+    c('and the correction is the only difference',
+      'replay' in (m.protocol.stage.balance.get('pinned') or {}), True)
+    c.verdict()
 
 
 def test_manage_replay_buffer_returns_first():
     """The gate must fire AHEAD of every read of fwd_stats -- the flow_states
     transfer is the cost, not the bookkeeping."""
-    print('manage_replay_buffer early return')
+    c = Checks('manage_replay_buffer early return')
     off = modeller(stage(VAR_CONDITIONING), SimpleNamespace(mode='rollout'))
-    ok = True
     try:
         off.manage_replay_buffer(Poisoned(), sample_batch=None)
-        ok &= check('no-op stage: fwd_stats never touched', True, True)
+        touched = False
     except AssertionError as e:
-        print(f'  FAIL  {e}')
-        ok = False
-    ok &= check('state latched for the transition print', off._replay_managed, False)
+        print(f'  (Poisoned fired: {e})')
+        touched = True
+    c('no-op stage: fwd_stats never touched', touched, False)
+    c('state latched for the transition print', off._replay_managed, False)
 
     # MUTATION: the same call on a stage that DOES use replay must reach the
-    # body. If it does not, the test above proves nothing.
+    # body. If it does not, the check above proves nothing.
     on = modeller(stage(NAIVE), SimpleNamespace(mode='rollout'))
     try:
         on.manage_replay_buffer(Poisoned(), sample_batch=None)
-        print('  FAIL  naive stage: manage_replay_buffer returned early too')
-        ok = False
+        reached_body = False
     except AssertionError:
-        ok &= check('naive stage: the body runs (mutation check)', True, True)
-    return ok
+        reached_body = True
+    c('naive stage: the body runs (mutation check)', reached_body, True)
+    c.verdict()
 
 
-def test_ray_probe_opt_in():
-    """The probe arms on an explicit 'ray' and on nothing else."""
-    print('_ray_probe_armed')
-    ok = True
-    for name, spec, patch, want in [
-        ('lr_sensor omitted (the retired default)', VAR_CONDITIONING, {'lr_sensor': None}, False),
-        ('kind: none', VAR_CONDITIONING, {'lr_sensor': {'kind': 'none'}}, False),
-        ('kind: hyper', VAR_CONDITIONING, {}, False),
-        ('kind: ray', NAIVE, {'lr_sensor': {'kind': 'ray'}}, True),
+def test_ray_probe_stays_off_unless_asked():
+    """A stage that did not declare `lr_sensor: {kind: ray}` must neither arm the
+    probe nor carry its apparatus.
+
+    THE DIRECTION THAT STILL COSTS SOMETHING. Arming is not tested (the sensor
+    reaches no learning rate; see the module docstring), but the old omission
+    default is a live regression risk in exactly this direction: any stage with
+    no lr_sensor block used to arm under a global flag, buying a parameter clone
+    and a set of forward passes on runs that never asked to be probed.
+
+    THE ASKER CHECKS ARE THE CONTROL, and without them this test would be a
+    column of Falses with nothing proving the harness can produce anything else
+    -- which is how a suite comes to read as reassurance. They stop deliberately
+    short of arming: that a ray stage IS routed to the apparatus is the switch
+    working, and it is all this file still claims about the probe."""
+    c = Checks('_ray_probe_armed: off unless asked')
+    for name, spec, patch in [
+        ('lr_sensor omitted (the retired default)', VAR_CONDITIONING, {'lr_sensor': None}),
+        ('kind: none', VAR_CONDITIONING, {'lr_sensor': {'kind': 'none'}}),
+        ('kind: hyper', VAR_CONDITIONING, {}),
     ]:
-        # RayCalibration.due latches the period bucket on first sight and fires
-        # on the NEXT one, so every case is primed once and read in the bucket
-        # after -- otherwise every answer is False and the suite proves nothing
-        m = modeller(stage(spec, **patch), ray_enabled=True, step_ind=3)
-        m._ray_probe_armed()
-        m.step_ind = 15
-        ok &= check(name, m._ray_probe_armed(), want)
-    # ...and an armed stage must NOT arm inside the bucket it already saw, or
-    # 'True' above would just mean 'always'
-    m = modeller(stage(NAIVE, lr_sensor={'kind': 'ray'}), ray_enabled=True, step_ind=3)
-    m._ray_probe_armed()
-    m.step_ind = 5
-    ok &= check('kind: ray, same period bucket', m._ray_probe_armed(), False)
-    return ok
+        m = modeller(stage(spec, **patch), step_ind=3)
+        c(name, armed_next_bucket(m), False)
+        # ...and it is off because nothing asked, not because some later gate
+        # happened to refuse. A non-asker builds no apparatus at all.
+        c(f'  ...{name}: no askers', m._ray_askers(), [])
+        c(f'  ...{name}: ray_cal disabled', m.ray_cal.enabled, False)
+        c(f'  ...{name}: no larder kept', m.larder, None)
 
-
-def test_check_ray_wiring():
-    """The two ways a config can disagree with an opt-in probe."""
-    print('_check_ray_wiring')
-    ok = True
-    m = modeller(stage(NAIVE, lr_sensor={'kind': 'ray'}), ray_enabled=False)
-    try:
-        m._check_ray_wiring()
-        print('  FAIL  ray stage + ray_calibration.enabled false did not raise')
-        ok = False
-    except ValueError as e:
-        ok &= check('ray stage with the block disabled raises', 'never arm' in str(e), True)
-
-    m = modeller(stage(VAR_CONDITIONING), ray_enabled=True)
-    m._check_ray_wiring()  # warns, must not raise
-    ok &= check('enabled with no asker is a warning, not an error', True, True)
-
-    m = modeller(stage(NAIVE, lr_sensor={'kind': 'ray'}), ray_enabled=True)
-    m._check_ray_wiring()
-    ok &= check('coherent pair is silent', True, True)
-    return ok
+    # THE CONTROL. A stage that DOES ask is routed to the apparatus -- so the
+    # Falses above are the gate answering, not the fixture being incapable.
+    asks = modeller(stage(NAIVE, lr_sensor={'kind': 'ray'}), step_ind=3)
+    c('kind: ray IS an asker', asks._ray_askers(), ['naive'])
+    c('...so ray_cal.enabled is derived true, never configured against it',
+      asks.ray_cal.enabled, True)
+    c('...and a larder is kept for it', isinstance(asks.larder, Larder), True)
+    c.verdict()
 
 
 if __name__ == '__main__':
-    results = [t() for t in (test_replay_in_play,
-                             test_pin_is_load_bearing,
-                             test_manage_replay_buffer_returns_first,
-                             test_ray_probe_opt_in,
-                             test_check_ray_wiring)]
-    print(f"\n{sum(results)}/{len(results)} groups passed")
-    sys.exit(0 if all(results) else 1)
+    tests = (test_replay_in_play,
+             test_pin_is_load_bearing,
+             test_manage_replay_buffer_returns_first,
+             test_ray_probe_stays_off_unless_asked)
+    # Each test asserts its own verdict now, so script mode catches the
+    # AssertionError per group rather than letting the first failure abort the
+    # run: printing every group is the reason the file reports as it goes.
+    failed = []
+    for t in tests:
+        try:
+            t()
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print(f'  -> {e}')
+    print(f"\n{len(tests) - len(failed)}/{len(tests)} groups passed")
+    sys.exit(1 if failed else 0)

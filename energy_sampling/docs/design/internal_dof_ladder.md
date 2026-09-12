@@ -6,6 +6,8 @@ enters, and what has to be built before any of it runs. Every claim is a code ci
 an argument, and the doc says which. No `decisions.md` entry yet: §10 lists what is still
 open.
 
+> **Chart specification and build state now live in [`conformer_parameterisation.md`](conformer_parameterisation.md)**, written 2026-09-08 against code. Where this file and that one disagree about what is built, that one is newer.
+
 **Steps 1 and 2 of §10 are built** (`test_conformer_levels.py`, 9 gates). Steps 3–7 are
 not; nothing above `dihedral` has been trained. Two things §3/§7 predicted were confirmed
 in the doing: the state→DoF map is a LINEAR MAP and not an index subset, because a
