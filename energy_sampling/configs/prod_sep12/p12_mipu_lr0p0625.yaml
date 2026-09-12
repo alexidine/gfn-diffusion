@@ -17,12 +17,18 @@ test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
 override_learning_rates: false
+checkpoint_read_only: false
+warm_start_ignore_problem_keys: null
+rewind_tolerance: 0.25
+nonfinite_abort_streak: 50
+freeze_backward_policy: false
 lr_policy: auto
 lr_back: auto
 lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1
 min_lr: 1.0e-08
+max_lr: null
 weight_decay: 0.0001
 use_weight_decay: false
 progress_gate:
@@ -55,6 +61,8 @@ lr_control:
   boundary_confirm_repeats: 1
   boundary_densify: true
   fixed_scale: 0.0625
+  trial_settle_steps: 10
+  logz_detour_nats: 2.0
   verbose: true
   hard_failure:
     loss_excursion_k: 60.0
@@ -78,6 +86,7 @@ profiling:
     with_stack: false
 compile_policy: false
 traj_checkpoint: true
+traj_checkpoint_modes: null
 gradient_norm_clip: auto
 grad_clip_guard:
   enabled: true
@@ -91,6 +100,7 @@ ema_decay: null
 max_reloads_per_1k_steps: 1.0
 model:
   full_flow: false
+  hold_dead_latent_rows: true
   s_emb_dim: 512
   t_dim: 64
   harmonics_dim: 64
@@ -123,7 +133,7 @@ model:
 buffer_device: cuda
 batch_size: 1600
 grow_batch_size: true
-max_batch_size: 1600
+max_batch_size: 4000
 eval_num_samples: 2500
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
@@ -133,7 +143,7 @@ figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50
-batch_util_target: 0
+batch_util_target: 0.65
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 2
 gpu_util_policy_window_s: 7200
@@ -167,10 +177,13 @@ fwd_loss_coeffs:
   pooled_vg: 0.0
   pooled_beta: 40.0
   pooled_ratio: 0.5
+  pooled_bridge_only: 0.0
+  pooled_source: fwd
 bwd_loss_coeffs:
   tb: 0.0
   freeze_policy: 0.0
   freeze_z: 1.0
+  detach_pb: 0.0
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 1.0
@@ -194,6 +207,7 @@ replay_loss_coeffs:
   tb: 1.0
   freeze_policy: 0.0
   freeze_z: 1.0
+  detach_pb: 0.0
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 0.0
@@ -220,6 +234,8 @@ condition_log_z:
   weighted_condition_sampling_clip_quantile: 0.99
   weighted_condition_sampling_temperature: 0.3
   weighted_condition_sampling_uniform_beta: 0.5
+  rollout_condition_draw: iid
+  rollout_under_drawn_power: 1.0
 z_calibration:
   mode: rollout
   sensor: pooled
@@ -228,22 +244,29 @@ z_calibration:
   grace: 0.8
   gain: 1.0
   max_steps_per_step: 100.0
-  fill_threshold: 20.0
+  fill_mode: absorb
+  fill_process_var: 0.01
+  fill_moment_reset: 0.5
+  fill_from_eval: fill
+  fill_threshold: 0.5
   fill_se: 5.0
-  fill_cooldown_steps: 200
+  fill_cooldown_steps: 0
   min_visits: null
   freshness_half_life_steps: 300.0
   se2_floor: 0.25
   holdout_modulus: 8
 conditional_worst_quantile: 0.25
-protocol: prod_eq
+nonthermal_entropy_per_dim: 4.0
+nonthermal_cond_bar: 0.1
+reasonable_cond_bar: 0.5
+per_step_probe_steps: 0
+protocol: unconditional_tb
 protocols:
   unconditional_tb:
     stages:
     - name: train_prior
       train_mode: bwd
       bwd_sampling_mode: dataset
-      skip_if: prior_loaded
       hot_lr_sensor:
         channel: bwd/mle
         form: absolute
@@ -258,11 +281,10 @@ protocols:
           tbc: 0.0
           repeats: 1.0
       exit:
-      - metric: gates/progress_done
-        above: 0.5
+      - metric: bwd/mle
+        above: -1000000000.0
         patience: 1
       on_exit:
-      - snapshot:phase1_exit
       - snapshot_prior
     - name: equilibration
       train_mode: fused
@@ -274,19 +296,22 @@ protocols:
       flags:
         update_log_z: true
         buffers_active: true
-        z_calibration: true
+        z_calibration: false
       on_enter:
       - rebuild_prior_by_churn
-      - bootstrap_z:train_conditioner
+      - bootstrap_z:rollout:4000
       fracs:
-        fwd: 0.05
-        bwd: 0.93
-        replay: 0.02
-      min_fracs:
-        fwd: 0.02
-        bwd: 0.02
-        replay: 0.02
+        fwd: 0.0
+        bwd: 0.9
+        replay: 0.1
       deactivate_threshold: 0.01
+      fwd_rollout_every: 20
+      z_pin_rollout_every: 0
+      fwd_rollout_triggers:
+        occupancy_min_batches: 2.0
+        val_gap_max: 0.0
+        drift_std_max: 0.0
+        ess_min: 0.0
       loss_coeffs:
         fwd:
           tb: 1.0
@@ -298,24 +323,26 @@ protocols:
           tb: 1.0
           beta: 80
       balance:
-        kind: ratio
+        kind: gated_ramp
+        ramp: replay
+        guard: bwd
         pinned:
-          fwd: 0.05
-        metrics:
-          replay: fwd/over_coverage
-          bwd: bwd/relative_under_wcen
-        numerator: replay
-        setpoint: 5.0
-        gain: 0.05
-        max_step: 0.05
+          fwd: 0.0
+        metric: bwd/under_coverage_rise150
+        bar: 0.0
+        ratchet_metric: bwd/under_coverage
+        ratchet_tol: 0.5
+        ratchet_cooldown_steps: 500
+        ratchet_release_tol: 0.25
+        up: 0.004
+        down: 0.006
         bounds:
-          replay:
-          - 0.02
-          - 0.93
           bwd:
-          - 0.02
-          - 0.93
-        converge_floor: 1.0
+          - 0.25
+          - 0.9
+          replay:
+          - 0.1
+          - 0.75
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -347,120 +374,91 @@ protocols:
       train_mode: fused
       bwd_sampling_mode: prior
       hot_lr_sensor:
-        channel: fwd/logw_std_within
+        channel: bwd/logw_std_within
         rows: 11
         above: 3.0
       flags:
         update_log_z: true
         buffers_active: true
-        weighted_bwd_sampling: true
-        weighted_condition_sampling: true
+        weighted_bwd_sampling: false
+        weighted_condition_sampling: false
       on_enter:
       - rebuild_prior_by_churn
       - set_lr_flow:1.0e-4
+      - freeze_pb
       fracs:
-        fwd: 0.5
+        fwd: 0.0
         bwd: 0.5
-        replay: 0.0
+        replay: 0.5
+      min_fracs:
+        fwd: 0.0
       deactivate_threshold: 0.01
+      fwd_rollout_every: 20
+      z_pin_rollout_every: 0
+      fwd_rollout_triggers:
+        occupancy_min_batches: 0.0
+        val_gap_max: 0.0
+        drift_std_max: 0.0
+        ess_min: 0.0
+      fwd_z_sidecar: true
+      replay_warmup_rows: 20000
+      condition_draw:
+        conditions: 0
+        replay_rows: 2
+        prior_rows: 2
+        pick: uniform
       loss_coeffs:
         fwd:
+          tb: 0.0
           vg_lb: 0.0
           vg_by_condition: 1.0
           emp_z: 1.0
+          freeze_policy: 1.0
           repeats: 2.0
           pooled_vg: 1.0
           pooled_beta: 40.0
           pooled_ratio: 0.5
+          pooled_source: replay
           tb_z_source: persistent
         bwd:
+          tb: 0.0
           vg_lb: 0.0
-          condition_block_m: 2.0
+          condition_block_m: 0
           repeats: 1.0
           level_gap: 0.0
           tb_z_source: persistent
         replay:
+          tb: 0.0
+          vg_by_condition: 1.0
+          condition_block_m: 0
           tb_z_source: persistent
       balance:
         kind: lexicographic
         default_boost:
-          fwd: 0.5
+          replay: 0.5
           bwd: 0.5
+        anneal_cooldown_steps: 1000
         rules:
-        - metric: pooled/pooled_vg
+        - metric: fwd/r2_unexplained
           relative: best
-          margin: 1.25
-          drift: 0.01
+          margin: 1.1
+          drift: 0.001
           if_missing: violated
           boost:
-            fwd: 0.5
+            replay: 0.5
             bwd: 0.5
-        - metric: zmatch/delta_mean
-          above: 20.0
+        - metric: bwd/r2_unexplained
+          relative: best
+          margin: 1.1
+          drift: 0.001
           if_missing: violated
           boost:
-            fwd: 0.5
+            replay: 0.5
             bwd: 0.5
         anneal_coeffs:
           lambda_mix:
             target: 1.0
-            rate: 0.93
-  prod_eq:
-    stages:
-    - name: train_prior
-      train_mode: bwd
-      bwd_sampling_mode: dataset
-      flags:
-        update_log_z: true
-        scramble_conditions: true
-      hot_lr_sensor:
-        channel: bwd/mle
-        form: absolute
-        rows: 31
-        above: 5.0
-        action: report
-      loss_coeffs:
-        bwd:
-          mle: 1.0
-          tbc: 0.0
-          repeats: 1.0
-          tb_z_source: persistent
-      exit:
-      - metric: bwd/mle
-        above: -1000000000.0
-        patience: 1
-      on_exit:
-      - snapshot_prior
-    - name: equilibration
-      train_mode: fused
-      bwd_sampling_mode: prior
-      hot_lr_sensor:
-        channel: fwd/scatter_err
-        rows: 11
-        above: 2.0
-        action: report
-      flags:
-        update_log_z: true
-        buffers_active: true
-        z_calibration: true
-      on_enter:
-      - rebuild_prior_by_churn
-      - bootstrap_z:train_conditioner
-      fracs:
-        fwd: 0.05
-        bwd: 0.475
-        replay: 0.475
-      deactivate_threshold: 0.01
-      loss_coeffs:
-        fwd:
-          tb: 1.0
-          freeze_policy: 1.0
-        bwd:
-          tb: 1.0
-          beta: 80
-        replay:
-          tb: 1.0
-          beta: 80
+            rate: 0.8
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -475,6 +473,7 @@ grad_geometry:
   every: 50
 buffers:
   prior_buffer:
+    source: prior_model
     seed_source: prior_dataset
     mean_lifetime: 100
     weighted_bwd_beta: 0.9
@@ -488,10 +487,15 @@ buffers:
     ramp_floor: 100
     ramp_width: 50
   replay_buffer:
-    churn_rate: 80
-    mean_residence_steps: 50
-    max_size: 12000
+    churn_rate: 0
+    mean_residence_steps: 120
+    max_size: 250000
     admit_reward_min: -200
+    backstop_mult: 5.0
+    admit_from_eval: true
+    val_frac: 0.0
+    val_min: 64
+    val_cap: 256
     prioritise:
       enabled: true
       kappa: 1.0

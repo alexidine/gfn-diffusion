@@ -1,55 +1,84 @@
 """prod_sep12 -- phase 2 on the four mle09 families, seeded from each arm's
-best-MLE checkpoint.
+best-MLE checkpoint, on the CURRENT DEFAULT (mk_dev's unconditional_tb with
+rare forward rollouts).
+
+    python configs/prod_sep12/make.py            # refuses on a dirty tree
+    python configs/prod_sep12/make.py --allow-dirty
 
 WHAT THIS IS. mle_sep09 carried phase 1 (bwd MLE on the rebuilt priors) far past
-the prod_t100 exits -- mip/neh to the 48 h wall at ~112k steps, mipu flat from
-~60k, nehu still descending at 24k. These four arms run the prod_sep02 phase-2
-shape (`prod_eq`: re-entry stub, then fused equilibration at pinned fractions
-0.05/0.475/0.475, frozen anchors, fixed rate) from those weights instead of the
-prod_t100 phase-1 exits. ONE arm per family, at the rate prod_sep02 gave its
-7-day paper slot: mip 1.0, neh 0.5, mipu 0.0625, nehu 0.125.
+the prod_t100 exits. These four arms take those weights into equilibration under
+the rare-rollout scheme the owner chose on 2026-09-12: the forward branch (the
+only branch that calls the energy function) runs on 1 step in N=20, bwd and
+replay train between, log Z is pinned by the absorber fill at each rollout, and
+the replay buffer stores the whole rollout under a hazard clock. ONE arm per
+family, at the rate prod_sep02 gave its paper slot: mip 1.0, neh 0.5,
+mipu 0.0625, nehu 0.125.
 
-THE SEED IS `_best.pt`, NOT A phase1_exit. mle09's stage is terminal by design
-(no `exit`, so on_exit never runs and no phase1_exit.pt exists). For a
-train_mode `bwd` stage `_best` is the bwd/mle record (train.py
-_best_metric_channels), hardlinked off `running` at the 50-step save cadence --
-i.e. the best-MLE sample of the run, which is exactly what is wanted. Its buffer
-sidecar resolves to the run's ROLLING sidecar (sidecar_candidates strips the
-`_best` tag), so anchors and prior buffer come across; equilibration's on_enter
-`rebuild_prior_by_churn` replaces the prior buffer anyway.
+THE BASE IS mk_dev.yaml AS IT IS ON DISK, by owner instruction, and that is a
+departure from the rule that generators read the COMMITTED mk_dev. The reason
+the rule exists still holds: the cluster runs committed code, and a key the
+committed code does not read runs the arm silently as a control. So `main`
+REFUSES when mk_dev.yaml or any module these arms execute is dirty, unless
+--allow-dirty is passed -- and an --allow-dirty build is for local validation,
+never for the cluster. Commit, regenerate clean, then push.
 
-FULL RESUME, as in prod_sep02. load_full restores the step (~110k on the ELJ
-arms) and the stage NAME `train_prior`, which this config's prod_eq protocol
-also defines -- as the stub that exits at the first eval (bwd/mle > -1e9,
-patience 1), fires snapshot_prior, and advances to equilibration. A `_best.pt`
-carries no request_eval stamp, so the stub can run up to eval_period-1 MLE
-steps before that eval; harmless on a converged prior. `epochs` is an ABSOLUTE
-cap (trange(init_step, epochs+1)) and is set unreachable; the wall ends the leg.
+THE SEED IS `_best.pt`, NOT A phase1_exit. mle09's stage is terminal (no `exit`,
+so on_exit never runs). For a train_mode `bwd` stage `_best` is the bwd/mle
+record hardlinked off `running` at the 50-step cadence -- the best-MLE sample.
+Loaded as a FULL resume (load_full): the step (~112k on ELJ) and the stage NAME
+`train_prior` come across, and this protocol's `train_prior` is the stub that
+exits at the first eval (bwd/mle > -1e9, patience 1), fires snapshot_prior --
+which `buffers.prior_buffer.source: prior_model` needs -- and advances. The
+sidecar resolves to the seed run's ROLLING buffers; equilibration's on_enter
+`rebuild_prior_by_churn` replaces the prior buffer anyway. `epochs` is an
+ABSOLUTE cap and is set unreachable; the wall ends a leg.
 
-IDENTITY IS INHERITED, NOT REBUILT. Each arm is derived from the mle09 YAML of
-its family, so energy_config/prior_path/space_groups -- the checkpoint's stored
-problem_def -- match by construction, and `check` asserts it through
-get_problem_definition. load_full honours no `warm_start_ignore_problem_keys`,
-so this is the only way a rebuilt-prior family can seed at all. The prod_eq
-protocol block is copied verbatim from the prod_sep02 arm of the same family,
-which ran it for 7 days.
+IDENTITY IS TAKEN FROM THE mle09 ARM, NOT REBUILT. load_full compares the stored
+problem_def with no exemption, and mip/mipu/nehu hash the rebuilt prior's
+filename. The family overlay copies prior_path/molecules_path/space_groups/
+energy_function/mlip_path from the mle09 YAML, and `check` asserts the resulting
+problem_def equals the seed's through get_problem_definition itself. Dead latent
+rows are architectural and cannot be reconfigured on resume; HEAD's gfn.py
+already carries them with the same resolver, so the mle09 checkpoints match.
 
-WHAT DIFFERS PER ROUTE, and only this:
-  ELJ (mip, neh)   traj_checkpoint False -- measured 1.7-2.2x per-step waste at
-                   4-5 GB of an 80 GB card; batch 1000 -> 4000 at util 0.65,
-                   the mle09 occupancy target, inherited.
-  UMA (mipu, nehu) traj_checkpoint True; batch PINNED at 1600 (prod_sep02's
-                   measured operating point), eval_period 1000 with 2500 eval
-                   samples, internal_oom_recovery on. All prod_sep02 values.
+THE CADENCE AND THE BUFFER, the two things the owner set:
+  fwd_rollout_every 20      the backstop period; the occupancy trigger (2.0
+                            batches, inherited) fires rollouts every step while
+                            the buffer is below that, i.e. a built-in warm-up.
+  mean_residence_steps 120  tau = 6N. Occupancy under store-all is B*tau/N, so
+                            6 batches (24k rows at the ELJ ceiling 4000, 9.6k at
+                            UMA 1600). Each rollout replaces 1/6 of the buffer;
+                            v0 asked for <= 1/5. The dose analysis says
+                            occupancy cancels out of exposure, so tau is a
+                            memory/lag choice, not a fit lever.
+  max_size 250000           the cap does NOT bind: >= 10x the equilibrium at the
+                            batch ceiling, asserted. Occupancy is set by tau.
+  churn_rate 0              store-all at the LIVE batch (inherited).
 
-REQUEUE-SAFE. 2-day wall so the arms backfill sooner than a 7-day request; the
-sbatch resumes an arm's own `_running.pt` (and its own `*_prior.pt`) when one
-exists, seeds from `*<src>_*_best.pt` otherwise, and honours the `.dead`
-sentinel so an UNRECOVERABLE arm does not eat a resubmission. Resubmit the same
-sbatch to continue.
+BATCH: the mle09 occupancy policy on every arm -- grow to 4000 at util 0.65,
+2 s sampler. UMA enters at 1600 (the prod_sep02 operating point), ELJ at 1000.
+Under rare rollouts the UMA step is cheaper and occupancy falls, and the sizer
+is what buys the margin back over the ~54% cancellation line.
+
+EVAL IS THE FIXED ENERGY FLOOR under rare rollouts. Training calls the MLIP on
+B/N rows per step (~80 at UMA 1600); an eval at period 250 with 10000 samples
+would call it 40 per step on top -- half the budget. UMA keeps prod_sep02's
+1000/2500 (2.5 per step). ELJ energy is cheap and keeps 500/10000.
+
+WHAT ELSE DIFFERS FROM mk_dev, and only this: the fixed rate (mode fixed is
+already the default; burn_in 500 at the operating rate, loss_excursion_k 60 --
+the values the p02 paper arms ran 7 days on; mk_dev's 10 is a bracket-mode
+setting), traj_checkpoint on the MLIP arms only, internal_oom_recovery on the
+MLIP arms, archive_buffers on. Everything else in `equilibration` -- the gated
+ramp, its bars, the triggers, the fill -- is mk_dev's, by owner instruction.
+
+REQUEUE-SAFE. 2-day wall; the sbatch resumes an arm's own `_running.pt` and its
+own `*_prior.pt` when they exist, seeds from `*<src>_*_best.pt` otherwise, and
+honours the `.dead` sentinel. Resubmit the same sbatch to continue.
 """
 import copy
 import pathlib
+import subprocess
 import sys
 from argparse import Namespace
 
@@ -57,27 +86,43 @@ import yaml
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+ES = ROOT.parent                      # energy_sampling/
+MK_DEV = ROOT / 'mk_dev.yaml'
 PLACEHOLDER = 'WARM_CHECKPOINT_PLACEHOLDER'
 PRIOR_PLACEHOLDER = 'PRIOR_MODEL_PLACEHOLDER'
 TAG = 'p12'
 WALL = '2-00:00:00'
 #: ABSOLUTE step cap, not a length -- the ELJ seeds sit at ~112k already.
 EPOCHS = 1_000_000
-FRACS = {'fwd': 0.05, 'bwd': 0.475, 'replay': 0.475}
-ANCHOR = {'frozen': True, 'online_loss_flow': False,
-          'thin_every_n_evals': 0, 'refresh_every_n_evals': 0, 'replay_beta': 1.0}
-UMA_BATCH = 1600
+
+#: owner, 2026-09-12
+N = 20
+TAU_OVER_N = 6
+TAU = N * TAU_OVER_N
+REPLAY_MAX = 250_000
+UTIL_TARGET = 0.65
+MAX_BATCH = 4000
+EXCURSION_K = 60.0
+
+#: the modules a training step executes; dirty = the cluster cannot run this build
+EXECUTED = ('configs/mk_dev.yaml', 'train.py', 'protocol.py', 'buffer.py',
+            'gflownet_losses.py', 'checkpointing.py', 'utils.py', 'config_invariants.py',
+            'models/gfn.py', 'models/set_policy.py', 'energies/molecular_crystal.py',
+            'lr_larder.py', 'gpu_guard.py')
 
 FAM = {
-    'mip': dict(seed='mle_sep09/mle09_mip_lr4p0.yaml', p2='prod_sep02/p02_mip_lr1.yaml',
-                src='mle09_mip_lr4p0', scale=1.0, mlip=False),
-    'neh': dict(seed='mle_sep09/mle09_neh_lr4p0.yaml', p2='prod_sep02/p02_neh_lr0p5.yaml',
-                src='mle09_neh_lr4p0', scale=0.5, mlip=False),
-    'mipu': dict(seed='mle_sep09/mle09_mipu_lr4p0.yaml', p2='prod_sep02/p02_mipu_lr0p0625.yaml',
-                 src='mle09_mipu_lr4p0', scale=0.0625, mlip=True),
-    'nehu': dict(seed='mle_sep09/mle09_nehu_lr4p0.yaml', p2='prod_sep02/p02_nehu_lr0p125.yaml',
-                 src='mle09_nehu_lr4p0', scale=0.125, mlip=True),
+    'mip':  dict(seed='mle_sep09/mle09_mip_lr4p0.yaml',  src='mle09_mip_lr4p0',  scale=1.0,    mlip=False, batch=1000),
+    'neh':  dict(seed='mle_sep09/mle09_neh_lr4p0.yaml',  src='mle09_neh_lr4p0',  scale=0.5,    mlip=False, batch=1000),
+    'mipu': dict(seed='mle_sep09/mle09_mipu_lr4p0.yaml', src='mle09_mipu_lr4p0', scale=0.0625, mlip=True,  batch=1600),
+    'nehu': dict(seed='mle_sep09/mle09_nehu_lr4p0.yaml', src='mle09_nehu_lr4p0', scale=0.125,  mlip=True,  batch=1600),
 }
+#: what the family overlay copies from the mle09 arm: the problem identity and
+#: the paths that carry it. Nothing else.
+IDENTITY_KEYS = ('prior_path', 'molecules_path', 'test_molecules_path', 'space_groups',
+                 'energy_function', 'mlip_path', 'checkpoints_dir')
+#: the p02/mle09 UMA eval budget; ELJ keeps mle09's 500/10000
+UMA_EVAL = dict(eval_period=1000, eval_num_samples=2500, figs_period=1000)
+ELJ_EVAL = dict(eval_period=500, eval_num_samples=10000, figs_period=1000)
 
 
 def tag_for(scale):
@@ -91,62 +136,84 @@ def load(rel):
 def _ns(obj):
     if isinstance(obj, dict):
         return Namespace(**{k: _ns(v) for k, v in obj.items()})
-    if isinstance(obj, list):
-        return [_ns(v) for v in obj]
     return obj
 
 
 def problem_def(cfg):
     """The identity load_full will compare against the checkpoint's stored one."""
-    sys.path.insert(0, str(ROOT.parent.parent))
+    sys.path.insert(0, str(ES.parent))
     from energy_sampling.utils import get_problem_definition, normalize_problem_def
     return normalize_problem_def(get_problem_definition(_ns(cfg)))
 
 
+def dirty_files():
+    out = subprocess.run(['git', 'status', '--porcelain', '--'] + [str(ES / p) for p in EXECUTED],
+                         capture_output=True, text=True, cwd=str(ES), check=True).stdout
+    return [line[3:] for line in out.splitlines() if line.strip()]
+
+
 def deltas(cfg, fam, name):
     spec = FAM[fam]
-    p2 = load(spec['p2'])
+    seed = load(spec['seed'])
 
+    # -- identity + location: the mle09 arm's, verbatim ------------------------
+    for k in IDENTITY_KEYS:
+        cfg[k] = copy.deepcopy(seed.get(k))
     cfg['run_name'] = name
     cfg['tag'] = TAG
+
+    # -- warm start: FULL resume on both roles; the sbatch picks the file ------
     cfg['checkpoint_name'] = PLACEHOLDER
-    # FULL resume on both roles (seed and own-running); the sbatch picks the file.
     cfg['load_weights_only'] = False
     cfg['continue_from_checkpoint'] = False
-    # only the weights-only path reads this; leaving it would imply it does something
-    cfg.pop('warm_start_ignore_problem_keys', None)
-    # prior_model is not checkpointed; leg 1's stub writes it, later legs glob it
+    cfg['warm_start_ignore_problem_keys'] = None     # weights-only path only; inert here
     cfg['prior_model_name'] = PRIOR_PLACEHOLDER
     cfg['epochs'] = EPOCHS
-    # phase-2 buffers are dynamics; archive them with the model as prod_sep02 did
     cfg['archive_period'] = 5000
     cfg['archive_buffers'] = True
 
-    # the validated phase-2 protocol, verbatim from the same family's prod_sep02 arm
-    cfg['protocol'] = 'prod_eq'
-    cfg['protocols'].pop('mle09', None)
-    cfg['protocols']['prod_eq'] = copy.deepcopy(p2['protocols']['prod_eq'])
+    # -- the ship length --------------------------------------------------------
+    cfg['integrator']['T'] = 100
+    cfg['eval_T'] = 100
 
+    # -- protocol: mk_dev's unconditional_tb, train_prior turned into the stub --
+    cfg['protocol'] = 'unconditional_tb'
+    stages = cfg['protocols']['unconditional_tb']['stages']
+    stub = [s for s in stages if s['name'] == 'train_prior'][0]
+    stub.pop('skip_if', None)          # the checkpoint re-enters this stage by name
+    stub['exit'] = [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}]
+    stub['on_exit'] = ['snapshot_prior']   # prior_buffer.source prior_model needs it
+    eq = [s for s in stages if s['name'] == 'equilibration'][0]
+    eq['fwd_rollout_every'] = N
+
+    # -- the replay buffer: tau sets occupancy, the cap never binds ------------
+    rb = cfg['buffers']['replay_buffer']
+    rb['churn_rate'] = 0
+    rb['mean_residence_steps'] = TAU
+    rb['max_size'] = REPLAY_MAX
+
+    # -- the fixed rate ----------------------------------------------------------
     lc = cfg['lr_control']
-    lc.update(mode='fixed', fixed_scale=float(spec['scale']), fire_cut_factor=1.0,
-              repeat_every=0, burn_in_steps=500)
-    # == fixed_scale: a rewind onto a burn-in-era checkpoint restores lr_ctrl.scale
-    lc['burn_in_scale'] = float(spec['scale'])
-    lc['hard_failure']['loss_excursion_k'] = float(p2['lr_control']['hard_failure']['loss_excursion_k'])
+    lc['mode'] = 'fixed'
+    lc['fixed_scale'] = float(spec['scale'])
+    lc['burn_in_scale'] = float(spec['scale'])   # == fixed: a rewind restores lr_ctrl.scale
+    lc['burn_in_steps'] = 500
+    lc['repeat_every'] = 0
+    lc['fire_cut_factor'] = 1.0
+    lc['hard_failure']['loss_excursion_k'] = EXCURSION_K
 
-    cfg['buffers']['anchor_buffer'].update(ANCHOR)
+    # -- batch: the mle09 occupancy policy ------------------------------------
+    cfg['batch_size'] = spec['batch']
+    cfg['grow_batch_size'] = True
+    cfg['max_batch_size'] = MAX_BATCH
+    cfg['batch_util_target'] = UTIL_TARGET
+    cfg['gpu_util_sample_period_s'] = 2
+    cfg['gpu_util_policy_window_s'] = 7200
 
-    if spec['mlip']:
-        cfg['traj_checkpoint'] = True
-        cfg['batch_size'] = UMA_BATCH
-        cfg['max_batch_size'] = UMA_BATCH
-        cfg['batch_util_target'] = 0
-        cfg['grow_batch_size'] = True
-        cfg['eval_period'] = int(p2['eval_period'])
-        cfg['eval_num_samples'] = int(p2['eval_num_samples'])
-        cfg['energy_config']['internal_oom_recovery'] = True
-    else:
-        cfg['traj_checkpoint'] = False
+    # -- route-specific ----------------------------------------------------------
+    cfg['traj_checkpoint'] = bool(spec['mlip'])
+    cfg['energy_config']['internal_oom_recovery'] = bool(spec['mlip'])
+    cfg.update(UMA_EVAL if spec['mlip'] else ELJ_EVAL)
     return cfg
 
 
@@ -168,42 +235,60 @@ def check(cfg, name, fam):
     # problem_def differs, with no exemption. Same identity as the seed arm, or no run.
     assert problem_def(cfg) == problem_def(seed), name + ': problem identity moved from the mle09 seed'
     assert cfg['prior_path'] == seed['prior_path'] == cfg['molecules_path'], name
+    assert cfg['integrator']['T'] == 100 == cfg['eval_T'], name
 
-    lc = cfg['lr_control']
-    assert lc['mode'] == 'fixed' and lc['fixed_scale'] == lc['burn_in_scale'] == spec['scale'], name
-    assert lc['fire_cut_factor'] == 1.0 and lc['repeat_every'] == 0, name
+    # warm start
     assert cfg['checkpoint_name'] == PLACEHOLDER and cfg['prior_model_name'] == PRIOR_PLACEHOLDER, name
     assert cfg['load_weights_only'] is False and cfg['continue_from_checkpoint'] is False, name
-    assert 'warm_start_ignore_problem_keys' not in cfg, name
     assert cfg['epochs'] >= 500_000, name + ': epochs is an absolute cap and the seed is at ~112k'
-    assert cfg['integrator']['T'] == 100 == cfg['eval_T'], name
-    assert cfg['energy_config'].get('reward_range'), name + ': soft clip NOT armed'
-    ab = cfg['buffers']['anchor_buffer']
-    for k, v in ANCHOR.items():
-        assert ab[k] == v, name + ': anchor_buffer.' + k
-    assert cfg['traj_checkpoint'] is spec['mlip'], name + ': traj_checkpoint rides the MLIPs only'
-    if spec['mlip']:
-        assert cfg['batch_size'] == cfg['max_batch_size'] == UMA_BATCH, name
-        assert cfg['batch_util_target'] == 0, name
-    else:
-        assert cfg['batch_size'] == 1000 and cfg['max_batch_size'] == 4000, name
-        assert cfg['batch_util_target'] == 0.65, name
+    assert cfg['model']['hold_dead_latent_rows'] is True, name + ': the mle09 checkpoints hold dead rows'
 
-    assert cfg['protocol'] == 'prod_eq' and 'mle09' not in cfg['protocols'], name
-    stages = cfg['protocols']['prod_eq']['stages']
-    names = [s['name'] for s in stages]
-    assert names[0] == 'train_prior', name + ': the checkpoint stage must re-enter by name'
-    stub = stages[0]
-    assert stub['exit'] == [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}], name + ': stub exit'
-    assert 'snapshot_prior' in stub['on_exit'] and 'skip_if' not in stub, name
-    fused = [s for s in stages if s.get('train_mode') == 'fused']
-    assert fused, name + ': no fused stage'
-    for s in fused:
-        assert s['fracs'] == FRACS and 'balance' not in s, name
+    # protocol
+    stages = cfg['protocols']['unconditional_tb']['stages']
+    assert cfg['protocol'] == 'unconditional_tb' and [s['name'] for s in stages] == ['train_prior', 'equilibration'], name
+    stub, eq = stages
+    assert stub['exit'] == [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}] and 'skip_if' not in stub, name
+    assert stub['on_exit'] == ['snapshot_prior'], name
+    assert cfg['buffers']['prior_buffer']['source'] == 'prior_model', name + ': the stub snapshot exists for this'
+    assert eq['train_mode'] == 'fused' and 'exit' not in eq, name + ': equilibration is terminal'
+    assert eq['fwd_rollout_every'] == N, name
+    assert eq['flags']['z_calibration'] is False, name + ': the servo would call the MLIP on every skipped step'
+    assert float(cfg['z_calibration']['fill_threshold']) > 0, name + ': the fill is the only Z pin'
+    assert cfg['z_calibration']['fill_mode'] == 'absorb', name
+    assert eq['balance']['kind'] == 'gated_ramp' and eq['balance']['pinned'] == {'fwd': eq['fracs']['fwd']}, name
+    assert (eq['fwd_rollout_triggers'].get('ess_min') or 0) == 0, name + ': ess_min latches at max rate'
     for s in stages:
         sensor = s.get('hot_lr_sensor')
         if isinstance(sensor, dict):
-            assert sensor.get('action') == 'report', name + ': hot_lr can still fire'
+            assert sensor.get('action', 'report') == 'report', name + ': hot_lr can still fire'
+
+    # replay buffer
+    rb = cfg['buffers']['replay_buffer']
+    assert rb['churn_rate'] == 0 and rb['mean_residence_steps'] == TAU, name
+    equilibrium = MAX_BATCH * TAU / N
+    assert rb['max_size'] >= 10 * equilibrium, \
+        name + ': replay cap %d would bind against a %d-row equilibrium' % (rb['max_size'], equilibrium)
+    assert rb['backstop_mult'] > 0, name
+    ab = cfg['buffers']['anchor_buffer']
+    assert ab['frozen'] is True and ab['online_loss_flow'] is False, name
+
+    # rate
+    lc = cfg['lr_control']
+    assert lc['mode'] == 'fixed' and lc['fixed_scale'] == lc['burn_in_scale'] == spec['scale'], name
+    assert lc['fire_cut_factor'] == 1.0 and lc['repeat_every'] == 0, name
+    assert lc['hard_failure']['loss_excursion_k'] == EXCURSION_K, name
+
+    # batch
+    assert cfg['grow_batch_size'] is True and cfg['max_batch_size'] == MAX_BATCH, name
+    assert cfg['batch_util_target'] == UTIL_TARGET and cfg['batch_size'] == spec['batch'], name
+    assert cfg['gpu_util_sample_period_s'] == 2, name
+
+    # route
+    assert cfg['traj_checkpoint'] is spec['mlip'], name + ': traj_checkpoint rides the MLIPs only'
+    assert cfg['energy_config']['internal_oom_recovery'] is spec['mlip'], name
+    assert cfg['energy_config'].get('reward_range'), name + ': soft clip NOT armed'
+    assert cfg['eval_period'] == (1000 if spec['mlip'] else 500), name
+    assert cfg['compile_policy'] is False, name
     _scan_local_paths(cfg, name)
 
 
@@ -211,7 +296,7 @@ def build():
     out = {}
     for fam, spec in FAM.items():
         name = TAG + '_' + fam + '_' + tag_for(spec['scale'])
-        cfg = deltas(load(spec['seed']), fam, name)
+        cfg = deltas(yaml.safe_load(MK_DEV.read_text(encoding='utf-8')), fam, name)
         check(cfg, name, fam)
         out[name] = (cfg, fam)
     assert len(out) == 4
@@ -231,9 +316,9 @@ SBATCH = """#!/bin/bash
 #SBATCH --job-name=p12
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/prod_sep12/joblogs/%x_%A_%a.out
 
-# prod_sep12: phase 2 from the mle09 best-MLE checkpoints. Arm = row of
-# INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py
-# rewrites it. Resubmit this same file to continue an arm past the wall.
+# prod_sep12: phase 2 from the mle09 best-MLE checkpoints, rare rollouts N=20.
+# Arm = row of INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND:
+# make.py rewrites it. Resubmit this same file to continue an arm past the wall.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -338,7 +423,15 @@ fi
 """
 
 
-def main():
+def main(argv):
+    dirty = dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: the cluster runs committed code, and these arms read keys from '
+                 'uncommitted files:\n  ' + '\n  '.join(dirty) +
+                 '\nCommit them and regenerate, or pass --allow-dirty for a LOCAL build.')
+    if dirty:
+        print('WARNING: --allow-dirty build on %d uncommitted files; NOT for the cluster' % len(dirty))
+
     arms = build()
     logs = HERE / 'joblogs'
     logs.mkdir(exist_ok=True)
@@ -356,10 +449,12 @@ def main():
         f.write(SBATCH.format(wall=WALL, last=len(arms) - 1, placeholder=PLACEHOLDER,
                               prior_placeholder=PRIOR_PLACEHOLDER))
     for name, (cfg, fam) in arms.items():
-        print('%-18s seed=%-16s scale=%-7g traj_ckpt=%s batch=%s/%s'
-              % (name, FAM[fam]['src'], FAM[fam]['scale'], cfg['traj_checkpoint'],
-                 cfg['batch_size'], cfg['max_batch_size']))
+        rb = cfg['buffers']['replay_buffer']
+        print('%-18s seed=%-16s scale=%-7g N=%d tau=%d cap=%d batch=%d->%d@%.2f traj_ckpt=%s eval=%d/%d'
+              % (name, FAM[fam]['src'], FAM[fam]['scale'], N, rb['mean_residence_steps'],
+                 rb['max_size'], cfg['batch_size'], cfg['max_batch_size'], cfg['batch_util_target'],
+                 cfg['traj_checkpoint'], cfg['eval_period'], cfg['eval_num_samples']))
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv[1:])

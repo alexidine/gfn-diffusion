@@ -11,9 +11,9 @@
 #SBATCH --job-name=p12
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/prod_sep12/joblogs/%x_%A_%a.out
 
-# prod_sep12: phase 2 from the mle09 best-MLE checkpoints. Arm = row of
-# INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py
-# rewrites it. Resubmit this same file to continue an arm past the wall.
+# prod_sep12: phase 2 from the mle09 best-MLE checkpoints, rare rollouts N=20.
+# Arm = row of INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND:
+# make.py rewrites it. Resubmit this same file to continue an arm past the wall.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
