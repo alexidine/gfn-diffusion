@@ -12,7 +12,7 @@ only branch that calls the energy function) runs on 1 step in N=20, bwd and
 replay train between, log Z is pinned by the absorber fill at each rollout, and
 the replay buffer stores the whole rollout under a hazard clock. ONE arm per
 family, at the rate prod_sep02 gave its paper slot: mip 1.0, neh 0.5,
-mipu 0.0625, nehu 0.125.
+mipu 0.0625, nehu 0.125; acr 0.05 appended 2026-09-13 (see FAM).
 
 THE BASE IS mk_dev.yaml AS IT IS ON DISK, by owner instruction, and that is a
 departure from the rule that generators read the COMMITTED mk_dev. The reason
@@ -56,7 +56,7 @@ THE CADENCE AND THE BUFFER, the two things the owner set:
   churn_rate 0              store-all at the LIVE batch (inherited).
 
 BATCH: the mle09 occupancy policy on every arm -- grow to 4000 at util 0.65,
-2 s sampler. UMA enters at 1600 (the prod_sep02 operating point), ELJ at 1000.
+2 s sampler. UMA enters at 1600 (the prod_sep02 operating point), ELJ and MACE at 1000.
 Under rare rollouts the UMA step is cheaper and occupancy falls, and the sizer
 is what buys the margin back over the ~54% cancellation line.
 
@@ -115,12 +115,18 @@ FAM = {
     'neh':  dict(seed='mle_sep09/mle09_neh_lr4p0.yaml',  src='mle09_neh_lr4p0',  scale=0.5,    mlip=False, batch=1000),
     'mipu': dict(seed='mle_sep09/mle09_mipu_lr4p0.yaml', src='mle09_mipu_lr4p0', scale=0.0625, mlip=True,  batch=1600),
     'nehu': dict(seed='mle_sep09/mle09_nehu_lr4p0.yaml', src='mle09_nehu_lr4p0', scale=0.125,  mlip=True,  batch=1600),
+    # appended 2026-09-13 as row 4; the running rows 0-3 are untouched. MACE is the
+    # heaviest route (71 GB peak at T=100 with checkpointing), so the sizer will OOM-cut
+    # below 4000 -- the accepted limit cycle. 0.05: inside the p02 scan (0.0125-0.1, all
+    # four survived, memorisation 0.80-0.94, far from the 1/e boundary), one rung above
+    # the rr07 centre 0.025. Confidence LOW: no acr arm has run this rate for long.
+    'acr':  dict(seed='mle_sep09/mle09_acr_lr4p0.yaml',  src='mle09_acr_lr4p0',  scale=0.05,   mlip=True,  batch=1000),
 }
 #: what the family overlay copies from the mle09 arm: the problem identity and
 #: the paths that carry it. Nothing else.
 IDENTITY_KEYS = ('prior_path', 'molecules_path', 'test_molecules_path', 'space_groups',
                  'energy_function', 'mlip_path', 'checkpoints_dir')
-#: the p02/mle09 UMA eval budget; ELJ keeps mle09's 500/10000
+#: the p02 MLIP eval budget (UMA and MACE); ELJ keeps mle09's 500/10000
 UMA_EVAL = dict(eval_period=1000, eval_num_samples=2500, figs_period=1000)
 ELJ_EVAL = dict(eval_period=500, eval_num_samples=10000, figs_period=1000)
 
@@ -299,7 +305,7 @@ def build():
         cfg = deltas(yaml.safe_load(MK_DEV.read_text(encoding='utf-8')), fam, name)
         check(cfg, name, fam)
         out[name] = (cfg, fam)
-    assert len(out) == 4
+    assert len(out) == 5
     return out
 
 
