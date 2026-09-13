@@ -295,7 +295,7 @@ def check(cfg, name, fam):
 
     # route
     assert cfg['traj_checkpoint'] is spec['mlip'], name + ': traj_checkpoint rides the MLIPs only'
-    assert cfg['traj_checkpoint_modes'] == (None if fam == 'acr' else ['fwd']), \n        name + ': per-branch checkpointing is [fwd] on UMA, every branch on MACE'
+    assert cfg['traj_checkpoint_modes'] == (None if fam == 'acr' else ['fwd']), name + ': modes are [fwd] on UMA, every branch on MACE'
     assert cfg['energy_config']['internal_oom_recovery'] is spec['mlip'], name
     assert cfg['energy_config'].get('reward_range'), name + ': soft clip NOT armed'
     assert cfg['eval_period'] == (1000 if spec['mlip'] else 500), name
