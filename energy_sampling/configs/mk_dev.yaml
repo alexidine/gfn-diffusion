@@ -277,7 +277,10 @@ traj_checkpoint: false         # gradient-checkpoint each rollout step: trajecto
 # worst step's, so a large bwd allocation can leave no contiguous block for the
 # next rollout's MLIP even where each step fits alone. Inert while traj_checkpoint
 # is false, and the OOM ladder's set_traj_checkpoint action clears it outright.
-traj_checkpoint_modes: null    # null | a list from [fwd, bwd, replay]
+# [fwd] is the default since 2026-09-13: tck_sep10 measured it 20% faster per step
+# than checkpointing every branch at a pinned batch of 1600 on mipu, values
+# identical. Unmeasured on MACE, which sits near the memory ceiling -- set null there.
+traj_checkpoint_modes: [fwd]   # null = every branch | a list from [fwd, bwd, replay]
 # Fallback clip. With grad_clip_guard on it does NOT clip the policy -- the guard
 # does -- so here it governs only the flow head in the z_calibration sidecars.
 # `auto` is fitted to POLICY gradient magnitudes and is not calibrated for that.
