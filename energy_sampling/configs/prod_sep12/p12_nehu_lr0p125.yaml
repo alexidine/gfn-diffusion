@@ -86,7 +86,8 @@ profiling:
     with_stack: false
 compile_policy: false
 traj_checkpoint: true
-traj_checkpoint_modes: null
+traj_checkpoint_modes:
+- fwd
 gradient_norm_clip: auto
 grad_clip_guard:
   enabled: true
