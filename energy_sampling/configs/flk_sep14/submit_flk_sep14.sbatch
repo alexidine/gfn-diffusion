@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-7
+#SBATCH --array=0-6
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=flk14
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/flk_sep14/joblogs/%x_%A_%a.out
 
-# flk_sep14: eight knobs off p12_mip_lr1's live checkpoint. Arm = row of
+# flk_sep14: seven knobs off one frozen p12_mip_lr1 archive. Arm = row of
 # INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND.
 module purge
 
@@ -37,20 +37,26 @@ if [ -f ${CKPTS}/${ARM}.dead ]; then
     echo "arm ${ARM} aborted UNRECOVERABLE on an earlier leg -- skipping"; exit 0
 fi
 
-# RESUME OWN, else SEED FROM THE PARENT'S LIVE running.pt. The parent is a running
-# job that rewrites this file atomically every 50 steps; whichever version is
-# on disk at launch is the seed, and the launch line prints its mtime so the
-# seed step can be read back from the parent's log.
+# RESUME OWN, else SEED FROM ONE FROZEN ARCHIVE SHARED BY THE WHOLE BATTERY.
+# The parent keeps training while these queue, so its live running.pt would
+# hand arms launched hours apart different seeds. The first arm to launch picks
+# the parent's newest _step<N>.pt archive (immutable, with its own frozen
+# buffer sidecar) and records it; later arms read the record.
+SEED_FILE=${LOGS}/SEED.txt
 OWN=$(ls -t ${CKPTS}/*${ARM}_*_running.pt 2>/dev/null | head -1)
 if [ -n "${OWN}" ]; then
     echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  RESUME: $(basename ${OWN})"; CK=${OWN}
 else
-    N=$(ls ${CKPTS}/*${SRC}_*_running.pt 2>/dev/null | wc -l)
-    if [ "${N}" -ne 1 ]; then
-        echo "FATAL: ${N} matches for *${SRC}_*_running.pt (need exactly 1):" >&2
-        ls ${CKPTS}/*${SRC}_*_running.pt >&2; exit 1
+    if [ ! -s ${SEED_FILE} ]; then
+        NEWEST=$(ls -t ${CKPTS}/*${SRC}_*_step*[0-9].pt 2>/dev/null | head -1)
+        if [ -z "${NEWEST}" ]; then
+            echo "FATAL: no archive matches *${SRC}_*_step<N>.pt in ${CKPTS}" >&2; exit 1
+        fi
+        echo "$(basename ${NEWEST})" > ${SEED_FILE}
+        echo "  seed chosen by this arm: $(basename ${NEWEST})"
     fi
-    CK=$(ls ${CKPTS}/*${SRC}_*_running.pt)
+    CK=${CKPTS}/$(cat ${SEED_FILE})
+    if [ ! -f "${CK}" ]; then echo "FATAL: recorded seed ${CK} is missing" >&2; exit 1; fi
     echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SEED: $(basename ${CK}) (mtime $(stat -c %y ${CK}))"
 fi
 

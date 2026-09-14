@@ -1,4 +1,4 @@
-"""flk_sep14 -- the mip Z-flicker battery: eight 8-hour arms off p12_mip_lr1's
+"""flk_sep14 -- the mip Z-flicker battery: seven 8-hour arms off p12_mip_lr1's
 live checkpoint, one knob each.
 
     python configs/flk_sep14/make.py
@@ -16,12 +16,16 @@ still above the 1/e line. The owner wants a robust TB minimum without the
 flicker, and to see what the replay bounds, an anchors-only prior churn and the
 anchor noise do on this checkpoint.
 
-THE SEED IS THE PARENT'S LIVE `_running.pt` under a FULL resume, plus the
-parent's `_prior.pt` (the stub wrote it; source: prior_model arms need it).
-Step ~135k, stage equilibration; a resume re-enters INSIDE the stage, so
-on_enter does not rerun and the buffers come from the parent's rolling sidecar.
-Every arm therefore starts from the identical state, mid-cycle wherever the
-parent happens to be, which is the point: the arms differ only in the knob.
+THE SEED IS ONE FROZEN ARCHIVE OF THE PARENT, shared by every arm. The parent
+keeps training while these queue, so seeding from its live `_running.pt` would
+hand arms launched hours apart checkpoints thousands of steps apart. Instead
+the FIRST arm to launch picks the parent's newest `_step<N>.pt` archive
+(immutable; archive_buffers is on, so it carries its own frozen buffer sidecar)
+and records the name in joblogs/SEED.txt; later arms read the file. A
+simultaneous start by two arms is benign -- both see the same newest archive.
+Loaded under a FULL resume with the parent's `_prior.pt` (the stub wrote it;
+source: prior_model arms need it). Stage equilibration, re-entered INSIDE the
+stage, so on_enter does not rerun. Every arm starts from the identical state.
 
 WALL 8 h: mip runs 2.6 s/step at its settled batch of 1600, so ~11k steps, five
 periods of the cycle -- enough to see it persist or vanish, and enough for a
@@ -32,13 +36,11 @@ ARMS (base = p12_mip_lr1.yaml, committed):
   band            the guard sized to the Z swing: slope bar 1.0, ratchet_tol 1.0,
                   release 0.5. Transparent in descent, ignores a 2-nat Z
                   relaxation at the plateau, still trips on a 1-nat coverage loss
-  band_cap50      band + replay bounded at 0.5 (bounds.replay [0.1, 0.5]) -- the
-                  upper bound of the ramp, tested as a knob
   pin30           fracs 0/0.7/0.3, PINNED by collapsing the ramp's bounds to a point
                   (a stage without balance would inherit the parent's 0.10 on resume)
-  pin50           fracs 0/0.5/0.5 (the rr07 shape)
   band_anch       band + prior_buffer.source anchors: churn from noised anchors,
                   the prior model out of the loop (the owner's intended default)
+  pin30_anch      the shipping fallback if the band still wobbles: pin + anchors
   band_anch_n3x   band_anch + anchor noise x3 (noise_log_range [-2.0, -1.0])
   band_anch_nd3   band_anch + anchor noise /3 ([-3.0, -2.0])
 The noise ladder rides on the anchors source because under prior_model only the
@@ -104,10 +106,9 @@ def _noise(cfg, lo, hi):
 ARMS = {
     'ctrl':          [],
     'band':          [_band],
-    'band_cap50':    [_band, lambda c: _eq(c)['balance']['bounds'].__setitem__('replay', [0.1, 0.5])],
     'pin30':         [lambda c: _pin(c, 0.3)],
-    'pin50':         [lambda c: _pin(c, 0.5)],
     'band_anch':     [_band, _anchors],
+    'pin30_anch':    [lambda c: _pin(c, 0.3), _anchors],
     'band_anch_n3x': [_band, _anchors, lambda c: _noise(c, -2.0, -1.0)],
     'band_anch_nd3': [_band, _anchors, lambda c: _noise(c, -3.0, -2.0)],
 }
@@ -156,7 +157,7 @@ def check(cfg, name, arm):
             assert b['bar'] == 0.0 and b['ratchet_tol'] == 0.5 and b['ratchet_release_tol'] == 0.25, name
         else:
             assert b['bar'] == 1.0 and b['ratchet_tol'] == 1.0 and b['ratchet_release_tol'] == 0.5, name
-        assert b['bounds']['replay'] == ([0.1, 0.5] if arm == 'band_cap50' else [0.1, 0.75]), name
+        assert b['bounds']['replay'] == [0.1, 0.75], name
     src = cfg['buffers']['prior_buffer']['source']
     assert src == ('anchors' if 'anch' in arm else 'prior_model'), name
     nr = cfg['buffers']['anchor_buffer']['noise_log_range']
@@ -181,7 +182,7 @@ SBATCH = """#!/bin/bash
 #SBATCH --job-name=flk14
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/flk_sep14/joblogs/%x_%A_%a.out
 
-# flk_sep14: eight knobs off p12_mip_lr1's live checkpoint. Arm = row of
+# flk_sep14: seven knobs off one frozen p12_mip_lr1 archive. Arm = row of
 # INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND.
 module purge
 
@@ -207,20 +208,26 @@ if [ -f ${{CKPTS}}/${{ARM}}.dead ]; then
     echo "arm ${{ARM}} aborted UNRECOVERABLE on an earlier leg -- skipping"; exit 0
 fi
 
-# RESUME OWN, else SEED FROM THE PARENT'S LIVE running.pt. The parent is a running
-# job that rewrites this file atomically every 50 steps; whichever version is
-# on disk at launch is the seed, and the launch line prints its mtime so the
-# seed step can be read back from the parent's log.
+# RESUME OWN, else SEED FROM ONE FROZEN ARCHIVE SHARED BY THE WHOLE BATTERY.
+# The parent keeps training while these queue, so its live running.pt would
+# hand arms launched hours apart different seeds. The first arm to launch picks
+# the parent's newest _step<N>.pt archive (immutable, with its own frozen
+# buffer sidecar) and records it; later arms read the record.
+SEED_FILE=${{LOGS}}/SEED.txt
 OWN=$(ls -t ${{CKPTS}}/*${{ARM}}_*_running.pt 2>/dev/null | head -1)
 if [ -n "${{OWN}}" ]; then
     echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  RESUME: $(basename ${{OWN}})"; CK=${{OWN}}
 else
-    N=$(ls ${{CKPTS}}/*${{SRC}}_*_running.pt 2>/dev/null | wc -l)
-    if [ "${{N}}" -ne 1 ]; then
-        echo "FATAL: ${{N}} matches for *${{SRC}}_*_running.pt (need exactly 1):" >&2
-        ls ${{CKPTS}}/*${{SRC}}_*_running.pt >&2; exit 1
+    if [ ! -s ${{SEED_FILE}} ]; then
+        NEWEST=$(ls -t ${{CKPTS}}/*${{SRC}}_*_step*[0-9].pt 2>/dev/null | head -1)
+        if [ -z "${{NEWEST}}" ]; then
+            echo "FATAL: no archive matches *${{SRC}}_*_step<N>.pt in ${{CKPTS}}" >&2; exit 1
+        fi
+        echo "$(basename ${{NEWEST}})" > ${{SEED_FILE}}
+        echo "  seed chosen by this arm: $(basename ${{NEWEST}})"
     fi
-    CK=$(ls ${{CKPTS}}/*${{SRC}}_*_running.pt)
+    CK=${{CKPTS}}/$(cat ${{SEED_FILE}})
+    if [ ! -f "${{CK}}" ]; then echo "FATAL: recorded seed ${{CK}} is missing" >&2; exit 1; fi
     echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  SEED: $(basename ${{CK}}) (mtime $(stat -c %y ${{CK}}))"
 fi
 

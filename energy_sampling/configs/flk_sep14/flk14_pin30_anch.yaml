@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: flk14_pin50
+run_name: flk14_pin30_anch
 tag: flk14
 seed: 12345
 device: cuda
@@ -303,8 +303,8 @@ protocols:
       - bootstrap_z:rollout:4000
       fracs:
         fwd: 0.0
-        bwd: 0.5
-        replay: 0.5
+        bwd: 0.7
+        replay: 0.3
       deactivate_threshold: 0.01
       fwd_rollout_every: 20
       z_pin_rollout_every: 0
@@ -339,11 +339,11 @@ protocols:
         down: 0.006
         bounds:
           bwd:
-          - 0.5
-          - 0.5
+          - 0.7
+          - 0.7
           replay:
-          - 0.5
-          - 0.5
+          - 0.3
+          - 0.3
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -474,7 +474,7 @@ grad_geometry:
   every: 50
 buffers:
   prior_buffer:
-    source: prior_model
+    source: anchors
     seed_source: prior_dataset
     mean_lifetime: 100
     weighted_bwd_beta: 0.9

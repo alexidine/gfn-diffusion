@@ -1,9 +1,8 @@
 arm	warm_src
 flk14_ctrl	p12_mip_lr1
 flk14_band	p12_mip_lr1
-flk14_band_cap50	p12_mip_lr1
 flk14_pin30	p12_mip_lr1
-flk14_pin50	p12_mip_lr1
 flk14_band_anch	p12_mip_lr1
+flk14_pin30_anch	p12_mip_lr1
 flk14_band_anch_n3x	p12_mip_lr1
 flk14_band_anch_nd3	p12_mip_lr1
