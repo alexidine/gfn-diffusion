@@ -36,6 +36,8 @@ else the parent's newest archive, recorded the same way):
   n1_lr05      D ~ 1.2  tau 120   n1 at half the rate, applied through seed_lr because a
                resumed controller keeps the parent's promoted scale (see _rate)
   n1_w15       D ~ 1.2  tau 120   n1 at share 0.15 -- the same dose by the other lever
+  n1_t6        D ~ 2.3  tau   6   occupancy ~9.6k, fresh fraction 1/6: the same buffer
+               shape as n20 with only the reuse per row changed, 20 -> 1
   t3           D ~ 47   tau  60   occupancy ~4.8k:  the tau ladder at FIXED dose
   t12          D ~ 47   tau 240   occupancy ~19k
   t48          D ~ 47   tau 960   occupancy ~77k   (cap 250k does not bind)
@@ -147,6 +149,12 @@ ARMS = {
     'n1':       COMMON + [_every(1)],
     'n1_lr05':  COMMON + [_every(1), _rate(0.5)],
     'n1_w15':   [lambda c: _pin(c, 0.15), _pin_batch, _holdout, _every(1)],
+    # --- the single-factor arm: N=1 with tau=6 keeps tau/N = 6, so occupancy (9.6k)
+    #     and the fresh fraction (1/6) are IDENTICAL to n20 and only the reuse per
+    #     row moves, 20 -> 1. The parent's bursts to 31-32 had a lower dose AND a
+    #     fresher buffer; n1 above lowers the dose with a staler buffer (1/120).
+    #     This arm lowers the dose with the buffer shape held fixed.
+    'n1_t6':    COMMON + [_every(1), _tau(6)],
     # --- the tau ladder at FIXED dose (N 20, w 0.3, rate 1.0): tau/N = 3, 12, 48;
     #     n20 above is tau/N = 6. Per-row dose is tau-invariant; what tau sets is
     #     how many independent rows share the capacity (O = B*tau/N: 4.8k, 19k,
@@ -157,7 +165,7 @@ ARMS = {
 }
 #: (N, replay share, rate scale, tau)
 EXPECT = {'n20': (20, 0.3, 1.0, 120), 'n5': (5, 0.3, 1.0, 120), 'n1': (1, 0.3, 1.0, 120),
-          'n1_lr05': (1, 0.3, 0.5, 120), 'n1_w15': (1, 0.15, 1.0, 120),
+          'n1_lr05': (1, 0.3, 0.5, 120), 'n1_w15': (1, 0.15, 1.0, 120), 'n1_t6': (1, 0.3, 1.0, 6),
           't3': (20, 0.3, 1.0, 60), 't12': (20, 0.3, 1.0, 240), 't48': (20, 0.3, 1.0, 960)}
 
 
