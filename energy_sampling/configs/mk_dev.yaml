@@ -540,6 +540,11 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
   tb_z_source: learned    # 'learned' | 'persistent'. CONDITIONAL routes want persistent -- set it in the stage, not here
   mle: 0.0
   repeats: 1.0            # stored trajectories, so K copies would be identical. Keep at 1
+  stored_force_mode: implied  # 'implied' = re-propagate the last k stored steps through their implied noise (exact reparameterisation of the fixed sample, both mean and sigma channels); 'mean' = fixed replay plus the force on dt*mu_theta(x_{T-1}) only (k must be 1; no implied noise anywhere)
+  stored_force_k: 0       # > 0: re-propagate the last k STORED steps through their implied noise and push x_T along the row's stored force d log R / d x_T, scored at ADMISSION for the admitted rows on every admission path (one extra reward call there; no energy call at replay). Refused with temperature_conditioning; exclusive with resample_last_k
+  resample_last_k: 0      # > 0: the last k steps of each replayed trajectory are re-sampled LIVE (reparameterised) from the stored x_{T-k} and the reward is re-scored on the fresh terminal -- one energy call per replay step. 0 = fixed replay
+  reward_grads: 0.0       # replay tail only (needs resample_last_k > 0): nonzero lets d log R / d x_T reach the policy through the re-sampled tail
+  reward_grad_clip: 0.0   # per-row clip on d loss / d log R for that tail, after nan_to_num; 0 = off. Logged as replayforce/rewardgrad_*
   condition_block_m: 0    # >= 2: replay draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while replay vg_by_condition > 0 and vg_lb/vg_lme > 0. 0 = off. Mutually exclusive with buffers.replay_buffer.prioritise (blocked draws bypass p); the draw raises if both are on
   traj_grads: 0.0
   loss_clip: 1.0E+9

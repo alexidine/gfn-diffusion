@@ -2,7 +2,8 @@
 does a fresher buffer hold the high-Z state that N=20 only visits, and does a
 larger buffer change the regime at the same per-row dose?
 
-    python configs/dose_sep16/make.py
+    python configs/dose_sep16/make.py            # the nine dose/tau arms
+    python configs/dose_sep16/make.py --with-k1  # + n20_sf1 and fs_k1 (needs the stored-force / path-gradient code committed)
 
 THE HYPOTHESIS (owner + 2026-09-16 readout of flk_sep14 and the four p12 arms).
 Across the production arms the replay dose D = N * (lr/1e-4) * (w/0.1) * (1000/B)
@@ -141,7 +142,61 @@ def _rate(scale):
     return f
 
 
+def _stored_force(cfg):
+    # REPLAY STORED-FORCE, k=1: every admitted row records d log R / d x_T at
+    # admission (one extra reward call on the admitted rows, cheap on ELJ) and the
+    # replay loss re-propagates the last stored step through its implied noise and
+    # pushes x_T along that force. No energy call at replay time. Rows restored
+    # from the parent's sidecar carry no force and are skipped until turned over.
+    rc = cfg['replay_loss_coeffs']
+    rc['stored_force_k'] = 1
+    rc['stored_force_mode'] = 'implied'
+    rc['resample_last_k'] = 0
+    rc['reward_grads'] = 0.0
+
+
+FS_FWD, FS_BWD, FS_REPLAY = round(0.3 / 0.7, 4), round(0.5 / 0.7, 4), round(0.2 / 0.7, 4)
+
+
+def _forward_seat_k1(cfg):
+    # THE ON-POLICY ENDPOINT WITH THE REWARD GRADIENT (pathgrad_sep14 k1_rg1 shape):
+    # a rollout every step, the forward branch trains the policy (freeze_policy 0)
+    # at a pinned 0.3 share, replay 0.2 / bwd 0.5 pinned by point bounds, the
+    # last-step path gradient live with the reward gradient through it, clip 10.
+    # Under fwd_rollout_every 0 the fill stash is free on every step and the
+    # trigger block is refused, so it is popped.
+    # THE RESUMED PAIR CARRIES MASS 1.0. bwd_frac + replay_frac are modeller state
+    # restored from the parent (0.9 + 0.1); the ramp re-splits that pair and never
+    # renormalises it, and the pinned fwd share is ADDED on top. Bounds written as
+    # absolute 0.5 / 0.2 therefore conflict at runtime (s_lo > s_hi) and collapse
+    # to a midpoint. So the intended 0.3 : 0.5 : 0.2 is written as its ratios
+    # against a pair of 1.0 -- fwd 0.4286, bwd 0.7143, replay 0.2857 -- the same
+    # split up to a global loss scale that Adam does not see. The parser caps each
+    # bound at 1 - pinned = 0.5714, so only the replay bound is written (0.2857
+    # fits) and bwd is the remainder of the pair; the entry fracs carry the same
+    # ratios and would normalise to 0.3/0.5/0.2 on a fresh transition.
+    eq = _eq(cfg)
+    eq['fwd_rollout_every'] = 0
+    eq['z_pin_rollout_every'] = 0
+    eq.pop('fwd_rollout_triggers', None)
+    eq['fracs'] = {'fwd': FS_FWD, 'bwd': FS_BWD, 'replay': FS_REPLAY}
+    eq['balance']['pinned'] = {'fwd': FS_FWD}
+    eq['balance']['bounds'] = {'replay': [FS_REPLAY, FS_REPLAY]}
+    eq['loss_coeffs']['fwd'] = {'tb': 1.0, 'freeze_policy': 0.0}
+    fc = cfg['fwd_loss_coeffs']
+    fc['path_grad_last_k'] = 1
+    fc['reward_grads'] = 1.0
+    fc['reward_grad_clip'] = 10.0
+    fc['traj_grads'] = 0.0
+
+
 COMMON = [lambda c: _pin(c, 0.3), _pin_batch, _holdout]
+#: built only with --with-k1: both need the stored-force / path-gradient code,
+#: which is not in the committed tree as of 2026-09-16.
+K1_ARMS = {
+    'n20_sf1':  COMMON + [_every(20), _stored_force],
+    'fs_k1':    [_pin_batch, _holdout, _forward_seat_k1],
+}
 ARMS = {
     # --- the dose ladder: N, then the two other levers at the same dose ---------
     'n20':      COMMON + [_every(20)],
@@ -166,7 +221,8 @@ ARMS = {
 #: (N, replay share, rate scale, tau)
 EXPECT = {'n20': (20, 0.3, 1.0, 120), 'n5': (5, 0.3, 1.0, 120), 'n1': (1, 0.3, 1.0, 120),
           'n1_lr05': (1, 0.3, 0.5, 120), 'n1_w15': (1, 0.15, 1.0, 120), 'n1_t6': (1, 0.3, 1.0, 6),
-          't3': (20, 0.3, 1.0, 60), 't12': (20, 0.3, 1.0, 240), 't48': (20, 0.3, 1.0, 960)}
+          't3': (20, 0.3, 1.0, 60), 't12': (20, 0.3, 1.0, 240), 't48': (20, 0.3, 1.0, 960),
+          'n20_sf1': (20, 0.3, 1.0, 120), 'fs_k1': (0, round(0.2 / 0.7, 4), 1.0, 120)}
 
 
 def dirty_files():
@@ -179,10 +235,11 @@ def dose(n, scale, w, batch=1600):
     return n * (1.25e-4 * scale / 1e-4) * (w / 0.1) * (1000.0 / batch)
 
 
-def build():
+def build(with_k1=False):
     base = yaml.safe_load(BASE.read_text(encoding='utf-8'))
     out = {}
-    for arm, deltas in ARMS.items():
+    arms = dict(ARMS, **K1_ARMS) if with_k1 else ARMS
+    for arm, deltas in arms.items():
         cfg = copy.deepcopy(base)
         name = TAG + '_' + arm
         cfg['run_name'] = name
@@ -207,14 +264,30 @@ def check(cfg, name, arm):
     assert cfg['buffers']['replay_buffer']['val_frac'] == 0.05, name + ': held-out split off'
     rb = cfg['buffers']['replay_buffer']
     assert rb['mean_residence_steps'] == tau, name
-    assert rb['max_size'] >= 3 * 1600 * tau / n, name + ': replay cap would bind on the tau arm'
+    assert rb['max_size'] >= 3 * 1600 * tau / max(n, 1), name + ': replay cap would bind on the tau arm'
     assert cfg['checkpoint_name'] == PLACEHOLDER and cfg['prior_model_name'] == PRIOR_PLACEHOLDER, name
     assert cfg['load_weights_only'] is False and cfg['epochs'] >= 500_000, name
-    assert eq['fwd_rollout_every'] == n and n >= 1, name + ': N must stay on the cadenced path (>= 1)'
+    assert eq['fwd_rollout_every'] == n, name
     assert eq['flags']['z_calibration'] is False and float(cfg['z_calibration']['fill_threshold']) > 0, name
-    b = eq['balance']; bwd = round(1 - w, 3)
-    assert eq['fracs'] == {'fwd': 0.0, 'bwd': bwd, 'replay': w}, name
-    assert b['bounds'] == {'bwd': [bwd, bwd], 'replay': [w, w]}, name + ': bounds must be a point'
+    b = eq['balance']
+    if arm == 'fs_k1':
+        assert n == 0 and 'fwd_rollout_triggers' not in eq, name + ': the forward seat rolls out every step'
+        assert eq['fracs'] == {'fwd': FS_FWD, 'bwd': FS_BWD, 'replay': FS_REPLAY} and b['pinned'] == {'fwd': FS_FWD}, name
+        assert b['bounds'] == {'replay': [FS_REPLAY, FS_REPLAY]}, name + ': the replay bound must be a point'
+        assert abs(FS_BWD + FS_REPLAY - 1.0) < 1e-3 and FS_REPLAY <= 1.0 - FS_FWD, name + ': the resumed pair has mass 1.0 and the bound must parse'
+        assert eq['loss_coeffs']['fwd'] == {'tb': 1.0, 'freeze_policy': 0.0}, name
+        fc = cfg['fwd_loss_coeffs']
+        assert fc['path_grad_last_k'] == 1 and fc['reward_grads'] == 1.0 and fc['reward_grad_clip'] == 10.0 and fc['traj_grads'] == 0.0, name
+    else:
+        assert n >= 1, name + ': N must stay on the cadenced path (>= 1)'
+        bwd = round(1 - w, 3)
+        assert eq['fracs'] == {'fwd': 0.0, 'bwd': bwd, 'replay': w}, name
+        assert b['bounds'] == {'bwd': [bwd, bwd], 'replay': [w, w]}, name + ': bounds must be a point'
+    rc = cfg['replay_loss_coeffs']
+    if arm == 'n20_sf1':
+        assert rc['stored_force_k'] == 1 and rc['stored_force_mode'] == 'implied' and rc['resample_last_k'] == 0 and rc['reward_grads'] == 0.0, name
+    else:
+        assert not rc.get('stored_force_k') and not rc.get('resample_last_k'), name + ': no replay tail on a dose arm'
     lc = cfg['lr_control']
     assert lc['mode'] == 'fixed' and lc['fixed_scale'] == lc['burn_in_scale'] == 1.0, name + ': the scale is inherited; the rate moves through seed_lr'
     assert abs(lc['seed_lr'] - 1.25e-4 * scale) < 1e-12, name
@@ -244,7 +317,7 @@ def main(argv):
     if dirty and '--allow-dirty' not in argv:
         sys.exit('REFUSING: uncommitted files the arms execute:\n  ' + '\n  '.join(dirty) +
                  '\nBuild from a clean worktree, or pass --allow-dirty for a LOCAL build.')
-    arms = build()
+    arms = build(with_k1='--with-k1' in argv)
     logs = HERE / 'joblogs'
     logs.mkdir(exist_ok=True)
     (logs / '.gitkeep').write_text('SLURM cannot create --output; SEED.txt is written here at launch\n', encoding='utf-8')
@@ -260,8 +333,9 @@ def main(argv):
                               prior_placeholder=PRIOR_PLACEHOLDER))
     for name, cfg in arms.items():
         n, w, scale, tau = EXPECT[name[len(TAG) + 1:]]
+        neff = max(n, 1)
         print('%-16s N=%-3d replay=%.2f scale=%.2f tau=%-4d occupancy~%6d  dose~%5.1f  batch %d pinned, val_frac %.2f'
-              % (name, n, w, scale, tau, 1600 * tau / n, dose(n, scale, w), cfg['batch_size'],
+              % (name, n, w, scale, tau, 1600 * tau / neff, dose(neff, scale, w), cfg['batch_size'],
                  cfg['buffers']['replay_buffer']['val_frac']))
 
 

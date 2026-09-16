@@ -1,3 +1,4 @@
+import functools
 import math
 from argparse import Namespace
 from typing import Optional, Sequence
@@ -1027,10 +1028,119 @@ class GFN(nn.Module):  # todo add seeding
             is_first, logpf_i)
         return logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
 
+    def last_step_mean_shift(self, trajectory, discretizer, condition, mol_batch,
+                             freeze_policy: bool = False):
+        """dt * mu_theta(x_{T-1}) LIVE for a batch of stored trajectories: the
+        MEAN channel of the last step's reparameterisation, dt * d mu / d theta.
+        For the mean-only stored-force surrogate (replay_loss_coeffs
+        .stored_force_mode 'mean'): the replay itself stays FIXED (no implied
+        tail, so no density-side path terms and no eps* anywhere), and the loss
+        adds F . (shift - shift.detach()) -- value 0, gradient F . dt d mu/d theta."""
+        trajectory = trajectory.detach()
+        batch_size = trajectory.shape[0]
+        ts = discretizer(batch_size).to(self.device)
+        T = ts.shape[1] - 1
+        dts = ts[:, T] - ts[:, T - 1]
+        if self.conditional:
+            if condition is not False:
+                condition_embedding = self.get_condition_embedding(condition, mol_batch)
+            else:
+                condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
+                                                  dtype=torch.float32, device=self.device)
+            if freeze_policy:
+                condition_embedding = condition_embedding.detach()
+        else:
+            condition_embedding = None
+        pf_mean = self._forward_kernel(trajectory[:, T - 1], ts[:, T - 1], condition_embedding,
+                                       ts[:, T], dts)[0]
+        return dts.unsqueeze(1) * pf_mean
+
+    def _implied_step(self, current_state, next_state_stored, dts, t_cur, t_next,
+                      condition_embedding, is_first: bool):
+        """
+        One STORED transition re-propagated LIVE through the noise the current
+        kernel needs to reproduce it: eps* = (x_{t+1} - x_t - dt*mu_theta) /
+        (sqrt(dt)*sigma_theta), detached. At the current parameters the step
+        lands exactly on the stored next state (nearest image on periodic
+        dims, dead dims pinned), so nothing about the scored path changes --
+        but next_state now carries d x_{t+1} / d theta = dt d mu/d theta +
+        sqrt(dt) eps* d sigma/d theta, the reparameterisation gradient of a
+        FIXED sample. This is what `traj_grads` on a replayed row means once
+        the noise is recovered from the states. Diagonal channel only: with
+        DPLR the split of one displacement into diagonal and low-rank noise is
+        not identifiable, and any split reproduces the state exactly; only the
+        sigma-credit differs.
+        """
+        pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
+            current_state, t_cur, condition_embedding, t_next, dts)
+        fwd_drift = dts.unsqueeze(1) * pf_mean
+        with torch.no_grad():
+            resid = self._wrap_ang(next_state_stored - current_state - fwd_drift)
+            u = resid / dts.sqrt().unsqueeze(1)          # per-unit-dt residual
+            if V is None:
+                eps, eps_r = u / d.sqrt(), None
+                mahal = (self._live_only(eps) ** 2).mean(dim=-1)
+            else:
+                # DPLR: the kernel's noise is D^1/2 eps + V eps_r, n + r unknowns for n
+                # constraints. Take the POSTERIOR MEAN (= minimum-norm) split
+                #     eps = D^1/2 Sigma^-1 u,  eps_r = V^T Sigma^-1 u,  Sigma = D + V V^T,
+                # via the same Woodbury factorisation fwd_gauss_logprob scores with.
+                # It reproduces u exactly (D s + V V^T s = Sigma s = u), and it is the
+                # ONLY split for which the fixed-sample reparameterisation is exact:
+                # the quadratic's total theta-derivative vanishes iff the noise vector
+                # lies in range(L^T), L = [D^1/2 V]. Attributing the whole residual to
+                # the diagonal (the previous form) leaves a spurious sigma/V gradient on
+                # every DPLR row -- measured 2026-09-15 as an implied-eps rms floor of
+                # 1.19 at ROW BIRTH on the qm9c route (dplr_rank 6), i.e. not staleness.
+                Dinv_V = V / d.unsqueeze(-1)                                   # [B, n, r]
+                r = V.shape[-1]
+                M = torch.eye(r, device=V.device, dtype=V.dtype) + torch.einsum('bnr,bns->brs', V, Dinv_V)
+                w = torch.einsum('bnr,bn->br', Dinv_V, u)                      # V^T D^-1 u
+                Minv_w = torch.cholesky_solve(w.unsqueeze(-1), torch.linalg.cholesky(M)).squeeze(-1)
+                s = u / d - torch.einsum('bnr,br->bn', Dinv_V, Minv_w)          # Sigma^-1 u
+                eps = d.sqrt() * s
+                eps_r = torch.einsum('bnr,bn->br', V, s)
+                # whitened residual norm per dim: u^T Sigma^-1 u / n, ~ chi2_n / n on an
+                # on-policy row (mean 1.0) whatever the split
+                u_l, s_l = self._live_only(u, s)
+                mahal = (u_l * s_l).sum(dim=-1) / u_l.shape[-1]
+        # NB do NOT detach d or V here. It was tried (rs_sf_k1_mu, 2026-09-14) and
+        # detonated: the explicit density term's +eps^2 d log sigma piece is
+        # cancelled ONLY by the path term through sigma (the sticking-the-landing
+        # identity); detaching sigma in the state leaves an eps*^2-weighted sigma
+        # gradient on every stale row. The mean-only force lives in
+        # last_step_mean_shift instead, on a FIXED replay.
+        noise = d.sqrt() * eps
+        if eps_r is not None:
+            noise = noise + torch.einsum('bnr,br->bn', V, eps_r)
+        next_state = current_state + fwd_drift + dts.sqrt().unsqueeze(1) * noise
+        # `_last_implied_eps_sq` keeps its meaning (1.0 = on-distribution): it is the
+        # whitened residual norm per dim, which equals mean(eps^2) on the diagonal
+        # path and generalises it under DPLR
+        self._last_implied_eps_sq = mahal.detach()
+        self._last_implied_epsr_sq = None if eps_r is None else (eps_r ** 2).mean(dim=-1).detach()
+        next_state = self._wrap_ang(next_state)
+        next_state = self._pin_dead(next_state)
+
+        flow_i = self._step_flow(s_emb, t_emb)
+        logpf_i = self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V)
+        back_drift, back_var, logpb_i = self._eval_pb_logprob(
+            condition_embedding, current_state, next_state, dts, t_cur, t_next,
+            is_first, logpf_i)
+        return next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True,
-                     freeze_policy: bool = False, path_grad_last_k: int = 0):
+                     freeze_policy: bool = False, path_grad_last_k: int = 0,
+                     state_grad_hook=None):
         """
+        state_grad_hook(i, grad): optional callback registered on every LIVE
+        (non-detached) next_state, receiving the step index and dL/dx_{i+1}
+        during backward. A pure diagnostic for the path-gradient arms: it is
+        what makes the per-step Jacobian growth VISIBLE rather than inferred
+        from a blow-up. Never registered on a detached step, so under the
+        shipped traj_grads 0 / path_grad_last_k 0 it is inert.
+
         path_grad_last_k > 0 = TRUNCATED path gradient: keep the reparameterized
         state gradient alive for the LAST k steps only, detaching everything
         before. 0 (default) reproduces the old bool behaviour bitwise, so this
@@ -1107,6 +1217,8 @@ class GFN(nn.Module):  # todo add seeding
                 log_flow[:, i] = flow_i
             if return_gauss_params:
                 self.log_gauss_params(gauss_params, i, back_drift, back_var, dts, fwd_drift, pflogvars, d)
+            if state_grad_hook is not None and not step_detach and next_state.requires_grad:
+                next_state.register_hook(functools.partial(state_grad_hook, i))
 
             current_state = next_state
             states[:, i + 1] = current_state
@@ -1253,7 +1365,8 @@ class GFN(nn.Module):  # todo add seeding
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
                         return_gauss_params: bool = False, freeze_policy: bool = False,
-                        scramble_condition_tiles: int = 0):
+                        scramble_condition_tiles: int = 0, resample_last_k: int = 0,
+                        state_grad_hook=None, implied_noise_last_k: int = 0):
         """
         Recompute log_flow, logpf and logpb for a fixed batch of trajectories
         (e.g., replayed from a buffer), instead of generating them. Mirrors
@@ -1261,6 +1374,22 @@ class GFN(nn.Module):  # todo add seeding
         rather than sampling them, so the output is naturally detached from
         the state-generating computation graph (only the policy/flow model
         evaluations carry gradient).
+
+        resample_last_k > 0: the LAST k steps are NOT read from the stored
+        trajectory but re-sampled LIVE from the stored x_{T-k} under the current
+        policy, reparameterised (step_detach False), exactly as get_traj_fwd
+        would. The returned `states` then carry the fresh tail, and the caller
+        must re-score the reward on states[:, -1] (a stored reward belongs to the
+        stored terminal). This is the off-policy last-step path gradient: an
+        on-policy tail on an off-policy prefix, so the reward direction
+        d log R / d x_T reaches the policy through replay rows without a
+        forward rollout. 0 = the fixed replay every route ships with.
+
+        implied_noise_last_k > 0: the last k steps are re-propagated LIVE
+        through the noise implied by the stored states (_implied_step), so the
+        returned states EQUAL the stored ones and carry d x / d theta. Pair
+        with a stored terminal force (replay_loss_coeffs.stored_force_k).
+        Mutually exclusive with resample_last_k.
 
         trajectory: [batch_size, trajectory_length + 1, dim]
         """
@@ -1293,14 +1422,47 @@ class GFN(nn.Module):  # todo add seeding
         if not self.full_flow:
             log_flow[:, 0] = self._condition_flow(condition_embedding)
 
+        resample_last_k = int(resample_last_k or 0)
+        implied_noise_last_k = int(implied_noise_last_k or 0)
+        if resample_last_k > 0 and implied_noise_last_k > 0:
+            raise ValueError("resample_last_k and implied_noise_last_k are mutually exclusive")
+        for _name, _k in (('resample_last_k', resample_last_k),
+                          ('implied_noise_last_k', implied_noise_last_k)):
+            if _k > trajectory_length:
+                raise ValueError(f"{_name} {_k} exceeds the trajectory length {trajectory_length}")
+        if resample_last_k > 0 or implied_noise_last_k > 0:
+            # the stored tensor is never written; the live tail goes into a copy
+            states = trajectory.clone()
+
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
-            next_state = states[:, i + 1]
+            if implied_noise_last_k > 0 and i >= trajectory_length - implied_noise_last_k:
+                (next_state, logpf_i, logpb_i, flow_i,
+                 back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                    use_ckpt, self._implied_step, current_state, trajectory[:, i + 1], dts,
+                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
+                if state_grad_hook is not None and next_state.requires_grad:
+                    next_state.register_hook(functools.partial(state_grad_hook, i))
+                states[:, i + 1] = next_state
+            elif resample_last_k > 0 and i >= trajectory_length - resample_last_k:
+                # LIVE step from the (stored or freshly sampled) current_state
+                eps = torch.randn(batch_size, self.dim, dtype=current_state.dtype, device=self.device)
+                eps_r = (torch.randn(batch_size, self.dplr_rank, device=self.device)
+                         if self.dplr_rank > 0 else None)
+                (next_state, logpf_i, logpb_i, flow_i,
+                 back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                    use_ckpt, self._fwd_step, current_state, dts, ts[:, i], ts[:, i + 1],
+                    condition_embedding, eps, eps_r, None, i == 0, False)
+                if state_grad_hook is not None and next_state.requires_grad:
+                    next_state.register_hook(functools.partial(state_grad_hook, i))
+                states[:, i + 1] = next_state
+            else:
+                next_state = states[:, i + 1]
 
-            (logpf_i, logpb_i, flow_i,
-             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
-                use_ckpt, self._replay_step, current_state, next_state, dts,
-                ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
+                (logpf_i, logpb_i, flow_i,
+                 back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                    use_ckpt, self._replay_step, current_state, next_state, dts,
+                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)

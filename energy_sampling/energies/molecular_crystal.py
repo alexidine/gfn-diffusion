@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import gc
 from argparse import Namespace
@@ -240,6 +241,8 @@ class MolecularCrystal(BaseSet):
         # fixed point with a term the flow never modelled.
         self.prior_flow = None
         self.lambda_mix = float(lambda_mix)
+        # the per-call leg capture used by capture_reward_legs (None = not capturing)
+        self._reward_leg_capture = None
         if prior_flow_path is not None:
             self.prior_flow = PriorFlow.load(prior_flow_path, device=self.device)
             if len(self.prior_flow.wrap_mask) != self.data_ndim:
@@ -636,6 +639,33 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy, None
 
+    #: The three REWARD LEGS generator_energy captures under capture_reward_legs(),
+    #: in this order and in ENERGY units (before energy()'s division by
+    #: temperature): flow_energy (0 on a run without a flow), physical_energy, and
+    #: the bounding total. The training total is
+    #:     (1 - lam) * flow + lam * phys + bound     for lam strictly inside (0, 1)
+    #:     flow + bound / phys + bound               at lam = 0 / lam = 1, EXACTLY
+    #: (see the endpoint note in generator_energy). Consumed by
+    #: gflownet_losses.terminal_force_legs, which stores each leg's gradient so a
+    #: replay row's terminal force can be re-mixed at a later lambda.
+    REWARD_LEGS = ('flow', 'phys', 'bound')
+
+    @contextlib.contextmanager
+    def capture_reward_legs(self):
+        """Collect the reward legs of every row scored inside the block: a list
+        of [B, 3] tensors, one per generator_energy call in call order (the
+        OOM-recovery path chunks one batch into several calls). The tensors
+        keep their graph, so under keep_grads each leg differentiates on its
+        own. Not re-entrant. The capture list is dropped on exit whatever
+        happens, so no graph is ever left parked on the energy function."""
+        if getattr(self, '_reward_leg_capture', None) is not None:
+            raise RuntimeError("capture_reward_legs blocks do not nest")
+        self._reward_leg_capture = []
+        try:
+            yield self._reward_leg_capture
+        finally:
+            self._reward_leg_capture = None
+
     def generator_energy(self, crystal_batch, temperature, raw_latents: Optional[torch.tensor] = None):
         ens_dict = {}
 
@@ -806,13 +836,15 @@ class MolecularCrystal(BaseSet):
         # 1. SEMANTICS. Bounding is the only term computed from `raw_latents` -- a
         #    penalty on what the POLICY EMITTED, not a property of the structure.
         # 2. STORED ROWS. A buffer row re-scored through prebuilt_sample_to_reward
-        #    passes no raw_latents, so its live training energy has bounding == 0.
-        #    A leg carrying an ADMISSION-TIME bounding term would therefore be
-        #    permanently wrong for every stored row, and -- since it enters the mix
-        #    with total weight (1-lam) + lam = 1 -- recomposing at the current
-        #    lambda would NOT remove it. Excluding it is what makes a stored pair
-        #    of legs re-mixable into exactly the row's live energy by a plain
-        #    weighted sum, with no correction term.
+        #    gets bounding from the raw_latents the CALLER hands it -- the stored
+        #    trajectory's pre-clamp terminal on the replay path (train.py
+        #    _finish_replay_draw, 2026-09-13), nothing on the prior-buffer path, so
+        #    there bounding is 0. A leg carrying an ADMISSION-TIME bounding term
+        #    would be permanently wrong for every stored row, and -- since it
+        #    enters the mix with total weight (1-lam) + lam = 1 -- recomposing at
+        #    the current lambda would NOT remove it. Excluding it from the legs is
+        #    what makes a stored pair of legs re-mixable into exactly the row's
+        #    live energy by a plain weighted sum, with bounding scored live on top.
         #
         # The total is algebraically unchanged either way (bounding carried weight
         # 1 before and carries weight 1 now), so lambda-free runs stay bit-identical.
@@ -875,6 +907,14 @@ class MolecularCrystal(BaseSet):
         # bounding is added ONCE, outside the mix -- see the note above. Zeroed on
         # the energy_clip branch, where it is already sealed inside the leg.
         total_energy = mixed + bounding_total
+        _capture = getattr(self, '_reward_leg_capture', None)
+        if _capture is not None:
+            # the legs the total was composed from, in REWARD_LEGS order, graph
+            # attached; a flow-free run captures a zero flow leg so the column
+            # has one shape on every route
+            _capture.append(torch.stack(
+                [flow_energy if flow_energy is not None else torch.zeros_like(physical_energy),
+                 physical_energy, bounding_total], dim=-1))
         ens_dict['physical_energy'] = physical_energy
 
         self._assert_finite_energy(total_energy, ens_dict, crystal_batch)
@@ -1078,13 +1118,20 @@ class MolecularCrystal(BaseSet):
         return crystal_energy
 
     @torch.no_grad()
-    def prebuilt_sample_to_reward(self, crystals, temperature, return_ens_dict: bool = False):
+    def prebuilt_sample_to_reward(self, crystals, temperature, return_ens_dict: bool = False,
+                                  raw_latents: Optional[torch.Tensor] = None):
         """
         For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
         :param temperature: per-sample torch float tensor containing temperature for each sample to be rewarded
         :param crystals:
         :param return_ens_dict: also return generator_energy's ens_dict (the live legs,
             physical_energy / bounding_energy / flow_energy) as a second value
+        :param raw_latents: the POLICY's pre-clamp terminal state for these rows (a stored
+            trajectory's last state). With it, the bounding penalty is scored live exactly as
+            on a fresh forward row; without it bounding is 0 -- which on the replay seat
+            meant the box never reached the policy at all (2026-09-13: samples walked out
+            of the box on dim 6 at lambda 0.032 while the replay branch carried the
+            training). Bounding stays OUTSIDE the two energy legs either way.
         :return:
         """
         if isinstance(crystals, list):
@@ -1092,7 +1139,7 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = crystals
 
-        energy, ens_dict = self.generator_energy(crystal_batch, temperature)
+        energy, ens_dict = self.generator_energy(crystal_batch, temperature, raw_latents=raw_latents)
 
         if torch.is_tensor(temperature):
             sample_temperature = temperature.to(crystal_batch.device)

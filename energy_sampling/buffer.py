@@ -91,6 +91,13 @@ ANCHOR_ENERGY_CURRENCY = 'e_anchor'
 #: drift statistic, which is why `replay/policy_drift_covered_frac` read 0.84 and
 #: nothing said why. ORIGIN_ROLLOUT is the default because it is the ordinary
 #: admission; the two others are passed explicitly by their call sites.
+#: Leg count of the replay buffer's per-row terminal force column (`force_legs`,
+#: [n, N_FORCE_LEGS, dim]): the gradient of each reward leg's log-reward
+#: contribution at the stored terminal, in the order MolecularCrystal.REWARD_LEGS
+#: documents (flow, phys, bound). gflownet_losses.remix_force_legs composes the
+#: row's d log R / d x_T at the CURRENT lambda from them.
+N_FORCE_LEGS = 3
+
 ORIGIN_ROLLOUT = 0     # the fused/fwd train step's own forward rollout
 ORIGIN_EVAL = 1        # evaluation()'s EMA-model rollout on the eval_T grid
 ORIGIN_BOOTSTRAP = 2   # bootstrap_z_by_rollout and any init/seed admission
@@ -295,6 +302,7 @@ class CrystalBuffer:
             birth_log_pf: Optional[torch.Tensor] = None,
             is_val: Optional[torch.Tensor] = None,
             origin: Optional[torch.Tensor] = None,
+            force_legs: Optional[torch.Tensor] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -360,6 +368,23 @@ class CrystalBuffer:
                 f"traj has {traj.shape[0]} entries, expected {n} to match dataset size"
             traj = traj.detach().to(device).contiguous()
         self.traj = traj
+        # Per-row TERMINAL FORCE LEGS, recorded at admission ([n, N_FORCE_LEGS,
+        # dim]: per reward leg d(leg's log-reward contribution) / d x_T; NaN =
+        # none recorded, e.g. rows admitted while the replay loss used no force).
+        # Consumed by replay_loss_coeffs.stored_force_k, which re-mixes the legs
+        # at the current lambda (gflownet_losses.remix_force_legs), differentiates
+        # the stored last step(s) through the noise implied by the stored states
+        # and pushes x_T along the result -- no energy call at replay time. Lives
+        # beside traj and follows it through add / purge / state_dict.
+        self.force_legs = None
+        if traj is not None:
+            self.force_legs = torch.full((n, N_FORCE_LEGS, traj.shape[-1]), float('nan'),
+                                         dtype=torch.float32, device=device)
+            if force_legs is not None:
+                force_legs = torch.as_tensor(force_legs).detach().to(device).float()
+                assert force_legs.shape == self.force_legs.shape, \
+                    f"force_legs has shape {tuple(force_legs.shape)}, expected {tuple(self.force_legs.shape)}"
+                self.force_legs = force_legs.contiguous()
 
     @staticmethod
     def _seed_column(value, n, default, dtype):
@@ -414,6 +439,8 @@ class CrystalBuffer:
             'ema_logw_sq': self.ema_logw_sq.cpu(),
             'ema_log_z_emp': self.ema_log_z_emp.cpu(),
             'traj': self.traj.cpu() if self.traj is not None else None,
+            'force_legs': (self.force_legs.cpu()
+                           if getattr(self, 'force_legs', None) is not None else None),
         }
 
     @classmethod
@@ -470,8 +497,41 @@ class CrystalBuffer:
         obj.ema_logw_sq = state['ema_logw_sq'].cpu()
         obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
         obj.traj = state['traj'].to(device) if state['traj'] is not None else None
+        # sidecars written before the force column carry no 'force_legs': every
+        # row reads as "no force recorded" (NaN) and stored_force_k skips it. A
+        # sidecar from the single-column era (key 'force', [n, dim], the total
+        # at its admission lambda) cannot be split into legs, so it reads the
+        # same way -- said out loud, since such a buffer then covers 0 rows until
+        # it has turned over.
+        obj.force_legs = None
+        if obj.traj is not None:
+            _f = state.get('force_legs')
+            if _f is not None:
+                _f = _f.to(device).float()
+                if _f.shape != (obj.traj.shape[0], N_FORCE_LEGS, obj.traj.shape[-1]):
+                    raise ValueError(
+                        f"sidecar force_legs has shape {tuple(_f.shape)}, expected "
+                        f"{(obj.traj.shape[0], N_FORCE_LEGS, obj.traj.shape[-1])}")
+                obj.force_legs = _f
+            else:
+                if state.get('force') is not None:
+                    print("buffer restore: sidecar carries the retired single-column 'force' "
+                          f"({tuple(state['force'].shape)}); it cannot be re-mixed per leg, so "
+                          "every restored row reads as 'no force recorded' until replaced",
+                          flush=True)
+                obj.force_legs = torch.full((obj.traj.shape[0], N_FORCE_LEGS, obj.traj.shape[-1]),
+                                            float('nan'), dtype=torch.float32, device=device)
         obj._refuse_unknown_currency(state)
         return obj
+
+    def force_legs_at(self, inds):
+        """[k, N_FORCE_LEGS, dim] terminal force legs for row indices `inds`
+        (NaN rows = none recorded), or None when this buffer stores no
+        trajectories."""
+        f = getattr(self, 'force_legs', None)
+        if f is None:
+            return None
+        return f[torch.as_tensor(inds, device=self.device, dtype=torch.long)]
 
     def stored_lj_coeff(self, context: str = 'buffer'):
         """The one coefficient every resident crystal row is stamped with, or
@@ -1242,9 +1302,15 @@ class CrystalBuffer:
     def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None,
             birth_step: int = 0, birth_log_pf: Optional[torch.Tensor] = None,
             is_val: Optional[torch.Tensor] = None,
-            origin: Optional[torch.Tensor] = None):
+            origin: Optional[torch.Tensor] = None,
+            force_legs: Optional[torch.Tensor] = None):
         """
         Append new graphs.
+
+        force_legs, if given, is a [k, N_FORCE_LEGS, dim] tensor of per-leg
+        terminal forces aligned with the k new graphs (NaN rows allowed).
+        Omitted = NaN for the k new rows. Only stored when this buffer stores
+        trajectories.
 
         Accepts either a list[Data] or an already-collated Batch. No data_list
         round trip if a Batch is provided.
@@ -1310,6 +1376,22 @@ class CrystalBuffer:
                 f"traj has {traj.shape[0]} entries, expected {new_batch.num_graphs} to match added batch size"
             new_traj_full = torch.cat([self.traj, traj.detach().to(self.device)], dim=0)
 
+        new_force_full = None
+        if self.traj is not None:
+            _shape = (N_FORCE_LEGS, self.traj.shape[-1])
+            _old_force = getattr(self, 'force_legs', None)
+            if _old_force is None:
+                _old_force = torch.full((self.traj.shape[0],) + _shape, float('nan'),
+                                        dtype=torch.float32, device=self.device)
+            if force_legs is None:
+                _new_force = torch.full((new_batch.num_graphs,) + _shape, float('nan'),
+                                        dtype=torch.float32, device=self.device)
+            else:
+                _new_force = torch.as_tensor(force_legs).detach().to(self.device).float()
+                assert _new_force.shape == (new_batch.num_graphs,) + _shape, \
+                    f"force_legs has shape {tuple(_new_force.shape)}, expected {(new_batch.num_graphs,) + _shape}"
+            new_force_full = torch.cat([_old_force, _new_force], dim=0)
+
         k = new_batch.num_graphs
         if init_loss is None:
             new_ema_loss = torch.full((k,), float("nan"), dtype=self.ema_loss.dtype)
@@ -1344,6 +1426,8 @@ class CrystalBuffer:
             self.y = new_y_full
         if new_traj_full is not None:
             self.traj = new_traj_full
+        if new_force_full is not None:
+            self.force_legs = new_force_full
         self.ema_loss = new_ema_loss_full
         self.select_counts = new_select_counts_full
         self.birth_step = new_birth_step_full
@@ -1396,6 +1480,8 @@ class CrystalBuffer:
         new_x = self.x[keep_t].contiguous()
         new_y = self.y[keep_t].contiguous() if self.y is not None else None
         new_traj = self.traj[keep_t].contiguous() if self.traj is not None else None
+        new_force = (self.force_legs[keep_t].contiguous()
+                     if getattr(self, 'force_legs', None) is not None else None)
 
         keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
         new_ema_loss = self.ema_loss[keep_cpu]
@@ -1415,6 +1501,8 @@ class CrystalBuffer:
             self.y = new_y
         if new_traj is not None:
             self.traj = new_traj
+        if new_force is not None:
+            self.force_legs = new_force
         self.ema_loss = new_ema_loss
         self.select_counts = new_select_counts
         self.birth_step = new_birth_step

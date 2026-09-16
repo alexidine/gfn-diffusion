@@ -35,7 +35,7 @@ for p in (_here, os.path.dirname(_here),
         sys.path.insert(0, p)
 
 from energy_sampling.buffer import (  # noqa: E402
-    ORIGIN_BOOTSTRAP, ORIGIN_EVAL, ORIGIN_NAMES, ORIGIN_ROLLOUT,
+    N_FORCE_LEGS, ORIGIN_BOOTSTRAP, ORIGIN_EVAL, ORIGIN_NAMES, ORIGIN_ROLLOUT,
     BufferColumnError, CrystalBuffer)
 
 _spec = importlib.util.spec_from_file_location(
@@ -193,6 +193,66 @@ def test_origin_survives_add_and_purge_by_marker():
         [ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_EVAL], dtype=torch.int8))
     # the trajectory names its own row, so this pins origin to the SAME rows
     assert torch.allclose(buf.traj[:, 0, 0], torch.tensor([1.0, 2.0, 5.0]))
+
+
+# ---------------------------------------------------------------- force legs
+
+def _legs(n, offset=0):
+    """[n, N_FORCE_LEGS, dim] legs whose every entry names its own row."""
+    return (torch.arange(offset, offset + n, dtype=torch.float32)[:, None, None]
+            .expand(n, N_FORCE_LEGS, TRAJ_DIM).contiguous())
+
+
+def test_force_legs_default_to_nan_and_follow_add_purge_and_pickle_by_marker():
+    buf = _buffer(4)
+    assert buf.force_legs.shape == (4, N_FORCE_LEGS, TRAJ_DIM)
+    assert torch.isnan(buf.force_legs).all(), 'no force recorded = NaN, never 0'
+    buf = CrystalBuffer(_built(4), device=CPU, y_fn='elj', traj=_traj(4),
+                        init_loss=torch.ones(4), birth_step=0, force_legs=_legs(4))
+    buf.add(_built(2, seed=1), traj=_traj(2, offset=4), init_loss=torch.ones(2))   # legs omitted
+    buf.add(_built(2, seed=2), traj=_traj(2, offset=6), init_loss=torch.ones(2),
+            force_legs=_legs(2, offset=6))
+    assert torch.isnan(buf.force_legs[4:6]).all()
+    assert torch.allclose(buf.force_legs[[0, 1, 2, 3, 6, 7], 0, 0],
+                          torch.tensor([0.0, 1.0, 2.0, 3.0, 6.0, 7.0]))
+    buf.purge_by_index([0, 2, 5])
+    # BY MARKER against the trajectory, which names its own row
+    assert torch.allclose(buf.traj[:, 0, 0], torch.tensor([1.0, 3.0, 4.0, 6.0, 7.0]))
+    assert torch.allclose(buf.force_legs[[0, 1, 3, 4], 0, 0], torch.tensor([1.0, 3.0, 6.0, 7.0]))
+    assert torch.isnan(buf.force_legs[2]).all()
+    back = CrystalBuffer.from_state_dict(_pickle_round_trip(buf.state_dict()), device=CPU)
+    assert back.force_legs.shape == buf.force_legs.shape
+    assert torch.equal(torch.isnan(back.force_legs), torch.isnan(buf.force_legs))
+    ok = ~torch.isnan(buf.force_legs)
+    assert torch.equal(back.force_legs[ok], buf.force_legs[ok])
+    assert torch.equal(back.force_legs_at([1, 4]), buf.force_legs[[1, 4]])
+    with pytest.raises(AssertionError, match='force_legs'):
+        buf.add(_built(1, seed=3), traj=_traj(1), init_loss=torch.ones(1),
+                force_legs=torch.zeros(1, TRAJ_DIM))      # the retired single-column shape
+
+
+def test_a_sidecar_without_force_legs_restores_as_none_recorded(capsys):
+    """Pre-column sidecars and single-column ('force') sidecars both read as
+    NaN; the single-column case says so, since it covers 0 rows until turnover."""
+    state = _pickle_round_trip(_buffer(4).state_dict())
+    state.pop('force_legs')
+    back = CrystalBuffer.from_state_dict(state, device=CPU)
+    assert back.force_legs.shape == (4, N_FORCE_LEGS, TRAJ_DIM) and torch.isnan(back.force_legs).all()
+    state['force'] = torch.zeros(4, TRAJ_DIM)
+    back = CrystalBuffer.from_state_dict(state, device=CPU)
+    assert torch.isnan(back.force_legs).all()
+    assert "retired single-column 'force'" in capsys.readouterr().out
+    state.pop('force')
+    state['force_legs'] = torch.zeros(4, TRAJ_DIM)
+    with pytest.raises(ValueError, match='force_legs'):
+        CrystalBuffer.from_state_dict(state, device=CPU)
+
+
+def test_a_traj_free_store_carries_no_force_legs():
+    buf = _buffer(4, with_traj=False)
+    assert buf.force_legs is None and buf.force_legs_at([0]) is None
+    back = CrystalBuffer.from_state_dict(_pickle_round_trip(buf.state_dict()), device=CPU)
+    assert back.force_legs is None
 
 
 # ----------------------------------------------------------------- the draw

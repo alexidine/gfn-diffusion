@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.utils import collate_data_list
+from buffer import N_FORCE_LEGS
 from utils import compute_sample_overlap
 
 
@@ -122,6 +123,120 @@ def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, 
     return crystal_batch, log_r
 
 
+FORCE_LEG_NAMES = ('flow', 'phys', 'bound')   # = MolecularCrystal.REWARD_LEGS
+
+
+def remix_force_legs(legs, lam: float):
+    """[B, dim] d log R / d x_T at mixing weight `lam`, composed from stored
+    force legs [B, N_FORCE_LEGS, dim] (flow, phys, bound; each the gradient of
+    that leg's log-reward contribution, see terminal_force_legs). A NaN row
+    stays NaN (the consumer masks it). Endpoints are taken EXACTLY, as
+    generator_energy takes them: at lam = 0 the physical leg is never read
+    (on a clashed row it is a zeroed non-finite gradient), at lam = 1 the
+    flow leg is never read -- so a flow-free run (flow leg 0, lam 1) gets
+    phys + bound, bitwise the single-column force it stored before."""
+    if legs.dim() != 3 or legs.shape[1] != N_FORCE_LEGS:
+        raise ValueError(f"force legs must be [B, {N_FORCE_LEGS}, dim], got {tuple(legs.shape)}")
+    flow, phys, bound = legs[:, 0], legs[:, 1], legs[:, 2]
+    lam = float(lam)
+    if lam == 0.0:
+        mixed = flow
+    elif lam == 1.0:
+        mixed = phys
+    else:
+        mixed = (1.0 - lam) * flow + lam * phys
+    return mixed + bound
+
+
+def terminal_force_legs(log_T_tensor, energy_function, mol_batch, states):
+    """Per-leg d log R / d x_T at the rollout's terminal, [B, N_FORCE_LEGS, dim]
+    in FORCE_LEG_NAMES order, for the replay buffer's force_legs column
+    (replay_loss_coeffs.stored_force_k). One extra reward call with the
+    terminal as a leaf; the legs are captured from generator_energy
+    (energy_function.capture_reward_legs, energy units) and each leg's
+    log-reward contribution -leg / T is differentiated on its own, so a stored
+    row can be re-mixed at any later lambda (remix_force_legs) without an
+    energy call. An energy without legs (the toys) yields (0, 0, total): the
+    bounding slot carries weight 1 at EVERY lambda, so it remixes to the total
+    everywhere (the physical slot would vanish at lambda = 0).
+
+    Sanitised with nan_to_num PER LEG (a clashed ELJ row has a non-finite
+    physical force and a finite flow force, and the flow leg must survive for
+    the lambda = 0 endpoint) and the sanitised fraction reported per leg, so
+    the filter is never invisible. The norm stats are of the force at the
+    energy function's CURRENT lambda. Returns (legs detached, stats)."""
+    x_T = (states[:, -1] if states.dim() == 3 else states).detach().clone().requires_grad_(True)
+    capture = getattr(energy_function, 'capture_reward_legs', None)
+    with torch.enable_grad():
+        if capture is None:
+            log_r = energy_function.log_reward(x_T, mol_batch, log_T_tensor, False, keep_grads=True)
+            scalars = [None, None, log_r]
+        else:
+            with capture() as captured:
+                energy_function.log_reward(x_T, mol_batch, log_T_tensor, False, keep_grads=True)
+            if not captured:
+                raise RuntimeError("terminal_force_legs: the reward call captured no legs "
+                                   "(generator_energy did not run under capture_reward_legs)")
+            legs_e = torch.cat(captured, dim=0)                       # [B, 3], energy units
+            if legs_e.shape != (x_T.shape[0], N_FORCE_LEGS):
+                raise RuntimeError(f"terminal_force_legs: captured legs {tuple(legs_e.shape)} do not "
+                                   f"pair with the {x_T.shape[0]} terminals")
+            # energy() divides the total by 10 ** log_T; the legs are captured
+            # before that, so divide here -- the flow leg is flow.energy * T and
+            # comes out temperature-free, the physical and bounding legs temper
+            T = (10.0 ** log_T_tensor.to(legs_e.device).float()).reshape(-1)
+            if T.shape[0] != legs_e.shape[0]:
+                raise RuntimeError(f"terminal_force_legs: {T.shape[0]} temperatures for "
+                                   f"{legs_e.shape[0]} rows")
+            legs_logr = -legs_e / T.unsqueeze(-1)
+            scalars = [legs_logr[:, i] for i in range(N_FORCE_LEGS)]
+        grads = []
+        for s in scalars:
+            if s is None or not s.requires_grad:
+                grads.append(torch.zeros_like(x_T))
+                continue
+            g = torch.autograd.grad(s.sum(), x_T, retain_graph=True, allow_unused=True)[0]
+            grads.append(torch.zeros_like(x_T) if g is None else g)
+    legs = torch.stack(grads, dim=1).detach()                        # [B, 3, dim]
+    finite = torch.isfinite(legs).all(-1)                            # [B, 3]
+    legs = torch.nan_to_num(legs, nan=0.0, posinf=0.0, neginf=0.0)
+    lam = float(getattr(energy_function, 'lambda_mix', 1.0))
+    norms = remix_force_legs(legs, lam).norm(dim=-1)
+    stats = {'force/nonfinite_frac': (~finite.all(-1)).float().mean(),
+             'force/norm_mean': norms.mean(), 'force/norm_max': norms.max()}
+    for i, name in enumerate(FORCE_LEG_NAMES):
+        stats[f'force/nonfinite_frac_{name}'] = (~finite[:, i]).float().mean()
+    return legs, stats
+
+
+def arm_reward_grad_hook(log_r, clip: float, prefix: str):
+    """SANITISE d loss / d log R AT THE SOURCE, ALWAYS, and REPORT what was
+    sanitised. The one arm that ever ran reward_grads (qm9c_lgp_fpg, 2026-08-28)
+    aborted on 50 consecutive non-finite gradients from its first step: a
+    clashed ELJ sample has a NaN d log R / d x_T and `clamp` passes NaN straight
+    through. nan_to_num turns that row's reward gradient into zero (a dropped
+    row, not a poisoned batch) and {prefix}/nonfinite_frac says how many rows
+    were dropped, so the filter can never be invisible. The clip is optional
+    (0 = off) and applies AFTER sanitising. Returns the stats dict the hook
+    fills in during backward (detached scalars)."""
+    stats = {}
+
+    def _hook(g, _c=float(clip), _st=stats, _p=prefix):
+        finite = torch.isfinite(g)
+        _st[f'{_p}/nonfinite_frac'] = (~finite).float().mean()
+        g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+        ga = g.abs()
+        _st[f'{_p}/abs_mean'] = ga.mean()
+        _st[f'{_p}/abs_max'] = ga.max()
+        if _c > 0:
+            _st[f'{_p}/clipped_frac'] = (ga > _c).float().mean()
+            g = g.clamp(-_c, _c)
+        return g
+
+    log_r.register_hook(_hook)
+    return stats
+
+
 def soft_clip(x, cutoff):
     abs_x = x.abs()
     sign_x = x.sign()
@@ -211,6 +326,26 @@ def get_gfn_forward_loss(loss_coeffs,
 
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
+    _path_k = int(getattr(loss_coeffs, 'path_grad_last_k', 0) or 0)
+    _path_live = loss_coeffs.traj_grads != 0 or _path_k > 0
+    # PATH-GRADIENT DIAGNOSTIC. When any rollout step is live, record the
+    # per-step ||dL/dx_{i+1}|| (batch mean) as it flows back through the
+    # reparameterised chain. Consumed by train.py's ten-step report as
+    # pathgrad/state_grad_step{i}; a growing norm toward EARLIER steps is the
+    # Jacobian product doing what the old 'very destabilizing' verdict only
+    # inferred. Stashed on the model, the same pattern as _live_fwd: the hook
+    # fires in backward, after loss_dict is built.
+    if _path_live and report_losses:
+        _stats = {}
+
+        def _state_grad_hook(i, g, _stats=_stats):
+            gn = torch.linalg.vector_norm(g.detach(), dim=-1)
+            _stats[f'pathgrad/state_grad_step{i}'] = gn.mean()
+            _stats[f'pathgrad/state_grad_max_step{i}'] = gn.max()
+
+        gfn._path_grad_stats = _stats
+    else:
+        _state_grad_hook = None
     (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
                                                             discretizer,
                                                             exploration_std,
@@ -219,8 +354,8 @@ def get_gfn_forward_loss(loss_coeffs,
                                                             detach_traj=loss_coeffs.traj_grads == 0,
                                                             return_gauss_params=False,
                                                             freeze_policy=freeze_policy,
-                                                            path_grad_last_k=getattr(
-                                                                loss_coeffs, 'path_grad_last_k', 0),
+                                                            path_grad_last_k=_path_k,
+                                                            state_grad_hook=_state_grad_hook,
                                                             )
     log_Z_learned = log_flow[:, 0]
 
@@ -242,8 +377,10 @@ def get_gfn_forward_loss(loss_coeffs,
     # path. Clipping at the source keeps a clashed sample's contribution
     # bounded without silencing the rest of the batch.
     _rg_clip = float(getattr(loss_coeffs, 'reward_grad_clip', 0) or 0)
-    if _rg_clip > 0 and log_r.requires_grad:
-        log_r.register_hook(lambda g: g.clamp(-_rg_clip, _rg_clip))
+    if log_r.requires_grad:
+        _rg_stats = arm_reward_grad_hook(log_r, _rg_clip, 'rewardgrad')
+        if report_losses:
+            gfn._reward_grad_stats = _rg_stats
     log_flow[:, -1] = log_r
 
     log_pf = log_pfs.sum(-1)
@@ -415,7 +552,10 @@ def get_gfn_forward_loss(loss_coeffs,
                      'log_pb': log_pb.detach(),
                      'log_Z': log_Z_learned.detach(),
                      'log_r': log_r.detach(),
-                     'flow_states': states.detach()}
+                     'flow_states': states.detach(),
+                     # the drawn temperatures, so replay admission can score the
+                     # terminal force of exactly the rows it admits
+                     'log_T_tensor': log_T_tensor.detach()}
         # log w = log_r + log_pb - log_pf, logged component-wise so the fwd/bwd
         # LEVEL GAP can be attributed. Without the split, a gap that closes
         # because log_pb moved (the P_B trajectory-KL channel, which moves no
@@ -472,6 +612,8 @@ def get_gfn_backward_loss(loss_coeffs,
                           mode_level_stream: Optional[str] = None,
                           sample_weights: Optional[torch.Tensor] = None,
                           live_stash: Optional[str] = 'bwd',
+                          log_reward_fn=None,
+                          log_T_tensor=None,
                           ):
     """
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
@@ -495,12 +637,121 @@ def get_gfn_backward_loss(loss_coeffs,
     freeze_policy = getattr(loss_coeffs, 'freeze_policy', 0) > 0.5
     freeze_z = getattr(loss_coeffs, 'freeze_z', 0) > 0.5
 
+    replay_force_stats = None
     if trajectories is not None:
         # replay a fixed trajectory (e.g. from a buffer) instead of resampling one
+        _rk = int(getattr(loss_coeffs, 'resample_last_k', 0) or 0)
+        _sk = int(getattr(loss_coeffs, 'stored_force_k', 0) or 0)
+        if _rk > 0 and _sk > 0:
+            raise ValueError("replay_loss_coeffs.resample_last_k and stored_force_k are mutually exclusive")
+        _sf_mode = str(getattr(loss_coeffs, 'stored_force_mode', 'implied') or 'implied')
+        if _sf_mode not in ('implied', 'mean'):
+            raise ValueError(f"replay_loss_coeffs.stored_force_mode must be 'implied' or 'mean', got {_sf_mode!r}")
+        if _sf_mode == 'mean' and _sk > 1:
+            raise ValueError("stored_force_mode 'mean' is a last-step-only surrogate: stored_force_k must be 1")
+        _implied_k = _sk if _sf_mode == 'implied' else 0
+        _hook = None
+        _prefix = 'replayforce' if _rk > 0 else 'storedforce'
+        if (_rk > 0 or _sk > 0) and report_losses and live_stash == 'replay':
+            replay_force_stats = {}
+
+            def _hook(i, g, _st=replay_force_stats, _p=_prefix):
+                gn = torch.linalg.vector_norm(g.detach(), dim=-1)
+                _st[f'{_p}/state_grad_step{i}'] = gn.mean()
+                _st[f'{_p}/state_grad_max_step{i}'] = gn.max()
+
         states, log_pfs, log_pbs, log_flow = gfn.get_traj_replay(
             trajectories, discretizer, condition, mol_batch,
             return_gauss_params=False, freeze_policy=freeze_policy,
-            scramble_condition_tiles=scramble_condition_tiles)
+            scramble_condition_tiles=scramble_condition_tiles,
+            resample_last_k=_rk, state_grad_hook=_hook, implied_noise_last_k=_implied_k)
+        if _sk > 0:
+            # THE STORED-FORCE PATH GRADIENT (replay_loss_coeffs.stored_force_k).
+            # The last k stored steps were re-propagated through their implied
+            # noise, so states[:, -1] EQUALS the stored terminal and carries
+            # d x_T / d theta. The residual keeps the STORED log R exactly; the
+            # zero-valued surrogate below adds F . d x_T/d theta to its gradient,
+            # F being d log R / d x_T at the CURRENT lambda, re-mixed by the draw
+            # from the legs recorded at admission (buffer force_legs column,
+            # NaN = none recorded -> that row gets no path term). No energy call.
+            # log_r carries the surrogate from here on, so the live stash below
+            # hands it to the pooled VarGrad term as well.
+            _F = getattr(mol_batch, 'replay_force', None)
+            if _F is None:
+                raise ValueError("stored_force_k > 0 needs mol_batch.replay_force from the replay "
+                                 "draw (train.py _finish_replay_draw re-mixes the buffer's "
+                                 "force_legs column; admissions record it whenever "
+                                 "stored_force_k > 0)")
+            _F = _F.to(gfn.device)
+            _mask = torch.isfinite(_F).all(-1)
+            _F = torch.nan_to_num(_F) * _mask.unsqueeze(-1).float()
+            _xT = states[:, -1]
+            if _sf_mode == 'mean':
+                # MEAN-ONLY: fixed replay (no implied tail), the force acts on
+                # dt * mu_theta(x_{T-1}) alone. No eps* anywhere, so nothing is
+                # weighted by an off-distribution noise; the density terms are
+                # untouched (pure density route, as on a stock replay row).
+                _shift = gfn.last_step_mean_shift(trajectories, discretizer, condition, mol_batch,
+                                                  freeze_policy=freeze_policy)
+                log_r = log_r + (_F.detach() * (_shift - _shift.detach())).sum(-1)
+            else:
+                log_r = log_r + (_F.detach() * (_xT - _xT.detach())).sum(-1)
+            if replay_force_stats is not None:
+                with torch.no_grad():
+                    replay_force_stats['storedforce/covered_frac'] = _mask.float().mean()
+                    replay_force_stats['storedforce/recon_err_max'] = gfn._wrap_ang(
+                        _xT.detach() - trajectories[:, -1]).abs().max()
+                    replay_force_stats['storedforce/force_norm_mean'] = _F.norm(dim=-1).mean()
+                    # implied-noise magnitude on the LAST step: 1.0 = on-distribution,
+                    # rising = the stored tail is stale under the current policy
+                    _e2 = getattr(gfn, '_last_implied_eps_sq', None)
+                    if _e2 is not None:
+                        replay_force_stats['storedforce/implied_eps_rms'] = _e2.mean().sqrt()
+                        replay_force_stats['storedforce/implied_eps_rms_max'] = _e2.max().sqrt()
+        if _rk > 0:
+            # THE OFF-POLICY LAST-STEP REWARD GRADIENT (replay_loss_coeffs
+            # .resample_last_k + reward_grads). The stored reward belongs to the
+            # stored terminal; the tail was re-sampled live, so the reward is
+            # re-scored on the fresh terminal with the energy function -- an
+            # energy call per replay step, which is the LIVE form of the term.
+            # (The production form on an MLIP route stores d log R / d x_T at
+            # admission and linearises; replayforce/lin_err below measures how
+            # good that linearisation would have been, using the gradient at
+            # the fresh terminal.) With reward_grads the sanitised
+            # d loss / d log R flows into the policy through the live tail.
+            if log_reward_fn is None or log_T_tensor is None:
+                raise ValueError("replay_loss_coeffs.resample_last_k > 0 needs the caller to "
+                                 "pass log_reward_fn and log_T_tensor (replay_train_step)")
+            _rg = float(getattr(loss_coeffs, 'reward_grads', 0) or 0) != 0
+            log_r_stored = log_r
+            _, log_r = get_loss_reward(log_T_tensor.to(gfn.device), log_reward_fn, mol_batch,
+                                       False, states, no_grad=not _rg)
+            if log_r.requires_grad:
+                _st = arm_reward_grad_hook(
+                    log_r, float(getattr(loss_coeffs, 'reward_grad_clip', 0) or 0),
+                    'replayforce/rewardgrad')
+                if replay_force_stats is not None:
+                    replay_force_stats.update(_st)
+            if replay_force_stats is not None:
+                with torch.no_grad():
+                    dl = (log_r.detach() - log_r_stored.detach())
+                    replay_force_stats['replayforce/dlogr_mean'] = dl.mean()
+                    replay_force_stats['replayforce/dlogr_abs_mean'] = dl.abs().mean()
+                    delta = gfn._wrap_ang(states[:, -1].detach() - trajectories[:, -1].detach())
+                    replay_force_stats['replayforce/terminal_move_rms'] = \
+                        delta.pow(2).sum(-1).sqrt().mean()
+                if log_r.requires_grad:
+                    # first-order check of the stored-force design: |dlogR - g'.delta|
+                    # with g' the gradient at the FRESH terminal
+                    g_new = torch.autograd.grad(log_r.sum(), states, retain_graph=True,
+                                                allow_unused=True)[0]
+                    if g_new is not None:
+                        g_t = torch.nan_to_num(g_new[:, -1].detach())
+                        lin = (g_t * delta).sum(-1)
+                        replay_force_stats['replayforce/lin_err_abs_mean'] = (dl - lin).abs().mean()
+                        replay_force_stats['replayforce/grad_norm_mean'] = g_t.norm(dim=-1).mean()
+        if replay_force_stats is not None:
+            gfn._replay_force_stats = replay_force_stats
     else:
         states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
             samples, discretizer, condition, mol_batch,

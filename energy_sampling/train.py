@@ -1699,6 +1699,17 @@ class Modeller:
         metrics.update(self._last_grad_norms)
         metrics['gradnorm/nonfinite_steps'] = self._grad_nonfinite
         self._grad_nonfinite = 0
+        # path-gradient / reward-gradient hook stats (gflownet_losses
+        # get_gfn_forward_loss). Written by backward hooks on the LAST reporting
+        # forward step, consume-on-read so a stale reading never repeats; absent
+        # entirely (no keys) unless the forward branch has a live path or reward
+        # gradient, which is what makes their presence a config check too.
+        for _slot in ('_path_grad_stats', '_reward_grad_stats', '_replay_force_stats',
+                      '_force_stats'):
+            _st = getattr(self.gfn_model, _slot, None)
+            if _st:
+                metrics.update({k: float(v) for k, v in _st.items()})
+                setattr(self.gfn_model, _slot, None)
         # fused-branch gradient-geometry diagnostic (grad_geometry.enabled) --
         # consume-on-read: it's computed far less often than every 10 steps,
         # so once logged it must not repeat as a stale value on later reports
@@ -1926,6 +1937,29 @@ class Modeller:
         stage transition takes effect the moment this runs."""
         for mode in ('fwd', 'bwd', 'replay'):
             setattr(self.args, f'{mode}_loss_coeffs', dict2namespace(self.protocol.coeffs(mode)))
+
+        # THE STORED-FORCE / RESAMPLED-TAIL REPLAY TERMS: refused here rather than
+        # at the first replay step, which on a rare-rollout stage is hundreds of
+        # steps in. stored_force_k needs the forward branch to RECORD forces at
+        # admission (terminal_force_legs), and the two tails are mutually exclusive.
+        _rc = self.args.replay_loss_coeffs
+        _fc = self.args.fwd_loss_coeffs
+        _sk = int(getattr(_rc, 'stored_force_k', 0) or 0)
+        _rk = int(getattr(_rc, 'resample_last_k', 0) or 0)
+        if _sk > 0 and _rk > 0:
+            raise ValueError("replay_loss_coeffs.stored_force_k and resample_last_k are mutually "
+                             "exclusive (two different last-step tails)")
+        if hasattr(_fc, 'terminal_force'):
+            raise ValueError("fwd_loss_coeffs.terminal_force is retired (2026-09-15): forces are scored "
+                             "at replay ADMISSION for the admitted rows whenever replay_loss_coeffs"
+                             ".stored_force_k > 0, on every admission path. Delete the key.")
+        if _sk > 0 and bool(getattr(self.energy_function, 'temperature_conditioning', False)):
+            raise ValueError("replay_loss_coeffs.stored_force_k > 0 with temperature_conditioning: the "
+                             "stored force legs are taken at the row's ADMISSION temperature and "
+                             "replay re-draws it. The physical leg's temperature dependence is not a "
+                             "single scale (the jacobian and reduction terms are pre-multiplied by "
+                             "T), so a per-draw rescale would be wrong. Store the legs at a "
+                             "reference T and rebuild them per draw before enabling this.")
 
         # ARMS THE LIVE-BRANCH STASH, and nothing else should.
         # get_gfn_forward_loss/get_gfn_backward_loss park their live log-weights
@@ -5203,7 +5237,8 @@ class Modeller:
                                worst_quantile=self.args.conditional_worst_quantile,
                                **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
-                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id']})
+                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id',
+                       'log_T_tensor']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
         # NB the condition-aware metrics -- 'logw_std_within' (the clean
@@ -6716,7 +6751,12 @@ class Modeller:
                                                 # the z_calibration tick stash nothing.
                                                 live_stash=('replay' if (side_effects
                                                                          and not val_rows)
-                                                            else None))
+                                                            else None),
+                                                # getattr: the stub modellers in tests/losses
+                                                # carry no energy function; the term is off there
+                                                log_reward_fn=getattr(getattr(self, 'energy_function', None),
+                                                                      'log_reward', None),
+                                                log_T_tensor=getattr(mol_batch, 'replay_log_T', None))
 
         if not side_effects:
             return loss, loss_dict
@@ -7299,8 +7339,34 @@ class Modeller:
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
-        log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
-                                                                    temperature)  # relies on the energy terms being attached to the graphs!
+        # the stored trajectory's last state is the policy's PRE-CLAMP terminal, i.e.
+        # the raw latent the forward branch scored bounding on at admission; hand it
+        # back so a stored row carries the same box penalty as a fresh one (crystal
+        # route only: the conformer energy has no bounding term and no raw_latents)
+        raw = None
+        if self.energy_function.is_crystal:
+            if traj.dim() != 3 or traj.shape[0] != mol_batch.num_graphs:
+                raise RuntimeError(f"replay re-score: stored trajectories {tuple(traj.shape)} do not "
+                                   f"pair 1:1 with the {mol_batch.num_graphs} drawn rows; bounding "
+                                   f"cannot be scored on the stored terminals")
+            raw = traj[:, -1]
+        log_reward = self.energy_function.prebuilt_sample_to_reward(
+            mol_batch, temperature, raw_latents=raw)  # relies on the energy terms being attached to the graphs!
+        # the drawn temperatures ride on the batch: the replay tail re-score
+        # (replay_loss_coeffs.resample_last_k) must use THIS draw's T, and
+        # condition_samples re-draws a fresh one on every call
+        mol_batch.replay_log_T = log_T_tensor.detach()
+        # the stored terminal force for these rows, RE-MIXED AT THE CURRENT
+        # LAMBDA from the buffer's per-leg column (force_legs; NaN = none
+        # recorded), read by replay_loss_coeffs.stored_force_k. A row admitted at
+        # one lambda therefore carries the force of the target it is scored
+        # against now -- the same lambda the log_reward above was composed at.
+        _legs_at = getattr(self.replay_buffer, 'force_legs_at', None)
+        _legs = _legs_at(inds) if _legs_at is not None else None
+        if _legs is not None:
+            from gflownet_losses import remix_force_legs
+            mol_batch.replay_force = remix_force_legs(
+                _legs.to(self.device), float(getattr(self.energy_function, 'lambda_mix', 1.0)))
         return condition, condition_id, inds, latents, log_reward, mol_batch, traj
 
     def handle_train_epoch_error(self, e, step_type):
@@ -9753,6 +9819,35 @@ class Modeller:
                 return float(pinned['replay']) > 0.0
         return True
 
+    def _replay_needs_force(self) -> bool:
+        """Does the live replay loss consume the buffer's force_legs column?"""
+        rc = getattr(self.args, 'replay_loss_coeffs', None)
+        return int(getattr(rc, 'stored_force_k', 0) or 0) > 0
+
+    def _admission_force_legs(self, fwd_stats, sample_batch, flow_states, idx):
+        """[k, N_FORCE_LEGS, dim] per-leg d log R / d x_T for the admitted rows
+        `idx` (gflownet_losses.terminal_force_legs), or None when the replay loss
+        does not use forces (the buffer then stores NaN). The reward is re-scored
+        with the terminal as a leaf on the SAME batch rows and the SAME drawn
+        temperatures the rollout used (fwd_stats['log_T_tensor']; the fixed
+        route temperature when a stats dict has none). Non-finite legs are
+        zeroed and counted (force/nonfinite_frac[_leg])."""
+        if not self._replay_needs_force() or idx.numel() == 0:
+            return None
+        from gflownet_losses import terminal_force_legs
+        idx_cpu = idx.detach().cpu()
+        rows = sample_batch.subsample_new_batch(idx_cpu).to(self.device)
+        rows.orient_molecule(mode='std')
+        log_T = fwd_stats.get('log_T_tensor')
+        if log_T is None:
+            log_T = torch.log10(torch.full((idx.numel(),), float(self.energy_function.temperature)))
+        else:
+            log_T = log_T.detach()[idx.to(log_T.device)]
+        x = flow_states[idx.to(flow_states.device)].to(self.device)
+        legs, stats = terminal_force_legs(log_T.to(self.device), self.energy_function, rows, x)
+        self.gfn_model._force_stats = stats
+        return legs.to(self.buffer_device)
+
     def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True,
                              origin: int = ORIGIN_ROLLOUT):
         """
@@ -9859,6 +9954,14 @@ class Modeller:
         elig = torch.argwhere(sane).flatten()
         # trajectories go wherever the buffer lives -- no forced D2H when GPU-resident
         flow_states = fwd_stats['flow_states'].detach().to(self.buffer_device)
+        # THE TERMINAL FORCE LEGS COLUMN, scored HERE for exactly the rows
+        # admitted, and only when the replay loss will use it (replay_loss_coeffs
+        # .stored_force_k > 0): one extra reward call with the terminal as a
+        # leaf, on the admitted rows only, on every admission path alike
+        # (training rollout, bootstrap, eval) -- like the MLIP cost itself, paid
+        # only where the loss needs it. Otherwise every row is stored NaN.
+        def _force_rows(idx):
+            return self._admission_force_legs(fwd_stats, sample_batch, flow_states, idx)
 
         # --- bootstrap ---
         if not hasattr(self, 'replay_buffer'):
@@ -9879,6 +9982,7 @@ class Modeller:
                 birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
                 is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
                 origin=int(origin),
+                force_legs=_force_rows(add_inds),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
             return
@@ -10039,6 +10143,7 @@ class Modeller:
                 birth_log_pf=(log_pf.detach().cpu()[add_inds] if on_policy else None),
                 is_val=_val_flags(add_inds.numel(), self._replay_val_frac()),
                 origin=int(origin),
+                force_legs=_force_rows(add_inds),
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
 
