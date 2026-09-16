@@ -9858,7 +9858,33 @@ class Modeller:
         else:
             log_T = log_T.detach()[idx.to(log_T.device)]
         x = flow_states[idx.to(flow_states.device)].to(self.device)
-        legs, stats = terminal_force_legs(log_T.to(self.device), self.energy_function, rows, x)
+        # CHUNKED, with the gradient taken PER CHUNK. terminal_force_legs keeps
+        # the reward graph for every row it is handed until its one autograd
+        # call, so its peak memory is the whole admitted batch: ~1.2 GB per
+        # acridine crystal on MACE, ~0.2 GB per row on UMA (measured 2026-09-16
+        # -- 16 acridine rows OOM'd an 8 GB cap). The energy function's own
+        # OOM recovery cannot help, it only chunks the forward and the graphs
+        # still accumulate. replay_loss_coeffs.force_chunk_rows bounds it.
+        chunk = int(getattr(self.args.replay_loss_coeffs, 'force_chunk_rows', 0) or 0)
+        n = x.shape[0]
+        if chunk <= 0 or chunk >= n:
+            legs, stats = terminal_force_legs(log_T.to(self.device), self.energy_function, rows, x)
+        else:
+            parts, stat_list = [], []
+            rows_cpu = rows.cpu()
+            for lo in range(0, n, chunk):
+                sl = list(range(lo, min(lo + chunk, n)))
+                r = rows_cpu.subsample_new_batch(sl).to(self.device)
+                l, st = terminal_force_legs(log_T[sl].to(self.device), self.energy_function, r, x[sl])
+                parts.append(l); stat_list.append((len(sl), st))
+                del r, l
+            legs = torch.cat(parts, dim=0)
+            # row-weighted means of the per-chunk stats; maxima as maxima
+            stats = {}
+            for k in stat_list[0][1]:
+                vals = torch.stack([st[k].float() for _, st in stat_list])
+                w = torch.tensor([float(c) for c, _ in stat_list], device=vals.device)
+                stats[k] = vals.max() if k.endswith('_max') else (vals * w).sum() / w.sum()
         self.gfn_model._force_stats = stats
         return legs.to(self.buffer_device)
 
