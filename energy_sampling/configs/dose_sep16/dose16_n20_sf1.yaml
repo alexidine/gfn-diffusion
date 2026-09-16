@@ -227,7 +227,7 @@ replay_loss_coeffs:
   beta: 10.0
   stored_force_k: 1
   stored_force_mode: implied
-  force_chunk_rows: 8
+  force_chunk_rows: 0
   resample_last_k: 0
   reward_grads: 0.0
 condition_log_z:
