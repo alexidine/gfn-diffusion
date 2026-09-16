@@ -9869,8 +9869,15 @@ class Modeller:
         # bases on a frozen arm rather than mk_dev (dose_sep16 -> prod_sep12)
         # emits no key at all, and 0 there is the whole-batch call that cannot
         # fit an MLIP. An explicit 0 still means one call.
+        # ...and the absent default is ROUTE-AWARE: on an MLIP the graph costs
+        # ~0.2-1.2 GB per row so 8; on ELJ memory is nothing and every reward
+        # call pays a fixed crystal-build overhead, so chunk 8 on 1600 rows was
+        # 200 calls and ~100 s per admission (cluster n20_sf1, 2026-09-16:
+        # energy/seconds 5.5 vs 0.22 per step, 3x the step time) -> one call.
         _fcr = getattr(self.args.replay_loss_coeffs, 'force_chunk_rows', None)
-        chunk = 8 if _fcr is None else int(_fcr)
+        if _fcr is None:
+            _fcr = 8 if getattr(self.energy_function, 'predictor', None) is not None else 0
+        chunk = int(_fcr)
         n = x.shape[0]
         if chunk <= 0 or chunk >= n:
             legs, stats = terminal_force_legs(log_T.to(self.device), self.energy_function, rows, x)
