@@ -476,6 +476,7 @@ integrator:
 #   beta              Huber beta for the TB-style losses.
 #   loss_clip         absolute ceiling on the per-row loss.
 fwd_loss_coeffs:
+  exploration_std: 0.0     # > 0: additive per-step LOG-STD on the forward SAMPLING kernel only; the scored log P_F stays the policy's own density, so the rows are off-policy (VarGrad-safe, emp_z's Z fit is then biased). 0 = on-policy draw
   tb: 0.0
   z_level: 0.0
   freeze_policy: 0.0
@@ -497,6 +498,7 @@ fwd_loss_coeffs:
   pooled_vg: 0.0          # HELD AT 0 HERE: a nonzero base flips condition_block_m 0 -> 2 in EVERY bwd stage. Turn it on in var_conditioning
   pooled_beta: 40.0       # its OWN knee, not the branch's: fwd/bwd rows sit ~lambda_b*Delta from the pooled centre. Scale with the measured zmatch/delta_mean, not once
   pooled_ratio: 0.5       # buffer share of the pooled group. 0.5 = the 50:50 design point
+  pooled_thin_by_condition: 1.0 # 1 = when the ratio thins the forward side, keep rows whose CONDITION the buffer side holds (whole pairs first); 0 = the old condition-blind randperm, which split pairs and left ~38% of rows single-source
   pooled_bridge_only: 0.0 # > 0.5 = restrict the buffer side of the draw to rows whose CONDITION the forward batch also holds. A kept row with no forward partner forms a single-source group, where the term degenerates to the backward branch's own and buys dilution instead of bridge. Read pooled_pairable_frac for the ceiling and pooled_lambda_b for what the ratio actually got
   pooled_source: fwd      # 'fwd' | 'replay': which branch's live rows pair with bwd's in the pooled term; pooled_ratio is then bwd's share against that branch. KEEP 'fwd' HERE and set 'replay' on the stage that runs the term: it is refused wherever pooled_vg is 0, where replay cannot carry weight, or with buffers.replay_buffer.prioritise.enabled. Published as pooled/pooled_source_replay
 bwd_loss_coeffs:
@@ -1052,28 +1054,33 @@ protocols:
           #   post-anneal  the rules ARE evaluated (their running bests follow
           #                the new lambda's level) but the clean streak is held
           #                at 0
-          # So events are at least 1000 + (anneal_patience - 1) ticks apart, and
-          # the 31 events from 0.001 to 1.0 at rate 0.8 take >= ~32k steps.
+          # So events are at least 2000 + (anneal_patience - 1) ticks apart; the
+          # 10 events from 0.001 to 1.0 at rate 0.5 take >= ~20k steps, and the
+          # delta gate below holds each rung until the level gap has recovered
+          # (measured 2026-09-13: ~12-15k steps per rung at LR scale 0.2).
           # Logged as protocol/anneal_cooling and protocol/anneal_events.
-          anneal_cooldown_steps: 1000
+          anneal_cooldown_steps: 2000
           rules:
-            # PACING GATE on each branch's UNEXPLAINED fraction 1 - r2 of the
-            # target's own per-condition spread (<branch>/r2_unexplained,
-            # quick_tb_stats). Scale-free, so it separates "the target got
-            # harder" (spread rises, r2 holds) from "the sampler fell behind"
-            # (r2 falls). A rule is violated when its metric exceeds `margin` x
-            # its OWN running best, a running minimum that relaxes upward by a
-            # factor (1 + drift) per balance tick (one tick per 10 train steps):
-            # at drift 0.001 the best relaxes ~5% per 500 steps, so a rung whose
-            # 1 - r2 plateaus above the pre-rung level is eventually accepted
-            # rather than welding the anneal shut. Written on the same cadence
-            # as logw_std_within (fwd on rollout steps, bwd every 10th bwd
-            # step); if_missing: violated holds the anneal until each has been
-            # written. A violated rule's boost is the default mix, so a
-            # violation only resets the clean streak.
-            - { metric: fwd/r2_unexplained, relative: best, margin: 1.1, drift: 0.001,
+            # PACING GATE on the LEVEL GAP delta = J_B - J_F between the
+            # anchor-supported backward rows and the sampler's own rows
+            # (gates/delta_mean, gates/delta_worst: published every report by
+            # the condition log-Z tracker, +inf = missing until enough
+            # conditions are characterised). delta is the terminal mass deficit
+            # plus non-negative KL terms, exactly 0 at the fixed point, and it is
+            # the only logged quantity that sees mass MISSING from a basin; the
+            # on-policy fit channels (1 - r2, logw_std_within) cannot, and their
+            # level rises with lambda even when the sampler is keeping up. A rule
+            # is violated when its metric exceeds `margin` x its OWN running
+            # best (a running minimum). drift is 0: the best never relaxes, so a
+            # rung is accepted only when the gap is back within the margin of
+            # the best level ever reached -- the 2026-09-12 ladder advanced on a
+            # timer because a 0.001 drift relaxed the best faster than a rung
+            # could recover. if_missing: violated holds while delta is +inf. A
+            # violated rule's boost is the default mix, so a violation only
+            # resets the clean streak.
+            - { metric: gates/delta_mean, relative: best, margin: 1.05, drift: 0.0,
                 if_missing: violated, boost: { replay: 0.5, bwd: 0.5 } }
-            - { metric: bwd/r2_unexplained, relative: best, margin: 1.1, drift: 0.001,
+            - { metric: gates/delta_worst, relative: best, margin: 1.1, drift: 0.0,
                 if_missing: violated, boost: { replay: 0.5, bwd: 0.5 } }
           # THE ANNEAL. Fires once every rule above has been clean for
           # controller.anneal_patience ticks outside the cooldown, and is strictly
@@ -1081,14 +1088,16 @@ protocols:
           # ⚠ IT CANNOT LEAVE EXACTLY 0 -- a lambda run must start at a small
           # POSITIVE lambda_mix, and low enough that the physical leg is a small
           # fraction of the flow leg's spread, or the early rungs buy nothing.
-          # `rate` is the GRANULARITY of one event (x1/rate = x1.25, so 31 events
+          # `rate` is the GRANULARITY of one event (x1/rate = x2, so 10 events
           # from 0.001 to 1.0); the rules above supply the actual pacing. A step
           # of d(lambda) injects ~d(lambda) x sigma_Delta of within-condition
           # spread (sigma_Delta ~155 nats at lambda 0); the settled spread itself
           # scales ~lambda x sigma_Delta once above the lambda-0 floor, so a
           # fixed ratio is a roughly constant RELATIVE injection along the path.
+          # x2 rather than x1.25 because each rung costs a ~10k-step recovery
+          # whatever its size (2026-09-13), so fewer, larger rungs are cheaper.
           anneal_coeffs:
-            lambda_mix: { target: 1.0, rate: 0.8 }
+            lambda_mix: { target: 1.0, rate: 0.5 }
 #        exit: # no exit condition, this is the terminal phase
 #          - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
 #          - { metric: bwd/logw_std_within, below: 3.0, patience: 5 }
@@ -1256,6 +1265,7 @@ energy_config:
   reduction_coeff: 10.0
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
+  physical_energy_clip: null # absolute crystal-energy cutoff above which the PHYSICAL leg is log-compressed (cutoff + log1p). Valid under lambda mixing (the flow leg is untouched); reward_range is not. Logs physical_clip_active_frac
   analyze_kwargs: { }  # elj: none
   # MLIP EXECUTION, uma route only; all three are the behaviour every run has had.
   mlip_compile: false            # torch.compile the MLIP. Needs mlip_edge_chunk_size set, or every distinct edge count is a recompile and dynamo silently falls back to eager. Unconditional/single-molecule arms only: a molecule-conditioned run makes atoms-per-batch dynamic too, which edge padding cannot fix. Changes float summation order, so energies move at ULP level

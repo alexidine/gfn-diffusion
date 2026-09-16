@@ -83,6 +83,7 @@ class MolecularCrystal(BaseSet):
                  z_primes: Tuple[int] = (1,),
                  mlip_path: Optional[str] = None,
                  reward_range: float = None,
+                 physical_energy_clip: float = None,  # soft-clip (cutoff + log1p) the PHYSICAL leg's crystal energy above this ABSOLUTE value. Unlike reward_range it touches only the physical leg, so it is valid under lambda mixing (the flow leg is untouched)
                  lj_rescale: float = None,
                  pressure: float = 1,  # in atm
                  log_temperature_range: list = None,
@@ -200,6 +201,7 @@ class MolecularCrystal(BaseSet):
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
         self.reward_clip = None
+        self.physical_energy_clip = None if physical_energy_clip is None else float(physical_energy_clip)
 
         # TWO independent facts, previously conflated into one:
         #
@@ -864,7 +866,18 @@ class MolecularCrystal(BaseSet):
                 + jacobian_energy)
             bounding_total = torch.zeros_like(bounding_total)
         else:
-            physical_energy = (crystal_energy +
+            crystal_leg = crystal_energy
+            if self.physical_energy_clip is not None:
+                # PHYSICAL-LEG TAIL CLIP: log-compress crystal energies above an
+                # absolute cutoff so a sterically bad sample's reward penalty grows
+                # like log(E) instead of E under lambda mixing. Only the physical
+                # leg is rescaled, so the lambda=0 endpoint is still exactly the
+                # flow and a stored pair of legs still re-mixes by a weighted sum.
+                # `physical_clip_active_frac` says how many rows it compressed.
+                crystal_leg = log_rescale_positive(crystal_energy, self.physical_energy_clip)
+                ens_dict['physical_clip_active_frac'] = torch.full_like(
+                    crystal_energy, float((crystal_energy > self.physical_energy_clip).float().mean()))
+            physical_energy = (crystal_leg +
                                  reduction_energy * self.reduction_coeff +
                                  jacobian_energy)
 

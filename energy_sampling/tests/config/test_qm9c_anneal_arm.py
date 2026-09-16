@@ -200,8 +200,8 @@ def test_mk_devs_own_globals_refuse_the_stage_and_the_registry_global_clears_it(
 
 def test_the_batch_is_pinned_and_the_replay_cap_is_headroom_over_its_equilibrium():
     """make.py's GLOBALS note: at churn_rate 0 each manage call admits batch_size
-    rows, one call per rollout and one per eval, so occupancy is
-    batch_size x (1/fwd_rollout_every + 1/eval_period) x mean_residence_steps.
+    rows, one call per rollout (eval admission is off on this arm), so
+    occupancy is batch_size / fwd_rollout_every x mean_residence_steps.
     The cap sits at ~2x that, so the hazard sets occupancy, and the warm-up
     releases well below it. With growth off, the batch this arithmetic assumes
     is the batch that runs."""
@@ -210,9 +210,12 @@ def test_the_batch_is_pinned_and_the_replay_cap_is_headroom_over_its_equilibrium
     rb = cfg['buffers']['replay_buffer']
     assert cfg['grow_batch_size'] is False and cfg['batch_util_target'] == 0
     assert rb['churn_rate'] == 0
-    occupancy = (cfg['batch_size'] * (1 / st['fwd_rollout_every'] + 1 / cfg['eval_period'])
+    # eval-site admission is OFF on this arm (admit_from_eval false), so only
+    # the rollout call admits: batch_size / fwd_rollout_every rows per step
+    assert rb['admit_from_eval'] is False
+    occupancy = (cfg['batch_size'] * (1 / st['fwd_rollout_every'])
                  * rb['mean_residence_steps'])
-    assert occupancy == pytest.approx(72000)
+    assert occupancy == pytest.approx(60000)
     assert 2 * occupancy <= rb['max_size'] <= 2.5 * occupancy
     assert st['replay_warmup_rows'] <= occupancy / 2
 
@@ -254,7 +257,9 @@ def test_churn_zero_admits_the_live_batch_not_the_tiled_rollout():
                         replay_buffer=_Buf(5000), replay_churn=defaultdict(int),
                         replay_cohort=defaultdict(int), _replay_managed=True,
                         _last_replay_manage_step=0, replay_in_play=lambda: True,
-                        _replay_val_frac=lambda: 0.0)
+                        _replay_val_frac=lambda: 0.0,
+                        # no replay force in play: the buffer stores NaN legs
+                        _admission_force_legs=lambda *a, **k: None)
     n = batch * repeats
     stats = {'log_r': -torch.rand(n), 'log_pf': torch.zeros(n), 'log_pb': torch.zeros(n),
              'log_Z': torch.zeros(n), 'flow_states': torch.zeros(n, 21, 12)}

@@ -1,4 +1,5 @@
 """analysis and figures for the results section of the paper"""
+import os
 from copy import copy
 
 import torch
@@ -7,19 +8,55 @@ from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
     pes_cartoon, plot_dual_density_contour, combo_fig
-from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat2, clustering, clustering3
-from energy_sampling.eval.paper1_results.utils import generator_reward
+from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat2, clustering, clustering3, \
+    dmat_row_indices
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
-torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+# GPU_MEM_FRACTION overrides, e.g. 0.25 when a local training run shares the card
+torch.cuda.set_per_process_memory_fraction(float(os.environ.get('GPU_MEM_FRACTION', 0.9)), device=0)
 
 
-def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
+PAPER_FIG_DIR = r'C:\Users\mikem\OneDrive\NYU\CSD\papers\generator'
+
+
+def elj_prescale_factor(elj_results, en_scaling_factor):
+    """Factor still to apply to a results file's stored `.elj`.
+
+    new_analysis.py stamps lj_coeff before analyze(), so `.elj` is stored ALREADY
+    scaled and its results carry an 'lj_coeff' key. The June analysis.py stored the
+    raw sum and had no such key. Multiplying a pre-scaled value again is a silent
+    x0.36 (mipcas) / x0.16 (nehzor) error, and it also shifts the 15 kT filter off
+    the rows the stored dmat was built from."""
+    return 1.0 if 'lj_coeff' in elj_results else float(en_scaling_factor)
+
+
+def require_rdf_mode(uma_results, elj_results):
+    """Both runs, and the experimental references scored here, must share one RDF mode.
+
+    For a 13-atom molecule atomwise and envwise both give 91 channels, so a mismatch
+    raises nothing and simply measures the wrong distances."""
+    modes = {uma_results.get('rdf_mode'), elj_results.get('rdf_mode')}
+    assert None not in modes, (
+        "a results file carries no 'rdf_mode' (it predates new_analysis.py's rdf_mode key); "
+        "rerun the analysis so the reference RDFs can be matched to it")
+    assert len(modes) == 1, f"UMA and eLJ results use different RDF modes: {modes}"
+    return modes.pop()
+
+
+def require_log_r(results, tag):
+    assert 'log_r' in results, (
+        f"{tag} results have no 'log_r' (the exact training reward). Rerun new_analysis.py with "
+        f"`train_config` set for that run; the old generator_reward was not the training reward.")
+    return results['log_r']
+
+
+def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, out_dir=PAPER_FIG_DIR):
     uma_results = torch.load(uma_results_path, weights_only=False)
     elj_results = torch.load(elj_results_path, weights_only=False)
+    rdf_mode = require_rdf_mode(uma_results, elj_results)
 
     cut_ind = 0  # only doing one now #np.argwhere(uma_results['n_clusts'] == 4).flatten()[0]
     uma_thermos = uma_results['metrics'][cut_ind]
@@ -30,7 +67,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     ebatch = collate_data_list(exp_crystals, max_z_prime=1)
     with torch.no_grad():
         ebatch.cuda()
-        ebatch.analyze(['elj', 'uma', 'rdf'], rdf_mode='atomwise', assign_outputs=True,
+        ebatch.analyze(['elj', 'uma', 'rdf'], rdf_mode=rdf_mode, assign_outputs=True,
                        predictor=predictor)
         ebatch.cpu()
     num_polymorphs = ebatch.num_graphs
@@ -43,43 +80,20 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     """
     fig_dict = {}
     '''TB plot'''
+    # log R is the EXACT training reward written by new_analysis.py
+    # (MolecularCrystal.prebuilt_sample_to_reward), not a hand-rolled copy
     prior_data = torch.load(prior_path, weights_only=False)
-    en_scaling_factor = prior_data['thermal_scaling_factor']
-    elj_batch = elj_results['sample_batch'].clone()
-    elj_batch.elj = elj_batch.elj * en_scaling_factor
-    rewards = generator_reward(
-        elj_batch,
-        None,
-        1,
-        energy_function='elj',
-        temperature=2.5,
-        energy_clip=None
-    )
-    x = elj_results['log_pbs'] + rewards
-    y = elj_results['log_pfs'] + elj_results['learned_log_z']
-    fig_dict['elj_TB_fig'] = parity_fig(x, y,
-                                        "log(P<sub>b</sub>) + log(R)", "log(P<sub>f</sub>) + log(Z<sub>θ</sub>)",
-                                        quantile_cut=0.99)
-
-    uma_batch = uma_results['sample_batch']
-    rewards = generator_reward(
-        uma_batch,
-        None,
-        1,
-        energy_function='uma',
-        temperature=2.5,
-        energy_clip=None
-    )
-    x = uma_results['log_pbs'] + rewards
-    y = uma_results['log_pfs'] + uma_results['learned_log_z']
-    fig_dict['uma_TB_fig'] = parity_fig(x, y,
-                                        "log(P<sub>b</sub>) + log(R)", "log(P<sub>f</sub>) + log(Z<sub>θ</sub>)",
-                                        quantile_cut=0.99)
+    en_scaling_factor = elj_prescale_factor(elj_results, prior_data['thermal_scaling_factor'])
+    for tag, res in (('elj', elj_results), ('uma', uma_results)):
+        x = res['log_pbs'] + require_log_r(res, tag).to(res['log_pbs'].dtype)
+        y = res['log_pfs'] + res['learned_log_z']
+        fig_dict[f'{tag}_TB_fig'] = parity_fig(x, y,
+                                               "log(P<sub>b</sub>) + log(R)",
+                                               "log(P<sub>f</sub>) + log(Z<sub>θ</sub>)",
+                                               quantile_cut=0.99)
 
     uma_batch = uma_results['sample_batch'].clone()
     elj_batch = elj_results['sample_batch'].clone()
-    prior_data = torch.load(prior_path, weights_only=False)
-    en_scaling_factor = prior_data['thermal_scaling_factor']
     uma_en = uma_batch.uma
     elj_en = elj_batch.elj * en_scaling_factor
 
@@ -192,8 +206,12 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
 
     "save the top crystals"
     esamples = ebatch.batch_to_list()
-    samples = uma_results['sample_batch'].batch_to_list() + esamples
-    cbatch = collate_data_list([samples[ind] for ind in p_maxima])
+    # p_maxima are rows of the FILTERED set (the dmat rows); map them back to the full
+    # sample list. Indexing the full list directly exported unrelated structures
+    # whenever the energy filter had removed any sample before a maximum.
+    rows = dmat_row_indices(uma_results['sample_batch'], uma_results, 'uma')
+    samples = uma_results['sample_batch'].batch_to_list()
+    cbatch = collate_data_list([samples[int(rows[ind])] for ind in p_maxima])
     clustbatch = cbatch.mol2cluster(cutoff=2)
     mols = []
 
@@ -309,7 +327,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
                 fig.update_annotations(font_size=fs)
         style = {skey: value for skey, value in style.items() if 'annotation' not in skey}
         fig.update_layout(**style)
-        fig.write_image(rf'C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{mol_name}_{key}.png',
+        fig.write_image(os.path.join(out_dir, f'{mol_name}_{key}.png'),
                         width=fig.layout.width, height=fig.layout.height, scale=scale)
 
     aa = 1
@@ -321,12 +339,13 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
     dmat_b = elj_results['dmat'].clone()
     rdf_a = uma_batch.rdf.clone()
     rdf_b = elj_batch.rdf.clone()
-    sample_energy = uma_batch['uma']
-    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
-    rdf_a = rdf_a[good_inds]
-    sample_energy = elj_batch['elj'] * en_scaling_factor
-    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
-    rdf_b = rdf_b[good_inds]
+    # each run's rdf read through the rows ITS dmat was built from; the saved index
+    # set is used when present rather than re-deriving the 15 kT filter
+    rdf_a = rdf_a[dmat_row_indices(uma_batch, uma_results, 'uma')]
+    if 'good_ens' not in elj_results:  # legacy file: the filter needs the scaled energy
+        elj_batch = elj_batch.clone()
+        elj_batch.elj = elj_batch.elj * en_scaling_factor
+    rdf_b = rdf_b[dmat_row_indices(elj_batch, elj_results, 'elj')]
     rdf_a = rdf_a[:subsamp]
     rdf_b = rdf_b[:subsamp]
     dmat_a = dmat_a[:subsamp][:, :subsamp]
@@ -381,8 +400,10 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
                       n_jobs=-1)
     sample_embedding = umap_model.fit_transform(merged.cpu().numpy().astype(np.float32))
     import plotly.graph_objects as go
-    uma_embed = sample_embedding[:subsamp]
-    lj_embed = sample_embedding[subsamp:-ebatch.num_graphs]
+    # slice by the ACTUAL row counts: a run with fewer than `subsamp` filtered rows
+    # made [:subsamp] swallow the eLJ rows and left the eLJ slice empty
+    uma_embed = sample_embedding[:n_a]
+    lj_embed = sample_embedding[n_a:n_a + n_b]
     from scipy.stats import gaussian_kde
     def density_alpha(pts, lo=0.15, hi=0.8, log=False):
         d = gaussian_kde(pts.T)(pts.T)
@@ -426,18 +447,25 @@ if __name__ == '__main__':
     """
     load up elj distribution, uma distribution, and experimental polymorphs
     """
-    # mol_name = 'mipcas'
-    # exp_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
-    # uma_results_path = r"D:\crystal_datasets\gfn_results\mipcas_uma.pt"
-    # elj_results_path = r"D:\crystal_datasets\gfn_results\mipcas_elj.pt"
-    # prior_path = r"D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt"
-    # do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path)
-
-    mol_name = 'nehzor'
-    exp_path = r"D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt"
-    uma_results_path = r"D:\crystal_datasets\gfn_results\nehzor_uma.pt"
-    elj_results_path = r"D:\crystal_datasets\gfn_results\nehzor_elj.pt"
-    prior_path = r"D:\crystal_datasets\nehzor\nehzor_elj_prior_dataset.pt"
-    do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path)
-
-    aa = 1
+    # prod_sep12 pairs: results from new_analysis.py (make_figures: false).
+    # prior_path is the eLJ prior; its thermal_scaling_factor only matters for
+    # legacy results that stored raw .elj.
+    RES = r"D:\crystal_datasets\gfn_results"
+    PRIORS = r"D:\crystal_datasets\conditional\priors"
+    PAIRS = {
+        'mipcas': dict(exp_path=r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt",
+                       uma_results_path=os.path.join(RES, 'p12_mipu_lr0p0625_best_10k.pt'),
+                       elj_results_path=os.path.join(RES, 'p12_mip_lr1_best_10k.pt'),
+                       prior_path=os.path.join(PRIORS, 'mipcas_sg2_zp1_elj_200k_prior_dataset.pt')),
+        'nehzor': dict(exp_path=r"D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt",
+                       uma_results_path=os.path.join(RES, 'p12_nehu_lr0p125_best_10k.pt'),
+                       elj_results_path=os.path.join(RES, 'p12_neh_lr0p5_best_10k.pt'),
+                       prior_path=os.path.join(PRIORS, 'nehzor_sg14_zp1_elj_prior_dataset.pt')),
+    }
+    only = {m.strip() for m in os.environ.get('ONLY_MOL', '').split(',') if m.strip()}
+    out_dir = os.environ.get('FIG_OUT_DIR', PAPER_FIG_DIR)
+    for mol_name, paths in PAIRS.items():
+        if only and mol_name not in only:
+            continue
+        print(f"\n=== {mol_name} -> {out_dir} ===")
+        do_figs(mol_name, out_dir=out_dir, **paths)

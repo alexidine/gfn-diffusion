@@ -1522,6 +1522,13 @@ def compute_zp_order_penalty(bounding_energy, crystal_batch):
 def generator_reward(crystal_batch, raw_latents, max_z_prime,
                      energy_function, temperature,
                      energy_clip, lj_coeff=1, bounding_coeff=10, reduction_coeff=10, density_coeff=10):
+    # RETIRED 2026-09-15. A frozen copy of an old molecular_crystal reward: no
+    # change-of-measure Jacobian, and other terms have moved since. Kept only so
+    # old/old_analysis.py still imports; calling it now fails loudly.
+    raise NotImplementedError(
+        "generator_reward is retired: it is not the training reward. new_analysis.py writes the "
+        "exact reward to results['log_r'] via MolecularCrystal.prebuilt_sample_to_reward "
+        "(set `train_config` on the run).")
     ens_dict = {}
 
     latents = crystal_batch.latent_params()
@@ -2657,11 +2664,38 @@ def basin_opt(basin_minima, samples, energy_function, predictor):
     return all_outs, all_records
 
 
+def dmat_row_indices(batch, results, energy_key, kT=2.5):
+    """Indices into `batch` of the rows results['dmat'] was built from.
+
+    Every per-sample quantity that is compared against a dmat row, or indexed by
+    cluster labels / p_maxima (which ARE dmat rows), must be read through these.
+    A batch already cut to those rows maps to itself. Otherwise prefer the index
+    set the analysis saved ('good_ens'); only legacy files fall back to
+    re-deriving the energy filter, and a length mismatch is fatal because it
+    means the re-derived filter is not the one that built the matrix.
+    """
+    n_rows = results['dmat'].shape[0]
+    if batch.num_graphs == n_rows:
+        return torch.arange(n_rows)
+    if 'good_ens' in results:
+        idx = torch.as_tensor(results['good_ens']).long()
+    else:
+        e = batch[energy_key]
+        idx = (e < e.amin() + 15 * kT).argwhere().flatten()
+    assert len(idx) == n_rows, (
+        f"{energy_key} batch filters to {len(idx)} rows but its dmat has {n_rows}: the index set "
+        f"does not match the one the distance matrix was built from")
+    return idx
+
+
 def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
-                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels):
-    sample_energy = uma_batch[energy_function]
-    # good_inds = (sample_energy < (sample_energy.amin() + 15*2.5)).argwhere().flatten()
-    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
+                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels, extra_refs=None):
+    """extra_refs: structures placed on the UMAP and nowhere else (see
+    new_analysis.score_embedding_references). They enter a SEPARATE matrix used only
+    for the UMAP fit, so every density, table value and basin assignment below is
+    computed exactly as without them. Their rows land in stats['extra_refs']['inds']."""
+    # rows of the UMA dmat within uma_batch; cluster_labels and p_maxima index THESE rows
+    good_inds = dmat_row_indices(uma_batch, uma_results, energy_function)
     num_filtered_samples = len(good_inds)
     # good_inds = (sample_energy < (sample_energy.quantile(0.95))).argwhere().flatten()
     sample_energy = uma_batch[energy_function][good_inds]
@@ -2692,9 +2726,32 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     assert full_dmat.shape[0] == len(good_inds) + num_polymorphs + n_basins, "full_dmat shape mismatch"
     polymorph_inds = [len(good_inds) + ind for ind in range(num_polymorphs)]
     new_min_inds = [len(good_inds) + num_polymorphs + ind for ind in range(basin_min_batch.num_graphs)]
+    umap_dmat = full_dmat
+    if extra_refs is not None:
+        # same row order as full_dmat: filtered samples, polymorph references, basin minima
+        existing_rdf = torch.cat([uma_batch.rdf[good_inds], ebatch.rdf, basin_min_batch.rdf], dim=0).cpu()
+        umap_dmat = augment_dmat2(extra_refs['rdf'].to(existing_rdf.dtype), existing_rdf, full_dmat.cpu())
+        n0 = full_dmat.shape[0]
+        extra_refs = dict(extra_refs, inds=list(range(n0, umap_dmat.shape[0])))
+        # CHECK: a reference that is also a polymorph row must sit at distance ~0 from it,
+        # or the new rows are misaligned with full_dmat.
+        n_good = len(good_inds)
+        to_poly = umap_dmat[n0:, n_good:n_good + num_polymorphs]
+        poly_names = [str(i) for i in getattr(ebatch, 'identifier', [])]
+        for k, (lab, tag) in enumerate(zip(extra_refs['labels'], extra_refs['tags'])):
+            if lab in poly_names:
+                print(f"  check {lab} ({tag}) -> polymorph row: {float(to_poly[k, poly_names.index(lab)]):.5f}")
+        # the number the pair segments draw: how far relaxation moves each form in RDF space
+        tag_order = list(dict.fromkeys(extra_refs['tags']))
+        if len(tag_order) >= 2:
+            pos = {(lab, tag): k for k, (lab, tag) in enumerate(zip(extra_refs['labels'], extra_refs['tags']))}
+            for lab in dict.fromkeys(extra_refs['labels']):
+                if (lab, tag_order[0]) in pos and (lab, tag_order[1]) in pos:
+                    d = float(umap_dmat[n0 + pos[(lab, tag_order[0])], n0 + pos[(lab, tag_order[1])]])
+                    print(f"  {lab}: {tag_order[0]} <-> {tag_order[1]} RDF distance {d:.4f}")
     umap_model = UMAP(n_components=2, n_neighbors=300, min_dist=0.75,
                       init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
-    sample_embedding = umap_model.fit_transform(full_dmat.cpu().numpy().astype(np.float32))
+    sample_embedding = umap_model.fit_transform(umap_dmat.cpu().numpy().astype(np.float32))
     basin_colorscale = px.colors.qualitative.Vivid[:n_basins + 2]
     basin_colorscale[0] = 'rgb(100, 100, 100)'
     sample_colors = [basin_colorscale[i + 1] for i in indexed_cluster_labels]
@@ -2709,12 +2766,17 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     """get polymorph & basin probs under elj"""
     edmat = elj_results['dmat']
     bins = torch.linspace(0, 10, elj_batch.rdf.shape[-1], device='cuda')
-    all_new_rdf = torch.cat([uma_batch.rdf[p_maxima], ebatch.rdf, basin_min_batch.rdf], dim=0)
-    # New samples vs. all original samples
+    # p_maxima are rows of the FILTERED uma set, so read the rdf through good_inds.
+    # Indexing the full batch with them picked up unrelated samples whenever the
+    # energy filter had removed anything before a maximum.
+    all_new_rdf = torch.cat([uma_batch.rdf[good_inds][p_maxima], ebatch.rdf, basin_min_batch.rdf], dim=0)
+    # the eLJ run has its OWN filtered rows (those of edmat). Using the UMA run's
+    # good_inds here indexed one run's samples with the other's filter.
+    elj_inds = dmat_row_indices(elj_batch, elj_results, 'elj')
     dists_to_elj = torch.stack([
-        compute_rdf_distance(all_new_rdf[ii], elj_batch.rdf[good_inds], bins.cpu())
+        compute_rdf_distance(all_new_rdf[ii], elj_batch.rdf[elj_inds], bins.cpu())
         for ii in range(all_new_rdf.shape[0])
-    ])  # [n, 10k]
+    ])  # [n, n_elj_rows]
     n_elj_samples = edmat.shape[0]
     old_elj_dens = (torch.exp(-(edmat ** 2) / (2 * d_kernel ** 2)).sum(
         dim=1) - 1)
@@ -2724,6 +2786,8 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     old_elj_dens /= dnorm
     new_elj_dens /= old_elj_dens.amax()
     stats = {}
+    if extra_refs is not None:
+        stats['extra_refs'] = extra_refs
     stats['sample_energy'] = torch.cat([basin_min_batch[energy_function], ebatch[energy_function]]).numpy()
     stats['sample_cp'] = torch.cat([sample_cps[p_maxima], ebatch.packing_coeff]).numpy()
     stats['density'] = torch.cat(

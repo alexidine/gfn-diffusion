@@ -1472,7 +1472,7 @@ def combo_fig(num_polymorphs,
     point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8)
 
     embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds, poly_labels=poly_labels)
+              sample_embedding, sample_inds, poly_labels=poly_labels, extra_refs=stats.get('extra_refs'))
 
     fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
              polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function,
@@ -1658,8 +1658,66 @@ def make_specs_fig(n_basins):
     return basin_positions, fig, total_cols
 
 
+def embedding_references(fig, sample_embedding, extra_refs, marker_font_size, already_labelled=()):
+    """Every form from each embedding-reference file, one marker style per file tag
+    (first tag filled, second open), with a grey segment joining the two copies of the
+    same form -- that segment IS the displacement relaxation causes in RDF space.
+    Forms outside the model's (space group, Z') are drawn grey and say so in their
+    label, because the model cannot generate them."""
+    inds, labels, tags, cells = (extra_refs['inds'], extra_refs['labels'],
+                                 extra_refs['tags'], extra_refs['cells'])
+    model_cell = extra_refs['model_cell']
+    tag_order = list(dict.fromkeys(tags))
+    symbols = ['diamond', 'diamond-open', 'square', 'square-open']
+
+    by_form = {}
+    for i, lab, tag in zip(inds, labels, tags):
+        by_form.setdefault(lab, {})[tag] = i
+    for lab, members in by_form.items():
+        if len(members) >= 2:
+            pts = [members[t] for t in tag_order if t in members]
+            fig.add_scatter(x=sample_embedding[pts, 0], y=sample_embedding[pts, 1],
+                            mode='lines', line=dict(color='rgb(90,90,90)', width=2),
+                            hoverinfo='skip', showlegend=False, row=1, col=1)
+
+    for t_ind, tag in enumerate(tag_order):
+        sel = [k for k, t in enumerate(tags) if t == tag]
+        colors = ['black' if tuple(cells[k]) == tuple(model_cell) else 'rgb(110,110,110)' for k in sel]
+        fig.add_scatter(x=sample_embedding[[inds[k] for k in sel], 0],
+                        y=sample_embedding[[inds[k] for k in sel], 1],
+                        mode='markers',
+                        marker_symbol=symbols[t_ind % len(symbols)],
+                        marker_color=colors, marker_line_color=colors, marker_line_width=2,
+                        marker_size=16, hovertext=[f"{labels[k]} ({tag})" for k in sel],
+                        showlegend=False, row=1, col=1)
+
+    # One label per form, on the first tag's marker. The forms outside the model's cell
+    # land within a few UMAP units of each other, so in-place text overprints; fan the
+    # labels into a column with leader lines instead, top point to top label. Forms the
+    # polymorph X already names are skipped rather than labelled twice.
+    first = [k for k, t in enumerate(tags) if t == tag_order[0] and labels[k] not in set(already_labelled)]
+    first.sort(key=lambda k: -sample_embedding[inds[k], 1])
+    spacing = marker_font_size + 8
+    for j, k in enumerate(first):
+        sg, zp = cells[k]
+        outside = '' if (sg, zp) == tuple(model_cell) else f"  sg{sg} Z'{zp}"
+        fig.add_annotation(x=sample_embedding[inds[k], 0], y=sample_embedding[inds[k], 1],
+                           text=f"{labels[k]}{outside}", showarrow=True, arrowhead=0,
+                           arrowwidth=1, arrowcolor='rgb(90,90,90)',
+                           ax=170, ay=(j - (len(first) - 1) / 2) * spacing,
+                           xanchor='left', font=dict(size=marker_font_size - 4, color='black'),
+                           bgcolor='rgba(255,255,255,0.85)', row=1, col=1)
+
+    key = '   '.join(f"{'◆◇■□'[t_ind % 4]} {tag}" for t_ind, tag in enumerate(tag_order))
+    fig.add_annotation(text=key + "   (grey: outside the model's cell)",
+                       xref='x domain', yref='y domain', x=0.01, y=0.99,
+                       xanchor='left', yanchor='top', showarrow=False,
+                       font=dict(size=marker_font_size - 4), bgcolor='rgba(255,255,255,0.8)',
+                       row=1, col=1)
+
+
 def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds, poly_labels=None):
+              sample_embedding, sample_inds, poly_labels=None, extra_refs=None):
     fig.add_scatter(x=sample_embedding[sample_inds, 0],
                     y=sample_embedding[sample_inds, 1],
                     marker_color=sample_colors,
@@ -1706,6 +1764,8 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
                     marker_size=18,
                     opacity=0.75,
                     showlegend=False, row=1, col=1)
+    if extra_refs is not None:
+        embedding_references(fig, sample_embedding, extra_refs, marker_font_size, already_labelled=heads)
     #
     # # Compute a direction for the label offset that points away from the data centroid,
     # # so labels reliably land in empty space rather than on top of other callouts.

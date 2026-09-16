@@ -39,7 +39,7 @@ lr_control:
   seed_lr: 0.000125
   control_flow_lr: false
   burn_in_steps: 250
-  burn_in_scale: 0.05
+  burn_in_scale: 0.2
   min_root_bias_correction: 0.9
   candidate_scales:
   - 0.05
@@ -53,7 +53,7 @@ lr_control:
   repeat_every: 8000
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.05
+  fixed_scale: 0.2
   verbose: true
   hard_failure:
     loss_excursion_k: 10.0
@@ -143,8 +143,8 @@ eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
 epochs: 6000
-eval_period: 100
-figs_period: 200
+eval_period: 250
+figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50

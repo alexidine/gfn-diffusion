@@ -114,14 +114,15 @@ def test_mk_devs_var_conditioning_carries_the_cooldown_and_the_branch_rules():
     cfg = yaml.safe_load(MK_DEV.read_text(encoding='utf-8'))
     st = Stage(cfg['protocols']['conditional_vargrad']['stages'][1], 1)
     b = st.balance
-    assert b['anneal_cooldown_steps'] == 1000
-    # 1 - r2 (scale-free unexplained fraction) is the pacing metric: it separates
-    # 'the target got harder' from 'the sampler fell behind' (2026-09-12)
-    assert [r['metric'] for r in b['rules']] == ['fwd/r2_unexplained', 'bwd/r2_unexplained']
-    for r in b['rules']:
-        assert (r['relative'], r['margin'], r['drift'], r['if_missing']) == 
-            ('best', 1.1, 0.001, 'violated')
-    assert b['anneal_coeffs']['lambda_mix'] == {'target': 1.0, 'rate': 0.8}
+    assert b['anneal_cooldown_steps'] == 2000
+    # the LEVEL GAP delta = J_B - J_F is the pacing metric: it is the only logged
+    # quantity that sees mass missing from a basin, and its running best never
+    # relaxes (drift 0), so a rung is accepted only once the gap has recovered
+    # (2026-09-13; the r2 gate with drift 0.001 advanced on a timer)
+    assert [r['metric'] for r in b['rules']] == ['gates/delta_mean', 'gates/delta_worst']
+    assert [(r['relative'], r['margin'], r['drift'], r['if_missing']) for r in b['rules']] == \
+        [('best', 1.05, 0.0, 'violated'), ('best', 1.1, 0.0, 'violated')]
+    assert b['anneal_coeffs']['lambda_mix'] == {'target': 1.0, 'rate': 0.5}
 
 
 # ---------------------------------------------------------------- the tick

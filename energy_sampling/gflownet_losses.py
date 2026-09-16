@@ -1416,7 +1416,7 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
 
 def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
                              min_group_count: int = 2, ratio=None,
-                             bridge_only: bool = False):
+                             bridge_only: bool = False, thin_by_condition: bool = True):
     """
     CROSS-BRANCH VarGrad: one per-condition group spanning BOTH the forward
     rollouts and the backward/buffer draws.
@@ -1498,7 +1498,20 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
             keep_b = cand_b
             want_f = int(round(n_b_pool * (1.0 - ratio) / ratio))
             if want_f < n_f_all:
-                keep_f = torch.randperm(n_f_all, device=dev)[:max(want_f, 1)]
+                # CONDITION-AWARE thinning. A blind randperm splits a condition's
+                # forward pair and strands rows whose condition the buffer side
+                # holds, so mixed groups were ~0.62 of rows by construction
+                # (2000 fwd rows over 1000 conditions vs 1000 bwd rows over 500).
+                # Rank forward rows with a buffer partner first, random within
+                # each class, and take the head: at these sizes that is exactly
+                # the paired conditions, whole.
+                if thin_by_condition:
+                    bc_u = torch.unique(live_bwd['condition_id'].to(dev).ravel()[cand_b])
+                    f_pair = torch.isin(live_fwd['condition_id'].to(dev).ravel(), bc_u).float()
+                    rank = f_pair + torch.rand(n_f_all, device=dev) * 0.5
+                    keep_f = torch.argsort(rank, descending=True)[:max(want_f, 1)]
+                else:  # the pre-2026-09-12 condition-blind draw, kept for the A/B
+                    keep_f = torch.randperm(n_f_all, device=dev)[:max(want_f, 1)]
 
     def take(d, idx):
         return {k: (v if idx is None else v[idx]) for k, v in d.items()}

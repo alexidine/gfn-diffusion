@@ -46,7 +46,7 @@ MK_DEV = os.path.join(CONFIGS, 'mk_dev.yaml')
 OUT = os.path.join(CONFIGS, 'qm9c_anneal.yaml')
 
 LAMBDA_START = 0.001   # 0 -> 0.001 is measured invisible; the ramp is multiplicative and cannot leave 0
-EPOCHS = 60000
+EPOCHS = 150000   # 10 rungs x ~10-15k recovery each; stop it when it is done
 
 # THE LAMBDA=0 NULL ARM (`python configs/qm9c_anneal/make.py --null`): the same
 # fresh start and the same stage at lambda 0, where the target is the prior
@@ -205,7 +205,7 @@ def main(null=False, step=None, source=NULL_RUN, length=None, suffix=''):
         lam, run_name = 0.0, f'{NULL_RUN}{tail}'
         out = NULL_OUT if not tail else os.path.join(CONFIGS, f'{run_name}.yaml')
     else:
-        lam, run_name, out = LAMBDA_START, 'qm9c_anneal_r2gate', OUT
+        lam, run_name, out = LAMBDA_START, 'qm9c_anneal_dgate', OUT
 
     cfg['run_name'] = run_name
     # absolute: a weights-only start is at step 0, so this is the whole budget;
@@ -297,8 +297,8 @@ def main(null=False, step=None, source=NULL_RUN, length=None, suffix=''):
         assert not any(k in got['balance'] for k in NULL_DROPPED)
     else:
         assert got['balance']['anneal_coeffs']['lambda_mix']['target'] == 1.0
-        assert got['balance']['anneal_cooldown_steps'] == 1000
-        assert got['balance']['anneal_coeffs']['lambda_mix']['rate'] == 0.8
+        assert got['balance']['anneal_cooldown_steps'] == 2000
+        assert got['balance']['anneal_coeffs']['lambda_mix']['rate'] == 0.5
     assert got['fracs'] == {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
     assert got['min_fracs'] == {'fwd': 0.0}
     fwd, bwd, rep = (got['loss_coeffs'][m] for m in ('fwd', 'bwd', 'replay'))
@@ -312,7 +312,9 @@ def main(null=False, step=None, source=NULL_RUN, length=None, suffix=''):
     assert got['condition_draw'] == {'conditions': 0, 'replay_rows': 2, 'prior_rows': 2,
                                      'pick': 'uniform'}
     assert [r['metric'] for r in got['balance']['rules']] == \
-        ['fwd/r2_unexplained', 'bwd/r2_unexplained']
+        ['gates/delta_mean', 'gates/delta_worst']
+    assert all(r['drift'] == 0.0 for r in got['balance']['rules']), 'no forced advance'
+    assert cfg['lr_control']['fixed_scale'] == 0.2, 'LR x4 from stage entry (2026-09-13)'
     # P_B is FROZEN (full snapshot) at stage entry on the replay seat: every
     # learned-P_B variant diverged there (2026-09-12)
     assert 'freeze_pb' in got['on_enter']

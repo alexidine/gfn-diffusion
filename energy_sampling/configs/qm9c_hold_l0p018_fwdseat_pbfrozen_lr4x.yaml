@@ -1,16 +1,16 @@
 project_state_version: 10
-run_name: qm9c_anneal_dgate
+run_name: qm9c_hold_l0p018_fwdseat_pbfrozen_lr4x
 tag: dev
 seed: 12345
 device: cuda
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.8
 anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
-checkpoint_name: dev_qm9c_t20_elj-qm9c100k_prior-T6.9-5e5294_phase1_exit.pt
+checkpoint_name: dev_qm9c_anneal_r2gate_elj-qm9c100k_prior-T6.9-5e5294_step16002.pt
 prior_model_name: dev_qm9c_t20_elj-qm9c100k_prior-T6.9-5e5294_prior.pt
-load_weights_only: true
+load_weights_only: false
 prior_path: D:\crystal_datasets\conditional\priors\qm9c100k_prior.pt
 molecules_path: D:\crystal_datasets\conditional\priors\qm9c100k_conditions.pt
 test_molecules_path: D:\crystal_datasets\conditional\priors\qm9c100k_test_conditions.pt
@@ -142,7 +142,7 @@ max_batch_size: 8000
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 150000
+epochs: 19000
 eval_period: 250
 figs_period: 1000
 batch_growth_factor: 1.6
@@ -381,45 +381,37 @@ protocols:
       on_enter:
       - rebuild_prior_by_churn
       - set_lr_flow:1.0e-4
-      - freeze_pb
       fracs:
-        fwd: 0.0
+        fwd: 0.5
         bwd: 0.5
-        replay: 0.5
-      min_fracs:
-        fwd: 0.0
+        replay: 0.0
       deactivate_threshold: 0.01
-      fwd_rollout_every: 20
+      fwd_rollout_every: 0
       z_pin_rollout_every: 0
       fwd_rollout_triggers:
-        occupancy_min_batches: 0.0
-        val_gap_max: 0.0
-        drift_std_max: 0.0
-        ess_min: 0.0
-      fwd_z_sidecar: true
-      replay_warmup_rows: 20000
-      condition_draw:
-        conditions: 0
-        replay_rows: 2
-        prior_rows: 2
-        pick: uniform
+        occupancy_min_batches: 0
+        val_gap_max: 0
+        drift_std_max: 0
+        ess_min: 0
+      fwd_z_sidecar: false
+      replay_warmup_rows: 0
       loss_coeffs:
         fwd:
           tb: 0.0
           vg_lb: 0.0
           vg_by_condition: 1.0
           emp_z: 1.0
-          freeze_policy: 1.0
+          freeze_policy: 0.0
           repeats: 2.0
           pooled_vg: 1.0
           pooled_beta: 40.0
           pooled_ratio: 0.5
-          pooled_source: replay
+          pooled_source: fwd
           tb_z_source: persistent
         bwd:
           tb: 0.0
           vg_lb: 0.0
-          condition_block_m: 0
+          condition_block_m: 2.0
           repeats: 1.0
           level_gap: 0.0
           tb_z_source: persistent
@@ -431,30 +423,25 @@ protocols:
       balance:
         kind: lexicographic
         default_boost:
-          replay: 0.5
+          fwd: 0.5
           bwd: 0.5
-        anneal_cooldown_steps: 2000
         rules:
-        - metric: gates/delta_mean
+        - metric: fwd/logw_std_within
           relative: best
-          margin: 1.05
-          drift: 0.0
+          margin: 1.5
+          drift: 0.005
           if_missing: violated
           boost:
-            replay: 0.5
+            fwd: 0.5
             bwd: 0.5
-        - metric: gates/delta_worst
+        - metric: bwd/logw_std_within
           relative: best
-          margin: 1.1
-          drift: 0.0
+          margin: 1.5
+          drift: 0.005
           if_missing: violated
           boost:
-            replay: 0.5
+            fwd: 0.5
             bwd: 0.5
-        anneal_coeffs:
-          lambda_mix:
-            target: 1.0
-            rate: 0.5
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -493,7 +480,6 @@ buffers:
       floor_frac: 0.25
       symmetric: true
     val_frac: 0.0
-    admit_from_eval: false
   anchor_buffer:
     seed_source: prior_dataset
     max_size: 200000
@@ -544,4 +530,4 @@ energy_config:
   reward_range: null
   analyze_kwargs: {}
   prior_flow_path: D:\crystal_datasets\conditional\priors\qm9c100k_prior_flow_T20.pt
-  lambda_mix: 0.001
+  lambda_mix: 0.018189894035458554

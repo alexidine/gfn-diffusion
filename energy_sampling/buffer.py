@@ -1976,8 +1976,9 @@ class ConditionLogZTracker:
     statistic (monotone, no beta/decay/variance concerns), updated via a
     plain scatter-min rather than any EMA math. See update_best_energy().
 
-    EMA math (logw, logw_sq, log_z_emp via logaddexp) is structurally like
-    CrystalBuffer.update_logw_stats, applied to the group-mean/group-logsumexp
+    EMA math (logw, logw_sq, log_z_emp) is structurally like
+    CrystalBuffer.update_logw_stats (except log_z_emp is a linear EMA of the
+    per-call logmeanexp here, not a logaddexp EMA -- see update()), applied to the group-mean/group-logsumexp
     of whichever samples in a given update() call share a condition_id --
     duplicates within one call (e.g. repeats-tiled trajectories) are folded
     into a single observation for that step rather than applied sequentially.
@@ -2201,6 +2202,17 @@ class ConditionLogZTracker:
         independent cross-check -- a large persistent gap between it and
         ema_logw (z_gap) is a signal the Jensen estimate is still being
         distorted, and trimming both would mute that signal.
+
+        The logmeanexp is taken WITHIN a call only; across calls ema_log_z_emp
+        is a plain linear EMA of the per-call values, like ema_logw. It used to
+        be a log-space EMA (logaddexp of the weighted old and new values), which
+        cannot forget a high outlier: the outlier's share of the mixture decays
+        by (1 - w_new) per visit, so the estimate falls by only -log(1 - w_new)
+        nats per visit -- LINEARLY, about 1 nat per half_life_visits/ln2 visits.
+        At half_life_visits=200 a 1500-nat spike took ~430k visits to clear.
+        The linear EMA decays the excess geometrically instead, at the configured
+        half-life. The cost: with ~1 sample per condition per call, the per-call
+        logmeanexp equals that sample, so z_gap reads ~0 (only the trim differs).
         """
         trim_frac = self.trim_frac if trim_frac is None else trim_frac
         max_batch_weight = self.max_batch_weight if max_batch_weight is None else max_batch_weight
@@ -2291,13 +2303,9 @@ class ConditionLogZTracker:
         new_mean = torch.where(nan_mask, mean_logw, (1.0 - w_new) * old_mean + w_new * mean_logw)
         new_sq = torch.where(nan_mask, mean_logw_sq, (1.0 - w_new) * old_sq + w_new * mean_logw_sq)
 
-        log_w_new = torch.log(w_new)
-        log_1m_w_new = torch.log1p(-w_new)  # log1p for precision as w_new -> 0 (well-established conditions)
-        new_log_z = torch.where(
-            nan_mask,
-            group_log_mean_exp,
-            torch.logaddexp(log_1m_w_new + old_log_z, log_w_new + group_log_mean_exp),
-        )
+        # linear EMA of the per-call logmeanexp, NOT logaddexp -- see docstring
+        new_log_z = torch.where(nan_mask, group_log_mean_exp,
+                                (1.0 - w_new) * old_log_z + w_new * group_log_mean_exp)
 
         self.ema_logw[unique_ids] = new_mean
         self.ema_logw_sq[unique_ids] = new_sq

@@ -8,9 +8,9 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
-checkpoint_name: dev_qm9c_t20_elj-qm9c100k_prior-T6.9-5e5294_phase1_exit.pt
+checkpoint_name: dev_qm9c_anneal_dgate_elj-qm9c100k_prior-T6.9-5e5294_running.pt
 prior_model_name: dev_qm9c_t20_elj-qm9c100k_prior-T6.9-5e5294_prior.pt
-load_weights_only: true
+load_weights_only: false
 prior_path: D:\crystal_datasets\conditional\priors\qm9c100k_prior.pt
 molecules_path: D:\crystal_datasets\conditional\priors\qm9c100k_conditions.pt
 test_molecules_path: D:\crystal_datasets\conditional\priors\qm9c100k_test_conditions.pt

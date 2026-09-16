@@ -1894,6 +1894,7 @@ class Modeller:
         metrics['zmatch/delta_mean'] = delta['mean']
         metrics['zmatch/delta_n_trusted'] = delta['n']
         self.protocol.publish_gate('delta_worst', delta['worst'])
+        self.protocol.publish_gate('delta_mean', delta['mean'])
         # the two sides of the gap on the gate's own fast clock -- the
         # bwd/fwd jensen_z panels are longer-horizon metric_tracker EMAs and
         # lag the true levels by nats during a fast z_match walkdown
@@ -4933,7 +4934,9 @@ class Modeller:
                 beta=float(getattr(self.args.fwd_loss_coeffs, 'pooled_beta', 40.0)),
                 ratio=float(getattr(self.args.fwd_loss_coeffs, 'pooled_ratio', 0.5)),
                 bridge_only=float(getattr(
-                    self.args.fwd_loss_coeffs, 'pooled_bridge_only', 0.0) or 0.0) > 0.5)
+                    self.args.fwd_loss_coeffs, 'pooled_bridge_only', 0.0) or 0.0) > 0.5,
+                thin_by_condition=float(getattr(
+                    self.args.fwd_loss_coeffs, 'pooled_thin_by_condition', 1.0)) > 0.5)
             # ANNOUNCED ONCE PER STATE, not once per process: at a stage entry the
             # aligned draw has no eligible condition (the replay buffer's first
             # rows land at the end of step 0), so a once-only line reads INERT
@@ -6192,6 +6195,13 @@ class Modeller:
                     (r2[ho] * w[ho]).sum() / w[ho].sum()))
         return True
 
+    def _fwd_exploration_std(self, init_state):
+        es = float(getattr(self.args.fwd_loss_coeffs, 'exploration_std', 0.0) or 0.0)
+        if es <= 0.0:
+            return None
+        return torch.full((init_state.shape[0],), es, device=init_state.device,
+                          dtype=init_state.dtype)
+
     def fwd_train_step(self,
                        discretizer,
                        return_exp=False,
@@ -6212,7 +6222,11 @@ class Modeller:
                                    discretizer,
                                    mol_batch,
                                    log_T_tensor,
-                                   exploration_std=None,
+                                   # fwd_loss_coeffs.exploration_std: per-step additive
+                                   # LOG-STD on the sampling kernel only (the scored
+                                   # density stays the policy's own), so rollouts reach
+                                   # off-policy regions. 0 = today's on-policy draw.
+                                   exploration_std=self._fwd_exploration_std(init_state),
                                    return_exp=return_exp,
                                    condition=condition,
                                    repeats=repeats,
