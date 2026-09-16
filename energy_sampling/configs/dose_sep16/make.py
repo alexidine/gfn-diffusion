@@ -1,5 +1,6 @@
-"""dose_sep16 -- the replay-dose ladder on mip: does a FRESHER buffer hold the
-high-Z state that N=20 only visits?
+"""dose_sep16 -- the replay-dose ladder and the tau ladder on mip, at a PINNED batch:
+does a fresher buffer hold the high-Z state that N=20 only visits, and does a
+larger buffer change the regime at the same per-row dose?
 
     python configs/dose_sep16/make.py
 
@@ -14,32 +15,51 @@ then memorising the same rows at 16x mipu's rate; pinned at 0.3 replay it holds
 29.8 (flk14_pin30). Rare rollouts were bought for the MLIP routes; on ELJ a
 rollout is nearly free, so N=20 buys nothing there and costs the freshness.
 
-THE LADDER, all replay PINNED at 0.3 unless stated (point bounds, as flk_sep14),
+THE BATCH IS PINNED AT 1600 ON EVERY ARM, sizer retest off, because the sizer
+walks 1600 <-> 2560 every 1000 steps on rung noise and under store-all that
+moves occupancy 1.6x and the per-row dose 1/1.6x on each edge -- log Z followed
+it in every arm measured, pinned or not. Here it is the instrument, not a
+strategy. The held-out split (val_frac 0.05) is ON so replay/val_gap_nats can
+separate learning from fitting the rows; resid_vs_intake cannot.
+
+THE LADDERS, replay PINNED at 0.3 unless stated (point bounds, as flk_sep14),
 all off the SAME 160k archive flk_sep14 used (read from its SEED.txt if present,
 else the parent's newest archive, recorded the same way):
 
-  n20          D ~ 47   the flk14_pin30 shape, re-run to 25k steps as control
-  n5           D ~ 12
-  n1           D ~ 2.3  fresh replay every step at share 0.3
-  n1_lr05      D ~ 1.2  n1 at half the rate, applied through seed_lr because a
+  n20          D ~ 47   tau 120   the flk14_pin30 shape at a pinned batch, the control
+  n5           D ~ 12   tau 120
+  n1           D ~ 2.3  tau 120   fresh replay every step at share 0.3. NB the N
+               ladder moves occupancy (B*tau/N: 9.6k -> 38k -> 192k) and the
+               fresh fraction (N/tau: 1/6 -> 1/24 -> 1/120) along with the dose;
+               that is what the cadence lever does in use, and only an absolute
+               admission count could isolate the dose alone
+  n1_lr05      D ~ 1.2  tau 120   n1 at half the rate, applied through seed_lr because a
                resumed controller keeps the parent's promoted scale (see _rate)
-  n1_w15       D ~ 1.2  n1 at share 0.15 -- the same dose by the other lever
+  n1_w15       D ~ 1.2  tau 120   n1 at share 0.15 -- the same dose by the other lever
+  t3           D ~ 47   tau  60   occupancy ~4.8k:  the tau ladder at FIXED dose
+  t12          D ~ 47   tau 240   occupancy ~19k
+  t48          D ~ 47   tau 960   occupancy ~77k   (cap 250k does not bind)
+
+Per-row dose is tau-invariant (draws per row = N under store-all); what tau sets
+is how many independent rows share the capacity and the tail the prioritised
+draw sees. The n20 arm is the tau/N = 6 rung of that ladder.
 
 fwd_rollout_every 1 keeps the cadenced code path (fill pins Z on every step);
 0 would take the legacy every-step path and is deliberately not used, so the
 only thing that changes down the ladder is N.
 
-WALL 12 h. At N=20 mip runs 2.6 s/step; at N=1 the forward rollout is on every
-step but ELJ is cheap, so budget ~3.5 s/step -> ~12k steps at N=1, ~16k at N=20.
-Not the 25k a full buffer turnover wants, but the replay buffer itself turns over
-in tau = 120 steps, so the dose effect is visible in a few thousand.
+WALL 12 h. At N=20 mip runs 2.6 s/step at batch 1600; at N=1 the forward rollout
+is on every step but ELJ is cheap, so budget ~3.5 s/step -> ~12k steps at N=1,
+~16k at N=20. The replay buffer equilibrates in ~3 tau: 360 steps on the dose
+arms, ~2900 on t48, all inside the wall.
 
 WHAT TO READ: fwd/log_Z_learned level and slope over the last 4k, its sd;
 replay/resid_vs_intake (mipu's 0.90 is the target; the 1/e line is 0.37);
 fwd/tb_err and eval_fwd/tb_err; fwd/emp_z minus learned (the ELBO gap);
 bwd/logw_std_within; Excess Energy Nats Mean (breadth); protocol/gr_held (must
-stay ~0 under a pin). The n1_lr05 vs n1_w15 pair says whether dose is the whole
-story or the share has a separate role.
+stay ~0 under a pin); replay/val_gap_nats on every arm, and its trend on the tau
+arms. The n1_lr05 vs n1_w15 pair says whether dose is the whole story or the
+share has a separate role.
 """
 import copy
 import importlib.util
@@ -68,6 +88,39 @@ _spec.loader.exec_module(flk)
 _eq, _pin = flk._eq, flk._pin
 
 
+def _pin_batch(cfg):
+    # THE BATCH IS THE INSTRUMENT'S ONLY CONFOUND. The sizer re-measures every
+    # 1000 steps and walks 1600 <-> 2560 on rung noise; under store-all that moves
+    # occupancy 1.6x and the per-row dose 1/1.6x on every step edge, and log Z
+    # follows it in every arm measured (memory: batch_sizer_retest_forces_the_z_cycle).
+    # Pinned here so N, w, eta and tau are the only things that move.
+    cfg['batch_size'] = 1600
+    cfg['max_batch_size'] = 1600
+    cfg['grow_batch_size'] = False
+    cfg['batch_util_target'] = 0.0
+    cfg['batch_sizer_retest_steps'] = 0
+
+
+def _holdout(cfg):
+    # 5% of every admission batch flagged held-out and never trained on, so
+    # replay/val_gap_nats separates learning (held-out falls too) from fitting the
+    # rows (only the trained side falls). resid_vs_intake cannot: a better policy
+    # and a memorised row both lower it. ~80 rows per rollout, ~480 resident at
+    # tau 120, well above val_min 64.
+    cfg['buffers']['replay_buffer']['val_frac'] = 0.05
+    # THE CAP MUST NEVER BIND: under store-all O = B*tau/N, and the N=1 arm sits at
+    # 1600*120 = 192k rows against the base cap of 250k, t48 at 77k. A binding cap
+    # turns eviction into displacement and the arm measures the cap. ~1 KB/row on
+    # the card, so a million-row ceiling costs nothing unless it is reached.
+    cfg['buffers']['replay_buffer']['max_size'] = 1_000_000
+
+
+def _tau(t):
+    def f(cfg):
+        cfg['buffers']['replay_buffer']['mean_residence_steps'] = int(t)
+    return f
+
+
 def _every(n):
     def f(cfg):
         _eq(cfg)['fwd_rollout_every'] = int(n)
@@ -86,15 +139,26 @@ def _rate(scale):
     return f
 
 
+COMMON = [lambda c: _pin(c, 0.3), _pin_batch, _holdout]
 ARMS = {
-    'n20':      [lambda c: _pin(c, 0.3), _every(20)],
-    'n5':       [lambda c: _pin(c, 0.3), _every(5)],
-    'n1':       [lambda c: _pin(c, 0.3), _every(1)],
-    'n1_lr05':  [lambda c: _pin(c, 0.3), _every(1), _rate(0.5)],
-    'n1_w15':   [lambda c: _pin(c, 0.15), _every(1)],
+    # --- the dose ladder: N, then the two other levers at the same dose ---------
+    'n20':      COMMON + [_every(20)],
+    'n5':       COMMON + [_every(5)],
+    'n1':       COMMON + [_every(1)],
+    'n1_lr05':  COMMON + [_every(1), _rate(0.5)],
+    'n1_w15':   [lambda c: _pin(c, 0.15), _pin_batch, _holdout, _every(1)],
+    # --- the tau ladder at FIXED dose (N 20, w 0.3, rate 1.0): tau/N = 3, 12, 48;
+    #     n20 above is tau/N = 6. Per-row dose is tau-invariant; what tau sets is
+    #     how many independent rows share the capacity (O = B*tau/N: 4.8k, 19k,
+    #     77k) and the tail of the prioritised draw. Read replay/val_gap_nats.
+    't3':       COMMON + [_every(20), _tau(60)],
+    't12':      COMMON + [_every(20), _tau(240)],
+    't48':      COMMON + [_every(20), _tau(960)],
 }
-EXPECT = {'n20': (20, 0.3, 1.0), 'n5': (5, 0.3, 1.0), 'n1': (1, 0.3, 1.0),
-          'n1_lr05': (1, 0.3, 0.5), 'n1_w15': (1, 0.15, 1.0)}
+#: (N, replay share, rate scale, tau)
+EXPECT = {'n20': (20, 0.3, 1.0, 120), 'n5': (5, 0.3, 1.0, 120), 'n1': (1, 0.3, 1.0, 120),
+          'n1_lr05': (1, 0.3, 0.5, 120), 'n1_w15': (1, 0.15, 1.0, 120),
+          't3': (20, 0.3, 1.0, 60), 't12': (20, 0.3, 1.0, 240), 't48': (20, 0.3, 1.0, 960)}
 
 
 def dirty_files():
@@ -127,8 +191,15 @@ def build():
 
 
 def check(cfg, name, arm):
-    n, w, scale = EXPECT[arm]
+    n, w, scale, tau = EXPECT[arm]
     eq = _eq(cfg)
+    # the instrument: batch pinned, sizer silent, held-out split on
+    assert cfg['batch_size'] == cfg['max_batch_size'] == 1600 and cfg['grow_batch_size'] is False, name + ': batch must be pinned'
+    assert cfg['batch_util_target'] == 0.0 and cfg['batch_sizer_retest_steps'] == 0, name + ': the sizer must be silent'
+    assert cfg['buffers']['replay_buffer']['val_frac'] == 0.05, name + ': held-out split off'
+    rb = cfg['buffers']['replay_buffer']
+    assert rb['mean_residence_steps'] == tau, name
+    assert rb['max_size'] >= 3 * 1600 * tau / n, name + ': replay cap would bind on the tau arm'
     assert cfg['checkpoint_name'] == PLACEHOLDER and cfg['prior_model_name'] == PRIOR_PLACEHOLDER, name
     assert cfg['load_weights_only'] is False and cfg['epochs'] >= 500_000, name
     assert eq['fwd_rollout_every'] == n and n >= 1, name + ': N must stay on the cadenced path (>= 1)'
@@ -141,7 +212,7 @@ def check(cfg, name, arm):
     assert abs(lc['seed_lr'] - 1.25e-4 * scale) < 1e-12, name
     assert all(cfg[k] == 'auto' for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused')), name + ': seed_lr only reaches auto keys'
     assert cfg['buffers']['prior_buffer']['source'] == 'prior_model', name
-    assert cfg['buffers']['replay_buffer']['churn_rate'] == 0 and cfg['buffers']['replay_buffer']['mean_residence_steps'] == 120, name
+    assert rb['churn_rate'] == 0, name
     for s in cfg['protocols']['unconditional_tb']['stages']:
         sensor = s.get('hot_lr_sensor')
         if isinstance(sensor, dict):
@@ -180,8 +251,10 @@ def main(argv):
         f.write(SBATCH.format(wall=WALL, last=len(arms) - 1, placeholder=PLACEHOLDER,
                               prior_placeholder=PRIOR_PLACEHOLDER))
     for name, cfg in arms.items():
-        n, w, scale = EXPECT[name[len(TAG) + 1:]]
-        print('%-16s N=%-3d replay=%.2f scale=%.2f  dose~%5.1f' % (name, n, w, scale, dose(n, scale, w)))
+        n, w, scale, tau = EXPECT[name[len(TAG) + 1:]]
+        print('%-16s N=%-3d replay=%.2f scale=%.2f tau=%-4d occupancy~%6d  dose~%5.1f  batch %d pinned, val_frac %.2f'
+              % (name, n, w, scale, tau, 1600 * tau / n, dose(n, scale, w), cfg['batch_size'],
+                 cfg['buffers']['replay_buffer']['val_frac']))
 
 
 if __name__ == '__main__':

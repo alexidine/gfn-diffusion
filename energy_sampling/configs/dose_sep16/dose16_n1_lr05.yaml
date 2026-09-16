@@ -132,9 +132,9 @@ model:
   dplr_mask_angular: true
   pb_exact_reversal: true
 buffer_device: cuda
-batch_size: 1000
-grow_batch_size: true
-max_batch_size: 4000
+batch_size: 1600
+grow_batch_size: false
+max_batch_size: 1600
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
@@ -144,7 +144,7 @@ figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50
-batch_util_target: 0.65
+batch_util_target: 0.0
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 2
 gpu_util_policy_window_s: 7200
@@ -152,7 +152,7 @@ max_step_seconds: 60
 oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000
-batch_sizer_retest_steps: 1000
+batch_sizer_retest_steps: 0
 eval_T: 100
 integrator:
   T: 100
@@ -490,11 +490,11 @@ buffers:
   replay_buffer:
     churn_rate: 0
     mean_residence_steps: 120
-    max_size: 250000
+    max_size: 1000000
     admit_reward_min: -200
     backstop_mult: 5.0
     admit_from_eval: true
-    val_frac: 0.0
+    val_frac: 0.05
     val_min: 64
     val_cap: 256
     prioritise:
