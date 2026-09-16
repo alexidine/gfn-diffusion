@@ -1430,9 +1430,14 @@ class GFN(nn.Module):  # todo add seeding
                           ('implied_noise_last_k', implied_noise_last_k)):
             if _k > trajectory_length:
                 raise ValueError(f"{_name} {_k} exceeds the trajectory length {trajectory_length}")
-        if resample_last_k > 0 or implied_noise_last_k > 0:
-            # the stored tensor is never written; the live tail goes into a copy
-            states = trajectory.clone()
+        # THE LIVE TAIL IS NEVER WRITTEN INTO A TENSOR THE STEPS READ FROM. Under
+        # trajectory checkpointing the checkpointed step saves its INPUT, and that
+        # input is a view of the states tensor (states[:, i]); writing the next
+        # live state into states[:, i + 1] bumps that storage's version and the
+        # backward recompute refuses ("modified by an inplace operation",
+        # smoke_mace_sf1 2026-09-16 -- MACE checkpoints every branch). So the
+        # tail is collected here and the returned tensor is assembled by cat.
+        live_tail = {}
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
@@ -1443,7 +1448,7 @@ class GFN(nn.Module):  # todo add seeding
                     ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
                 if state_grad_hook is not None and next_state.requires_grad:
                     next_state.register_hook(functools.partial(state_grad_hook, i))
-                states[:, i + 1] = next_state
+                live_tail[i + 1] = next_state
             elif resample_last_k > 0 and i >= trajectory_length - resample_last_k:
                 # LIVE step from the (stored or freshly sampled) current_state
                 eps = torch.randn(batch_size, self.dim, dtype=current_state.dtype, device=self.device)
@@ -1455,7 +1460,7 @@ class GFN(nn.Module):  # todo add seeding
                     condition_embedding, eps, eps_r, None, i == 0, False)
                 if state_grad_hook is not None and next_state.requires_grad:
                     next_state.register_hook(functools.partial(state_grad_hook, i))
-                states[:, i + 1] = next_state
+                live_tail[i + 1] = next_state
             else:
                 next_state = states[:, i + 1]
 
@@ -1472,6 +1477,12 @@ class GFN(nn.Module):  # todo add seeding
                 self.log_gauss_params(gauss_params, i, back_drift, back_var, dts, fwd_drift, pflogvars, d)
 
             current_state = next_state
+
+        if live_tail:
+            first = min(live_tail)
+            assert sorted(live_tail) == list(range(first, trajectory_length + 1)),                 f"live tail must be the contiguous last steps, got {sorted(live_tail)}"
+            states = torch.cat([trajectory[:, :first]] +
+                               [live_tail[j].unsqueeze(1) for j in range(first, trajectory_length + 1)], dim=1)
 
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T

@@ -348,3 +348,28 @@ def test_a_missing_replay_force_is_refused_not_skipped():
     stored = _rollout(gfn)
     with pytest.raises(ValueError, match='replay_force'):
         _stash(gfn, stored, None, 1, 'replay', torch.arange(B))
+
+
+@pytest.mark.parametrize('mode', ['implied', 'resample'])
+def test_live_tail_survives_trajectory_checkpointing(mode):
+    """Under trajectory activation checkpointing (MACE checkpoints every branch)
+    the checkpointed step saves its input, a view of the states tensor. The
+    live tail must not write into that tensor, or the backward recompute
+    refuses with 'modified by an inplace operation' (smoke_mace_sf1, 2026-09-16).
+    Both live tails, k = 2, gradient must run to the parameters."""
+    gfn = _gfn(0)
+    gfn.traj_checkpoint = True
+    gfn.traj_checkpoint_modes = None
+    stored = _rollout(gfn)
+    torch.manual_seed(4)
+    F = torch.randn(B, DIM)
+    kw = {'implied_noise_last_k': 2} if mode == 'implied' else {'resample_last_k': 2}
+    st, pf, pb, _ = gfn.get_traj_replay(stored, _disc(), False, None, **kw)
+    assert st.shape == stored.shape
+    if mode == 'implied':
+        assert gfn._wrap_ang((st.detach() - stored).reshape(-1, DIM)).abs().max() < 1e-5
+    else:
+        assert torch.equal(st[:, :TRAJ - 1], stored[:, :TRAJ - 1])
+    gfn.zero_grad()
+    ((F * st[:, -1]).sum() + pf.sum()).backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in gfn.parameters())
