@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=12:00:00
+#SBATCH --time=8:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=48G
 #SBATCH --cpus-per-task=8

@@ -2,9 +2,9 @@ arm	warm_src
 dose16_n20	p12_mip_lr1
 dose16_n5	p12_mip_lr1
 dose16_n1	p12_mip_lr1
-dose16_n1_lr05	p12_mip_lr1
-dose16_n1_w15	p12_mip_lr1
 dose16_n1_t6	p12_mip_lr1
-dose16_t3	p12_mip_lr1
-dose16_t12	p12_mip_lr1
-dose16_t48	p12_mip_lr1
+dose16_n1_w15	p12_mip_lr1
+dose16_n20_lr05	p12_mip_lr1
+dose16_n20_b2560	p12_mip_lr1
+dose16_n10_w60_t60	p12_mip_lr1
+dose16_n20_pbfrozen	p12_mip_lr1

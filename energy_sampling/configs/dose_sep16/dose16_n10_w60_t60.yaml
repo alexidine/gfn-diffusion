@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: dose16_n1_lr05
+run_name: dose16_n10_w60_t60
 tag: dose16
 seed: 12345
 device: cuda
@@ -42,7 +42,7 @@ progress_gate:
     bar: 10.0
 lr_control:
   mode: fixed
-  seed_lr: 6.25e-05
+  seed_lr: 0.000125
   control_flow_lr: false
   fire_cut_factor: 1.0
   burn_in_steps: 500
@@ -303,10 +303,10 @@ protocols:
       - bootstrap_z:rollout:4000
       fracs:
         fwd: 0.0
-        bwd: 0.7
-        replay: 0.3
+        bwd: 0.4
+        replay: 0.6
       deactivate_threshold: 0.01
-      fwd_rollout_every: 1
+      fwd_rollout_every: 10
       z_pin_rollout_every: 0
       fwd_rollout_triggers:
         occupancy_min_batches: 2.0
@@ -339,11 +339,11 @@ protocols:
         down: 0.006
         bounds:
           bwd:
-          - 0.7
-          - 0.7
+          - 0.4
+          - 0.4
           replay:
-          - 0.3
-          - 0.3
+          - 0.6
+          - 0.6
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -489,14 +489,14 @@ buffers:
     ramp_width: 50
   replay_buffer:
     churn_rate: 0
-    mean_residence_steps: 120
+    mean_residence_steps: 60
     max_size: 1000000
     admit_reward_min: -200
     backstop_mult: 5.0
     admit_from_eval: true
     val_frac: 0.05
     val_min: 64
-    val_cap: 256
+    val_cap: 1024
     prioritise:
       enabled: true
       kappa: 1.0

@@ -496,7 +496,7 @@ buffers:
     admit_from_eval: true
     val_frac: 0.05
     val_min: 64
-    val_cap: 256
+    val_cap: 1024
     prioritise:
       enabled: true
       kappa: 1.0
