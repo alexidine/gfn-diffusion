@@ -9865,7 +9865,12 @@ class Modeller:
         # -- 16 acridine rows OOM'd an 8 GB cap). The energy function's own
         # OOM recovery cannot help, it only chunks the forward and the graphs
         # still accumulate. replay_loss_coeffs.force_chunk_rows bounds it.
-        chunk = int(getattr(self.args.replay_loss_coeffs, 'force_chunk_rows', 0) or 0)
+        # ABSENT KEY = 8, the mk_dev default, NOT 0: a battery whose generator
+        # bases on a frozen arm rather than mk_dev (dose_sep16 -> prod_sep12)
+        # emits no key at all, and 0 there is the whole-batch call that cannot
+        # fit an MLIP. An explicit 0 still means one call.
+        _fcr = getattr(self.args.replay_loss_coeffs, 'force_chunk_rows', None)
+        chunk = 8 if _fcr is None else int(_fcr)
         n = x.shape[0]
         if chunk <= 0 or chunk >= n:
             legs, stats = terminal_force_legs(log_T.to(self.device), self.energy_function, rows, x)

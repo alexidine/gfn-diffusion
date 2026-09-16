@@ -188,6 +188,7 @@ def _stored_force(cfg):
     rc = cfg['replay_loss_coeffs']
     rc['stored_force_k'] = 1
     rc['stored_force_mode'] = 'implied'
+    rc['force_chunk_rows'] = 8          # rows per gradient call at admission; ~1.2 GB/row on MACE, ~0.2 on UMA, nil on ELJ
     rc['resample_last_k'] = 0
     rc['reward_grads'] = 0.0
 
@@ -333,6 +334,7 @@ def check(cfg, name, arm):
     assert cfg['freeze_backward_policy'] == ('full' if arm == 'n20_pbfrozen' else False), name + ': freeze_backward_policy'
     assert float(rc.get('detach_pb', 0.0)) == 0.0, name + ': detach_pb is a dead key; leave it 0'
     if arm == 'n20_sf1':
+        assert rc['force_chunk_rows'] == 8, name + ': admission forces must be chunked (whole-batch cannot fit an MLIP)'
         assert rc['stored_force_k'] == 1 and rc['stored_force_mode'] == 'implied' and rc['resample_last_k'] == 0 and rc['reward_grads'] == 0.0, name
     else:
         assert not rc.get('stored_force_k') and not rc.get('resample_last_k'), name + ': no replay tail on a dose arm'
