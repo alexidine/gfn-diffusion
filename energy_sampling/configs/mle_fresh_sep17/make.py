@@ -26,6 +26,8 @@ def _load(rel, name):
 
 nig = _load('mle_nig_sep17', 'nigmake')
 w3 = nig.w3
+#: fresh weights with DPLR off detonated at the 0.05 -> 4.0 promotion (mlefr_*_lr4, 17916557)
+w3.SCALE = 2.0
 
 TAG = 'mlefr'
 BATTERY = 'mle_fresh_sep17'
@@ -67,6 +69,7 @@ def check(cfg, name, fam):
     assert cfg['prior_path'] == cfg['molecules_path'] == to_prior(seed['prior_path']), name
     assert cfg['checkpoint_name'] is None and cfg['continue_from_checkpoint'] == w3.CONT_PLACEHOLDER, name
     assert cfg['model']['dplr_rank'] == 0, name
+    assert cfg['lr_control']['fixed_scale'] == w3.SCALE == 2.0, name
     st = cfg['protocols'][w3.PROTOCOL]['stages']
     assert len(st) == 1 and 'exit' not in st[0] and st[0]['train_mode'] == 'bwd', name
     assert cfg['integrator']['T'] == w3.SHIP_T == cfg['eval_T'], name

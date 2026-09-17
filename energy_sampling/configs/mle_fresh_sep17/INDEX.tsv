@@ -1,6 +1,6 @@
 arm	family	start	warm_src	prior	prior_bytes
-mlefr_neh_lr4	neh	fresh	-	nehzor_sg14_zp1_elj_prior_dataset_w3.pt	200300990
-mlefr_nehu_lr4	nehu	fresh	-	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
-mlefr_acr_lr4	acr	fresh	-	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697
-mlefr_mip_lr4	mip	fresh	-	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
-mlefr_mipu_lr4	mipu	fresh	-	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061
+mlefr_neh_lr2	neh	fresh	-	nehzor_sg14_zp1_elj_prior_dataset_w3.pt	200300990
+mlefr_nehu_lr2	nehu	fresh	-	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+mlefr_acr_lr2	acr	fresh	-	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697
+mlefr_mip_lr2	mip	fresh	-	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
+mlefr_mipu_lr2	mipu	fresh	-	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061
