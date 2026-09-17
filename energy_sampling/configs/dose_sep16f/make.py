@@ -141,7 +141,14 @@ SBATCH = dm.SBATCH.replace('#SBATCH --job-name=dose16', '#SBATCH --job-name=dose
     .replace('configs/dose_sep16/joblogs/%x_%A_%a.out', 'configs/dose_sep16f/joblogs/%x_%A_%a.out') \
     .replace('ARMS=${{WORKDIR}}/configs/dose_sep16', 'ARMS=${{WORKDIR}}/configs/dose_sep16f') \
     .replace('# dose_sep16: the replay-dose ladder off the SAME frozen p12_mip_lr1 archive flk_sep14 used.',
-             '# dose_sep16f: anchors-only prior buffer at three noise radii, off the SAME frozen archive dose_sep16 and flk_sep14 used.')
+             '# dose_sep16f: anchors-only prior buffer at three noise radii, off the SAME frozen archive dose_sep16 and flk_sep14 used.') \
+    .replace('        source /ext3/env.sh\n',
+             '        source /ext3/env.sh\n'
+             '        # the archive and every dose arm trained under the PRE-Niggli triclinic walls; MXtalTools\n'
+             '        # HEAD now applies the Niggli walls by default, so a continuing run must opt back out\n'
+             '        export MXT_LEGACY_TRICLINIC_WALLS=1\n')
+assert SBATCH.count('export MXT_LEGACY_TRICLINIC_WALLS=1') == 1 \
+    and SBATCH.index('MXT_LEGACY_TRICLINIC_WALLS') < SBATCH.index('python -u train.py'), 'legacy walls export missing'
 assert 'job-name=dose16f' in SBATCH and 'configs/dose_sep16f/joblogs' in SBATCH \
     and 'ARMS=${{WORKDIR}}/configs/dose_sep16f' in SBATCH and 'dose_sep16/' not in SBATCH.replace('dose_sep16f', '')
 

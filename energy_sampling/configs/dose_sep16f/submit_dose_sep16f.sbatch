@@ -103,6 +103,9 @@ srun singularity exec --nv \
     ${IMAGE} \
     /bin/bash -c "
         source /ext3/env.sh
+        # the archive and every dose arm trained under the PRE-Niggli triclinic walls; MXtalTools
+        # HEAD now applies the Niggli walls by default, so a continuing run must opt back out
+        export MXT_LEGACY_TRICLINIC_WALLS=1
         export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         python -u train.py --config ${RESOLVED}
     " 2>&1 | tee ${J}.trainlog
