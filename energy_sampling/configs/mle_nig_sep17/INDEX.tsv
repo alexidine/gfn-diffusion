@@ -1,5 +1,3 @@
 arm	family	start	warm_src	prior	prior_bytes
-mlenig_mip_warm_lr4	mip	warm	mle09_mip_lr4p0	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
 mlenig_mip_fresh_lr4	mip	fresh	-	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
-mlenig_mipu_warm_lr4	mipu	warm	mle09_mipu_lr4p0	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061
 mlenig_mipu_fresh_lr4	mipu	fresh	-	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061

@@ -37,7 +37,7 @@ FAM = {
     'mip':  dict(seed='mle_sep09/mle09_mip_lr4p0.yaml',  src='mle09_mip_lr4p0',  prior_bytes=165_617_107),
     'mipu': dict(seed='mle_sep09/mle09_mipu_lr4p0.yaml', src='mle09_mipu_lr4p0', prior_bytes=232_846_061),
 }
-STARTS = ('warm', 'fresh')
+STARTS = ('fresh',)
 
 
 def nig_path(path):
