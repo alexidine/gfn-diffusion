@@ -1,0 +1,4 @@
+arm	family	scale	warm_src	prior	prior_bytes
+mlew3_neh_lr4	neh	4	mle09_neh_lr4p0	nehzor_sg14_zp1_elj_prior_dataset_w3.pt	200300990
+mlew3_nehu_lr4	nehu	4	mle09_nehu_lr4p0	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+mlew3_acr_lr4	acr	4	mle09_acr_lr4p0	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697
