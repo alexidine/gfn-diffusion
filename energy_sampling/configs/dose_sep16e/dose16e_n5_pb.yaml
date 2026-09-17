@@ -218,7 +218,7 @@ lr_control:
   mode: fixed
   repeat_every: 0
   safety_rungs: 1
-  seed_lr: 3.125e-05
+  seed_lr: 0.000125
   trial_settle_steps: 10
   trial_steps: 150
   verbose: true
@@ -469,7 +469,7 @@ protocols:
         fwd: 0.0
         bwd: 0.7
         replay: 0.3
-      fwd_rollout_every: 20
+      fwd_rollout_every: 5
       fwd_rollout_triggers:
         drift_std_max: 0.0
         ess_min: 0.0
@@ -518,7 +518,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 rewind_tolerance: 0.25
-run_name: dose16e_n20_lr025_pb
+run_name: dose16e_n5_pb
 seed: 12345
 sg_conditioning: false
 space_groups:

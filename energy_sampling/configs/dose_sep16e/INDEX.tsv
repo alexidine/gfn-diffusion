@@ -1,4 +1,4 @@
 arm	warm_src
-dose16e_n20_lr025_pb	p12_mip_lr1
-dose16e_n20_lr025_t600_pb	p12_mip_lr1
-dose16e_n5_t600_pb	p12_mip_lr1
+dose16e_n1_pbfrozen	p12_mip_lr1
+dose16e_n5_pb	p12_mip_lr1
+dose16e_n20_lr05_pb	p12_mip_lr1

@@ -11,7 +11,7 @@
 #SBATCH --job-name=dose16e
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/dose_sep16e/joblogs/%x_%A_%a.out
 
-# dose_sep16e: P_B frozen + low pressure (+ big pool) off the SAME frozen archive dose_sep16 and flk_sep14 used. Arm = row of
+# dose_sep16e: P_B frozen along the N and pressure ladders off the SAME frozen archive dose_sep16 and flk_sep14 used. Arm = row of
 # INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND.
 module purge
 

@@ -55,7 +55,7 @@ buffers:
     backstop_mult: 5.0
     churn_rate: 0
     max_size: 1000000
-    mean_residence_steps: 600
+    mean_residence_steps: 120
     prioritise:
       enabled: true
       floor_frac: 0.25
@@ -469,7 +469,7 @@ protocols:
         fwd: 0.0
         bwd: 0.7
         replay: 0.3
-      fwd_rollout_every: 5
+      fwd_rollout_every: 1
       fwd_rollout_triggers:
         drift_std_max: 0.0
         ess_min: 0.0
@@ -518,7 +518,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 rewind_tolerance: 0.25
-run_name: dose16e_n5_t600_pb
+run_name: dose16e_n1_pbfrozen
 seed: 12345
 sg_conditioning: false
 space_groups:

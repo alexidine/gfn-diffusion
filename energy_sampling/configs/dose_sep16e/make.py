@@ -1,23 +1,20 @@
-"""dose_sep16e -- the winning combination, three ways. Same seed archive, same 8 h
-wall, same generator contract as dose_sep16 / 16b / 16c.
+"""dose_sep16e -- P_B frozen along the N ladder and the pressure ladder. Same seed
+archive, same 8 h wall, same generator contract as dose_sep16 / 16b / 16c / 16d.
 
-WHAT dose_sep16/16b/16c SHOWED AT THE WALL (read 2026-09-17 08:00, ~10k steps):
-  * n1_t6_pbfrozen (P_B frozen) is the best arm on EVERY P_B-free oracle: Z 35.5
-    and still rising, monotone (sd 0.02), forward TB error 2.9 (next best 3.7),
-    highest importance-weighted Z, LOWEST sample energies. Every trainable-P_B
-    N=1 arm caps at ~33 with a ~1700-step Z cycle; measured cause is P_B's
-    log-prob on fresh rollouts wandering by +-150 nats (0.5 frozen).
-  * n20_lr025 (rate/4, dose 12) reaches the same 33.6 ceiling at 1/20 of the
-    energy calls; level within N=20 is monotone in pressure per pass.
-  * tau 600 cuts the held-out gap 30-40% and adds ~0.6 nat; n20_pbfrozen = n20
-    because 20 passes at full pressure memorise first.
-The combination freeze + low pressure + big pool is untested. These arms test it:
+The 16d battery holds the production candidates (freeze + rate/4 at N=20, the
+same + tau 600, and n5 tau 600 frozen). These three isolate what the freeze
+interacts with:
 
-  n20_lr025_pb       n20 at rate/4 with P_B frozen: the ELJ production candidate.
-  n20_lr025_t600_pb  the same with tau 600 (pool 48k).
-  n5_t600_pb         n5 with tau 600 (pool 192k) and P_B frozen: the moderate-N
-                     candidate for routes where N=5 is affordable.
-Read tau arms after ~5 tau = 3000 steps.
+  n1_pbfrozen   n1 (tau 120, pool 192k, the arm with the 1700-step Z cycle) with
+                P_B frozen. n1_t6_pbfrozen removed the cycle on FRESH rows; this
+                asks whether the freeze alone removes it on a stale pool, i.e.
+                whether tau still matters once P_B is frozen.
+  n5_pb         n5 (tau 120) frozen: dose 12 at 5 passes. Against n20_lr025_pb
+                (dose 12 at 20 passes) it is the N ladder at fixed pressure per
+                row under the freeze.
+  n20_lr05_pb   n20 at rate/2 frozen: dose 23. With n20_lr025_pb it is the
+                pressure ladder under the freeze -- is the level still set by the
+                pressure once P_B cannot move?
 """
 import importlib.util
 import pathlib
@@ -34,12 +31,12 @@ dm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dm)
 
 ARMS = {
-    'n20_lr025_pb':      dm.COMMON + [dm._every(20), dm._rate(0.25), dm._freeze_pb],
-    'n20_lr025_t600_pb': dm.COMMON + [dm._every(20), dm._rate(0.25), dm._tau(600), dm._freeze_pb],
-    'n5_t600_pb':        dm.COMMON + [dm._every(5), dm._tau(600), dm._freeze_pb],
+    'n1_pbfrozen': dm.COMMON + [dm._every(1), dm._freeze_pb],
+    'n5_pb':       dm.COMMON + [dm._every(5), dm._freeze_pb],
+    'n20_lr05_pb': dm.COMMON + [dm._every(20), dm._rate(0.5), dm._freeze_pb],
 }
-EXPECT = {'n20_lr025_pb': (20, 0.3, 0.25, 120, 1600), 'n20_lr025_t600_pb': (20, 0.3, 0.25, 600, 1600),
-          'n5_t600_pb': (5, 0.3, 1.0, 600, 1600)}
+EXPECT = {'n1_pbfrozen': (1, 0.3, 1.0, 120, 1600), 'n5_pb': (5, 0.3, 1.0, 120, 1600),
+          'n20_lr05_pb': (20, 0.3, 0.5, 120, 1600)}
 
 
 def build():
@@ -84,7 +81,7 @@ SBATCH = dm.SBATCH.replace('#SBATCH --job-name=dose16', '#SBATCH --job-name=dose
     .replace('configs/dose_sep16/joblogs/%x_%A_%a.out', 'configs/dose_sep16e/joblogs/%x_%A_%a.out') \
     .replace('ARMS=${{WORKDIR}}/configs/dose_sep16', 'ARMS=${{WORKDIR}}/configs/dose_sep16e') \
     .replace('# dose_sep16: the replay-dose ladder off the SAME frozen p12_mip_lr1 archive flk_sep14 used.',
-             '# dose_sep16e: P_B frozen + low pressure (+ big pool) off the SAME frozen archive dose_sep16 and flk_sep14 used.')
+             '# dose_sep16e: P_B frozen along the N and pressure ladders off the SAME frozen archive dose_sep16 and flk_sep14 used.')
 assert 'job-name=dose16e' in SBATCH and 'configs/dose_sep16e/joblogs' in SBATCH and 'ARMS=${{WORKDIR}}/configs/dose_sep16e' in SBATCH and 'dose_sep16/' not in SBATCH.replace('dose_sep16e', '')
 
 

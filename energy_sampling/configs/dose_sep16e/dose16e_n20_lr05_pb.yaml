@@ -55,7 +55,7 @@ buffers:
     backstop_mult: 5.0
     churn_rate: 0
     max_size: 1000000
-    mean_residence_steps: 600
+    mean_residence_steps: 120
     prioritise:
       enabled: true
       floor_frac: 0.25
@@ -218,7 +218,7 @@ lr_control:
   mode: fixed
   repeat_every: 0
   safety_rungs: 1
-  seed_lr: 3.125e-05
+  seed_lr: 6.25e-05
   trial_settle_steps: 10
   trial_steps: 150
   verbose: true
@@ -518,7 +518,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 rewind_tolerance: 0.25
-run_name: dose16e_n20_lr025_t600_pb
+run_name: dose16e_n20_lr05_pb
 seed: 12345
 sg_conditioning: false
 space_groups:
