@@ -492,6 +492,11 @@ fwd_loss_coeffs:
   tb_z_source: learned    # 'learned' | 'persistent'. CONDITIONAL routes want persistent -- set it in the stage, not here
   traj_grads: 0.0
   reward_grads: 0.0
+  path_grad_last_k: 0     # > 0: the reparameterised state gradient stays live for the LAST k rollout steps only (0 = every step detached unless traj_grads). With reward_grads this is the truncated terminal-force path; alone it is inert (the reward runs under no_grad)
+  reward_grad_clip: 0.0   # per-row clip on d loss / d log R after nan_to_num; 0 = off. NB the Huber knee already bounds that quantity at beta*w/B, so this clips nothing unless set below it -- the force itself is bounded by reward_grad_force_clip
+  reward_grad_gate: null  # null = off. A float: rows whose TB residual (log Z + log P_F - log R - log P_B) is <= this get NO reward-path gradient; the rest keep it. Needs reward_grads != 0 and path_grad_last_k > 0. Logged as rewardgrad/gate_frac
+  reward_grad_force_clip: 0.0  # > 0: per-row cap on |d log R / d x_T| before it reaches the live terminal; 0 = off. Needs reward_grads != 0 and path_grad_last_k > 0. Logged as rewardgrad/force_norm_* and force_clipped_frac
+  path_grad_scale: 1      # 1 = the live-step path gradient reaches the step's noise scale as well as its mean; 0 = the scale is detached on the path route (its density-route gradient is unchanged)
   repeats: 1.0            # fwd tiles share a condition and land on DISTINCT terminals -- the cross-terminal group VarGrad needs
   loss_clip: 1.0E+9
   beta: 10.0

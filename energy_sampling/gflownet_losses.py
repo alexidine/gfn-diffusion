@@ -328,6 +328,29 @@ def get_gfn_forward_loss(loss_coeffs,
     log_T_tensor = log_T_tensor.to(gfn.device)
     _path_k = int(getattr(loss_coeffs, 'path_grad_last_k', 0) or 0)
     _path_live = loss_coeffs.traj_grads != 0 or _path_k > 0
+    # RESHAPED REWARD PATH (fwd_loss_coeffs.reward_grad_gate / reward_grad_force_clip).
+    # The plain reward path lets d log R / d x_T reach the live terminal through
+    # the energy graph, weighted per row by d loss / d log R. Measured on the
+    # frozen mip checkpoint (2026-09-18): that push is set by ~1% of rows (clash
+    # forces 100x the median) and 30% of it moves UNDER-dense samples away from
+    # states that should gain probability. The reshaped path scores the reward
+    # on a DETACHED copy of the terminal, takes the per-row force by autograd,
+    # clips its norm per row (reward_grad_force_clip, 0 = off), zeroes it on rows
+    # whose TB residual is at or below reward_grad_gate (null = off), and injects
+    # the result onto the live terminal through a surrogate term of zero value.
+    # The loss's own d loss / d log R (Huber knee, IW weights, whatever the loss
+    # did) is taken by autograd too, so nothing about the weighting is assumed.
+    _rg_on = float(getattr(loss_coeffs, 'reward_grads', 0) or 0) != 0
+    _rg_gate = getattr(loss_coeffs, 'reward_grad_gate', None)
+    _rg_gate = None if _rg_gate is None else float(_rg_gate)
+    _rg_fclip = float(getattr(loss_coeffs, 'reward_grad_force_clip', 0) or 0)
+    _rg_reshape = _rg_on and (_rg_gate is not None or _rg_fclip > 0)
+    if _rg_reshape and not _path_live:
+        raise ValueError("fwd_loss_coeffs.reward_grad_gate / reward_grad_force_clip reshape the "
+                         "reward path onto the LIVE terminal: set path_grad_last_k > 0 (or traj_grads)")
+    if _rg_reshape and freeze_policy:
+        raise ValueError("fwd_loss_coeffs.reward_grad_gate / reward_grad_force_clip need a trained "
+                         "policy on this branch: freeze_policy must be 0")
     # PATH-GRADIENT DIAGNOSTIC. When any rollout step is live, record the
     # per-step ||dL/dx_{i+1}|| (batch mean) as it flows back through the
     # reparameterised chain. Consumed by train.py's ten-step report as
@@ -346,26 +369,45 @@ def get_gfn_forward_loss(loss_coeffs,
         gfn._path_grad_stats = _stats
     else:
         _state_grad_hook = None
-    (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
-                                                            discretizer,
-                                                            exploration_std,
-                                                            condition,
-                                                            mol_batch,
-                                                            detach_traj=loss_coeffs.traj_grads == 0,
-                                                            return_gauss_params=False,
-                                                            freeze_policy=freeze_policy,
-                                                            path_grad_last_k=_path_k,
-                                                            state_grad_hook=_state_grad_hook,
-                                                            )
+    gfn.path_grad_scale_live = float(getattr(loss_coeffs, 'path_grad_scale', 1) if getattr(loss_coeffs, 'path_grad_scale', 1) is not None else 1) != 0
+    try:
+        (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
+                                                                discretizer,
+                                                                exploration_std,
+                                                                condition,
+                                                                mol_batch,
+                                                                detach_traj=loss_coeffs.traj_grads == 0,
+                                                                return_gauss_params=False,
+                                                                freeze_policy=freeze_policy,
+                                                                path_grad_last_k=_path_k,
+                                                                state_grad_hook=_state_grad_hook,
+                                                                )
+    finally:
+        gfn.path_grad_scale_live = True
     log_Z_learned = log_flow[:, 0]
 
-    crystal_batch, log_r = get_loss_reward(log_T_tensor,
-                                           log_reward_fn,
-                                           mol_batch,
-                                           return_exp,
-                                           states,
-                                           no_grad=loss_coeffs.reward_grads == 0
-                                           )
+    if _rg_reshape:
+        # the reward is scored on a LEAF copy of the terminal: its graph ends
+        # there, so the plain reward path cannot reach the policy. The force is
+        # read off that graph once; the loss sees a second leaf (log_r) whose
+        # d loss / d log R is read by autograd; the two are recombined below.
+        _x_leaf = states[:, -1].detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            if return_exp:
+                _log_r_force, crystal_batch = log_reward_fn(_x_leaf, mol_batch, log_T_tensor, return_exp, keep_grads=True)
+                crystal_batch = crystal_batch.detach().to('cpu')
+            else:
+                _log_r_force = log_reward_fn(_x_leaf, mol_batch, log_T_tensor, return_exp, keep_grads=True)
+                crystal_batch = None
+        log_r = _log_r_force.detach().clone().requires_grad_(True)
+    else:
+        crystal_batch, log_r = get_loss_reward(log_T_tensor,
+                                               log_reward_fn,
+                                               mol_batch,
+                                               return_exp,
+                                               states,
+                                               no_grad=loss_coeffs.reward_grads == 0
+                                               )
     # OPTIONAL per-sample clip on the REWARD's own gradient path, separate from
     # the global grad clip. Defaults to 0 = off, so this is inert unless asked
     # for. Rationale: with reward_grads on, d log R / d x_T for an LJ-type
@@ -546,6 +588,41 @@ def get_gfn_forward_loss(loss_coeffs,
     # counter to _frozen_training_state -- so weights are never stepped on a
     # NaN, and the LR controller's reset tier sees the loss on its own clock.
     loss = combined_losses.mean()
+
+    if _rg_reshape:
+        # d loss / d log R per row, exactly as the loss weights it (autograd
+        # through the Huber knee / any IW weighting; the log_r leaf ends there)
+        _dl = torch.autograd.grad(loss, log_r, retain_graph=True, allow_unused=True)[0]
+        _dl = torch.zeros_like(log_r) if _dl is None else torch.nan_to_num(_dl.detach())
+        # d log R / d x_T per row, ONE backward through the energy graph
+        _F = torch.autograd.grad(_log_r_force.sum(), _x_leaf, allow_unused=True)[0]
+        _F = torch.zeros_like(_x_leaf) if _F is None else _F.detach()
+        _finite = torch.isfinite(_F).all(-1)
+        _F = torch.nan_to_num(_F, nan=0.0, posinf=0.0, neginf=0.0)
+        _fn = torch.linalg.vector_norm(_F, dim=-1)
+        _rs = {'rewardgrad/force_nonfinite_frac': (~_finite).float().mean(),
+               'rewardgrad/force_norm_mean': _fn.mean(), 'rewardgrad/force_norm_max': _fn.max()}
+        if _rg_fclip > 0:
+            _rs['rewardgrad/force_clipped_frac'] = (_fn > _rg_fclip).float().mean()
+            _F = _F * torch.clamp(_rg_fclip / _fn.clamp_min(1e-12), max=1.0).unsqueeze(-1)
+        if _rg_gate is not None:
+            # the row's TB residual; > gate = the sampler over-weights this row and
+            # sliding it downhill is the right correction; <= gate = leave it to
+            # the density route
+            _resid = (log_Z_learned + log_pf - log_r - log_pb).detach()
+            _gate = (_resid > _rg_gate).float()
+            _rs['rewardgrad/gate_frac'] = _gate.mean()
+            _dl = _dl * _gate
+        _c = _dl.unsqueeze(-1) * _F                       # reshaped d loss / d x_T through the reward
+        _rs['rewardgrad/push_norm_mean'] = torch.linalg.vector_norm(_c, dim=-1).mean()
+        _surrogate = (states[:, -1] * _c).sum()
+        loss = loss + (_surrogate - _surrogate.detach())  # zero value, gradient _c on the live terminal
+        if report_losses:
+            _slot = getattr(gfn, '_reward_grad_stats', None)
+            if isinstance(_slot, dict):
+                _slot.update({k: v.detach() for k, v in _rs.items()})
+            else:
+                gfn._reward_grad_stats = {k: v.detach() for k, v in _rs.items()}
 
     if report_losses:
         loss_dict = {'log_pf': log_pf.detach(),

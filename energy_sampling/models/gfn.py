@@ -892,6 +892,13 @@ class GFN(nn.Module):  # todo add seeding
         pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
             current_state, t_cur, condition_embedding, t_next, dts)
         pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, d.log())
+        # fwd_loss_coeffs.path_grad_scale 0: the reparameterised path gradient
+        # reaches the step's MEAN but not its noise SCALE. At small dt the scale
+        # channel carries sqrt(dt)/dt more of a terminal force than the mean
+        # channel (10x at T=100), and it is the channel that widens the last step.
+        # The density route's own gradient on the scale is untouched.
+        if not getattr(self, 'path_grad_scale_live', True):
+            pflogvars_sample = pflogvars_sample.detach()
         # exploration only inflates the diagonal; V is never inflated for sampling
         V_sample = V.detach() if (detach_traj and V is not None) else V
         next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample,
