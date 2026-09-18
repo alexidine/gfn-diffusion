@@ -1,5 +1,5 @@
-"""dose_sep16g -- owner's side experiment (2026-09-18): wider anchor noise than any 16f arm,
-with and without a 10x looser prior-buffer energy window. Same seed archive, same shape
+"""dose_sep16g -- owner's side experiment (2026-09-18): wider anchor noise than any 16f arm
+with a 10x looser prior-buffer energy window. Same seed archive, same shape
 (dose16e_n1_pbfrozen: N=1, tau 120, P_B frozen, replay 0.3 pinned, batch 1600), same
 anchors-only rebuild-on-resume mechanics and legacy-walls launch as dose_sep16f.
 
@@ -14,10 +14,10 @@ to 1000 kJ/mol above the minimum are admitted and never expire, the coverage wei
 flat to 500 above the minimum, and the reach trigger cannot fire (excesses of tens of
 kJ/mol never reach 75% of 1000).
 
-  anch_n08      noise 10^-1.4..10^-1.1 (0.04-0.08 latent), window as today (100 / 50)
-  anch_n08_w10  the same noise, ramp_floor 1000, ramp_width 500
+  anch_n08_w10  noise 10^-1.4..10^-1.1 (0.04-0.08 latent), ramp_floor 1000, ramp_width 500
 
-Read after ~5 tau; compare against dose16f_anch_n05 (0.03-0.06) and the parent.
+One arm (owner's call). Read after ~5 tau against dose16f_anch_n05 (0.03-0.06, window as
+today) and the parent; the noise and the window are not separated by this arm alone.
 """
 import importlib.util
 import pathlib
@@ -44,11 +44,10 @@ def _window(floor, width):
 
 
 NOISE = (-1.4, -1.1)
-ARMS = {
-    'anch_n08':     df.BASE_DELTAS + [df._anchors_only(*NOISE, 250_000, 0.25), df._rebuild_stage],
+ARMS = {   # owner 2026-09-18: just the one arm; the noise-only control is dose16f_anch_n05 (0.03-0.06)
     'anch_n08_w10': df.BASE_DELTAS + [df._anchors_only(*NOISE, 250_000, 0.25), df._rebuild_stage, _window(1000, 500)],
 }
-EXPECT = {'anch_n08': (NOISE[0], NOISE[1], 100, 50), 'anch_n08_w10': (NOISE[0], NOISE[1], 1000, 500)}
+EXPECT = {'anch_n08_w10': (NOISE[0], NOISE[1], 1000, 500)}
 
 
 def build():
