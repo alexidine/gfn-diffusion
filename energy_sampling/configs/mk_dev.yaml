@@ -1137,7 +1137,7 @@ buffers:
   # ~4 full turnovers in a 100k-step run -- against the replay buffer's 50, a
   # 500x separation that is the whole reason there are two of them.
   prior_buffer:
-    source: 'prior_model'   # 'prior_model' | 'anchors'. WHERE top-ups come from. Under 'anchors', snapshot_prior and prior_model_name are unnecessary and the resume gap they create (no prior_model after a restart) does not exist -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only. CONDITIONAL ARM: 'anchors' (it still sets prior_model_name, which is what fires train_prior's skip_if)
+    source: 'anchors'       # 'anchors' | 'prior_model'. WHERE top-ups (and rebuild_prior_by_churn) come from. 'anchors' = noised anchor_buffer rows at anchor_buffer.noise_log_range, no prior MODEL in the loop (owner default 2026-09-18). Under 'anchors', snapshot_prior and prior_model_name are unnecessary and the resume gap they create (no prior_model after a restart) does not exist -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only. CONDITIONAL ARM: 'anchors' (it still sets prior_model_name, which is what fires train_prior's skip_if)
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag

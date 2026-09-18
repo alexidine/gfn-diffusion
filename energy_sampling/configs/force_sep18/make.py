@@ -21,6 +21,13 @@ ARMS (fwd_loss_coeffs; everything else identical):
   g0c_pb    k 1, gate 0.0, |F| clip 250  the gate threshold's sensitivity
   g_pb      k 1, gate 1.0, no clip       added 14:10 after gc_pb: the clip cost half the search gain
                                           and all of the clash-tail cleanup; this isolates gate from clip
+  bad_pb    NO force; prior buffer rebuilt from ANCHORS ONLY at the stage transition, anchor noise
+            0.04-0.08 latent (mk_dev: 0.003-0.03, prior-model source), prior-buffer energy window
+            ramp_floor 1000 / ramp_width 500 (mk_dev: 100 / 50). Owner's absorption hypothesis
+            (2026-09-18): high-energy rows are the negative examples MLE lacks; does the still-
+            absorbing sampler absorb faster with them in the backward branch? Read against ctrl_pb
+            on the FORWARD oracles (Z, eval_fwd/tb_err, excess-energy P90/P99); every bwd/* metric
+            averages over this arm's own harder rows and is not comparable.
 
 SEAT. Rollout every step, fwd trains the policy at a pinned 0.3 share, bwd 0.5 /
 replay 0.2 with the ramp frozen; constant LR (burn_in_scale == fixed_scale); P_B
@@ -100,8 +107,20 @@ def common(cfg, name, steps=STEPS):
     return cfg
 
 
-def arm(name, k, rg, gate=None, force_clip=0.0, scale=1, steps=STEPS):
+def bad_buffer(cfg, lo=-1.4, hi=-1.1, floor=1000.0, width=500.0):
+    pb = cfg['buffers']['prior_buffer']
+    pb['source'] = 'anchors'
+    pb['ramp_floor'] = float(floor)
+    pb['ramp_width'] = float(width)
+    cfg['buffers']['anchor_buffer']['noise_log_range'] = [float(lo), float(hi)]
+    assert cfg['buffers']['anchor_buffer']['frozen'] is True
+    return cfg
+
+
+def arm(name, k, rg, gate=None, force_clip=0.0, scale=1, steps=STEPS, bad=False):
     cfg = common(fwd_seat(base()), name, steps=steps)
+    if bad:
+        cfg = bad_buffer(cfg)
     fc = cfg['fwd_loss_coeffs']
     fc['path_grad_last_k'] = int(k)
     fc['reward_grads'] = float(rg)
@@ -124,4 +143,5 @@ if __name__ == '__main__':
     arm('gcs_pb', 1, 1.0, gate=1.0, force_clip=FORCE_CLIP, scale=0)
     arm('g0c_pb', 1, 1.0, gate=0.0, force_clip=FORCE_CLIP)
     arm('g_pb', 1, 1.0, gate=1.0, force_clip=0.0)
+    arm('bad_pb', 0, 0.0, bad=True)
     arm('smoke_gc_pb', 1, 1.0, gate=1.0, force_clip=FORCE_CLIP, scale=0, steps=60)   # crosses the stub exit at +250, then 60 fused steps
