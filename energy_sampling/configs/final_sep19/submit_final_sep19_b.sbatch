@@ -11,7 +11,7 @@
 #SBATCH --job-name=fin19
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/final_sep19/joblogs/%x_%A_%a.out
 
-# final_sep19 leg b: the switch into rare rollouts (N=10, share pin30) from leg A archives; 2x2 on P_B kept frozen x stored force.
+# final_sep19 leg b: the switch into rare rollouts (N=10, share inherit) from leg A archives; 2x2 on P_B kept frozen x stored force.
 # Arm = row of INDEX_b.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge

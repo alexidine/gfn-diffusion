@@ -354,11 +354,11 @@ protocols:
         down: 0.006
         bounds:
           bwd:
-          - 0.7
-          - 0.7
+          - 0.05
+          - 0.9
           replay:
-          - 0.3
-          - 0.3
+          - 0.1
+          - 0.95
       exit:
       - metric: fwd/log_Z_learned
         above: -1000000000.0
@@ -376,10 +376,6 @@ protocols:
         z_calibration: false
       on_enter:
       - unfreeze_pb
-      fracs:
-        fwd: 0.0
-        bwd: 0.7
-        replay: 0.3
       deactivate_threshold: 0.01
       fwd_rollout_every: 10
       z_pin_rollout_every: 0
@@ -398,27 +394,7 @@ protocols:
         replay:
           tb: 1.0
           beta: 80
-      balance:
-        kind: gated_ramp
-        ramp: replay
-        guard: bwd
-        pinned:
-          fwd: 0.0
-        metric: bwd/under_coverage_rise150
-        bar: 0.0
-        ratchet_metric: bwd/under_coverage
-        ratchet_tol: 0.5
-        ratchet_cooldown_steps: 500
-        ratchet_release_tol: 0.25
-        up: 0.004
-        down: 0.006
-        bounds:
-          bwd:
-          - 0.7
-          - 0.7
-          replay:
-          - 0.3
-          - 0.3
+      balance: null
   conditional_vargrad:
     stages:
     - name: train_prior

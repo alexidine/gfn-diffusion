@@ -7,8 +7,10 @@ known-good but expensive regime first, then switch it into rare rollouts and tes
 LEG A (submit_final_sep19_a.sbatch, one arm per family, fin19_<fam>_a): phase 2 from the mle_fresh_sep17
 best-MLE checkpoint under the shape that reached 35.5-35.9 on mip (dose_sep16 n1_t6_pbfrozen / dose16e
 n1_pbfrozen): a rollout EVERY step, P_B frozen at the phase-2 entry (freeze_pb:full on equilibration's
-on_enter), replay 0.3 / bwd 0.7 PINNED by point bounds, tau 120, no forces, batch pinned 1600. This is the
-trunk; it runs until the owner judges it converged (log Z flat, held-out gap flat).
+on_enter), entering at replay 0.3 / bwd 0.7 with the gated ramp FREE up to replay 0.95 / bwd 0.05 (owner:
+"let the controller do its job"; the local ramp50 arm ramped unvetoed from a fresh reference and climbed ~2x
+faster than the 0.3 pin), tau 120, no forces, batch pinned 1600. This is the trunk; it runs until the owner
+judges it converged (log Z flat, held-out gap flat).
 
 LEG B (submit_final_sep19_b.sbatch, four cells per family): the SWITCH into rare rollouts, seeded by a FULL
 resume of the leg-A arm's newest step archive (archive_period 5000, archive_buffers on: `_stepN.pt` pairs
@@ -28,9 +30,10 @@ staged form never asks rare rollouts to climb; it asks them to HOLD a converged 
 regime's only job in production. The hold test (rr19 hold10: dose16e_n1_pbfrozen best -> N=10) is the local
 evidence for this design.
 
-SHARE_MODE. 'pin30': the rare stage keeps replay 0.3 / bwd 0.7 pinned (the trunk's split). 'ramp50': the
-rare stage enters at replay 0.5 / bwd 0.5 with the gated ramp free between replay 0.1-0.95 / bwd 0.05-0.9
-(owner: "let the controller do its job, up to 95:5"); chosen by the local ramp50 arm.
+SHARE_MODE. 'inherit' (shipped): the rare stage declares no fracs and no balance, so the transition leaves the
+split exactly where leg A's controller left it and nothing moves it afterwards -- the switch changes N and
+nothing else. 'pin30': replay 0.3 / bwd 0.7 pinned (the local hold test's shape). 'ramp50': enter at 0.5 with
+the ramp free.
 
 IDENTITY: prior_path/molecules_path/space_groups/z_primes/energy_function/mlip_path/checkpoints_dir, the
 `model` block (dplr_rank 0; committed mk_dev carries 6) and energy_config VERBATIM from the seed yaml
@@ -67,7 +70,7 @@ EPOCHS = 1_000_000                      # ABSOLUTE step cap; the seeds sit at ~1
 
 #: ---- the shape -------------------------------------------------------------------------------------
 N_RARE = 10                             # leg B rollout period; the local ladder reads N=10 (hold10) tonight
-SHARE_MODE = 'pin30'                    # 'pin30' | 'ramp50' -- see the docstring; set by the local ramp50 arm
+SHARE_MODE = 'inherit'                  # 'inherit' | 'pin30' | 'ramp50' -- see the docstring
 TAU_A, TAU_B = 120, 600
 REPLAY_MAX = 1_000_000                  # the cap must never bind: B x tau / N = 192k rows in leg A at 1600 / 120 / 1
 VAL_FRAC, VAL_CAP = 0.05, 1024
@@ -206,7 +209,11 @@ def stage_a(cfg, fam, name):
     common(cfg, fam, name)
     eq = _stage(cfg, 'equilibration')
     eq['fwd_rollout_every'] = 1
-    _pin(eq, PIN_REPLAY)
+    # entry replay 0.3 / bwd 0.7 (the split that reached 35.5) with the gated ramp FREE up to 95:5: the local
+    # ramp50 arm showed the controller ramps up unvetoed from a fresh reference while log Z climbs (level falling),
+    # and climbed ~2x faster than the 0.3 pin at the same steps; the deadlock was the stale reference + floor entry.
+    eq['fracs'] = {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3}
+    eq['balance']['bounds'] = {k: list(v) for k, v in RAMP_BOUNDS.items()}
     eq['on_enter'] = list(eq['on_enter']) + ['freeze_pb:full']
     cfg['buffers']['replay_buffer']['mean_residence_steps'] = TAU_A
     _rate(cfg, RATE_N1[fam])
@@ -226,7 +233,12 @@ def leg_b(cfg, fam, name, keep_frozen, force):
     rare.pop('on_exit', None)
     rare['on_enter'] = [] if keep_frozen else ['unfreeze_pb']
     rare['fwd_rollout_every'] = N_RARE
-    if SHARE_MODE == 'pin30':
+    if SHARE_MODE == 'inherit':
+        # no fracs, no balance: advance() leaves the live split as leg A's controller left it and nothing moves it
+        # afterwards, so the switch changes N and nothing else
+        rare.pop('fracs', None)
+        rare['balance'] = None
+    elif SHARE_MODE == 'pin30':
         _pin(rare, PIN_REPLAY)
     elif SHARE_MODE == 'ramp50':
         rare['fracs'] = {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5}
@@ -254,7 +266,7 @@ def check_common(cfg, name, fam):
     assert stub['exit'] == [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}] and 'skip_if' not in stub, name
     eq = _stage(cfg, 'equilibration')
     assert eq['fwd_rollout_every'] == 1 and eq['fracs'] == {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3}, name
-    assert eq['balance']['bounds'] == {'bwd': [0.7, 0.7], 'replay': [0.3, 0.3]} and 'freeze_pb:full' in eq['on_enter'], name
+    assert eq['balance']['bounds'] == RAMP_BOUNDS and 'freeze_pb:full' in eq['on_enter'], name
     assert eq['loss_coeffs']['fwd']['freeze_policy'] == 1.0, name
     rb = cfg['buffers']['replay_buffer']
     assert rb['max_size'] >= 5 * BATCH * TAU_A and rb['val_frac'] == VAL_FRAC, name
@@ -285,7 +297,9 @@ def check_b(cfg, name, fam, keep_frozen, force, cfg_a):
     assert eq['exit'] == [{'metric': 'fwd/log_Z_learned', 'above': -1.0e9, 'patience': 1}], name
     assert rare['fwd_rollout_every'] == N_RARE and 'exit' not in rare, name
     assert rare['on_enter'] == ([] if keep_frozen else ['unfreeze_pb']), name
-    if SHARE_MODE == 'pin30':
+    if SHARE_MODE == 'inherit':
+        assert 'fracs' not in rare and rare['balance'] is None, name
+    elif SHARE_MODE == 'pin30':
         assert rare['fracs'] == {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3} and rare['balance']['bounds'] == {'bwd': [0.7, 0.7], 'replay': [0.3, 0.3]}, name
     else:
         assert rare['fracs'] == {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5} and rare['balance']['bounds'] == RAMP_BOUNDS, name
@@ -516,7 +530,7 @@ def main(argv):
         f.write(SBATCH.format(last=len(B) - 1, leg='b', seed_block=SEED_B,
                               what=f'the switch into rare rollouts (N={N_RARE}, share {SHARE_MODE}) from leg A archives; 2x2 on P_B kept frozen x stored force.', **common_kw))
     for i, (name, (cfg, fam)) in enumerate(A.items()):
-        print(f"[a{i}] {name:<16} N=1 tau={TAU_A} rate={cfg['lr_control']['fixed_scale']:g} pinned {PIN_REPLAY} frozen-at-entry seed=*{SRC[fam]}_*_best.pt")
+        print(f"[a{i}] {name:<16} N=1 tau={TAU_A} rate={cfg['lr_control']['fixed_scale']:g} entry 0.3 ramp-free-to-95:5 frozen-at-entry seed=*{SRC[fam]}_*_best.pt")
     for i, (name, (cfg, fam, src, kf, force)) in enumerate(B.items()):
         print(f"[b{i}] {name:<16} N={N_RARE} tau={TAU_B} rate={cfg['lr_control']['fixed_scale']:g} share={SHARE_MODE} "
               f"pb_frozen_kept={kf} stored_force={force} switch-from=*{src}_*_step*.pt")
