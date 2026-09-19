@@ -153,6 +153,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # trials are paid N times. This is the cheap place to spend steps.
   burn_in_steps: 3000        # ~0.975 bias correction at beta2 0.999
   burn_in_scale: 0.05        # x seed_lr = 6.25e-6, the conservative end of the range measured survivable on this route (5e-6 through 8e-5 clean; 2e-4 non-finite by step 1560)
+  promotion_ramp_steps: 1000 # mode: fixed only -- steps over which the scale moves geometrically from burn_in_scale to fixed_scale after burn-in; the burn-in bars stay live through it and are refitted at fixed_scale. 0 = a single jump
   # GO / NO-GO ON MEASURING AT ALL, checked once, when burn-in ends and the
   # root is taken. Pass -> the grid runs and a rate is selected. Fail -> NO
   # TRIALS RUN, and the stage holds burn_in_scale for its whole length: the

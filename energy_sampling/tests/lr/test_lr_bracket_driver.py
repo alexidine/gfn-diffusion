@@ -901,7 +901,7 @@ def test_fixed_mode_on_resume_waits_for_the_window_before_asserting_its_rate():
     backstops alone. The wait is safe: until the window fills the run holds
     the burn-in scale."""
     m = FakeTrainer(lr_control=_control(mode='fixed', fixed_scale=0.4,
-                                        burn_in_steps=30))
+                                        burn_in_steps=30, promotion_ramp_steps=0))
     c = m.lr_controller
     # a resume: burn-in elapsed by step count, this process has observed nothing
     m.step_ind = 500
@@ -920,6 +920,82 @@ def test_fixed_mode_on_resume_waits_for_the_window_before_asserting_its_rate():
     assert c.scale == 0.4, 'fixed mode never asserted its rate after the wait'
     assert m.train_key in c.bars.loss_bar, (
         'the wait must buy a real derived bar, not just delay the backstop hold')
+
+
+def _ramping(ramp_steps=40, fixed_scale=0.8, **kw):
+    """A fixed-mode trainer taken through burn-in to the start of its promotion ramp."""
+    m = FakeTrainer(lr_control=_control(mode='fixed', fixed_scale=fixed_scale,
+                                        burn_in_steps=30,
+                                        promotion_ramp_steps=ramp_steps, **kw))
+    c = m.lr_controller
+    for _ in range(60):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+        if c._state().get('ramp') is not None:
+            break
+    assert c._state().get('ramp') is not None, 'fixed mode never started its promotion ramp'
+    return m, c
+
+
+def _advance(m, c, n):
+    for _ in range(n):
+        m.step_ind += 1
+        c.tick()
+
+
+def test_fixed_mode_ramps_geometrically_to_its_scale():
+    """Owner 2026-09-19: the single jump from burn_in_scale to fixed_scale shocked
+    the MLE by 1-4 nats on nehu. The scale follows lo * (hi/lo)^(k/n) and then
+    holds hi, and the bar refit is queued only once hi is reached."""
+    m, c = _ramping(ramp_steps=40, fixed_scale=0.8)
+    lo, hi = c.bracket.burn_in_scale, 0.8
+    assert c.scale == pytest.approx(lo)
+    assert c._cruise_bar is None, 'the bar refit must wait for the end of the ramp'
+    _advance(m, c, 20)
+    assert c.scale == pytest.approx(lo * (hi / lo) ** 0.5), 'not geometric at the midpoint'
+    assert c.live_rates()[m.train_key] == pytest.approx(0.1 * c.scale), (
+        'the ramp moved the recorded scale but not the optimizer')
+    _advance(m, c, 20)
+    assert c.scale == pytest.approx(hi) and c._state().get('ramp') is None
+    assert c._cruise_bar is not None, 'no bar refit queued at the end of the ramp'
+    _advance(m, c, 10)
+    assert c.scale == pytest.approx(hi), 'the scale left the target after the ramp'
+
+
+def test_a_cut_mid_ramp_scales_the_whole_ramp():
+    """A fire restores lr_ctrl and multiplies the scale; mid-ramp the next tick
+    would recompute the uncut ramp and silently undo the cut."""
+    m, c = _ramping(ramp_steps=40, fixed_scale=0.8, fire_cut_factor=0.5)
+    lo, hi = c.bracket.burn_in_scale, 0.8
+    _advance(m, c, 20)
+    c.on_divergence()
+    assert c.scale == pytest.approx(0.5 * lo * (hi / lo) ** 0.5)
+    _advance(m, c, 1)
+    assert c.scale == pytest.approx(0.5 * lo * (hi / lo) ** (21 / 40)), 'the cut was undone'
+    _advance(m, c, 19)
+    assert c.scale == pytest.approx(0.5 * hi)
+
+
+def test_a_stage_change_drops_the_ramp():
+    m, c = _ramping(ramp_steps=40, fixed_scale=0.8)
+    _advance(m, c, 10)
+    c.on_stage_change()
+    assert c._state().get('ramp') is None
+    assert c.scale == pytest.approx(c.bracket.burn_in_scale)
+
+
+def test_a_zero_ramp_is_the_old_single_jump():
+    m = FakeTrainer(lr_control=_control(mode='fixed', fixed_scale=0.8, burn_in_steps=30,
+                                        promotion_ramp_steps=0))
+    c = m.lr_controller
+    for _ in range(60):
+        m.step_ind += 1
+        loss = m.train_step(m.train_key)
+        c.observe(m.train_key, loss, m.last_grad_norm_pre_clip)
+        c.tick()
+    assert c.scale == pytest.approx(0.8) and c._state().get('ramp') is None
 
 
 def test_a_promotion_clears_the_refusal_latch():
@@ -977,7 +1053,7 @@ def test_fixed_mode_still_derives_a_hard_failure_bar():
     Without a derived bar the whole stage's only guard is the absolute backstop,
     which is what caught nothing on this route when the loss ran -25 -> +318."""
     m = FakeTrainer(lr_control=_control(mode='fixed', fixed_scale=0.2,
-                                        burn_in_steps=40))
+                                        burn_in_steps=40, promotion_ramp_steps=0))
     c = m.lr_controller
     for _ in range(40):
         m.step_ind += 1
@@ -1285,7 +1361,7 @@ def test_a_tested_rate_suspends_the_cold_bar_and_an_untested_one_does_not():
     assert not bracketed.lr_controller.bars.loss_bar, (
         'a trial-validated rate should not be judged by the burn-in bar')
 
-    fixed = _hot_seat(mode='fixed', fixed_scale=3.2)
+    fixed = _hot_seat(mode='fixed', fixed_scale=3.2, promotion_ramp_steps=0)
     _to_cruise(fixed)
     assert fixed.lr_controller._cruise_bar['suspended'] is False
     assert fixed.train_key in fixed.lr_controller.bars.loss_bar, (

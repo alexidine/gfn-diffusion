@@ -174,6 +174,12 @@ class LRController:
     def _cfg(self, name, default=None):
         return _get(self._cfg_node(), name, default)
 
+    def _promotion_ramp_steps(self) -> int:
+        n = int(self._cfg('promotion_ramp_steps', self._PROMOTION_RAMP_STEPS) or 0)
+        if n < 0:
+            raise ValueError(f'lr_control.promotion_ramp_steps must be >= 0, got {n}')
+        return n
+
     def _managed_keys(self):
         """Config keys the bracket owns -- those written `auto`, recorded by
         resolve_derived_config at load. Empty set = the controller reads and logs
@@ -233,7 +239,12 @@ class LRController:
         'verbose', 'hard_failure', 'ray_calibration',
         'trial_settle_steps', 'logz_detour_nats',
         'fire_cut_factor', 'fire_cooldown_steps',
+        'promotion_ramp_steps',
     })
+
+    #: Fixed mode: steps over which the scale moves geometrically from the burn-in
+    #: scale to fixed_scale. 0 = the old single jump.
+    _PROMOTION_RAMP_STEPS = 1000
     _HARD_FAILURE_KEYS = frozenset({
         'loss_excursion_k', 'grad_excursion_x', 'loss_abs', 'grad_abs',
         'root_window', 'min_observations',
@@ -278,8 +289,11 @@ class LRController:
         b = self.bracket
         managed = ','.join(sorted(self._managed_keys())) or 'NOTHING (control arm)'
         if b.mode == 'fixed':
+            ramp = self._promotion_ramp_steps()
+            ramp_note = (f'a geometric ramp over {ramp} steps to' if ramp > 0
+                         and b.fixed_scale != b.burn_in_scale else 'then')
             print(f'lr_ctrl (bracket v10): FIXED mode -- burn-in {b.burn_in_steps} steps '
-                  f'at scale {b.burn_in_scale:g}, then scale {b.fixed_scale:g} held for '
+                  f'at scale {b.burn_in_scale:g}, {ramp_note} scale {b.fixed_scale:g} held for '
                   f'the stage. No trials, no re-bracketing. Managed: {managed}')
             return
         print(f'lr_ctrl (bracket v10): burn-in {b.burn_in_steps} steps at scale '
@@ -509,6 +523,11 @@ class LRController:
         """
         self._divergences += max(int(count), 1)
         factor = float(self._cfg('fire_cut_factor', 0.5))
+        ramp = self._state().get('ramp')
+        if ramp is not None:
+            # a cut mid-ramp scales the whole ramp, or the next tick would undo it
+            ramp['from'] = float(ramp['from']) * factor
+            ramp['to'] = float(ramp['to']) * factor
         new = self.set_scale(self.scale * factor, why='disaster_rewind_cut')
         print(f'lr_ctrl: fire #{self._divergences} -- rewound, and the rate is '
               f'CUT to scale {new:.4g} (x{factor:g}): re-entering restored weights '
@@ -595,6 +614,9 @@ class LRController:
                   f'since the last selection')
             skip = self._open_bracket(step)
 
+        if b.phase == CRUISE and self._state().get('ramp') is not None:
+            self._advance_ramp(step)
+
         if b.phase == CRUISE:
             b.note_promoted_steps(1)
             if self._cruise_bar is not None:
@@ -609,6 +631,24 @@ class LRController:
         st['bracket'] = b.state_dict()
         st['scale'] = float(st.get('scale', b.scale_now()))
         return int(skip)
+
+    def _advance_ramp(self, step: int):
+        """Set the scale to from * (to/from)^(elapsed/steps); at the end, hold the
+        target and queue the bar refit at it."""
+        st = self._state()
+        ramp = st['ramp']
+        lo, hi = float(ramp['from']), float(ramp['to'])
+        n = max(int(ramp['steps']), 1)
+        done = step - int(ramp['start'])
+        if done >= n:
+            st.pop('ramp', None)
+            self.set_scale(hi, why='promotion_ramp_complete')
+            self._arm_cruise_bar(hi, suspend=False)
+            print(f'lr_ctrl: promotion ramp complete at step {step} -- holding scale {hi:g}.')
+            return
+        scale = lo * (hi / lo) ** (max(done, 0) / n)
+        if scale != self.scale:
+            self.set_scale(scale, why='promotion_ramp')
 
     def _bars_ready(self, full: bool = False) -> bool:
         """Has the root window filled enough to derive a bar that can fire?
@@ -855,11 +895,24 @@ class LRController:
             else:
                 print(f'lr_ctrl: NO derived hard-failure bar ({why}) -- fixed mode '
                       f'continues on the absolute backstops alone.')
-            self.set_scale(b.fixed_scale, why='fixed_mode')
-            b.promote(b.fixed_scale, step)
-            self._arm_cruise_bar(b.fixed_scale, suspend=False)
+            ramp_steps = self._promotion_ramp_steps()
+            target = float(b.fixed_scale)
+            b.promote(target, step)
+            if ramp_steps > 0 and entry_scale > 0 and target != entry_scale:
+                # THE RAMP LIVES IN lr_ctrl, which is checkpointed: a rewind or a
+                # resume lands mid-ramp and tick() continues it from the restored
+                # step. The bars fitted at the burn-in rate stay live through it
+                # and are refitted once the target is reached.
+                self._state()['ramp'] = {'from': entry_scale, 'to': target,
+                                         'start': int(step), 'steps': int(ramp_steps)}
+                print(f'lr_ctrl: burn-in complete at step {step}; FIXED mode -- ramping '
+                      f'scale {entry_scale:g} -> {target:g} geometrically over '
+                      f'{ramp_steps} steps, then holding it for the stage. No trials run.')
+                return 0
+            self.set_scale(target, why='fixed_mode')
+            self._arm_cruise_bar(target, suspend=False)
             print(f'lr_ctrl: burn-in complete at step {step}; FIXED mode -- holding '
-                  f'scale {b.fixed_scale:g} for the stage. No trials run.')
+                  f'scale {target:g} for the stage. No trials run.')
             return 0
 
         if not self.stepping_optimizer_keys():
@@ -1063,6 +1116,7 @@ class LRController:
         # the outgoing bars must NOT be put back.
         self._cruise_bar = None
         self._bars_redrawn = False
+        st.pop('ramp', None)
         self.set_scale(b.burn_in_scale, why='stage_change')
         print(f'lr_ctrl: stage change -- burn-in restarted, {b.burn_in_steps} steps at '
               f'scale {b.burn_in_scale:g}. The optimizers were rebuilt, so Adam\'s step '
