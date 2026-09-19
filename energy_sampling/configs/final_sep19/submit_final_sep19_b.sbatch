@@ -11,8 +11,8 @@
 #SBATCH --job-name=fin19
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/final_sep19/joblogs/%x_%A_%a.out
 
-# final_sep19: phase 2 under rare rollouts from the mle_fresh_sep17 best-MLE checkpoints, 2x2 on P_B frozen x stored force.
-# Arm = row of INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
+# final_sep19 leg b: the switch into rare rollouts (N=10, share pin30) from leg A archives; 2x2 on P_B kept frozen x stored force.
+# Arm = row of INDEX_b.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
 
@@ -27,10 +27,11 @@ DATA=/scratch/mk8347/data/crystal_datasets/conditional/priors
 mkdir -p ${LOGS}
 
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
-ARM=$(awk -F'\t' -v n=${ROW} 'NR==n {print $1}' ${ARMS}/INDEX.tsv)
-SRC=$(awk -F'\t' -v n=${ROW} 'NR==n {print $4}' ${ARMS}/INDEX.tsv)
-PRIOR=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${ARMS}/INDEX.tsv)
-PRIOR_BYTES=$(awk -F'\t' -v n=${ROW} 'NR==n {print $6}' ${ARMS}/INDEX.tsv)
+INDEX=${ARMS}/INDEX_b.tsv
+ARM=$(awk -F'\t' -v n=${ROW} 'NR==n {print $1}' ${INDEX})
+SRC=$(awk -F'\t' -v n=${ROW} 'NR==n {print $4}' ${INDEX})
+PRIOR=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${INDEX})
+PRIOR_BYTES=$(awk -F'\t' -v n=${ROW} 'NR==n {print $6}' ${INDEX})
 if [ -z "${ARM}" ]; then echo "no arm at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 CONFIG=${ARMS}/${ARM}.yaml
 if [ ! -f "${CONFIG}" ]; then echo "missing config ${CONFIG}" >&2; exit 1; fi
@@ -63,28 +64,34 @@ if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
 fi
 
 # RESUME OR SEED. checkpoint_name always wins in train.py: an arm with its own _running.pt continues it
-# (full load); only a first launch seeds from the mlefr arm's _best.pt (its bwd/mle record). REFUSES AN
-# AMBIGUOUS MATCH.
+# (full load); only a first launch seeds. REFUSES AN AMBIGUOUS MATCH.
 OWN=$(ls -t ${CKPTS}/*${ARM}_*_running.pt 2>/dev/null | head -1)
 if [ -n "${OWN}" ]; then
     echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  RESUME: $(basename ${OWN})"
     CK=${OWN}
 else
-    NM=$(ls ${CKPTS}/*${SRC}_*_best.pt 2>/dev/null | wc -l)
-    if [ "${NM}" -ne 1 ]; then
-        echo "FATAL: ${NM} matches for *${SRC}_*_best.pt in ${CKPTS} (need exactly 1):" >&2
-        ls ${CKPTS}/*${SRC}_*_best.pt >&2; exit 1
+    # THE SEED IS LEG A'S NEWEST STEP ARCHIVE (archive_period 5000; its frozen _stepN_buffers.pt sidecar
+    # pairs with it), never its live _running.pt, which the still-running leg-A job may be rewriting.
+    CK=$(ls -t ${CKPTS}/*${SRC}_*_step[0-9]*.pt 2>/dev/null | grep -v '_buffers.pt$' | head -1)
+    if [ -z "${CK}" ]; then
+        echo "FATAL: leg A arm ${SRC} has no step archive yet in ${CKPTS} (needs archive_period steps)" >&2; exit 1
     fi
-    CK=$(ls ${CKPTS}/*${SRC}_*_best.pt)
-    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SEED: $(basename ${CK}) (mtime $(stat -c %y ${CK}))"
+    if [ ! -f "${CK%.pt}_buffers.pt" ]; then
+        echo "FATAL: ${CK} has no frozen buffers sidecar beside it" >&2; exit 1
+    fi
+    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SWITCH from: $(basename ${CK}) (mtime $(stat -c %y ${CK}))"
 fi
 
-# THE PRIOR MODEL: the stub's snapshot_prior writes it on leg 1; a continued leg is handed its own.
+# THE PRIOR MODEL: written by the stub's snapshot_prior on leg A's first launch; every later launch is
+# handed one (its own if it has one, else its source arm's).
 OWNPRIOR=$(ls -t ${CKPTS}/*${ARM}_*_prior.pt 2>/dev/null | head -1)
+SRCPRIOR=$(ls -t ${CKPTS}/*${SRC}_*_prior.pt 2>/dev/null | head -1)
 if [ -n "${OWNPRIOR}" ]; then
-    PM=$(basename ${OWNPRIOR}); echo "  prior model <- ${PM}"
+    PM=$(basename ${OWNPRIOR}); echo "  prior model <- ${PM} (own)"
+elif [ -n "${SRCPRIOR}" ]; then
+    PM=$(basename ${SRCPRIOR}); echo "  prior model <- ${PM} (source arm)"
 else
-    PM=null; echo "  prior model <- null (leg 1 writes it)"
+    PM=null; echo "  prior model <- null (the stub writes it)"
 fi
 
 sed -e "s|WARM_CHECKPOINT_PLACEHOLDER|$(basename ${CK})|" \
