@@ -4,13 +4,14 @@ known-good but expensive regime first, then switch it into rare rollouts and tes
     python configs/final_sep19/make.py            # base = the COMMITTED mk_dev (git show HEAD:), warns on a dirty tree
     python configs/final_sep19/make.py --families nehu
 
-LEG A (submit_final_sep19_a.sbatch, one arm per family, fin19_<fam>_a): phase 2 from the mle_fresh_sep17
+LEG A (submit_final_sep19_a.sbatch): the PRODUCTION TRUNK fin19_<fam>_a -- phase 2 from the mle_fresh_sep17
 best-MLE checkpoint under the shape that reached 35.5-35.9 on mip (dose_sep16 n1_t6_pbfrozen / dose16e
 n1_pbfrozen): a rollout EVERY step, P_B frozen at the phase-2 entry (freeze_pb:full on equilibration's
-on_enter), entering at replay 0.3 / bwd 0.7 with the gated ramp FREE up to replay 0.95 / bwd 0.05 (owner:
-"let the controller do its job"; the local ramp50 arm ramped unvetoed from a fresh reference and climbed ~2x
-faster than the 0.3 pin), tau 120, no forces, batch pinned 1600. This is the trunk; it runs until the owner
-judges it converged (log Z flat, held-out gap flat).
+on_enter), replay 0.3 / bwd 0.7 PINNED, tau 120, no forces, batch pinned 1600. It runs until the owner judges
+it converged (log Z flat, held-out gap flat, zmatch/delta_mean settled). Beside it on ELJ families only
+(RAMP_TRUNKS), fin19_<fam>_ramp_a: the same trunk with the gated ramp FREE from 0.3 up to replay 0.95 /
+bwd 0.05 -- the share question, given the horizon it needs, without the production path depending on it.
+Owner 2026-09-19 21:10: mip only for now.
 
 LEG B (submit_final_sep19_b.sbatch, four cells per family): the SWITCH into rare rollouts, seeded by a FULL
 resume of the leg-A arm's newest step archive (archive_period 5000, archive_buffers on: `_stepN.pt` pairs
@@ -76,6 +77,7 @@ REPLAY_MAX = 1_000_000                  # the cap must never bind: B x tau / N =
 VAL_FRAC, VAL_CAP = 0.05, 1024
 RAMP_BOUNDS = {'bwd': [0.05, 0.9], 'replay': [0.1, 0.95]}
 PIN_REPLAY = 0.3
+PINNED_BOUNDS = {'bwd': [0.7, 0.7], 'replay': [0.3, 0.3]}
 BATCH = 1600
 BURN_IN_STEPS = 500
 EXCURSION_K = 60.0
@@ -89,7 +91,8 @@ RATE_N5 = {'nehu': 0.125, 'mip': 1.0}
 #: replay/tb_err fell 3.7 -> 3.1: memorisation at that pressure. Leg B's job is to hold, not to climb, so it
 #: takes half the pressure per pass; the cluster's batch 1600 gives 4x the fresh rows per step on top.
 RATE_B_FACTOR = 0.5
-FAMILIES = ['nehu', 'mip']
+FAMILIES = ['mip']                      # owner 2026-09-19 21:10: mip only for now
+RAMP_TRUNKS = ['mip']                   # families that also get the controller-free trunk (the leg-A share question)
 SEED_ARM = {'nehu': 'mle_fresh_sep17/mlefr_nehu_lr2.yaml', 'mip': 'mle_fresh_sep17/mlefr_mip_lr2.yaml'}
 SRC = {'nehu': 'mlefr_nehu_lr2', 'mip': 'mlefr_mip_lr2'}
 MLIP = {'nehu': True, 'mip': False}
@@ -205,15 +208,24 @@ def _rate(cfg, scale):
     lc['burn_in_scale'] = float(scale)
 
 
-def stage_a(cfg, fam, name):
+def stage_a(cfg, fam, name, share='pin'):
     common(cfg, fam, name)
     eq = _stage(cfg, 'equilibration')
     eq['fwd_rollout_every'] = 1
-    # entry replay 0.3 / bwd 0.7 (the split that reached 35.5) with the gated ramp FREE up to 95:5: the local
-    # ramp50 arm showed the controller ramps up unvetoed from a fresh reference while log Z climbs (level falling),
-    # and climbed ~2x faster than the 0.3 pin at the same steps; the deadlock was the stale reference + floor entry.
-    eq['fracs'] = {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3}
-    eq['balance']['bounds'] = {k: list(v) for k, v in RAMP_BOUNDS.items()}
+    if share == 'pin':
+        # THE PRODUCTION TRUNK: replay 0.3 / bwd 0.7 pinned by point bounds -- the only split with long-horizon
+        # evidence (dose_sep16 n1 arms, 8k-21k steps, 35.9 on mip). Nothing about the share is assumed here.
+        _pin(eq, PIN_REPLAY)
+    elif share == 'ramp':
+        # THE SHARE QUESTION, beside the pinned trunk on ELJ where it is cheap: enter at the same 0.3 / 0.7 with the
+        # gated ramp FREE up to 95:5 (owner: let the controller do its job). The local ramp50 arm ramped unvetoed
+        # from a fresh reference and climbed faster over 1000 steps, but zmatch/delta_mean was not read and the runs
+        # were far too short for convergence statistics; read this arm at 5k / 10k / 20k on zmatch/delta_mean,
+        # replay/val_gap_nats and fwd/log_Z_learned against the pinned trunk.
+        eq['fracs'] = {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3}
+        eq['balance']['bounds'] = {k: list(v) for k, v in RAMP_BOUNDS.items()}
+    else:
+        raise ValueError(share)
     eq['on_enter'] = list(eq['on_enter']) + ['freeze_pb:full']
     cfg['buffers']['replay_buffer']['mean_residence_steps'] = TAU_A
     _rate(cfg, RATE_N1[fam])
@@ -223,7 +235,7 @@ def stage_a(cfg, fam, name):
 def leg_b(cfg, fam, name, keep_frozen, force):
     """Leg A's config (same identity, same stages) plus the switch: `equilibration` exits at its first eval
     into `equilibration_rare`."""
-    stage_a(cfg, fam, name)
+    stage_a(cfg, fam, name, share='pin')      # seeded from the PINNED trunk; 'inherit' then holds 0.3 / 0.7
     stages = cfg['protocols']['unconditional_tb']['stages']
     eq = _stage(cfg, 'equilibration')
     eq['exit'] = [{'metric': 'fwd/log_Z_learned', 'above': -1.0e9, 'patience': 1}]
@@ -266,7 +278,7 @@ def check_common(cfg, name, fam):
     assert stub['exit'] == [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}] and 'skip_if' not in stub, name
     eq = _stage(cfg, 'equilibration')
     assert eq['fwd_rollout_every'] == 1 and eq['fracs'] == {'fwd': 0.0, 'bwd': 0.7, 'replay': 0.3}, name
-    assert eq['balance']['bounds'] == RAMP_BOUNDS and 'freeze_pb:full' in eq['on_enter'], name
+    assert eq['balance']['bounds'] in (RAMP_BOUNDS, PINNED_BOUNDS) and 'freeze_pb:full' in eq['on_enter'], name
     assert eq['loss_coeffs']['fwd']['freeze_policy'] == 1.0, name
     rb = cfg['buffers']['replay_buffer']
     assert rb['max_size'] >= 5 * BATCH * TAU_A and rb['val_frac'] == VAL_FRAC, name
@@ -280,10 +292,12 @@ def check_common(cfg, name, fam):
     w3._scan_local_paths(cfg, name)
 
 
-def check_a(cfg, name, fam):
+def check_a(cfg, name, fam, share):
     check_common(cfg, name, fam)
     assert [s['name'] for s in cfg['protocols']['unconditional_tb']['stages']] == ['train_prior', 'equilibration'], name
-    assert 'exit' not in _stage(cfg, 'equilibration'), name
+    eq = _stage(cfg, 'equilibration')
+    assert 'exit' not in eq, name
+    assert eq['balance']['bounds'] == (RAMP_BOUNDS if share == 'ramp' else PINNED_BOUNDS), name
     assert cfg['buffers']['replay_buffer']['mean_residence_steps'] == TAU_A, name
     assert cfg['lr_control']['fixed_scale'] == RATE_N1[fam] and cfg['replay_loss_coeffs']['stored_force_k'] == 0, name
 
@@ -291,6 +305,7 @@ def check_a(cfg, name, fam):
 def check_b(cfg, name, fam, keep_frozen, force, cfg_a):
     check_common(cfg, name, fam)
     assert w3.problem_def(cfg) == w3.problem_def(cfg_a), name + ': identity differs from leg A'
+    assert _stage(cfg, 'equilibration')['balance']['bounds'] == PINNED_BOUNDS, name
     st = cfg['protocols']['unconditional_tb']['stages']
     assert [s['name'] for s in st] == ['train_prior', 'equilibration', 'equilibration_rare'], name
     eq, rare = st[1], st[2]
@@ -481,10 +496,16 @@ def build(families):
     A, B = {}, {}
     for fam in families:
         name_a = f'{TAG}_{fam}_a'
-        cfg_a = stage_a(copy.deepcopy(base), fam, name_a)
-        check_a(cfg_a, name_a, fam)
+        cfg_a = stage_a(copy.deepcopy(base), fam, name_a, share='pin')
+        check_a(cfg_a, name_a, fam, 'pin')
         load_check(cfg_a, name_a, ['train_prior', 'equilibration'])
         A[name_a] = (cfg_a, fam)
+        if fam in RAMP_TRUNKS:
+            name_r = f'{TAG}_{fam}_ramp_a'   # NOT <fam>_a_ramp: leg B's seed glob *<fam>_a_*_step*.pt must not match it
+            cfg_r = stage_a(copy.deepcopy(base), fam, name_r, share='ramp')
+            check_a(cfg_r, name_r, fam, 'ramp')
+            load_check(cfg_r, name_r, ['train_prior', 'equilibration'])
+            A[name_r] = (cfg_r, fam)
         for cell, (keep_frozen, force) in CELLS.items():
             name = f'{TAG}_{fam}_{cell}'
             cfg = leg_b(copy.deepcopy(base), fam, name, keep_frozen, force)
@@ -530,7 +551,8 @@ def main(argv):
         f.write(SBATCH.format(last=len(B) - 1, leg='b', seed_block=SEED_B,
                               what=f'the switch into rare rollouts (N={N_RARE}, share {SHARE_MODE}) from leg A archives; 2x2 on P_B kept frozen x stored force.', **common_kw))
     for i, (name, (cfg, fam)) in enumerate(A.items()):
-        print(f"[a{i}] {name:<16} N=1 tau={TAU_A} rate={cfg['lr_control']['fixed_scale']:g} entry 0.3 ramp-free-to-95:5 frozen-at-entry seed=*{SRC[fam]}_*_best.pt")
+        share = 'ramp free 0.3->95:5' if name.endswith('_ramp_a') else 'pinned 0.3/0.7'
+        print(f"[a{i}] {name:<16} N=1 tau={TAU_A} rate={cfg['lr_control']['fixed_scale']:g} {share} frozen-at-entry seed=*{SRC[fam]}_*_best.pt")
     for i, (name, (cfg, fam, src, kf, force)) in enumerate(B.items()):
         print(f"[b{i}] {name:<16} N={N_RARE} tau={TAU_B} rate={cfg['lr_control']['fixed_scale']:g} share={SHARE_MODE} "
               f"pb_frozen_kept={kf} stored_force={force} switch-from=*{src}_*_step*.pt")

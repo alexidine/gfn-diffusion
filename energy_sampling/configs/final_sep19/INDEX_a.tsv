@@ -1,3 +1,3 @@
 arm	family	start	warm_src	prior	prior_bytes
-fin19_nehu_a	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
 fin19_mip_a	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
+fin19_mip_ramp_a	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
