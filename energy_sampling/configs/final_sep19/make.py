@@ -24,6 +24,8 @@ held log Z at the full dose but its held-out gap crept, see RATE_B_FACTOR). The 
   <fam>_unpb    unfreeze_pb on the rare stage's on_enter                              does a live P_B help or hurt once converged
   <fam>_pbf     frozen + stored terminal force on replay rows (stored_force_k 1)      the untested cell of the dose ladder
   <fam>_unpbf   live P_B + stored force
+  <fam>_pb_n5, <fam>_pb_n20   the plain cell (frozen, no force) at N=5 and N=20, dose-matched rate (x 5/N):
+                the fan over N -- how rare the rollouts can be while the trunk's state holds (rows after the 2x2)
 
 WHY STAGED. The local rr_sep19 ladder (2026-09-19) showed that resuming a held state (replay 0.1 / bwd 0.9)
 under rare rollouts is a deadlock: log Z flat, coverage level rising, the ramp's ratchet never releases. The
@@ -70,7 +72,8 @@ WALL = '2-00:00:00'
 EPOCHS = 1_000_000                      # ABSOLUTE step cap; the seeds sit at ~120k
 
 #: ---- the shape -------------------------------------------------------------------------------------
-N_RARE = 10                             # leg B rollout period; the local ladder reads N=10 (hold10) tonight
+N_RARE = 10                             # leg B rollout period for the 2x2 (the local hold test's N)
+N_FAN = [5, 20]                         # the plain cell (P_B kept frozen, no force) repeated at these N, dose-matched rate
 SHARE_MODE = 'inherit'                  # 'inherit' | 'pin30' | 'ramp50' -- see the docstring
 TAU_A, TAU_B = 120, 600
 REPLAY_MAX = 1_000_000                  # the cap must never bind: B x tau / N = 192k rows in leg A at 1600 / 120 / 1
@@ -232,7 +235,7 @@ def stage_a(cfg, fam, name, share='pin'):
     return cfg
 
 
-def leg_b(cfg, fam, name, keep_frozen, force):
+def leg_b(cfg, fam, name, keep_frozen, force, n_rare=N_RARE):
     """Leg A's config (same identity, same stages) plus the switch: `equilibration` exits at its first eval
     into `equilibration_rare`."""
     stage_a(cfg, fam, name, share='pin')      # seeded from the PINNED trunk; 'inherit' then holds 0.3 / 0.7
@@ -244,7 +247,7 @@ def leg_b(cfg, fam, name, keep_frozen, force):
     rare.pop('exit')
     rare.pop('on_exit', None)
     rare['on_enter'] = [] if keep_frozen else ['unfreeze_pb']
-    rare['fwd_rollout_every'] = N_RARE
+    rare['fwd_rollout_every'] = int(n_rare)
     if SHARE_MODE == 'inherit':
         # no fracs, no balance: advance() leaves the live split as leg A's controller left it and nothing moves it
         # afterwards, so the switch changes N and nothing else
@@ -259,7 +262,7 @@ def leg_b(cfg, fam, name, keep_frozen, force):
         raise ValueError(SHARE_MODE)
     stages.append(rare)
     cfg['buffers']['replay_buffer']['mean_residence_steps'] = TAU_B
-    _rate(cfg, RATE_N5[fam] * 5.0 / N_RARE * RATE_B_FACTOR)
+    _rate(cfg, RATE_N5[fam] * 5.0 / n_rare * RATE_B_FACTOR)
     if force:
         cfg['replay_loss_coeffs']['stored_force_k'] = 1
     return cfg
@@ -302,7 +305,7 @@ def check_a(cfg, name, fam, share):
     assert cfg['lr_control']['fixed_scale'] == RATE_N1[fam] and cfg['replay_loss_coeffs']['stored_force_k'] == 0, name
 
 
-def check_b(cfg, name, fam, keep_frozen, force, cfg_a):
+def check_b(cfg, name, fam, keep_frozen, force, cfg_a, n_rare=N_RARE):
     check_common(cfg, name, fam)
     assert w3.problem_def(cfg) == w3.problem_def(cfg_a), name + ': identity differs from leg A'
     assert _stage(cfg, 'equilibration')['balance']['bounds'] == PINNED_BOUNDS, name
@@ -310,7 +313,7 @@ def check_b(cfg, name, fam, keep_frozen, force, cfg_a):
     assert [s['name'] for s in st] == ['train_prior', 'equilibration', 'equilibration_rare'], name
     eq, rare = st[1], st[2]
     assert eq['exit'] == [{'metric': 'fwd/log_Z_learned', 'above': -1.0e9, 'patience': 1}], name
-    assert rare['fwd_rollout_every'] == N_RARE and 'exit' not in rare, name
+    assert rare['fwd_rollout_every'] == n_rare and 'exit' not in rare, name
     assert rare['on_enter'] == ([] if keep_frozen else ['unfreeze_pb']), name
     if SHARE_MODE == 'inherit':
         assert 'fracs' not in rare and rare['balance'] is None, name
@@ -319,7 +322,7 @@ def check_b(cfg, name, fam, keep_frozen, force, cfg_a):
     else:
         assert rare['fracs'] == {'fwd': 0.0, 'bwd': 0.5, 'replay': 0.5} and rare['balance']['bounds'] == RAMP_BOUNDS, name
     assert cfg['buffers']['replay_buffer']['mean_residence_steps'] == TAU_B, name
-    assert cfg['lr_control']['fixed_scale'] == RATE_N5[fam] * 5.0 / N_RARE * RATE_B_FACTOR, name
+    assert cfg['lr_control']['fixed_scale'] == RATE_N5[fam] * 5.0 / n_rare * RATE_B_FACTOR, name
     assert cfg['replay_loss_coeffs']['stored_force_k'] == (1 if force else 0), name
     if force:
         assert not raw_problem_def(cfg).get('temp_cond'), name + ': stored force under temperature conditioning'
@@ -511,7 +514,13 @@ def build(families):
             cfg = leg_b(copy.deepcopy(base), fam, name, keep_frozen, force)
             check_b(cfg, name, fam, keep_frozen, force, cfg_a)
             load_check(cfg, name, ['train_prior', 'equilibration', 'equilibration_rare'])
-            B[name] = (cfg, fam, name_a, keep_frozen, force)
+            B[name] = (cfg, fam, name_a, keep_frozen, force, N_RARE)
+        for n in N_FAN:      # rows AFTER the 2x2, so --array=0-3 still submits the 2x2 alone
+            name = f'{TAG}_{fam}_pb_n{n}'
+            cfg = leg_b(copy.deepcopy(base), fam, name, True, False, n_rare=n)
+            check_b(cfg, name, fam, True, False, cfg_a, n_rare=n)
+            load_check(cfg, name, ['train_prior', 'equilibration', 'equilibration_rare'])
+            B[name] = (cfg, fam, name_a, True, False, n)
     return A, B
 
 
@@ -553,8 +562,8 @@ def main(argv):
     for i, (name, (cfg, fam)) in enumerate(A.items()):
         share = 'ramp free 0.3->95:5' if name.endswith('_ramp_a') else 'pinned 0.3/0.7'
         print(f"[a{i}] {name:<16} N=1 tau={TAU_A} rate={cfg['lr_control']['fixed_scale']:g} {share} frozen-at-entry seed=*{SRC[fam]}_*_best.pt")
-    for i, (name, (cfg, fam, src, kf, force)) in enumerate(B.items()):
-        print(f"[b{i}] {name:<16} N={N_RARE} tau={TAU_B} rate={cfg['lr_control']['fixed_scale']:g} share={SHARE_MODE} "
+    for i, (name, (cfg, fam, src, kf, force, n)) in enumerate(B.items()):
+        print(f"[b{i}] {name:<16} N={n} tau={TAU_B} rate={cfg['lr_control']['fixed_scale']:g} share={SHARE_MODE} "
               f"pb_frozen_kept={kf} stored_force={force} switch-from=*{src}_*_step*.pt")
 
 
