@@ -6,3 +6,4 @@ p20_nehu_n5	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset
 p20_acr_n5	acr	seed	mlefr_acr_lr2	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697
 p20_mip_n10	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
 p20_nehu_n10	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+p20_mip_n5_f	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
