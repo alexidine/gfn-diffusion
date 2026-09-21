@@ -192,7 +192,6 @@ bwd_loss_coeffs:
   tb: 0.0
   freeze_policy: 0.0
   freeze_z: 1.0
-  detach_pb: 0.0
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 1.0
@@ -216,7 +215,6 @@ replay_loss_coeffs:
   tb: 1.0
   freeze_policy: 0.0
   freeze_z: 1.0
-  detach_pb: 0.0
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 0.0

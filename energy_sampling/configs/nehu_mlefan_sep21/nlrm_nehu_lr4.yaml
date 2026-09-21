@@ -1,18 +1,18 @@
 project_state_version: 10
-run_name: p20_neh_n5
-tag: p20
+run_name: nlrm_nehu_lr4
+tag: nlrm
 seed: 12345
 device: cuda
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.97
 anomaly_detection: false
-continue_from_checkpoint: false
-mlip_path: null
+continue_from_checkpoint: CONTINUE_PLACEHOLDER
+mlip_path: /scratch/mk8347/models/uma/esen_s.pt
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 checkpoint_name: WARM_CHECKPOINT_PLACEHOLDER
-prior_model_name: PRIOR_MODEL_PLACEHOLDER
-load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_elj_prior_dataset_w3.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_elj_prior_dataset_w3.pt
+prior_model_name: null
+load_weights_only: true
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
@@ -46,8 +46,7 @@ lr_control:
   control_flow_lr: false
   fire_cut_factor: 1.0
   burn_in_steps: 500
-  burn_in_scale: 0.5
-  promotion_ramp_steps: 1000
+  burn_in_scale: 0.05
   min_root_bias_correction: 0.9
   candidate_scales:
   - 0.05
@@ -61,12 +60,12 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.5
+  fixed_scale: 4.0
   trial_settle_steps: 10
   logz_detour_nats: 2.0
   verbose: true
   hard_failure:
-    loss_excursion_k: 60.0
+    loss_excursion_k: 40.0
     grad_excursion_x: 100.0
     loss_abs: 1000000.0
     grad_abs: 1000000.0
@@ -74,6 +73,7 @@ lr_control:
     cruise_settle_steps: 200
     root_window: 200
     min_observations: 20
+  promotion_ramp_steps: 1000
 profiling:
   enabled: false
   regions: null
@@ -153,7 +153,7 @@ max_step_seconds: 60
 oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000
-batch_sizer_retest_steps: 0
+batch_sizer_retest_steps: 1000
 eval_T: 100
 integrator:
   T: 100
@@ -174,11 +174,6 @@ fwd_loss_coeffs:
   tb_z_source: learned
   traj_grads: 0.0
   reward_grads: 0.0
-  path_grad_last_k: 0
-  reward_grad_clip: 0.0
-  reward_grad_gate: null
-  reward_grad_force_clip: 0.0
-  path_grad_scale: 1
   repeats: 1.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -273,13 +268,14 @@ nonthermal_entropy_per_dim: 4.0
 nonthermal_cond_bar: 0.1
 reasonable_cond_bar: 0.5
 per_step_probe_steps: 0
-protocol: unconditional_tb
+protocol: mle_w3
 protocols:
   unconditional_tb:
     stages:
     - name: train_prior
       train_mode: bwd
       bwd_sampling_mode: dataset
+      skip_if: prior_loaded
       hot_lr_sensor:
         channel: bwd/mle
         form: absolute
@@ -294,10 +290,11 @@ protocols:
           tbc: 0.0
           repeats: 1.0
       exit:
-      - metric: bwd/mle
-        above: -1000000000.0
+      - metric: gates/progress_done
+        above: 0.5
         patience: 1
       on_exit:
+      - snapshot:phase1_exit
       - snapshot_prior
     - name: equilibration
       train_mode: fused
@@ -313,13 +310,12 @@ protocols:
       on_enter:
       - rebuild_prior_by_churn
       - bootstrap_z:rollout:4000
-      - freeze_pb:full
       fracs:
         fwd: 0.0
-        bwd: 0.7
-        replay: 0.3
+        bwd: 0.9
+        replay: 0.1
       deactivate_threshold: 0.01
-      fwd_rollout_every: 5
+      fwd_rollout_every: 20
       z_pin_rollout_every: 0
       fwd_rollout_triggers:
         occupancy_min_batches: 2.0
@@ -352,11 +348,11 @@ protocols:
         down: 0.006
         bounds:
           bwd:
-          - 0.7
-          - 0.7
+          - 0.25
+          - 0.9
           replay:
-          - 0.3
-          - 0.3
+          - 0.1
+          - 0.75
   conditional_vargrad:
     stages:
     - name: train_prior
@@ -473,6 +469,25 @@ protocols:
           lambda_mix:
             target: 1.0
             rate: 0.5
+  mle_w3:
+    stages:
+    - name: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      hot_lr_sensor:
+        channel: bwd/mle
+        form: absolute
+        rows: 31
+        above: 5.0
+        action: fire
+      flags:
+        update_log_z: true
+        scramble_conditions: true
+      loss_coeffs:
+        bwd:
+          mle: 1.0
+          tbc: 0.0
+          repeats: 1.0
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -487,7 +502,7 @@ grad_geometry:
   every: 50
 buffers:
   prior_buffer:
-    source: anchors
+    source: prior_model
     seed_source: prior_dataset
     mean_lifetime: 100
     weighted_bwd_beta: 0.9
@@ -502,14 +517,14 @@ buffers:
     ramp_width: 50
   replay_buffer:
     churn_rate: 0
-    mean_residence_steps: 600
-    max_size: 1000000
+    mean_residence_steps: 240
+    max_size: 50000
     admit_reward_min: -200
     backstop_mult: 5.0
     admit_from_eval: true
-    val_frac: 0.05
+    val_frac: 0.0
     val_min: 64
-    val_cap: 1024
+    val_cap: 256
     prioritise:
       enabled: true
       kappa: 1.0
@@ -540,7 +555,7 @@ buffers:
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
-energy_function: elj
+energy_function: uma
 temperature_conditioning: false
 molecule_conditioning: false
 sg_conditioning: false

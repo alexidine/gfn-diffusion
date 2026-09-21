@@ -1,0 +1,5 @@
+arm	family	start	warm_src	prior	prior_bytes
+nlre_nehu_lr0p125	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+nlre_nehu_lr0p25	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+nlre_nehu_lr1	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+nlre_nehu_lr2	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846

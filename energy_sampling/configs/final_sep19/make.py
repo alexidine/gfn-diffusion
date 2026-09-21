@@ -202,6 +202,10 @@ def common(cfg, fam, name):
     rc['resample_last_k'] = 0
     rc['reward_grads'] = 0.0
     rc['force_chunk_rows'] = None
+    # detach_pb was NEVER READ by any executed module (retired 2026-09-20 in the working tree; committed code
+    # ignores it): dropped so the config loads under either, and a requeue after the retirement lands still resolves
+    for blk in ('bwd_loss_coeffs', 'replay_loss_coeffs'):
+        cfg[blk].pop('detach_pb', None)
     return cfg
 
 
