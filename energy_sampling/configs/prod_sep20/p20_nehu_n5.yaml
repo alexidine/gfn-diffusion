@@ -46,7 +46,7 @@ lr_control:
   control_flow_lr: false
   fire_cut_factor: 1.0
   burn_in_steps: 500
-  burn_in_scale: 0.125
+  burn_in_scale: 0.5
   promotion_ramp_steps: 1000
   min_root_bias_correction: 0.9
   candidate_scales:
@@ -61,7 +61,7 @@ lr_control:
   repeat_every: 0
   boundary_confirm_repeats: 1
   boundary_densify: true
-  fixed_scale: 0.125
+  fixed_scale: 0.5
   trial_settle_steps: 10
   logz_detour_nats: 2.0
   verbose: true

@@ -6,8 +6,8 @@ keep it at all if we are doing N=5 or more anyway").
 
 THE SHAPE, per family, straight from the MLE checkpoint (no N=1 trunk): a rollout every 5th step, P_B frozen at
 the phase-2 entry (freeze_pb:full on equilibration's on_enter, AFTER the stub's last MLE steps), replay 0.3 /
-bwd 0.7 PINNED, tau 600, no forces, batch pinned (1600; acr 1000 for MACE memory), rate = the family's rate
-(prod_sep12's paper slots: mip 1.0, neh 0.5, mipu 0.0625, nehu 0.125, acr 0.05) x 5/N.
+bwd 0.7 PINNED, tau 600, no forces, batch pinned (1600; acr 1000 for MACE memory), ONE rate for every family:
+0.5 x 5/N (see RATE_N5 -- the memorisation curve is system-independent in absolute LR).
   p20_<fam>_n5   the five production arms
   p20_mip_n10    every 10th step at half rate: does the rare climber reach the ceiling? judged against the
                  final_sep19 mip trunk (N=1, converged 35.7 at ~26k) at matched steps
@@ -51,7 +51,13 @@ fin.SEED_ARM.update({'neh': 'mle_fresh_sep17/mlefr_neh_lr2.yaml', 'mipu': 'mle_f
                      'acr': 'mle_fresh_sep17/mlefr_acr_lr2.yaml'})
 fin.SRC.update({'neh': 'mlefr_neh_lr2', 'mipu': 'mlefr_mipu_lr2', 'acr': 'mlefr_acr_lr2'})
 fin.MLIP.update({'neh': False, 'mipu': True, 'acr': True})
-RATE_N5 = {'mip': 1.0, 'neh': 0.5, 'mipu': 0.0625, 'nehu': 0.125, 'acr': 0.05}
+#: ONE RATE FOR ALL FIVE (owner 2026-09-20 ~21:30). The memorisation sensor (replay/resid_vs_intake, prod_sep02)
+#: is monotone in ABSOLUTE learning rate across all five families on one curve (~-0.06 per doubling), so the old
+#: 20x family spread (mip 1.0 / neh 0.5 / nehu 0.125 / mipu 0.0625 / acr 0.05) was kill artefacts and survival,
+#: not the surfaces. 0.5 = neh's measured rate, half of mip's hottest-defensible 1.0 (memo 0.47; hotter p02 arms
+#: were killed by replay overfitting), memo ~0.55 at ~20 passes per row and higher still at N=5's 5 passes; 4x
+#: under the MLE ceiling of 2.0 that every family trained at. Read the sensor against the ELJ band 0.47-0.55.
+RATE_N5 = {'mip': 0.5, 'neh': 0.5, 'mipu': 0.5, 'nehu': 0.5, 'acr': 0.5}
 BATCH = {'mip': 1600, 'neh': 1600, 'mipu': 1600, 'nehu': 1600, 'acr': 1000}
 ARMS = [(fam, 5, False) for fam in FAMS] + [('mip', 10, False), ('nehu', 10, False), ('mip', 5, True)]
 
