@@ -1,0 +1,8 @@
+arm	family	start	warm_src	prior	prior_bytes
+p20_mip_n5	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
+p20_neh_n5	neh	seed	mlefr_neh_lr2	nehzor_sg14_zp1_elj_prior_dataset_w3.pt	200300990
+p20_mipu_n5	mipu	seed	mlefr_mipu_lr2	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061
+p20_nehu_n5	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
+p20_acr_n5	acr	seed	mlefr_acr_lr2	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697
+p20_mip_n10	mip	seed	mlefr_mip_lr2	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
+p20_nehu_n10	nehu	seed	mlefr_nehu_lr2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
