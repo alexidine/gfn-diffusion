@@ -522,7 +522,9 @@ def test_top_up_record_breakers_are_judged_in_the_anchor_currency():
         energy_function=SimpleNamespace(
             prior_flow=FLOW, bounding_coeff=1.0,
             log_reward=lambda x, b, logT, **kw: (torch.tensor([50.0, 150.0]), b)),
-        _noise_and_condition=lambda b, r: (b, torch.zeros(2), None, b.condition_id),
+        # anchor_inds: the seam takes the drawn rows' anchor-buffer indices (the
+        # shaped-tile key); unread on this stub, which is the iso path
+        _noise_and_condition=lambda b, r, anchor_inds=None: (b, torch.zeros(2), None, b.condition_id),
         _batch_latents=lambda b: torch.zeros(2, 4),
         _condition_energy_floor=lambda cid: None)
     bind(m, '_anchor_energy_phys', '_anchor_energy')

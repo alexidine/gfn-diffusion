@@ -61,9 +61,9 @@ CANONICAL_DRIFT = {
     'config.lr_control', 'config.adaptive_lr', 'config.lr_warmup_ratio',
     # ...and its per-stage half. Every historical arm declares `lr_sensor` on
     # every stage, because under the sensor-era schema an `auto` rate with no
-    # sensor was a raising load gate. Canonical declares NONE: `ray` and `hyper`
-    # reach no learning rate any more, so an omitted block is the correct default
-    # rather than a trap, and `plateau` no longer parses at all.
+    # sensor was a raising load gate. Canonical declares NONE: `ray` reaches no
+    # learning rate any more, so an omitted block is the correct default rather
+    # than a trap, and `plateau` and `hyper` no longer parse at all.
     'stages[0].lr_sensor', 'stages[1].lr_sensor', 'stages[2].lr_sensor',
     'stages[3].lr_sensor', 'stages[4].lr_sensor',
     # min_lr dropped 1e-6 -> 1e-8 on 2026-08-17. It is a NUMERICAL BACKSTOP, not a
@@ -358,10 +358,24 @@ def test_the_corpus_check_can_fail(tmp_path):
         'the comparator did not see a changed seed -- it is not comparing')
 
 
+#: The one load failure every corpus arm is EXPECTED to carry, because the
+#: schema removed the key and old battery configs are never updated: every arm
+#: declares `lr_sensor: {kind: hyper}`, deleted 2026-09-20 and refused at parse.
+#: Named exactly, so any OTHER schema break still fails the test below.
+_EXPECTED_LOAD_ERROR = "lr_sensor kind 'hyper'"
+
+
 def test_the_loadable_corpus_is_measured_not_assumed():
     """The corpus is small for a stated reason. If a schema change makes these
-    stop loading, this fails rather than the corpus quietly shrinking to zero."""
+    stop loading, this fails rather than the corpus quietly shrinking to zero --
+    except for the one removal whose refusal is the point (_EXPECTED_LOAD_ERROR),
+    which is matched rather than waived."""
     for name in sorted(CORPUS):
         path = CORPUS[name]()[0]
-        assert not config_snapshot.snapshot(path).get('load_error'), (
-            f'{path} no longer loads; the corpus arm is inert')
+        try:
+            err = config_snapshot.snapshot(path).get('load_error')
+        except Exception as e:      # a stage-parse refusal RAISES; it is not recorded
+            err = f'{type(e).__name__}: {e}'
+        if err and _EXPECTED_LOAD_ERROR in str(err):
+            continue
+        assert not err, f'{path} no longer loads; the corpus arm is inert: {err}'

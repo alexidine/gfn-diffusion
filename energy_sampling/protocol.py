@@ -187,11 +187,19 @@ TRAJ_CKPT_FALSE = ('0', 'false', 'off', 'no')
 # declared rather than derived from the active loss coefficients.
 # DIAGNOSTIC ONLY since the LR bracket took over actuation (controller.py).
 # `plateau` is gone entirely -- it was a pure actuator with nothing to report.
-# `ray` and `hyper` are retained, OFF unless a stage names one, and neither
-# reaches a learning rate: alpha* was measured uncorrelated with the rate it
-# steered, and cos is a stationarity statistic with no fixed point. No canonical
-# config declares either.
-LR_SENSOR_KINDS = ('ray', 'hyper', 'none')
+# `hyper` (the hypergradient cosine) was deleted 2026-09-20 and is REFUSED at
+# load, not ignored -- see _parse_lr_sensor. `ray` is retained, OFF unless a
+# stage names it, and reaches no learning rate: alpha* was measured uncorrelated
+# with the rate it steered. No canonical config declares it.
+LR_SENSOR_KINDS = ('ray', 'none')
+
+#: Sensor kinds that once parsed here and now refuse, with the reason. A dead
+#: kind must fail loudly: silently ignored, it reads as an armed sensor.
+RETIRED_LR_SENSOR_KINDS = {
+    'hyper': "removed 2026-09-20 -- the hypergradient cosine is a stationarity "
+             "statistic, negative at every stable rate, so it never had a fixed "
+             "point to steer to; delete the lr_sensor block",
+}
 
 #: `hot_lr_sensor.action`. 'report' moves nothing; 'fire' (owner review
 #: 2026-08-26) routes a sensor fire into the SAME unified fire response as a
@@ -961,10 +969,10 @@ class Stage:
         THIS BLOCK NO LONGER STEERS ANYTHING. Learning rates are set by the
         brute-force bracket (controller.py, lr_bracket.py), which is a run-level
         mechanism rather than a per-stage one: burn in, checkpoint, trial a fixed
-        grid, promote a rung a safety margin below the lowest failure, hold. Both
-        sensors below survive only as instruments, so a future claim about either
-        can be measured rather than argued about, and no canonical config
-        declares one.
+        grid, promote a rung a safety margin below the lowest failure, hold. The
+        one sensor below survives only as an instrument, so a future claim about
+        it can be measured rather than argued about, and no canonical config
+        declares it.
 
           kind: ray       the alpha* ray calibration -- scores the fused
                           composite this stage's step descends, on batches
@@ -977,15 +985,10 @@ class Stage:
                           on `train_prior` -- so declaring it is a deliberate
                           purchase. Optional `period` / `n_sub` override the
                           global values for this stage.
-          kind: hyper     the hypergradient cosine between the current gradient
-                          and the direction the previous step moved the policy.
-                          Retired as an actuator for a different reason: cos is a
-                          STATIONARITY statistic, negative at every stable rate
-                          once the iterate has equilibrated, so it has no fixed
-                          point to steer to. `beta` is still required, because a
-                          recorded bandwidth that was never chosen is not a
-                          record of anything.
           kind: none      this stage deliberately runs no diagnostic.
+
+        `kind: hyper` was DELETED 2026-09-20 and is refused here rather than
+        ignored (RETIRED_LR_SENSOR_KINDS).
 
         `none` is spelled out rather than left to omission, so "no sensor" is a
         decision in the config and not an oversight. Omitting the block means the
@@ -998,51 +1001,12 @@ class Stage:
             raise TypeError(f"stage '{self.name}': lr_sensor must be a mapping, got {type(node)}")
         node = dict(node)
         kind = node.get('kind')
+        if kind in RETIRED_LR_SENSOR_KINDS:
+            raise ValueError(f"stage '{self.name}': lr_sensor kind {kind!r} is "
+                             f"{RETIRED_LR_SENSOR_KINDS[kind]}.")
         if kind not in LR_SENSOR_KINDS:
             raise ValueError(f"stage '{self.name}': lr_sensor.kind must be one of "
                              f"{LR_SENSOR_KINDS}, got {kind!r}")
-        if kind == 'hyper':
-            # beta is REQUIRED. It is a bandwidth, not a safe constant: swept on
-            # the bench across 12 cells the per-cell optimum spanned 20x and the
-            # best worst-case setting was still 3.2x the best fixed rate. A
-            # default here would be a universal claim the measurements do not
-            # support.
-            if 'beta' not in node:
-                raise ValueError(f"stage '{self.name}': lr_sensor kind 'hyper' "
-                                 f"requires an explicit 'beta' -- it is a "
-                                 f"bandwidth, and no value is right for every "
-                                 f"stage")
-            bad = set(node) - {'kind', 'beta', 'beta_down', 'every', 'cos_target'}
-            if bad:
-                raise ValueError(f"stage '{self.name}': unknown lr_sensor keys "
-                                 f"for kind 'hyper': {sorted(bad)}")
-            # cos_target is hyper's analogue of calibration.alpha_target, and it
-            # exists for the same reason. The update's fixed point is cos == this,
-            # so 0.0 (the default) parks the rate at the ONE-STEP optimum -- which
-            # adaptive_lr.calibration's own comment says "the rate a run survives
-            # sits well BELOW", because a local probe cannot see the gradient-noise
-            # term. `ray` carries that margin explicitly as alpha_target: 4.0;
-            # hyper had none. A POSITIVE value holds the rate under the greedy
-            # optimum by steering to "still mildly under-stepped".
-            ct = node.get('cos_target', 0.0)
-            if not isinstance(ct, (int, float)) or not (-1.0 < float(ct) < 1.0):
-                raise ValueError(f"stage '{self.name}': lr_sensor.cos_target must "
-                                 f"be a number in (-1, 1) -- it is compared against "
-                                 f"a cosine -- got {ct!r}")
-            node['cos_target'] = float(ct)
-            for k in ('beta', 'beta_down'):
-                if k in node and not (isinstance(node[k], (int, float))
-                                      and float(node[k]) > 0):
-                    raise ValueError(f"stage '{self.name}': lr_sensor.{k} must "
-                                     f"be a positive number, got {node[k]!r}")
-            node['beta'] = float(node['beta'])
-            if node.get('beta_down') is not None:
-                node['beta_down'] = float(node['beta_down'])
-            node['every'] = int(node.get('every', 1))
-            if node['every'] < 1:
-                raise ValueError(f"stage '{self.name}': lr_sensor.every must be "
-                                 f">= 1, got {node['every']}")
-            return node
         if kind == 'none':
             bad = set(node) - {'kind'}
             if bad:

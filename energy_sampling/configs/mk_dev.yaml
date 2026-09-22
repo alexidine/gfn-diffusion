@@ -359,6 +359,14 @@ fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor
 epochs: 100000             # number of training epochs
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+
+xcond_eval:                   # cross-conditional density matrix; fires inside eval, costs no energy calls
+  enabled: true               # inert unless one of {embedding,molecule,vector}_conditioning is set
+  period: 2500                # steps between runs; must be a multiple of eval_period or it won't fire
+  conditions: 20              # matrix side C; needs C distinct condition_id in the eval batch or the pass skips
+  per_condition: 4            # terminals rolled forward per condition; diagonal is averaged over C*per_condition cells
+  k: 4                        # backward rollouts per cell, split into two replicates; must be even
+  chunk_rows: 2560            # rows per batched get_traj_bwd call over the C^2*per_condition*k grid
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
 # throughput -- whose answer is the CONSTANT batch_size = fused_grad_accum_min_samples,
@@ -493,7 +501,7 @@ fwd_loss_coeffs:
   tb_z_source: learned    # 'learned' | 'persistent'. CONDITIONAL routes want persistent -- set it in the stage, not here
   traj_grads: 0.0
   reward_grads: 0.0
-  path_grad_last_k: 0     # > 0: the reparameterised state gradient stays live for the LAST k rollout steps only (0 = every step detached unless traj_grads). With reward_grads this is the truncated terminal-force path; alone it is inert (the reward runs under no_grad)
+  path_grad_last_k: 0     # > 0: the reparameterised state gradient stays live for the LAST k rollout steps only (0 = every step detached unless traj_grads). With reward_grads this is the truncated terminal-force path. NOT INERT ALONE: the reward half is (get_loss_reward detaches x_T and log_r at reward_grads 0), but log_pf and log_pb still differentiate through the live next_state on the last step (gfn.py:916, :919), so k>0 at reward_grads 0 is NOT the same gradient as k=0
   reward_grad_clip: 0.0   # per-row clip on d loss / d log R after nan_to_num; 0 = off. NB the Huber knee already bounds that quantity at beta*w/B, so this clips nothing unless set below it -- the force itself is bounded by reward_grad_force_clip
   reward_grad_gate: null  # null = off. A float: rows whose TB residual (log Z + log P_F - log R - log P_B) is <= this get NO reward-path gradient; the rest keep it. Needs reward_grads != 0 and path_grad_last_k > 0. Logged as rewardgrad/gate_frac
   reward_grad_force_clip: 0.0  # > 0: per-row cap on |d log R / d x_T| before it reaches the live terminal; 0 = off. Needs reward_grads != 0 and path_grad_last_k > 0. Logged as rewardgrad/force_norm_* and force_clipped_frac
@@ -511,7 +519,6 @@ bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
   freeze_z: 1.0
-  detach_pb: 0.0          # 1 = log P_B on this branch's rows is detached (no P_B gradient from this branch; P_F gradient untouched)
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 1.0    # cross-terminal here, so off-policy SAFE as a policy loss, and it doubles as mode retention. bwd emp_z is asserted off with this
@@ -535,7 +542,6 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
   tb: 1.0
   freeze_policy: 0.0
   freeze_z: 1.0
-  detach_pb: 0.0          # 1 = log P_B on this branch's rows is detached (no P_B gradient from stored paths; P_F gradient untouched); the pooled term's live stash carries the detached value
   vg_lb: 0
   vg_lme: 0
   vg_by_condition: 0.0    # needs condition_block_m >= 2 below to form groups at all: replay repeats is 1, so the tile path is singleton-grouped and reads identically zero
@@ -679,10 +685,10 @@ protocols:
         hot_lr_sensor: { channel: bwd/mle, form: absolute, rows: 31, above: 5.0 }
         # NO `lr_sensor` BLOCK, and that is now the correct default rather than
         # a trap. Learning rates come from the run-level brute-force bracket
-        # (lr_control), not from a per-stage sensor. `ray` and `hyper` survive
-        # here only as opt-in DIAGNOSTICS that reach no learning rate; declaring
-        # `ray` on this stage costs about 4.8% of step time at period 500, so it
-        # is a purchase rather than a default.
+        # (lr_control), not from a per-stage sensor. `ray` survives here only as
+        # an opt-in DIAGNOSTIC that reaches no learning rate; declaring it on
+        # this stage costs about 4.8% of step time at period 500, so it is a
+        # purchase rather than a default.
         flags:
           update_log_z: true           # accumulate ema_logw / best_energy evidence
           scramble_conditions: true    # intent flag; applies only on conditional problems
@@ -736,10 +742,9 @@ protocols:
         # floor sits below the current level and an ordinary pause reads as
         # drawdown. Detection 7/7, false positives 0/11.
         hot_lr_sensor: { channel: fwd/scatter_err, rows: 11, above: 2.0 }
-        # todo THE OTHER lr_sensor KINDS ARE NOT WRITTEN DOWN ANYWHERE (docs/TODO.md #6a).
-        # A stage may declare `lr_sensor: {kind: hyper|ray, ...}`, and those blocks carry
+        # todo THE OTHER lr_sensor KIND IS NOT WRITTEN DOWN ANYWHERE (docs/TODO.md #6a).
+        # A stage may declare `lr_sensor: {kind: ray, ...}`, and that block carries
         # live keys that appear in NO config:
-        #   kind: hyper   beta, beta_down, cos_target, every        (train.py:5082, :5137)
         #   kind: ray     alphas, n_sub, period, dual_score,
         #                 log_grid, larder_depth                    (train.py:2938)
         # Under the mk_dev-carries-everything rule they belong here as commented blocks.
@@ -1239,6 +1244,11 @@ buffers:
     health_gate_ceiling: 0.5
     replay_beta: 1.0           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors
     noise_log_range: [ -2.5, -1.5 ]  # log10-uniform isotropic latent noise magnitude for prior top-ups
+    # --- the SHAPE of the jitter a drawn anchor gets before it is rescored ---
+    tile: 'iso'               # 'iso' = the log-uniform isotropic draw above, centred on the STORED anchor. 'shaped' = a per-anchor Gaussian read from shape_path, centred on that anchor's stored RELAXED minimum; noise_log_range is then unread. Absent = 'iso'
+    shape_path: null          # path to the tile sidecar (format_version 1; per anchor: x_min, evals, evecs, plus a sha1 of anchor_buffer.x). Read ONCE, when the anchor buffer is seeded or restored. Missing file, wrong format_version, row-count mismatch or sha mismatch RAISES -- there is no fallback to 'iso'. Inert while tile is 'iso'
+    tile_temperature: 1.0     # scales the tile variance: the width along eigenvector i is sqrt(tile_temperature / lambda_i)
+    tile_width_cap: 0.15      # latent units. The width used for any direction with lambda <= 0, and the cap on every direction's width
     topup_admit_record_breakers: true  # noised children that STRICTLY lower their condition's Emin(c) stand for anchor admission. CONDITIONAL ARM: true
     reach_quantile: 0.9        # prior_buffer quantile (energy above own condition's best) checked against ramp_floor
     reach_threshold: 0.75      # trigger a purge-and-replace top-up if that quantile covers less than this fraction of ramp_floor

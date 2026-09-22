@@ -17,6 +17,7 @@ import yaml
 
 import config_invariants as ci
 from config_invariants import BASELINE, ERROR, RULES, check, errors
+from protocol import Stage
 
 HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
@@ -206,7 +207,7 @@ def test_an_inactive_protocol_that_cannot_parse_is_caught(canonical):
     cfg = copy.deepcopy(canonical)
     cfg['protocols']['conditional_vargrad'] = {
         'stages': [{'name': 'train_prior', 'train_mode': 'bwd',
-                    'lr_sensor': {'kind': 'hyper'}}]}   # hyper REQUIRES beta
+                    'lr_sensor': {'kind': 'ray', 'period': 7}}]}   # period must be a multiple of 10
     assert _fires(cfg, 'every_protocol_parses')
 
 
@@ -233,9 +234,9 @@ def test_a_well_formed_inactive_protocol_passes(canonical):
     cfg = copy.deepcopy(canonical)
     cfg['protocols']['conditional_vargrad'] = {
         'stages': [{'name': 'train_prior', 'train_mode': 'bwd',
-                    'lr_sensor': {'kind': 'hyper', 'beta': 0.1}},
+                    'lr_sensor': {'kind': 'none'}},
                    {'name': 'var_conditioning', 'train_mode': 'fused',
-                    'lr_sensor': {'kind': 'hyper', 'beta': 0.05}}]}
+                    'lr_sensor': {'kind': 'none'}}]}
     assert not _fires(cfg, 'every_protocol_parses')
     assert errors(cfg) == [], [str(e) for e in errors(cfg)]
 
@@ -382,13 +383,15 @@ def test_no_config_can_make_ray_incoherent_any_more(canonical):
     assert not any(v.rule.startswith('ray_sensor') for v in check(cfg))
 
 
-def test_hyper_is_accepted_on_a_non_fused_stage(canonical):
-    """`hyper` reads no loss, so unlike `ray` it is coherent whatever the stage
-    trains. Flagging it would push people back to omitting the block."""
+def test_hyper_is_refused_at_load(canonical):
+    """`hyper` was removed 2026-09-20. A config still declaring it must FAIL --
+    ignored, a dead kind reads as an armed sensor."""
     cfg = copy.deepcopy(canonical)
     cfg['protocols']['unconditional_tb']['stages'][0]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
-    assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
-    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+    assert _fires(cfg, 'every_protocol_parses')
+    with pytest.raises(ValueError, match='2026-09-20'):
+        Stage({'name': 'x', 'train_mode': 'bwd',
+               'lr_sensor': {'kind': 'hyper', 'beta': 0.05}}, 0)
 
 
 def test_periodic_centroids_with_two_space_groups_is_an_error(canonical):

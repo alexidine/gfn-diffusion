@@ -392,9 +392,7 @@ _RETIRED_KEYS = {
         "deleted -- a stage declaring `lr_sensor: {kind: ray}` IS the switch, and "
         "a second flag could disagree with it (a stage asking for ray while the "
         "flag said false trained at its seed LR with the config claiming a "
-        "sensor). `enabled` is now DERIVED from which stages ask. Note the "
-        "asymmetry that gave it away: `hyper` has no block at all and declares "
-        "itself inline at the stage.",
+        "sensor). `enabled` is now DERIVED from which stages ask.",
     'adaptive_lr.ray_calibration.enabled':
         "deleted (see ray_calibration.enabled) -- derived from the stages that "
         "declare lr_sensor kind 'ray'.",
@@ -476,6 +474,18 @@ _RETIRED_KEYS = {
         "envelope underneath them makes the rate under test differ from the rate "
         "applied -- which is exactly how a too-hot rung survives its trial. Set "
         "lr_control.burn_in_scale and lr_control.burn_in_steps.",
+    'bwd_loss_coeffs.detach_pb':
+        "retired 2026-09-20 -- it was NEVER READ. The key was carried in the "
+        "coefficient block with a comment describing a per-branch detach of "
+        "log P_B, but no .py file a training step executes ever looked it up, so "
+        "every config that set it to 1.0 got the un-detached branch and the run "
+        "log recorded an intention rather than a behaviour. P_B is controlled by "
+        "`freeze_backward_policy` (and the stage actions freeze_pb / unfreeze_pb), "
+        "which acts on the parameters rather than on one branch's graph.",
+    'replay_loss_coeffs.detach_pb':
+        "retired 2026-09-20 -- never read, exactly as "
+        "bwd_loss_coeffs.detach_pb. Use `freeze_backward_policy` (or the "
+        "freeze_pb / unfreeze_pb stage actions) to control P_B.",
 }
 
 
@@ -694,11 +704,10 @@ def resolve_derived_config(args):
         #
         # THE TEST IS WHETHER A STAGE ASKS, not whether ray_calibration is on.
         # This used to check `ray_calibration.enabled` alone, which is wrong in
-        # both directions now that the sensor is opt-in per stage and there are
-        # three adaptive kinds: it PASSED a config with the block enabled and no
-        # stage asking (the LRs then sat at the seed for the whole run, which is
-        # exactly what it was written to prevent), and it would REJECT a config
-        # driven entirely by `hyper`, which does not use ray_calibration at all.
+        # both directions now that the sensor is opt-in per stage: it PASSED a
+        # config with the block enabled and no stage asking (the LRs then sat at
+        # the seed for the whole run, which is exactly what it was written to
+        # prevent), and it would REJECT a config using no ray_calibration at all.
         _require_lr_control(args, managed, seed_lr)
 
     # `lr_flow` IS NOT BRACKET-MANAGED and deliberately not in _LR_KEYS: the

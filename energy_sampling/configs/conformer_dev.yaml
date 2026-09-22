@@ -50,8 +50,7 @@ lr_back: 7.8125e-05
 lr_replay: 7.8125e-05
 lr_fused: 3.90625e-05
 lr_flow: 1.0e-1
-min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. At 1.0e-6 it sat barely below the conditional VarGrad quality optimum (~2e-6 to 2e-5), so a controller asking to go lower was refused silently, and it would clamp the BOTTOM OF THE RAMP for any stage whose base is set low (5e-6 at lr_warmup_ratio 10 starts at 5e-7). lr_ctrl/lr_floored_groups reports when it binds
-lr_warmup_ratio: 100
+min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. At 1.0e-6 it sat barely below the conditional VarGrad quality optimum (~2e-6 to 2e-5), so a controller asking to go lower was refused silently. A binding floor also silently turns the conservative burn-in rate into a hotter one. lr_ctrl/lr_floored_groups reports when it binds
 gradient_norm_clip: 1.0
 grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms
   enabled: true                # false -> the bar is gradient_norm_clip, unchanged
@@ -63,17 +62,6 @@ grad_clip_guard:               # adaptive clip bar, per step_type, tracking a qu
   refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live
 weight_decay: 1.0e-4
 use_weight_decay: false
-
-adaptive_lr:
-  # v8 (2026-08-11): peak_scale is moved only by periodic ray calibration
-  # (adaptive_lr.calibration / top-level ray_calibration), which the conformer
-  # route does not configure -- these four LRs are explicit floats, never
-  # `auto`, so no key here marks them servo-managed and peak_scale never
-  # applies to them. Only the warmup envelope and the divergence bar act.
-  warmup_steps: 200
-  divergence_loss_abs: 1.0e+9   # non-finite or past this -> reload + peak cut
-  divergence_grad_abs: 1.0e+9
-  divergence_cut: 0.5
 
 # Training
 ################################################################

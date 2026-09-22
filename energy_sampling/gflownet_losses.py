@@ -1713,21 +1713,26 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
 
     Un-detached (the default, and the only behaviour before 2026-08-14) the
     group centre is itself a function of theta, so autograd differentiates
-    through it too. With a QUADRATIC loss that costs nothing -- the centred
-    residuals sum to zero identically, so the centre's term cancels exactly and
-    the gradient is the pure contrast sum_i d_i grad r_i. The huber breaks that
-    cancellation: the influence weights become psi_beta(d_i) = clip(d_i, +-beta),
-    and clip is nonlinear, so sum_i psi_beta(d_i) != 0 as soon as the group's
-    residual tails are asymmetric -- the normal state of an under-covered
-    buffer. What survives is a leftover term along the batch-mean score,
-    i.e. an MLE-on-buffer force whose weight is set by TAIL SKEW rather than by
-    any coefficient (same shape as the saturated-backward-TB -> MLE*beta
-    collapse in module_losses.md L8a).
+    through it too -- and that differentiation is what RECENTRES the influence
+    weights. With influence function psi_beta(d_i) = clip(d_i, +-beta) and
+    psi_bar the group mean of those, each row's coefficient is psi_bar -
+    psi(d_j), so the coefficients sum to zero EXACTLY, at any beta and whatever
+    the group's residual tails do. The huber does not break that cancellation:
+    in the quadratic regime psi is the identity and the coefficients are the
+    centred residuals, and past the knee the centre's own term subtracts psi_bar
+    instead. The gradient is a pure contrast, with no component along the
+    batch-mean score.
 
-    Detached, the centre is a constant, the leftover vanishes, and beta changes
-    ONLY the influence function -- the fixed point stays exactly where plain
-    VarGrad's already was. Sign-correct absorption is then something you add
-    deliberately (level_gap), not a by-product of the robustness knee.
+    Detached, the centre is a constant, so the coefficients are the raw
+    -psi(d_j) and they sum to -g*psi_bar over a group of size g -- nonzero as
+    soon as the residual tails are asymmetric, the normal state of an
+    under-covered buffer. What survives is a leftover along the batch-mean
+    score, i.e. an MLE-on-buffer force whose weight is set by TAIL SKEW rather
+    than by any coefficient (same shape as the saturated-backward-TB -> MLE*beta
+    collapse in module_losses.md L8a). It is inert in the QUADRATIC regime,
+    where psi is linear and psi_bar is zero by construction: the two forms then
+    agree to precision at any group size, so the flag does nothing until the
+    knee bites.
 
     The two coincide identically at group size 2, where d_2 = -d_1 and clip is
     odd, so sum psi_beta = 0 whatever beta is. They diverge only on groups of 3+,

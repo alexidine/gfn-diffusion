@@ -29,8 +29,8 @@ which is the property a bare `assert` per check would give up.
 
 WHAT THIS FILE NO LONGER COVERS, AND WHY. The ray sensor reaches no learning
 rate: LRs come from the run-level brute-force bracket (lr_control), and
-`configs/mk_dev.yaml` keeps `ray` and `hyper` only as opt-in DIAGNOSTICS, priced
-at ~4.8% of step time. So the probe ARMING is not worth a fixture that has to
+`configs/mk_dev.yaml` keeps `ray` only as an opt-in DIAGNOSTIC, priced at ~4.8%
+of step time. So the probe ARMING is not worth a fixture that has to
 stock a larder to reach it, and `_check_ray_wiring` was DELETED on 2026-09-10:
 it only printed a NOTE once `enabled` became derived from the askers, and
 nothing acted on it. `_ray_askers` carries why no check stands in its place.
@@ -76,7 +76,7 @@ VAR_CONDITIONING = {
     'bwd_sampling_mode': 'prior',
     'deactivate_threshold': 0.01,
     'fracs': {'fwd': 0.5, 'bwd': 0.5, 'replay': 0.0},
-    'lr_sensor': {'kind': 'hyper', 'beta': 0.05},
+    'lr_sensor': {'kind': 'none'},
     'balance': {
         'kind': 'proportional',
         'alpha': 0.01,
@@ -355,7 +355,7 @@ def test_ray_probe_stays_off_unless_asked():
     for name, spec, patch in [
         ('lr_sensor omitted (the retired default)', VAR_CONDITIONING, {'lr_sensor': None}),
         ('kind: none', VAR_CONDITIONING, {'lr_sensor': {'kind': 'none'}}),
-        ('kind: hyper', VAR_CONDITIONING, {}),
+        ('kind: none (as declared)', VAR_CONDITIONING, {}),
     ]:
         m = modeller(stage(spec, **patch), step_ind=3)
         c(name, armed_next_bucket(m), False)

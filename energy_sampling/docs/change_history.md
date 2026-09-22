@@ -365,6 +365,8 @@ THE ADAPTIVE LR CONTROLLER IS REPLACED BY A BRUTE-FORCE BRACKET, and the `adapti
 
 - `lr_warmup_ratio` -- the warmup envelope is gone. Burn-in is a fixed scale held for a fixed number of steps, not a ramp, so there is no ratio to start from.
 - `lr_control.ray_calibration.enabled` -- the switch is which stages declare lr_sensor kind ray, and a second flag could disagree with them. `ray` reaches no learning rate now, so `enabled: true` would read as arming a controller that does not exist.
+- `bwd_loss_coeffs.detach_pb` -- never read by any .py file a training step executes, so a config setting it to 1 recorded an intention and ran the un-detached branch. Dropped rather than migrated: there is no behaviour to carry. P_B is controlled by freeze_backward_policy and the freeze_pb/unfreeze_pb stage actions.
+- `replay_loss_coeffs.detach_pb` -- the replay branch's copy of the same unread key -- see bwd_loss_coeffs.detach_pb.
 
 **Moved:**
 

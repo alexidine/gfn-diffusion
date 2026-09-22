@@ -117,7 +117,7 @@ def test_effective_coefficients_are_base_overlaid_with_stage(base_snap):
 
 def test_lr_sensor_is_captured_per_stage(base_snap):
     """The LR controller is a PER-STAGE choice and the kinds behave completely
-    differently (ray / plateau / hyper / none), so it has to be in the snapshot
+    differently (ray / none), so it has to be in the snapshot
     or two configs that train nothing alike compare equal."""
     for s in base_snap['stages']:
         assert 'lr_sensor' in s
@@ -127,7 +127,7 @@ def test_dropping_an_lr_sensor_block_is_caught(tmp_path, raw, base_snap):
     """The silent case: omitting the block means 'no sensor', with no error. A
     consolidation that lost one must not pass clean."""
     new = copy.deepcopy(raw)
-    new['protocols']['unconditional_tb']['stages'][1]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+    new['protocols']['unconditional_tb']['stages'][1]['lr_sensor'] = {'kind': 'ray', 'period': 500}
     withsensor = snap_of(tmp_path, 'sensor.yaml', new)
 
     gained = cs.compare(base_snap, withsensor)
@@ -141,15 +141,15 @@ def test_dropping_an_lr_sensor_block_is_caught(tmp_path, raw, base_snap):
 
 
 def test_changing_the_sensor_kind_is_caught(tmp_path, raw, base_snap):
-    """ray vs hyper vs plateau are different controllers, not variants of one."""
+    """ray vs none are different instruments, not variants of one."""
     def with_kind(node, name):
         new = copy.deepcopy(raw)
         new['protocols']['unconditional_tb']['stages'][1]['lr_sensor'] = node
         return snap_of(tmp_path, name, new)
 
     ray = with_kind({'kind': 'ray'}, 'ray.yaml')
-    hyper = with_kind({'kind': 'hyper', 'beta': 0.05}, 'hyper.yaml')
-    c = cs.compare(ray, hyper)
+    none = with_kind({'kind': 'none'}, 'none.yaml')
+    c = cs.compare(ray, none)
     assert not c.behaviour_preserved
     assert any('lr_sensor' in p for p, _, _ in c.changed)
 

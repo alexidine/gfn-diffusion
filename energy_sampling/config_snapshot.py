@@ -132,10 +132,10 @@ def _stage_summary(spec: dict, index: int, args) -> dict:
         'fracs': dict(getattr(st, 'fracs', {}) or {}),
         'min_fracs': dict(getattr(st, 'min_fracs', {}) or {}),
         'deactivate_threshold': getattr(st, 'deactivate_threshold', None),
-        # WHICH LR CONTROLLER this stage runs, and it is per stage. The four
-        # kinds (ray / plateau / hyper / none) behave completely differently, so
-        # two configs with identical seeds and identical servo maps can still
-        # train nothing alike. Recorded explicitly as 'absent' rather than left
+        # WHICH LR DIAGNOSTIC this stage runs, and it is per stage. The two
+        # kinds (ray / none) behave completely differently, so two configs with
+        # identical seeds and identical servo maps can still train nothing
+        # alike. Recorded explicitly as 'absent' rather than left
         # as None because OMITTING the block means "no sensor" SILENTLY -- and it
         # did not always: omission used to arm the ray probe under the global
         # ray_calibration.enabled. A consolidation that dropped an lr_sensor

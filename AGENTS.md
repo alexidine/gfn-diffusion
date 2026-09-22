@@ -30,7 +30,9 @@ GFN depends on the sibling MXtalTools repository. The production dependency is o
 - Observations: findings, measurements, and run results; evidence, not policy.
 - History: explicitly labelled historical notes, old configs, prior experiments, run sheets, and archived scripts; no current authority unless a canonical source explicitly incorporates them.
 
-Agent memories, prior-chat summaries, handoffs, and tool-specific state are navigation leads, not repository authority; recheck their material claims against the sources above before acting. Do not include `.claude/worktrees/` or similar generated/cache directories in repository-wide searches unless the task explicitly targets that worktree; a nested copy is never evidence about the main working tree.
+The knowledge base at `energy_sampling/docs/wiki/` (router: `index.md`; production rules: `writing-protocol.md`) is the home for decisions, working assumptions, derivations, and mechanism descriptions that cannot live more clearly in code, config, or tests. Each page states what the code does and what the theory derives, is verified against a stamped commit, and is checked by `docs/wiki/check_refs.py` (fast-tier test `tests/wiki/`) so that a symbol or config key it names must exist. Read the page for the thing you are touching before touching it, and update that page in the same change when the change invalidates it. Owner choices on a page are written by the owner.
+
+Agent memories, prior-chat summaries, handoffs, and tool-specific state are navigation leads, not repository authority; recheck their material claims against the sources above before acting. A wiki page beats a memory file on any conflict. Do not include `.claude/worktrees/` or similar generated/cache directories in repository-wide searches unless the task explicitly targets that worktree; a nested copy is never evidence about the main working tree.
 
 If appropriate authoritative sources disagree, surface the conflict. Do not infer project policy from repeated historical usage, a comment, or the newest-looking document.
 
@@ -131,10 +133,11 @@ If a column cannot be given a quantity and a unit, it does not belong in the tab
 
 ## Keeping context current
 
-Stale prose is harmful context, not harmless history. Maintain active knowledge in two bounded ways:
+Stale prose is harmful context, not harmless history. Maintain active knowledge in three bounded ways:
 
-1. **Event-driven:** when a change invalidates directly relevant prose, update it or explicitly demote it in the same change. Do not sweep unrelated documentation.
-2. **Milestone-triggered:** at an owner-declared project milestone or during an explicitly requested dedicated audit, inspect only high-exposure context: `AGENTS.md`, README/routing material, active workflow documents, canonical-config comments, and accepted decisions.
+1. **Event-driven:** when a change invalidates directly relevant prose, update it or explicitly demote it in the same change. For the knowledge base this means the wiki page for the thing you changed, in the same change. Do not sweep unrelated documentation.
+2. **Checked:** `python energy_sampling/docs/wiki/check_refs.py` fails on any symbol, config key or page link a wiki page names that no longer exists, and `--drift` lists the pages whose referenced files changed since their stamped commit. A failing reference is a defect to fix in that change; a drift line is a prompt to re-verify the page.
+3. **Milestone-triggered:** at an owner-declared project milestone or during an explicitly requested dedicated audit, inspect only high-exposure context: `AGENTS.md`, the wiki index and protocol, active workflow documents, canonical-config comments, and the owner-choice sections of wiki pages.
 
 Classify reviewed material as current policy, working assumption, observation, or history. A stale or unresolved document must not continue to sound current: correct it, mark its status prominently, or remove it from active context. Do not assume Git can recover missing intent; preserve important history explicitly and discard obsolete claims from places agents are expected to consult.
 
@@ -142,7 +145,7 @@ Freshness dates may help route attention but do not establish correctness. Verif
 
 ## Documentation
 
-For work involving repository knowledge, read `energy_sampling/docs/README.md` for routing and `energy_sampling/docs/EPISTEMIC_PROTOCOL.md` for the operating procedure. They are subordinate to this file.
+For work involving repository knowledge, read `energy_sampling/docs/wiki/index.md` for routing and `energy_sampling/docs/wiki/writing-protocol.md` for how a page is drafted, verified, reviewed and kept current. Both are subordinate to this file. `energy_sampling/docs/README.md` routes the older document families, which are legacy or snapshot material unless the wiki cites them; `EPISTEMIC_PROTOCOL.md` is retired as an operating procedure and retained as history.
 
 For infrastructure-stabilization work, `energy_sampling/docs/design/infrastructure_stabilization.md` is the active plan adopted by `current_decisions.md` D-002. It controls sequencing and remaining-work status, not current executable behavior; read only the sections implicated by the task.
 

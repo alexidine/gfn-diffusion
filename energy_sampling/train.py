@@ -593,7 +593,7 @@ class Modeller:
         """
         return hasattr(self, 'prior_model')
 
-    def _noise_and_condition(self, batch, noise_log_range):
+    def _noise_and_condition(self, batch, noise_log_range, anchor_inds=None):
         """Jitter a stored batch's state, then condition it. IN PLACE on `batch`.
 
         The two anchor paths (refresh_anchor_buffer_surprise, top_up_prior_from_anchors)
@@ -601,12 +601,76 @@ class Modeller:
         condition_samples with sg_ind/z_prime, orient_molecule -- so it is one seam, hooked
         once. Noising happens BEFORE conditioning so the noised state is what gets
         conditioned and scored.
+
+        `anchor_inds` names each row's position in the anchor buffer. It is unread on
+        the default `tile: iso` branch (which is byte-identical to the version before
+        the tile existed). Under `tile: shaped` it is the KEY into the per-anchor tile
+        sidecar, so a call site that cannot supply it raises rather than falling back
+        to the isotropic draw.
         """
-        batch.log_noise_latent_parameters(*noise_log_range)
+        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'shaped':
+            self._shaped_anchor_tile(batch, anchor_inds)
+        else:
+            batch.log_noise_latent_parameters(*noise_log_range)
         batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)
         batch.orient_molecule(mode='std')
         return batch, log_T_tensor, condition, condition_id
+
+    @torch.no_grad()
+    def _shaped_anchor_tile(self, batch, anchor_inds):
+        """Replace the isotropic jitter with the per-anchor Gaussian from the sidecar.
+
+        Draws N(x_min, V) per row, where x_min is that anchor's stored RELAXED minimum
+        (not the stored anchor) and V = sum_i w_i^2 v_i v_i^T over the stored
+        eigenvectors, w_i = sqrt(tile_temperature / lambda_i). A direction with
+        lambda <= 0 takes tile_width_cap outright, and every w_i is capped there.
+
+        Post-processing is the primitive's: clip into the open box, latent_to_cell_params,
+        clean_cell_parameters(mode='hard'), so every consumer downstream of the seam
+        (condition_samples, orient_molecule, scoring, admission) sees the same thing it
+        sees on the iso branch.
+        """
+        tile = getattr(self, '_anchor_tile', None)
+        if tile is None:
+            raise RuntimeError(
+                "buffers.anchor_buffer.tile is 'shaped' but no tile sidecar is loaded. "
+                "It is read once by apply_anchor_buffer_policy, i.e. whenever the anchor "
+                "buffer is seeded or restored -- a draw reaching here without one means "
+                "the buffer was built by a path that does not call that hook.")
+        if anchor_inds is None:
+            raise ValueError(
+                "buffers.anchor_buffer.tile is 'shaped' but this _noise_and_condition "
+                "call supplied no anchor_inds, so the drawn rows cannot be matched to "
+                "their tiles. Pass the anchor-buffer indices at this call site; the "
+                "isotropic draw is NOT a legal substitute here.")
+        inds = torch.as_tensor(anchor_inds, device=tile['x_min'].device,
+                               dtype=torch.long).flatten()
+        if int(inds.numel()) != int(batch.num_graphs):
+            raise ValueError(
+                f"shaped anchor tile: {inds.numel()} anchor indices against "
+                f"{batch.num_graphs} drawn rows -- they must be 1:1 and in order.")
+
+        cap = float(tile['width_cap'])
+        evals = tile['evals'][inds]
+        w = torch.where(evals > 0,
+                        (tile['temperature'] / evals.clamp(min=1e-12)).sqrt(),
+                        torch.full_like(evals, cap)).clamp(max=cap)
+        z = torch.randn_like(w)
+        delta = torch.einsum('nij,nj->ni', tile['evecs'][inds], w * z)
+        x_min = tile['x_min'][inds]
+        noised = (x_min + delta).clip(min=-1 + 1e-6, max=1 - 1e-6)
+        batch.latent_to_cell_params(noised)
+        batch.clean_cell_parameters(mode='hard')
+
+        # displacement AFTER the box clip, so it is the move actually made
+        disp = (noised - x_min).norm(dim=-1).detach().float().cpu()
+        p50 = float(disp.median()) if disp.numel() else float('nan')
+        p90 = float(torch.quantile(disp, 0.9)) if disp.numel() else float('nan')
+        print(f"anchor tile: shaped draw, rows={int(disp.numel())}, "
+              f"|x - x_min| p50={p50:.4f} p90={p90:.4f}")
+        # picked up by log_buffer_stats at the next eval and drained there
+        self._anchor_tile_disp = (p50, p90)
 
     _domain_figs = None  #: None = eval_figs uses its own crystal block, unchanged
 
@@ -3361,19 +3425,15 @@ class Modeller:
         # separately.
         sp_cfg = getattr(getattr(self.args, 'lr_control', None),
                          'ray_calibration', None)
-        # ONE list, built once, shared by both sensors. `get_policy_params` is a
-        # local of this method, so the hypergradient sensor cannot call it later
-        # -- and it must snapshot exactly what the ray probe does (policy only,
-        # decision D26b) or the two sensors would disagree about what they are
-        # measuring.
-        self._hyper_param_cache = [
+        # ONE list, built once. `get_policy_params` is a local of this method,
+        # so the probe cannot rebuild it later -- it snapshots policy params
+        # only (decision D26b), which is what the probe is defined to measure.
+        self._ray_param_cache = [
             p for g in get_policy_params(self.gfn_model) for p in g['params']]
-        self._hyper_prev_step = None
         # ENABLED IS DERIVED, not configured. A stage declaring
         # `lr_sensor: {kind: ray}` IS the switch; a separate `ray_calibration.
         # enabled` was a second mechanism for the same decision, and the two could
-        # disagree. Note the asymmetry that gave it away: `hyper` has no block at
-        # all and declares itself inline at the stage.
+        # disagree.
         #
         # Defaulting this to False on a missing key would silently kill the probe,
         # so it is computed from the protocol rather than read.
@@ -3393,7 +3453,7 @@ class Modeller:
         if stage_sensor.get('kind') != 'ray':
             stage_sensor = {}
         self.ray_cal = RayCalibration(
-            self._hyper_param_cache,
+            self._ray_param_cache,
             alphas=tuple(getattr(sp_cfg, 'alphas', (0.0, 1.0, 2.0, 4.0, 8.0))),
             n_sub=int(stage_sensor.get('n_sub', getattr(sp_cfg, 'n_sub', 8))),
             period=int(stage_sensor.get('period', getattr(sp_cfg, 'period', 500))),
@@ -3407,8 +3467,8 @@ class Modeller:
         # different branch set and loss mixture, so scoring a ray on them would
         # rate an objective the run has already left. Rebuilding drops them.
         #
-        # Kept iff some stage asks for `ray`, so a hyper-only or sensorless run
-        # pays neither the tee nor the host memory.
+        # Kept iff some stage asks for `ray`, so a sensorless run pays neither
+        # the tee nor the host memory.
         #
         # DEPTH IS n_sub PLUS A SMALL MARGIN, not a multiple of it. It was
         # `4 * n_sub`, on the reasoning that headroom above n_sub "only buys
@@ -3867,7 +3927,11 @@ class Modeller:
                     # BEFORE the tick: a fill closes the whole gap from data the
                     # step already paid for, so it must pre-empt the servo's
                     # rollouts rather than run after they have spent an energy
-                    # call each crawling at lr_flow
+                    # call each crawling at lr_flow. On a fused step whose
+                    # forward loss is detached the fill already ran inside the
+                    # step (fused_train_step, before the bwd/replay losses) and
+                    # this call finds the stash consumed; it acts only when the
+                    # forward loss was live.
                     self.z_level_fill()
                     self.z_calibration_tick(step_type)
                 self.times['train_step_end'] = time()
@@ -4840,6 +4904,16 @@ class Modeller:
             weights['fwd'] = self.fwd_frac if fwd_active else 0.0
             # this branch's own logw, for the free Z re-level -- see z_level_fill
             self._stash_z_fill_logw(fwd_loss_dict)
+            # FILL BEFORE THE OTHER BRANCHES. With the forward loss detached,
+            # log_Z is in no live graph yet, so the pin lands here and the bwd
+            # and replay residuals below are computed against the pinned level;
+            # the host loop's post-step fill then finds the stash consumed. Left
+            # at the post-step site, the pin described the pre-update policy and
+            # landed after an optimizer step on Z taken against the stale level.
+            # With a live forward loss (fwd_active or the sidecar) log_Z is
+            # already in fwd's graph, so the post-step site still owns the fill.
+            if not (fwd_active or sidecar):
+                self.z_level_fill()
 
         # ALIGNED PER-CONDITION DRAW (stage.condition_draw). ONE condition set
         # per step, chosen after the rollout and before either buffer is drawn
@@ -5663,65 +5737,6 @@ class Modeller:
         out['composite'] = total
         return out
 
-    def _hyper_sensor_cfg(self, step_type):
-        """The stage's hypergradient config, or None if it is not this sensor.
-
-        Gated on the TRAINED step type: the sensor differences the policy's own
-        displacement, so it is only meaningful on a step that moved the policy."""
-        sensor = self.protocol.stage.lr_sensor
-        if sensor is None or sensor.get('kind') != 'hyper':
-            return None
-        if step_type not in ('fused', 'fwd', 'bwd', 'replay'):
-            return None
-        if self.step_ind % int(sensor.get('every', 1)):
-            return None
-        return sensor
-
-    def _hyper_params(self):
-        # THE SAME LIST THE RAY PROBE SNAPSHOTS -- policy only, built once where
-        # the probe is built. The flow head is LR-pinned separately and excluded
-        # there for the same reason (decision D26b); including it would mix a
-        # parameter on a different, unservoed rate into the displacement.
-        return getattr(self, '_hyper_param_cache', None) or []
-
-    @torch.no_grad()
-    def _hyper_flat(self):
-        return torch.cat([p.detach().reshape(-1) for p in self._hyper_params()])
-
-    @torch.no_grad()
-    def _hyper_apply(self, cfg, clip_ratio=None):
-        """cos(current gradient, previous displacement) -> the controller.
-
-        `clip_ratio` is pre-clip grad norm / the guard's bar for this branch,
-        passed in rather than read off grad_clip_guard because that object's
-        counters are DRAINED at every report and reading them here would race
-        the reporter. The controller uses it as a validity gate on cos: once the
-        clip binds on essentially every step the update magnitude is set by the
-        LR alone and cos stops being a curvature statistic -- see
-        LRController._clip_saturated."""
-        gs = [p.grad.reshape(-1) for p in self._hyper_params() if p.grad is not None]
-        if not gs:
-            return
-        g = torch.cat(gs)
-        d = -self._hyper_prev_step
-        if g.numel() != d.numel():
-            # parameter set changed under us (a stage rebuilt the optimizers);
-            # drop the stale operand rather than difference across it
-            self._hyper_prev_step = None
-            return
-        ng, nd = float(g.norm()), float(d.norm())
-        if not (ng > 0 and nd > 0):
-            return
-        cos = float(torch.dot(g, d) / (ng * nd))
-        # DIAGNOSTIC ONLY since the bracket took over. `on_hypergradient` records
-        # the cosine and moves nothing: cos is a stationarity statistic --
-        # negative at every stable rate once the iterate has equilibrated -- so
-        # it has no fixed point to steer to. Kept reachable, off by default, so a
-        # future claim about it can be measured rather than argued about.
-        self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'),
-                                            cfg.get('cos_target', 0.0),
-                                            clip_ratio=clip_ratio)
-
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
         if not do_step:
@@ -5795,39 +5810,8 @@ class Modeller:
         # this scalar holds only the LAST branch to step, so it cannot.
         self.last_grad_norm_pre_clip = pre_clip
 
-        # ---- hypergradient sensor: read BEFORE the step, difference AFTER.
-        # `cos(g_t, d_{t-1})` -- the current gradient against the direction the
-        # PREVIOUS step actually moved the policy. Both operands exist whatever
-        # the stage trains, which is the whole reason this sensor is available
-        # where `ray` is not (protocol.py::_parse_lr_sensor).
-        _hyp = self._hyper_sensor_cfg(step_type)
-        if _hyp is not None and not self._hyper_params():
-            _hyp = None
-        _theta_before = self._hyper_flat() if _hyp else None
-        if _hyp is not None and getattr(self, '_hyper_prev_step', None) is not None:
-            # pre-clip norm against the bar that was actually applied above: >= 1
-            # means the clip fired on this step. The controller cares about the
-            # sustained rate, not this one reading.
-            #
-            # WITHHELD WHILE THE GUARD IS WARMING. During a branch's first
-            # `grad_clip_guard.warmup_steps` observations the bar is the STATIC
-            # fallback, fitted to nothing in particular, so a high fire rate is
-            # about the bar rather than the rate -- and with refresh_on_stage the
-            # guard re-warms at every stage transition. None makes the
-            # controller's gate inert rather than feeding it evidence that means
-            # something else (see GradClipGuard.is_calibrated).
-            _ratio = (float(pre_clip) / float(bar)
-                      if bar and self.grad_guard.is_calibrated(step_type) else None)
-            self._hyper_apply(_hyp, clip_ratio=_ratio)
-
         self.optimizers[step_type].step()
 
-        if _hyp is not None:
-            # the REALISED displacement, not `-lr*g`: read this way it is
-            # optimizer-agnostic and cannot drift out of sync with what Adam
-            # actually did, which matters because Adam's step direction is
-            # mhat/(sqrt(vhat)+eps) and not the gradient.
-            self._hyper_prev_step = self._hyper_flat() - _theta_before
         # Non-fused steps: step the standalone flow optimizer here (fwd/bwd/replay run
         # separately, so whichever one had freeze_z=False unambiguously trained Z).
         # Fused steps: skip it -- flow is a param group of optimizers['fused'], so the
@@ -7633,6 +7617,61 @@ class Modeller:
                               **self._reward_ramp_kwargs(cid))
 
     @torch.no_grad()
+    def log_xcond_metrics(self, eval_discretizer, sample_batch):
+        """
+        Cross-conditional sharpening: are the per-condition distributions annealing into
+        their own shapes, or settling into one shared basin wearing C labels?
+
+        Scores each terminal under EVERY condition and decomposes the resulting density
+        matrix (eval/xcond.py carries the derivation). Costs C^2 * per_condition * k
+        backward rollouts and NO energy calls -- measured 2026-09-22 at 6400 rollouts in
+        1.1 s on a laptop 5080 co-tenant with a live run at chunk_rows 2560; the same work
+        in per-column batches took 6.4 s, so chunk_rows is the knob that matters.
+
+        CONDITIONS COME FROM THE CALLER'S BATCH, not a fresh draw. fwd_eval_sampling
+        advances the condition cycle, so drawing again here would shift which conditions
+        the run trains on next -- a diagnostic that perturbs the run it observes.
+        """
+        cfg = getattr(self.args, 'xcond_eval', None)
+        if cfg is None or not getattr(cfg, 'enabled', False):
+            return {}
+        # ON BY DEFAULT, so it must be inert off the conditional route rather than relying
+        # on the distinct-condition_id guard below to notice. Same three flags
+        # config_invariants.py::conditional_z_settings_are_conditional calls conditional.
+        if not any(bool(getattr(self.args, k, False)) for k in
+                   ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning')):
+            return {}
+        period = int(getattr(cfg, 'period', 0) or 0)
+        if period <= 0 or self.step_ind % period != 0:
+            return {}
+
+        from eval.xcond import cross_condition_delta, xcond_metrics
+        C = int(getattr(cfg, 'conditions', 20))
+        n = int(getattr(cfg, 'per_condition', 4))
+        k = int(getattr(cfg, 'k', 4))
+        batch = sample_batch.to(self.device)
+        cid = getattr(batch, 'condition_id', None)
+        if cid is None or batch.num_graphs < C or torch.unique(cid[:C]).numel() < C:
+            # a square matrix needs C DISTINCT conditions; scoring a repeated condition as
+            # two columns would put duplicate columns into the decomposition.
+            return {'xcond/skipped': 1.0}
+
+        with torch.no_grad():
+            cols = batch.subsample_new_batch(torch.arange(C, device=self.device))
+            cond_vec = cols.conditions
+            dim = self._batch_latents(cols).shape[1]
+            tile = torch.arange(C, device=self.device).repeat_interleave(n)
+            states, *_ = self.ema_model.get_traj_fwd(
+                get_gfn_init_state(C * n, dim, self.device), eval_discretizer, None,
+                cond_vec[tile], cols.subsample_new_batch(tile))
+            delta, rep_a, rep_b = cross_condition_delta(
+                self.ema_model, cols, cond_vec, states[:, -1], eval_discretizer, k,
+                chunk_rows=int(getattr(cfg, 'chunk_rows', 2560)))
+        out = xcond_metrics(delta, rep_a, rep_b,
+                            worst_quantile=float(self.args.conditional_worst_quantile))
+        out['xcond/skipped'] = 0.0
+        return out
+
     def log_test_metrics(self, eval_discretizer, fwd_stats):
         """
         Conditional generalization check: the same on-policy eval protocol run
@@ -8543,6 +8582,9 @@ class Modeller:
         if getattr(self, 'test_mol_dataset', None) is not None:
             self._merge_metrics(metrics, self.log_test_metrics(eval_discretizer, fwd_stats),
                                 'log_test_metrics')
+        self._merge_metrics(metrics,
+                            self.log_xcond_metrics(eval_discretizer, sample_batch),
+                            'log_xcond_metrics')
 
         self.times['eval_figs_start'] = time()
         fig_dict = {}
@@ -8744,6 +8786,12 @@ class Modeller:
             # -drop caps, or no prior_model yet under the forward-first protocol)
             metrics['prior_buffer_prior_admit_rate'] = (
                 churn['from_prior_model'] / churn['budget'] if churn['budget'] > 0 else float('nan'))
+        # Shaped anchor tile: the last shaped draw's displacement from x_min, drained
+        # so a window with no shaped draw emits nothing rather than repeating a value
+        tile_disp = getattr(self, '_anchor_tile_disp', None)
+        if tile_disp is not None:
+            metrics['anchor_tile/disp_p50'], metrics['anchor_tile/disp_p90'] = tile_disp
+            self._anchor_tile_disp = None
         for key in churn:
             churn[key] = 0
 
@@ -9532,7 +9580,7 @@ class Modeller:
                 return
         anchor_batch = anchor_batch.clone().to(self.device)
         anchor_batch, log_T_tensor, condition, condition_id = self._noise_and_condition(
-            anchor_batch, cfg.noise_log_range)
+            anchor_batch, cfg.noise_log_range, anchor_inds=anchor_inds)
 
         terminal_latents = self._batch_latents(anchor_batch)
         # Bulk anchor scan, not the per-step hot path, and it runs inside a stage
@@ -9657,7 +9705,7 @@ class Modeller:
         # noised BEFORE conditioning, so the noised state is what gets
         # conditioned, oriented and scored
         seed_batch, log_T_tensor, condition, condition_id = self._noise_and_condition(
-            seed_batch, cfg.noise_log_range)
+            seed_batch, cfg.noise_log_range, anchor_inds=tiled_idx)
 
         terminal_latents = self._batch_latents(seed_batch)
         reward, seed_batch = self.energy_function.log_reward(
@@ -10400,6 +10448,68 @@ class Modeller:
         print(f"anchor_buffer [{source}]: frozen={buf.frozen}, "
               f"refresh_every_n_evals={getattr(cfg, 'refresh_every_n_evals', None)}, "
               f"rows={len(buf)}")
+        # The tile sidecar is keyed to THIS anchor set, so it is read here -- the one
+        # place every construction and every restore passes through -- and not at a
+        # fixed point in init, which the resume path does not reach in the same order.
+        if getattr(cfg, 'tile', 'iso') == 'shaped':
+            self._load_anchor_tile(source)
+
+    def _load_anchor_tile(self, source):
+        """Read buffers.anchor_buffer.shape_path and bind it to the LIVE anchor set.
+
+        Four checks, each fatal: the file exists, format_version == 1, the row count
+        matches the anchor buffer, and anchor_x_sha1 matches the sha1 of the live
+        anchor_buffer.x taken over its contiguous float32 bytes. There is no fallback
+        to the isotropic draw -- a tile bound to a different anchor set would jitter
+        every row around another anchor's minimum and nothing downstream would say so.
+        """
+        import hashlib
+
+        cfg = self.args.buffers.anchor_buffer
+        buf = self.anchor_buffer
+        path = getattr(cfg, 'shape_path', None)
+        if not path:
+            raise ValueError(
+                "buffers.anchor_buffer.tile is 'shaped' but shape_path is unset.")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"anchor tile sidecar not found: {path} (buffers.anchor_buffer.shape_path)")
+        d = torch.load(path, map_location='cpu', weights_only=False)
+
+        version = d.get('format_version')
+        if version != 1:
+            raise ValueError(
+                f"anchor tile sidecar {path} has format_version={version!r}, expected 1.")
+        n = len(buf)
+        if int(d['n']) != n:
+            raise ValueError(
+                f"anchor tile sidecar {path} holds n={int(d['n'])} rows against an anchor "
+                f"buffer [{source}] of {n}. The tile is per-anchor and positional.")
+        live_sha = hashlib.sha1(
+            buf.x.detach().cpu().float().contiguous().numpy().tobytes()).hexdigest()
+        if d.get('anchor_x_sha1') != live_sha:
+            raise ValueError(
+                f"anchor tile sidecar {path} was built for a different anchor set: it "
+                f"records anchor_x_sha1={d.get('anchor_x_sha1')!r}, the live anchor_buffer.x "
+                f"[{source}] hashes to {live_sha!r}. Rebuild the sidecar against this "
+                f"anchor set.")
+        dim = int(d['dim'])
+        if int(buf.x.shape[1]) != dim:
+            raise ValueError(
+                f"anchor tile sidecar {path} holds dim={dim} against anchor latents of "
+                f"width {int(buf.x.shape[1])}.")
+
+        temperature = float(getattr(cfg, 'tile_temperature', 1.0))
+        width_cap = float(getattr(cfg, 'tile_width_cap', 0.15))
+        self._anchor_tile = {
+            'x_min': d['x_min'].to(self.device, torch.float32),
+            'evals': d['evals'].to(self.device, torch.float32),
+            'evecs': d['evecs'].to(self.device, torch.float32),
+            'temperature': temperature,
+            'width_cap': width_cap,
+        }
+        print(f"anchor tile: shaped, n={n}, sha ok, tile_temperature={temperature}, "
+              f"width_cap={width_cap}")
 
     def init_anchor_buffer_seed(self):
         """

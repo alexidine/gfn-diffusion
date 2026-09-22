@@ -158,8 +158,9 @@ def _modeller(cfg, rollout, replay_rows=None, condition_draw=True, accum_target=
     m._fwd_gates = lambda deact, force_refresh: (rollout, False, False)
     m.mode_repeats = lambda mode: 1
     m._stash_z_fill_logw = lambda d: None
+    m.z_level_fill = lambda *a, **k: None  # the fill runs inside the fused step when fwd is detached
     m._fused_grad_diag_armed = lambda: False
-    m.manage_replay_buffer = lambda d, b: None
+    m.manage_replay_buffer = lambda d, b, **kw: None
     m._ray_probe_armed = lambda: False
     m.record_fused_substep_losses = lambda subs: None
     m.update_ema_model = lambda: None

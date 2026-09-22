@@ -1023,6 +1023,12 @@ class MolecularCrystal(BaseSet):
         theta = sph[..., 0]  # polar angle
         r = sph[..., 2]  # rotation magnitude
         eps = 1e-8
+        # NB the clamps below bound these terms' VALUES, not their gradients, and the
+        # non-finite d(jacobian)/dx seen on out-of-box rot_theta rows is NOT fixable here:
+        # it is created upstream in latent_params()'s crystal -> latent rotation inverse,
+        # whose local derivative is infinite outside the theta chart [0, pi/2], so any mask
+        # applied to theta/r here still meets 0 * Inf = NaN in that backward. Measured
+        # 2026-09-21: 3 rows in 1024 of a phase-1 policy's draws, all with |rot_theta| > 1.
         # these come from composing the transforms of spherical -> cartesian ball and then to uniform rotation;
         # sum over z', because each dim gets its own correction
         rot_r_energy = - temperature * 2 * torch.log(torch.sin(r / 2).clamp_min(eps)).sum(dim=-1)

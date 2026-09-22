@@ -170,7 +170,7 @@ def excess_kt(en, x, zero):
 
 
 def descend(en, x0, steps, lr=None, optimizer='rprop'):
-    """Adam on the STATE x. Returns (best_x, best_u), the best point SEEN, not the last.
+    """Rprop (by default) on the STATE x. Returns (best_x, best_u), the best point SEEN, not the last.
 
     x IS the tier's coordinate, so a step cannot leave the tier's manifold and there is
     nothing to project back. At a collective tier that is the whole point: one state column

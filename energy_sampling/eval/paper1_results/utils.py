@@ -583,8 +583,13 @@ def expand_tree_fast(root_dim, root_cluster, p1, idx_cache, N,
 
 def estimate_logp_with_convergence(
         gfn_model, terminal_states,
-        n_steps, tol=1e-3, window=5, max_repeats=200
+        n_steps, tol=1e-3, window=5, max_repeats=200, mol_batch=None
 ):
+    """log p_model(x) by importance sampling over backward trajectories:
+    logmeanexp_k [log P_F(tau_k) - log P_B(tau_k | x)], tau_k ~ P_B(. | x), drawn until the running
+    estimate moves less than `tol` over `window` repeats or `max_repeats` is reached.
+    Biased LOW and tail-dependent: read the returned history before quoting a value.
+    mol_batch is the conditioning batch on the molecule-conditioned route; None for an unconditional model."""
     flows = []
     logp_history = []
 
@@ -598,7 +603,7 @@ def estimate_logp_with_convergence(
         with torch.no_grad():
             states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
                 terminal_states.clone().to(gfn_model.device),
-                discretizer, condition, return_gauss_params=False
+                discretizer, condition, mol_batch, return_gauss_params=False
             )
             delta = (log_pfs.sum(-1) - log_pbs.sum(-1)).cpu().detach()
             flows.append(delta)

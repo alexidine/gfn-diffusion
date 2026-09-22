@@ -309,7 +309,6 @@ class TrainerSnapshot:
         '_grad_nonfinite_streak',   # the abort counter; a stale one aborts early
         '_nonfinite_pending',       # a pending divergence response
         'last_grad_norm_pre_clip',  # read by every guard
-        '_hyper_prev_step',         # the diagnostic sensor's operand
         '_z_cal_rollouts',
         # DRAINED-AT-REPORT COUNTERS. These accumulate during a trial and are
         # published at the next 10-step report as if they described promoted

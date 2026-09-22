@@ -1,0 +1,24 @@
+# References check_refs.py cannot resolve and that are correct as written.
+# One per line, `<ref>  # <reason>`. The ref is spelled exactly as the failure
+# line prints it. Keep this file short: a growing allowlist is a checker being
+# switched off one line at a time.
+
+# Third-party source, in neither repository.
+torch_geometric/data/data.py::BaseData.to    # PyTorch Geometric, outside both repos
+torch_geometric/data/storage.py::BaseStorage.apply  # PyTorch Geometric, outside both repos
+storage.py::BaseStorage.apply                # PyTorch Geometric, outside both repos
+
+# Symbols the pages name BECAUSE they are gone.
+phases.py::_refresh_optimization             # layer deleted; the page names it as no longer existing
+controller.py::LRController.on_hypergradient # removed 2026-09-20
+controller.py::LRController._hyper_apply     # removed 2026-09-20
+utils.py::_hyper_apply                       # removed 2026-09-20
+
+# Config keys the pages name as retired: carrying one is refused at load.
+cfg:buffers.anchor_buffer.mcmc               # retired key, in utils.py::_RETIRED_KEYS
+cfg:condition_log_z.{fwd,bwd,replay}_tb_z_source  # retired keys, moved to the per-branch blocks
+cfg:bwd_loss_coeffs.detach_pb                # removed 2026-09-20
+cfg:replay_loss_coeffs.detach_pb             # removed 2026-09-20
+
+# The notation itself, written out on a page about checking references.
+file.py::symbol                              # the notation, not a symbol

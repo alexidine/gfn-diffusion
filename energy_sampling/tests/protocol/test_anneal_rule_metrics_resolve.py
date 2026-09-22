@@ -135,8 +135,9 @@ def _modeller(cfg):
     m.replay_train_step = lambda discretizer, repeats, report_losses: _bwd_loss(rep_c)
     m.mode_repeats = lambda mode: 1
     m._stash_z_fill_logw = lambda d: None
+    m.z_level_fill = lambda *a, **k: None  # the fill runs inside the fused step when fwd is detached
     m._fused_grad_diag_armed = lambda: False
-    m.manage_replay_buffer = lambda d, b: None
+    m.manage_replay_buffer = lambda d, b, **kw: None
     for name in ('fused_train_step', 'record_fused_substep_losses', '_update_rolling',
                  '_per_step_probe', '_reward_ramp_kwargs', '_forgetting_sensor'):
         setattr(m, name, MethodType(getattr(Modeller, name), m))

@@ -702,7 +702,7 @@ class ConformerModeller(Modeller):
 
     # ----------------------------------------------------------- anchor paths
 
-    def _noise_and_condition(self, batch, noise_log_range):
+    def _noise_and_condition(self, batch, noise_log_range, anchor_inds=None):
         """The conformer form: jitter ``torsion_state``, then condition.
 
         Mirrors the crystal noiser's convention exactly -- a unit-norm random direction
@@ -720,6 +720,13 @@ class ConformerModeller(Modeller):
         """
         from energies.conformer_data import batch_states, set_batch_states
 
+        # `anchor_inds` is the crystal shaped tile's key into its sidecar; that tile is
+        # built over CELL latents and has no conformer form, so it is refused here
+        # rather than dropped (which would silently run the isotropic draw instead).
+        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'shaped':
+            raise NotImplementedError(
+                "buffers.anchor_buffer.tile: 'shaped' is a crystal-latent tile "
+                "(x_min/evals/evecs over cell parameters) and has no conformer form.")
         log_min, log_max = float(noise_log_range[0]), float(noise_log_range[1])
         state = batch_states(batch)
         direction = torch.randn_like(state)

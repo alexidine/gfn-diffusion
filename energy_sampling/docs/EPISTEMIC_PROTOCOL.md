@@ -1,6 +1,6 @@
 # GFN epistemic protocol
 
-Status: **ACTIVE**  
+Status: **RETIRED 2026-09-20** as operating procedure; superseded by `wiki/writing-protocol.md`. Retained as history.  
 Scope: institutional knowledge under `gfn_diffusion/`  
 Authority: implements the repository-root `AGENTS.md`; if they conflict, `AGENTS.md` wins
 

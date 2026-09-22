@@ -14,8 +14,9 @@ boundary it never found.
 
 WHAT THIS REPLACED, AND WHY. Controller v8 moved `peak_scale` from a per-stage
 declared sensor: `ray` (a line-search optimum alpha*), `hyper` (a hypergradient
-cosine) or `plateau`, under a warmup envelope with its own freeze rules, with a
-pooled estimator and a periodic re-probe on top. The ray was killed on
+cosine, deleted 2026-09-20) or `plateau`, under a warmup envelope with its own
+freeze rules, with a pooled estimator and a periodic re-probe on top. The ray
+was killed on
 2026-08-23 by its own acceptance test -- alpha* is defined as s*/lr, so the slope
 of log(alpha*) against log(lr) MUST be -1, and measured 0.00 +- 0.2 across twelve
 runs, two stages and 2.7 decades of rate. The sensor was uncorrelated with the
@@ -35,12 +36,14 @@ WHAT SURVIVES FROM v8, and it is deliberately little:
     longer the only ones: see `lr_bracket_probe.HardFailureBars`, which derives a
     bar from the root's own loss scale, because at 1e9 the shipped bars caught
     numerical death and nothing else.
-  * `ray` and `hyper` as OPTIONAL, OFF-BY-DEFAULT DIAGNOSTICS. They no longer
-    reach any learning rate, and no canonical config declares one. They are kept
-    reachable so a future claim about either can be measured rather than argued
-    about; their reporting is off unless a stage explicitly asks.
+  * `ray` as an OPTIONAL, OFF-BY-DEFAULT DIAGNOSTIC. It no longer reaches any
+    learning rate, and no canonical config declares it. It is kept reachable so
+    a future claim about it can be measured rather than argued about; its
+    reporting is off unless a stage explicitly asks.
 
-WHAT IS GONE: `plateau`, the pooled estimator (`lr_pool`), the rung ladder
+WHAT IS GONE: `plateau`, `hyper` (deleted 2026-09-20 -- the cosine is a
+stationarity statistic with no fixed point to steer to, and a stage declaring it
+is now refused at load), the pooled estimator (`lr_pool`), the rung ladder
 (`lr_ramp`), the sweep (`lr_sweep`), the warmup envelope and its freeze rules,
 the divergence LR cut and its ceiling, the alpha target, the warm restart.
 """
@@ -77,7 +80,6 @@ class LRController:
         self._moderate_fires = 0         # the excursion-tier subset of the above
         self._fire_cooldown_until = 0
         self._calibrations = 0
-        self._hypergrads = 0
         self._lr_capped_groups = 0
         self._lr_floored_groups = 0
         self._skip_steps = 0          # promoted steps the host loop must skip
@@ -1154,23 +1156,12 @@ class LRController:
         self._calibrations += 1
         self._last_ray = dict(reading or {})
 
-    def on_hypergradient(self, cos, beta=None, beta_down=None, cos_target=0.0,
-                         clip_ratio=None):
-        """Record one hypergradient cosine. IT MOVES NOTHING -- same contract as
-        `on_calibration`. `cos` is a stationarity statistic: it is negative at
-        every stable rate once the iterate has equilibrated, so it has no fixed
-        point to steer to."""
-        if cos is None or not math.isfinite(float(cos)):
-            return
-        self._hypergrads += 1
-        self._last_cos = float(cos)
-
     # ---------------------------------------------------------------- report
 
     def _emit(self, st):
         """The LR channel. Pared to what a reader needs to reconstruct the rate
-        and the experiment that chose it -- and deliberately NOT carrying alpha*
-        or cos, which would read as explanations for a selection neither entered.
+        and the experiment that chose it -- and deliberately NOT carrying alpha*,
+        which would read as an explanation for a selection it never entered.
         """
         self._report = {
             'lr_ctrl/scale': float(st['scale']),
@@ -1187,15 +1178,11 @@ class LRController:
         if self._max_lr() is not None:
             self._report['lr_ctrl/lr_capped_groups'] = float(self._lr_capped_groups)
         self._report['lr_ctrl/lr_floored_groups'] = float(self._lr_floored_groups)
-        # THE DIAGNOSTIC SENSORS ARE SILENT UNLESS THEY RAN. A channel that
+        # THE DIAGNOSTIC SENSOR IS SILENT UNLESS IT RAN. A channel that
         # publishes a constant whether or not the sensor fired is how a dead
         # sensor reads exactly like a working one.
         if self._calibrations:
             self._report['lr_ctrl/calibrations'] = float(self._calibrations)
-        if self._hypergrads:
-            self._report['lr_ctrl/hypergrads'] = float(self._hypergrads)
-            if getattr(self, '_last_cos', None) is not None:
-                self._report['lr_ctrl/hyper_cos'] = float(self._last_cos)
 
     def report(self):
         return dict(self._report)

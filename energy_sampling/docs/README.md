@@ -1,5 +1,17 @@
 # GFN documentation router
 
+Status: **LEGACY ROUTER**
+Scope: `energy_sampling/docs/`
+
+**The knowledge base at [`wiki/index.md`](wiki/index.md) is the active documentation.** It is grouped by subject, every page is verified against a stamped commit and checked by `wiki/check_refs.py`, and [`wiki/writing-protocol.md`](wiki/writing-protocol.md) says how a page is produced. Read the repository-root `AGENTS.md` first, then the wiki page for the thing you are touching.
+
+Everything else in this directory is history, evidence, a snapshot or a proposal unless a wiki page cites it. `EPISTEMIC_PROTOCOL.md` and `PROTOCOL.md` are retired as operating procedure. `findings.md` is a frozen evidence ledger; `current_decisions.md` and `decisions.md` are frozen; `synthesis.md` and `module_*.md` are snapshots superseded by the wiki's code-bound pages; `design/` holds the derivation notes the theory pages were built from and the plans and handoffs that preceded them.
+
+---
+
+The original router follows, for anyone tracing where a claim came from.
+
+
 Status: **ACTIVE ROUTER**  
 Scope: `energy_sampling/docs/`
 

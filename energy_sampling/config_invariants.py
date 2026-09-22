@@ -1214,7 +1214,7 @@ def every_protocol_parses(cfg: dict) -> list[Violation]:
 
     DELIBERATELY SHALLOW. This parses each stage through `protocol.Stage`, which
     is the validation the trainer already does: unknown keys, train_mode, flags,
-    lr_sensor shape (hyper needs an explicit beta, ray takes no other keys), the
+    lr_sensor shape (ray takes only period/n_sub, retired kinds refuse), the
     balance kind. That catches the trivially-broken protocol. It does NOT check
     whether a stage's exit metrics are ever published, whether a handover's
     on_enter actions are coherent, or anything else that needs a run -- those are

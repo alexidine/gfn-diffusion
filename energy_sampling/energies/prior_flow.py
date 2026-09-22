@@ -473,12 +473,22 @@ class PriorFlow:
 
     # -- energy ------------------------------------------------------------
     def energy(self, x):
-        """-log p(x) + const. Deterministic; a single masked forward pass."""
+        """-log p(x) + const. Deterministic; a single masked forward pass.
+
+        THE GRAPH IS BUILT ONLY WHEN THE CALLER ASKS FOR IT, i.e. when x carries grad and
+        grad mode is on. This used to be an unconditional `with torch.no_grad()`, which made
+        d(flow leg)/dx identically zero: under lambda mixing the terminal reward force was
+        then entirely lambda * d(physical)/dx at every lambda, with no flow contribution
+        even at lambda -> 0 where the flow IS the target (measured 2026-09-21). Every
+        scoring path that does not want a graph -- buffer rescoring, eval, admission --
+        passes a detached x and is unaffected, so this keeps their cost exactly as it was.
+        """
         dev_in = x.device if torch.is_tensor(x) else None
         xt = torch.as_tensor(x, dtype=torch.float32).to(self.device)
         xt = self._to_internal(xt)
+        want_grad = torch.is_grad_enabled() and xt.requires_grad
         out = []
-        with torch.no_grad():
+        with torch.enable_grad() if want_grad else torch.no_grad():
             for i in range(0, xt.shape[0], 65536):
                 out.append(self.flow.log_prob(xt[i:i + 65536]))
         lp = torch.cat(out) + self._jac_const()

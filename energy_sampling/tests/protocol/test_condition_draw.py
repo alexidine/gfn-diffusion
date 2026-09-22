@@ -178,8 +178,10 @@ def _fused(cond_spec=SPEC, cids=(4, 7), pooled_vg=1.0):
     m._choose_draw_conditions = choose
     m.mode_repeats = lambda mode: 1
     m._stash_z_fill_logw = lambda d: None
+    m.z_level_fill = lambda *a, **k: None  # the fill runs inside the fused step when fwd is detached
     m._fused_grad_diag_armed = lambda: False
-    m.manage_replay_buffer = lambda d, b: None
+    m.manage_replay_buffer = lambda d, b, **kw: None
+    m._note_replay_draw_origins = lambda *a, **k: None
     m.fused_train_step = MethodType(Modeller.fused_train_step, m)
     return m
 

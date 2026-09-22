@@ -169,10 +169,10 @@ def test_nan_equals_nan_but_nan_does_not_equal_a_number():
 
 def test_a_key_present_on_only_one_side_is_reported_not_ignored():
     a, b = _trace(), _trace()
-    b['logged'][1]['values']['lr_ctrl/hyper_cos'] = 0.3
+    b['logged'][1]['values']['lr_ctrl/calibrations'] = 0.3
     cmp = T.compare_traces(a, b)
     assert not cmp.identical
-    assert 'logged[1].values.lr_ctrl/hyper_cos' in cmp.only_b
+    assert 'logged[1].values.lr_ctrl/calibrations' in cmp.only_b
 
 
 def test_a_differing_step_count_is_never_identical():

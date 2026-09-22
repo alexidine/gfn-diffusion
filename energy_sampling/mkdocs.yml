@@ -1,0 +1,99 @@
+site_name: GFN knowledge base
+docs_dir: docs/wiki
+site_dir: ../../.mkdocs_site
+use_directory_urls: false
+
+nav:
+  - Index: index.md
+  - Writing protocol: writing-protocol.md
+  - Theory of the objective:
+      - trajectory-balance: trajectory-balance.md
+      - vargrad: vargrad.md
+      - on-policy-and-off-policy-training: on-policy-and-off-policy-training.md
+      - flat-directions-and-limit-cycles: flat-directions-and-limit-cycles.md
+      - gradient-routes-and-terminal-force: gradient-routes-and-terminal-force.md
+      - loss-composition: loss-composition.md
+      - mle-phase: mle-phase.md
+      - lambda-annealing: lambda-annealing.md
+      - z-calibration: z-calibration.md
+  - Conditioning:
+      - conditional-route: conditional-route.md
+      - prior-density-models: prior-density-models.md
+      - molecule-conditions-and-anchors: molecule-conditions-and-anchors.md
+      - molecule-encoder: molecule-encoder.md
+  - Training dynamics and control:
+      - learning-rate: learning-rate.md
+      - gradient-clipping: gradient-clipping.md
+      - stage-protocol-engine: stage-protocol-engine.md
+      - balance-controllers: balance-controllers.md
+      - under-coverage-metric-family: under-coverage-metric-family.md
+  - Buffers and rollouts:
+      - prior-buffer: prior-buffer.md
+      - prior-buffer-row-geometry: prior-buffer-row-geometry.md
+      - anchor-buffer: anchor-buffer.md
+      - replay-buffer: replay-buffer.md
+      - rollout-cadence-and-dose: rollout-cadence-and-dose.md
+  - Compute and energy:
+      - batch-size: batch-size.md
+      - gpu-occupancy: gpu-occupancy.md
+      - compute-guards: compute-guards.md
+      - mlip-energy-routes: mlip-energy-routes.md
+      - reward-construction: reward-construction.md
+      - crystal-force-fields: crystal-force-fields.md
+  - Crystal physics:
+      - cell-fundamental-domains: cell-fundamental-domains.md
+      - asymmetric-unit-reduction: asymmetric-unit-reduction.md
+      - latent-dimension-structure: latent-dimension-structure.md
+      - landscape-structure: landscape-structure.md
+      - crystal-search-method: crystal-search-method.md
+      - structure-comparison-metrics: structure-comparison-metrics.md
+  - Conformers:
+      - conformer-chart-and-internal-coordinates: conformer-chart-and-internal-coordinates.md
+      - conformer-force-field-and-prior: conformer-force-field-and-prior.md
+      - conformer-training: conformer-training.md
+      - conformer-conditioning-and-carrier: conformer-conditioning-and-carrier.md
+  - Infrastructure:
+      - config-validation: config-validation.md
+      - battery-generation: battery-generation.md
+      - checkpoints-and-resume: checkpoints-and-resume.md
+      - cluster-operations: cluster-operations.md
+      - failure-signatures: failure-signatures.md
+      - run-reading: run-reading.md
+      - dev-traps: dev-traps.md
+      - codebase-map: codebase-map.md
+      - paper-vs-code: paper-vs-code.md
+      - external-dependency-validation: external-dependency-validation.md
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - search.highlight
+    - content.code.copy
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js

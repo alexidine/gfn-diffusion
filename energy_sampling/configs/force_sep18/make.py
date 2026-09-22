@@ -28,6 +28,28 @@ ARMS (fwd_loss_coeffs; everything else identical):
             absorbing sampler absorb faster with them in the backward branch? Read against ctrl_pb
             on the FORWARD oracles (Z, eval_fwd/tb_err, excess-energy P90/P99); every bwd/* metric
             averages over this arm's own harder rows and is not comparable.
+  anch_pb   NO force; prior buffer from ANCHORS ONLY at the DEFAULT noise (0.003-0.03) and the
+            default window (100 / 50). The control bad_pb lacked: differs from bad_pb in the noise
+            and the window only, and from ctrl_pb in the source only (owner, 2026-09-18).
+  bad2_pb   bad_pb with the noise raised again: 0.06-0.13 latent, window unchanged (1000 / 500), so it
+            differs from bad_pb in the noise only. NB the ramp gates admission/expiry and weights the
+            under-coverage METRIC; the backward LOSS weights every admitted row equally (owner asked
+            2026-09-18). Rows above Emin + 1000 are refused at admission.
+  therm_pb  anch_pb with the anchor jitter SHAPED: buffers.anchor_buffer.tile 'shaped', so each drawn
+            anchor is redrawn from N(x_min, V) -- x_min the anchor's relaxed minimum and V built from
+            the per-anchor Hessian eigenpairs -- instead of the isotropic noise_log_range ball around
+            the stored anchor. tile_temperature 1.0, tile_width_cap at mk_dev's 0.15. Source 'anchors'
+            and the default window (100 / 50), so it differs from anch_pb in the tile only.
+            READS D:\\crystal_datasets\\gfn_checkpoints\\anchor_shapes_e01bd1.pt (format_version 1:
+            x_min, evals, evecs per anchor, plus a sha1 of anchor_buffer.x the loader must match).
+  therm05_pb therm_pb at tile_temperature 0.5, i.e. every width scaled by 1/sqrt(2); differs from
+            therm_pb in that number only.
+  therm2_pb  therm_pb on the v2 sidecar (anchor_shapes_e01bd1_v2.pt: 5 saddle-free Newton iterations at trust 0.04
+            instead of 2 at 0.1, so the relaxed centres carry a smaller residual gradient) with tile_width_cap 0.08
+            (v1: 0.15) on the flat and capped directions; tile_temperature 1.0. Differs from therm_pb in the sidecar
+            and the cap only.
+  therm2_05_pb  therm2_pb at tile_temperature 0.5.
+  smoke_therm_pb  therm_pb at 60 fused steps -- the mechanics check, same shape as smoke_gc_pb.
 
 SEAT. Rollout every step, fwd trains the policy at a pinned 0.3 share, bwd 0.5 /
 replay 0.2 with the ramp frozen; constant LR (burn_in_scale == fixed_scale); P_B
@@ -57,6 +79,8 @@ STUB_STEPS = 250   # one eval period of MLE before the always-true exit fires
 STEPS = 3000
 FWD_SHARE = 0.3
 FORCE_CLIP = 250.0
+SHAPE_PATH = 'D:\\crystal_datasets\\gfn_checkpoints\\anchor_shapes_e01bd1.pt'
+SHAPE_PATH_V2 = 'D:\\crystal_datasets\\gfn_checkpoints\\anchor_shapes_e01bd1_v2.pt'   # 5 Newton iterations, trust 0.04
 
 
 def base():
@@ -108,6 +132,7 @@ def common(cfg, name, steps=STEPS):
 
 
 def bad_buffer(cfg, lo=-1.4, hi=-1.1, floor=1000.0, width=500.0):
+    # lo/hi: log10 of the isotropic anchor-noise radius range in latent units
     pb = cfg['buffers']['prior_buffer']
     pb['source'] = 'anchors'
     pb['ramp_floor'] = float(floor)
@@ -117,10 +142,32 @@ def bad_buffer(cfg, lo=-1.4, hi=-1.1, floor=1000.0, width=500.0):
     return cfg
 
 
-def arm(name, k, rg, gate=None, force_clip=0.0, scale=1, steps=STEPS, bad=False):
+def shaped_tile(cfg, temperature, path=None, cap=None):
+    # the anchor jitter becomes a per-anchor Gaussian read from the sidecar, centred on
+    # each anchor's stored relaxed minimum; noise_log_range is unread under this tile
+    ab = cfg['buffers']['anchor_buffer']
+    ab['tile'] = 'shaped'
+    ab['shape_path'] = SHAPE_PATH if path is None else path
+    ab['tile_temperature'] = float(temperature)
+    assert ab['tile_width_cap'] == 0.15, ab['tile_width_cap']
+    if cap is not None:
+        ab['tile_width_cap'] = float(cap)
+    return cfg
+
+
+def arm(name, k, rg, gate=None, force_clip=0.0, scale=1, steps=STEPS, bad=False, anchors=False,
+        noise=None, tile_t=None, tile_path=None, tile_cap=None):
     cfg = common(fwd_seat(base()), name, steps=steps)
     if bad:
-        cfg = bad_buffer(cfg)
+        cfg = bad_buffer(cfg, *(noise or (-1.4, -1.1)))
+    elif anchors:
+        cfg['buffers']['prior_buffer']['source'] = 'anchors'
+    else:
+        # the six force arms and ctrl_pb ran BEFORE mk_dev's default moved to 'anchors' (2026-09-18):
+        # keep them on the prior model so the set stays internally comparable
+        cfg['buffers']['prior_buffer']['source'] = 'prior_model'
+    if tile_t is not None:
+        cfg = shaped_tile(cfg, tile_t, path=tile_path, cap=tile_cap)
     fc = cfg['fwd_loss_coeffs']
     fc['path_grad_last_k'] = int(k)
     fc['reward_grads'] = float(rg)
@@ -132,7 +179,9 @@ def arm(name, k, rg, gate=None, force_clip=0.0, scale=1, steps=STEPS, bad=False)
     out = HERE / f'{name}.yaml'
     with out.open('w', encoding='utf-8') as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
-    print(f'wrote {out.name:16s} k={k} reward_grads={rg} gate={gate} force_clip={force_clip} path_grad_scale={scale} steps={steps}')
+    print(f'wrote {out.name:16s} k={k} reward_grads={rg} gate={gate} force_clip={force_clip} '
+          f'path_grad_scale={scale} steps={steps} tile={cfg["buffers"]["anchor_buffer"]["tile"]}'
+          f'{"" if tile_t is None else f"@{tile_t}"}')
     return out
 
 
@@ -144,4 +193,11 @@ if __name__ == '__main__':
     arm('g0c_pb', 1, 1.0, gate=0.0, force_clip=FORCE_CLIP)
     arm('g_pb', 1, 1.0, gate=1.0, force_clip=0.0)
     arm('bad_pb', 0, 0.0, bad=True)
+    arm('anch_pb', 0, 0.0, anchors=True)
+    arm('bad2_pb', 0, 0.0, bad=True, noise=(-1.2, -0.9))
+    arm('therm_pb', 0, 0.0, anchors=True, tile_t=1.0)
+    arm('therm05_pb', 0, 0.0, anchors=True, tile_t=0.5)
+    arm('therm2_pb', 0, 0.0, anchors=True, tile_t=1.0, tile_path=SHAPE_PATH_V2, tile_cap=0.08)
+    arm('therm2_05_pb', 0, 0.0, anchors=True, tile_t=0.5, tile_path=SHAPE_PATH_V2, tile_cap=0.08)
     arm('smoke_gc_pb', 1, 1.0, gate=1.0, force_clip=FORCE_CLIP, scale=0, steps=60)   # crosses the stub exit at +250, then 60 fused steps
+    arm('smoke_therm_pb', 0, 0.0, anchors=True, tile_t=1.0, steps=60)

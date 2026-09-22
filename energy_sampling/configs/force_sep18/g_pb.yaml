@@ -533,6 +533,10 @@ buffers:
     noise_log_range:
     - -2.5
     - -1.5
+    tile: iso
+    shape_path: null
+    tile_temperature: 1.0
+    tile_width_cap: 0.15
     topup_admit_record_breakers: true
     reach_quantile: 0.9
     reach_threshold: 0.75
