@@ -416,25 +416,33 @@ fi
 
 # RESUME OR SEED. checkpoint_name always wins in train.py: an arm with its own _running.pt continues it
 # (full load); only a first launch seeds. REFUSES AN AMBIGUOUS MATCH.
+# CK_STEP=<N> (env) seeds this leg from the arm's OWN _step<N>.pt archive and its frozen _step<N>_buffers.pt
+# instead of the live _running.pt -- the way back from a poisoned leg (cancel it first). The archive must exist.
 OWN=$(ls -t ${{CKPTS}}/*${{ARM}}_*_running.pt 2>/dev/null | head -1)
-if [ -n "${{OWN}}" ]; then
+if [ -n "${{CK_STEP:-}}" ]; then
+    NA=$(ls ${{CKPTS}}/*${{ARM}}_*_step${{CK_STEP}}.pt 2>/dev/null | grep -v '_buffers.pt$' | wc -l)
+    if [ "${{NA}}" -ne 1 ]; then
+        echo "FATAL: ${{NA}} matches for *${{ARM}}_*_step${{CK_STEP}}.pt in ${{CKPTS}} (need exactly 1)" >&2; exit 1
+    fi
+    CK=$(ls ${{CKPTS}}/*${{ARM}}_*_step${{CK_STEP}}.pt | grep -v '_buffers.pt$')
+    if [ ! -f "${{CK%.pt}}_buffers.pt" ]; then
+        echo "FATAL: ${{CK}} has no frozen buffers sidecar beside it" >&2; exit 1
+    fi
+    echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  RESTART FROM ARCHIVE: $(basename ${{CK}}) (CK_STEP=${{CK_STEP}})"
+elif [ -n "${{OWN}}" ]; then
     echo "array ${{SLURM_ARRAY_TASK_ID}} -> arm ${{ARM}}  RESUME: $(basename ${{OWN}})"
     CK=${{OWN}}
 else
 {seed_block}
 fi
 
-# THE PRIOR MODEL: written by the stub's snapshot_prior on leg A's first launch; every later launch is
-# handed one (its own if it has one, else its source arm's).
-OWNPRIOR=$(ls -t ${{CKPTS}}/*${{ARM}}_*_prior.pt 2>/dev/null | head -1)
-SRCPRIOR=$(ls -t ${{CKPTS}}/*${{SRC}}_*_prior.pt 2>/dev/null | head -1)
-if [ -n "${{OWNPRIOR}}" ]; then
-    PM=$(basename ${{OWNPRIOR}}); echo "  prior model <- ${{PM}} (own)"
-elif [ -n "${{SRCPRIOR}}" ]; then
-    PM=$(basename ${{SRCPRIOR}}); echo "  prior model <- ${{PM}} (source arm)"
-else
-    PM=null; echo "  prior model <- null (the stub writes it)"
-fi
+# THE PRIOR MODEL IS NEVER HANDED TO A LEG. These arms churn the prior buffer from noised ANCHORS
+# (buffers.prior_buffer.source: anchors), under which the prior model is never used -- and loading one is
+# actively harmful: train.py's init-time grow_prior_buffer() fills the prior buffer with min_size (10k)
+# prior-MODEL samples whenever a prior model is loaded and the buffer is under max_size, bypassing the
+# anchors-only source (p20_acr_n5 leg 2, 2026-09-23: anchor fraction 1.0 -> 0.2, bwd/under_coverage 2.83 -> 3.49,
+# backward and replay errors rising). Leg 1 always ran with null; every leg does.
+PM=null; echo "  prior model <- null (anchors-only churn; never loaded)"
 
 sed -e "s|WARM_CHECKPOINT_PLACEHOLDER|$(basename ${{CK}})|" \\
     -e "s|PRIOR_MODEL_PLACEHOLDER|${{PM}}|" ${{CONFIG}} > ${{RESOLVED}}
