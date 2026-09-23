@@ -721,6 +721,7 @@ protocols:
       - name: equilibration
         train_mode: fused
         bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
+        coeff_schedule: {}             # {coefficient: {target, steps, kind: geometric|linear}}: ramps an energy_config coefficient from its config value to target over `steps` train steps, anchored at the stage's first tick (stage_ctrl.coeff_sched_entry, rides the checkpoint), then holds; any balance kind; a coefficient also named in balance.anneal_coeffs is refused. {} = none
         # "The LR is hot" sensor -- REPORT-ONLY, moves nothing. It fills a
         # measured gap: `lr_ctrl/divergences` was 0 across all 97 stage segments
         # swept, INCLUDING all 19 failures, so the hard tripwire does not fire on

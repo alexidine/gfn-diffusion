@@ -261,6 +261,9 @@ def fresh_stage_ctrl():
         'gate_state': {},   # gate internals, e.g. the MLE slope gate's window
         'rules': {},        # rule index -> {'best', 'thr', 'look'}
         'coeffs': {},       # anneal_coeffs name -> {'val': live value}
+        # coeff_schedule: the train step the ramp is anchored at, stamped at the stage's first
+        # energy_coeffs() evaluation; rides the checkpoint so a requeued leg continues the ramp
+        'coeff_sched_entry': None,
         'exit': {},         # exit term index -> consecutive-pass streak
         # exit term index -> the write-stamp of the last value that streak
         # ACTUALLY JUDGED. Without it a streak cannot tell a new measurement
@@ -329,7 +332,7 @@ class Stage:
                                # accepted here ONLY so Stage.__init__'s own check
                                # reports the rename; the generic unknown-key error
                                # would otherwise fire first and say nothing useful
-                               'fwd_rollout_drift_max'}
+                               'fwd_rollout_drift_max', 'coeff_schedule'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -478,7 +481,19 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': deactivate_threshold must be in [0, 1/3), got {v}")
             self.deactivate_threshold = float(v)
 
+        # coeff_schedule: energy_config coefficients RAMPED on a step clock -- {name: {target, steps, kind}},
+        # kind 'geometric' (default: multiply from the base config value to target) or 'linear' (add). The
+        # anchor is the stage's first energy_coeffs() evaluation (stage_ctrl['coeff_sched_entry'], rides the
+        # checkpoint), progress p = min(1, elapsed / steps), so it terminates at target and holds. Any balance
+        # kind; balance.anneal_coeffs is the lexicographic controller's EVENT-driven ramp of the same
+        # coefficients, so naming one coefficient in both is refused below.
+        self.coeff_schedule = self._parse_coeff_schedule(spec.get('coeff_schedule'))
         self.balance = self._parse_balance(spec.get('balance'))
+        if self.coeff_schedule and self.balance is not None:
+            both = set(self.coeff_schedule) & set(self.balance.get('anneal_coeffs') or {})
+            if both:
+                raise ValueError(f"stage '{self.name}': {sorted(both)} named in both coeff_schedule and "
+                                 f"balance.anneal_coeffs -- one ramp per coefficient")
         self.buffer_servo = self._parse_buffer_servo(spec.get('buffer_servo'))
         self.lr_sensor = self._parse_lr_sensor(spec.get('lr_sensor'))
         self.mle_gate = self._parse_mle_gate(spec.get('mle_gate'))
@@ -496,6 +511,33 @@ class Stage:
         self._parse_condition_draw(spec)
 
     # ------------------------------------------------------------ sub-parsers
+
+    def _parse_coeff_schedule(self, node):
+        """{coefficient: {'target': float, 'steps': int >= 1, 'kind': 'geometric'|'linear'}}; {} when
+        absent. The coefficient must be a numeric energy_config key -- checked where the config is in
+        hand (StageProtocol.energy_coeffs), not here."""
+        if not node:
+            return {}
+        if not isinstance(node, dict):
+            raise ValueError(f"stage '{self.name}': coeff_schedule must be a mapping "
+                             f"{{coefficient: {{target, steps, kind}}}}, got {node!r}")
+        out = {}
+        for name, spec in node.items():
+            where = f"stage '{self.name}': coeff_schedule.{name}"
+            if not isinstance(spec, dict) or 'target' not in spec or 'steps' not in spec:
+                raise ValueError(f"{where} needs 'target' and 'steps'")
+            bad = set(spec) - {'target', 'steps', 'kind'}
+            if bad:
+                raise ValueError(f"{where} unknown keys {sorted(bad)}")
+            target = float(_require_real(spec['target'], where + '.target'))
+            steps = _require_count(spec['steps'], where + '.steps', minimum=1)
+            kind = spec.get('kind', 'geometric')
+            if kind not in ('geometric', 'linear'):
+                raise ValueError(f"{where}.kind must be 'geometric' or 'linear', got {kind!r}")
+            if kind == 'geometric' and target <= 0:
+                raise ValueError(f"{where}: a geometric ramp needs target > 0, got {target}")
+            out[str(name)] = {'target': target, 'steps': int(steps), 'kind': kind}
+        return out
 
     def _parse_replay_seat(self, spec):
         """The three keys that let the REPLAY branch take the forward branch's
@@ -1857,10 +1899,30 @@ class StageProtocol:
             self._energy_coeff_defaults = {
                 k: v for k, v in vars(self.m.args.energy_config).items()
                 if isinstance(v, (int, float))}
+        out = {}
+        sched = self.stage.coeff_schedule
+        if sched:
+            # the step clock: anchored at THIS stage's first evaluation (a resumed leg keeps the stamp)
+            step = int(getattr(self.m, 'step_ind', 0) or 0)
+            entry = self.ctrl.get('coeff_sched_entry')
+            if entry is None:
+                entry = self.ctrl['coeff_sched_entry'] = step
+            for name, spec in sched.items():
+                if name not in self._energy_coeff_defaults:
+                    raise ValueError(f"stage '{self.stage.name}': coeff_schedule.{name} is not a "
+                                     f"numeric energy_config key")
+                base = float(self._energy_coeff_defaults[name])
+                p = min(1.0, max(0.0, (step - int(entry)) / float(spec['steps'])))
+                if spec['kind'] == 'geometric':
+                    if base <= 0:
+                        raise ValueError(f"stage '{self.stage.name}': coeff_schedule.{name}: a geometric "
+                                         f"ramp needs a positive base energy_config value, got {base}")
+                    out[name] = base * (spec['target'] / base) ** p
+                else:
+                    out[name] = base + (spec['target'] - base) * p
         bal = self.stage.balance
         if not bal or bal['kind'] != 'lexicographic':
-            return {}
-        out = {}
+            return out
         for name, spec in bal['anneal_coeffs'].items():
             if name not in self._energy_coeff_defaults:
                 raise ValueError(f"stage '{self.stage.name}': anneal_coeffs.{name} is not "
@@ -3300,6 +3362,12 @@ class StageProtocol:
                 v = self._resolve(metric)
                 if v is not None:
                     out[f'protocol/rt_metric_{mode}'] = v
+        if stage.coeff_schedule:
+            entry = self.ctrl.get('coeff_sched_entry')
+            if entry is not None:
+                step = int(getattr(self.m, 'step_ind', 0) or 0)
+                for name, spec in stage.coeff_schedule.items():
+                    out[f'protocol/coeff_sched_p_{name}'] = min(1.0, max(0.0, (step - int(entry)) / float(spec['steps'])))
         if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
             for i, rule in enumerate(stage.balance['rules']):
                 rs = self.ctrl['rules'].get(i, {})

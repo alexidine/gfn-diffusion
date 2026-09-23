@@ -1,0 +1,5 @@
+arm	family	start	warm_src	prior	prior_bytes
+p23_mip_ft	mip	switch	p20_mip_n5	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt	165617107
+p23_mipu_ft	mipu	switch	p20_mipu_n5	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061
+p23_neh_ft	neh	switch	p20_neh_n5	nehzor_sg14_zp1_elj_prior_dataset_w3.pt	200300990
+p23_nehu_ft	nehu	switch	p20_nehu_n5	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846
