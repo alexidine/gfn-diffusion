@@ -1835,6 +1835,26 @@ class Modeller:
             metrics['batch/med_step_s'] = _med
             if _med > 0:
                 metrics['batch/sps_rung'] = float(self.batch_size) / _med
+        # THE STEP TIME AS LOGGED. drain_elapsed_times() below turns the timed
+        # 'train_step' pair into train_step_time = the duration of ONE step, the
+        # reporting step. Under rare rollouts a step is one of two costs -- a
+        # rollout step carrying the energy call, or a replay/backward step without
+        # it -- and with rollouts every 5 on a 10-step report grid, which one lands
+        # on the report is fixed by the step count the leg started at: p20_acr_n5
+        # read 3.2 s on its first leg and 8.8 s on a restart from a step archive at
+        # identical throughput (2026-09-23). So the key is OVERWRITTEN after the
+        # drain with the mean over the sizer's 64-step window (both kinds in their
+        # true proportion) and the two costs are logged beside it.
+        _step_time_window = {}
+        _rolled = getattr(self, '_recent_step_rolled', None)
+        if _times and _rolled and len(_rolled) == len(_times) and len(_times) >= 10:
+            _t = np.asarray(list(_times), dtype=float)
+            _r = np.asarray(list(_rolled), dtype=bool)
+            _step_time_window['train_step_time'] = float(_t.mean())
+            if _r.any():
+                _step_time_window['train_step_time_rollout'] = float(np.median(_t[_r]))
+            if (~_r).any():
+                _step_time_window['train_step_time_replay'] = float(np.median(_t[~_r]))
         # WHERE THE STEP'S SECONDS GO. energy/frac_of_step is the load-bearing one:
         # paired with GPU utilization it separates 'the MLIP call is expensive' from
         # 'the MLIP call is idle waiting on the host'. Denominator is the same window
@@ -1919,6 +1939,7 @@ class Modeller:
         # boost state, per-rule live (annealed) thresholds/elevations, exit streaks
         metrics.update(self.protocol.report())
         metrics.update(drain_elapsed_times(self.times))
+        metrics.update(_step_time_window)   # the window statistics replace the single-step sample (see above)
         # PERSISTENT (cross-visit) views of the same quantities the rolling
         # fwd|bwd|replay channels carry per batch. Namespaced 'tracker/' on
         # purpose: only the rolling channels reach metric_tracker, so only THEY
@@ -3830,7 +3851,19 @@ class Modeller:
             # mol_id on prior_dataset.batch; no sampling/energy involved). Runs
             # first so grow_prior_buffer's top-up sees the seeded fill level.
             self.init_prior_buffer_seed()
-            if self._has_prior_sampler():
+            # THE ONE PATH THAT BYPASSES buffers.prior_buffer.source: an ungated fill
+            # from the prior MODEL whenever one is loaded and the buffer is under
+            # max_size. Under source 'anchors' the churn never draws from the prior
+            # model, so this fill is a composition the config forbids. It fired on a
+            # REQUEUE whose sbatch handed the leg its own *_prior.pt (p20_acr_n5 leg 2,
+            # 2026-09-23: 10k prior-model rows, anchor fraction 1.0 -> 0.2, backward
+            # and replay errors rising). Skipped there, loudly.
+            _prior_src = getattr(self.args.buffers.prior_buffer, 'source', 'prior_model')
+            if self._has_prior_sampler() and _prior_src == 'anchors':
+                print(f"grow_prior_buffer SKIPPED: buffers.prior_buffer.source is 'anchors' -- a prior model "
+                      f"is loaded ({getattr(self.args, 'prior_model_name', None)}) but must not fill the buffer",
+                      flush=True)
+            elif self._has_prior_sampler():
                 self.grow_prior_buffer()
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
@@ -3939,7 +3972,14 @@ class Modeller:
                 if not hasattr(self, '_recent_step_times'):
                     self._recent_step_times = deque(maxlen=64)
                     self._recent_step_work = deque(maxlen=64)
+                if not hasattr(self, '_recent_step_rolled'):
+                    self._recent_step_rolled = deque(maxlen=64)
                 self._recent_step_times.append(step_dt)  # feeds the sizer's rung median
+                # did THIS step run a rollout? train_logic stamps _last_rollout_step
+                # for the step it decides on, before the timed window opens. Under
+                # rare rollouts a step is one of two costs, and the report needs both.
+                self._recent_step_rolled.append(
+                    getattr(self, '_last_rollout_step', None) == self.step_ind)
                 # WORK, not just the training batch: z_calibration_tick runs
                 # self._z_cal_rollouts extra full-batch rollouts inside the timing
                 # window above, and its rate is frequency-modulated by a sensor that
