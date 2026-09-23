@@ -1,6 +1,6 @@
 # Stage protocol engine
 
-*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `7a29c68`, 2026-09-23. Sources at the end.*
 
 A *protocol* is an ordered list of *stages*, and a stage is one declarative description of a training regime: what the train step is, which loss coefficients are live, which branch weights move and how, and what has to be true before the run leaves it. `protocol.py` parses that list into `Stage` objects and runs it with `StageProtocol`, which holds a reference to its owning `Modeller` and keeps every mutable engine value on that `Modeller`. The config names the live protocol in `cfg:protocol` and defines them all under `cfg:protocols`; the trainer and the config validators both resolve it through `config_invariants.active_stages`, so they read the same list.
 
