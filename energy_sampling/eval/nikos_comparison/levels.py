@@ -54,7 +54,6 @@ OPT_CONFIG = dict(
     max_num_steps=500,
     rdf_warmup=None,
     target_packing_coeff=None,
-    umbrella=False,
 )
 
 

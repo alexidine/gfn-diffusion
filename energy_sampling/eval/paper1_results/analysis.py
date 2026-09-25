@@ -354,9 +354,6 @@ def run_analysis(config):
         "max_num_steps": 500,
         "rdf_warmup": None,
         "target_packing_coeff": None,
-        "umbrella": False,
-        "umbrella_sigma": 0.25,
-        "umbrella_epsilon": 40.0,
         'predictor': predictor,
     }
     opt_out, opt_record = expbatch.optimize_crystal_parameters(return_record=True, **opt_config)
