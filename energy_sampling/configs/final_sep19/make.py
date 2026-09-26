@@ -496,14 +496,30 @@ SEED_A = """    # THE SEED IS THE mlefr ARM'S _best.pt (its bwd/mle record; that
 
 SEED_B = """    # THE SEED IS LEG A'S NEWEST STEP ARCHIVE (archive_period 5000; its frozen _stepN_buffers.pt sidecar
     # pairs with it), never its live _running.pt, which the still-running leg-A job may be rewriting.
-    CK=$(ls -t ${CKPTS}/*${SRC}_*_step[0-9]*.pt 2>/dev/null | grep -v '_buffers.pt$' | head -1)
-    if [ -z "${CK}" ]; then
-        echo "FATAL: leg A arm ${SRC} has no step archive yet in ${CKPTS} (needs archive_period steps)" >&2; exit 1
-    fi
-    if [ ! -f "${CK%.pt}_buffers.pt" ]; then
-        echo "FATAL: ${CK} has no frozen buffers sidecar beside it" >&2; exit 1
-    fi
-    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SWITCH from: $(basename ${CK}) (mtime $(stat -c %y ${CK}))\""""
+    # SRC_RUNNING=1 (env) seeds from the source arm's _running.pt instead: written every 50 steps by an atomic
+    # write, so it is always a complete file; its buffers are the run's rolling <run>_buffers.pt (written at eval
+    # cadence, the same lag the frozen archive sidecar carries). For a source arm that was CANCELLED or finished:
+    # nothing is lost to the archive cadence. Inert on a resubmit (the arm's own _running.pt wins above).
+    if [ -n "${SRC_RUNNING:-}" ]; then
+        NR=$(ls ${CKPTS}/*${SRC}_*_running.pt 2>/dev/null | wc -l)
+        if [ "${NR}" -ne 1 ]; then
+            echo "FATAL: ${NR} matches for *${SRC}_*_running.pt in ${CKPTS} (need exactly 1)" >&2; exit 1
+        fi
+        CK=$(ls ${CKPTS}/*${SRC}_*_running.pt)
+        if [ ! -f "${CK%_running.pt}_buffers.pt" ]; then
+            echo "FATAL: ${CK} has no rolling buffers sidecar ${CK%_running.pt}_buffers.pt" >&2; exit 1
+        fi
+        echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SWITCH from RUNNING: $(basename ${CK}) (mtime $(stat -c %y ${CK}); SRC_RUNNING set)"
+    else
+        CK=$(ls -t ${CKPTS}/*${SRC}_*_step[0-9]*.pt 2>/dev/null | grep -v '_buffers.pt$' | head -1)
+        if [ -z "${CK}" ]; then
+            echo "FATAL: leg A arm ${SRC} has no step archive yet in ${CKPTS} (needs archive_period steps)" >&2; exit 1
+        fi
+        if [ ! -f "${CK%.pt}_buffers.pt" ]; then
+            echo "FATAL: ${CK} has no frozen buffers sidecar beside it" >&2; exit 1
+        fi
+        echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  SWITCH from: $(basename ${CK}) (mtime $(stat -c %y ${CK}))"
+    fi"""
 
 
 def build(families):

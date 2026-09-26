@@ -12,7 +12,9 @@ equilibration stage,
 a GEOMETRIC ramp of both penalty coefficients from the config's 10 to 1000 over 20k train steps, anchored at
 the leg's first tick (stage_ctrl.coeff_sched_entry rides the checkpoint, so a requeue continues the ramp),
 then held. Each arm is a FULL resume of the p20 arm's newest step archive (`_stepN.pt` + its frozen
-`_stepN_buffers.pt`): the coefficients are NOT part of the problem identity (utils._NON_IDENTITY_ENERGY_CONFIG_KEYS),
+`_stepN_buffers.pt`; or, with SRC_RUNNING=1 in the sbatch environment, of the p20 arm's `_running.pt` and rolling
+sidecar -- for a source arm that was cancelled first, so no steps are lost to the 5000-step archive cadence):
+the coefficients are NOT part of the problem identity (utils._NON_IDENTITY_ENERGY_CONFIG_KEYS),
 so the load is the ordinary continuation -- stage `equilibration` continues, P_B snapshot restored, LR at the
 restored cruise scale, replay buffer restored.
 
