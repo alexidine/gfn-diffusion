@@ -309,6 +309,15 @@ protocols:
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior
+      coeff_schedule:
+        bounding_coeff:
+          target: 1000.0
+          steps: 20000
+          kind: geometric
+        reduction_coeff:
+          target: 1000.0
+          steps: 20000
+          kind: geometric
       hot_lr_sensor:
         channel: fwd/scatter_err
         rows: 11
@@ -364,15 +373,6 @@ protocols:
           replay:
           - 0.3
           - 0.3
-      coeff_schedule:
-        bounding_coeff:
-          target: 1000.0
-          steps: 20000
-          kind: geometric
-        reduction_coeff:
-          target: 1000.0
-          steps: 20000
-          kind: geometric
   conditional_vargrad:
     stages:
     - name: train_prior
