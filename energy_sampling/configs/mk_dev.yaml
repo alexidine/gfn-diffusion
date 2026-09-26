@@ -1138,6 +1138,7 @@ grad_geometry:
 
 
 buffers:
+  fresh_on_switch: false       # true = when checkpoint_name belongs to ANOTHER run (its stored run_name differs from this run's), no buffer sidecar is restored: prior/anchor buffers seed from the re-analysed prior dataset, the replay buffer refills from live rollouts, every stored row scored by this run's energy function; a resume of the run's own checkpoint restores as usual. false = restore the sidecar whenever one is found
   # SLOW store: a representation of a DISTRIBUTION, churned on a rate the
   # config sets rather than on any per-row property. Residence works out as
   # mean_lifetime * max_size / churn_batch_ref = 25,000 train steps here, i.e.

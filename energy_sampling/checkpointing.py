@@ -107,6 +107,13 @@ MODELLER_STATE_DEFAULTS = {
     # reinterpreted, because a v8 dict carries a peak_scale, a warmup envelope
     # and a freeze latch that have no meaning under the bracket.
     'lr_ctrl': {'ver': None, 'scale': None, 'stage_entry_step': 0, 'bracket': None},
+    # the conformer route's prior-draw stream (ConformerModeller._prior_rng, a numpy
+    # Generator created from cfg seed on first use). Unsaved, every leg recreated it from
+    # the seed, so a requeued leg REPLAYED the first leg's InternalPrior draws: the prior
+    # dataset and every later churn draw repeated, with nothing saying so. It pickles
+    # under torch.save and set_state_dict restores it before init_prior_dataset reads it.
+    # The crystal route never creates one, so it round-trips as None there.
+    '_prior_rng_state': None,
 }
 
 # Buffers live in their own sidecar file rather than inside each checkpoint:
@@ -128,6 +135,26 @@ BUFFER_SUFFIX = '_buffers.pt'
 # run-level prefix when resolving its rolling sidecar.
 CHECKPOINT_TAGS = ('best', 'running', 'prior', 'thermalized', 'final',
                    'phase1_exit', 'phase2_exit', 'ff_calibrated')
+
+
+def fresh_buffers_on_switch(modeller, checkpoint: dict, path: str) -> bool:
+    """cfg:buffers.fresh_on_switch -- when THIS run loads ANOTHER run's checkpoint (the checkpoint's stored
+    run_name differs from the modeller's), leave every resident buffer unrestored: the init path then seeds the
+    prior and anchor buffers from the prior dataset the live energy function has just re-analysed
+    (Modeller.init_prior_buffer_seed / init_anchor_buffer_seed) and the replay buffer refills from live rollouts,
+    so every stored row is scored by this run's energy function. Built for a model switch under an unchanged
+    problem identity (mlip_path is not part of it). A resume of the run's OWN checkpoint restores the sidecar as
+    usual, so a requeue never resets the buffers. Off by default; prints when it fires."""
+    buffers = getattr(modeller.args, 'buffers', None)
+    if not bool(getattr(buffers, 'fresh_on_switch', False)):
+        return False
+    src = checkpoint.get('run_name')
+    if src == modeller.run_name:
+        return False
+    print(f"buffers.fresh_on_switch: {path} belongs to run {src!r}, this run is {modeller.run_name!r} -- the buffer "
+          f"sidecar is NOT restored; prior/anchor buffers seed from the re-analysed prior dataset and the replay "
+          f"buffer refills from live rollouts, so every stored row is scored by this run's energy function", flush=True)
+    return True
 
 
 class Checkpointer:
@@ -593,6 +620,20 @@ class Checkpointer:
     # weight layout and has to come from the file.
     RECONFIGURABLE_GFN_KEYS = ('t_scale_ratio', 't_scale_power', 't_scale_preserve_budget')
 
+    def _build_gfn(self, config):
+        """The model a checkpoint's gfn_config describes, BEFORE any weights load.
+
+        A modeller that assembles its model after GFN(**gfn_config) -- the conformer
+        route swaps in a set head and re-classes the GFN (ConformerModeller.
+        _install_set_policy) -- supplies `gfn_from_config`, and gets to rebuild that
+        architecture from what it stamped into gfn_config. Without the seam the strict
+        load_state_dict below meets a flat GFN and fails on every set-head tensor, and a
+        swap AFTER the load would discard the restored weights, EMA and Adam state.
+        The crystal Modeller has no such method and takes the unchanged branch.
+        """
+        builder = getattr(self.modeller, 'gfn_from_config', None)
+        return builder(config) if builder is not None else GFN(**config)
+
     def _gfn_config_from(self, checkpoint):
         """
         The checkpoint's gfn_config, with RECONFIGURABLE_GFN_KEYS re-derived
@@ -651,7 +692,7 @@ class Checkpointer:
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
         self.assert_problem_match(checkpoint, path, 'checkpoint_name')
         m.gfn_config = self._gfn_config_from(checkpoint)
-        m.gfn_model = GFN(**m.gfn_config).to(m.device)
+        m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)
         m.ema_model.load_state_dict(checkpoint['model_eval'])
@@ -671,8 +712,10 @@ class Checkpointer:
 
         # checkpoints written before buffers moved to a sidecar carry them
         # inline; prefer those, since they pair exactly with these weights
-        if any(checkpoint.get(k) is not None
-               for k in ('prior_buffer', 'replay_buffer', 'anchor_buffer')):
+        if fresh_buffers_on_switch(m, checkpoint, path):
+            pass    # said so above; the init path seeds every store afresh
+        elif any(checkpoint.get(k) is not None
+                 for k in ('prior_buffer', 'replay_buffer', 'anchor_buffer')):
             self.restore_buffers(checkpoint, path)
         else:
             self.load_buffers_for(path)
@@ -773,7 +816,7 @@ class Checkpointer:
                   f"the same target. Buffers, optimizers and step count start fresh.")
         self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
         m.gfn_config = self._gfn_config_from(checkpoint)
-        m.gfn_model = GFN(**m.gfn_config).to(m.device)
+        m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)
         m.ema_model.load_state_dict(checkpoint['model_eval'])
@@ -781,6 +824,10 @@ class Checkpointer:
 
         m.gfn_model.train()
         m.ema_model.eval()
+        # read by the protocol's `skip_if: weights_loaded` (StageProtocol.begin): the
+        # phase-2 entry for a route that can never hold a `prior_model`. Set only here,
+        # after the load succeeded, so a failed load cannot skip a stage.
+        m.weights_only_loaded = True
 
     def load_optimizer_state(self, checkpoint, strict: bool = False):
         """Restore every optimizer's state, including Adam's step counter.
