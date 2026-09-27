@@ -50,6 +50,9 @@ def test_cmdline_matching():
         [r'C:\venv\Scripts\python.exe', r'C:\proj\energy_sampling\train.py'],
         ['python', 'train_conformer.py'],
         ['python', '"C:/proj/train.py"'],
+        # the conformer route's launch script: a running conformer job is a tenant
+        ['python', '-u', 'conformer_modeller.py', '--config', 'configs/conformer_mk_multi.yaml'],
+        [r'C:\venv\Scripts\python.exe', r'C:\proj\energy_sampling\conformer_modeller.py'],
     ]
     no = [
         # the whole point: these merely MENTION the name
@@ -59,6 +62,7 @@ def test_cmdline_matching():
         ['python', 'pretrain.py'],
         ['python', 'test_train.py'],
         ['python', 'gpu_guard.py'],
+        ['python', 'test_conformer_modeller.py'],
         ['python', 'read_results.py', '--note', 'after train.py finishes'],
         [],
         None,
@@ -298,7 +302,11 @@ def test_signature_agrees_across_dict_and_namespace():
     # should fail when the SIGNATURE breaks, not when an old battery ages out, so
     # a config that no longer loads is skipped with its reason rather than
     # failing here.
-    cfgs = [os.path.join(_here, 'configs', 'mk_dev.yaml')]
+    # A conformer set config FIRST, so the conformer-only fields (model.policy_kind and
+    # the molecules_path key) are compared through the real loader too -- first because
+    # the checks after the loop read the LAST config that loaded, and pin its 0.9 ceiling.
+    cfgs = [os.path.join(_here, 'configs', 'conformer_mk_multi.yaml'),
+            os.path.join(_here, 'configs', 'mk_dev.yaml')]
     cfgs += sorted(glob.glob(os.path.join(_here, 'configs', 'gauss_aug12', '*_sg*_o*.yaml')))[:3]
 
     checked = 0
@@ -328,6 +336,79 @@ def test_signature_agrees_across_dict_and_namespace():
     for field in ('energy_function', 'batch_size', 'max_batch_size', 'grow_batch_size',
                   'z_primes', 'traj_checkpoint', 'eval_num_samples', 'buffer_device'):
         check(f"real args exposes {field}", hasattr(args, field))
+
+
+def test_conformer_signature_keys_the_policy_and_the_set():
+    """
+    Every conformer config at one batch used to sign the same, so the 6-molecule
+    smoke's measured peak would have been reused for a set of hundreds -- an
+    UNDER-estimate, the direction that crashes the box. On energy_function
+    conformer_torsions the signature now appends model.policy_kind and the
+    molecules_path file's size. Crystal signatures must not move at all: the peaks
+    already on record are keyed by them.
+    """
+    print("\n7a. conformer signature carries the policy kind and the condition set")
+    import tempfile, shutil, copy
+    import yaml
+    tmp = tempfile.mkdtemp()
+    real_write, real_reg = G._write_registry, G.load_registry
+    try:
+        small, big = os.path.join(tmp, 'r0.pt'), os.path.join(tmp, 'r1.pt')
+        with open(small, 'wb') as f:
+            f.write(b'\0' * 1000)
+        with open(big, 'wb') as f:
+            f.write(b'\0' * 500000)
+        carrier = {'energy_function': 'conformer_torsions', 'batch_size': 1024,
+                   'max_batch_size': 1024, 'cuda_memory_fraction': 0.9, 'z_primes': [1],
+                   'model': {'s_emb_dim': 512, 'dplr_rank': 0, 'policy_kind': 'set'},
+                   'integrator': {'T': 10}, 'molecules_path': small}
+        a = G.config_signature(carrier)
+        b = G.config_signature(dict(carrier, molecules_path=big))
+        check("two carrier configs over different sets sign differently", a != b, f"{a} vs {b}")
+        flat = copy.deepcopy(carrier)
+        flat['model']['policy_kind'] = 'flat'
+        check("set and flat policies over one set sign differently",
+              G.config_signature(flat) != a, G.config_signature(flat))
+        # APPEND-ONLY: the first nine fields are the historical crystal-shaped key
+        base = G.config_signature(dict(carrier, energy_function='zzz_test')).split('|')
+        check("a conformer key is the historical key plus two fields",
+              a.split('|')[1:9] == base[1:] and len(a.split('|')) == len(base) + 2
+              and a.endswith(f'|set|set:{os.path.getsize(small)}B'), a)
+        # one molecule declared in energy_config, no condition file
+        check("no molecules_path keys as set:none",
+              G.config_signature(dict(carrier, molecules_path=None)).endswith('|set:none'))
+        # the trainer records from a Namespace, the launch reads the YAML dict: the
+        # new fields must agree across both, or every peak lands on a key nothing reads
+        from energy_sampling.utils import dict2namespace
+        ns = G.config_signature(dict2namespace(copy.deepcopy(carrier)))
+        check("a Namespace of the same carrier config signs identically", ns == a,
+              f"{ns} vs {a}")
+
+        # an unstat-able path matches no measurement and is never recorded as one
+        gone = dict(carrier, molecules_path=os.path.join(tmp, 'missing.pt'))
+        check("an unreadable set keys as set:unreadable",
+              G.config_signature(gone).endswith('|set:unreadable'), G.config_signature(gone))
+        written = []
+        G._write_registry = lambda reg: written.append(reg)
+        G.load_registry = lambda: {}
+        G.record_peak(gone, 9000)
+        check("record_peak refuses to store an unreadable-set key", written == [], str(written))
+        G.record_peak(carrier, 9000)
+        check("record_peak stores a readable-set key",
+              len(written) == 1 and a in written[0], str(written))
+
+        # crystal: the canonical config's key must not see the new fields at all
+        mk = yaml.safe_load(open(os.path.join(_here, 'configs', 'mk_dev.yaml'), encoding='utf-8'))
+        sig = G.config_signature(mk)
+        moved = copy.deepcopy(mk)
+        moved.setdefault('model', {})['policy_kind'] = 'set'
+        moved['molecules_path'] = big
+        check("mk_dev's signature has the historical nine fields", len(sig.split('|')) == 9, sig)
+        check("mk_dev's signature ignores policy_kind and the molecules_path file",
+              G.config_signature(moved) == sig, f"{G.config_signature(moved)} vs {sig}")
+    finally:
+        G._write_registry, G.load_registry = real_write, real_reg
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_projection_prefers_measurement_and_is_labelled():
@@ -514,6 +595,7 @@ def main():
                test_room_check_only_where_it_belongs,
                test_the_room_check_message_says_what_the_code_did,
                test_signature_agrees_across_dict_and_namespace,
+               test_conformer_signature_keys_the_policy_and_the_set,
                test_projection_prefers_measurement_and_is_labelled,
                test_measured_config_relaunches_on_an_empty_card,
                test_cotenancy_coherence, test_free_gpu_passes):

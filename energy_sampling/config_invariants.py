@@ -29,7 +29,10 @@ this module exists to prevent.
 
 from __future__ import annotations
 
+import ast
+import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -1618,6 +1621,396 @@ def condition_draw_is_well_formed(cfg: dict) -> list[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# THE CONFORMER ROUTE. conformer_modeller.py runs `ConformerModeller` over the
+# crystal trainer's config schema, and a config ported from the crystal lineage
+# carries keys that are inert there, refused only after the queue wait, or
+# quietly replaced by a constructor default. Every rule below returns [] unless
+# energy_function is conformer_torsions, so no crystal config changes verdict.
+#
+# A SET is a config with `molecules_path` set: ConformerModeller reads the
+# condition set from that file (`_condition_set_molecules`) and builds a
+# MultiConformerTorsions over it when it holds more than one molecule. Whether a
+# set is a CARRIER -- members whose coordinate layouts differ, padded to one width
+# -- is decided by the file's CONTENTS, which a torch-free rule cannot read. A
+# hazard that exists only on a carrier, or only above some member count, is
+# therefore BASELINE here: an ERROR must never fire falsely (dplr_is_well_formed
+# states the same policy), and a set whose members share one layout is a real
+# configuration (an equal-N rung, a held-out file). `config_snapshot --check`
+# fails on both severities, so a canonical conformer config is held to all of
+# them either way; generation refuses only the ERRORs.
+# ---------------------------------------------------------------------------
+
+#: The three flags that make the route conditional, as train.py's
+#: log_xcond_metrics and conditional_z_settings_are_conditional read them.
+_CONDITIONING_FLAGS = ('embedding_conditioning', 'molecule_conditioning',
+                       'vector_conditioning')
+
+#: Where the conformer energy's contract is read from: the files the route imports,
+#: beside this module. PARSED, not imported -- both import torch.
+_ENERGY_SAMPLING_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFORMER_TORSIONS_SRC = os.path.join(_ENERGY_SAMPLING_DIR, 'energies',
+                                       'conformer_torsions.py')
+_CONFORMER_MODELLER_SRC = os.path.join(_ENERGY_SAMPLING_DIR, 'conformer_modeller.py')
+
+#: energy_config keys ConformerModeller drops that are still LEGAL on this route.
+#: `temperature` is the crystal's; the conformer derives kT from log_temperature,
+#: but utils.problem_slug reads energy_config.temperature to name the checkpoint.
+_CONFORMER_TOLERATED_ENERGY_KEYS = frozenset({'temperature'})
+
+
+def _on_conformer_route(cfg: dict) -> bool:
+    return _get(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS
+
+
+def _conformer_set(cfg: dict) -> bool:
+    """`molecules_path` names a condition file. The loader branches on the path's
+    truthiness, so an empty string is no set."""
+    path = _get(cfg, 'molecules_path')
+    return isinstance(path, str) and bool(path.strip())
+
+
+def _conditional(cfg: dict) -> bool:
+    return any(bool(_get(cfg, k)) for k in _CONDITIONING_FLAGS)
+
+
+def _policy_kind(cfg: dict) -> str:
+    """model.policy_kind as ConformerModeller._install_set_policy reads it:
+    lower-cased, 'flat' when absent."""
+    return str(_get(cfg, 'model.policy_kind', 'flat')).lower()
+
+
+@functools.lru_cache(maxsize=None)
+def _conformer_energy_contract() -> tuple:
+    """(ConformerTorsions.__init__ parameter names, conformer_modeller's
+    _NON_ENERGY_KEYS, ConformerTorsions.LEVELS), by AST parse of the source.
+
+    THE SAME SETS THE RUN FILTERS WITH, NOT A COPY OF THEM. init_energy_function
+    pops _NON_ENERGY_KEYS and filters the rest through
+    `inspect.signature(ConformerTorsions.__init__)`; a hand-kept list here would be
+    the thing that drifts. Raises when either file is missing or has lost the
+    expected shape -- the rules that call this report that as a violation, so a
+    check that could not run never reads as a pass."""
+    def parse(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return ast.parse(f.read(), path)
+
+    def assigned(body, name, where):
+        for node in body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return ast.literal_eval(node.value)
+        raise LookupError(f'no literal assignment to {name} in {where}')
+
+    tree = parse(_CONFORMER_TORSIONS_SRC)
+    cls = next((n for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.name == 'ConformerTorsions'), None)
+    init = next((n for n in (cls.body if cls is not None else [])
+                 if isinstance(n, ast.FunctionDef) and n.name == '__init__'), None)
+    if init is None:
+        raise LookupError(f'ConformerTorsions.__init__ not found in {_CONFORMER_TORSIONS_SRC}')
+    a = init.args
+    params = frozenset(x.arg for x in a.posonlyargs + a.args + a.kwonlyargs) - {'self'}
+    levels = tuple(assigned(cls.body, 'LEVELS', 'ConformerTorsions'))
+    non_energy = frozenset(assigned(parse(_CONFORMER_MODELLER_SRC).body,
+                                    '_NON_ENERGY_KEYS', _CONFORMER_MODELLER_SRC))
+    return params, non_energy, levels
+
+
+def _contract_unreadable(rule: str, e: Exception) -> list[Violation]:
+    return [Violation(ERROR, rule,
+                      f'could not read the conformer energy contract from '
+                      f'{_CONFORMER_TORSIONS_SRC} / {_CONFORMER_MODELLER_SRC} '
+                      f'({type(e).__name__}: {e}); this check did not run.')]
+
+
+def conformer_dplr_is_off_on_a_set(cfg: dict) -> list[Violation]:
+    """DPLR (model.dplr_rank > 0) on the conformer route, in two cases.
+
+    SET POLICY -> ERROR. _install_set_policy refuses it: SetPolicy emits the
+    low-rank factor rank-major while GFN.split_params reads it dim-major, so u_raw
+    would be silently transposed. The refusal fires at init, after the queue wait.
+
+    FLAT POLICY ON A SET -> BASELINE. On a carrier, ConformerGFN masks the pad
+    columns only inside gauss_logprob, and the DPLR forward density takes the
+    Woodbury path in GFN.fwd_gauss_logprob, which never calls it -- so pad columns
+    enter log P_F and nothing reports it. The config cannot say whether the set is
+    a carrier (section note above); a set whose members share one layout has no
+    pads to leak, so this is reported rather than refused."""
+    if not _on_conformer_route(cfg):
+        return []
+    rank = _num(_get(cfg, 'model.dplr_rank'))
+    if rank is None or rank <= 0:
+        return []
+    kind = _policy_kind(cfg)
+    if kind == 'set':
+        return [Violation(
+            ERROR, 'conformer_dplr_is_off_on_a_set',
+            f'model.policy_kind set with model.dplr_rank {rank:g}. The set head emits '
+            f'the low-rank factor rank-major and GFN.split_params reads it dim-major, '
+            f'so _install_set_policy refuses this at init. Set dplr_rank: 0.')]
+    if kind == 'flat' and _conformer_set(cfg):
+        return [Violation(
+            BASELINE, 'conformer_dplr_is_off_on_a_set',
+            f'a flat policy over the condition set in molecules_path with '
+            f'model.dplr_rank {rank:g}. If the set is a carrier, the DPLR forward '
+            f'density bypasses ConformerGFN\'s pad mask and pad columns enter log P_F '
+            f'silently. Set dplr_rank: 0 unless every member shares one layout.')]
+    return []
+
+
+def conformer_set_policy_is_conditioned(cfg: dict) -> list[Violation]:
+    """A set policy over a condition SET must see the molecule, at a width its
+    pooled readout can split.
+
+    Without embedding_conditioning the set head is built from ONE molecule's static
+    features. On a carrier _install_set_policy refuses; on a set whose members
+    share one layout it builds the dense head bound to the reference member and
+    scores every row through it -- finite, plausible, and the wrong molecule.
+    Both conditional set heads split the embedding into two equal blocks and raise
+    on an odd embedding_conditioning_dim, and _install_set_policy raises on an
+    unset one; this moves both from init to generation."""
+    if not _on_conformer_route(cfg) or _policy_kind(cfg) != 'set':
+        return []
+    out = []
+    conditioned = bool(_get(cfg, 'embedding_conditioning'))
+    if _conformer_set(cfg) and not conditioned:
+        out.append(Violation(
+            ERROR, 'conformer_set_policy_is_conditioned',
+            'model.policy_kind set over the condition set in molecules_path with '
+            'embedding_conditioning false. The set head would be built from one '
+            'member\'s static features: refused at init on a carrier, and silently '
+            'bound to the reference member otherwise. Set embedding_conditioning: true.'))
+    if conditioned:
+        dim = _num(_get(cfg, 'embedding_conditioning_dim'))
+        if dim is None or dim <= 0 or dim != int(dim) or int(dim) % 2:
+            out.append(Violation(
+                ERROR, 'conformer_set_policy_is_conditioned',
+                f"embedding_conditioning_dim={_get(cfg, 'embedding_conditioning_dim')!r} "
+                f'under a conditional set policy. The pooled readout is two equal '
+                f'blocks, so it must be a positive even integer, and it must match the '
+                f'embeddings stored in molecules_path.'))
+    return out
+
+
+def conformer_level_and_force_field_are_stated(cfg: dict) -> list[Violation]:
+    """energy_config must name a known `level` and a `force_field`.
+
+    `level` is keyword-only with no default, so an absent or unknown one fails at
+    construction: loudly, but after the queue wait. `force_field` is the silent
+    half. Its constructor default is 'reference', so a config that omits it -- or
+    misspells the key, which conformer_energy_config_keys_are_read reports --
+    trains on the reference force field while saying nothing about it. Absence is
+    judged rather than abstained on because the fallback is a live value, as in
+    conditional_z_settings_are_conditional."""
+    if not _on_conformer_route(cfg):
+        return []
+    rule = 'conformer_level_and_force_field_are_stated'
+    try:
+        _, _, levels = _conformer_energy_contract()
+    except Exception as e:           # reported, never swallowed into a pass
+        return _contract_unreadable(rule, e)
+    ec = _get(cfg, 'energy_config')
+    ec = ec if isinstance(ec, dict) else {}
+    out = []
+    level = ec.get('level')
+    if level is None:
+        out.append(Violation(
+            ERROR, rule,
+            f'energy_config.level is not set. ConformerTorsions takes it keyword-only '
+            f'with no default, so the run dies at construction. Name one of {levels}; '
+            f'`full` is the training target, the others are helper tiers.'))
+    elif level not in levels:
+        out.append(Violation(
+            ERROR, rule,
+            f'energy_config.level={level!r} is not one of ConformerTorsions.LEVELS '
+            f'{levels}; construction raises.'))
+    if ec.get('force_field') is None:
+        out.append(Violation(
+            ERROR, rule,
+            "energy_config.force_field is not set. The ConformerTorsions default is "
+            "'reference', so the run would train on the reference force field while "
+            "nothing in the config says so. Write force_field: mmff or reference."))
+    return out
+
+
+def conformer_energy_config_keys_are_read(cfg: dict) -> list[Violation]:
+    """Every energy_config key must reach something on this route.
+
+    init_energy_function pops _NON_ENERGY_KEYS, filters the rest against
+    ConformerTorsions.__init__ (which takes no **kwargs, deliberately) and DROPS
+    whatever is left with one printed line. A crystal-lineage key is then inert
+    while the config reads as setting it, and a misspelt one is worse:
+    `forcefield: mmff` is dropped and the run trains on the constructor default.
+    `temperature` is the one tolerated drop (_CONFORMER_TOLERATED_ENERGY_KEYS)."""
+    if not _on_conformer_route(cfg):
+        return []
+    rule = 'conformer_energy_config_keys_are_read'
+    ec = _get(cfg, 'energy_config')
+    if not isinstance(ec, dict) or not ec:
+        return []
+    try:
+        params, non_energy, _ = _conformer_energy_contract()
+    except Exception as e:           # reported, never swallowed into a pass
+        return _contract_unreadable(rule, e)
+    unknown = sorted(set(ec) - params - non_energy - _CONFORMER_TOLERATED_ENERGY_KEYS)
+    if not unknown:
+        return []
+    return [Violation(
+        ERROR, rule,
+        f'energy_config carries {unknown}, which is neither a ConformerTorsions '
+        f'parameter nor a key ConformerModeller consumes (_NON_ENERGY_KEYS). '
+        f'init_energy_function drops them with one printed line, so each is inert '
+        f'here, and a misspelt key leaves its parameter at the constructor default. '
+        f'Remove them, or fix the spelling.')]
+
+
+def conformer_protocol_omits_snapshot_prior(cfg: dict) -> list[Violation]:
+    """No active stage may name `snapshot_prior` on this route.
+
+    The conformer route samples backward from a fitted InternalPrior, and
+    protocol._snapshot_prior refuses the action when one is loaded -- at the
+    phase-1 EXIT, after the whole MLE phase has run. The crystal train_prior
+    stage carries it, so a literal port of a crystal protocol inherits it."""
+    if not _on_conformer_route(cfg):
+        return []
+    out = []
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        for where in ('on_enter', 'on_exit'):
+            for action in (st.get(where) or []):
+                if str(action).partition(':')[0].strip() == 'snapshot_prior':
+                    out.append(Violation(
+                        ERROR, 'conformer_protocol_omits_snapshot_prior',
+                        f"stage {st.get('name')!r} {where} names snapshot_prior. It "
+                        f"freezes the MLE policy as the prior model; this route's prior "
+                        f"is the fitted InternalPrior, and protocol._snapshot_prior "
+                        f"refuses the action at the phase-1 exit, after the MLE phase "
+                        f"has run. Drop it (snapshot:<tag> keeps the checkpoint)."))
+    return out
+
+
+def conformer_prior_model_name_is_null(cfg: dict) -> list[Violation]:
+    """`prior_model_name` is inert on this route and must be null.
+
+    It is read only by Modeller.init_prior_dataset, which ConformerModeller
+    overrides without calling super(). A named prior therefore loads nothing, and
+    `skip_if: prior_loaded` -- the stage skip the crystal route sets the key to
+    trip -- never holds, so a crystal-style phase-2 arm silently re-runs phase 1
+    from its loaded weights."""
+    if not _on_conformer_route(cfg):
+        return []
+    name = _get(cfg, 'prior_model_name')
+    if name is None:
+        return []
+    return [Violation(
+        ERROR, 'conformer_prior_model_name_is_null',
+        f'prior_model_name={name!r} on the conformer route. ConformerModeller\'s '
+        f'init_prior_dataset never reads it, so nothing loads and skip_if: '
+        f'prior_loaded cannot hold -- the first stage runs anyway. Set it null.')]
+
+
+def conformer_set_policy_is_not_scrambled(cfg: dict) -> list[Violation]:
+    """`flags.scramble_conditions` cannot act on a set policy's forward half.
+
+    The scramble permutes the conditioner's output at the conditioner-to-trunk
+    seam, and on the set route that seam feeds only s_model -- read by P_B and the
+    flow head -- while the set policy takes the true molecule through mol_cond. A
+    stage declaring it trains a conditional P_F against a P_B shown scrambled
+    conditions, and because the scramble also detaches the conditioner's output,
+    the conditioner gets no gradient from that stage."""
+    if not _on_conformer_route(cfg) or _policy_kind(cfg) != 'set':
+        return []
+    out = []
+    for st in active_stages(cfg):
+        if isinstance(st, dict) and (st.get('flags') or {}).get('scramble_conditions') is True:
+            out.append(Violation(
+                ERROR, 'conformer_set_policy_is_not_scrambled',
+                f"stage {st.get('name')!r} sets flags.scramble_conditions under "
+                f"model.policy_kind set. The set policy reads the molecule through "
+                f"mol_cond, not the scrambled seam, so only P_B and the flow head see "
+                f"the scramble and the conditioner is detached for the stage. Drop "
+                f"the flag."))
+    return out
+
+
+def conformer_set_clips_energy(cfg: dict) -> list[Violation]:
+    """A condition SET should set energy_config.energy_clip; absent is null.
+
+    The per-condition log Z tracker trims floor(trim_frac x rows) from each side
+    of a visit, which is zero whenever a visit holds fewer than 1/trim_frac rows
+    (100 at the 0.01 the conformer configs carry). Past a handful of members every
+    visit is that small, so one clash row at U = 1e4 kcal/mol (T = 1) enters its
+    condition's evidence at about -1e4 nats untrimmed and drags that condition's
+    TB centre for hundreds of visits. The clip bounds the row.
+
+    The VALUE is not judged here. The clip compresses ABSOLUTE U, so it has to sit
+    above every member's energy floor plus its thermal tail -- a census over the
+    set, not a property of the file. BASELINE because the hazard needs enough
+    members to starve each visit, and the member count is in the conditions file."""
+    if not _on_conformer_route(cfg) or not _conformer_set(cfg):
+        return []
+    if _get(cfg, 'energy_config.energy_clip') is not None:
+        return []
+    return [Violation(
+        BASELINE, 'conformer_set_clips_energy',
+        'energy_config.energy_clip is null (absent = null, the constructor default) '
+        'over the condition set in molecules_path. Once a visit holds fewer than '
+        '1/condition_log_z.trim_frac rows per condition the tracker trims nothing, '
+        'and one clash row moves that condition\'s log Z centre by tens of nats. Set '
+        'the clip above every member\'s energy floor plus its thermal tail.')]
+
+
+def conformer_set_xcond_is_off(cfg: dict) -> list[Violation]:
+    """xcond_eval should be off on a conditional conformer SET.
+
+    The cross-condition matrix scores terminals drawn under condition a through
+    backward rollouts on condition b's graph, and ConformerGFN binds b's state mask.
+    On a carrier each cell is then a density over b's valid columns with b's pads
+    pinned, so the matrix's columns live on different coordinate sets and the
+    dimension terms dominate the delta -- and it returns finite numbers. BASELINE
+    because a set whose members share one layout is well posed, and the layout is
+    in the file."""
+    if not (_on_conformer_route(cfg) and _conformer_set(cfg) and _conditional(cfg)):
+        return []
+    if not bool(_get(cfg, 'xcond_eval.enabled')):
+        return []
+    return [Violation(
+        BASELINE, 'conformer_set_xcond_is_off',
+        'xcond_eval.enabled over the condition set in molecules_path. On a carrier '
+        'each matrix cell scores a terminal under another member\'s state mask, so '
+        'cells are densities over different coordinate sets and the result is finite '
+        'and meaningless. Set xcond_eval.enabled: false.')]
+
+
+def conformer_set_policy_is_not_compiled(cfg: dict) -> list[Violation]:
+    """compile_policy off under a set policy. A WORKING ASSUMPTION, not a finding.
+
+    Scope: model.policy_kind set on the conformer route. maybe_compile_policy runs
+    at the end of the base init_gfn and compiles the trunk submodules in place;
+    _install_set_policy then swaps an uncompiled set head into forward_policy and
+    deep-copies the partly compiled model into the EMA. No conformer run has
+    executed that path -- compile is Linux + CUDA only, so every local run is
+    eager -- and suppress_errors turns a failed compile into a silent fallback.
+    `auto` and `step` count as on, because they compile on the cluster; a quoted
+    'off' is a truthy string and compiles as well.
+
+    Revisit when a cluster smoke measures compile on this route (launch count and
+    step time, bench.compile_rollout). BASELINE so that smoke stays expressible."""
+    if not _on_conformer_route(cfg) or _policy_kind(cfg) != 'set':
+        return []
+    setting = _get(cfg, 'compile_policy')
+    if not setting:                      # absent, null, false: eager
+        return []
+    return [Violation(
+        BASELINE, 'conformer_set_policy_is_not_compiled',
+        f'compile_policy={setting!r} under model.policy_kind set. The compile-then-swap '
+        f'path (trunk compiled in init_gfn, set head installed after it) has never run '
+        f'on this route and a failed compile degrades to eager silently. Working '
+        f'assumption until a cluster smoke measures it: set compile_policy: false.')]
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
@@ -1643,6 +2036,17 @@ RULES = (
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
     condition_draw_is_well_formed,
+    # the conformer route; each returns [] off energy_function conformer_torsions
+    conformer_dplr_is_off_on_a_set,
+    conformer_set_policy_is_conditioned,
+    conformer_level_and_force_field_are_stated,
+    conformer_energy_config_keys_are_read,
+    conformer_protocol_omits_snapshot_prior,
+    conformer_prior_model_name_is_null,
+    conformer_set_policy_is_not_scrambled,
+    conformer_set_clips_energy,
+    conformer_set_xcond_is_off,
+    conformer_set_policy_is_not_compiled,
 )
 
 

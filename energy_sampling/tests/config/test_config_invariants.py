@@ -1025,11 +1025,16 @@ def test_condition_draws_are_judged_on_the_resolved_config(canonical):
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check
-    that is asserted to pass and never shown capable of failing."""
-    src = Path(__file__).read_text(encoding='utf-8')
+    that is asserted to pass and never shown capable of failing.
+
+    The conformer-route rules are mutation-tested against their own minimal
+    conformer config in test_conformer_route_rules.py, so that file counts too."""
+    src = ''.join(Path(__file__).with_name(name).read_text(encoding='utf-8')
+                  for name in (Path(__file__).name, 'test_conformer_route_rules.py'))
     for rule in RULES:
         assert f"'{rule.__name__}'" in src, (
-            f'rule {rule.__name__} has no mutation test in this file')
+            f'rule {rule.__name__} has no mutation test in this file or '
+            f'test_conformer_route_rules.py')
 
 
 def test_rules_abstain_on_an_empty_config():

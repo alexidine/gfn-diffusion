@@ -44,10 +44,19 @@ declares:
                     NB the first stage is never ENTERED via a transition, so its
                     on_enter does not fire -- put entry actions on the stage
                     being transitioned INTO
-  skip_if           entry condition ('prior_loaded'): on a fresh run the stage
-                    is skipped when the condition holds (e.g. the MLE warm-
-                    start is redundant when a prior model was loaded by path
-                    given by prior_model_name)
+  skip_if           entry condition ('prior_loaded' | 'weights_loaded'): on a
+                    fresh run the stage is skipped when the condition holds
+                    (e.g. the MLE warm-start is redundant when a prior model
+                    was loaded by path given by prior_model_name, or -- on a
+                    route with no prior model, the conformer -- when this
+                    process loaded checkpoint_name with load_weights_only)
+  max_steps         a BOUND on the stage, in its own train steps: when the stage
+                    has run this many steps without its exit firing, the next
+                    eval advances it anyway (or ends the run, with 'stop'), with
+                    a line naming the cap. Exit terms are an AND-list with no
+                    step metric, so this is the only OR a stage can express --
+                    and progress_gate reads 0 below its min_history, so an exit
+                    on it alone is an unbounded wait. Absent = no bound.
 
 Balance rules (kind: lexicographic) walk in order; the FIRST violated rule's
 `boost` (a mode name, or a {mode: weight} mix -- same form as default_boost)
@@ -172,7 +181,12 @@ ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
            'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint', 'stop',
            'freeze_pb', 'unfreeze_pb')
-SKIP_CONDITIONS = ('prior_loaded',)
+#: `weights_loaded` holds iff THIS process loaded checkpoint_name with load_weights_only
+#: (Checkpointer.load_weights_only sets modeller.weights_only_loaded). It exists for the
+#: conformer route, which can never satisfy `prior_loaded`: ConformerModeller's
+#: init_prior_dataset never builds a `prior_model`, so a crystal-style phase-2 arm there
+#: would silently re-run phase 1 from the loaded weights. Crystal configs never name it.
+SKIP_CONDITIONS = ('prior_loaded', 'weights_loaded')
 
 #: `set_traj_checkpoint` argument vocabulary. BARE MEANS ON, like every other action --
 #: `freeze_pb` with no argument is the affirmative 'full'. It used to read '' as OFF, so
@@ -264,6 +278,9 @@ def fresh_stage_ctrl():
         # coeff_schedule: the train step the ramp is anchored at, stamped at the stage's first
         # energy_coeffs() evaluation; rides the checkpoint so a requeued leg continues the ramp
         'coeff_sched_entry': None,
+        # NB 'max_steps_entry' (the stage cap's clock) is NOT listed here: it is written
+        # only for a stage that declares max_steps (advance / begin), so a stage without
+        # one carries exactly the state it always did
         'exit': {},         # exit term index -> consecutive-pass streak
         # exit term index -> the write-stamp of the last value that streak
         # ACTUALLY JUDGED. Without it a streak cannot tell a new measurement
@@ -325,6 +342,7 @@ class Stage:
                                # generic unknown-key error would say nothing useful
                                'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
+                               'max_steps',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
                                'fwd_rollout_triggers', 'z_pin_rollout_every',
                                'fwd_z_sidecar', 'replay_warmup_rows',
@@ -505,6 +523,15 @@ class Stage:
         self.skip_if = spec.get('skip_if')
         if self.skip_if is not None and self.skip_if not in SKIP_CONDITIONS:
             raise ValueError(f"stage '{self.name}': skip_if must be one of {SKIP_CONDITIONS}")
+
+        # THE STAGE'S TERMINATION BOUND (see the module docstring). A positive int or
+        # absent; refused at load otherwise, because a cap that parsed as 0, a float or a
+        # bool would either fire at entry or read as a bound that never binds. Whether
+        # the stage has a successor to advance INTO is a property of the whole list, so
+        # that half is checked in StageProtocol.stages.
+        raw = spec.get('max_steps')
+        self.max_steps = (None if raw is None else
+                          _require_count(raw, f"stage '{self.name}': max_steps", minimum=1))
 
         # after balance/fracs/loss_coeffs: every check below reads them
         self._parse_replay_seat(spec)
@@ -1807,10 +1834,20 @@ class StageProtocol:
                     f"no live protocol: `protocol` names {name!r} and `protocols` "
                     f"defines {known or 'nothing'}. Set `protocol:` to one of them "
                     f"(see configs/mk_dev.yaml).")
-            self._stages = [Stage(s, i) for i, s in enumerate(specs)]
-            names = [s.name for s in self._stages]
+            stages = [Stage(s, i) for i, s in enumerate(specs)]
+            names = [s.name for s in stages]
             if len(set(names)) != len(names):
                 raise ValueError(f"protocol.stages names must be unique, got {names}")
+            # A CAP ON THE LAST STAGE HAS NOWHERE TO GO. advance() would look up a
+            # successor that does not exist, mid-run, at the eval the cap fires on --
+            # unless the stage ends the run instead ('stop' on its on_exit).
+            last = stages[-1]
+            if last.max_steps is not None and not any(n == 'stop' for n, _ in last.on_exit):
+                raise ValueError(
+                    f"stage '{last.name}': max_steps={last.max_steps} on the LAST stage, "
+                    f"which has no successor to advance into. Add 'stop' to its on_exit "
+                    f"to end the run at the cap, or bound the run with `epochs` instead.")
+            self._stages = stages
         return self._stages
 
     @property
@@ -1995,6 +2032,35 @@ class StageProtocol:
         if self.stage.balance is not None:
             self._balance_tick()
         self._exit_tick()
+        # the cap pulls the eval forward exactly as an armed exit does, so the
+        # transition still executes in the one place transitions execute
+        if self._step_cap_reached() and not self.ctrl.get('request_eval', False):
+            self.ctrl['request_eval'] = True
+
+    # ------------------------------------------------------------- step cap
+
+    def _stage_steps(self):
+        """Train steps this stage has run, or None when it declares no max_steps.
+
+        The clock is stamped at entry (advance(), or begin() for the first stage) into
+        stage_ctrl['max_steps_entry'], so it rides the checkpoint and a requeued leg
+        continues it. A restored stage_ctrl without a stamp -- a cap added to a stage
+        already under way -- starts the clock at the first read, and says so: the cap then
+        bounds the steps from THIS leg, not the ones before the cap existed."""
+        cap = self.stage.max_steps
+        if cap is None:
+            return None
+        step = int(getattr(self.m, 'step_ind', 0) or 0)
+        entry = self.ctrl.get('max_steps_entry')
+        if entry is None:
+            entry = self.ctrl['max_steps_entry'] = step
+            print(f"protocol: stage '{self.stage.name}' max_steps={cap} clock starts at "
+                  f"step {step} (no entry stamp in the stage state)")
+        return step - int(entry)
+
+    def _step_cap_reached(self) -> bool:
+        n = self._stage_steps()
+        return n is not None and n >= self.stage.max_steps
 
     # ------------------------------------------------------------- exit logic
 
@@ -2088,7 +2154,16 @@ class StageProtocol:
             if term['metric'].startswith('eval/'):
                 self._advance_term(i, term, eval_metrics)
         if not self._exit_satisfied(eval_metrics):
-            return False
+            if not self._step_cap_reached():
+                return False
+            # THE BOUND, NOT THE GATE. Printed as a forced exit so a run that left its
+            # stage on the cap is never read as one whose exit condition was met --
+            # the on_exit actions run either way, and the snapshot they write looks
+            # the same.
+            print(f"protocol: stage '{self.stage.name}' FORCED EXIT at max_steps="
+                  f"{self.stage.max_steps} ({self._stage_steps()} steps in stage) -- "
+                  f"its exit condition was NOT met; exit streaks "
+                  f"{dict(self.ctrl['exit'])}")
         self.advance(eval_metrics)
         return True
 
@@ -2104,6 +2179,10 @@ class StageProtocol:
             m.stage = self.stages[0].name
         if m.step_ind != 0:
             return
+        # the first stage is never entered through advance(), so its cap clock is
+        # stamped here -- and only for a stage that declares one
+        if self.stage.max_steps is not None and self.ctrl.get('max_steps_entry') is None:
+            self.ctrl['max_steps_entry'] = int(m.step_ind)
         while self.stage.skip_if is not None and self.stage.index + 1 < len(self.stages):
             if self.stage.skip_if == 'prior_loaded':
                 if not hasattr(m, 'prior_model'):
@@ -2116,6 +2195,15 @@ class StageProtocol:
                 # do match
                 print(f"protocol: prior model loaded (prior_model_name) "
                       f"-- skipping stage '{self.stage.name}' (policy weights untouched)")
+            elif self.stage.skip_if == 'weights_loaded':
+                if not getattr(m, 'weights_only_loaded', False):
+                    break
+                # the loaded weights ARE the skipped stage's product; unlike the
+                # prior_loaded case they are the live policy's own, so nothing else
+                # is needed -- the next stage's on_enter fires below exactly as it
+                # would at a natural transition
+                print(f"protocol: weights loaded (checkpoint_name, load_weights_only) "
+                      f"-- skipping stage '{self.stage.name}'")
             self.advance(None, run_exit_actions=False)
 
     def advance(self, eval_metrics, run_exit_actions: bool = True):
@@ -2149,6 +2237,9 @@ class StageProtocol:
         print(f"protocol: stage '{old.name}' -> '{new.name}'")
         m.stage = new.name
         m.stage_ctrl = fresh_stage_ctrl()
+        if new.max_steps is not None:
+            # the cap's clock (see _stage_steps); absent for a stage without a cap
+            m.stage_ctrl['max_steps_entry'] = int(m.step_ind)
         if new.fracs:
             total = float(sum(new.fracs.values()))
             for mode in MODES:
@@ -3368,6 +3459,12 @@ class StageProtocol:
                 step = int(getattr(self.m, 'step_ind', 0) or 0)
                 for name, spec in stage.coeff_schedule.items():
                     out[f'protocol/coeff_sched_p_{name}'] = min(1.0, max(0.0, (step - int(entry)) / float(spec['steps'])))
+        if stage.max_steps is not None and self.ctrl.get('max_steps_entry') is not None:
+            # how much of the bound is spent, so a stage about to be FORCED out is
+            # visible before it happens rather than only in the transition line
+            out['protocol/max_steps_frac'] = (
+                float(int(self.m.step_ind) - int(self.ctrl['max_steps_entry']))
+                / float(stage.max_steps))
         if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
             for i, rule in enumerate(stage.balance['rules']):
                 rs = self.ctrl['rules'].get(i, {})

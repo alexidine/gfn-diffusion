@@ -1,6 +1,6 @@
 # Developer traps
 
-*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20. Sources at the end.*
+*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the `TRAIN_ENTRYPOINTS` value re-verified on 2026-09-26 against commit `5f4828d` plus uncommitted working-tree changes that are in no commit yet. Sources at the end.*
 
 A *silent wrong result* is an outcome that differs from the intended one while nothing raises, nothing warns, and the run or the test reports success. This page collects the mechanisms in this codebase and its dependencies that produce one, each with the code that exhibits it and the shape of a check that catches it. Config keys accepted but never read belong to [config-validation](config-validation.md); GPU admission and OOM to [compute-guards](compute-guards.md); launch lines and submission to [cluster-operations](cluster-operations.md).
 
@@ -54,7 +54,7 @@ Three patterns turn an unrun or failed check into a green result. A suite report
 
 ## The interpreter and the path
 
-The project interpreter is `C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe`, named by `tests/infra/test_gpu_guard.py::VENV` and by the local run scripts. There are no editable installs: `configs/cond_workup/generate_configs.py::PYTHONPATH` names `C:\Users\mikem\Projects\mxt_gfn\mxtaltools` and `C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion`, the second being the parent of `energy_sampling/` that the dotted imports require; under pytest `pythonpath = . ..` supplies both spellings. `gpu_guard.py::require_free_gpu` returns immediately, with a printed reason from `_skip_reason`, when `GFN_GPU_GUARD` is falsy, when `CUDA_VISIBLE_DEVICES` hides all GPUs, or when any of `SCHEDULER_ENV` is set; `GFN_ALLOW_GPU_SHARING` downgrades a block to a warning. Both go through `_env_true` and `_env_false`, which take `1/true/on/yes/y` and `0/false/off/no/n` case-insensitively. `TRAIN_ENTRYPOINTS` is `('train.py', 'train_conformer.py')`, so a test session holding the card is not a tenant.
+The project interpreter is `C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe`, named by `tests/infra/test_gpu_guard.py::VENV` and by the local run scripts. There are no editable installs: `configs/cond_workup/generate_configs.py::PYTHONPATH` names `C:\Users\mikem\Projects\mxt_gfn\mxtaltools` and `C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion`, the second being the parent of `energy_sampling/` that the dotted imports require; under pytest `pythonpath = . ..` supplies both spellings. `gpu_guard.py::require_free_gpu` returns immediately, with a printed reason from `_skip_reason`, when `GFN_GPU_GUARD` is falsy, when `CUDA_VISIBLE_DEVICES` hides all GPUs, or when any of `SCHEDULER_ENV` is set; `GFN_ALLOW_GPU_SHARING` downgrades a block to a warning. Both go through `_env_true` and `_env_false`, which take `1/true/on/yes/y` and `0/false/off/no/n` case-insensitively. `TRAIN_ENTRYPOINTS` is `('train.py', 'train_conformer.py', 'conformer_modeller.py')`, so a test session holding the card is not a tenant.
 
 ## Owner choices
 

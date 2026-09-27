@@ -59,7 +59,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
-TRAIN_ENTRYPOINTS = ('train.py', 'train_conformer.py')
+# conformer_modeller.py is the conformer route's launch script (`python -u
+# conformer_modeller.py --config ...`). Its own __main__ calls require_free_gpu, but
+# until it was listed here a RUNNING conformer job was invisible to everyone else's
+# check: a second launch saw no tenant, skipped the room check on an unmeasured
+# config, and was cleared onto the occupied card.
+TRAIN_ENTRYPOINTS = ('train.py', 'train_conformer.py', 'conformer_modeller.py')
 OVERRIDE_ENV = 'GFN_ALLOW_GPU_SHARING'
 
 # Declared co-tenancy for a run that was LAUNCHED as one of N deliberate siblings.
@@ -337,7 +342,7 @@ def config_signature(cfg):
     model = _get(cfg, 'model', {})
     integ = _get(cfg, 'integrator', {})
     try:
-        return '|'.join(str(v) for v in (
+        fields = (
             _get(cfg, 'energy_function'),
             # The OPERATING batch, not the growth CAP. Keying on max_batch_size treated a
             # ceiling as the working size: configs/aug02/0.yaml runs at batch 1000 with a
@@ -365,9 +370,50 @@ def config_signature(cfg):
             # card. Both move the peak, so both belong in the key.
             int(_get(cfg, 'eval_num_samples', 0) or 0),
             str(_get(cfg, 'buffer_device', 'cuda')),
-        ))
+        )
+        # APPENDED, and only on the conformer route, so every crystal key -- and the
+        # crystal peaks already on record -- stays byte-identical.
+        if _get(cfg, 'energy_function') in CONFORMER_ENERGY_FUNCTIONS:
+            fields += _conformer_set_key(cfg, model)
+        return '|'.join(str(v) for v in fields)
     except (TypeError, ValueError):
         return None
+
+
+#: Energy functions run by conformer_modeller.py; config_invariants.py names the
+#: same route `_CONFORMER_ENERGY_FUNCTIONS`.
+CONFORMER_ENERGY_FUNCTIONS = ('conformer_torsions',)
+_UNREADABLE_SET = 'set:unreadable'
+
+
+def _conformer_set_key(cfg, model):
+    """(policy kind, condition-set size) for a conformer config.
+
+    Without these, every conformer config at one batch signed the same: the
+    6-molecule smoke's measured peak would have been projected for a set of
+    hundreds of molecules at the same batch -- an UNDER-estimate, the direction
+    that crashes the box. The carrier width and the per-row condition fields the
+    buffers hold grow with the set, and the set head is a different network from
+    the flat one. Peaks recorded before this key existed match no conformer
+    config any more, which then projects from its declared ceiling until it is
+    measured again: the conservative direction.
+
+    THE SET IS KEYED BY ITS FILE SIZE, not by its contents. Reading member count
+    or carrier width would mean torch.load'ing a file that grows with the set, on
+    every poll of a waiting launch and before CUDA is touched; the byte count is
+    free and moves whenever the set does. Relative paths resolve against the
+    working directory, as the trainer's own load does. A path that cannot be
+    stat'ed keys as 'set:unreadable' rather than failing the guard; record_peak
+    never stores that key, so it matches no measurement and the projection falls
+    back to the declared ceiling."""
+    kind = str(_get(model, 'policy_kind', 'flat')).lower()
+    path = _get(cfg, 'molecules_path')
+    if not path:
+        return kind, 'set:none'
+    try:
+        return kind, f'set:{os.path.getsize(path)}B'
+    except OSError:
+        return kind, _UNREADABLE_SET
 
 
 def _traj_checkpoint_key(cfg):
@@ -434,6 +480,8 @@ def record_peak(cfg, peak_mb, peak_allocated_mb=None):
     sig = config_signature(cfg)
     if not sig or not peak_mb:
         return
+    if sig.endswith('|' + _UNREADABLE_SET):
+        return      # not a measurement OF anything identifiable; see _conformer_set_key
     reg = load_registry()
     row = reg.get(sig) or {}
     if peak_allocated_mb:
