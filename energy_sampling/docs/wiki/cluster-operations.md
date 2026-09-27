@@ -1,6 +1,6 @@
 # Cluster operations
 
-*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20. Sources at the end.*
+*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the conformer script section verified on 2026-09-26 against commit `9c532ac` plus uncommitted working-tree changes. Sources at the end.*
 
 A *battery* is a directory under `configs/` holding one YAML file per *arm*, a tab-separated index, and one SLURM submission script. This page is about what that directory contains once written, how it reaches the cluster, and what the cluster does with it. How the YAMLs are derived from the canonical config is [battery-generation](battery-generation.md); what a checkpoint holds is [checkpoints-and-resume](checkpoints-and-resume.md).
 
@@ -36,6 +36,16 @@ Each array task, in order:
 6. **Substitution.** `sed` replaces `WARM_CHECKPOINT_PLACEHOLDER` and `PRIOR_MODEL_PLACEHOLDER`, writing a *resolved* YAML into `joblogs/`; a surviving placeholder is `FATAL`.
 
 The launch is `srun singularity exec --nv` with a read-only overlay, two `--bind` mounts, `--pwd` at `energy_sampling`, `PYTHONPATH` prefixed with both repository roots, an inline `python -c` assertion that `mxtaltools.common.sym_utils.NIGGLI_TRICLINIC` is true, and `python -u train.py --config ${RESOLVED}`, piped through `tee` into `joblogs/<arm>_<jobid>.trainlog`. After the pipe, `grep -q UNRECOVERABLE` on that log creates the `.dead` sentinel.
+
+## The conformer script
+
+`configs/conformer_cond/make.py::conformer_template` derives the conformer route's script from the same template, with four substitutions. Each is refused unless its span occurs exactly once in `configs/final_sep19/make.py::SBATCH`.
+- The two index reads of the prior (columns 5 and 6) become one read of column 5 into `RDKIT`, the RDKit version the condition sets were built under.
+- The block from the `MONO_CLASS` grep through the prior byte check becomes `conformer_cond/make.py::DATA_GUARD`. It sets `NIG_EXPORT` empty and exits `FATAL` when `RDKIT` is empty. It loops over the (path, bytes, sha256) triples from column 6 of the index row, comparing `stat -c %s` of each file under `DATA` with its recorded size and, when the size matches, `sha256sum` with its recorded hash. It exits `FATAL` before `srun` when the row holds no triple, and names every mismatched file.
+- The inline `NIGGLI_TRICLINIC` assertion becomes an assertion that `rdkit.__version__` equals `RDKIT` and that RDKit's `AllChem` carries `MMFFGetMoleculeForceField`, followed by an import of `mxtaltools.conformers.builder`. It runs inside the container, where a failure exits the task before `conformer_modeller.py` starts.
+- The launch becomes `python -u conformer_modeller.py --config ${RESOLVED}`.
+
+Its seed block, `conformer_cond/make.py::SEED_FRESH`, sets `CK=null`, so a first launch substitutes `null` for `WARM_CHECKPOINT_PLACEHOLDER`. A resubmit takes the template's own branches: the arm's `_running.pt` when one exists, or `_step<N>.pt` under `CK_STEP=<N>`. The arm config carries `load_weights_only: false`, so each of these is a full load. The RESUME and CK_STEP globs and the `<arm>.dead` sentinel match on the arm name, which ends in `conformer_cond/make.py::arm_digest` ([battery-generation](battery-generation.md)), so they find only files written under this exact arm. `tests/config/test_conformer_battery.py` runs the rendered script under bash against a fake project, data and checkpoint tree with `srun` and the SLURM tools replaced by shims. The legs it runs are a first launch, a resume, a regenerated arm beside the old arm's `_running.pt` and `<arm>.dead`, a `CK_STEP` restart with and without its sidecar, an ambiguous `CK_STEP` match, a file of the wrong size, a file of the right size with other bytes, an index row with no artifact, and the `<arm>.dead` sentinel.
 
 ## Two repositories, both at the intended commit
 
@@ -75,7 +85,7 @@ Resubmission is per array, not per arm: the same `--array=0-{last}` range re-ent
 
 `cfg:run_name`, `cfg:tag`, `cfg:epochs`, `cfg:eval_period`, `cfg:figs_period`, `cfg:checkpoints_dir`, `cfg:checkpoint_name`, `cfg:prior_model_name`, `cfg:nonfinite_abort_streak`, `cfg:gpu_util_window_s`, `cfg:gpu_util_sample_period_s`, `cfg:gpu_util_policy_window_s`.
 
-Code: `train.py::Modeller.train`, `._log_metrics`, `._MAX_LOG_FAILURES`, `._start_gpu_util_thread`, `._sample_gpu_util`, `._gpu_util_mean`, `._gpu_util_capacity`, `._announce_gpu_util_source`, `.vram_ledger`, `.ten_step_reporting`; `train.py::_UTIL_MIN_SPAN_S`, `train.py::FrozenTrainingState`; `gpu_guard.py::_visible_index`; `utils.py::_report_config_invariants`; `config_invariants.py::check`, `::figs_period_fires`; `configs/final_sep19/make.py::SBATCH`, `::WALL`, `::committed_mk_dev`; `configs/mle_w3_sep16/make.py::dirty_files`, `::_scan_local_paths`, `::CLUSTER_CKPTS`, `::CLUSTER_DATA`; `configs/prod_sep20/submit_prod_sep20.sbatch`, `configs/prod_sep20/INDEX_a.tsv`, `configs/prod_sep12/submit_prod_sep12.sbatch`.
+Code: `train.py::Modeller.train`, `._log_metrics`, `._MAX_LOG_FAILURES`, `._start_gpu_util_thread`, `._sample_gpu_util`, `._gpu_util_mean`, `._gpu_util_capacity`, `._announce_gpu_util_source`, `.vram_ledger`, `.ten_step_reporting`; `train.py::_UTIL_MIN_SPAN_S`, `train.py::FrozenTrainingState`; `gpu_guard.py::_visible_index`; `utils.py::_report_config_invariants`; `config_invariants.py::check`, `::figs_period_fires`; `configs/final_sep19/make.py::SBATCH`, `::WALL`, `::committed_mk_dev`; `configs/conformer_cond/make.py::conformer_template`, `::render_sbatch`, `::DATA_GUARD`, `::SEED_FRESH`, `::arm_digest`; `configs/mle_w3_sep16/make.py::dirty_files`, `::_scan_local_paths`, `::CLUSTER_CKPTS`, `::CLUSTER_DATA`; `configs/prod_sep20/submit_prod_sep20.sbatch`, `configs/prod_sep20/INDEX_a.tsv`, `configs/prod_sep12/submit_prod_sep12.sbatch`.
 
 ## Could be tooling
 
@@ -83,4 +93,4 @@ Several of the checks above are string comparisons a script could make before an
 
 ## Sources
 
-The code above, read at the stamped commit; `configs/prod_sep20/` and `configs/prod_sep12/` as written in the tree at that commit; the canonical config's evaluation and occupancy blocks; `docs/reading_runs.md` section 8; `configs/prod_sep02/analysis/low_util_cancellation/REPORT.md` for the two tagged calibrations. Memory files located the code and were not used as evidence: project_cluster_push_and_submit_workflow, feedback_live_log_looks_like_a_dead_job, project_low_util_kill_is_node_contention_gpu_busy_constant, project_prod_sep02_battery, project_prod_sep12_phase2_from_mle09_best, feedback_cluster_eval_fig_periods, project_epochs_is_absolute_and_resumes_can_start_past_it.
+The code above, read at the stamped commit; `configs/conformer_cond/make.py` and `tests/config/test_conformer_battery.py` read in the working tree, uncommitted at the stamp; `configs/prod_sep20/` and `configs/prod_sep12/` as written in the tree at that commit; the canonical config's evaluation and occupancy blocks; `docs/reading_runs.md` section 8; `configs/prod_sep02/analysis/low_util_cancellation/REPORT.md` for the two tagged calibrations. Memory files located the code and were not used as evidence: project_cluster_push_and_submit_workflow, feedback_live_log_looks_like_a_dead_job, project_low_util_kill_is_node_contention_gpu_busy_constant, project_prod_sep02_battery, project_prod_sep12_phase2_from_mle09_best, feedback_cluster_eval_fig_periods, project_epochs_is_absolute_and_resumes_can_start_past_it.
