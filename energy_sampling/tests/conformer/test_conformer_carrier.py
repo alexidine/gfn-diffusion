@@ -3,6 +3,9 @@ own chart.
 
 Load-bearing claims, each asserted directly because a failure of any returns plausible numbers:
   * dispatch is EXACT -- a carrier row scores to the member's own energy of the member state;
+  * the TERMINAL FORCE through the dispatcher is the member's own gradient, a pad column gets
+    exactly none, and it agrees with finite differences -- the pathwise-gradient branch
+    reads it, and a severed or misrouted gradient still returns a finite loss;
   * the graph reconstruction through the carrier-padded condition equals the member chart;
   * a nonzero pad, or a state_mask from another layout, is REFUSED, not scored;
   * on a carrier, chart methods of the dispatcher itself are refused by name;
@@ -60,6 +63,36 @@ def test_dispatch_is_exact(multi, carrier_batch):
     got = multi.energy(X, batch)
     want = torch.cat([m.energy(x) for _, m, x in xs])
     assert torch.equal(got, want)
+
+
+def test_terminal_force_is_the_members_own(multi, carrier_batch):
+    """d(E/T)/dx through `energy(keep_grads=True)`: the member's gradient placed in the
+    carrier, exactly zero on the pads, and a float64 central difference below 1e-6."""
+    batch, X, xs = carrier_batch
+    lay = multi.carrier
+    xa = X.clone().requires_grad_(True)
+    g, = torch.autograd.grad(multi.energy(xa, batch, keep_grads=True).sum(), xa)
+
+    want = []
+    for ident, m, x in xs:
+        xm = x.clone().requires_grad_(True)
+        gm, = torch.autograd.grad(m.energy(xm, keep_grads=True).sum(), xm)
+        want.append(lay.to_carrier(ident, gm))
+    want = torch.cat(want)
+    assert float((g - want).abs().max()) <= 1e-9 * float(want.abs().max())
+
+    pads = ~batch.state_mask.reshape(X.shape).bool()
+    assert pads.any() and torch.equal(g[pads], torch.zeros_like(g[pads]))
+
+    h = 1e-6
+    rng = np.random.default_rng(0)
+    for i in range(X.shape[0]):
+        for j in rng.choice(np.flatnonzero(~pads[i].numpy()), size=3, replace=False):
+            xp, xn = X.clone(), X.clone()
+            xp[i, j] += h
+            xn[i, j] -= h
+            fd = float(multi.energy(xp, batch)[i] - multi.energy(xn, batch)[i]) / (2 * h)
+            assert abs(fd - float(g[i, j])) <= 1e-6 * max(1.0, abs(float(g[i, j]))), (i, j)
 
 
 def test_graph_reconstruction_through_the_carrier(multi):

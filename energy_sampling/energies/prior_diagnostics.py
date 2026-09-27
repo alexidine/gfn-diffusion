@@ -100,7 +100,9 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     ph0 = en.ph0.detach().cpu().numpy()
     s_r, s_th = en.thermal_rtheta_sigma(T)
     s_imp = en.improper_phi_sigma(T)
-    imp = en.improper_phi_rows()
+    # the HELD rows, which torsion_groups excludes: the improper rows, plus the rows about a
+    # locked double bond when the stereo lock is on (ConformerTorsions.held_phi_rows)
+    imp = en.held_phi_rows()
     groups = en.torsion_groups()
     g_sigma = en.sibling_jitter_sigma(groups, T)
     ref = np.concatenate([r0, th0, ph0])

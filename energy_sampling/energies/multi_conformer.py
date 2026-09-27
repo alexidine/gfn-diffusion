@@ -17,16 +17,24 @@ so a mixed batch scored against one member is wrong by a different constant for 
 which is exactly a per-condition log Z error, the thing conditional training is trying to
 learn.
 
-WHAT MAKES THIS CHEAP. `ConformerTorsions.energy` never reads `mol_batch`; it computes from
-`x` and its own chart. So dispatch is a grouping, not a rewrite: split the rows by molecule,
-call each member on its own rows, and gather the results back into batch order.
+ONE PASS, NOT A LOOP OVER MOLECULES. Everything per-molecule about the energy is either on
+the condition graph or a parameter table. The tree, the state -> (r, theta, phi) map and the
+BAT volume element are read graph-natively off the batch (`conformer_data.batch_tree`,
+`state_to_dof`), whatever mix of molecules it holds; the force field is gathered from a
+packed per-molecule library (energies/ff_library.py); the chart constant is a per-molecule
+lookup. So a mixed batch costs one build and one force-field evaluation, independent of how
+many molecules it holds. The per-member loop this replaced cost a fixed 5-7 ms per molecule
+present -- ~2 s per 1024-row step at 50 molecules, ~7 s at 500 -- and survives only as the
+test oracle (`_energy_per_member`).
 
 ONE STATE WIDTH FOR THE WHOLE SET. The GFN's state dimension is fixed when it is built. A set
 whose members share their block layout uses the reference chart's state unchanged. A MIXED-k
 set uses the width-K CARRIER (energies/conformer_carrier.py): each member's columns are placed
-in fixed r | theta | phi blocks, pads are pinned to 0, and each row is sliced back to its own
-member's columns before scoring -- with a positive check that the pads really are 0 and that
-the batch's `state_mask` matches the layout, rather than a removed assertion.
+in fixed r | theta | phi blocks (a linear bend's transverse u and v in the theta block), pads
+are pinned to 0, and the condition graph's reconstruction map reads each row's own columns --
+with a positive check that the pads really are 0, that the batch's `state_mask` matches the
+layout, and that each row's atoms (and which of them carry a linear bend) are the molecule its
+`mol_id` names, rather than a removed assertion.
 """
 from __future__ import annotations
 
@@ -35,6 +43,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from energies.conformer_data import stereo_coeff_mismatch
 from energies.conformer_torsions import ConformerTorsions
 
 
@@ -89,6 +98,53 @@ class MultiConformerTorsions(ConformerTorsions):
             self._free_block = layout.free_block
             self._lin_free_idx = torch.as_tensor(np.flatnonzero(layout.free_block != 2),
                                                  dtype=torch.long, device=self.device)
+        self._build_library()
+
+    def _build_library(self) -> None:
+        """The per-molecule tables the one-pass energy reads, in `_members` order.
+
+        `_lib` packs every member's force field, atom count, placement-order `z`, per-atom
+        transverse flag and chart constant; `_valid_of_lib[i]` is entry i's carrier columns
+        (all True on the identity layout, which has no pads). `_lib_of_mol_id` stays None
+        until `bind_identifier_registry` supplies the mol_id numbering.
+        """
+        from energies.ff_library import ForceFieldLibrary
+
+        # THE WALL CONSTANTS ARE READ OFF THE DISPATCHER, once for the whole batch: the box and
+        # the transverse disc (`_energy_one_pass`) use `bounding_coeff` and `rho_wall`, the
+        # clip `energy_clip`, and the stereo lock `stereo_coeff`. Every member is built from the
+        # same kwargs, so they agree today; checked because one member that did not would be
+        # scored against a wall that is not its own -- a plausible number, and the per-member
+        # oracle would disagree silently.
+        for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff'):
+            want = getattr(self, name)
+            off = [i for i, m in self._members.items() if getattr(m, name) != want]
+            if off:
+                raise ValueError(
+                    f'{name} differs between the set and {len(off)} member(s) (e.g. '
+                    f'{off[0]!r}: {getattr(self._members[off[0]], name)!r} against {want!r}); '
+                    f'the one-pass energy applies one value to every row')
+        self._lib_idents: List[str] = list(self._members)
+        self._lib_index: Dict[str, int] = {k: i for i, k in enumerate(self._lib_idents)}
+        self._lib = ForceFieldLibrary.from_members(self._members, device=self.device,
+                                                   dtype=self.dtype)
+        if self._carrier is None:
+            valid = np.ones((len(self._lib_idents), int(self.data_ndim)), dtype=bool)
+        else:
+            valid = np.stack([self._carrier.valid(i) for i in self._lib_idents])
+        self._valid_of_lib = torch.as_tensor(valid, device=self.device)
+        # `torsion` and `dihedral` freeze r and theta, so log J is a per-molecule CONSTANT
+        # there and the prebuilt reward needs no geometry at all; `flex` and `full` have none
+        consts = [m.log_jacobian_const for m in self._members.values()]
+        if all(c is None for c in consts):
+            self._log_jac_const_of_lib = None
+        elif any(c is None for c in consts):
+            raise ValueError('members disagree on whether log J is constant; they were built '
+                             'at different levels')
+        else:
+            self._log_jac_const_of_lib = torch.as_tensor(
+                np.asarray(consts, dtype=np.float64), device=self.device)
+        self._lib_of_mol_id: Optional[torch.Tensor] = None
 
     @property
     def is_carrier(self) -> bool:
@@ -107,9 +163,20 @@ class MultiConformerTorsions(ConformerTorsions):
         a buffer carries only `mol_id`, because buffers keep tensors and `identifier` is a list.
         Binding the registry lets both resolve to the same chart instead of the second silently
         falling back to the reference molecule.
+
+        Also builds `_lib_of_mol_id`, the mol_id -> library-index table the one-pass energy
+        resolves rows through: a tensor lookup, where the identifier route is a Python walk
+        over the rows. -1 marks a mol_id this energy holds no member for.
         """
-        self._by_mol_id = {int(v): k for k, v in dict(registry).items()
-                           if k in self._members}
+        reg = {k: int(v) for k, v in dict(registry).items()}
+        if any(v < 0 for v in reg.values()):
+            raise ValueError('identifier registry holds a negative mol_id')
+        self._by_mol_id = {v: k for k, v in reg.items() if k in self._members}
+        table = torch.full((max(reg.values(), default=-1) + 1,), -1, dtype=torch.long)
+        for k, v in reg.items():
+            if k in self._lib_index:
+                table[v] = self._lib_index[k]
+        self._lib_of_mol_id = table.to(self.device)
 
     #: NOT `n_molecules` -- that name is already the energy protocol's, set by
     #: `set_n_molecules` from init_identifiers' mol_id registry and used as the condition_id
@@ -176,126 +243,465 @@ class MultiConformerTorsions(ConformerTorsions):
                 f'about how many samples there are')
         return idents
 
-    def _groups(self, mol_batch, n: int, device
-                ) -> List[Tuple[str, ConformerTorsions, torch.Tensor]]:
-        """`(identifier, member, row indices)` per molecule present, first-appearance order."""
+    def _lib_ids(self, mol_batch, n: int) -> torch.Tensor:
+        """Per-row LIBRARY index, ``[n]`` long on the batch's device; -1 = mol_id not held.
+
+        `mol_id` first, through the tensor table `bind_identifier_registry` built: it is what
+        survives a buffer, and a lookup costs one gather where the identifier route walks the
+        rows in Python. `identifier` is the fallback -- a batch straight off a conditions
+        file, or an energy whose registry is not bound yet. Neither present is refused, as
+        `_row_identifiers` refuses it: scoring against the reference member instead is the
+        silent error this class exists to remove.
+        """
+        dev = mol_batch.z.device
+        mid = getattr(mol_batch, 'mol_id', None)
+        if mid is not None and self._lib_of_mol_id is not None:
+            mid = mid.reshape(-1).long()
+            if int(mid.numel()) != n:
+                raise RuntimeError(f'{mid.numel()} mol_ids for {n} rows')
+            table = self._lib_of_mol_id.to(dev)
+            if int(table.numel()) == 0:
+                return torch.full((n,), -1, dtype=torch.long, device=dev)
+            oob = (mid < 0) | (mid >= table.numel())
+            got = table.index_select(0, mid.clamp(0, int(table.numel()) - 1))
+            return torch.where(oob, torch.full_like(got, -1), got)
         idents = self._row_identifiers(mol_batch, n)
-        order: Dict[str, List[int]] = {}
-        for i, ident in enumerate(idents):
-            order.setdefault(ident, []).append(i)
-        unknown = [k for k in order if k not in self._members]
+        unknown = sorted({k for k in idents if k not in self._lib_index})
         if unknown:
             raise RuntimeError(
                 f'batch carries {len(unknown)} molecule(s) this energy was not built for, '
                 f'e.g. {unknown[0]!r}. The energy set and the condition set must be built '
                 f'from the same molecule list.')
-        return [(k, self._members[k], torch.as_tensor(v, dtype=torch.long, device=device))
-                for k, v in order.items()]
+        return torch.as_tensor([self._lib_index[k] for k in idents], dtype=torch.long,
+                               device=dev)
 
-    def _member_rows(self, ident: str, x: torch.Tensor, mol_batch,
-                     idx: torch.Tensor) -> torch.Tensor:
-        """Rows `idx` of a carrier state, read through member `ident`'s own columns.
+    def _resolve_rows(self, mol_batch, n: int, x: Optional[torch.Tensor] = None,
+                      geometry: bool = True):
+        """``(lib_ids, ptr)`` for a batch, after POSITIVE checks that each row is its molecule.
 
-        The identity layout returns the rows unchanged. On a real carrier, two POSITIVE
-        checks before the slice, because a wrong one returns a plausible energy:
-          * every PAD column is exactly 0 -- pads are pinned, so a nonzero pad means the row
-            was produced for a different member's layout;
-          * when the batch carries `state_mask`, each row's mask IS this member's.
+        Every check is a tensor reduction, and they are read back together -- ONE host sync
+        per call whatever the batch size or molecule count; the per-check detail is computed
+        only on the failure path, to name the offending row. A failure raises, because each
+        one otherwise returns a plausible energy for the wrong molecule:
+
+          * a mol_id this energy holds no member for;
+          * a row whose recorded STEREO COEFFICIENT (``ctree_stereo_coeff``, written by
+            `condition_from_energy` from the energy the graph was built with) differs from
+            this energy's. A baked row carries clip(U + P) at that coefficient and is never
+            re-scored, and a condition graph's per-coordinate features mark the rows the prior
+            holds only when the lock is on, so a file built unlocked and read by a locked run
+            (or the reverse) trains on another target with no other error. A batch without the
+            field reads as built unlocked;
+          * a row whose atom count, placement-order ``z`` or per-atom TRANSVERSE or
+            DUMMY-FRAME flag (``ctree_transverse``, ``ctree_dummy_frame``) differs from its
+            library entry's. The z part is the only
+            check that sees a mol_id registered to the WRONG member between two molecules with
+            the same block counts -- constitutional isomers such as CCCO and CC(C)O share
+            every carrier column, so the pad and mask checks pass, and that member's force
+            field would be applied silently to the other's geometry. The flag part is the one
+            that sees a STALE file: the flags decide which theta/phi slots the build reads as
+            a (u, v) bend, so a file whose flags sit on other atoms -- even the same NUMBER
+            of them -- builds a wrong geometry from right-shaped tensors. Compared atom by
+            atom, not by count, in the same reduction as z;
+          * with the stereo lock on, a row whose per-atom lock element (``ctree_stereo_kind``
+            times ``ctree_stereo_sign``, and ``ctree_stereo_nbr``) differs from its library
+            entry's. Stereoisomers share z, atom count and every chart flag, so this is the
+            only check that sees a mol_id bound to the WRONG STEREOISOMER; the lock read off
+            the graph would then pin one isomer on the row of the other's condition;
+          * a nonzero PAD column in ``x`` (pads are pinned to 0 along the whole trajectory, so
+            the row was not produced in its member's layout);
+          * a ``state_mask`` that is not the row's member's.
+
+        With ``geometry`` the batch's float fields must also be in this energy's dtype: the
+        reconstruction reads them, and a float64 file under a float32 run would build in the
+        wrong precision or fail deep inside the force field.
         """
-        xi = x.index_select(0, idx)
-        if self._carrier is None:
-            return xi
-        lay = self._carrier
-        pads = torch.as_tensor(lay.pad_cols(ident), dtype=torch.long, device=x.device)
-        if pads.numel() and bool((xi.index_select(1, pads) != 0).any()):
-            worst = float(xi.index_select(1, pads).abs().max())
+        if not mol_batch.is_batch:
+            raise RuntimeError('the multi-molecule energy scores a collated BATCH of condition '
+                               'graphs; got a single graph')
+        if int(mol_batch.num_graphs) != n:
             raise RuntimeError(
-                f'{ident}: carrier rows carry nonzero PAD columns (max |x| {worst:.3g}). Pads '
-                f'are pinned to 0 along the whole trajectory, so this row was not produced in '
-                f'{ident}\'s layout; scoring it would read another chart\'s coordinates.')
-        mask = getattr(mol_batch, 'state_mask', None) if mol_batch is not None else None
-        if mask is not None:
-            want = torch.as_tensor(lay.valid(ident), device=mask.device)
-            got = mask.reshape(-1, lay.K).index_select(0, idx.to(mask.device)).bool()
-            if not bool((got == want).all()):
+                f'{mol_batch.num_graphs} graphs in the batch against {n} rows of state; the '
+                f'batch and the state disagree about how many samples there are')
+        dev = mol_batch.z.device
+        if x is not None and x.device != dev:
+            raise RuntimeError(
+                f'state on {x.device} but mol_batch on {dev}: the one-pass energy reads the '
+                f'tree and the DoF map off the batch, so both must sit on one device')
+        if geometry:
+            fdt = mol_batch.ctree_r0.dtype
+            if fdt != self.dtype:
                 raise RuntimeError(
-                    f'{ident}: the batch\'s state_mask disagrees with this energy\'s carrier '
-                    f'layout -- the conditions file was built against a different member set')
-        return lay.from_carrier(ident, xi)
+                    f'batch conformer fields are {fdt} but this energy runs in {self.dtype}; '
+                    f'cast the batch to the run dtype (ConformerModeller._as_run_dtype) '
+                    f'before scoring it')
 
-    @staticmethod
-    def _regroup(parts: Sequence[torch.Tensor], index: Sequence[torch.Tensor],
-                 n: int) -> torch.Tensor:
-        """Concatenated per-group results -> batch order, DIFFERENTIABLY.
+        lib_ids = self._lib_ids(mol_batch, n)
+        bad_id = lib_ids < 0
+        safe = lib_ids.clamp_min(0)
+        ptr, graph = mol_batch.ptr, mol_batch.batch
+        bad_coeff = stereo_coeff_mismatch(mol_batch, self.stereo_coeff).to(dev)
 
-        A gather, not an in-place scatter into an empty tensor: `keep_grads=True` is a real
-        call path (the pathwise-gradient forward branch), and writing into a fresh tensor
-        would sever it silently -- the values would be right and no gradient would flow.
+        # atom count, placement-order z and the transverse flag, at atom level so one gather
+        # covers the batch. A batch without `ctree_transverse` reads as flag-free, which is
+        # what a file written before the transverse chart meant -- and is refused against any
+        # member that has one.
+        n_atoms = self._lib.n_atoms.to(dev)
+        n_lib = n_atoms.index_select(0, safe)
+        bad_n = (ptr[1:] - ptr[:-1]) != n_lib
+        slot = torch.arange(int(graph.numel()), device=dev) - ptr[:-1].index_select(0, graph)
+        n_own = n_lib.index_select(0, graph)
+        z_at = (self._lib.z_ptr.to(dev).index_select(0, safe.index_select(0, graph))
+                + torch.minimum(slot, n_own - 1))
+        bad_z_atom = (slot >= n_own) | (self._lib.z.to(dev).index_select(0, z_at)
+                                        != mol_batch.z.reshape(-1).long())
+        tvf = getattr(mol_batch, 'ctree_transverse', None)
+        tvf = (torch.zeros_like(bad_z_atom) if tvf is None
+               else tvf.reshape(-1).to(device=dev, dtype=torch.bool))
+        bad_tv_atom = self._lib.transverse.to(dev).index_select(0, z_at) != tvf
+        # the DUMMY-FRAME flag, compared the same way and in the same reduction: it decides
+        # which phi slots are read against a dummy atom, so flags on other atoms build a
+        # wrong geometry from right-shaped tensors exactly as misplaced transverse flags do
+        dmf = getattr(mol_batch, 'ctree_dummy_frame', None)
+        dmf = (torch.zeros_like(bad_z_atom) if dmf is None
+               else dmf.reshape(-1).to(device=dev, dtype=torch.bool))
+        bad_tv_atom = bad_tv_atom | (self._lib.dummy_frame.to(dev).index_select(0, z_at) != dmf)
+        # THE STEREO LOCK, compared only when it is ON: off, it adds no term, so a row carrying
+        # another stereoisomer's table is scored exactly as its own would be. A batch without
+        # the fields reads as lock-free and is refused against any member that has an element.
+        bad_st_atom = torch.zeros_like(bad_z_atom)
+        if self.stereo_coeff > 0.0:
+            sk = getattr(mol_batch, 'ctree_stereo_kind', None)
+            ss = getattr(mol_batch, 'ctree_stereo_sign', None)
+            sq = getattr(mol_batch, 'ctree_stereo_nbr', None)
+            code = (torch.zeros_like(z_at) if sk is None or ss is None
+                    else (sk.reshape(-1) * ss.reshape(-1)).to(device=dev, dtype=torch.long))
+            quad = (torch.zeros(int(z_at.numel()), 4, dtype=torch.long, device=dev) if sq is None
+                    else sq.reshape(-1, 4).to(device=dev, dtype=torch.long))
+            bad_st_atom = ((self._lib.stereo_code.to(dev).index_select(0, z_at) != code)
+                           | (self._lib.stereo_nbr.to(dev).index_select(0, z_at)
+                              != quad).any(-1))
+        bad_z = torch.zeros(n, dtype=torch.long, device=dev).index_add(
+            0, graph, (bad_z_atom | bad_tv_atom | bad_st_atom).long()) > 0
+
+        valid_rows = self._valid_of_lib.to(dev).index_select(0, safe)
+        K = int(valid_rows.shape[1])
+        bad_pad = torch.zeros(n, dtype=torch.bool, device=dev)
+        if x is not None and self._carrier is not None:
+            # masked_fill keeps a NaN or inf in a pad visible to the != 0 test
+            bad_pad = (x.detach().masked_fill(valid_rows, 0) != 0).any(-1)
+        bad_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        mask = getattr(mol_batch, 'state_mask', None)
+        if mask is None and self._carrier is not None:
+            # REQUIRED ON A CARRIER, because a carrier is no longer always WIDER than its
+            # members. A transverse v moves from the phi region to the theta one, so two
+            # same-size nitriles whose bends sit on different rows (OCCCC#N and OCC(C)C#N)
+            # share every region width and the carrier is a pure PERMUTATION: K = k, no pads.
+            # A member-order file then passes the pad check and every width, and its
+            # `ctree_*_col` read the carrier state in the wrong order. `state_mask` is what
+            # `carrier_pad_condition` writes; its absence is the marker.
+            raise RuntimeError(
+                'the batch carries no state_mask, but this energy is a CARRIER: its condition '
+                'graphs were not re-expressed in the carrier layout (carrier_pad_condition), '
+                'so their reconstruction map indexes member columns, not carrier ones')
+        if mask is not None:
+            if int(mask.numel()) != n * K:
+                raise RuntimeError(
+                    f'state_mask has {mask.numel()} entries for {n} rows of width {K}; the '
+                    f'conditions file was built against a different layout')
+            bad_mask = (mask.reshape(n, K).bool() != valid_rows).any(-1)
+
+        flags = torch.stack([bad_id.any(), bad_coeff.any(), (bad_n | bad_z).any(),
+                             bad_pad.any(), bad_mask.any()]).tolist()
+        if any(flags):
+            self._raise_row_check(flags, mol_batch, lib_ids, bad_id, bad_n | bad_z, bad_pad,
+                                  x, valid_rows,
+                                  bad_z_or_count_atom=bad_z_atom | bad_n.index_select(0, graph),
+                                  bad_stereo_atom=bad_st_atom, bad_coeff=bad_coeff)
+        return lib_ids, ptr
+
+    def _raise_row_check(self, flags, mol_batch, lib_ids, bad_id, bad_atoms, bad_pad, x,
+                         valid_rows, bad_z_or_count_atom=None, bad_stereo_atom=None,
+                         bad_coeff=None):
+        """The failure path of `_resolve_rows`: name the first offending row, then raise.
+
+        ``bad_z_or_count_atom`` is the per-atom mismatch WITHOUT the transverse flags, so a row
+        flagged in `bad_atoms` but clean here is a flag mismatch alone and is named as one;
+        ``bad_stereo_atom`` separates a stereo-lock mismatch from a chart-flag one the same way.
         """
-        taken = torch.cat(list(index))
-        inverse = torch.empty(n, dtype=torch.long, device=taken.device)
-        inverse[taken] = torch.arange(n, dtype=torch.long, device=taken.device)
-        return torch.cat(list(parts))[inverse]
+        first = lambda m: int(torch.nonzero(m)[0])
+        mid = getattr(mol_batch, 'mol_id', None)
+        mid_of = lambda i: ('' if mid is None else f' (mol_id {int(mid.reshape(-1)[i])})')
+        if flags[0]:
+            i = first(bad_id)
+            raise RuntimeError(
+                f'row {i}{mid_of(i)}: this mol_id is not in the identifier registry this '
+                f'energy was bound to, or names no member of it ({self.n_charts} molecules); '
+                f'the energy set and the condition set must be built from the same list')
+        if flags[1]:
+            i = first(bad_coeff)
+            rec = getattr(mol_batch, 'ctree_stereo_coeff', None)
+            got = 0.0 if rec is None else float(rec.reshape(-1)[i])
+            raise RuntimeError(
+                f'row {i}{mid_of(i)} was built under stereo_coeff {got:g} '
+                f'(ctree_stereo_coeff{"" if rec is not None else ": absent, read as 0"}), but '
+                f'this energy locks at {self.stereo_coeff:g}. Its baked energy and its '
+                f'per-coordinate features belong to the other target, and a baked row is never '
+                f're-scored. Rebuild the conditions / prior file with '
+                f'build_conformer_conditions.py --stereo-coeff {self.stereo_coeff:g}.')
+        if flags[2]:
+            i = first(bad_atoms)
+            ident = self._lib_idents[int(lib_ids[i])]
+            in_row = mol_batch.batch == i
+            if (bad_z_or_count_atom is not None and bad_stereo_atom is not None
+                    and not bool(bad_z_or_count_atom[in_row].any())
+                    and bool(bad_stereo_atom[in_row].any())):
+                raise RuntimeError(
+                    f'row {i}{mid_of(i)} resolves to {ident!r} and carries its atoms, but its '
+                    f'stereo lock (ctree_stereo_kind * ctree_stereo_sign, ctree_stereo_nbr) '
+                    f'differs from that member\'s on atom(s) '
+                    f'{torch.nonzero(bad_stereo_atom[in_row]).flatten().tolist()}: the row is '
+                    f'another STEREOISOMER of the same molecule, or its conditions file was '
+                    f'built without the lock or against another reference. Scoring it would pin '
+                    f'the other isomer on this condition. Check the mol_id registry, or rebuild '
+                    f'the conditions file.')
+            if (bad_z_or_count_atom is not None
+                    and not bool(bad_z_or_count_atom[in_row].any())):
+                # count and z agree, so it is the flags alone: the right molecule, charted
+                # differently from the member this run built
+                raise RuntimeError(
+                    f'row {i}{mid_of(i)} resolves to {ident!r} and carries its atoms, but its '
+                    f'transverse flags (ctree_transverse) or dummy-frame flags '
+                    f'(ctree_dummy_frame) sit on different atoms from that member\'s chart: '
+                    f'the conditions file was built against another chart (a stale file). '
+                    f'Building it would read a (u, v) bend or a dummy-frame dihedral out of '
+                    f'the wrong atoms\' slots. Rebuild the conditions file.')
+            raise RuntimeError(
+                f'row {i}{mid_of(i)} resolves to {ident!r}, but its atoms (count or '
+                f'placement-order z) are not that molecule\'s: the mol_id registry, the '
+                f'conditions file and this energy\'s member set disagree. Scoring it would '
+                f'apply {ident!r}\'s force field to another molecule\'s geometry.')
+        if flags[3]:
+            i = first(bad_pad)
+            ident = self._lib_idents[int(lib_ids[i])]
+            worst = float(x.detach()[i].masked_fill(valid_rows[i], 0).abs().max())
+            raise RuntimeError(
+                f'{ident}: carrier row {i} carries nonzero PAD columns (max |x| {worst:.3g}). '
+                f'Pads are pinned to 0 along the whole trajectory, so this row was not '
+                f'produced in {ident}\'s layout; scoring it would read another chart\'s '
+                f'coordinates.')
+        raise RuntimeError(
+            'the batch\'s state_mask disagrees with this energy\'s carrier layout -- the '
+            'conditions file was built against a different member set')
+
+    def member_groups(self, mol_batch) -> List[Tuple[str, torch.Tensor]]:
+        """``[(identifier, row indices)]`` per molecule present, in library order.
+
+        For PER-MEMBER work that genuinely needs one chart at a time -- per-molecule
+        evaluation, the oracle below -- not for scoring, which is one pass. Built by a stable
+        sort on the resolved library index, with the same identity checks the energy runs
+        (the pad check needs a state and is the energy's).
+        """
+        n = int(mol_batch.num_graphs)
+        lib_ids, _ = self._resolve_rows(mol_batch, n, geometry=False)
+        order = torch.argsort(lib_ids, stable=True)
+        uniq, counts = torch.unique_consecutive(lib_ids.index_select(0, order),
+                                                return_counts=True)
+        return [(self._lib_idents[int(u)], rows)
+                for u, rows in zip(uniq.tolist(), torch.split(order, counts.tolist()))]
 
     # ------------------------------------------------------------------ energy
 
     def energy(self, x, mol_batch=None, log_temperature=None, return_exp: bool = False,
                keep_grads: bool = False, internal_oom_recovery=None):
         """E/T per sample, each row through ITS OWN chart. See `ConformerTorsions.energy`."""
-        n = int(x.shape[0])
         if self._carrier is not None and mol_batch is None:
             raise RuntimeError(
                 'a carrier-state energy needs mol_batch to know which member owns each row; '
                 'without it there is no chart to score against')
         if self.n_charts <= 1 or mol_batch is None:
-            # the single-molecule case is the parent's, byte for byte -- no grouping, no
+            # the single-molecule case is the parent's, byte for byte -- no library, no
             # gather, and no behaviour to diverge
             return super().energy(x, mol_batch, log_temperature, return_exp,
                                   keep_grads=keep_grads,
                                   internal_oom_recovery=internal_oom_recovery)
+        return self._energy_one_pass(x, mol_batch, log_temperature, return_exp, keep_grads)
 
-        groups = self._groups(mol_batch, n, x.device)
+    def _row_log_temperature(self, log_temperature, n: int, device) -> torch.Tensor:
         if log_temperature is None:
             log_temperature = torch.tensor(self.log_temperature)
-        log_T = torch.as_tensor(log_temperature, dtype=self.dtype, device=self.device).flatten()
+        log_T = torch.as_tensor(log_temperature, dtype=self.dtype, device=device).flatten()
         if log_T.numel() == 1:
-            log_T = log_T.expand(n)
+            return log_T.expand(n)
+        if int(log_T.numel()) != n:
+            raise RuntimeError(f'{log_T.numel()} log-temperatures for {n} rows')
+        return log_T
 
-        es, bakes, idxs = [], [], []
-        one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
-        for ident, member, idx in groups:
-            xi = self._member_rows(ident, x, mol_batch, idx)
-            es.append(member.energy(xi, None, log_T[idx], return_exp=False,
-                                    keep_grads=keep_grads))
-            idxs.append(idx)
-            if return_exp:
-                with torch.no_grad():
-                    bakes.append(member.potential_energy(xi.detach(), one))
-        e = self._regroup(es, idxs, n)
+    def _energy_one_pass(self, x, mol_batch, log_temperature, return_exp: bool,
+                         keep_grads: bool):
+        """The whole mixed batch in one build and one force-field evaluation.
+
+        Term for term the member's `energy` (`potential_energy` + `jacobian_energy` - T *
+        `log_chart_jacobian`, divided by T), in the same association, with each piece read
+        per row instead of from one chart:
+
+          * the tree and (r, theta, phi) from the condition graph (`batch_tree`,
+            `state_to_dof`) -- on a carrier its reconstruction map already points at each
+            row's own columns, so no slice back to member width is needed;
+          * U from the force field GATHERED for these rows (`ForceFieldLibrary.gather`), plus
+            the stereo lock read off the rows' own ``ctree_stereo_*``
+            (`stereo_lock.batch_lock_energy`), both before the clip;
+          * the box wall over `_lin_free_idx`, the carrier's non-phi columns: pads are
+            exactly 0 (checked), so relu adds exactly 0 there and the wall is each member's;
+          * the transverse DISC wall in rho, per ATOM off ``ctree_transverse`` (`_disc_wall`),
+            added to the box before the T pre-multiplication exactly as the member's
+            `bounding_energy` adds it -- so a pad, which owns no atom, cannot reach it;
+          * log J_BAT by `log_jacobian`, an index_add over the rows' own bond/angle entries,
+            with the transverse rows measured as log sinc(rho) under the same mask the build
+            used (the member's `_log_jac`);
+          * log|dq/dx| as the per-molecule CONSTANT from the library -- not the graph-derived
+            sum of log|scale|, which overcounts at `torsion`, where one column drives
+            several dihedral rows.
+
+        With `return_exp` the baked potential is ``clip(U + lock) + wall`` at T = 1 from this
+        same pass --
+        the member's `potential_energy(x, 1)`, without a second evaluation.
+        """
+        from mxtaltools.conformers.builder import build, log_jacobian
+        from mxtaltools.conformers.energy import intramolecular_energy
+
+        from energies.conformer_data import (batch_tree, dummy_frame_mask, state_to_dof,
+                                             transverse_mask)
+
+        n = int(x.shape[0])
+        lib_ids, ptr = self._resolve_rows(mol_batch, n, x)
+        temperature = 10 ** self._row_log_temperature(log_temperature, n, x.device)
+
+        grad_ctx = torch.enable_grad() if keep_grads else torch.no_grad()
+        with grad_ctx:
+            xs = x.to(self.dtype)
+            tree = batch_tree(mol_batch)
+            r, th, ph = state_to_dof(mol_batch, xs)
+            # None on a batch with no linear centre, which keeps it on exactly the code path
+            # it was on before transverse rows were admitted
+            tv = transverse_mask(mol_batch)
+            # None likewise on a batch with no dummy-frame row. Not passed to log_jacobian: a
+            # dummy moves the frame phi is measured in, not the volume element
+            pos = build(tree, r, th, ph, transverse=tv,
+                        dummy_frame=dummy_frame_mask(mol_batch))
+            e = intramolecular_energy(tree, pos, self._lib.gather(lib_ids, ptr[:-1]))
+            if self.stereo_coeff > 0.0:
+                # THE STEREO LOCK, graph-natively off ctree_stereo_* -- the sign read off each
+                # graph's own reference, which `_resolve_rows` has just compared atom by atom
+                # with the member's table. Inside the clip, as the member adds it
+                # (ConformerTorsions.potential_energy), so the baked value carries it too.
+                from energies.stereo_lock import batch_lock_energy
+                e = e + batch_lock_energy(mol_batch, pos, self.stereo_coeff)
+            if self.energy_clip is not None:
+                # the force field (and the lock) only, before the wall --
+                # ConformerTorsions.potential_energy
+                from mxtaltools.common.utils import log_rescale_positive
+                e = log_rescale_positive(e, self.energy_clip)
+            baked = e
+            if self._lin_free_idx.numel():
+                xl = xs.index_select(-1, self._lin_free_idx)
+                wall = self.bounding_coeff * (torch.relu(xl - 1.0) ** 2
+                                              + torch.relu(-(xl + 1.0)) ** 2).sum(-1)
+                if tv is not None:
+                    wall = wall + self._disc_wall(mol_batch, th, ph, n)
+                baked = e + wall
+                e = e + wall * temperature
+            e = e + (-temperature * log_jacobian(tree, r, th, None if tv is None else ph,
+                                                 transverse=tv))
+            e = e - temperature * self._lib.log_chart.index_select(0, lib_ids)
+        # BEFORE the division, as the parent stores it: the crystal convention for
+        # `gfn_energy`, which the eval publishes as 'Mean Sample Energy'
+        gfn_e = e
+        e = e / temperature
         if not return_exp:
             return e
 
-        # `set_batch_states` only writes attributes, so it runs ONCE over the whole batch --
-        # the per-molecule part is the scoring above. `gfn_energy` is the pre-division value
-        # the crystal route stores and the eval publishes as 'Mean Sample Energy', recovered
-        # here rather than re-derived so the two routes keep meaning the same thing.
         from energies.conformer_data import set_batch_states
-        baked = self._regroup(bakes, idxs, n)
-        temperature = (10 ** log_T).to(e.dtype)
-        return e, set_batch_states(mol_batch, x.detach(), baked,
-                                   gfn_energy=(e * temperature).detach(),
-                                   periodic=self.periodic_dims)
+        return e, set_batch_states(mol_batch, x.detach(), baked.detach(),
+                                   gfn_energy=gfn_e.detach(), periodic=self.periodic_dims)
+
+    def _disc_wall(self, mol_batch, th, ph, n: int) -> torch.Tensor:
+        """``bounding_coeff * sum relu(rho - rho_wall)^2`` per ROW, ``[n]``, graph-natively.
+
+        The disc term of the member's `bounding_energy`, which a box over the columns cannot
+        express: the box is a SQUARE in (x_u, x_v) and the transverse domain a disc, so
+        without this term the one-pass energy would score a different target from every
+        member (see `ConformerTorsions.bounding_energy` for the measured escape route).
+
+        Formed from the reconstruction this pass already made, not from state columns. On a
+        transverse atom `state_to_dof` returns u in the atom's theta slot (unclamped: the clamp
+        exempts it) and v in its phi slot, each ``ref + scale * x`` -- the same affine map, the
+        same reference and the same signed scale `_transverse_rho2` applies -- so rho is the
+        member's number. PER ATOM, off ``ctree_transverse``, which `_resolve_rows` has just
+        compared atom by atom with the member's chart; a pad owns no atom and cannot reach it.
+        """
+        from energies.conformer_data import dof_rank
+
+        flag = mol_batch.ctree_transverse.reshape(-1).bool()
+        rank = dof_rank(mol_batch)
+        # `th` is aligned with the rank >= 2 atoms and `ph` with the rank >= 3 atoms, both in
+        # atom order, so the per-atom flag restricted to each selects the same atoms in the
+        # same order: u and v pair by position.
+        u = th[flag[rank >= 2]]
+        v = ph[flag[rank >= 3]]
+        if u.shape != v.shape:
+            # a flagged frame seed (rank 2) has no phi row to carry v. build() refuses that
+            # too, but a shape of 1 would BROADCAST here rather than fail, pairing one v with
+            # every u
+            raise RuntimeError(
+                f'{int(u.numel())} transverse u components against {int(v.numel())} v: a '
+                f'flagged atom owns no torsion row, so its bend has no second component')
+        rho = torch.sqrt((u * u + v * v).clamp_min(1e-24))
+        disc = torch.zeros(n, dtype=th.dtype, device=th.device).index_add(
+            0, mol_batch.batch[flag], torch.relu(rho - self.rho_wall) ** 2)
+        return self.bounding_coeff * disc
+
+    def _energy_per_member(self, x, mol_batch, log_temperature=None,
+                           keep_grads: bool = False) -> torch.Tensor:
+        """The per-member LOOP the one-pass energy replaced, kept as its REFERENCE ORACLE.
+
+        Each molecule's rows through that member's own `energy`, in its own chart and at its
+        own width, reassembled into batch order by a gather (differentiable, so the
+        `keep_grads` path can be compared too). Not a scoring path: it pays the fixed
+        per-molecule cost the one-pass energy exists to remove, and it does not repeat the
+        pad check. Tests and the timing comparison call it; nothing in training does.
+        """
+        n = int(x.shape[0])
+        log_T = self._row_log_temperature(log_temperature, n, x.device)
+        es, idxs = [], []
+        for ident, rows in self.member_groups(mol_batch):
+            rows = rows.to(x.device)
+            xi = x.index_select(0, rows)
+            if self._carrier is not None:
+                xi = self._carrier.from_carrier(ident, xi)
+            es.append(self._members[ident].energy(xi, None, log_T.index_select(0, rows),
+                                                  keep_grads=keep_grads))
+            idxs.append(rows)
+        taken = torch.cat(idxs)
+        inverse = torch.empty(n, dtype=torch.long, device=taken.device)
+        inverse[taken] = torch.arange(n, dtype=torch.long, device=taken.device)
+        return torch.cat(es)[inverse]
 
     # ------------------------------------------------------------------ prebuilt rewards
 
     def prebuilt_sample_to_reward(self, mols, temperature):
         """log reward from a baked `conformer_energy`, with EACH ROW'S OWN measure terms.
 
-        At `level='torsion'` this is the parent's arithmetic with two per-molecule constants
-        gathered per row instead of taken from the reference member. Those constants span
-        ~1 nat across ordinary QM9 molecules, so using one member's for the whole batch is a
-        per-condition log Z error of that size -- silent, and pointed straight at the quantity
-        the conditional route is trying to learn.
+        The parent's arithmetic, ``-(U / T) + log J + log|dq/dx|``, with both measure terms
+        read per row instead of from the reference member. Those terms span ~1 nat across
+        ordinary QM9 molecules at `torsion` and far more at `full`, so using one member's for
+        the whole batch is a per-condition log Z error of that size -- silent, and pointed
+        straight at the quantity the conditional route is trying to learn.
+
+        `flex` and `full`: log J moves with the sample, so it is recomputed graph-natively
+        from the stored state, in one pass over the mixed batch -- this used to be a loop
+        over the molecules present, on EVERY backward draw. `torsion` and `dihedral`: r and
+        theta are frozen, log J is each member's constant, and no geometry is read.
         """
         e = getattr(mols, 'conformer_energy', None)
         if e is None:
@@ -307,45 +713,26 @@ class MultiConformerTorsions(ConformerTorsions):
         if self.n_charts <= 1:
             return super().prebuilt_sample_to_reward(mols, temperature)
         t = torch.as_tensor(temperature, dtype=e.dtype, device=e.device).flatten()
-        if self.log_jacobian_const is None:
-            # STATE-DEPENDENT log J -- `flex` and `full`, where r and theta are free so the
-            # BAT term prod r^2 sin(theta) moves with the sample and cannot be a per-molecule
-            # constant. This used to raise, which made `full` unreachable on the ENTIRE
-            # conditional route: the conditional arm is always a MultiConformerTorsions, and
-            # the anchor-buffer seed calls this before the first training step.
-            #
-            # The dispatch is the same grouping `energy()` uses, and each member is a whole
-            # ConformerTorsions with its own `_batch` tree cache -- so the "per-member cache
-            # this class does not keep" was already there, one level down. Rebuilding per
-            # member rather than per row keeps it one `build` call per distinct molecule.
-            from energies.conformer_data import batch_states
-            state = torch.as_tensor(batch_states(mols), dtype=self.dtype,
-                                    device=self.device)
-            if int(state.shape[0]) != n:
-                raise RuntimeError(
-                    f'{state.shape[0]} baked states against {n} baked energies; the prebuilt '
-                    f'rows disagree with themselves')
-            parts, idxs = [], []
-            for ident, member, idx in self._groups(mols, n, state.device):
-                xi = self._member_rows(ident, state, mols, idx)
-                r, th, ph = member.dof_from_state(xi)
-                tree, _ = member._batch(int(xi.shape[0]))
-                # the CHART term is per member too: it is sum(log scale) over that molecule's
-                # own free columns, so it differs whenever the free-column sets differ. Adding
-                # the reference member's to every row is the same per-condition log Z error
-                # this class exists to remove, one level further in.
-                parts.append(member._log_jac(tree, r, th, ph, int(xi.shape[0])).flatten()
-                             + float(member.log_chart_jacobian))
-                idxs.append(idx)
-            log_j = self._regroup(parts, idxs, n).to(e.device)
-            return -(e / t) + log_j
+        chart = self._lib.log_chart.to(device=e.device, dtype=e.dtype)
+        if self._log_jac_const_of_lib is not None:
+            lib_ids, _ = self._resolve_rows(mols, n, geometry=False)
+            lj = self._log_jac_const_of_lib.to(device=e.device, dtype=e.dtype)
+            return -(e / t) + lj.index_select(0, lib_ids) + chart.index_select(0, lib_ids)
 
-        idents = self._row_identifiers(mols, n)
-        lj = torch.tensor([float(self._members[i].log_jacobian_const) for i in idents],
-                          dtype=e.dtype, device=e.device)
-        ch = torch.tensor([float(self._members[i].log_chart_jacobian) for i in idents],
-                          dtype=e.dtype, device=e.device)
-        return -(e / t) + lj + ch
+        from mxtaltools.conformers.builder import log_jacobian
+
+        from energies.conformer_data import (batch_states, batch_tree, state_to_dof,
+                                             transverse_mask)
+        state = batch_states(mols)
+        lib_ids, _ = self._resolve_rows(mols, n, state)
+        r, th, ph = state_to_dof(mols, state)
+        # the transverse rows' measure is log sinc(rho), which reads BOTH components -- the
+        # same mask and the same phi the energy's own log J takes, or the prebuilt reward and
+        # energy() disagree on every row carrying a linear bend
+        tv = transverse_mask(mols)
+        log_j = log_jacobian(batch_tree(mols), r, th, None if tv is None else ph,
+                             transverse=tv).to(e.dtype)
+        return -(e / t) + log_j + chart.index_select(0, lib_ids)
 
     # ------------------------------------------------------------------ reporting
 
@@ -373,10 +760,12 @@ class MultiConformerTorsions(ConformerTorsions):
 _CHART_METHODS = (
     'dof_from_state', 'build_positions', 'bounding_energy', '_transverse_rho2',
     'transverse_crossings', 'state_from_dof', 'prior_dof_types', 'torsion_groups',
-    'improper_phi_rows', 'improper_phi_sigma', 'sibling_jitter_sigma', 'ring_blocks',
+    'improper_phi_rows', 'held_phi_rows', 'improper_phi_sigma', 'sibling_jitter_sigma',
+    'ring_blocks',
     'ring_frame_groups', 'prior_log_prob', 'thermal_rtheta_sigma', 'sample_prior_states',
     'potential_energy', 'jacobian_energy', 'brute_force_log_z', 'sample', '_batch',
-    '_log_jac', '_tiled_transverse',
+    '_log_jac', '_tiled_transverse', '_build', '_tiled_dummy', 'dummy_frame_crossings',
+    'torsion_frame_atoms',
 )
 
 

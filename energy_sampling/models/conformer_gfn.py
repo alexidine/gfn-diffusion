@@ -12,26 +12,60 @@ WHAT IT ADDS, and it is deliberately small:
     three `get_traj_*` entry points DO receive `mol_batch`, so this binds the tensors there,
     once per trajectory, and `predict_next_state` reads them on every step.
 
-WHAT IT DOES NOT ADD, because it already exists:
-
-    the `log Z(c)` head. conformer_conditional_stack.md section 5 asks for
-    `log Z(c) = Z_MLP(Agg_i g_i)`; on the conditional route `GFN.init_flow_model` already
-    builds `scalarMLP(input_dim=condition_embedding_dim, output_dim=1)` and `_condition_flow`
-    already reads it. Since the condition vector now carries the pooled molecular embedding --
-    which IS `[sum softmax(s_i) h_i || sum h_i]`, the augmented aggregation over per-atom
-    embeddings the design asks for -- that head is `Z_MLP(Agg_i g_i)` as written. Adding a
-    second one would be two heads competing to normalise the same object.
+    the `log Z(c)` head can REPLACE its input, opt-in (`install_flow_head`). By default the
+    head is `GFN.init_flow_model`'s `scalarMLP(input_dim=condition_embedding_dim)`, read by
+    `_condition_flow` off the conditioner's output, detached. That output is shaped by
+    whatever trains the conditioner, and on the set route nothing does once P_B is frozen:
+    the set P_F never reads `s_emb`, and the frozen P_B snapshot (`GFN._pb_net`) consumes
+    the conditioner detached. The head then regresses on a feature fixed at its phase-1
+    value, yet `get_tb_loss` uses it as the TB centre for every condition the tracker does
+    not yet trust. `install_flow_head('mol_emb')`
+    swaps in a head over the pooled baked molecular embedding instead -- a frozen,
+    per-molecule feature that does not depend on the conditioner training at all. It is an
+    A/B arm, not a default; still ONE head, so the two never compete to normalise the same
+    object.
 
 BINDING IS PER TRAJECTORY, NOT PER STEP, and that is the point of precomputing at all: the
 molecular embedding is frozen and static, so it is gathered once and read T times.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
+from mxtaltools.models.modules.components import scalarMLP
 
 from models.gfn import GFN, logtwopi
+
+
+class MolEmbFlowHead(scalarMLP):
+    """``log Z(c)`` over ``[pooled molecular embedding || per-block valid-column counts]``.
+
+    A scalarMLP whose forward REFUSES any other input width. The width check is the whole
+    reason for the subclass: `train.py`'s `bootstrap_log_z` (protocol action `bootstrap_z`
+    on a conditional run) calls ``flow_model(get_condition_embedding(...))`` directly, and
+    this head must not read the conditioner's output as though it were a molecule.
+    `ConformerGFN.install_flow_head` refuses the one width at which that check could not
+    tell the two apart.
+    """
+
+    def __init__(self, in_dim: int, block_onehot: Optional[torch.Tensor], **mlp_kw):
+        super().__init__(input_dim=in_dim, output_dim=1, **mlp_kw)
+        # NON-persistent: which block each column belongs to is the energy's layout, not a
+        # learned weight. install_flow_head rebuilds it on every construction, so the
+        # checkpoint carries weights only and a reload cannot overwrite the current layout
+        self.register_buffer('block_onehot', block_onehot, persistent=False)
+
+    def forward(self, x, *args, **kwargs):
+        if x.dim() != 2 or x.shape[-1] != self.input_dim:
+            raise RuntimeError(
+                f'the mol_emb log Z head reads [B, {self.input_dim}] -- the pooled molecular '
+                f'embedding (+ per-block valid-column counts) that ConformerGFN binds per '
+                f'trajectory -- and was called on {tuple(x.shape)}. A caller that passes the '
+                f'conditioner output straight to flow_model (train.py bootstrap_log_z, i.e. '
+                f'the `bootstrap_z` stage action on a conditional run) is not wired for this '
+                f'head: drop that action from the arm, or keep the default head')
+        return super().forward(x, *args, **kwargs)
 
 
 class ConformerGFN(GFN):
@@ -44,6 +78,10 @@ class ConformerGFN(GFN):
         #: set by the modeller when the energy is a CARRIER state; a batch without
         #: `state_mask` is then refused rather than scored as though every column were real
         self._carrier = False
+        # the modeller RE-CLASSES a built GFN rather than constructing one, so this __init__
+        # never runs there: every read of these two goes through getattr with this default
+        self._flow_head_kind = 'condition'
+        self._flow_in: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ binding
 
@@ -170,6 +208,25 @@ class ConformerGFN(GFN):
         per = -0.5 * ((z / var.sqrt()) ** 2 + logtwopi + var.log())
         return torch.where(m, per, torch.zeros_like(per)).sum(1)
 
+    def fwd_gauss_logprob(self, delta_x, drift, d, dt, V=None):
+        """The parent's, but DPLR on a carrier is refused rather than scored unmasked.
+
+        With a low-rank factor the parent takes the Woodbury path, which sums over all K
+        columns and never calls `gauss_logprob` -- so the per-row mask above never applies,
+        and every pad column (pinned to 0, residual ``-drift``) enters log P_F. Finite,
+        plausible and wrong. The set policy already refuses DPLR in `predict_next_state`;
+        this closes the FLAT policy on a carrier. It keys on the carrier, not on whether this
+        batch happens to have pads, so the refusal cannot come and go with the batch.
+        """
+        if V is not None and (getattr(self, '_carrier', False)
+                              or getattr(self, '_state_mask', None) is not None):
+            raise NotImplementedError(
+                f'dplr_rank {self.dplr_rank} on a CARRIER state: the DPLR (Woodbury) forward '
+                f'density sums over every one of the {self.dim} columns and never reaches the '
+                f'per-row pad mask, so pad columns would enter log P_F. Set model.dplr_rank: 0 '
+                f'for a carrier run')
+        return super().fwd_gauss_logprob(delta_x, drift, d, dt, V)
+
     def _pb_logprob(self, prev_state, next_state, drift_coeff, back_mean_correction,
                     back_var, t_next):
         m = self._row_mask(next_state)
@@ -215,6 +272,165 @@ class ConformerGFN(GFN):
         wrapped_comp_logp = torch.logsumexp(comp_logp, dim=-1)
         return torch.logsumexp(log_pi + wrapped_comp_logp, dim=-1)
 
+    # ------------------------------------------------------------------ log Z(c) head
+
+    FLOW_HEAD_KINDS = ('condition', 'mol_emb')
+
+    @property
+    def flow_head_kind(self) -> str:
+        """'condition' (the parent's head over the conditioner) or 'mol_emb'."""
+        return getattr(self, '_flow_head_kind', 'condition')
+
+    def install_flow_head(self, kind: str = 'condition', mol_dim: Optional[int] = None,
+                          column_blocks: Optional[Sequence[int]] = None) -> None:
+        """Choose what the ``log Z(c)`` head reads. Call BEFORE the optimizers are built.
+
+        'condition' is the default and a no-op: the parent's head, its weights and its
+        reading are untouched.
+
+        'mol_emb' REPLACES ``self.flow_model`` -- the attribute name is kept, so every router
+        keyed on ``flow_model.parameters()`` (the lr_flow group, the fused optimizer's flow
+        group, the z_calibration sidecars' clip) picks the new head up unchanged -- with a
+        `MolEmbFlowHead` over the batch's pooled ``embedding`` (``mol_dim`` wide). With
+        ``column_blocks`` (the energy's per-column block code, e.g. ``_free_block``: 0 r,
+        1 theta, 2 phi, 3 transverse) it also reads each row's count of VALID columns per block, because
+        log Z(c) grows with the number of free coordinates of each kind and a carrier row's
+        count is otherwise only implicit in the embedding. Depth, width, norm, dropout and
+        activation are copied from the head it replaces, so an A/B differs in the input only.
+
+        The optimizers and the EMA copy hold references to the OLD head's parameters: a
+        caller installing after either was built must rebuild the optimizers, and install on
+        the EMA model too unless it is deep-copied afterwards.
+        """
+        if kind not in self.FLOW_HEAD_KINDS:
+            raise ValueError(f'flow head kind must be one of {self.FLOW_HEAD_KINDS}, got {kind!r}')
+        current = self.flow_head_kind
+        if current != 'condition':
+            # a second install would re-initialise a head that may already be trained (or
+            # loaded), and 'condition' cannot be restored once the parent's head is gone
+            raise RuntimeError(f'the {current!r} log Z head is already installed on this model')
+        if kind == 'condition':
+            return
+
+        if not self.conditional:
+            why_not = 'the model is unconditional, so log Z is one number'
+        elif self.full_flow:
+            why_not = 'full_flow reads flow_model per step over [s_emb, t_emb] (GFN._step_flow)'
+        elif not isinstance(self.flow_model, scalarMLP):
+            why_not = ('a condition set of one keeps the LearnableScalar head, which '
+                       'z_level_fill writes through `.scalar`')
+        else:
+            why_not = None
+        if why_not:
+            raise NotImplementedError(f"flow head 'mol_emb' refused: {why_not}")
+        if not mol_dim or int(mol_dim) <= 0:
+            raise ValueError(f"flow head 'mol_emb' needs the pooled embedding width "
+                             f"(embedding_conditioning_dim), got mol_dim={mol_dim!r}")
+        onehot = None
+        if column_blocks is not None:
+            # a numpy array on both energies today (ConformerTorsions, CarrierLayout)
+            blocks = torch.as_tensor(column_blocks, dtype=torch.long).reshape(-1).cpu()
+            if blocks.numel() != self.dim:
+                raise ValueError(f'column_blocks has {blocks.numel()} entries for a '
+                                 f'{self.dim}-wide state')
+            # sorted, so one count per block code PRESENT, in code order (r, theta, phi,
+            # transverse); a code absent from this energy gets no input column
+            codes = torch.unique(blocks)
+            onehot = (blocks.view(-1, 1) == codes.view(1, -1)).to(torch.get_default_dtype())
+        in_dim = int(mol_dim) + (0 if onehot is None else onehot.shape[1])
+        if in_dim == self.condition_embedding_dim:
+            # the head's width check is what refuses bootstrap_log_z's direct
+            # flow_model(condition_embedding) call; at this width it could not tell the
+            # conditioner's output from a molecule and would read it silently
+            raise ValueError(
+                f"flow head 'mol_emb' input width {in_dim} equals condition_embedding_dim; "
+                f"a direct flow_model(condition_embedding) call would then be read as a "
+                f"molecule without error. Change either width")
+
+        old = self.flow_model
+        p = next(old.parameters())
+        # scalarMLP's constructor calls torch.manual_seed(seed). Forked so that installing a
+        # head after construction does not rewind the caller's CPU random stream to seed 0
+        with torch.random.fork_rng(devices=[]):
+            head = MolEmbFlowHead(in_dim, onehot, layers=old.n_layers,
+                                  filters=old.fc_layers[0].out_features,
+                                  activation=old.activation, dropout=old.dropout_p,
+                                  norm=old.norm_mode, bias=old.bias,
+                                  norm_after_linear=old.norm_after_linear)
+        self.flow_model = head.to(device=p.device, dtype=p.dtype)
+        self._flow_head_kind = kind
+        self._flow_in = None
+
+    def _bind_flow_input(self, mol_batch, condition) -> None:
+        """The mol_emb head's per-row input ``[B, in_dim]``, bound once per trajectory.
+
+        DETACHED, for the same invariant as the parent's `_condition_flow`: a Z-side gradient
+        reaches flow_model's own parameters and nothing else. The baked embedding carries no
+        graph today; the detach keeps that true if the encoder is ever run live.
+        """
+        if self.flow_head_kind != 'mol_emb':
+            self._flow_in = None
+            return
+        if condition is False:
+            # the parent's no-conditioning pass reads log Z at a zero condition; this head
+            # is a function of the molecule and has no molecule-free value to report
+            raise RuntimeError("the mol_emb log Z head has no value for a no-conditioning "
+                               "(condition=False) pass")
+        emb = getattr(mol_batch, 'embedding', None) if mol_batch is not None else None
+        if emb is None:
+            raise RuntimeError(
+                "the mol_emb log Z head needs the batch's pooled `embedding`. Bake it with: "
+                "python build_conformer_conditions.py --smiles ... --encoder-ckpt <ckpt> "
+                "--out <conditions.pt>")
+        head = self.flow_model
+        p = next(head.parameters())
+        n = int(mol_batch.num_graphs)
+        x = emb.reshape(n, -1).detach().to(device=p.device, dtype=p.dtype)
+        onehot = head.block_onehot
+        if onehot is not None:
+            m = self._state_mask                 # bound just before, by _bind_state_mask
+            valid = (m.to(p.dtype) if m is not None
+                     else torch.ones(n, onehot.shape[0], device=p.device, dtype=p.dtype))
+            if valid.shape[1] != onehot.shape[0]:
+                raise RuntimeError(
+                    f'state_mask is {valid.shape[1]} wide but the head was installed for '
+                    f'{onehot.shape[0]} columns')
+            x = torch.cat([x, valid @ onehot.to(p.dtype)], dim=1)
+        if x.shape[1] != head.input_dim:
+            raise RuntimeError(
+                f'the batch gives the mol_emb head a {x.shape[1]}-wide input; it was '
+                f'installed for {head.input_dim}. The conditions file and '
+                f'embedding_conditioning_dim disagree')
+        self._flow_in = x
+
+    def _condition_flow(self, condition_embedding):
+        """The parent's read unless the mol_emb head is installed; then that head's.
+
+        Every caller of this is one of the three `get_traj_*` entry points, and each binds
+        `_flow_in` for its own batch first. Under the bwd/replay `scramble_conditions` stage
+        the parent's head reads the SCRAMBLED conditioner rows; this one reads the true
+        molecule, the same pairing `condition_id` and the tracker keep.
+
+        The binding is CONSUMED by the read. A path that reaches here without rebinding --
+        an entry point that skips `_bind_trajectory`, or the parent's `get_traj_*` called
+        directly -- would otherwise score its rows against the PREVIOUS batch's molecules,
+        and the row check below cannot see that when both batches have the same size, which
+        the branch batches usually do. Consumed, it raises instead.
+        """
+        if self.flow_head_kind != 'mol_emb':
+            return super()._condition_flow(condition_embedding)
+        x = getattr(self, '_flow_in', None)
+        if x is None:
+            raise RuntimeError('the mol_emb log Z head was read with no batch bound for this '
+                               'trajectory: each get_traj_* entry point binds its own, and a '
+                               'binding is read once')
+        self._flow_in = None
+        if condition_embedding is not None and condition_embedding.shape[0] != x.shape[0]:
+            raise RuntimeError(
+                f'the bound flow input has {x.shape[0]} rows and this trajectory '
+                f'{condition_embedding.shape[0]}; the bound batch is not the one being scored')
+        return self.flow_model(x).flatten()
+
     # ------------------------------------------------------------------ policy call
 
     def predict_next_state(self, s_emb, t_emb, state=None):
@@ -245,20 +461,30 @@ class ConformerGFN(GFN):
 
     # ------------------------------------------------------------------ entry points
 
+    def _bind_trajectory(self, mol_batch, condition) -> None:
+        self.bind_molecular_conditioning(mol_batch)
+        self._bind_flow_input(mol_batch, condition)
+
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      *args, **kwargs):
-        self.bind_molecular_conditioning(mol_batch)
-        return super().get_traj_fwd(initial_state, discretizer, exploration_std, condition,
-                                    mol_batch, *args, **kwargs)
+        self._bind_trajectory(mol_batch, condition)
+        flow_in = self._flow_in                  # taken now: the parent's read consumes it
+        out = super().get_traj_fwd(initial_state, discretizer, exploration_std, condition,
+                                   mol_batch, *args, **kwargs)
+        if flow_in is not None:
+            # the parent stashed the CONDITIONER rows for z_calibration's regression mode,
+            # which re-feeds them to flow_model(...) directly; this head reads its own input
+            self._z_cal_embedding = flow_in
+        return out
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
                      *args, **kwargs):
-        self.bind_molecular_conditioning(mol_batch)
+        self._bind_trajectory(mol_batch, condition)
         return super().get_traj_bwd(terminal_state, discretizer, condition, mol_batch,
                                     *args, **kwargs)
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
                         *args, **kwargs):
-        self.bind_molecular_conditioning(mol_batch)
+        self._bind_trajectory(mol_batch, condition)
         return super().get_traj_replay(trajectory, discretizer, condition, mol_batch,
                                        *args, **kwargs)

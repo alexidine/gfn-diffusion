@@ -108,7 +108,8 @@ class ConformerModeller(Modeller):
     #: ranged it as degrees, which draws a bond-length distribution as though it were an
     #: angle (train_conformer.torsion_latent_figure, scaling problem 3).
     _DOF_CLASSES = ((0, 'r (bond length)', 1.0), (1, 'theta (angle)', 1.0),
-                    (2, 'phi (torsion, deg)', 180.0))
+                    (2, 'phi (torsion, deg)', 180.0),
+                    (3, 'transverse (linear bend u, v)', 1.0))
 
     def _domain_figs(self, fig_dict, sample_batch, prior_latent_params, anchor_latents):
         """The 12 worst state columns, drawn with the CRYSTAL latent-parameter panel code.
@@ -144,7 +145,12 @@ class ConformerModeller(Modeller):
         anchors = host(anchor_latents)
         periodic = np.asarray(host(self.energy_function.periodic_dims)).astype(bool)
         block = host(self.energy_function._free_block)
-        cls_name = {0: 'r', 1: 'theta', 2: 'phi'}
+        cls_name = {0: 'r', 1: 'theta', 2: 'phi', 3: 'transverse'}
+        # on a CARRIER `_free_block` is the REGION code, which files a linear bend's u and v
+        # under theta; the layout's per-member kinds say what the column holds for whom
+        carrier = getattr(self.energy_function, 'carrier', None)
+        label = ((lambda j: carrier.column_label(j)) if carrier is not None
+                 else (lambda j: cls_name.get(int(block[j]), '?')))
 
         w1 = _column_w1(samples, reference, periodic)
         order = np.argsort(-w1)[:12]
@@ -156,7 +162,7 @@ class ConformerModeller(Modeller):
             dists.append(('anchors', anchors))
         colors = MolCrystalData._get_color_set(None, len(dists))
 
-        titles = [f'col {int(j)} · {cls_name.get(int(block[j]), "?")}'
+        titles = [f'col {int(j)} · {label(j)}'
                   f'{" (wraps)" if periodic[j] else ""}  |  W1 {w1[j]:.4f}' for j in order]
         fig = make_subplots(rows=4, cols=3, subplot_titles=titles)
         for i, j in enumerate(order):
@@ -518,13 +524,20 @@ class ConformerModeller(Modeller):
         return cfg
 
     #: `model:` keys selecting and sizing the SET policy over per-coordinate tokens. Kept
-    #: out of gfn_config on purpose (see above), which also means they are NOT stored in the
-    #: checkpoint -- see the resume refusal in _install_set_policy.
+    #: out of the GFN constructor's arguments on purpose (see above). What they BUILT is
+    #: stamped into gfn_config['conformer'] instead (_install_set_policy), which is what
+    #: lets the checkpointer rebuild the head (gfn_from_config).
     #: NAMES ARE PREFIXED DELIBERATELY. `policy_layers` and `policy_hidden_dim` already
     #: exist in the model block as the FLAT policy's own GFN arguments; popping either
     #: would silently unbuild the flat path.
     _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
                     'set_policy_corr_dim')
+
+    #: the set head's sizes when the config omits them. ONE definition, read by the fresh
+    #: build and by the reload check alike, so the two cannot disagree about a default and
+    #: refuse a checkpoint the config never changed.
+    _SET_POLICY_DEFAULTS = {'set_policy_hidden': 64, 'set_policy_layers': 4,
+                            'set_policy_corr_dim': 32}
 
     def _condition_set_molecules(self):
         """`(smiles, identifiers)` of the condition set, or `(None, None)`.
@@ -569,51 +582,278 @@ class ConformerModeller(Modeller):
             binder(self.identifier_registry)
 
     def init_gfn(self):
-        """Base build, then swap the flat policy for the set policy if asked."""
+        """Base build or checkpoint load, then install -- or, on a reload, VERIFY -- the policy.
+
+        THE RELOAD FLAG IS RECORDED ON THE PATH, not inferred from the stored block. It is
+        cleared here and set by `gfn_from_config`, which only the checkpointer's two load
+        paths call. Testing for gfn_config['conformer'] instead would read a flat checkpoint
+        written before the block existed as a FRESH build: a set config would then swap a new
+        head over the loaded trunk and reset the EMA and the Adam state load_full had just
+        restored -- worse than refusing.
+        """
+        self._refuse_inert_prior_model()
+        self._refuse_compiled_set_policy()
+        self._gfn_reloaded = False
         super().init_gfn()
         self._install_set_policy()
+
+    def _refuse_inert_prior_model(self):
+        """`prior_model_name` is read by nothing on this route; refuse it rather than ignore it.
+
+        Modeller.init_prior_dataset is the only reader, and this class overrides it without
+        calling super(). So the frozen prior never loads, `skip_if: prior_loaded` can never
+        hold, and a crystal-style phase-2 arm silently re-runs phase 1 from its loaded weights.
+        Refused here, before any checkpoint is read.
+        """
+        name = getattr(self.args, 'prior_model_name', None)
+        if name is not None:
+            raise ValueError(
+                f"prior_model_name={name!r} on the conformer route. Only "
+                f"Modeller.init_prior_dataset reads it, and ConformerModeller overrides that "
+                f"without calling super(), so no prior model would load and "
+                f"`skip_if: prior_loaded` could never hold -- the arm would re-run phase 1. "
+                f"Seed phase 2 with checkpoint_name + load_weights_only and "
+                f"`skip_if: weights_loaded`; this route's prior is "
+                f"energy_config.internal_prior_path.")
+
+    def _config_policy_spec(self):
+        """The set-policy keys as THIS config states them, on every path.
+
+        `_policy_spec` is written by `_build_gfn_config`, which only a fresh build runs; a
+        reload never calls it, so reading it there sees {} and calls every reload flat.
+        """
+        model = getattr(getattr(self, 'args', None), 'model', None)
+        model = vars(model) if model is not None else {}
+        return {k: model[k] for k in self._SET_POLICY_KEYS if k in model}
+
+    def _refuse_compiled_set_policy(self):
+        """A compiled set head would run on a resumed leg and not on a fresh one.
+
+        maybe_compile_policy runs INSIDE the base init_gfn. On a fresh build that is before
+        the swap, so it compiles the flat head _install_set_policy throws away and the set
+        head runs eager. On a reload the checkpointer has already built the set head, so it
+        IS compiled. The two legs of one run would then execute different code, and the
+        ragged head's shapes change with every batch's molecule mix.
+        """
+        kind = str(self._config_policy_spec().get('policy_kind', 'flat')).lower()
+        setting = getattr(self.args, 'compile_policy', False)
+        # MIRRORS train.py maybe_compile_policy, which compiles on 'auto'/'step' (platform-
+        # dependent) and otherwise on bool(setting) -- so the STRINGS 'off' and 'false' compile
+        # there, and letting them through here would be exactly the split this refuses.
+        compiles = setting in ('auto', 'step') or bool(setting)
+        if kind == 'set' and compiles:
+            raise ValueError(
+                f"compile_policy={setting!r} with model.policy_kind: set. The base init_gfn "
+                f"compiles before the set head is swapped in on a fresh build and after it "
+                f"is rebuilt on a reload, so a fresh and a resumed leg would run different "
+                f"code. Set compile_policy: false until a cluster measurement shows "
+                f"compiling the ragged set head pays.")
+
+    def _needs_ragged_policy(self) -> bool:
+        """The set head must be the RAGGED one: a carrier state, or more than one molecule.
+
+        The identity-layout case is the one that bites. A multi-molecule set whose members
+        share their block counts is not a carrier (`is_carrier` False, K = k), and the dense
+        `conditional_set_policy_for(self.energy_function, ...)` then bakes the REFERENCE
+        member's static features into every row -- finite, plausible and wrong for every
+        other molecule. The ragged head reads `dof_static` and `state_mask` off each row,
+        and `build_conformer_conditions.py --carrier` writes both even for an identity
+        layout. A set of ONE molecule repeated under several identifiers keeps the dense
+        head: its reference features are every row's features.
+        """
+        en = getattr(self, 'energy_function', None)
+        return (bool(getattr(en, 'is_carrier', False))
+                or int(getattr(en, 'distinct_smiles', 1) or 1) > 1)
+
+    def _state_block_width(self):
+        """``[r, theta, phi]`` column counts of this run's state -- the carrier layout.
+
+        Read off `_free_block`, which on a carrier IS the layout's (CarrierLayout.free_block),
+        so this equals `carrier.block_width` there and gives the same numbers for an identity
+        layout, which keeps no CarrierLayout.
+        """
+        fb = np.asarray(self.energy_function._free_block).reshape(-1)
+        return [int((fb == b).sum()) for b in (0, 1, 2)]
+
+    def _ragged_policy_stamp(self, spec, mol_dim):
+        """Every argument the ragged set head is built from, as stored in the checkpoint.
+
+        Written EXPLICITLY, defaults included (frame_size, norm, dropout), so the head a
+        checkpoint rebuilds does not depend on RaggedConditionalSetPolicy's defaults staying
+        what they were when it was trained.
+        """
+        from energies.dof_features import MAX_FRAME, state_feature_names
+        if mol_dim % 2:
+            raise ValueError(f'mol_dim {mol_dim} is odd; the pooled readout is two '
+                             f'equal blocks')
+        sizes = {k: int(spec.get(k, d)) for k, d in self._SET_POLICY_DEFAULTS.items()}
+        return {'policy_kind': 'set', **sizes,
+                'n_static': len(state_feature_names()),
+                'enc_dim': mol_dim // 2, 'mol_dim': int(mol_dim),
+                'frame_size': int(MAX_FRAME), 'norm': None, 'dropout': 0,
+                'carrier': True, 'block_width': self._state_block_width()}
+
+    @staticmethod
+    def _ragged_policy_from_stamp(stamp, angular_mask, t_dim, zero_init: bool = False):
+        # zero_init is an INITIALISATION, not architecture, so it is not in the stamp: the
+        # fresh build passes model.zero_init (_install_set_policy); a reload leaves it False,
+        # because the checkpoint's weights overwrite the init
+        from models.ragged_set_policy import RaggedConditionalSetPolicy
+        return RaggedConditionalSetPolicy(
+            int(stamp['n_static']), angular_mask, int(t_dim),
+            enc_dim=int(stamp['enc_dim']), mol_dim=int(stamp['mol_dim']),
+            corr_dim=int(stamp['set_policy_corr_dim']), frame_size=int(stamp['frame_size']),
+            hidden_dim=int(stamp['set_policy_hidden']),
+            layers=int(stamp['set_policy_layers']), out_per_token=2,
+            dropout=stamp['dropout'], norm=stamp['norm'], zero_init=bool(zero_init))
+
+    def _set_policy_plan(self, spec):
+        """`(head, stamp, mol_dim)` for a `policy_kind: set` config against THIS energy.
+
+        `head` is 'ragged', 'conditional' (dense, bound to the energy's chart) or 'dense'.
+        Shared by the fresh build and the reload check, so a reload compares against exactly
+        what a fresh build of this config would construct.
+        """
+        conditional = bool(getattr(self.args, 'embedding_conditioning', False))
+        ragged = self._needs_ragged_policy()
+        if ragged and not conditional:
+            raise NotImplementedError(
+                'policy_kind: set on a CARRIER state or a multi-molecule set needs '
+                'embedding_conditioning: the per-column features come from the molecule, and '
+                'an unconditional set head bakes one molecule\'s features in at construction')
+        mol_dim = None
+        if conditional:
+            mol_dim = int(getattr(self.args, 'embedding_conditioning_dim', 0) or 0)
+            if not mol_dim:
+                raise ValueError(
+                    'embedding_conditioning is on but embedding_conditioning_dim is unset; '
+                    'the set policy needs the width to build its context input')
+        if ragged:
+            return 'ragged', self._ragged_policy_stamp(spec, mol_dim), mol_dim
+        sizes = {k: int(spec.get(k, d)) for k, d in self._SET_POLICY_DEFAULTS.items()}
+        # the dense heads bind the energy's chart at construction, so there is nothing to
+        # rebuild them from; the stamp names them so a reload is refused BY NAME
+        stamp = {'policy_kind': 'set', **sizes, 'mol_dim': mol_dim, 'carrier': False}
+        return ('conditional' if conditional else 'dense'), stamp, mol_dim
+
+    def gfn_from_config(self, cfg):
+        """The checkpointer's builder seam (Checkpointer._build_gfn), called by both loads.
+
+        Builds the model a STORED gfn_config describes -- class, set head and `_carrier` --
+        before any weights load, so the strict load_state_dict meets the architecture that
+        was saved. load_full then deep-copies the EMA from it (class and head included),
+        restores the P_B snapshot through set_pb_freeze, and restores the optimizers over the
+        same parameter groups: reassigning `forward_policy` keeps its slot in `_modules`, so
+        parameter order matches the fresh path's.
+
+        `cfg` is NOT mutated. m.gfn_config keeps the 'conformer' block, so the next save
+        writes it again and the leg after that can load too. The head is built from the
+        STORED arguments, never from this config: the architecture follows the file, and
+        _install_set_policy then checks the config against it field by field.
+        """
+        from models.conformer_gfn import ConformerGFN
+        from models.gfn import GFN
+
+        cfg = dict(cfg)
+        stamp = cfg.pop('conformer', None)
+        self._assert_checkpoint_layout(cfg, stamp)
+        self._gfn_reloaded = True
+        kind = 'flat' if stamp is None else str(stamp.get('policy_kind'))
+        carrier = bool(stamp.get('carrier', False)) if stamp is not None else False
+        if kind == 'flat':
+            if not carrier:
+                return GFN(**cfg)
+            model = ConformerGFN(**cfg)
+            model._carrier = True
+            return model
+        if kind == 'set' and carrier:
+            model = ConformerGFN(**cfg)
+            model.forward_policy = self._ragged_policy_from_stamp(
+                stamp, cfg['angular_mask'], cfg['t_dim'])
+            model._carrier = True
+            return model
+        raise NotImplementedError(
+            f"this checkpoint stores model policy_kind {kind!r} with carrier={carrier}. Only a "
+            f"flat policy or the RAGGED carrier set head can be rebuilt from a checkpoint: "
+            f"the dense set heads bind one molecule's chart at construction, so there is "
+            f"nothing stored to rebuild them from. Retrain on the ragged head.")
+
+    def _assert_checkpoint_layout(self, cfg, stamp):
+        """Refuse a checkpoint whose policy WIDTH or carrier LAYOUT is not this run's.
+
+        Both P_F and P_B are built at the checkpoint's `dim` (models/gfn.py init_policies),
+        and the ragged head raises on a K mismatch only at its first forward. So a rung
+        trained at K = 21 handed to a K = 75 run would fail its strict load at best, and at
+        worst build a 21-wide model against a 75-wide energy. Equal K is not enough either:
+        the r | theta | phi split decides which columns wrap and which member column lands
+        where, and two splits can share K.
+        """
+        en = self.energy_function
+        want_dim, got_dim = int(en.data_ndim), int(cfg['dim'])
+        if got_dim != want_dim:
+            raise ValueError(
+                f"checkpoint policy width {got_dim} does not match this run's state width "
+                f"{want_dim}. Both policies are built at the checkpoint's width, so this "
+                f"load would fail its strict state_dict or build a {got_dim}-wide model "
+                f"against a {want_dim}-wide energy. Pin the carrier layout across the runs "
+                f"that share weights, or start this run fresh.")
+        stored_mask = cfg.get('angular_mask')
+        if stored_mask is not None:
+            got = [bool(b) for b in stored_mask]
+            want = [bool(b) for b in en.periodic_dims]
+            if got != want:
+                raise ValueError(
+                    f"checkpoint periodic columns {[i for i, b in enumerate(got) if b]} do "
+                    f"not match this run's {[i for i, b in enumerate(want) if b]} (width "
+                    f"{want_dim} both). The policy would wrap the wrong columns.")
+        if stamp is not None and stamp.get('block_width') is not None:
+            want_bw = self._state_block_width()
+            got_bw = [int(w) for w in stamp['block_width']]
+            if got_bw != want_bw:
+                raise ValueError(
+                    f"checkpoint carrier layout r|theta|phi {got_bw} (K = {sum(got_bw)}) "
+                    f"does not match this run's {want_bw} (K = {sum(want_bw)}). Member "
+                    f"columns would land in the wrong blocks.")
+        elif getattr(en, 'is_carrier', False):
+            print(f"WARNING: checkpoint carries no carrier-layout stamp (written before it "
+                  f"existed). Width {want_dim} and the periodic columns match; the "
+                  f"r|theta split cannot be verified from the file.")
 
     def _install_set_policy(self):
         """`model.policy_kind: set` -> swap the flat scalarMLP for a per-coordinate set head.
 
         WHY A POST-CONSTRUCTION SWAP rather than a GFN constructor argument. `models/gfn.py`
         is shared with crystal and, per the owner decision of 2026-08-19, takes no changes
-        beyond the raw-state passthrough without a further decision. The cost is recorded
-        honestly in the resume refusal below rather than hidden.
+        beyond the raw-state passthrough without a further decision. The cost is paid here:
+        what the swap built is STAMPED into gfn_config['conformer'], and a checkpoint load
+        rebuilds it through `gfn_from_config` before the weights go in.
 
-        THREE THINGS HAVE TO HAPPEN IN THIS ORDER and the last is the one that bites: the
-        base `init_gfn` has already deep-copied the EMA model and already built the
-        optimizers over the OLD policy's parameters. Swapping without rebuilding both leaves
-        a run that trains nothing in the new head and reports a perfectly plausible loss.
+        ON A RELOAD THIS IS A CHECKED NO-OP (`_check_reloaded_policy`). The model, its EMA and
+        the optimizers already hold the checkpoint's state; swapping here would replace the
+        loaded head with a fresh init, reset the EMA and discard the Adam moments.
+
+        On a fresh build THREE THINGS HAVE TO HAPPEN IN THIS ORDER and the last is the one
+        that bites: the base `init_gfn` has already deep-copied the EMA model and already
+        built the optimizers over the OLD policy's parameters. Swapping without rebuilding
+        both leaves a run that trains nothing in the new head and reports a perfectly
+        plausible loss.
         """
+        if getattr(self, '_gfn_reloaded', False):
+            self._check_reloaded_policy()
+            return
         spec = getattr(self, '_policy_spec', {})
         kind = str(spec.get('policy_kind', 'flat')).lower()
         carrier = bool(getattr(getattr(self, 'energy_function', None), 'is_carrier', False))
         if kind == 'flat':
             if carrier:
-                # a flat policy runs on the carrier unchanged, but the log-probs must still be
-                # masked per row, which only ConformerGFN does. Both copies are re-classed: the
-                # EMA model was already deep-copied by the base init_gfn.
-                from models.conformer_gfn import ConformerGFN
-                for m in (self.gfn_model, self.ema_model):
-                    m.__class__ = ConformerGFN
-                    m._mol_cond, m._state_mask, m._carrier = None, None, True
-                print(f'policy: FLAT on a {self.energy_function.data_ndim}-wide CARRIER '
-                      f'state; log-probs masked per row')
+                self._flat_on_carrier()
+                self.gfn_config['conformer'] = {'policy_kind': 'flat', 'carrier': True,
+                                                'block_width': self._state_block_width()}
             return
         if kind != 'set':
             raise ValueError(
                 f"model.policy_kind must be 'flat' or 'set', got "
                 f"{spec.get('policy_kind')!r}")
-
-        if (self.args.checkpoint_name is not None
-                or getattr(self.args, 'continue_from_checkpoint', False)):
-            raise NotImplementedError(
-                "model.policy_kind: set cannot be resumed. The policy choice lives in the "
-                "modeller rather than in gfn_config, so the checkpointer rebuilds a FLAT "
-                "GFN and its strict load_state_dict would fail on the set head's weights. "
-                "Run the parity comparison fresh; making this resumable means putting the "
-                "key in gfn_config, which is a shared-file change and its own decision.")
 
         rank = int(self.gfn_config.get('dplr_rank', 0) or 0)
         if rank > 0:
@@ -626,43 +866,31 @@ class ConformerModeller(Modeller):
         from copy import deepcopy
         from models.set_policy import conditional_set_policy_for, set_policy_for
 
-        common = dict(hidden_dim=int(spec.get('set_policy_hidden', 64)),
-                      layers=int(spec.get('set_policy_layers', 4)),
-                      out_per_token=2)
-        conditional = bool(getattr(self.args, 'embedding_conditioning', False))
-        if carrier and not conditional:
-            raise NotImplementedError(
-                'policy_kind: set on a CARRIER state needs embedding_conditioning: the '
-                'per-column features come from the molecule, and an unconditional set head '
-                'bakes one molecule\'s features in at construction')
-        if conditional:
-            mol_dim = int(getattr(self.args, 'embedding_conditioning_dim', 0) or 0)
-            if not mol_dim:
-                raise ValueError(
-                    'embedding_conditioning is on but embedding_conditioning_dim is unset; '
-                    'the set policy needs the width to build its context input')
-        if carrier:
+        head, stamp, mol_dim = self._set_policy_plan(spec)
+        # model.zero_init REACHES THE SET HEAD: it zeroes the head's output layer, which has no
+        # bias, so the untrained head emits exactly 0 whatever its inputs. Not passed, the key
+        # was inert under policy_kind set, and an untrained set head was a random function
+        # that any change in its per-coordinate feature width re-drew
+        zero_init = bool(self.gfn_config.get('zero_init', False))
+        common = dict(hidden_dim=stamp['set_policy_hidden'], layers=stamp['set_policy_layers'],
+                      out_per_token=2, zero_init=zero_init)
+        t_dim = int(self.gfn_config['t_dim'])
+        if head == 'ragged':
             # RAGGED OVER VALID COLUMNS, dense [B, 2K] out -- see RaggedConditionalSetPolicy.
             # Per-column static features ride on the batch (`dof_static`), so nothing here is
             # bound to one member.
-            from energies.dof_features import state_feature_names
-            from models.ragged_set_policy import RaggedConditionalSetPolicy
-            if mol_dim % 2:
-                raise ValueError(f'mol_dim {mol_dim} is odd; the pooled readout is two '
-                                 f'equal blocks')
-            policy = RaggedConditionalSetPolicy(
-                len(state_feature_names()), self.energy_function.periodic_dims,
-                int(self.gfn_config['t_dim']), enc_dim=mol_dim // 2, mol_dim=mol_dim,
-                corr_dim=int(spec.get('set_policy_corr_dim', 32)), **common).to(self.device)
-        elif conditional:
+            policy = self._ragged_policy_from_stamp(
+                stamp, self.energy_function.periodic_dims, t_dim,
+                zero_init=zero_init).to(self.device)
+        elif head == 'conditional':
             policy = conditional_set_policy_for(
-                self.energy_function, int(self.gfn_config['t_dim']), mol_dim,
-                corr_dim=int(spec.get('set_policy_corr_dim', 32)), **common).to(self.device)
+                self.energy_function, t_dim, mol_dim,
+                corr_dim=stamp['set_policy_corr_dim'], **common).to(self.device)
         else:
-            policy = set_policy_for(
-                self.energy_function, int(self.gfn_config['t_dim']), **common).to(self.device)
+            policy = set_policy_for(self.energy_function, t_dim, **common).to(self.device)
         self.gfn_model.forward_policy = policy
 
+        conditional = mol_dim is not None
         if conditional:
             # RE-CLASS, in the same post-construction spirit as the policy swap above and for
             # the same reason: `models/gfn.py` is shared with crystal. `ConformerGFN` adds no
@@ -670,14 +898,19 @@ class ConformerModeller(Modeller):
             # is exactly equivalent to having built one -- and it keeps the conformer route's
             # only structural need (carrying the molecule into the policy call) out of the
             # shared file. The EMA copy is taken AFTER, so it inherits the class.
+            # `_carrier` follows the HEAD, not the energy: the ragged head needs `state_mask`
+            # on every batch, identity layout included, so a batch without one is refused at
+            # binding rather than at the policy's first gather.
             from models.conformer_gfn import ConformerGFN
             self.gfn_model.__class__ = ConformerGFN
             self.gfn_model._mol_cond = None
             self.gfn_model._state_mask = None
-            self.gfn_model._carrier = carrier
+            self.gfn_model._carrier = head == 'ragged'
 
         self.ema_model = deepcopy(self.gfn_model)
         self.init_schedulers_optimizers()
+        # the ARCHITECTURE, for the checkpoint: Checkpointer.save stores gfn_config whole
+        self.gfn_config['conformer'] = stamp
 
         n_new = sum(p.numel() for p in policy.parameters())
         print(f"policy: {'CONDITIONAL ' if conditional else ''}SET over {policy.dim} "
@@ -686,6 +919,123 @@ class ConformerModeller(Modeller):
         if conditional:
             print(f"        f_j is LEARNED from per-atom embeddings (DoFCorrelator); the "
                   f"pooled {mol_dim}-d molecular embedding joins rho's context")
+
+    def _flat_on_carrier(self):
+        """A flat policy on the carrier: refuse DPLR, then re-class both copies.
+
+        The flat head runs on the carrier unchanged, but the log-probs must be masked per
+        row, which only ConformerGFN does -- and only in gauss_logprob. With dplr_rank > 0
+        fwd_gauss_logprob takes the Woodbury path and never calls it, so the pad columns
+        (pinned to 0, residual -drift) would enter the forward density unmasked.
+        """
+        rank = int(self.gfn_config.get('dplr_rank', 0) or 0)
+        if rank > 0:
+            raise NotImplementedError(
+                f"a flat policy on a CARRIER state with dplr_rank {rank} is refused: the "
+                f"DPLR forward density bypasses ConformerGFN's per-row mask, so pad columns "
+                f"would be scored as real coordinates. Set dplr_rank: 0 for this run.")
+        from models.conformer_gfn import ConformerGFN
+        # both copies: the EMA model was already deep-copied by the base init_gfn (or by
+        # load_full, which re-classing leaves loaded)
+        for m in (self.gfn_model, self.ema_model):
+            m.__class__ = ConformerGFN
+            m._mol_cond, m._state_mask, m._carrier = None, None, True
+        print(f'policy: FLAT on a {self.energy_function.data_ndim}-wide CARRIER '
+              f'state; log-probs masked per row')
+
+    def _check_reloaded_policy(self):
+        """After a checkpoint load: the config must describe the architecture the FILE holds.
+
+        The architecture follows the file (the same rule as Checkpointer.
+        _assert_dead_rows_match), so a disagreement is refused, naming the field, rather than
+        resolved either way. A checkpoint with no 'conformer' block predates the stamp and
+        was trained flat. Nothing is swapped, copied or rebuilt: the EMA and the optimizer
+        state are the ones the load restored.
+        """
+        stored = self.gfn_config.get('conformer')
+        stored_kind = 'flat' if stored is None else str(stored.get('policy_kind'))
+        spec = self._config_policy_spec()
+        want_kind = str(spec.get('policy_kind', 'flat')).lower()
+        if want_kind not in ('flat', 'set'):
+            raise ValueError(f"model.policy_kind must be 'flat' or 'set', got "
+                             f"{spec.get('policy_kind')!r}")
+        if want_kind != stored_kind:
+            raise ValueError(
+                f"model.policy_kind: this config asks for {want_kind!r}, the checkpoint "
+                f"holds a {stored_kind!r} policy"
+                + (" (it carries no conformer block: written before the stamp, i.e. flat)"
+                   if stored is None else "")
+                + ". The architecture follows the file; point checkpoint_name at a "
+                  "checkpoint of this kind, or set policy_kind to match it.")
+        if stored_kind == 'flat':
+            if getattr(self.energy_function, 'is_carrier', False):
+                self._flat_on_carrier()
+            print("policy: FLAT, rebuilt from the checkpoint; nothing swapped")
+            return
+        _, expected, _ = self._set_policy_plan(spec)
+        for field, want in expected.items():
+            got = stored.get(field, '<absent>')
+            if got != want:
+                raise ValueError(
+                    f"set policy field {field!r}: the checkpoint was built with {got!r}, "
+                    f"this config and energy give {want!r}. The architecture follows the "
+                    f"file -- restore the config value, or start this run fresh.")
+        print(f"policy: SET head rebuilt from the checkpoint's stamp (hidden "
+              f"{stored['set_policy_hidden']}, layers {stored['set_policy_layers']}, K = "
+              f"{self.energy_function.data_ndim}); config agrees field by field -- nothing "
+              f"swapped, EMA and optimizer state as restored")
+
+    def scramble_applicable(self):
+        """Never on the conditional set head, which does not read the scrambled seam.
+
+        The scramble permutes the conditioner output at the conditioner->trunk seam. On the
+        set route that seam feeds only s_model, which P_B and the flow head read; the forward
+        policy takes the TRUE molecule through its own bindings (mol_emb, atom_embedding,
+        dof_static) and never sees s_emb. A scrambled stage would train a conditional P_F
+        against a P_B shown a shuffled condition -- and the scramble DETACHES the conditioner
+        (GFN._maybe_scramble_condition_embedding), so the Z head's input would stop training
+        too. Said once, so a stage flag asking for it does not read as having run.
+        """
+        if getattr(self.gfn_model.forward_policy, 'wants_molecular_conditioning', False):
+            if not getattr(self, '_scramble_refusal_said', False):
+                self._scramble_refusal_said = True
+                print('scramble_conditions: NOT APPLIED -- the forward policy is the '
+                      'conditional SET head, which reads the molecule through its own '
+                      'bindings, not the scrambled s_emb seam')
+            return False
+        return super().scramble_applicable()
+
+    def init_condition_log_z(self):
+        """The base tracker, then -- on a FULL RESUME -- this config's tracker settings.
+
+        load_full restores the tracker through from_state_dict, which takes min_visits,
+        half_life_visits, trim_frac and max_batch_weight from the checkpoint, and the base
+        method then returns early. A leg that retunes them (a ladder rung sized for a new M)
+        would run the old values while its config read as applied. The rewind path
+        (Modeller.fire_loss_spike) already writes the config's values back; this is the same
+        rule on the conformer's resume, kept conformer-local so a crystal resume is unchanged.
+        clip_beta is NOT adopted: z_grad_ema's history is denominated in it.
+        """
+        restored = hasattr(self, 'condition_log_z')
+        super().init_condition_log_z()
+        tracker = self.condition_log_z
+        want = int(self.energy_function.condition_library_size)
+        if int(tracker.library_size) != want:
+            raise ValueError(
+                f"condition_log_z holds {int(tracker.library_size)} conditions but this "
+                f"run's energy has {want}. A restored table sized for another condition set "
+                f"would index its rows against the wrong molecules.")
+        cz = getattr(self.args, 'condition_log_z', None)
+        if not restored or cz is None:
+            return
+        for key in ('min_visits', 'half_life_visits', 'trim_frac', 'max_batch_weight'):
+            val = getattr(cz, key, None)
+            if val is None:
+                continue
+            old = getattr(tracker, key)
+            if old != val:
+                print(f"condition_log_z.{key}: checkpoint {old!r} -> config {val!r}")
+            setattr(tracker, key, val)
 
     def _resolve_periodic_centroid_axes(self):
         """No cell, so no centroids to wrap. config_invariants refuses the flag outright."""
@@ -977,6 +1327,30 @@ class ConformerModeller(Modeller):
                 f'as written by build_conformer_conditions.py')
         return blob
 
+    def _refuse_stereo_mismatch(self, batch, path, what):
+        """SystemExit when any graph of a file was built under another stereo-lock coefficient.
+
+        At LOAD, before anything reads the file: its baked `conformer_energy` holds clip(U + P)
+        at the builder's coefficient and the `prior_path` branch of `init_prior_dataset` takes
+        it as it stands (only the single-molecule `_load_prior_dataset` re-scores), and its
+        `dof_static` marks the prior's held double-bond rows only when the builder locked.
+        `MultiConformerTorsions._resolve_rows` refuses the same rows at scoring; this names the
+        FILE, before the first policy call has read them.
+        """
+        from energies.conformer_data import stereo_coeff_mismatch
+        want = float(getattr(self.energy_function, 'stereo_coeff', 0.0))
+        bad = stereo_coeff_mismatch(batch, want)
+        if bool(bad.any()):
+            rec = getattr(batch, 'ctree_stereo_coeff', None)
+            got = (['absent (built before the field existed, read as 0)'] if rec is None
+                   else sorted({float(v) for v in rec.reshape(-1)[bad].tolist()}))
+            raise SystemExit(
+                f'{what} file {path}: {int(bad.sum())} of {int(bad.numel())} graphs were built '
+                f'under stereo_coeff {got}, but this run locks at {want:g} '
+                f'(energy_config.stereo_coeff). Their baked energies and per-coordinate features '
+                f'belong to the other target. Rebuild it with build_conformer_conditions.py '
+                f'--stereo-coeff {want:g}.')
+
     def _prior_row_energy(self):
         """The prior buffer's current per-row training energy, conformer currency.
 
@@ -1013,6 +1387,7 @@ class ConformerModeller(Modeller):
         path = getattr(self.args, 'molecules_path', None)
         if path:
             batch = self._as_run_dtype(self._read_graph_file(path, 'conditions')['prior'])
+            self._refuse_stereo_mismatch(batch, path, 'conditions')
             self.mol_dataset = ConformerBuffer(batch,
                                                device=self.buffer_device,
                                                **self._buffer_kwargs(),
@@ -1226,6 +1601,7 @@ class ConformerModeller(Modeller):
             # conditioner, so a double batch raises `expected m1 and m2 to have the same
             # dtype` at the first matmul rather than merely wasting memory.
             batch = self._as_run_dtype(batch)
+            self._refuse_stereo_mismatch(batch, graph_prior, 'prior')
             e_t = getattr(batch, 'conformer_energy', None)
             if e_t is None:
                 raise SystemExit(

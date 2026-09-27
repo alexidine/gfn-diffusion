@@ -38,6 +38,41 @@ from energies.base_set import BaseSet
 from energies.conformer_data import RingModes
 
 
+class ChartRefused(ValueError):
+    """A molecule this chart refuses at a tier, with a machine-readable ``code``.
+
+    A ValueError, so every existing ``except ValueError`` and ``pytest.raises(ValueError)``
+    keeps working; the code is what a conditions builder records, so a rejection list can be
+    counted by cause without parsing prose:
+
+      * ``incomplete_chart`` -- rows held at a linear centre the chart could not cover;
+      * ``wholly_linear`` -- every atom on one line: 3N-5 internal DoF, so no 3N-6 chart
+        exists and the shortfall is the molecule's, not the chart's;
+      * ``cumulated`` -- a collinear frame through a cumulated sp centre (allene, cumulene),
+        held deliberately: freeing it frees an end-to-end twist the force field does not
+        restrain.
+
+    and, only when the stereo lock is on (``stereo_coeff > 0``; energies/stereo_lock.py):
+
+      * ``stereo_unspecified`` -- the SMILES leaves a lockable stereo element unassigned, so
+        the isomer the lock would pin is whatever the embedding happened to realise;
+      * ``stereo_unsupported`` -- a stereo element the lock does not enforce is tagged (a
+        tetrahedral N, an allene or atropisomer axis);
+      * ``stereo_verify_failed`` -- the reference embedding realised a different isomer
+        than the SMILES names;
+      * ``stereo_lock_in_band`` -- an element's best indicator is within ``MIN_MARGIN`` of
+        zero at the reference, so the wrong configuration would pay too little to be locked
+        out (build_conformer_conditions.py also records it when the lock fires on a thermal
+        sample of the correct isomer, `stereo_lock.thermal_check`);
+      * ``stereo_torsion_double_bond`` -- at ``torsion`` a rotatable column turns a locked
+        double bond, which the torsion prior draws into both E and Z.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 class ConformerTorsions(BaseSet):
     # Free-DoF levels, as freeze sets over InternalParams.CLASSES = ("r","theta","phi").
     # These are NOT a ladder of approximations: freezing a DoF at a constant gives
@@ -46,6 +81,11 @@ class ConformerTorsions(BaseSet):
     # the rest are each some related distribution, useful for staging and regression.
     # See docs/design/internal_dof_ladder.md section 2.
     LEVELS = ("torsion", "dihedral", "flex", "full")
+    # THE TIERS THAT CARRY A LINEAR CENTRE THROUGH: the transverse bend, the Z-matrix dummy
+    # frame and the sp-root rule. They move angle rows (theta), so a tier that holds every
+    # theta cannot use them; `torsion` and `dihedral` keep the pre-transverse chart byte for
+    # byte, which is what keeps the helper tiers' stored anchors meaning what they meant.
+    CHART_TIERS = ("flex", "full")
     # matches topology.spec_from_graph's own default, so a flag measured here means the
     # same thing as one measured there
     LINEAR_TOL_DEG = 175.0
@@ -113,6 +153,11 @@ class ConformerTorsions(BaseSet):
                  ring_mode_fill: float = 0.0,
                  ring_pop_temper: float = 1.0,
                  energy_clip: float = None,
+                 # THE STEREO LOCK's stiffness, kcal/mol per unit squared indicator
+                 # (energies/stereo_lock.py). 0 = off, the default, so no existing target
+                 # changes: the table is still built (condition graphs and the per-coordinate
+                 # features carry it), but no term is added and nothing is refused.
+                 stereo_coeff: float = 0.0,
                  ):
         """
         `level` is keyword-only and has NO default, and there is deliberately no
@@ -179,7 +224,16 @@ class ConformerTorsions(BaseSet):
         z = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int64)
         ref_pos = np.asarray(mol.GetConformer().GetPositions(), dtype=np.float64)
         bonds = infer_bond_index(z, ref_pos)
-        self.spec = spec_from_graph(z, bonds, ref_pos, use_geometry=False)
+        # NEVER ROOT ON AN sp CARBON, at the tiers that carry linear centres. Rooted there,
+        # the seed angle between the root's two neighbours is linear and nothing downstream
+        # can recover it (topology.choose_root). Gated to CHART_TIERS because the rule changes
+        # the tree of exactly the molecules whose default root is an sp carbon, at every tier
+        # it runs at -- and at torsion/dihedral those charts must not move. It changes nothing
+        # else: a molecule whose default root is not an sp carbon gets the identical tree, and
+        # one whose root it does move is checked below to have been held without it.
+        self.avoid_sp_root = level in self.CHART_TIERS
+        self.spec = spec_from_graph(z, bonds, ref_pos, use_geometry=False,
+                                    avoid_sp_root=self.avoid_sp_root)
         # full bond graph in PLACEMENT-SLOT numbering. The tree in `spec` is a spanning
         # tree, so it cannot supply atom degree -- which the handcrafted prior needs as
         # its hybridisation proxy when typing a torsion.
@@ -262,6 +316,38 @@ class ConformerTorsions(BaseSet):
             self.torsion_frame_is_linear = _linear(
                 np.asarray(self.spec.torsion_index)[:, :3])
         self.linearity_verified = True
+        _is_linear = _typed_linear if self.linearity_source == 'mmff_typed' else _linear
+
+        # THE ROOT MOVED ONLY WHERE IT HAD TO. `choose_root` reads the GRAPH (a carbon with two
+        # neighbours) because MolData's tree builder has no typing; this chart's own linearity
+        # predicate is the authority on whether that atom is a linear centre. If it is not,
+        # the default tree would have built -- and moving its root would change a chart that
+        # works today -- so the disagreement is refused rather than absorbed. Measured over all
+        # 133,726 QM9 molecules the two agree exactly; this makes that a checked property.
+        if self.spec.root_moved_from >= 0:
+            _r = int(slot[self.spec.root_moved_from])
+            _nb = sorted({int(v) for u, v in self.bond_index_slot.T if int(u) == _r}
+                         | {int(u) for u, v in self.bond_index_slot.T if int(v) == _r})
+            if len(_nb) != 2 or not bool(_is_linear(np.array([[_nb[0], _r, _nb[1]]]))[0]):
+                raise RuntimeError(
+                    f"{smiles}: the sp-root rule moved the root off atom {_r} (a carbon with "
+                    f"two neighbours), but this chart's {self.linearity_source} linearity does "
+                    f"not call that atom a linear centre -- so the default tree was not "
+                    f"singular there and the move would change a chart that builds today. "
+                    f"The graph rule and the typing disagree on this molecule.")
+
+        # CUMULATED sp CENTRES (allene, cumulene: a carbon with two double bonds), in slot
+        # numbering. A collinear frame through one is NOT given a dummy reference below: for an
+        # allene the dummy row IS the end-to-end twist, which the held chart pins at the
+        # reference and MMFF94 does not restrain (flat to 0.007 kcal/mol under a rigid 90 deg
+        # twist of penta-2,3-diene), so freeing it would interconvert axially chiral
+        # stereoisomers the condition is supposed to fix. QM9 has none.
+        from rdkit.Chem import BondType
+        self.cumulated_centres = np.array(sorted(
+            int(slot[a.GetIdx()]) for a in mol.GetAtoms()
+            if a.GetAtomicNum() == 6 and a.GetDegree() == 2
+            and all(b.GetBondType() == BondType.DOUBLE for b in a.GetBonds())),
+            dtype=np.int64)
 
         # ring membership in PLACEMENT-SLOT numbering, for the prior draw. InternalPrior
         # samples ring systems JOINTLY (a whole observed DoF block) because closure is a
@@ -277,6 +363,12 @@ class ConformerTorsions(BaseSet):
         # ---- the free-DoF mask over the concatenated [r | theta | phi] vector ---------
         self.rotatable, self.mask = self._find_rotatable(bonds, z, include_trivial_rotations)
         mask_np = self.mask.detach().cpu().numpy()
+
+        # ---- THE STEREO LOCK's table, built whether or not the lock is on --------------
+        # Off (stereo_coeff 0) it adds no term and refuses nothing; the table still exists so
+        # a condition graph and the per-coordinate features are the same object either way.
+        self.stereo_coeff = stereo_coeff             # validated by the property's setter
+        self._init_stereo(smiles, slot, pos_np, level)
         self.rotatable_cols = (np.argmax(mask_np, axis=0).astype(np.int64)
                                if mask_np.shape[1] else np.zeros(0, dtype=np.int64))
 
@@ -284,6 +376,58 @@ class ConformerTorsions(BaseSet):
         self.n_r, self.n_th, self.n_ph = n_at - 1, n_at - 2, n_at - 3
         n_dof = self.n_r + self.n_th + self.n_ph          # == 3N - 6 == spec.n_dof
         assert n_dof == self.spec.n_dof, (n_dof, self.spec.n_dof)
+
+        # ---- DUMMY-FRAME rows ---------------------------------------------------------
+        # A torsion row whose frame a-b-c is COLLINEAR (b an sp centre, a and c on its axis)
+        # has no plane to measure phi in, so today it is held. The Z-matrix remedy is a DUMMY
+        # ATOM X on b at 90 degrees to the axis, and phi measured as X-b-c-d: the row stays
+        # driven and `full` keeps 3N-6. See the note above mxtaltools builder.DummyFrame for
+        # the construction and why log J is unchanged.
+        #
+        # WHICH ROWS: this chart's own collinear-frame flags, at CHART_TIERS only (the
+        # transverse chart's tiers, so torsion and dihedral stay byte-identical), minus
+        #   * frames through a CUMULATED centre (see `cumulated_centres`), and
+        #   * rows X cannot be built for (builder.dummy_frame_refs: b must be c's parent and
+        #     not the root) or whose azimuth anchor is itself a linear angle -- an unchained
+        #     X's anchor angle is a tree angle at b's parent, and if THAT is linear the anchor
+        #     is on the axis. Dropping a row can unchain its children, so this is iterated to
+        #     a fixed point: each pass removes at least one row or stops, so it ends within
+        #     n_ph + 1 passes.
+        # Rows that remain collinear and unflagged are held exactly as before.
+        _ti = np.asarray(self.spec.torsion_index)
+        self.cumulated_frames = (np.asarray(self.torsion_frame_is_linear, dtype=bool)
+                                 & np.isin(_ti[:, 1], self.cumulated_centres))
+        dummy = np.zeros(self.n_ph, dtype=bool)
+        if level in self.CHART_TIERS:
+            from mxtaltools.conformers.builder import dummy_frame_refs
+            dummy = np.asarray(self.torsion_frame_is_linear, dtype=bool) & ~self.cumulated_frames
+            for _ in range(self.n_ph + 1):
+                _refs, _ok = dummy_frame_refs(tree1, torch.as_tensor(dummy), strict=False)
+                _anc = _refs.anchor.cpu().numpy()[_ti[:, 3]]
+                _unch = dummy & ~_refs.chained.cpu().numpy()[_ti[:, 3]] & (_anc >= 0)
+                # the anchor angle's row is the one placing its LATER arm: b's own row when
+                # the anchor is b's angle reference, the anchor's when b is the root's first
+                # child -- in placement numbering angle row j places slot j + 2
+                _own = np.maximum(_ti[:, 1], _anc) - 2
+                _anc_lin = np.zeros_like(dummy)
+                _anc_lin[_unch] = np.asarray(self.angle_is_linear, dtype=bool)[_own[_unch]]
+                keep = dummy & _ok.cpu().numpy() & ~_anc_lin
+                if (keep == dummy).all():
+                    break
+                dummy = keep
+        #: per TORSION ROW: this row's phi (or transverse v) is measured against the Z-matrix
+        #: dummy X instead of its collinear real reference atom
+        self.dummy_frame_rows = dummy
+        #: per torsion row: collinear and NOT carried by a dummy, hence held
+        self.held_frame_rows = np.asarray(self.torsion_frame_is_linear, dtype=bool) & ~dummy
+        if dummy.any():
+            # RE-MEASURED, because the measure above ran before the flags existed: on a
+            # dummy row it read the dihedral against the collinear real atom, i.e. noise
+            # multiplied by a vanishing frame. `ph0` stays POLAR (theta0/phi0 are what the
+            # prior histograms read); only its reference atom changes. Nothing else moves --
+            # r0 and th0 do not depend on the torsion frame.
+            _, _, ph0 = measure(tree1, pos1, dummy_frame=torch.as_tensor(dummy))
+            self.ph0 = ph0
 
         # ---- TRANSVERSE linear-bending rows ------------------------------------------
         # A linear bend is a POLE OF THE (theta, phi) CHART, not a rigid constraint. Below,
@@ -295,19 +439,20 @@ class ConformerTorsions(BaseSet):
         # THREE CONDITIONS, and the last two are why this does not fix every linear centre:
         #   1. the bend is linear                              (angle_is_linear)
         #   2. the atom HAS a torsion row to carry v           (frame seeds do not)
-        #   3. its placement frame a-b-c is NOT itself collinear
+        #   3. its placement frame a-b-c is NOT itself collinear, or is carried by a dummy
         # Failing 2 means the missing component is the sixth EXTERNAL DoF, under a frame
-        # convention that stops fixing a frame at all once atoms 0-1-2 are collinear.
-        # Failing 3 means the normal defining phi is arbitrary, so there is no frame to bend
-        # in -- a smooth frame construction, not this pair, is what that needs. Rows failing
-        # either are still HELD, and `describe()` reports them separately.
+        # convention that stops fixing a frame at all once atoms 0-1-2 are collinear -- which
+        # the sp-root rule removes wherever the molecule is not wholly linear. Failing 3 means
+        # the normal defining phi is arbitrary, so there is no frame to bend in; the dummy
+        # frame above is the smooth frame construction that supplies one. Rows failing either
+        # are still HELD, and `describe()` reports them separately.
         ang_atom = np.asarray(self.spec.angle_index)[:, 2]
         tor_atom = np.asarray(self.spec.torsion_index)[:, 3]
         slot_of = {int(a): i for i, a in enumerate(tor_atom)}
         partner = np.array([slot_of.get(int(a), -1) for a in ang_atom], dtype=np.int64)
         has_partner = partner >= 0
         frame_bad = np.zeros(self.n_th, dtype=bool)
-        frame_bad[has_partner] = self.torsion_frame_is_linear[partner[has_partner]]
+        frame_bad[has_partner] = self.held_frame_rows[partner[has_partner]]
         #: per ANGLE ROW: this row's (theta, phi) pair is carried as (u, v)
         self.transverse_angles = self.angle_is_linear & has_partner & ~frame_bad
         #: per angle row: the torsion row holding its v, -1 where there is none
@@ -404,11 +549,13 @@ class ConformerTorsions(BaseSet):
         # `self.constrained_rows` and the CONSTRAINED line in `describe()`.
         # A TRANSVERSE ROW IS NOT SINGULAR AND IS NOT HELD -- that is the whole point of the
         # pair. Its partner phi row carries v and is free for the same reason; it cannot be
-        # in `torsion_frame_is_linear`, because condition 3 above excluded exactly those.
+        # in `held_frame_rows`, because condition 3 above excluded exactly those. Nor is a
+        # DUMMY-FRAME row: its frame is X-b-c, which is regular, so only the collinear rows
+        # no dummy carries are held.
         singular = np.zeros(n_dof, dtype=bool)
         singular[self.n_r + np.flatnonzero(self.angle_is_linear
                                            & ~self.transverse_angles)] = True
-        singular[self.n_r + self.n_th + np.flatnonzero(self.torsion_frame_is_linear)] = True
+        singular[self.n_r + self.n_th + np.flatnonzero(self.held_frame_rows)] = True
         m_full[singular, :] = 0.0
 
         keep = m_full.any(axis=0)
@@ -424,16 +571,52 @@ class ConformerTorsions(BaseSet):
         # constrained molecule at 'full' trained silently, and its run summary, its checkpoint
         # and its conditions file all said 'full'. Raising here closes every path at once and
         # demotes the builder's check to a redundant early skip.
+        #
+        # THREE CAUSES, each with its own code (ChartRefused), because they mean different
+        # things: a WHOLLY LINEAR molecule has 3N-5 internal DoF, so no 3N-6 chart exists and
+        # the shortfall is the molecule's; a CUMULATED centre is held on purpose; anything
+        # else is this chart's limitation.
         if level == 'full' and self.constrained_rows and not allow_constrained:
             n_lin = 3 * self.spec.n_atoms - 6
-            raise ValueError(
+            deg = np.bincount(self.bond_index_slot.reshape(-1), minlength=n_at)
+            centres = np.flatnonzero(deg >= 2)
+            wholly_linear = bool(len(centres)) and bool((deg[centres] == 2).all())
+            if wholly_linear:
+                _nbr = {int(i): sorted({int(v) for u, v in self.bond_index_slot.T if u == i}
+                                       | {int(u) for u, v in self.bond_index_slot.T if v == i})
+                        for i in centres}
+                wholly_linear = bool(_is_linear(np.array(
+                    [[_nbr[i][0], i, _nbr[i][1]] for i in _nbr]).reshape(-1, 3)).all())
+            if wholly_linear:
+                raise ChartRefused(
+                    'wholly_linear',
+                    f"{smiles} is WHOLLY LINEAR: every atom lies on one axis, so it has 3N-5 "
+                    f"internal degrees of freedom, not 3N-6 = {n_lin}. No atom tree charts "
+                    f"it at level 'full' -- a property of the molecule, not a chart "
+                    f"limitation; the missing coordinate is the rotation about its own axis, "
+                    f"which is external. Pass allow_constrained=True to study the held chart "
+                    f"deliberately.")
+            n_cum = int(self.cumulated_frames.sum())
+            if n_cum:
+                raise ChartRefused(
+                    'cumulated',
+                    f"{smiles} has {n_cum} collinear frame(s) through a CUMULATED sp centre "
+                    f"(allene or cumulene), held deliberately: the dummy frame would free the "
+                    f"end-to-end twist, which MMFF94 does not restrain, and axially chiral "
+                    f"isomers would interconvert. It does not have a complete chart at level "
+                    f"'full' until a twist term exists. Pass allow_constrained=True to study "
+                    f"the held chart deliberately.")
+            raise ChartRefused(
+                'incomplete_chart',
                 f"{smiles} does not have a complete chart at level 'full': "
                 f"{self.constrained_rows} row(s) held and {self.constrained_columns} "
                 f"column(s) dropped, giving d = {int(keep.sum())} against 3N-6 = {n_lin}. "
                 f"{self.uncovered_linear_angles} linear angle(s) are not covered by the "
-                f"transverse pair (frame seed, or collinear reference frame) -- a chart "
-                f"limitation, not a rigid molecule. Pass allow_constrained=True to study it "
-                f"deliberately; the shortfall is then recorded on the run.")
+                f"transverse pair (frame seed, or collinear reference frame) and "
+                f"{int(self.held_frame_rows.sum())} collinear frame(s) could not take a dummy "
+                f"reference -- a chart limitation, not a rigid molecule. Pass "
+                f"allow_constrained=True to study it deliberately; the shortfall is then "
+                f"recorded on the run.")
         m_full, col_block = m_full[:, keep], col_block[keep]
         self.data_ndim = int(keep.sum())
         if self.data_ndim == 0:
@@ -489,6 +672,47 @@ class ConformerTorsions(BaseSet):
                     f"{smiles}: delta_theta_max {delta_theta_max} lets a transverse bend "
                     f"reach rho >= pi, where the (u, v) chart stops being injective and its "
                     f"measure turns negative. Reduce it, or exclude this molecule.")
+            # TIGHTER FOR A BEND THAT ANCHORS A DUMMY FRAME: the frame angle X-b-c is
+            # pi/2 +- rho_c, so the dummy chart goes collinear at rho_c = pi/2 -- inside the
+            # disc, long before the (u, v) chart's own boundary at pi.
+            _anchors = np.isin(ang_atom[_tv_rows], _ti[dummy, 2])
+            if _anchors.any() and float(reach[torch.as_tensor(_anchors)].max()) >= (np.pi / 2) ** 2:
+                raise ValueError(
+                    f"{smiles}: delta_theta_max {delta_theta_max} lets a transverse bend that "
+                    f"anchors a dummy frame reach rho >= pi/2, where that frame goes collinear "
+                    f"(its angle is pi/2 +- rho). Reduce it, or exclude this molecule.")
+
+        # THE DUMMY FRAMES' CONDITIONING, BOUNDED OVER THE BOX rather than sampled. Every frame
+        # a dummy row touches has an angle the box confines: X_d's own frame angle
+        # angle(X_d, b, c) = pi/2 +- rho_c; a chained X's azimuth frame angle(X_c, q, b) =
+        # pi/2 +- rho_b; an unchained X's is a tree angle theta0 +- delta_theta_max. The sine of
+        # that angle scales the frame normal's cross product, so its minimum over the box is a
+        # certificate that no frame goes collinear anywhere a state in [-1, 1]^d can put it.
+        # The design this replaced took X's azimuth from c's OWN frame, whose sibling-pick
+        # angle is set by free dihedrals and was measured 0.42 deg from collinear in the box.
+        self.dummy_frame_min_sin = None
+        if dummy.any():
+            _rho_max = {}
+            if bool(self.transverse_angles.any()):
+                for _k, _j in enumerate(_tv_rows):
+                    _rho_max[int(ang_atom[_j])] = float(reach[_k].sqrt())
+            _th0 = th0.detach().cpu().numpy()
+            _rho_of = lambda a: _rho_max.get(int(a), float(np.pi - _th0[int(a) - 2]))
+            _ch = _refs.chained.cpu().numpy()[_ti[:, 3]]
+            _anc = _refs.anchor.cpu().numpy()[_ti[:, 3]]
+            _sins = []
+            for _j in np.flatnonzero(dummy):
+                _b, _c = int(_ti[_j, 1]), int(_ti[_j, 2])
+                _sins.append(np.cos(_rho_of(_c)))
+                if _ch[_j]:
+                    _sins.append(np.cos(_rho_of(_b)))
+                else:
+                    _t0 = _th0[max(_b, int(_anc[_j])) - 2]
+                    _sins.append(min(np.sin(_t0 - float(delta_theta_max)),
+                                     np.sin(_t0 + float(delta_theta_max))))
+            #: smallest sine of any dummy-row frame angle over the whole state box; > 0 is
+            #: the regularity certificate (see the comment above)
+            self.dummy_frame_min_sin = float(min(_sins))
         self._ref_dof = torch.cat([r0, th_ref, ph_ref]).to(dtype)
         self._free_scale = torch.as_tensor(scale, dtype=dtype, device=self.device)
         # indexes the STATE, not the DoF vector: the box wall applies to the non-periodic
@@ -541,6 +765,31 @@ class ConformerTorsions(BaseSet):
         assert len(_u_cols) == int(self.transverse_angles.sum()), (
             f"{smiles} at {level!r}: {len(_u_cols)} complete pairs of "
             f"{int(self.transverse_angles.sum())} flagged")
+        #: per transverse PAIR (the `_tv_u_cols` order): this bend anchors a dummy frame, so
+        #: its chart is regular only on rho < pi/2 -- see `dummy_frame_crossings`
+        self._tv_dummy_anchor = torch.as_tensor(
+            np.isin(ang_atom[_tv_rows[:len(_u_cols)]], _ti[dummy, 2]), dtype=torch.bool,
+            device=self.device)
+        # THE DISC WALL MUST ENGAGE BEFORE THE DUMMY FRAME DEGENERATES. The box keeps rho well
+        # inside pi/2 (checked above), but the wall is what prices a state OUTSIDE the box, and
+        # past pi/2 a dummy frame is collinear: a wall that only starts there guards nothing.
+        if dummy.any() and not self.rho_wall < np.pi / 2:
+            raise ValueError(
+                f"{smiles}: rho_wall {self.rho_wall} is not below pi/2, where the dummy frames "
+                f"this molecule carries go collinear; the disc wall must engage first")
+
+        #: per TORSION ROW, for `build` / `measure`. None when no row carries a dummy frame,
+        #: which keeps every molecule without one on exactly the code path it was on before.
+        self._dummy_t = (torch.as_tensor(dummy, dtype=torch.bool, device=self.device)
+                         if dummy.any() else None)
+        #: per torsion row, the atom in the first slot of the row's FRAME: `torsion_index[:, 0]`
+        #: except on a dummy row, where it is the real atom whose side X points to (the anchor
+        #: at the start of a dummy chain) -- the collinear atom in `torsion_index` fixes nothing
+        self.torsion_frame_first = np.asarray(_ti[:, 0], dtype=np.int64).copy()
+        if dummy.any():
+            from mxtaltools.conformers.builder import dummy_frame_anchor_atoms
+            _real = dummy_frame_anchor_atoms(tree1, self._dummy_t).cpu().numpy()
+            self.torsion_frame_first[dummy] = _real[_ti[dummy, 3]]
 
         #: set when the caller opted in to an incomplete chart, so downstream reporting can
         #: mark the result rather than letting `level: full` speak for it
@@ -581,7 +830,12 @@ class ConformerTorsions(BaseSet):
                     f"[{lo:.3f}, {hi:.3f}] rad, outside (0, pi) with margin "
                     f"{self.theta_floor}; the clamp would bind inside the wall")
 
-        self._ff_cache, self._tree_cache = {}, {}
+        # SEEDED WITH THE BATCH-1 ENTRY ALREADY BUILT ABOVE. `_batch(1)` would collate
+        # [spec] into a tree identical to tree1 and hand `_make_ff` the same positions and
+        # kwargs -- so for 'mmff' it re-ran ff_from_mmff, every RDKit parameter query
+        # again, only to rebuild ff_single for the log J probe and e_ref just below. One
+        # typing per construction; the eviction rule treats this entry like any other.
+        self._ff_cache, self._tree_cache = {1: self.ff_single}, {1: tree1}
         self._ff_kwargs = dict(epsilon=epsilon, min_separation=min_separation,
                                scale_14=scale_14, lj_k_factor=lj_k_factor)
 
@@ -614,6 +868,152 @@ class ConformerTorsions(BaseSet):
         self.e_ref = self.energy(torch.zeros(1, self.data_ndim, dtype=dtype,
                                              device=self.device),
                                  None, torch.tensor(log_temperature)).item()
+
+    # ------------------------------------------------------------------ stereo lock
+
+    @property
+    def stereo_coeff(self) -> float:
+        """The stereo lock's stiffness, kcal/mol; 0 = off. See energies/stereo_lock.py."""
+        return self._stereo_coeff
+
+    @stereo_coeff.setter
+    def stereo_coeff(self, value):
+        """Set ONCE, at construction; afterwards only the value already in force is accepted.
+
+        train.set_energy_coeffs sets any numeric energy_config key a stage's coeff_schedule or
+        anneal names, every step, so a ramp of this key reaches here -- and is refused, for two
+        reasons. A BAKED row (prior, anchor, replay) stores clip(U + P) at the coefficient in
+        force when it was scored, and prebuilt_sample_to_reward never recomputes it, so after
+        any change the stored rows and the live ones score different locks, silently; every
+        condition graph records the coefficient it was built under (``ctree_stereo_coeff``) and
+        `MultiConformerTorsions._resolve_rows` refuses a row whose record differs. And whether
+        the lock is on decides things fixed at construction -- the refusals of an unassigned or
+        unverifiable stereoisomer, and the prior's held double-bond rows -- so a ramp from 0
+        would lock whatever isomer the embedding happened to realise, unrefused and unrecorded.
+        """
+        value = float(value)
+        if not (np.isfinite(value) and value >= 0.0):
+            raise ValueError(f'stereo_coeff must be finite and >= 0, got {value!r}')
+        old = getattr(self, '_stereo_coeff', None)
+        if old is not None and value != old:
+            raise ValueError(
+                f'stereo_coeff {old:g} -> {value:g} after construction. It is fixed for the '
+                f'life of the energy: baked rows (prior, anchor, replay) carry the lock at '
+                f'{old:g} and are never re-scored, and the refusals and held prior rows were '
+                f'decided at construction. Set it in energy_config and name it in no stage\'s '
+                f'coeff_schedule or anneal_coeffs.')
+        self._stereo_coeff = value
+
+    def _init_stereo(self, smiles: str, slot: np.ndarray, pos_slot: np.ndarray, level: str):
+        """Build `self.stereo` (energies/stereo_lock.StereoTable) and, if locking, refuse.
+
+        THE ISOMER IS PINNED ON THE CONDITION SIDE. The tagged SMILES says which stereoisomer
+        the condition is; the lock enforces it; so with the lock on, a SMILES that leaves a
+        lockable element unassigned is refused rather than locked to whatever the ETKDG
+        embedding realised -- a single seeded embedding, which a different RDKit build can
+        resolve the other way under the same SMILES and the same problem hash. With every
+        element tagged, the SMILES in energy_config (or a condition's identifier) names the
+        locked isomer, which is how it enters the problem identity.
+
+        The signs are then read off the reference, not off the tags, so the reference must BE
+        the tagged isomer: `realised_isomer` re-perceives it from 3D and it must equal the
+        input's canonical isomeric SMILES.
+        """
+        from energies import stereo_lock as sl
+
+        #: the INPUT molecule's potential stereo elements (stereo_lock.tagged_elements), in
+        #: `self.mol`'s atom indexing -- the condition side of the stereo contract
+        self.stereo_elements = sl.tagged_elements(smiles)
+        dbl = [tuple(int(slot[a]) for a in e['atoms']) for e in self.stereo_elements
+               if e['kind'] == sl.DOUBLE_BOND]
+        centres = [int(slot[e['atoms'][0]]) for e in self.stereo_elements
+                   if e['kind'] == sl.TETRAHEDRAL and e['specified'] and e['degree'] == 4]
+        self.stereo = sl.build_table(pos_slot, self.bond_index_slot, dbl, stereocentres=centres)
+        #: the isomer the reference conformer REALISES (re-perceived from 3D), and the input's
+        self.stereo_isomer = sl.realised_isomer(self.mol)
+        self.stereo_input = sl.canonical_isomeric(smiles)
+        if self.stereo_coeff <= 0.0:
+            return
+
+        odd = [e for e in self.stereo_elements if e['kind'] == 0]
+        inv = [e for e in self.stereo_elements
+               if e['kind'] == sl.TETRAHEDRAL and e['degree'] != 4 and e['specified']]
+        if odd or inv:
+            what = ([f"{e['type']} at atom {e['atoms']}" for e in odd]
+                    + [f"tetrahedral {e['element']}{e['atoms'][0]} (3-coordinate)" for e in inv])
+            raise ChartRefused(
+                'stereo_unsupported',
+                f"{smiles}: stereo element(s) {what} are present, but the stereo lock does not "
+                f"enforce them -- a three-coordinate centre (an amine N) is left to invert "
+                f"inside one condition (RDKit does not recover N stereo from 3D, so it could "
+                f"not be verified), and axial stereo has no indicator. Strip those tags, or run "
+                f"with stereo_coeff 0.")
+        isomers = sl.consistent_isomers(smiles)
+        if len(isomers) != 1:
+            loose = [(e['type'], e['atoms']) for e in self.stereo_elements
+                     if not e['specified'] and not (e['kind'] == sl.TETRAHEDRAL
+                                                    and e['degree'] != 4)]
+            raise ChartRefused(
+                'stereo_unspecified',
+                f"{smiles}: the tags are consistent with {len(isomers)} stereoisomers (e.g. "
+                f"{isomers[:3]}); unassigned elements {loose}. With stereo_coeff > 0 the lock "
+                f"pins one isomer, and the SMILES must say which: an untagged element would be "
+                f"locked to whatever the ETKDG embedding realised ({self.stereo_isomer!r} "
+                f"this time), which the problem identity does not record. Pass a fully tagged "
+                f"stereoisomer.")
+        if self.stereo_isomer != self.stereo_input:
+            raise ChartRefused(
+                'stereo_verify_failed',
+                f"{smiles}: the reference embedding realises {self.stereo_isomer!r}, not the "
+                f"requested {self.stereo_input!r}. The lock reads its signs off the "
+                f"reference, so it would pin the wrong isomer.")
+        thin = np.flatnonzero(self.stereo.margin < sl.MIN_MARGIN)
+        if thin.size:
+            raise ChartRefused(
+                'stereo_lock_in_band',
+                f"{smiles}: {thin.size} stereo element(s) have best |indicator| below "
+                f"{sl.MIN_MARGIN} at the reference (atoms {self.stereo.key[thin].tolist()}, "
+                f"|v| {np.round(self.stereo.margin[thin], 4).tolist()}): the reference sits "
+                f"near the stereo boundary, where the wrong configuration's mirror point pays "
+                f"too little to be locked out (stereo_lock.MIN_MARGIN).")
+        if level == 'torsion':
+            # THE TORSION TIER'S ROTATABLE SET HAS NO BOND-ORDER TEST (_find_rotatable), so an
+            # acyclic C=C or C=N is a column there and its prior (build_prior_states.
+            # draw_states) draws it per column, into both E and Z. Freezing it instead would
+            # change the torsion tier's column count, a helper-tier target change that is the
+            # owner's to make; refused until then.
+            locked = self.stereo.bonds()
+            hit = [(int(u), int(v)) for u, v in self.rotatable
+                   if frozenset((int(u), int(v))) in locked]
+            if hit:
+                raise ChartRefused(
+                    'stereo_torsion_double_bond',
+                    f"{smiles}: at level 'torsion' the rotatable column(s) about {hit} turn a "
+                    f"locked double bond. The torsion tier admits acyclic double bonds as "
+                    f"rotatable (no bond-order test) and its prior draws both E and Z, so the "
+                    f"lock would reject a fixed share of every prior draw. Run it unlocked "
+                    f"(stereo_coeff 0), or at dihedral/flex/full.")
+
+    def held_phi_rows(self):
+        """phi rows the prior HOLDS at their reference: impropers, plus locked double bonds.
+
+        `improper_phi_rows` always. With the lock on, also every row whose central bond is a
+        LOCKED double bond: the sibling-group draw takes a group's leader from a rotamer
+        histogram keyed on the central bond, which puts a double bond into the other E/Z
+        basin on a large share of draws, and the lock rejects every one of them. Held rows
+        take the improper path instead -- a thermal rattle about the reference -- at every
+        site improper rows are special (`torsion_groups`, `sample_prior_states`,
+        `prior_log_prob`), so the draw and its density stay matched.
+
+        Identical to `improper_phi_rows` when the lock is off, so no prior draw changes.
+        """
+        rows = set(self.improper_phi_rows())
+        if self.stereo_coeff > 0.0 and self.stereo.n:
+            locked = self.stereo.bonds()
+            ti = np.asarray(self.spec.torsion_index)
+            rows |= {j for j in range(self.n_ph)
+                     if frozenset((int(ti[j, 1]), int(ti[j, 2]))) in locked}
+        return sorted(rows)
 
     # ------------------------------------------------------------------ topology
 
@@ -689,6 +1089,17 @@ class ConformerTorsions(BaseSet):
                 f"sin phi), regular at the pole; their measure is log sinc(rho), not "
                 f"log sin(theta). {self.uncovered_linear_angles} linear angle(s) NOT "
                 f"covered (frame seed or collinear reference frame) and still held.")
+        n_dm = int(np.asarray(getattr(self, 'dummy_frame_rows', ())).sum())
+        if n_dm:
+            lines.append(
+                f"   DUMMY FRAME: {n_dm} dihedral(s) whose frame runs along a linear axis are "
+                f"measured against a Z-matrix dummy atom (90 deg to the axis) instead of the "
+                f"collinear real atom; min frame-angle sine over the box "
+                f"{self.dummy_frame_min_sin:.3f}. "
+                f"{int(np.asarray(self.held_frame_rows).sum())} collinear frame(s) held.")
+        if getattr(self.spec, 'root_moved_from', -1) >= 0:
+            lines.append(f"   ROOT moved off the sp carbon the default rule picks (input atom "
+                         f"{self.spec.root_moved_from}); see topology.choose_root")
         # SAY SO WHEN THE TIER IS NOT WHAT IT CLAIMS. A globally nonlinear molecule has 3N-6
         # internal degrees of freedom regardless of a locally linear centre, so at 'full' any
         # shortfall is this chart's, and reporting `full` without saying so would present a
@@ -704,6 +1115,16 @@ class ConformerTorsions(BaseSet):
                     f"      d = {self.data_ndim} against 3N-6 = {expected}; the molecule is "
                     f"globally nonlinear, so the shortfall is the chart's. Transverse "
                     f"linear-bending coordinates would restore it (design note 3.2).")
+        st = getattr(self, 'stereo', None)
+        if st is not None:
+            n_t = int((st.kind == 1).sum())
+            n_b = int((st.kind == 2).sum())
+            state = (f'ON, stereo_coeff {self.stereo_coeff:g} kcal/mol'
+                     if self.stereo_coeff > 0 else 'OFF (stereo_coeff 0): table built, no term')
+            lines.append(
+                f"   STEREO LOCK {state}: {n_t} tetrahedral centre(s) ({int(st.stereocentre.sum())} "
+                f"stereocentre(s), the rest labelled parity), {n_b} double bond(s); reference "
+                f"realises {self.stereo_isomer!r}")
         if n_free[0] or n_free[1]:
             lines.append(f"   box: r +/-{self.delta_r_max} A, theta "
                          f"+/-{self.delta_theta_max} rad, wall {self.bounding_coeff}, "
@@ -833,12 +1254,22 @@ class ConformerTorsions(BaseSet):
         affine in N, so it is a PER-MOLECULE offset and must be carried wherever log Z(c)
         is compared across molecules.
         """
-        from mxtaltools.conformers.builder import build
-
         r, th, ph = self.dof_from_state(x)
         tree, _ = self._batch(x.shape[0])
+        return self._build(tree, r, th, ph, x.shape[0])
+
+    def _build(self, tree, r, th, ph, b: int) -> torch.Tensor:
+        """`builder.build` with BOTH chart masks: transverse bends and dummy frames.
+
+        The counterpart of `_log_jac`, and routed through one helper for the same reason:
+        each mask changes what a slot MEANS, so a call site that builds without one returns
+        a finite, right-shaped geometry for a different state -- a silent error. Every
+        builder.build on this molecule's chart goes through here (build_positions, the prior
+        smoke harness), so there is no way to build it with a mask left behind.
+        """
+        from mxtaltools.conformers.builder import build
         return build(tree, r.reshape(-1), th.reshape(-1), ph.reshape(-1),
-                     transverse=self._tiled_transverse(x.shape[0]))
+                     transverse=self._tiled_transverse(b), dummy_frame=self._tiled_dummy(b))
 
     def _tiled_transverse(self, b: int):
         """The per-angle-row transverse mask, tiled over a b-replica batch tree.
@@ -849,6 +1280,23 @@ class ConformerTorsions(BaseSet):
         byte-identical to the pre-transverse code path.
         """
         return None if self._transverse_t is None else self._transverse_t.repeat(b)
+
+    def _tiled_dummy(self, b: int):
+        """The per-torsion-row dummy-frame mask, tiled like `_tiled_transverse`; None if none."""
+        return None if self._dummy_t is None else self._dummy_t.repeat(b)
+
+    def torsion_frame_atoms(self) -> np.ndarray:
+        """``[n_ph, 4]`` the atoms that FIX each dihedral row, in spec numbering.
+
+        `spec.torsion_index` with its first column replaced, on a dummy-frame row, by the
+        real atom the dummy X points toward (`torsion_frame_first`). Anything that names a
+        row's frame -- the per-coordinate features, the atom frames a correlator reads --
+        takes it from here: on a dummy row the collinear atom `torsion_index` names carries
+        no direction at all.
+        """
+        out = np.asarray(self.spec.torsion_index, dtype=np.int64).copy()
+        out[:, 0] = self.torsion_frame_first
+        return out
 
     def _log_jac(self, tree, r, th, ph, b: int):
         """`builder.log_jacobian` with the transverse rows measured as ``log sinc(rho)``.
@@ -939,6 +1387,26 @@ class ConformerTorsions(BaseSet):
         with torch.no_grad():
             return int((self._transverse_rho2(x) >= np.pi ** 2).sum())
 
+    def dummy_frame_crossings(self, x: torch.Tensor) -> int:
+        """How many bends that ANCHOR A DUMMY FRAME reached ``rho >= pi/2`` in this batch.
+
+        The dummy chart's own singular set, and one `transverse_crossings` cannot see: a
+        dummy row's frame angle is ``pi/2 +- rho_c``, collinear at rho_c = pi/2, which is
+        inside the (u, v) disc. The box keeps rho under pi/2 by a construction-time check and
+        the disc wall engages before it (`rho_wall < pi/2`, asserted), so this should read
+        zero.
+
+        A PROBE, NOT A MONITOR: as of 2026-09-26 no trainer, modeller or eval path calls
+        this or `transverse_crossings`, so a run that crossed would not say so. What guards a
+        run today is the construction-time check and the disc wall; a run that must SHOW
+        zero needs these wired into its eval logging first.
+        """
+        if self._transverse_t is None or not bool(self._tv_dummy_anchor.any()):
+            return 0
+        with torch.no_grad():
+            rho2 = self._transverse_rho2(x)[..., self._tv_dummy_anchor]
+            return int((rho2 >= (np.pi / 2) ** 2).sum())
+
     # -------------------------------------------------------------- prior draw
 
     def state_from_dof(self, r, th, ph) -> torch.Tensor:
@@ -1015,7 +1483,12 @@ class ConformerTorsions(BaseSet):
         return out
 
     def torsion_groups(self):
-        """phi DoF rows grouped by CENTRAL BOND, improper rows excluded, leader first.
+        """phi DoF rows grouped by CENTRAL BOND, HELD rows excluded, leader first.
+
+        Held rows are `held_phi_rows`: the improper rows, plus -- with the stereo lock on --
+        the rows about a locked double bond. Everything below about impropers is about the
+        first set; the second is excluded so its rows are held at the reference rather than
+        led from a rotamer histogram into the other E/Z basin.
 
         A group is the set of atoms placed onto one parent -- every dihedral whose
         DIFFERENCES from the others fix a bond angle at that parent. An H-C-H angle is a
@@ -1046,7 +1519,8 @@ class ConformerTorsions(BaseSet):
         """
         from collections import defaultdict
         ti = np.asarray(self.spec.torsion_index)
-        imp = set(self.improper_phi_rows())
+        # HELD rows, which are the improper rows unless the stereo lock is on (held_phi_rows)
+        imp = set(self.held_phi_rows())
         g = defaultdict(list)
         for j in range(self.n_ph):
             if j in imp:
@@ -1140,7 +1614,9 @@ class ConformerTorsions(BaseSet):
         """
         from energies.conformer_data import condition_from_energy
         m = condition_from_energy(self, partial_charges=False)
-        m.build_conformer_tree()
+        # the SAME root rule this chart was built with, or the two trees differ on every
+        # molecule whose default root is an sp carbon and the assertion below fires on them
+        m.build_conformer_tree(avoid_sp_root=self.avoid_sp_root)
         for lbl, a, b in (('bond', np.asarray(self.spec.bond_index), m.tree_bond_index),
                           ('angle', np.asarray(self.spec.angle_index), m.tree_angle_index),
                           ('torsion', np.asarray(self.spec.torsion_index), m.tree_torsion_index)):
@@ -1163,12 +1639,17 @@ class ConformerTorsions(BaseSet):
         _, blocks, sigs, _ = prior._layout(m)
         bi, ai, ti = (np.asarray(self.spec.bond_index), np.asarray(self.spec.angle_index),
                       np.asarray(self.spec.torsion_index))
-        # WHY THIS IS RECORDED RATHER THAN RE-DERIVED. Four different things end in
-        # `bank = None` below -- aromatic by design, no key resolved, a bank too thin, and
-        # a stale prior whose keys cannot resolve at all -- and the tuple return cannot
-        # tell them apart. A reader that re-derives aromaticity and the lookup to label
-        # them is a second copy of this branch, free to drift from it; energies/
-        # ring_metrics.py reads this instead. See that module for what each class means.
+        # the bond list ring_systems itself read, so it is in `sysid`'s numbering by
+        # construction; deduplicated so a list carrying both directions cannot double-count
+        mol_bonds = {tuple(sorted((int(a), int(b))))
+                     for a, b in m.mol_bond_index.detach().cpu().numpy().T}
+        # WHY THIS IS RECORDED RATHER THAN RE-DERIVED. Five different things end in
+        # `bank = None` below -- aromatic by design, no key resolved, a bank too thin, a
+        # polycyclic system refused a topology-blind key, and a stale prior whose keys
+        # cannot resolve at all -- and the tuple return cannot tell them apart. A reader
+        # that re-derives aromaticity and the lookup to label them is a second copy of this
+        # branch, free to drift from it; energies/ring_metrics.py reads this instead. See
+        # that module for what each class means.
         self.ring_block_info = []
         out = []
         for s, cols in blocks.items():
@@ -1177,11 +1658,25 @@ class ConformerTorsions(BaseSet):
                      + [('phi', int(j)) for j in cols['phi']])
             in_sys_pre = {int(a) for a in range(len(sysid)) if int(sysid[a]) == int(s)}
             aromatic = bool(self.atom_is_aromatic[list(in_sys_pre)].all())
+            # CYCLOMATIC NUMBER of the system -- its count of independent rings, E - V + 1
+            # over its own bonds (a system is one connected component by construction, and
+            # any bond joining two of its atoms is a ring bond, or it would lie on no cycle
+            # and they would not share a system). 1 is a monocycle; 2+ is fused, bridged
+            # or spiro. Below 1 the bond list and `sysid` disagree on numbering, and the
+            # gate below would then misread every ring -- so that raises.
+            n_cycles = sum(1 for a, b in mol_bonds
+                           if a in in_sys_pre and b in in_sys_pre) - len(in_sys_pre) + 1
+            if n_cycles < 1:
+                raise RuntimeError(
+                    f"{self.smiles}: ring system {int(s)} has {len(in_sys_pre)} atoms but "
+                    f"cyclomatic number {n_cycles}; the bond list and the ring-system ids are "
+                    f"not in the same numbering, so the polycyclic gate cannot be evaluated")
             # a fitted MODE SUBSPACE wins over the discrete bank: the rows were isolated
             # islands with near-zero mass between basins, and the saddles live between them
             bank = getattr(prior, 'ring_modes', {}).get((sigs[s], len(order)))
             if bank is None:
                 bank = prior.rings.get((sigs[s], len(order)))
+            bank_refused = None
             if aromatic:
                 # An aromatic ring is RIGID: there is no pucker to sample, so a bank buys
                 # nothing and can only do harm. It did: under signature version 1 the key
@@ -1191,6 +1686,26 @@ class ConformerTorsions(BaseSet):
                 # and bond angles stay near 120 deg through a pucker). Holding it planar
                 # near the reference is correct by construction and needs no fit.
                 bank = None
+            elif n_cycles > 1 and bank is not None:
+                # A POLYCYCLIC SYSTEM IS HELD, NOT BANKED. The key is (atom count, sorted
+                # (element, degree) multiset, block DoF count) and carries NO TOPOLOGY, while
+                # every bank in conformer_prior_v2.pt was fitted on a bare MONOCYCLE
+                # (build_ring_banks.RING_SMILES). So a fused, bridged or spiro system with
+                # the same count and atom types resolves a monocycle's bank: norbornane
+                # takes cycloheptane's, CC12CN1C1C(O)C21 piperidine's, spiro[2.4]heptane
+                # cycloheptane's. RingModes' kind-sequence check does not catch it -- the
+                # sequences agree -- and the draw then writes a seven-ring pucker into a
+                # bicycle. Measured at 'full'/mmff, 400 draws: median prior energy 69,359
+                # and 20,526 kcal/mol banked against 40.8 and 70.9 held, closure error
+                # 1.1-1.8 A against 0.03-0.04. Holding is the known-good fallback.
+                #
+                # This also refuses a bank fitted on a GENUINE polycycle, deliberately:
+                # the key cannot tell decalin from spiro[4.5]decane either, so no bank a
+                # polycycle resolves can be trusted until the signature carries ring
+                # topology (a ring_sig_version 3 change in MXtalTools' prior.ring_systems).
+                # Reported through the existing 'held_unsupported' class, with the reason on
+                # `bank_refused`, so energies/ring_metrics.py's four classes stand as they are.
+                bank, bank_refused = None, 'polycyclic'
             elif isinstance(bank, RingModes):
                 pass                                    # subspaces carry their own width
             elif bank is not None and (bank.rows.shape[1] != len(order)
@@ -1220,6 +1735,10 @@ class ConformerTorsions(BaseSet):
                                'banked_rows' if bank is not None else 'held_unsupported'),
                 'n_block_dof': len(order), 'n_extra_dof': len(extra),
                 'stale_prior': bool(self.ring_sig_stale),
+                # orthogonal to ring_class, like stale_prior: 'held_unsupported' with
+                # bank_refused 'polycyclic' means a key DID resolve and was refused for
+                # topology, not that no bank exists for this ring
+                'n_cycles': int(n_cycles), 'bank_refused': bank_refused,
             })
             out.append((order, bank, extra))
         return out
@@ -1361,7 +1880,8 @@ class ConformerTorsions(BaseSet):
         # ---- phi, mirroring the leader/follower structure exactly ----
         if joint_torsions:
             s_imp = self.improper_phi_sigma(float(self.temperature))
-            for j in self.improper_phi_rows():
+            # the HELD rows, as sample_prior_states draws them (held_phi_rows)
+            for j in self.held_phi_rows():
                 total += wrapped_gauss(dof[:, n_phi0 + j], ph0[j], s_imp)
             for gi, rows_j in enumerate(groups):
                 grows = [n_phi0 + j for j in rows_j]
@@ -1571,12 +2091,26 @@ class ConformerTorsions(BaseSet):
             dof[:, row] = draw(row, kind, hist)
 
         # ---- phi ----
+        # DUMMY-FRAME ROWS draw from their central-bond marginal like any other row, but
+        # InternalPrior.fit measured it with no dummy (mol.internal_dof on the default tree), so
+        # on a bond to a linear centre it was fitted against a collinear frame and its shape
+        # carries no signal. MEASURED BENIGN, 2026-09-26, six alkynes at 'full', mmff,
+        # conformer_prior_v2.pt, 2000 draws each: replacing every dummy group's fitted twist by
+        # a uniform RIGID rotation of the group (a transverse dummy row: its bend direction by a
+        # uniform angle) moved the median potential above the reference by <= 0.06 kcal/mol and
+        # its 95th percentile by <= 0.8; a rigid twist of a dummy group about its axis spans
+        # 3e-5 to 0.86 kcal/mol of MMFF94. The twist across an alkyne is nearly free, so a flat
+        # marginal is close to right. A fit through the chart's masks is what would give it
+        # signal; see docs/wiki/conformer-force-field-and-prior.md.
         if joint_torsions:
             # improper rows FIRST: they are angles at the parent, not rotations, so they
-            # rattle thermally about the reference instead of taking a rotamer histogram
-            imp = [j for j in self.improper_phi_rows() if n_phi0 + j not in ring_rows]
+            # rattle thermally about the reference instead of taking a rotamer histogram. With
+            # the stereo lock on, rows about a locked double bond join them (held_phi_rows).
+            imp = [j for j in self.held_phi_rows() if n_phi0 + j not in ring_rows]
             s_imp = self.improper_phi_sigma(float(self.temperature))
-            stats['n_improper'] = len(imp)
+            _true_imp = set(self.improper_phi_rows())
+            stats['n_improper'] = sum(1 for j in imp if j in _true_imp)
+            stats['n_held_bond'] = len(imp) - stats['n_improper']
             for j in imp:
                 dof[:, n_phi0 + j] = ph0[j] + rng.normal(0.0, s_imp, n)
             stats['n_groups'] = len(groups)
@@ -1730,7 +2264,7 @@ class ConformerTorsions(BaseSet):
 
     def potential_energy(self, x: torch.Tensor, temperature, keep_grads: bool = False,
                          return_positions: bool = False):
-        """Bonded + LJ + box wall. NO change of measure, and NOT divided by T.
+        """Bonded + LJ (+ stereo lock), clipped, + box wall. NO change of measure, NOT / T.
 
         Split out from energy() because `bake_energies` must store THIS: the baked field
         is divided by the sampling temperature when it is read back, and a change of
@@ -1747,6 +2281,16 @@ class ConformerTorsions(BaseSet):
             tree, ff = self._batch(x.shape[0])
             pos = self.build_positions(x)
             e = intramolecular_energy(tree, pos, ff)
+            if self.stereo_coeff > 0.0 and self.stereo.n:
+                # THE STEREO LOCK, a potential in kcal/mol, INSIDE the clip below: the soft
+                # clip is the identity wherever U + P is under the cap, which covers the
+                # locked basins and their edges, and above it the owner's cap then bounds the
+                # total rather than being defeated by a term added after it. NOT multiplied by
+                # T: it is divided by T with U, so the baked value (T = 1, divided on the read
+                # side) and a live row agree at every temperature. Skipped, not added as zero,
+                # when off, so the unlocked path stays bitwise.
+                e = e + self.stereo.lock_energy(pos.reshape(x.shape[0], -1, 3),
+                                                self.stereo_coeff)
             if self.energy_clip is not None:
                 # Above the cutoff, U -> cutoff + log1p(U - cutoff): monotone, smooth,
                 # IDENTITY BELOW IT, so nothing a physical conformer reaches is deformed.
@@ -1754,7 +2298,8 @@ class ConformerTorsions(BaseSet):
                 # point -- log Z's TB fixed point is a MEAN of log w, so an unbounded left
                 # tail on log_reward drags it without limit.
                 #
-                # THE FORCE FIELD ONLY, and BEFORE the wall. The box wall is the domain
+                # THE FORCE FIELD (AND THE STEREO LOCK) ONLY, and BEFORE the wall. The lock is
+                # part of the target, not a domain guarantee. The box wall is the domain
                 # guarantee, not part of the potential being tempered; compressing it would
                 # make a far off-domain excursion CHEAPER than the clamp intends, and the
                 # sampler would be free to leave the domain. The measure terms (BAT volume
@@ -1934,6 +2479,20 @@ class ConformerTorsions(BaseSet):
         n_groups = n // max(repeats, 1)
         dev = mol_batch.device
 
+        # A SET NEEDS mol_id. Without it condition_id falls back to zeros, which is right
+        # for the single-molecule route (library size 1, one condition) and silently wrong
+        # on a set: every row lands on condition 0, so the tracker, the per-condition log Z
+        # and prior-row expiry all book it under the first molecule. Checked FIRST, before
+        # the temperature draw consumes the RNG, so a refused call changes nothing.
+        mol_id = getattr(mol_batch, 'mol_id', None)
+        if mol_id is None and int(self.condition_library_size) > 1:
+            raise RuntimeError(
+                f"condition_samples got a batch with no `mol_id` on a "
+                f"{self.condition_library_size}-condition set. condition_id would default "
+                f"every row to condition 0 -- the first molecule -- and nothing downstream "
+                f"could tell. Attach mol_id from the identifier registry (init_identifiers) "
+                f"before conditioning.")
+
         conds = []
         if self.temperature_conditioning:
             if temperature is not None:
@@ -1976,7 +2535,6 @@ class ConformerTorsions(BaseSet):
         else:
             condition = torch.cat(conds, dim=-1)
 
-        mol_id = getattr(mol_batch, 'mol_id', None)
         mol_id = (torch.zeros(n, dtype=torch.long, device=dev) if mol_id is None
                   else mol_id.to(dev))
         condition_id = mol_id * (self.n_sg * self.n_zp)   # n_sg = n_zp = 1

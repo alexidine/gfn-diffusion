@@ -77,8 +77,8 @@ def feature_names() -> list:
         names += ['a{}_degree'.format(s), 'a{}_in_ring'.format(s),
                   'a{}_aromatic'.format(s), 'a{}_parity'.format(s),
                   'a{}_present'.format(s)]
-    names += ['row_in_ring', 'row_aromatic', 'is_improper',
-              'is_group_member', 'is_rotatable', 'is_free_at_tier']
+    names += ['row_in_ring', 'row_aromatic', 'row_ez_parity', 'is_improper',
+              'is_group_member', 'is_rotatable', 'is_held_bond', 'is_free_at_tier']
     names += ['log_thermal_sigma', 'ref_r', 'ref_theta', 'ref_bend']
     return names
 
@@ -114,6 +114,10 @@ def dof_features(en, prior=None) -> np.ndarray:
     # the chirality pseudoscalar. Without it the features are ENANTIOMER-BLIND: a 2D graph
     # plus atom types is identical for a mirror pair. See atom_parity.
     parity = atom_parity(en)
+    # and its double-bond counterpart, per phi ROW. The frozen molecule encoder reads bond
+    # order only, so an E/Z pair gives it identical inputs; this column is what lets the
+    # policy tell the two conditions apart. See row_ez_parity.
+    ez = row_ez_parity(en)
 
     T = float(en.temperature)
     s_r, s_th = en.thermal_rtheta_sigma(T)    # SPEC-ordered, looked up by atom identity
@@ -121,6 +125,11 @@ def dof_features(en, prior=None) -> np.ndarray:
     g_sigma = en.sibling_jitter_sigma(groups, T)
     s_imp = en.improper_phi_sigma(T)
     improper = set(en.improper_phi_rows())
+    # rows the prior HOLDS beyond the impropers: about a locked double bond, with the stereo
+    # lock on (ConformerTorsions.held_phi_rows). torsion_groups excludes them, so without a
+    # bit of their own they would read as ungrouped, non-improper rows -- a feature change the
+    # lock made silently.
+    held_bond = set(en.held_phi_rows()) - improper
     member = {j for g in groups for j in g}
     # a phi row is "rotatable" when its central bond is one of the rotatable axes
     rot_bonds = {tuple(sorted(uv)) for uv in en.rotatable}
@@ -145,6 +154,11 @@ def dof_features(en, prior=None) -> np.ndarray:
     tv = np.asarray(en.transverse_angles, dtype=bool)
     tv_partner = np.asarray(en.transverse_partner, dtype=np.int64)
     angle_of_v = {int(tv_partner[j]): int(j) for j in np.flatnonzero(tv)}
+    # THE ROW'S FRAME, not its tree references: on a DUMMY-FRAME row the dihedral is measured
+    # against a dummy atom X on the linear axis, and `torsion_index[:, 0]` still names the
+    # collinear real atom, which fixes no direction. `torsion_frame_atoms` puts the real atom
+    # X points toward in that slot; every other row is `torsion_index` unchanged.
+    tf = en.torsion_frame_atoms()
     ref_dof = en._ref_dof.detach().cpu().numpy()
     KINDS = ('r', 'theta', 'phi', 'bend_u', 'bend_v')
 
@@ -161,11 +175,13 @@ def dof_features(en, prior=None) -> np.ndarray:
 
             # THE FOUR-ATOM PLACEMENT FRAME ON BOTH ROWS OF A PAIR, not the 3-atom angle
             # frame. This is correctness, not convenience: place_nerf_transverse builds n
-            # from (pb - pa) and m2 from n, so the direction u points in is fixed by atom a,
-            # which the angle frame omits entirely. It also makes the two rows of a pair
-            # identical in every atom column and different only in the kind bit and the
+            # from (pb - pa) and m2 from n, so the direction u points in is fixed by the
+            # frame's first atom (a, or on a dummy-frame row the atom its dummy points
+            # toward), which the angle frame omits entirely. It also makes the two rows of a
+            # pair identical in every atom column and different only in the kind bit and the
             # reference -- which is precisely the truth about them.
-            atoms = [int(a) for a in (ti[tv_partner[angle_row]] if bend else table[j])]
+            atoms = [int(a) for a in (tf[tv_partner[angle_row]] if bend
+                                      else tf[j] if kind == 'phi' else table[j])]
             f = [1.0 if (bend or kind) == k else 0.0 for k in KINDS]
             for s in range(MAX_FRAME):
                 if s < len(atoms):
@@ -177,6 +193,7 @@ def dof_features(en, prior=None) -> np.ndarray:
                     f += [0.0] * N_ELEM + [0.0, 0.0, 0.0, 0.0, 0.0]
             f.append(float(all(in_ring[a] for a in atoms)))
             f.append(float(all(arom[a] for a in atoms)))
+            f.append(float(ez[j]) if kind == 'phi' and not bend else 0.0)
 
             row_global = (j if kind == 'r' else en.n_r + j if kind == 'theta'
                           else en.n_r + en.n_th + j)
@@ -188,7 +205,7 @@ def dof_features(en, prior=None) -> np.ndarray:
                 # is_improper / is_group_member / is_rotatable are ROTATION-ABOUT-A-BOND
                 # semantics. An out-of-plane bend component is none of the three, and the v
                 # row was picking up is_group_member from torsion_groups().
-                flags = [0.0, 0.0, 0.0]
+                flags = [0.0, 0.0, 0.0, 0.0]
                 refs = [0.0, 0.0, float(ref_dof[row_global])]
             elif kind == 'phi':
                 gi = next((i for i, g in enumerate(groups) if j in g), None)
@@ -196,11 +213,11 @@ def dof_features(en, prior=None) -> np.ndarray:
                        else g_sigma[gi] if gi is not None else s_imp)
                 central = tuple(sorted((int(ti[j, 1]), int(ti[j, 2]))))
                 flags = [float(j in improper), float(j in member),
-                         float(central in rot_bonds)]
+                         float(central in rot_bonds), float(j in held_bond)]
                 refs = [0.0, 0.0, 0.0]
             else:
                 sig = s_r[j] if kind == 'r' else s_th[j]
-                flags = [0.0, 0.0, 0.0]
+                flags = [0.0, 0.0, 0.0, 0.0]
                 refs = [float(r0[j]) if kind == 'r' else 0.0,
                         float(th0[j]) if kind == 'theta' else 0.0, 0.0]
             # BUILT EXPLICITLY, in feature_names() order. This used to end with
@@ -263,8 +280,10 @@ def free_dof_atom_index(en):
     numbering, which is the numbering `models.encoder_cache` stores embeddings in.
     """
     spec = en.spec
+    # 'phi' is the rows' FRAME (`torsion_frame_atoms`): on a dummy-frame row its first atom is
+    # the real atom the dummy points toward, not the collinear one `torsion_index` names
     tables = {'r': np.asarray(spec.bond_index), 'theta': np.asarray(spec.angle_index),
-              'phi': np.asarray(spec.torsion_index)}
+              'phi': en.torsion_frame_atoms()}
     m = en._M.detach().cpu().numpy()
     driven = en._driven_idx.detach().cpu().numpy()
     per_col = [driven[np.flatnonzero(m[:, j])] for j in range(m.shape[1])]
@@ -318,16 +337,22 @@ def atom_parity(en) -> np.ndarray:
     chemistry, and would differ between two SMILES orderings of one molecule. RDKit's
     perceived stereocentres are the set where the sign is an invariant of the molecule.
 
+    PERCEIVED FROM THE TAGGED INPUT, the condition side: the tetrahedral elements the SMILES
+    SPECIFIES (`stereo_lock.tagged_elements`, which includes ring cis/trans and
+    pseudo-asymmetric centres and runs under the pinned perception), so an untagged centre
+    reads 0 -- the condition does not say which configuration it is. A three-coordinate
+    centre (an amine N) is left at 0: its invertomers are one condition (stereo_lock's module
+    note). Read off the energy's own record; `en.mol` is not touched (this used to reassign
+    its stereo in place).
+
     The sign is read off the reference conformer, which is legitimate here in a way it was
     NOT for the reference dihedral: the embedding respects the SMILES stereo tags, so parity
     is discrete and stereochemically determined, where ph0 was a continuous quantity fixed by
     the embedding's arbitrary rotational zero.
     """
-    from rdkit import Chem
-    mol = en.mol
-    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-    centres = {int(i) for i, _ in
-               Chem.FindMolChiralCenters(mol, includeUnassigned=False, useLegacyImplementation=False)}
+    from energies.stereo_lock import TETRAHEDRAL
+    centres = {int(e['atoms'][0]) for e in en.stereo_elements
+               if e['kind'] == TETRAHEDRAL and e['specified'] and e['degree'] == 4}
     n = en.spec.n_atoms
     out = np.zeros(n)
     if not centres:
@@ -347,4 +372,45 @@ def atom_parity(en) -> np.ndarray:
             continue
         u, v, w = (pos[ns[k]] - pos[a] for k in range(3))
         out[a] = float(np.sign(np.dot(u, np.cross(v, w))))
+    return out
+
+
+def row_ez_parity(en) -> np.ndarray:
+    """``[n_ph]`` in {-1, 0, +1} per phi ROW: cis (+1) or trans (-1) about a tagged double bond.
+
+    WHY. The frozen molecule encoder reads bond ORDER only, so the two isomers of a
+    stereogenic double bond give it identical inputs, and `atom_parity` is tetrahedral. Each
+    stereoisomer is a distinct condition, pinned on the condition side, so the per-coordinate
+    features must carry E/Z or the policy cannot tell the two conditions apart.
+
+    NONZERO ONLY on a PROPER row (reference atom a bonded to b) whose central bond b=c is a
+    double bond the SMILES SPECIFIES (`stereo_lock.tagged_elements`): the row's own four atoms
+    (a, b, c, d) are then cis or trans, which is the reference dihedral's side of pi/2 -- read
+    off the reference, which the embedding builds to the tags (and which the stereo lock
+    verifies when it is on). Relative to the row's own atoms, so it is a property of the
+    molecule and the canonical placement order, not of the SMILES ordering; the two isomers
+    of one double bond give opposite signs on the same rows. 0 on every other row, and on an
+    untagged double bond -- the condition does not say which side it is.
+    """
+    from energies.stereo_lock import DOUBLE_BOND
+    n = int(en.spec.n_atoms)
+    slot = np.empty(n, dtype=np.int64)
+    slot[np.asarray(en.spec.perm)] = np.arange(n)
+    tagged = {frozenset(int(slot[a]) for a in e['atoms']) for e in en.stereo_elements
+              if e['kind'] == DOUBLE_BOND and e['specified']}
+    out = np.zeros(int(en.n_ph))
+    if not tagged:
+        return out
+    nbr = {}
+    for u, v in np.asarray(en.spec.graph_bond_index):
+        nbr.setdefault(int(u), set()).add(int(v))
+        nbr.setdefault(int(v), set()).add(int(u))
+    pos = np.asarray(en.ref_pos.detach().cpu().numpy(), dtype=np.float64)
+    for j, (a, b, c, d) in enumerate(en.torsion_frame_atoms()):
+        a, b, c, d = int(a), int(b), int(c), int(d)
+        if frozenset((b, c)) not in tagged or a not in nbr.get(b, ()):
+            continue
+        b1, b2, b3 = pos[b] - pos[a], pos[c] - pos[b], pos[d] - pos[c]
+        n1, n2 = np.cross(b1, b2), np.cross(b2, b3)
+        out[j] = 1.0 if float(np.dot(n1, n2)) > 0.0 else -1.0     # cos(phi) > 0: cis
     return out

@@ -16,7 +16,8 @@ FAILURE rather than a quieter pass:
   3. The closure monitor must be gated on the MOLECULE, not on joint_rings. This is the
      specific bug, pinned directly.
   4. A ring statistic over an EMPTY population must not read as a pass.
-  5. The four ring classes must stay apart: banked, held-by-design, unsupported, stale.
+  5. The four ring classes must stay apart: banked, held-by-design, unsupported, stale --
+     and within unsupported, a polycyclic system refused a monocycle's bank.
   6. Density-dependent ring numbers must stay refused, not approximated.
 
 Deliberately small: three molecules, n=64, one or two seeds. These test the BENCHMARK's
@@ -191,6 +192,28 @@ def test_ring_classes_stay_distinct(prior):
     assert len({tuple(v) for v in got.values()}) == 3, (
         'the ring set no longer distinguishes banked from held-by-design from '
         'unsupported, so the class column cannot fail: ' + repr(got))
+
+
+def test_polycyclic_hold_is_distinguished_from_no_bank(prior):
+    """A REFUSED bank and an ABSENT bank both read held_unsupported; `bank_refused` splits them.
+
+    Norbornane's key resolves cycloheptane's bank, which ring_blocks refuses because the key
+    carries no topology. Proline's key resolves nothing. Same class, different reasons -- the
+    first is a signature limitation, the second a gap in the fit -- so, like `stale_prior`,
+    the reason travels on the record. The monocycles of RING_SET must carry no refusal, or the
+    topology gate is holding rings it should bank.
+    """
+    for name, smi in RING_SET:
+        for r in rmet.classify_ring_blocks(_en(smi), prior):
+            assert r['n_cycles'] == 1 and r['bank_refused'] is None, (name, r)
+    (poly,) = rmet.classify_ring_blocks(_en('CC12CCC(C)(CC1)C2'), prior)
+    (none,) = rmet.classify_ring_blocks(_en(UNSUPPORTED[1]), prior)
+    assert poly['ring_class'] == none['ring_class'] == 'held_unsupported', (poly, none)
+    assert poly['bank_refused'] == 'polycyclic' and poly['n_cycles'] == 2, poly
+    assert none['bank_refused'] is None, none
+    # the four-class count is unchanged: a refused bank is counted as held, not as banked
+    counts = rmet.ring_class_counts([poly])
+    assert counts['held_unsupported'] == 1 and counts['banked_modes'] == 0, counts
 
 
 def test_mixed_molecule_reports_each_ring_against_its_own_contract(prior):

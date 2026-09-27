@@ -34,7 +34,7 @@ somewhere and read as a real coordinate at 0:
 |---|---|
 | `ConformerGFN._pin_dead` | pads written to exactly 0 at every wrap point and both endpoints (`torch.where`, so a NaN becomes 0) |
 | `ConformerGFN.gauss_logprob`, `_pb_logprob` | per-row `state_mask` on the final sum; the exact P_B mixture via `_pb_mixture_ang_terms`, a replica of the shared-file method minus its sum (tested equal) |
-| `MultiConformerTorsions._member_rows` | REFUSES a row whose pads are nonzero, or whose `state_mask` disagrees with the layout, before slicing it to its member's columns |
+| `MultiConformerTorsions._resolve_rows` (was `_member_rows` before the one-pass energy, 2026-09-26) | REFUSES a row whose pads are nonzero, or whose `state_mask` disagrees with the layout, before slicing it to its member's columns |
 | `MultiConformerTorsions` chart methods | on a carrier `self` is a dispatcher; `potential_energy`, `sample_prior_states`, `dof_from_state`, ... are refused by name |
 
 **Policy: ragged over valid columns** (`models/ragged_set_policy.py::RaggedConditionalSetPolicy`).
@@ -48,7 +48,7 @@ carrier: `ctree_{r,th,ph}_col` remapped (so `state_to_dof` works on a mixed batc
 `n_torsions = K`, `state_mask [1, K]`, `dof_static [1, K*F]`, `dof_atoms`/`dof_mask` padded to
 K. The reconstruction is re-checked against each member's chart AFTER padding
 (`check_carrier_convention`, 0.00e+00 A on all six). The run rebuilds the same layout from
-the same member set, and `_member_rows` checks the two agree on every energy call.
+the same member set, and `_resolve_rows` checks the two agree on every energy call.
 
 **Prior** (`ConformerModeller._draw_carrier_prior`). Equal rows per member, each drawn,
 optionally relaxed, and baked in its own chart, then placed in the carrier. Used by both
@@ -59,7 +59,10 @@ optionally relaxed, and baked in its own chart, then placed in the carrier. Used
 - **Physical eval stats** (`log_physical_properties`' `cm.*` block, basin coverage, tier
   minimum) read one chart; on a carrier the block is ABSENT with a one-time notice. Per-member
   versions are the next eval item.
-- **Transverse columns** (`_free_block == 3`) have no carrier block; refused at layout build.
+- **Transverse columns** (`_free_block == 3`): no longer a gap (2026-09-26). u and v are placed
+  in the theta region, the member code is kept per member in `CarrierLayout.kinds`, and the
+  one-pass energy builds, measures and disc-walls them per atom off `ctree_transverse`; see the
+  wiki page conformer-conditioning-and-carrier. Alkynes still need the chart change.
 - **`policy_kind: set` cannot be resumed** (unchanged): any carrier set-policy run starts fresh.
 - **Flow head** at >1 condition is a `scalarMLP`: `z_level_fill` cannot pin it and `lr_flow`
   must be sized for ~1.6M params, not a scalar.

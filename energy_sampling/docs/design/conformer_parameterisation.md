@@ -189,6 +189,14 @@ the same bend rather than a coordinate that moved nothing. Propionitrile likewis
 `21 = 3N-6`. **Propyne does not** — its linear angle is at the frame seed and it carries four
 collinear torsion frames — and it correctly still reports 9 of 15.
 
+**Status, 2026-09-26: both limits are now covered at `flex` and `full`**, by two further
+changes the two paragraphs above predate. Condition (2)'s collinear seed is removed by rooting
+the tree off an sp carbon (`mxtaltools/conformers/topology.py::choose_root`,
+`avoid_sp_carbon`), and condition (3)'s collinear frame is measured against a Z-matrix dummy
+atom on the axis (`mxtaltools/conformers/builder.py::DummyFrame`), with `log_jacobian`
+unchanged. Propyne reports `d = 15 = 3N-6` at `full`; `torsion` and `dihedral` are unchanged.
+The current mechanics are on the wiki page `conformer-chart-and-internal-coordinates.md`.
+
 **Rank and measure were verified separately** (`mxtaltools/conformers/tests/
 test_transverse_bending.py`), at the linear reference and at perturbations, because a chart
 can have the right rank and the wrong density and the column count establishes neither:

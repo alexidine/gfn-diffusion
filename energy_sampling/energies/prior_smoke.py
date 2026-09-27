@@ -1092,7 +1092,6 @@ def _group_rigid(en, name, level, led, seed, inject=()):
     closure bond, and closure bonds and ring angles ARE in the force field's graph lists, so
     the motion is legitimately not rigid there. That is what closure_sigma measures instead.
     """
-    from mxtaltools.conformers.builder import build
     groups = en.torsion_groups()
     ti = np.asarray(en.spec.torsion_index)
     inr = en.atom_in_ring
@@ -1110,7 +1109,9 @@ def _group_rigid(en, name, level, led, seed, inject=()):
     x0, _ = draw_states(en, nb, rng)
     tree, ff = en._batch(nb)
     r0, th0, ph0 = en.dof_from_state(x0)
-    p0 = build(tree, r0.reshape(-1), th0.reshape(-1), ph0.reshape(-1))
+    # en._build, NOT builder.build: it carries the chart's transverse and dummy-frame masks,
+    # without which a nitrile's or alkyne's geometry here is not the one en.energy builds
+    p0 = en._build(tree, r0, th0, ph0, nb)
     _, a0 = graph_geometry(p0, ff)
     d0 = _nonbonded_d(p0, ff)
 
@@ -1126,7 +1127,7 @@ def _group_rigid(en, name, level, led, seed, inject=()):
         delta = 0.0 if 'null-perturbation' in inject else float(rng.uniform(0.4, 2.0))
         for j in g:
             ph1[:, j] += delta            # ONE shared displacement over the whole group
-        p1 = build(tree, r0.reshape(-1), th0.reshape(-1), ph1.reshape(-1))
+        p1 = en._build(tree, r0, th0, ph1, nb)
         _, a1 = graph_geometry(p1, ff)
         worst_a = max(worst_a, (a1 - a0).abs().max().item())
         m = _moved(d0, _nonbonded_d(p1, ff))
@@ -1178,8 +1179,6 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
             return {'name': name, 'smiles': smiles, 'skipped': msg}
         raise
 
-    from mxtaltools.conformers.builder import build
-
     # ---------------------------------------- LEG 0: structural invariants, before any draw
     apply_structural_injections(en, inject)
     _structure_leg(en, name, level, led)
@@ -1195,7 +1194,7 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
     r, th, ph = en.dof_from_state(x)
     r, th, ph = inject_dof(en, r, th, ph, np.random.default_rng(seed + 11), inject)
     tree, ff = en._batch(n)
-    pos = build(tree, r.reshape(-1), th.reshape(-1), ph.reshape(-1))
+    pos = en._build(tree, r, th, ph, n)          # with the chart's masks, as en.energy builds
     e_state = en.energy(x)                       # the pure state path: no injection reaches it
 
     # THE POSITIVE CONTROL ON THE DRAW, and it is the one check here that generalises over
@@ -1335,7 +1334,6 @@ def _rigid(en, name, level, led, seed, inject):
     never rotates a ring bond, so no tree bond and no closure bond can move. It was zero by
     construction rather than by correctness.
     """
-    from mxtaltools.conformers.builder import build
     if not en.rotatable:
         for k in ('rigid_angle', 'rigid_perturbation_moved'):
             led.skip(k, name, level,
@@ -1370,7 +1368,7 @@ def _rigid(en, name, level, led, seed, inject):
             r_, th_, ph_ = en.dof_from_state(x0)
             ph_ = ph_.clone()
             ph_[:, sorted(rows)[0] - n0] += delta
-            p1 = build(tree, r_.reshape(-1), th_.reshape(-1), ph_.reshape(-1))
+            p1 = en._build(tree, r_, th_, ph_, nb)
         else:
             x1 = x0.clone()
             for c in drive:
@@ -1742,8 +1740,11 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
         # rounds to "verified". They are UNREACHABLE, not inapplicable: nothing about this
         # molecule or this level says the property does not hold, only that no code got to
         # measure it.
+        rep = None
         for k in PRIOR_REPORT_CHECKS:
             led.skip(k, name, level, f'{type(ex).__name__}: {ex}', K_UNREACHABLE)
+    if rep is None:
+        pass                                   # skipped above, by name
     elif 'skipped' in rep:
         # `prior_report` CATCHES the density's NotImplementedError itself and returns a
         # labelled skip, so nothing reaches the `except` above and this branch used to run
@@ -1820,7 +1821,8 @@ def _prior_key_external(en, name, level, led):
     try:
         got = en.prior_dof_types(bare)
         m = condition_from_energy(en, partial_charges=False)
-        m.build_conformer_tree()
+        # the root rule the chart was built with, or the trees differ on sp-root molecules
+        m.build_conformer_tree(avoid_sp_root=getattr(en, 'avoid_sp_root', False))
         keys = InternalPrior._atom_keys(m)
         bi = m.tree_bond_index.detach().cpu().numpy()
         ai = m.tree_angle_index.detach().cpu().numpy()

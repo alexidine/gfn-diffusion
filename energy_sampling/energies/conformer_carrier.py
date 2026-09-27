@@ -7,14 +7,27 @@ metric ragged, each molecule's state is PLACED into a shared width-K carrier:
 
     carrier = [ r block (R_max) | theta block (T_max) | phi block (P_max) ]
 
-A molecule's j-th state column goes to ``offset[block(j)] + rank of j within its block``, and
-every other column is PAD. Two properties follow by construction and are what make the
+A molecule's j-th state column goes to ``offset[region(j)] + rank of j within its region``,
+and every other column is PAD. Two properties follow by construction and are what make the
 carrier cheap:
 
   * the periodic mask is COLUMN-CONSTANT -- every carrier column in the phi block wraps, for
     every molecule -- so the GFN's single `angular_mask` is still the truth;
-  * when every member has the same block counts the layout is the IDENTITY (K = k, column j
-    goes to j), so a same-k set is byte-identical to the pre-carrier route.
+  * when every member has the same per-column block codes the layout is the IDENTITY
+    (K = k, column j goes to j), so a same-layout set is byte-identical to the pre-carrier
+    route.
+
+A TRANSVERSE COLUMN (block code 3, one component of a linear bend's (u, v) pair) is placed in
+the THETA region, both u and v. It is non-periodic, walled by the same box and scaled by the
+same `delta_theta_max` as theta, so the region's three shared properties -- no wrap, the box
+wall, the scale -- all hold for it, and the phi region keeps only columns that wrap. A fourth
+block would buy nothing the theta region lacks and costs width (K 79 against 75 on the
+3000-molecule QM9 census). What the region code LOSES is which columns are u and v: that is
+kept per member in `kind` (the member's own code, 3 included), because the region code is
+right for periodicity, walls and the checkpoint's `block_width` stamp but wrong for anything
+that reports or conditions on what a column IS. The pair's own properties -- the disc wall in
+rho and the log sinc measure -- are per-atom and read off the condition graph
+(`ctree_transverse`), never off a carrier column.
 
 PADS ARE NOT COORDINATES. They are pinned to exactly 0 along the whole trajectory
 (``ConformerGFN._pin_dead``), excluded from every log-prob sum (``state_mask``), never
@@ -32,8 +45,12 @@ import numpy as np
 import torch
 
 #: block codes, as ``ConformerTorsions._free_block`` spells them
-BLOCKS = (0, 1, 2)           # r, theta, phi
+BLOCKS = (0, 1, 2)           # r, theta, phi -- the carrier's REGIONS
 TRANSVERSE = 3
+#: member block code -> the carrier region its column is placed in (module docstring)
+REGION = {0: 0, 1: 1, 2: 2, TRANSVERSE: 1}
+#: labels for a member block code, for reporting; -1 is a pad
+KIND_NAMES = {0: 'r', 1: 'theta', 2: 'phi', TRANSVERSE: 'transverse'}
 
 
 class CarrierLayout:
@@ -42,32 +59,62 @@ class CarrierLayout:
     def __init__(self, members: Mapping[str, object]):
         if not members:
             raise ValueError('CarrierLayout needs at least one member')
-        blocks = {}
+        kinds, blocks = {}, {}
         for ident, en in members.items():
-            fb = np.asarray(en._free_block).reshape(-1)
-            if (fb == TRANSVERSE).any():
-                # a transverse column is walled like r/theta but is a (u, v) pair with its own
-                # measure; it has no block of its own in the carrier yet
-                raise NotImplementedError(
-                    f'{ident}: carries {int((fb == TRANSVERSE).sum())} transverse column(s); '
-                    f'the carrier layout has no transverse block yet')
-            blocks[ident] = fb
-        self.block_width = [max(int((fb == b).sum()) for fb in blocks.values())
-                            for b in BLOCKS]
-        self.offsets = [0, self.block_width[0], self.block_width[0] + self.block_width[1]]
-        self.K = int(sum(self.block_width))
-        self.free_block = np.repeat(np.asarray(BLOCKS), self.block_width)
+            fb = np.asarray(en._free_block, dtype=np.int64).reshape(-1)
+            unknown = sorted(set(fb.tolist()) - set(REGION))
+            if unknown:
+                # a code with no region would be placed nowhere, or -- read as an index --
+                # into some other block's columns
+                raise ValueError(f'{ident}: block code(s) {unknown} have no carrier region')
+            kinds[ident] = fb
+            blocks[ident] = np.asarray([REGION[int(b)] for b in fb], dtype=np.int64)
 
-        self.cols: Dict[str, np.ndarray] = {}
-        for ident, fb in blocks.items():
-            seen = [0, 0, 0]
-            cols = np.empty(len(fb), dtype=np.int64)
-            for j, b in enumerate(fb):
-                cols[j] = self.offsets[int(b)] + seen[int(b)]
-                seen[int(b)] += 1
-            self.cols[ident] = cols
-        self.is_identity = all(len(c) == self.K and (c == np.arange(self.K)).all()
-                               for c in self.cols.values())
+        # THE IDENTITY is decided on the members' OWN codes, before any placement: when every
+        # member has the same `_free_block`, column j means the same thing for every member,
+        # so it goes to j. Two consequences, both deliberate. A set of one nitrile's
+        # stereoisomers (identical codes, v in the phi part of the state) stays the identity
+        # instead of becoming a permuted carrier for no reason. And a set whose members
+        # DISAGREE on a column's kind is never the identity: the identity route keeps no
+        # layout, so the dispatcher's own chart methods -- `bounding_energy`, the eval
+        # statistics, the column labels -- read the reference member's `_free_block` for
+        # EVERY row, and would read another member's theta as a bend, or its bend as a theta.
+        # With no transverse column this is exactly the old test (every column in its block).
+        first = next(iter(kinds.values()))
+        self.is_identity = all(len(fb) == len(first) and (fb == first).all()
+                               for fb in kinds.values())
+        if self.is_identity:
+            self.K = int(len(first))
+            #: per carrier column, its REGION code (0 r, 1 theta -- transverse included --
+            #: 2 phi): what periodicity, the box wall and the `block_width` stamp read. In
+            #: column order, which on the identity is the members' own order
+            self.free_block = next(iter(blocks.values()))
+            self.block_width = [int((self.free_block == b).sum()) for b in BLOCKS]
+            self.offsets = None
+            self.cols: Dict[str, np.ndarray] = {ident: np.arange(self.K, dtype=np.int64)
+                                                for ident in kinds}
+        else:
+            self.block_width = [max(int((fb == b).sum()) for fb in blocks.values())
+                                for b in BLOCKS]
+            self.offsets = [0, self.block_width[0], self.block_width[0] + self.block_width[1]]
+            self.K = int(sum(self.block_width))
+            self.free_block = np.repeat(np.asarray(BLOCKS), self.block_width)
+            self.cols = {}
+            for ident, fb in blocks.items():
+                seen = [0, 0, 0]
+                cols = np.empty(len(fb), dtype=np.int64)
+                for j, b in enumerate(fb):
+                    cols[j] = self.offsets[int(b)] + seen[int(b)]
+                    seen[int(b)] += 1
+                self.cols[ident] = cols
+        #: per member, ``[K]``: the member's OWN block code at each of its carrier columns
+        #: (3 on u and v), -1 on its pads. PER MEMBER because the same theta-region column can
+        #: be one member's theta and another's u; a single per-column code cannot say both.
+        self.kinds: Dict[str, np.ndarray] = {}
+        for ident, fb in kinds.items():
+            kd = np.full(self.K, -1, dtype=np.int64)
+            kd[self.cols[ident]] = fb
+            self.kinds[ident] = kd
 
     # ------------------------------------------------------------------ per member
 
@@ -82,6 +129,24 @@ class CarrierLayout:
 
     def pad_cols(self, ident: str) -> np.ndarray:
         return np.flatnonzero(~self.valid(ident))
+
+    def kind(self, ident: str) -> np.ndarray:
+        """``[K]`` long: the member's own block code per carrier column (3 = u or v), -1 pad."""
+        return self.kinds[ident]
+
+    def column_kinds(self) -> list:
+        """Per carrier column, the sorted member codes that occupy it (pads excluded).
+
+        A theta-region column is ``(1,)``, ``(3,)`` or ``(1, 3)`` -- theta for every member
+        owning it, a bend component for every one, or theta for some and a bend for others.
+        What a pooled per-column reading over a mixed batch is a reading OF.
+        """
+        tab = np.stack(list(self.kinds.values()))
+        return [tuple(sorted(set(c[c >= 0].tolist()))) for c in tab.T]
+
+    def column_label(self, j: int) -> str:
+        """``'theta'``, ``'transverse'`` or ``'theta|transverse'`` -- `column_kinds` as text."""
+        return '|'.join(KIND_NAMES[int(c)] for c in self.column_kinds()[int(j)]) or 'pad'
 
     def col_map(self, ident: str) -> np.ndarray:
         """``[K]`` long: the member column at each carrier column, -1 on a pad."""
@@ -106,11 +171,14 @@ class CarrierLayout:
 
     def describe(self) -> str:
         w = self.block_width
-        lines = [f'   CARRIER K = {self.K}  (r {w[0]} | theta {w[1]} | phi {w[2]})'
-                 + ('  -- identity, every member has the same block counts'
+        lines = [f'   CARRIER K = {self.K}  (r {w[0]} | theta {w[1]} | phi {w[2]}; '
+                 f'transverse u/v sit in the theta region)'
+                 + ('  -- identity, every member has the same per-column block codes'
                     if self.is_identity else '')]
         for ident, c in self.cols.items():
-            lines.append(f'      {ident}: k = {len(c)}, {self.K - len(c)} pad column(s)')
+            n_tv = int((self.kinds[ident] == TRANSVERSE).sum())
+            lines.append(f'      {ident}: k = {len(c)}, {self.K - len(c)} pad column(s)'
+                         + (f', {n_tv} transverse' if n_tv else ''))
         return '\n'.join(lines)
 
 

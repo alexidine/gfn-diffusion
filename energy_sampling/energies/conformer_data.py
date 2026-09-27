@@ -83,6 +83,9 @@ Per-atom, ``[N]``::
     ctree_angle_is_linear           theta ~ pi: a genuine singularity of any atom tree.
     ctree_torsion_is_proper         False on near-root impropers.
     ctree_torsion_frame_is_linear   phi ill-conditioned.
+    ctree_transverse                this atom's (theta, phi) slots carry the transverse (u, v).
+    ctree_dummy_frame               this atom's phi slot is measured against the Z-matrix
+                                    dummy on its linear axis, not the collinear ref_a.
     ctree_state_col                 which state dimension drives this atom's torsion,
                                     -1 if frozen. The sparse form of
                                     ``ConformerTorsions.mask``; sparse because that mask
@@ -92,10 +95,18 @@ Per-atom, ``[N]``::
                                     so one is assigned to each free endpoint; a molecule
                                     needing two on one atom raises rather than dropping
                                     one silently.
+    ctree_stereo_kind, _sign,       the STEREO LOCK's table on its key atoms
+    ctree_stereo_nbr [N, 4], _lo    (energies/stereo_lock.py): kind 0 none, 1 tetrahedral
+                                    (keyed on the centre), 2 double bond (keyed on atom b);
+                                    the reference sign; the four indicator atoms as DELTAS
+                                    from the key; the per-element in-band threshold.
 
 Per-graph::
 
     n_torsions        [1] long, = k.
+    ctree_stereo_coeff [1] float, the stereo lock's coefficient of the energy the graph was
+                      built from (0 = unlocked). Checked against the run's energy by
+                      ``MultiConformerTorsions._resolve_rows`` and ``stereo_coeff_mismatch``.
     torsion_state     [1, k] float, prior/replay rows only.
     conformer_energy  [1] float, prior/replay rows only. RAW energy in the force field's
                       own units (kcal/mol), i.e. baked at T = 1 --
@@ -136,9 +147,21 @@ CTREE_ATOM_FIELDS = (
     # carries the reference and the map but not this flag reconstructs a wrong geometry
     # from right-shaped tensors.
     'ctree_transverse',
+    # per TORSION-OWNING atom: this row's phi (or v) is measured against the Z-matrix DUMMY
+    # atom on its linear axis, not against the collinear real atom its ref_a names
+    # (mxtaltools builder.DummyFrame). Same reason as ctree_transverse: it changes what the
+    # phi slot means, so it travels with the slot.
+    'ctree_dummy_frame',
+    # the STEREO LOCK (energies/stereo_lock.STEREO_FIELDS): which stereoisomer this condition
+    # is, as signs read off THIS graph's reference and the atoms they are read from. Required,
+    # so a file written without them is refused rather than scored unlocked.
+    'ctree_stereo_kind', 'ctree_stereo_sign', 'ctree_stereo_nbr', 'ctree_stereo_lo',
 )
 # per-graph fields present on every conformer graph
-CTREE_GRAPH_FIELDS = ('n_torsions', 'ctree_r_floor', 'ctree_theta_floor', 'ctree_clamp')
+CTREE_GRAPH_FIELDS = ('n_torsions', 'ctree_r_floor', 'ctree_theta_floor', 'ctree_clamp',
+                      # the stereo lock's coefficient the graph was built under: which TARGET
+                      # its baked energy and its per-coordinate features belong to
+                      'ctree_stereo_coeff')
 CONFORMER_FIELDS = CTREE_ATOM_FIELDS + CTREE_GRAPH_FIELDS
 # additionally required of a prior / replay row, but not of a condition
 STATE_FIELDS = ('torsion_state', 'conformer_energy')
@@ -331,8 +354,20 @@ def condition_from_energy(energy, identifier: Optional[str] = None,
     mol.ctree_r0 = _scatter(_ref[:_nr], rank >= 1, n, dtype)
     mol.ctree_theta0 = _scatter(_ref[_nr:_nr + _nth], rank >= 2, n, dtype)
     mol.ctree_phi0 = _scatter(_ref[_nr + _nth:], rank >= 3, n, dtype)
-    mol.ctree_transverse = _scatter(as_bool(energy.transverse_angles), rank >= 2, n,
-                                    torch.bool, fill=False)
+    mol.ctree_transverse = transverse_atom_flags(energy)
+    mol.ctree_dummy_frame = dummy_frame_atom_flags(energy)
+    # THE STEREO LOCK's table, written whether or not the energy locks (stereo_coeff), so a
+    # conditions file is the same object either way. From the energy, like everything here:
+    # its signs were read off `energy.ref_pos`, which is this graph's `pos`, so the sign and
+    # the geometry it refers to travel together.
+    from energies.stereo_lock import graph_fields
+    for _name, _val in graph_fields(energy.stereo, n, dtype).items():
+        setattr(mol, _name, _val)
+    # ...and the COEFFICIENT, which the table is not: whether the lock is on changes the target
+    # every row baked from this graph carries (clip(U + P)) and the per-coordinate features
+    # (`dof_features`' held rows), and neither says so. Recorded per graph so every row that
+    # descends from it -- conditions, prior, anchor, replay, a restored buffer -- carries it.
+    mol.ctree_stereo_coeff = torch.tensor([float(energy.stereo_coeff)], dtype=dtype)
 
     mol.ctree_angle_is_linear = _scatter(as_bool(spec.angle_is_linear), rank >= 2, n,
                                          torch.bool)
@@ -389,6 +424,36 @@ def condition_from_smiles(smiles: str, identifier: Optional[str] = None,
 
     energy = ConformerTorsions(smiles=smiles, device='cpu', **energy_kwargs)
     return condition_from_energy(energy, identifier=identifier)
+
+
+def transverse_atom_flags(energy) -> torch.Tensor:
+    """``[n_atoms]`` bool in PLACEMENT order: this atom's (theta, phi) pair is carried as (u, v).
+
+    The per-angle-row `energy.transverse_angles` scattered onto the atom each row places, i.e.
+    the ``ctree_transverse`` field a condition graph stores. ONE function for both writers --
+    `condition_from_energy` and the multi-molecule energy's library
+    (`ForceFieldLibrary.from_members`) -- because the energy refuses a row whose stored flags
+    differ from its member's atom by atom, and two copies of this scatter could drift into a
+    refusal of every correct file, or into agreeing on a wrong one.
+    """
+    rank = np.minimum(np.asarray(energy.spec.round_id), 3)
+    return _scatter(torch.as_tensor(np.ascontiguousarray(energy.transverse_angles),
+                                    dtype=torch.bool),
+                    rank >= 2, int(energy.spec.n_atoms), torch.bool, fill=False)
+
+
+def dummy_frame_atom_flags(energy) -> torch.Tensor:
+    """``[n_atoms]`` bool in PLACEMENT order: this atom's torsion row takes a dummy frame.
+
+    The per-torsion-row `energy.dummy_frame_rows` scattered onto the atom each row places --
+    the ``ctree_dummy_frame`` field. One function for both writers, `condition_from_energy`
+    and the multi-molecule energy's library, for the reason `transverse_atom_flags` gives.
+    """
+    rank = np.minimum(np.asarray(energy.spec.round_id), 3)
+    rows = np.asarray(getattr(energy, 'dummy_frame_rows',
+                              np.zeros(int(energy.n_ph), dtype=bool)), dtype=bool)
+    return _scatter(torch.as_tensor(np.ascontiguousarray(rows), dtype=torch.bool),
+                    rank >= 3, int(energy.spec.n_atoms), torch.bool, fill=False)
 
 
 def _scatter(values, mask, n: int, dtype, fill=0):
@@ -565,6 +630,22 @@ def require_conformer_fields(batch, require_state: bool = False):
             f"batch is missing conformer fields {missing}; build it with "
             f"energies.conformer_data (condition_from_energy / attach_states)")
     return batch
+
+
+def stereo_coeff_mismatch(batch, coeff: float) -> torch.Tensor:
+    """``[num_graphs]`` bool: the graph was built under another stereo-lock coefficient.
+
+    Read off ``ctree_stereo_coeff``; a batch without it reads as built unlocked (0), which is
+    what a file written before the field meant. Relative tolerance 1e-6, so a float64 file
+    cast to a float32 run still matches its own coefficient; 0 matches only 0.
+    """
+    rec = getattr(batch, 'ctree_stereo_coeff', None)
+    n = int(batch.num_graphs) if getattr(batch, 'is_batch', True) else 1
+    if rec is None:
+        rec = torch.zeros(n, dtype=torch.float64)
+    rec = rec.reshape(-1).double()
+    want = torch.full_like(rec, float(coeff))
+    return ~torch.isclose(rec, want, rtol=1e-6, atol=0.0)
 
 
 def state_dim(batch) -> int:
@@ -768,6 +849,22 @@ def transverse_mask(batch):
     return flag[dof_rank(batch) >= 2]
 
 
+def dummy_frame_mask(batch):
+    """Per-TORSION-ROW dummy-frame flags for ``builder.build``, or None when there are none.
+
+    `transverse_mask`'s counterpart: the stored flag is per atom, the builder wants it per
+    torsion row, and ``batch_tree`` builds ``torsion_index`` from the ``rank >= 3`` atoms in
+    atom order, so the restriction is the conversion. None on a batch with no dummy row keeps
+    it on the code path it took before dummy frames existed. A batch carrying NO such field
+    reads as dummy-free; the multi-molecule energy compares it against each member's chart
+    atom by atom and refuses a member that has one.
+    """
+    flag = getattr(batch, 'ctree_dummy_frame', None)
+    if flag is None or not bool(flag.any()):
+        return None
+    return flag[dof_rank(batch) >= 3]
+
+
 def state_to_dof(batch, state: torch.Tensor):
     """State ``[B, k]`` on [-1, 1] -> ``(r, theta, phi)``, the graph-native twin of
     ``ConformerTorsions.dof_from_state``.
@@ -856,7 +953,7 @@ def states_to_positions(batch, state: torch.Tensor) -> torch.Tensor:
     from mxtaltools.conformers.builder import build
 
     return build(batch_tree(batch), *state_to_dof(batch, state),
-                 transverse=transverse_mask(batch))
+                 transverse=transverse_mask(batch), dummy_frame=dummy_frame_mask(batch))
 
 
 # ------------------------------------------------- state-bearing (prior) rows

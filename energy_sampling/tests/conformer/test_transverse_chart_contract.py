@@ -13,10 +13,14 @@ Three properties that were all UNTESTED when the chart landed, each for a differ
     on rho < pi; past it the map is an orientation-reversing double cover, log sinc is -inf,
     and one row takes the batch's TB loss to infinity.
 
-`CC#N` and `CCC#N` are the COVERED molecules (their linear bend becomes a transverse pair);
-`CC#C` and `CC#CCO` are the UNCOVERED contrast (frame seed and collinear reference frames), and
-they must stay refused. Keeping both in every test is what stops "it works" from meaning "it
-works on the case I chose".
+`CC#N` and `CCC#N` are the COVERED molecules (their linear bend becomes a transverse pair).
+`CC#C` and `CC#CCO` were the uncovered contrast (frame seed and collinear reference frames) until
+the sp-root rule and the Z-matrix dummy frame covered them too; they are now ALKYNES, complete at
+`full` and unchanged at `dihedral`. What is still refused at `full` is a CUMULATED centre
+(`CC=C=CC`, held on purpose) and, as the fallback for a collinear frame no dummy can carry,
+the generic incomplete chart -- which no molecule tested here reaches on its own, so it is
+forced (`_no_dummy`). Keeping both sides in every test is what stops "it works" from meaning
+"it works on the case I chose".
 """
 import numpy as np
 import pytest
@@ -27,7 +31,8 @@ from energies.conformer_data import condition_from_energy
 from energies.conformer_torsions import ConformerTorsions
 
 COVERED = ['CC#N', 'CCC#N']
-UNCOVERED = ['CC#C', 'CC#CCO']
+ALKYNES = ['CC#C', 'CC#CCO']
+UNCOVERED = ['CC=C=CC']
 PLAIN = ['CCCO', 'CCCCO']
 
 
@@ -58,6 +63,19 @@ def _state_at_rho(en, rho, n=1):
     return x
 
 
+@pytest.fixture
+def _no_dummy(monkeypatch):
+    """Every collinear frame refused a dummy reference: the chart's fallback for a frame no
+    dummy can carry. The rows are then held exactly as they were before the dummy existed."""
+    import mxtaltools.conformers.builder as B
+    real = B.dummy_frame_refs
+
+    def refuse_all(tree, mask, strict=True):
+        refs, ok = real(tree, mask, strict=False)
+        return refs, torch.zeros_like(ok)
+    monkeypatch.setattr(B, 'dummy_frame_refs', refuse_all)
+
+
 def _pair(en):
     """``(u_row, v_row, angle_row)`` for the first transverse pair, in DoF numbering."""
     j = int(np.flatnonzero(np.asarray(en.transverse_angles, dtype=bool))[0])
@@ -78,16 +96,28 @@ def test_an_incomplete_full_chart_is_refused_by_the_energy(smiles):
         _en(smiles, 'full')
 
 
-@pytest.mark.parametrize('smiles', UNCOVERED)
-def test_the_refusal_names_the_shortfall_and_the_opt_out(smiles):
+@pytest.mark.parametrize('smiles', ALKYNES)
+def test_the_refusal_names_the_shortfall_and_the_opt_out(smiles, _no_dummy):
     """An error that says only "refused" makes the next person delete the guard."""
     with pytest.raises(ValueError) as exc:
         _en(smiles, 'full')
     msg = str(exc.value)
+    assert exc.value.code == 'incomplete_chart'
     assert '3N-6' in msg and 'allow_constrained' in msg
     assert 'not covered by the transverse pair' in msg
+    assert 'could not take a dummy reference' in msg
     # and it must not blame the molecule
     assert 'chart limitation, not a rigid molecule' in msg
+
+
+@pytest.mark.parametrize('smiles', ALKYNES)
+def test_an_alkyne_is_complete_at_full(smiles):
+    """The sp-root rule and the dummy frame cover what the transverse pair alone could not."""
+    en = _en(smiles, 'full')
+    assert en.constrained_rows == 0 and en.uncovered_linear_angles == 0
+    assert en.data_ndim == 3 * en.spec.n_atoms - 6
+    assert int(np.asarray(en.dummy_frame_rows).sum()) > 0
+    assert 'DUMMY FRAME' in en.describe() and 'CONSTRAINED' not in en.describe()
 
 
 @pytest.mark.parametrize('smiles', UNCOVERED)
@@ -110,7 +140,7 @@ def test_a_covered_molecule_is_not_refused_and_is_complete(smiles):
     assert 'TRANSVERSE' in en.describe()
 
 
-@pytest.mark.parametrize('smiles', UNCOVERED + COVERED)
+@pytest.mark.parametrize('smiles', UNCOVERED + ALKYNES + COVERED)
 def test_the_lower_tiers_are_unchanged_by_the_chart(smiles):
     """`torsion` and `dihedral` cannot drive a whole pair, so they keep the old treatment.
 
@@ -125,6 +155,8 @@ def test_the_lower_tiers_are_unchanged_by_the_chart(smiles):
         pytest.skip(f'{smiles} does not build at dihedral: {exc}')
     assert int(np.asarray(en.transverse_angles).sum()) == 0
     assert not (np.asarray(en._free_block) == 3).any()
+    # nor a dummy frame, nor a moved root: the tree is the default one
+    assert not np.asarray(en.dummy_frame_rows).any() and en.spec.root_moved_from == -1
 
 
 # ------------------------------------------------------------------ the features

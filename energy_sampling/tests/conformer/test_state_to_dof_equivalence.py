@@ -34,19 +34,17 @@ TOL = 1e-9
 #: 'CC#N' and 'CCC#N' were added when the transverse chart landed. They are the cases whose
 #: linear bend is COVERED by it -- so their theta and phi slots hold (u, v), the two builders
 #: must agree about that, and the graph path must reconstruct through place_nerf_transverse.
-#: 'CC#CCO' is NOT covered (its linear angle sits at a frame seed with collinear reference
-#: frames) and is kept for the held-row case; the two are different tests, not a duplicate.
-MOLECULES = ['CCCCO', 'CCC(C)CO', 'C1CCCCC1CO', 'C[C@H](O)CC=O', 'CC#CCO',
+#: 'CC#CCO' and 'CCC#CC#CC#C' are the ALKYNES: at `flex` and `full` their collinear frames
+#: are measured against a Z-matrix dummy atom (a chain of them in the tetrayne) and the root
+#: moves off the sp carbon, so the graph path must carry `ctree_dummy_frame` and rebuild the
+#: same dummies; at `torsion` and `dihedral` they keep the held-row chart, which is the
+#: contrast case. Neither needs `allow_constrained` any more -- both are complete at `full`.
+MOLECULES = ['CCCCO', 'CCC(C)CO', 'C1CCCCC1CO', 'C[C@H](O)CC=O', 'CC#CCO', 'CCC#CC#CC#C',
              'CC#N', 'CCC#N']
 
 
 def _energy(smiles, level):
-    # allow_constrained: 'CC#CCO' is here precisely BECAUSE its chart is incomplete at
-    # 'full' -- it is the held-row contrast case for the transverse molecules. Without the
-    # opt-in the refusal would turn this file's most interesting case into a skip, which is
-    # coverage lost to a guard rather than a guard doing its job.
-    return ConformerTorsions(smiles=smiles, device='cpu', level=level,
-                             allow_constrained=True)
+    return ConformerTorsions(smiles=smiles, device='cpu', level=level)
 
 
 def _states(energy, n=4, seed=0):

@@ -56,7 +56,8 @@ def test_gfn_has_no_kwargs_sink():
 
 
 def test_install_is_a_no_op_without_the_key():
-    """Default must be exactly the flat path: absent key -> return before touching anything.
+    """Default must be exactly the flat path on a single chart: absent key -> return before
+    touching anything.
 
     Called on a bare instance with no runtime attached; reaching any further would raise
     AttributeError, so completing the call IS the assertion.
@@ -90,13 +91,77 @@ def test_dplr_is_refused_at_construction_not_mid_rollout():
         ConformerModeller._install_set_policy(m)
 
 
-def test_resume_is_refused_loudly():
-    """The policy choice is not in gfn_config, so the checkpointer would rebuild a FLAT GFN
-    and its strict load would fail on the set head's weights. Refuse with the reason."""
+# `test_resume_is_refused_loudly` pinned a refusal that fired on the WRONG path -- a fresh
+# launch with continue_from_checkpoint and no running file -- while no real reload reached
+# it. The set policy now resumes; tests/conformer/test_set_policy_resume.py is the round trip
+# that replaces it, including the fresh-launch case the refusal used to block.
+
+
+def _install_stub(smiles, conditional=True, kind='set', dplr_rank=0):
+    """A ConformerModeller holding a real energy and a real GFN, and nothing else
+    _install_set_policy reads. The optimizer rebuild is stubbed: what is under test is
+    WHICH head gets built, not the optimizer."""
+    from copy import deepcopy
+
+    from energies.multi_conformer import MultiConformerTorsions
+    from models.gfn import GFN as BareGFN      # the class ConformerGFN subclasses
+
+    en = MultiConformerTorsions(smiles, identifiers=smiles, device='cpu', level='full',
+                                force_field='mmff')
     m = ConformerModeller.__new__(ConformerModeller)
-    m._policy_spec = {'policy_kind': 'set'}
+    m.energy_function = en
+    m.device = 'cpu'
     m.args = _Args()
-    m.args.checkpoint_name = 'something.pt'
-    m.gfn_config = {'dplr_rank': 0, 't_dim': 64}
-    with pytest.raises(NotImplementedError, match='cannot be resumed'):
+    m.args.embedding_conditioning = conditional
+    m.args.embedding_conditioning_dim = 16
+    m._policy_spec = {'policy_kind': kind, 'set_policy_hidden': 16, 'set_policy_layers': 2,
+                      'set_policy_corr_dim': 8}
+    m.gfn_config = dict(dim=en.data_ndim, s_emb_dim=16, conditions_dim=16, harmonics_dim=4,
+                        t_dim=8, t_hidden_dim=16, condition_embedding_dim=8,
+                        conditional=True, learn_pb=True, device='cpu',
+                        do_periodic_angles=False, angular_mask=en.periodic_dims,
+                        s_hidden_dim=16, policy_hidden_dim=16, flow_hidden_dim=16,
+                        cond_hidden_dim=16, s_layers=2, policy_layers=2, flow_layers=2,
+                        cond_layers=2, dplr_rank=dplr_rank)
+    m.gfn_model = BareGFN(**m.gfn_config)
+    m.ema_model = deepcopy(m.gfn_model)
+    m.init_schedulers_optimizers = lambda: None
+    return m
+
+
+def test_an_identity_layout_set_gets_the_ragged_head():
+    """NH3 and H2CO both have 4 atoms, so at `full` their block counts agree (3|2|1): the
+    layout is the IDENTITY and the energy is not a carrier. The dense conditional head would
+    bake the REFERENCE member's static features into every row -- wrong for the other
+    molecule, silently. More than one distinct molecule must get the ragged head."""
+    from models.conformer_gfn import ConformerGFN
+    from models.ragged_set_policy import RaggedConditionalSetPolicy
+
+    m = _install_stub(['N', 'C=O'])
+    assert not m.energy_function.is_carrier and m.energy_function.distinct_smiles == 2, \
+        'separator: this set must be an identity layout, or the test proves nothing'
+    ConformerModeller._install_set_policy(m)
+    for model in (m.gfn_model, m.ema_model):
+        assert isinstance(model.forward_policy, RaggedConditionalSetPolicy)
+        assert type(model) is ConformerGFN and model._carrier is True
+    stamp = m.gfn_config['conformer']
+    assert stamp['carrier'] is True and stamp['block_width'] == [3, 2, 1]
+
+
+def test_an_identity_layout_set_without_embeddings_is_refused():
+    m = _install_stub(['N', 'C=O'], conditional=False)
+    with pytest.raises(NotImplementedError, match='embedding_conditioning'):
         ConformerModeller._install_set_policy(m)
+
+
+def test_a_flat_policy_with_dplr_on_a_carrier_is_refused():
+    """DPLR's Woodbury forward density never calls ConformerGFN.gauss_logprob, the only
+    masked path, so pad columns would enter the forward log-prob."""
+    m = _install_stub(['C', 'CO', 'N'], kind='flat', dplr_rank=2)
+    assert m.energy_function.is_carrier
+    with pytest.raises(NotImplementedError, match='dplr_rank 2'):
+        ConformerModeller._install_set_policy(m)
+    ok = _install_stub(['C', 'CO', 'N'], kind='flat', dplr_rank=0)
+    ConformerModeller._install_set_policy(ok)
+    assert ok.gfn_config['conformer'] == {'policy_kind': 'flat', 'carrier': True,
+                                          'block_width': [5, 4, 3]}
