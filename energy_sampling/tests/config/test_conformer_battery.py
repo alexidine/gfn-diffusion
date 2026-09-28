@@ -4,6 +4,11 @@ and drift it exists to catch aborts generation by name, and the rendered sbatch 
 crystal template with four substitutions -- runs each leg the way it says against a fake
 cluster tree.
 
+Two rung kinds: r0 is a VALIDATION rung, read from a hand-picked set
+(build_conformer_conditions.py --manifest), r1 and r2 are TRAINING rungs, read from the set
+builder's walk. The set refusals run on both kinds; each kind refuses the other's manifest;
+and one slow test builds the real hand-picked set and hands it to the generator.
+
 The generator reads the COMMITTED canonical configs; here the working-tree files stand in for
 them, handed to `build` directly, so the test checks the files it ships beside.
 """
@@ -28,6 +33,9 @@ _spec.loader.exec_module(make)
 RUNGS = ['r0', 'r1', 'r2']
 RDKIT = '2025.03.5'
 PRIOR = 'conformer_prior_v2.pt'
+R0 = make.RUNGS['r0']['set_id']
+#: one rung of each kind: every set refusal runs on both
+KINDS = ['r0', 'r1']
 
 
 def _load(rel):
@@ -42,24 +50,40 @@ def inputs():
     return _load('configs/conformer_mk.yaml'), _load('configs/mk_dev.yaml'), contract
 
 
-def _write_set(d, payload, inputs, n=6, conditions=None, **manifest):
-    """A set builder output directory: the training conditions and a manifest that lists
-    them, counts n train molecules in `conditions` conditions (default n), and was built
-    under the base's energy kwargs."""
+def _write_set(d, payload, inputs, n=6, conditions=None, smiles=None, **manifest):
+    """A set directory: the training conditions and a manifest that lists them, counts n
+    train molecules in `conditions` conditions (default n, or len(smiles)), and was built under
+    the base's energy kwargs. With `smiles`, a hand-picked set's manifest
+    (VALIDATION_MANIFEST_FORMAT) whose train members are those SMILES; without, the walk's."""
     d.mkdir(parents=True, exist_ok=True)
     cond = d / make.CONDITIONS_FILE
     cond.write_bytes(payload)
     params = inputs[2][0]
     kwargs = {k: v for k, v in inputs[0]['energy_config'].items()
               if k in params and k not in make.RUN_SURFACE_KEYS}
+    if conditions is None:
+        conditions = n if smiles is None else len(smiles)
     man = {'format': make.MANIFEST_FORMAT, 'versions': {'rdkit': RDKIT},
            'artifacts': {make.CONDITIONS_FILE: {'sha256': make.sha256_of(cond),
                                                 'bytes': cond.stat().st_size}},
            'energy': {'kwargs': kwargs},
-           'rungs': {'train': {'molecules': n, 'conditions': n if conditions is None else conditions}}}
+           'rungs': {'train': {'molecules': n, 'conditions': conditions}}}
+    if smiles is not None:
+        man['format'] = make.VALIDATION_MANIFEST_FORMAT
+        man['members'] = {'train': [{'identifier': s, 'smiles': s} for s in smiles]}
     man.update(manifest)
     (d / make.MANIFEST_FILE).write_text(json.dumps(man), encoding='utf-8')
     return man
+
+
+def _write_rung(sets, rung, payload, inputs, **kw):
+    """`_write_set` into `rung`'s set directory, of the rung's kind and size unless `kw` says
+    otherwise."""
+    spec = make.RUNGS[rung]
+    kw.setdefault('n', spec['n'])
+    if spec.get('validation'):
+        kw.setdefault('smiles', spec['smiles'])
+    return _write_set(sets / spec['set_id'], payload, inputs, **kw)
 
 
 @pytest.fixture
@@ -67,8 +91,7 @@ def local(inputs, tmp_path):
     """The local artifacts the index takes its sizes and hashes from."""
     sets, es = tmp_path / 'sets', tmp_path / 'es'
     for i, rung in enumerate(RUNGS):
-        _write_set(sets / make.RUNGS[rung]['set_id'], b'c' * (100 + i), inputs,
-                   n=make.RUNGS[rung]['n'])
+        _write_rung(sets, rung, b'c' * (100 + i), inputs)
     es.mkdir()
     (es / PRIOR).write_bytes(b'p' * 321)
     return sets, es
@@ -131,9 +154,9 @@ def test_a_dry_run_renders_the_three_rung_ladder(inputs, local, tmp_path):
     rows = [r.split('\t') for r in (out / 'INDEX_a.tsv').read_text(encoding='utf-8').splitlines()]
     assert rows[0][:5] == ['arm', 'rung', 'start', 'warm_src', 'rdkit']
     assert [r[0] for r in rows[1:]] == list(arms)
-    cond = local[0] / 'qm9_r0' / make.CONDITIONS_FILE
+    cond = local[0] / R0 / make.CONDITIONS_FILE
     assert rows[1][1:] == ['r0', 'fresh', '-', RDKIT,
-                           f'qm9_r0/{make.CONDITIONS_FILE}', '100', make.sha256_of(cond),
+                           f'{R0}/{make.CONDITIONS_FILE}', '100', make.sha256_of(cond),
                            PRIOR, '321', make.sha256_of(local[1] / PRIOR)]
     sbatch = (out / 'submit_conformer_cond_a.sbatch').read_text(encoding='utf-8')
     assert 'python -u conformer_modeller.py --config' in sbatch
@@ -172,7 +195,7 @@ def test_an_arm_is_renamed_by_any_change_to_its_run(inputs, local, monkeypatch):
     monkeypatch.setattr(make, 'RUNGS', rungs)
     assert _r0_name(inputs, local) != name                      # a rung setting
     monkeypatch.undo()
-    _write_set(local[0] / 'qm9_r0', b'C' * 100, inputs)          # same size, other bytes
+    _write_rung(local[0], 'r0', b'C' * 100, inputs)              # same size, other bytes
     assert _r0_name(inputs, local) != name                      # the data
 
 
@@ -199,7 +222,8 @@ def test_a_relative_untracked_data_path_aborts_generation(inputs, local):
     _build(inputs, local, base=base, committed=lambda p: True)
 
 
-def test_an_uncommitted_energy_config_key_aborts_generation(inputs, local):
+@pytest.mark.parametrize('rung', KINDS)
+def test_an_uncommitted_energy_config_key_aborts_generation(inputs, local, rung):
     """The contract is parsed from HEAD, so a key the base carries whose handler is only in
     the working tree is outside it. This test used to add stereo_coeff to the base, when the
     working-tree ConformerTorsions did not take it; the stereo lock is now in the working-tree
@@ -208,14 +232,14 @@ def test_an_uncommitted_energy_config_key_aborts_generation(inputs, local):
     built by a builder on that code."""
     head = _at_head_without(inputs, 'stereo_coeff')
     assert inputs[0]['energy_config']['stereo_coeff'] == make.STEREO_COEFF
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, head)
-    _refused(lambda: _build(head, local, rungs=['r0']), 'stereo_coeff', 'COMMITTED')
+    _write_rung(local[0], rung, b'c' * 100, head)
+    _refused(lambda: _build(head, local, rungs=[rung]), 'stereo_coeff', 'COMMITTED')
     # a misspelt key is outside the contract whatever is committed (the set rebuilt under the
     # full contract, so the energy-kwargs comparison passes)
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs)
+    _write_rung(local[0], rung, b'c' * 100, inputs)
     base = copy.deepcopy(inputs[0])
     base['energy_config']['stereo_coef'] = make.STEREO_COEFF
-    _refused(lambda: _build(inputs, local, rungs=['r0'], base=base), "'stereo_coef'", 'COMMITTED')
+    _refused(lambda: _build(inputs, local, rungs=[rung], base=base), "'stereo_coef'", 'COMMITTED')
 
 
 def test_an_mk_dev_key_the_base_lacks_aborts_generation(inputs, local):
@@ -237,12 +261,13 @@ def test_a_temperature_other_than_its_log_aborts_generation(inputs, local):
     _refused(lambda: _build(inputs, local, base=base), 'temperature', '10**log_temperature')
 
 
+@pytest.mark.parametrize('rung', KINDS)
 @pytest.mark.parametrize('value, named', [
     (0.0, '0.0'),
     (30.0, '30.0'),
     (None, 'absent'),                      # None = the key removed: the code default, lock off
 ])
-def test_an_arm_off_the_stereo_lock_aborts_generation(inputs, local, value, named):
+def test_an_arm_off_the_stereo_lock_aborts_generation(inputs, local, value, named, rung):
     """The base's stereo_coeff reaches check_protocol even when the set agrees with it: the
     set is built under the same base, so the energy-kwargs comparison passes and the refusal
     is the lock's own."""
@@ -251,9 +276,9 @@ def test_an_arm_off_the_stereo_lock_aborts_generation(inputs, local, value, name
         del base['energy_config']['stereo_coeff']
     else:
         base['energy_config']['stereo_coeff'] = value
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, (base, inputs[1], inputs[2]))
-    _refused(lambda: _build(inputs, local, rungs=['r0'], base=base), 'cc_r0_n6',
-             'stereo_coeff', named, 'STEREO_COEFF')
+    _write_rung(local[0], rung, b'c' * 100, (base, inputs[1], inputs[2]))
+    _refused(lambda: _build(inputs, local, rungs=[rung], base=base),
+             f'cc_{rung}_n{make.RUNGS[rung]["n"]}', 'stereo_coeff', named, 'STEREO_COEFF')
 
 
 def test_a_duplicate_arm_aborts_generation(inputs, local, monkeypatch):
@@ -275,71 +300,228 @@ def test_a_missing_local_artifact_aborts_generation(inputs, local):
     _refused(lambda: _build(inputs, local), 'qm9_r1', 'does not exist')
 
 
-def test_a_set_without_a_manifest_aborts_generation(inputs, local):
-    (local[0] / 'qm9_r0' / make.MANIFEST_FILE).unlink()
-    _refused(lambda: _build(inputs, local), 'qm9_r0', make.MANIFEST_FILE, 'does not exist')
+@pytest.mark.parametrize('rung, builder', [
+    ('r0', 'build_conformer_conditions.py --smiles C CO N CCO C=O CC --carrier'),
+    ('r1', 'build_conformer_set.py --out-dir'),
+])
+def test_a_set_without_a_manifest_aborts_generation(inputs, local, rung, builder):
+    set_id = make.RUNGS[rung]['set_id']
+    (local[0] / set_id / make.MANIFEST_FILE).unlink()
+    msg = _refused(lambda: _build(inputs, local, rungs=[rung]), set_id, make.MANIFEST_FILE,
+                   'does not exist', builder)
+    if rung == 'r0':
+        assert '--manifest' in msg
 
 
-def test_a_conditions_file_its_manifest_does_not_list_aborts_generation(inputs, local):
-    man = _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs)
-    (local[0] / 'qm9_r0' / make.CONDITIONS_FILE).write_bytes(b'x' * 100)
+@pytest.mark.parametrize('rung', KINDS)
+def test_a_conditions_file_its_manifest_does_not_list_aborts_generation(inputs, local, rung):
+    man = _write_rung(local[0], rung, b'c' * 100, inputs)
+    set_id = make.RUNGS[rung]['set_id']
+    (local[0] / set_id / make.CONDITIONS_FILE).write_bytes(b'x' * 100)
     assert man['artifacts'][make.CONDITIONS_FILE]['bytes'] == 100
-    _refused(lambda: _build(inputs, local), 'qm9_r0', 'not the file the builder wrote')
+    _refused(lambda: _build(inputs, local, rungs=[rung]), set_id, 'not the file the builder wrote')
 
 
-def test_a_manifest_of_another_format_aborts_generation(inputs, local):
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs, format='conformer_set_v0')
-    _refused(lambda: _build(inputs, local), 'conformer_set_v0')
+@pytest.mark.parametrize('rung', KINDS)
+def test_a_manifest_of_another_format_aborts_generation(inputs, local, rung):
+    _write_rung(local[0], rung, b'c' * 100, inputs, format='conformer_set_v0')
+    _refused(lambda: _build(inputs, local, rungs=[rung]), 'conformer_set_v0')
 
 
-def test_a_set_built_under_other_energy_kwargs_aborts_generation(inputs, local):
+@pytest.mark.parametrize('rung', KINDS)
+def test_a_set_built_under_other_energy_kwargs_aborts_generation(inputs, local, rung):
+    """The same energy-kwargs, clip and stereo-lock refusals on a validation rung's
+    hand-picked set as on a training rung's walk."""
     kwargs = {k: v for k, v in inputs[0]['energy_config'].items()
               if k in inputs[2][0] and k not in make.RUN_SURFACE_KEYS}
     # a builder config without energy_clip ran at the committed default (None), not 300
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs,
-               energy={'kwargs': {k: v for k, v in kwargs.items() if k != 'energy_clip'}})
-    _refused(lambda: _build(inputs, local), 'energy_clip', 'Rebuild the set')
+    _write_rung(local[0], rung, b'c' * 100, inputs,
+                energy={'kwargs': {k: v for k, v in kwargs.items() if k != 'energy_clip'}})
+    _refused(lambda: _build(inputs, local, rungs=[rung]), 'energy_clip', 'Rebuild the set')
     # a set built with the lock off -- explicitly, or by a config that did not declare it (the
     # builder then ran at the committed default, 0) -- is not the arm's target
     assert kwargs['stereo_coeff'] == make.STEREO_COEFF and inputs[2][2]['stereo_coeff'] == 0.0
     for off in ({**kwargs, 'stereo_coeff': 0.0},
                 {k: v for k, v in kwargs.items() if k != 'stereo_coeff'}):
-        _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs, energy={'kwargs': off})
-        _refused(lambda: _build(inputs, local), "('stereo_coeff', 300.0, 0.0)", 'Rebuild the set')
+        _write_rung(local[0], rung, b'c' * 100, inputs, energy={'kwargs': off})
+        _refused(lambda: _build(inputs, local, rungs=[rung]), "('stereo_coeff', 300.0, 0.0)",
+                 'Rebuild the set')
     # a builder on uncommitted code passed a parameter the committed signature lacks. This
     # used to be stereo_coeff against the full contract, before the working-tree signature took
     # it; the committed signature lacking it is now reproduced by parsing the contract without
     # it, while the builder's kwargs (the working tree's) carry it
     head = _at_head_without(inputs, 'stereo_coeff')
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs, energy={'kwargs': kwargs})
-    _refused(lambda: _build(head, local, rungs=['r0']), 'stereo_coeff', 'not a committed parameter')
+    _write_rung(local[0], rung, b'c' * 100, inputs, energy={'kwargs': kwargs})
+    _refused(lambda: _build(head, local, rungs=[rung]), 'stereo_coeff', 'not a committed parameter')
     # an absent key whose committed default equals the arm's value is the same set
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs,
-               energy={'kwargs': {k: v for k, v in kwargs.items() if k != 'rho_wall'}})
+    _write_rung(local[0], rung, b'c' * 100, inputs,
+                energy={'kwargs': {k: v for k, v in kwargs.items() if k != 'rho_wall'}})
     assert inputs[0]['energy_config']['rho_wall'] == inputs[2][2]['rho_wall']
-    _build(inputs, local)
+    _build(inputs, local, rungs=[rung])
 
 
 def test_buffer_caps_below_the_per_condition_floor_abort_generation(inputs, local, monkeypatch):
     rungs = dict(make.RUNGS)
-    rungs['r3'] = dict(n=5000, set_id='qm9_r3', phase1_max_steps=20_000, epochs=200_000)
+    rungs['r3'] = dict(n=5000, set_id='qm9_r3', validation=False, phase1_max_steps=20_000,
+                       epochs=200_000)
     monkeypatch.setattr(make, 'RUNGS', rungs)
-    _write_set(local[0] / 'qm9_r3', b'c' * 100, inputs, n=5000)
+    _write_rung(local[0], 'r3', b'c' * 100, inputs)
     _refused(lambda: _build(inputs, local, rungs=['r3']), 'cc_r3_n5000', 'per condition')
 
 
 def test_the_floors_count_conditions_not_molecules(inputs, local):
-    """Stereoisomers are separate conditions: 6 molecules in 3000 conditions put the
+    """Stereoisomers are separate conditions: 50 molecules in 3000 conditions put the
     prior-rebuild floor at 20 x 3000 = 60,000 rows, above the 25,000 the caps rebuild to.
-    At 6 conditions every floor clears."""
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs, n=6, conditions=3000)
-    _refused(lambda: _build(inputs, local, rungs=['r0']), 'prior_rebuild', '3000 conditions')
+    At 50 conditions every floor clears."""
+    _write_rung(local[0], 'r1', b'c' * 100, inputs, conditions=3000)
+    _refused(lambda: _build(inputs, local, rungs=['r1']), 'prior_rebuild', '3000 conditions')
+    _write_rung(local[0], 'r1', b'c' * 100, inputs)
+    _build(inputs, local, rungs=['r1'])
 
 
-def test_a_set_of_another_rung_size_aborts_generation(inputs, local):
-    _write_set(local[0] / 'qm9_r0', b'c' * 100, inputs, n=7)
-    _refused(lambda: _build(inputs, local, rungs=['r0']), 'counts 7 train molecules',
-             'the rung is 6 molecules')
+@pytest.mark.parametrize('rung', KINDS)
+def test_a_set_of_another_rung_size_aborts_generation(inputs, local, rung):
+    n = make.RUNGS[rung]['n']
+    _write_rung(local[0], rung, b'c' * 100, inputs, n=n + 1)
+    _refused(lambda: _build(inputs, local, rungs=[rung]), f'counts {n + 1} train molecules',
+             f'the rung is {n} molecules')
+
+
+# ----------------------------------------------------------------------------- rung kinds
+
+def test_r0_is_the_validation_rung_and_the_rest_are_walks():
+    assert make.rung_smiles('r0', make.RUNGS['r0']) == ('C', 'CO', 'N', 'CCO', 'C=O', 'CC')
+    assert make.RUNGS['r0']['n'] == len(make.RUNGS['r0']['smiles'])
+    for rung in RUNGS[1:]:
+        assert make.rung_smiles(rung, make.RUNGS[rung]) is None
+
+
+@pytest.mark.parametrize('rung, change, named', [
+    ('r1', {'validation': None}, 'validation is None'),            # absent: the kind is open
+    ('r1', {'validation': 'false'}, "validation is 'false'"),
+    ('r0', {'validation': 1}, 'validation is 1'),
+    ('r1', {'smiles': ('C', 'CO')}, 'names no SMILES'),             # a walk takes no list
+    ('r0', {'smiles': None}, 'smiles is None'),
+    ('r0', {'smiles': ()}, 'smiles is ()'),
+    ('r0', {'smiles': ('C', 'CO', 'C')}, 'distinct'),
+    ('r0', {'smiles': ('C', 'CO ')}, 'stripped'),
+])
+def test_a_rung_that_leaves_its_kind_open_aborts_generation(inputs, local, monkeypatch,
+                                                             rung, change, named):
+    rungs = copy.deepcopy(make.RUNGS)
+    for k, v in change.items():
+        if v is None:
+            rungs[rung].pop(k, None)
+        else:
+            rungs[rung][k] = v
+    monkeypatch.setattr(make, 'RUNGS', rungs)
+    _refused(lambda: _build(inputs, local, rungs=[rung]), f'rung {rung}', named)
+
+
+def test_a_training_rung_refuses_a_hand_picked_set(inputs, local):
+    """The hand-picked path cannot stand in for the walk: a set with the right molecule count
+    and energy kwargs, written by build_conformer_conditions.py --manifest into a training
+    rung's directory, is refused by its format."""
+    _write_rung(local[0], 'r1', b'c' * 100, inputs,
+                smiles=tuple(f'C{"C" * i}O' for i in range(50)))
+    _refused(lambda: _build(inputs, local, rungs=['r1']), 'cc_r1_n50',
+             'hand-picked VALIDATION set', 'build_conformer_set.py', make.MANIFEST_FORMAT)
+    _refused(lambda: _build(inputs, local), 'cc_r1_n50', 'hand-picked VALIDATION set')
+
+
+def test_a_validation_rung_refuses_a_walk_set(inputs, local):
+    _write_rung(local[0], 'r0', b'c' * 100, inputs, smiles=None)
+    _refused(lambda: _build(inputs, local, rungs=['r0']), 'cc_r0_n6', "builder's walk",
+             '--manifest', make.VALIDATION_MANIFEST_FORMAT)
+
+
+@pytest.mark.parametrize('smiles, conditions', [
+    (('C', 'CO', 'N', 'CCO', 'C=O', 'CN'), None),        # one molecule swapped
+    (('C', 'CO', 'N', 'CCO', 'C=O'), 6),                 # one missing, count kept at 6
+    (('C', 'CO', 'N', 'CCO', 'C=O', 'CC'), 7),           # a condition the members omit
+])
+def test_a_validation_set_of_other_molecules_aborts_generation(inputs, local, smiles, conditions):
+    _write_rung(local[0], 'r0', b'c' * 100, inputs, smiles=smiles, conditions=conditions)
+    _refused(lambda: _build(inputs, local, rungs=['r0']), 'cc_r0_n6',
+             'the validation rung names', str(sorted(make.RUNGS['r0']['smiles'])))
+
+
+# ----------------------------------------------------------------------------- the real builder
+
+@pytest.fixture
+def builder():
+    """build_conformer_conditions, with the process-wide torch state its `main` sets
+    (default dtype, thread count) restored afterwards."""
+    import build_conformer_conditions as bcc
+    dtype, threads = bcc.torch.get_default_dtype(), bcc.torch.get_num_threads()
+    yield bcc
+    bcc.torch.set_default_dtype(dtype)
+    bcc.torch.set_num_threads(threads)
+
+
+@pytest.mark.slow
+def test_the_hand_picked_builder_writes_the_set_a_validation_rung_reads(inputs, local,
+                                                                        tmp_path, builder):
+    """build_conformer_conditions.py --manifest on the r0 SMILES under the canonical config,
+    read by the generator: accepted on the validation rung with the rung's six conditions,
+    refused on a training rung; a flag override of the config is recorded in the manifest's
+    kwargs, where energy_kwargs_mismatches finds it; and the builder refuses what a manifest
+    cannot describe, before building, leaving another builder's manifest untouched."""
+    bcc = builder
+    sets = tmp_path / 'real'
+    cond = sets / R0 / make.CONDITIONS_FILE
+    common = ['--carrier', '--config', str(ES / 'configs' / 'conformer_mk.yaml'),
+              '--encoder-ckpt', bcc.encoder_cache.DEFAULT_CKPT]
+    assert bcc.MANIFEST_FORMAT == make.VALIDATION_MANIFEST_FORMAT
+    assert bcc.MANIFEST_NAME == make.MANIFEST_FILE
+    assert bcc.MANIFEST_CONDITIONS_NAME == make.CONDITIONS_FILE
+
+    # refused before anything is built
+    for argv, named in ((['--carrier', '--config', 'x.yaml'], '--encoder-ckpt'),
+                        (['--config', 'x.yaml', '--encoder-ckpt', 'e.pt'], '--carrier'),
+                        (common[:1] + common[3:], '--config')):
+        with pytest.raises(SystemExit, match=named):
+            bcc.main(['--smiles', 'N', *argv, '--out', str(cond), '--manifest'])
+    with pytest.raises(SystemExit, match=make.CONDITIONS_FILE):
+        bcc.main(['--smiles', 'N', *common, '--out', str(sets / 'other.pt'), '--manifest'])
+    assert not sets.exists()
+    walk = tmp_path / 'walk'
+    walk.mkdir()
+    (walk / make.MANIFEST_FILE).write_text(json.dumps({'format': make.MANIFEST_FORMAT}),
+                                           encoding='utf-8')
+    with pytest.raises(SystemExit, match="another builder's"):
+        bcc.main(['--smiles', 'N', *common, '--out', str(walk / make.CONDITIONS_FILE),
+                  '--manifest'])
+    assert json.loads((walk / make.MANIFEST_FILE).read_text(encoding='utf-8')) == \
+        {'format': make.MANIFEST_FORMAT}
+    assert not (walk / make.CONDITIONS_FILE).exists()
+
+    # the r0 set, as the generator's refusal message says to build it
+    bcc.main(['--smiles', *make.RUNGS['r0']['smiles'], *common, '--out', str(cond),
+              '--manifest'])
+    man = json.loads((sets / R0 / make.MANIFEST_FILE).read_text(encoding='utf-8'))
+    assert man['format'] == make.VALIDATION_MANIFEST_FORMAT
+    assert man['rungs']['train'] == {'molecules': 6, 'conditions': 6}
+    assert man['artifacts'] == {make.CONDITIONS_FILE: {'sha256': make.sha256_of(cond),
+                                                       'bytes': cond.stat().st_size}}
+    assert man['energy']['kwargs']['stereo_coeff'] == make.STEREO_COEFF
+    assert man['energy']['kwargs']['energy_clip'] == make.ENERGY_CLIP
+    arms = _build(inputs, (sets, local[1]), rungs=['r0'])
+    (arm,) = arms.values()
+    assert arm['validation'] is True and arm['conditions'] == 6
+    assert arm['artifacts'][0] == (f'{R0}/{make.CONDITIONS_FILE}', cond.stat().st_size,
+                                   make.sha256_of(cond))
+    shutil.copytree(sets / R0, sets / make.RUNGS['r1']['set_id'])
+    _refused(lambda: _build(inputs, (sets, local[1]), rungs=['r1']),
+             'hand-picked VALIDATION set')
+
+    # a flag override of the config reaches the manifest, where the generator reads it
+    over = tmp_path / 'over' / make.CONDITIONS_FILE
+    bcc.main(['--smiles', 'N', *common, '--energy-clip', '100', '--out', str(over),
+              '--manifest'])
+    kw = json.loads((over.parent / make.MANIFEST_FILE).read_text(encoding='utf-8'))['energy']['kwargs']
+    assert ('energy_clip', make.ENERGY_CLIP, 100.0) in make.energy_kwargs_mismatches(
+        inputs[0]['energy_config'], kw, inputs[2])
 
 
 def test_buffer_caps_above_the_vram_budget_abort_generation(inputs, local, monkeypatch):
@@ -432,8 +614,8 @@ def _deploy(tmp_path, arms, local):
     arms_dir.mkdir(parents=True, exist_ok=True)
     make.write(arms_dir, arms)
     data, ckpts, shims = tmp_path / 'data', tmp_path / 'ckpts', tmp_path / 'bin'
-    (data / 'qm9_r0').mkdir(parents=True, exist_ok=True)
-    shutil.copy(local[0] / 'qm9_r0' / make.CONDITIONS_FILE, data / 'qm9_r0' / make.CONDITIONS_FILE)
+    (data / R0).mkdir(parents=True, exist_ok=True)
+    shutil.copy(local[0] / R0 / make.CONDITIONS_FILE, data / R0 / make.CONDITIONS_FILE)
     shutil.copy(local[1] / PRIOR, data / PRIOR)
     ckpts.mkdir(exist_ok=True)
     shims.mkdir(exist_ok=True)
@@ -532,7 +714,7 @@ def test_ck_step_refuses_an_ambiguous_match(cluster):
 
 
 def test_an_artifact_of_the_wrong_size_stops_the_task_before_srun(cluster):
-    path = cluster['data'] / 'qm9_r0' / make.CONDITIONS_FILE
+    path = cluster['data'] / R0 / make.CONDITIONS_FILE
     path.write_bytes(path.read_bytes()[:-1])
     r, _cfg, log = _run(cluster)
     assert r.returncode == 1

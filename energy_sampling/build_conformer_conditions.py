@@ -27,6 +27,13 @@ A plain file (no ``--carrier``) is ONE k, because the GFN's state dimension is f
 construction; molecules of another k are skipped and named. ``--carrier`` writes a mixed-k
 set in the width-K carrier layout instead (energies/conformer_carrier.py).
 
+``--manifest`` also writes ``manifest.json`` beside ``--out`` (``write_manifest``): a
+HAND-PICKED set, format ``MANIFEST_FORMAT``, which configs/conformer_cond/make.py reads for a
+validation rung and refuses for a training rung. It records the SMILES as given, the energy
+kwargs the members were built under (``--config``'s, with any flag override), the encoder, the
+RDKit version, each member and the sha256 and size of every file written. The list is not
+filtered against the encoder's training pool, and there is no held-out side.
+
 EVERY STEP OF ``build_member`` IS GUARDED AND EVERY REFUSAL HAS A REASON CODE
 (``REASON_CODES``): an exception anywhere in it becomes ``MemberRefused``, classified by its
 text, 'other' with the message kept when no pattern matches. Before this, only the
@@ -52,6 +59,11 @@ import argparse
 import contextlib
 import functools
 import inspect
+import json
+import os
+import platform
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -155,6 +167,13 @@ PROBE_SEEDS = 4
 _RUN_SURFACE_KEYS = ('smiles', 'device', 'dtype', 'temperature_conditioning',
                      'embedding_conditioning', 'embedding_conditioning_dim',
                      'log_temperature_range')
+
+#: ``--manifest``: the format of a HAND-PICKED set's manifest
+#: (configs/conformer_cond/make.py::VALIDATION_MANIFEST_FORMAT), its file name, and the name
+#: ``--out`` must carry beside it, the conditions file that generator reads
+MANIFEST_FORMAT = 'conformer_set_hand_picked_v1'
+MANIFEST_NAME = 'manifest.json'
+MANIFEST_CONDITIONS_NAME = 'conditions_train.pt'
 
 
 class MemberRefused(Exception):
@@ -754,6 +773,109 @@ def report_rejections(skipped, n_in: int):
             print(f'           {smi}: {msg[:160]}')
 
 
+# ------------------------------------------------------------------ the hand-picked manifest
+
+
+def clear_manifest(args) -> Path:
+    """The path ``--manifest`` writes, once the build is one a manifest can describe.
+
+    REFUSED before anything is built: no ``--carrier`` (the conditional route reads carrier
+    files), no ``--config`` (the energy kwargs would be this builder's defaults), no
+    ``--encoder-ckpt`` (the route conditions on the baked embedding), an ``--out`` not named
+    ``MANIFEST_CONDITIONS_NAME``, and a directory already holding a manifest of another
+    format, such as build_conformer_set.py's walk, which this would overwrite. A previous
+    hand-picked manifest there is removed FIRST, so a build that stops early leaves no
+    manifest describing files it did not write. The set directory is created when absent, as
+    build_conformer_set.py creates its ``--out-dir``.
+    """
+    missing = [flag for flag, given in (('--carrier', args.carrier), ('--config', args.config),
+                                        ('--encoder-ckpt', args.encoder_ckpt)) if not given]
+    if missing:
+        raise SystemExit(f'--manifest needs {", ".join(missing)}: the manifest certifies a set '
+                         f'for the conditional route, which reads a carrier file with baked '
+                         f'embeddings built under its config\'s energy kwargs')
+    if args.out.name != MANIFEST_CONDITIONS_NAME:
+        raise SystemExit(f'--manifest needs --out named {MANIFEST_CONDITIONS_NAME}, the file '
+                         f'configs/conformer_cond/make.py reads beside the manifest; got '
+                         f'{args.out.name}')
+    path = args.out.parent / MANIFEST_NAME
+    if path.exists():
+        try:
+            fmt = json.loads(path.read_text(encoding='utf-8')).get('format')
+        except (ValueError, AttributeError):
+            fmt = '<unreadable>'
+        if fmt != MANIFEST_FORMAT:
+            raise SystemExit(f'{path} holds a {fmt!r} manifest, not a hand-picked one '
+                             f'({MANIFEST_FORMAT!r}); refusing to overwrite another builder\'s '
+                             f'set. Write this one to another directory')
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_manifest(path: Path, *, argv, config: Path, energy_kw: dict, bundle, layout,
+                   members, skipped, requested, written, checked: bool) -> dict:
+    """``manifest.json`` for a HAND-PICKED set, written after every other file.
+
+    The fields configs/conformer_cond/make.py::read_set reads are the walk's
+    (build_conformer_set.py): ``format``, ``artifacts`` (sha256 and bytes per file, keyed by
+    its path relative to the manifest's directory), ``rungs.train`` (molecules, counted by
+    stereo-free constitution, and conditions), ``versions.rdkit`` and ``energy.kwargs``; and,
+    for this format only, ``members.train`` with each condition's SMILES. ``requested`` is the
+    SMILES list as given; a refused molecule is in ``refused``, not in ``members``.
+    """
+    from rdkit import rdBase
+    from build_conformer_set import _provenance_git, _sha256
+
+    root = path.parent.resolve()
+
+    def rel(p):
+        try:
+            return Path(os.path.relpath(Path(p).resolve(), root)).as_posix()
+        except ValueError:                        # another drive: no relative path exists
+            return Path(p).resolve().as_posix()
+
+    man = {
+        'format': MANIFEST_FORMAT,
+        'selection': 'hand-picked: the --smiles list as given. NOT filtered against the frozen '
+                     'encoder\'s training pool, no held-out side, no stereoisomer enumeration '
+                     '(each SMILES names one stereoisomer). configs/conformer_cond/make.py '
+                     'reads it for a validation rung only',
+        'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'argv': ['build_conformer_conditions.py', *argv],
+        'git': _provenance_git(Path(config)),
+        'versions': {'rdkit': rdBase.rdkitVersion, 'torch': torch.__version__,
+                     'numpy': np.__version__, 'python': platform.python_version()},
+        'energy': {'config': str(Path(config).resolve()), 'config_sha256': _sha256(config),
+                   'kwargs': energy_kw},
+        'encoder': {**{k: bundle[k] for k in ('arm', 'hidden', 'layers', 'k', 'attention',
+                                             'ckpt_path', 'sha256')},
+                    'embedding_dim': 2 * int(bundle['hidden'])},
+        'requested': list(requested),
+        'rungs': {'train': {'molecules': len({constitution_smiles(mb.smiles) for mb in members}),
+                            'conditions': len(members)}},
+        'layout': {'K': int(layout.K), 'block_width': [int(v) for v in layout.block_width],
+                   'offsets': (None if layout.offsets is None
+                               else [int(v) for v in layout.offsets]),
+                   'is_identity': bool(layout.is_identity)},
+        'members': {'train': [{'identifier': mb.identifier, 'smiles': mb.smiles,
+                               'key': constitution_smiles(mb.smiles),
+                               'k': int(layout.k(mb.identifier)),
+                               'n_pad': int(layout.K - layout.k(mb.identifier))}
+                              for mb in members]},
+        'refused': [{'smiles': smi, 'identifier': ident, 'code': code}
+                    for smi, ident, code, _msg in skipped],
+        'checked': bool(checked),
+        'artifacts': {rel(p): {'sha256': _sha256(p), 'bytes': Path(p).stat().st_size}
+                      for p in written},
+    }
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(man, f, indent=1)
+    print(f'\nwrote manifest -> {path}  (format {MANIFEST_FORMAT}, '
+          f'{man["rungs"]["train"]["conditions"]} conditions)')
+    return man
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -830,7 +952,13 @@ def main(argv=None):
                          "and set embedding_conditioning_dim to the printed width")
     ap.add_argument("--rejections-out", type=Path, default=None,
                     help="also write the refusals as a TSV (smiles, identifier, code, message)")
+    ap.add_argument("--manifest", action="store_true",
+                    help="also write manifest.json beside --out: a HAND-PICKED set (format "
+                         "MANIFEST_FORMAT), which configs/conformer_cond/make.py accepts for a "
+                         "validation rung and refuses for a training rung. Needs --carrier, "
+                         "--config, --encoder-ckpt and --out named conditions_train.pt")
     args = ap.parse_args(argv)
+    argv_given = sys.argv[1:] if argv is None else list(argv)
 
     torch.set_default_dtype(torch.float64)
     torch.set_num_threads(args.threads)
@@ -846,6 +974,7 @@ def main(argv=None):
     identifiers = args.identifiers or args.smiles
     if len(identifiers) != len(args.smiles):
         raise SystemExit(f"{len(args.smiles)} SMILES against {len(identifiers)} identifiers")
+    manifest_path = clear_manifest(args) if args.manifest else None
 
     ff, ec = ({}, {}) if args.config is None else energy_kwargs_from_config(args.config)
     flags = dict(epsilon=args.epsilon, min_separation=args.min_separation,
@@ -967,7 +1096,18 @@ def main(argv=None):
         print("     embedding_conditioning: true")
         print(f"     embedding_conditioning_dim: {2 * bundle['hidden']}")
 
+    def finish():
+        """The manifest, last: it lists every file this run wrote."""
+        if manifest_path is None:
+            return
+        written = [args.out] + [p for p in (args.rejections_out, args.prior_out)
+                                if p is not None]
+        write_manifest(manifest_path, argv=argv_given, config=args.config, energy_kw=ff,
+                       bundle=bundle, layout=layout, members=members, skipped=skipped,
+                       requested=args.smiles, written=written, checked=not args.no_check)
+
     if args.prior_out is None:
+        finish()
         return
 
     print(f"\nprior: {args.n_prior} states per molecule")
@@ -1014,6 +1154,7 @@ def main(argv=None):
                     source="InternalPrior" if internal_prior else "uniform",
                     n_per_molecule=args.n_prior)
     print(f"\nwrote prior -> {args.prior_out}  ({prior.num_graphs} rows)")
+    finish()
 
 
 if __name__ == "__main__":

@@ -12,15 +12,23 @@ the ConformerTorsions.__init__ parameters with their defaults, and
 conformer_modeller._NON_ENERGY_KEYS -- is parsed from the COMMITTED sources as well, so an
 energy_config key whose handler is uncommitted is refused here rather than at every arm's
 construction. It refuses outright when git cannot produce a file, and warns on a dirty tree.
-Per rung it reads the set builder's (build_conformer_set.py) output directory
-LOCAL_SETS/<set_id>/: CONDITIONS_FILE, and MANIFEST_FILE, which must be format
-MANIFEST_FORMAT, list CONDITIONS_FILE with the file's own sha256 and bytes, count the rung's n molecules on
+Per rung it reads the set directory LOCAL_SETS/<set_id>/: CONDITIONS_FILE, and MANIFEST_FILE,
+which must list CONDITIONS_FILE with the file's own sha256 and bytes, count the rung's n molecules on
 its train side, name the RDKit version it was built under, and carry energy kwargs whose
 effective values (committed defaults filling an absent key) equal the arm's, stereo_coeff
 included, so a set built with the lock off or at another coefficient is refused. The manifest's
 train CONDITIONS (stereoisomers are separate conditions) set the per-condition floors. The builder's held-out and prior files are
 not shipped: ConformerModeller builds no held-out set, and the prior dataset is drawn from
 the fitted InternalPrior (prior_path null).
+
+TWO KINDS OF RUNG, declared per rung by `validation` (rung_smiles). A TRAINING rung (False)
+reads the set builder's out-of-pool walk (build_conformer_set.py; manifest format
+MANIFEST_FORMAT) and names no SMILES. A VALIDATION rung (True) names its SMILES list and reads
+a hand-picked set, build_conformer_conditions.py --manifest (format
+VALIDATION_MANIFEST_FORMAT), whose train members must be exactly those SMILES. Each kind
+refuses the other's manifest, so a hand-picked set -- not filtered against the encoder's
+training pool, no held-out side -- cannot stand in for a training rung. Every other check
+above applies to both kinds alike.
 
 WHAT EACH ARM IS. The committed conformer_mk with:
   - run_name `cc_<rung>_n<M>_<digest>`, tag TAG, checkpoints_dir the cluster root. <digest>
@@ -42,9 +50,11 @@ WHAT IT REFUSES, naming the offender: a drive-letter or backslash path anywhere 
 relative data path not committed at HEAD; an energy_config key outside the committed energy
 contract; an mk_dev key the base lacks that is not in CRYSTAL_ONLY_KEYS; a protocol, stage,
 TB-seat, tripwire, energy-clip, stereo-lock (STEREO_COEFF, declared) or temperature setting
-other than check_protocol's; a condition set whose
-manifest is missing, of another format, disagrees with its file, or was built under other
-energy kwargs; two arms equal apart from run_name; an arm name that is a suffix of another
+other than check_protocol's; a rung whose `validation` is not a bool, a validation rung
+without its SMILES or a training rung with some; a condition set whose
+manifest is missing, of another format or of the other rung kind, disagrees with its file, or
+was built under other energy kwargs; a validation set whose members are not the rung's SMILES;
+two arms equal apart from run_name; an arm name that is a suffix of another
 (the sbatch's `*${ARM}_*` globs would cross); a missing local artifact; buffer caps below the
 per-condition floors or above the VRAM budget; buffer sidecars above the disk budget; and any
 config_invariants violation, BASELINE included.
@@ -63,7 +73,15 @@ a substituted span exactly once refuses generation.
 
 THE DATA, staged by hand before submission: each rung's `<set_id>/conditions_train.pt` and
 the fitted InternalPrior, copied to CLUSTER_SETS with the same relative paths. The sizes and
-hashes written into the index are the local files'.
+hashes written into the index are the local files'. A training rung's set is written by
+
+    python build_conformer_set.py --out-dir <LOCAL_SETS>/<set_id> --n-train <n> ...
+
+and a validation rung's by
+
+    python build_conformer_conditions.py --smiles <the rung's SMILES> --carrier \\
+        --config configs/conformer_mk.yaml --encoder-ckpt <ckpt> \\
+        --out <LOCAL_SETS>/<set_id>/conditions_train.pt --manifest
 """
 import argparse
 import ast
@@ -100,6 +118,9 @@ LOCAL_SETS = pathlib.Path(r'D:\crystal_datasets\conformer_sets')
 CONDITIONS_FILE = 'conditions_train.pt'
 MANIFEST_FILE = 'manifest.json'
 MANIFEST_FORMAT = 'conformer_set_v1'
+#: a hand-picked set's manifest (build_conformer_conditions.py::MANIFEST_FORMAT), read for a
+#: VALIDATION rung only
+VALIDATION_MANIFEST_FORMAT = 'conformer_set_hand_picked_v1'
 CUDA_MEMORY_FRACTION = 0.97
 ENERGY_CLIP = 300.0                     # owner 2026-09-26; one value across the ladder
 #: energy_config.stereo_coeff every arm carries, declared (an absent key is the code default
@@ -115,10 +136,16 @@ UPDATE_LOG_Z = True
 #: each molecule contributes one or more stereoisomer conditions). phase1_max_steps and epochs are
 #: WORKING ASSUMPTIONS: no conformer set has run phase 1 at these sizes. Revisit from the R0
 #: run's phase-1 exit step (FORCED EXIT or gate) and its tracker trust onset.
+#: `validation` (required on every rung, rung_smiles): True = a hand-picked set named by
+#: `smiles`, False = the builder's out-of-pool walk. r0 is a validation rung: six molecules
+#: inside the encoder's training pool, among them NH3 and H2CO, the two the exact log Z check
+#: takes (decision by delegated judgement, 2026-09-27, G0 open item 1); r1 onward are walks.
 RUNGS = {
-    'r0': dict(n=6, set_id='qm9_r0', phase1_max_steps=10_000, epochs=40_000),
-    'r1': dict(n=50, set_id='qm9_r1', phase1_max_steps=20_000, epochs=100_000),
-    'r2': dict(n=500, set_id='qm9_r2', phase1_max_steps=20_000, epochs=200_000),
+    'r0': dict(n=6, set_id='val_r0', validation=True,
+               smiles=('C', 'CO', 'N', 'CCO', 'C=O', 'CC'),
+               phase1_max_steps=10_000, epochs=40_000),
+    'r1': dict(n=50, set_id='qm9_r1', validation=False, phase1_max_steps=20_000, epochs=100_000),
+    'r2': dict(n=500, set_id='qm9_r2', validation=False, phase1_max_steps=20_000, epochs=200_000),
 }
 #: Buffer caps in rows, every rung. The floors are rows per condition: the prior-buffer
 #: rebuild target (max_size x init_fraction) and the prior dataset each >= 20 per condition,
@@ -435,19 +462,62 @@ def energy_kwargs_mismatches(ec, built, contract):
     return out
 
 
-def read_set(set_dir, name, n_molecules, ec, contract):
+def rung_smiles(rung, spec):
+    """None for a TRAINING rung (the builder's walk), the rung's SMILES tuple for a
+    VALIDATION rung (a hand-picked set). Refuses a rung that leaves its kind open: `validation`
+    absent or not a bool, a validation rung without a non-empty list of distinct SMILES, or a
+    training rung that names SMILES, which the walk does not take."""
+    v = spec.get('validation')
+    if not isinstance(v, bool):
+        raise SystemExit(f'REFUSING rung {rung}: validation is {v!r}. Every rung declares it: '
+                         f'True for a hand-picked validation set named by `smiles` '
+                         f'(build_conformer_conditions.py --manifest), False for the '
+                         f'out-of-pool walk (build_conformer_set.py)')
+    smiles = spec.get('smiles')
+    if not v:
+        if smiles is not None:
+            raise SystemExit(f'REFUSING rung {rung}: a training rung is the builder\'s walk and '
+                             f'names no SMILES, but it names {smiles!r}')
+        return None
+    if (not isinstance(smiles, (list, tuple)) or not smiles
+            or not all(isinstance(s, str) and s.strip() == s and s for s in smiles)
+            or len(set(smiles)) != len(smiles)):
+        raise SystemExit(f'REFUSING rung {rung}: a validation rung names its set as a non-empty '
+                         f'list of distinct, stripped SMILES; smiles is {smiles!r}')
+    return tuple(smiles)
+
+
+def read_set(set_dir, name, n_molecules, ec, contract, smiles=None):
     """(bytes, sha256, RDKit version, train conditions) for one rung's builder output,
-    checked against its manifest, the rung's molecule count and the arm's energy_config."""
+    checked against its manifest, the rung's molecule count and the arm's energy_config.
+
+    `smiles` is rung_smiles: None for a training rung, whose manifest must be the walk's
+    (MANIFEST_FORMAT), and the rung's SMILES for a validation rung, whose manifest must be a
+    hand-picked set's (VALIDATION_MANIFEST_FORMAT) with exactly those SMILES as its train
+    members. Every other check is the same for both."""
     set_dir = pathlib.Path(set_dir)
     cond, man_path = set_dir / CONDITIONS_FILE, set_dir / MANIFEST_FILE
+    want = MANIFEST_FORMAT if smiles is None else VALIDATION_MANIFEST_FORMAT
     for p in (cond, man_path):
         if not p.is_file():
-            raise SystemExit(f'REFUSING {name}: {p} does not exist; build the set with '
-                             f'build_conformer_set.py --out-dir {set_dir}')
+            how = (f'build_conformer_set.py --out-dir {set_dir}' if smiles is None else
+                   f'build_conformer_conditions.py --smiles {" ".join(smiles)} --carrier '
+                   f'--config configs/conformer_mk.yaml --encoder-ckpt <ckpt> '
+                   f'--out {cond} --manifest')
+            raise SystemExit(f'REFUSING {name}: {p} does not exist; build the set with {how}')
     man = json.loads(man_path.read_text(encoding='utf-8'))
-    if man.get('format') != MANIFEST_FORMAT:
-        raise SystemExit(f'REFUSING {name}: {man_path} is format {man.get("format")!r}, '
-                         f'not {MANIFEST_FORMAT!r}')
+    fmt = man.get('format')
+    if fmt != want:
+        if fmt == VALIDATION_MANIFEST_FORMAT:
+            raise SystemExit(f'REFUSING {name}: {man_path} is a hand-picked VALIDATION set '
+                             f'({fmt!r}: not filtered against the encoder\'s training pool, no '
+                             f'held-out side). A training rung reads only the out-of-pool walk, '
+                             f'build_conformer_set.py ({MANIFEST_FORMAT!r})')
+        if fmt == MANIFEST_FORMAT:
+            raise SystemExit(f'REFUSING {name}: {man_path} is the builder\'s walk ({fmt!r}); a '
+                             f'validation rung reads only a hand-picked set, '
+                             f'build_conformer_conditions.py --manifest ({want!r})')
+        raise SystemExit(f'REFUSING {name}: {man_path} is format {fmt!r}, not {want!r}')
     listed = (man.get('artifacts') or {}).get(CONDITIONS_FILE) or {}
     size, sha = cond.stat().st_size, sha256_of(cond)
     if listed.get('sha256') != sha or listed.get('bytes') != size:
@@ -468,6 +538,13 @@ def read_set(set_dir, name, n_molecules, ec, contract):
         raise SystemExit(f'REFUSING {name}: {man_path} was built under other energy kwargs '
                          f'than the arm runs, (key, arm, builder): {bad}. Rebuild the set from '
                          f'the committed configs/conformer_mk.yaml')
+    if smiles is not None:
+        rows = (man.get('members') or {}).get('train') or []
+        have = sorted(str(r.get('smiles')) for r in rows)
+        if have != sorted(smiles) or int(train['conditions']) != len(rows):
+            raise SystemExit(f'REFUSING {name}: {man_path} holds {have} in '
+                             f'{train.get("conditions")} conditions; the validation rung names '
+                             f'{sorted(smiles)}')
     return size, sha, rdkit, int(train['conditions'])
 
 
@@ -555,7 +632,9 @@ def arm_name(rung, spec, digest):
 
 def build_arm(base, rung, spec, local_sets, local_es, contract):
     """{'cfg', 'artifacts' [(path under CLUSTER_SETS, bytes, sha256), ...], 'rung', 'rdkit',
-    'conditions'} for one rung. The run name is set last, from the digest of everything else."""
+    'conditions', 'validation'} for one rung. The run name is set last, from the digest of
+    everything else."""
+    smiles = rung_smiles(rung, spec)
     cfg = copy.deepcopy(base)
     label = f'cc_{rung}_n{spec["n"]}'
     cfg['run_name'] = None
@@ -576,7 +655,8 @@ def build_arm(base, rung, spec, local_sets, local_es, contract):
     cfg['energy_config']['prior_sample_size'] = BUFFER_CAPS['prior_sample']
 
     size, sha, rdkit, n_conditions = read_set(pathlib.Path(local_sets) / spec['set_id'], label,
-                                              int(spec['n']), cfg['energy_config'], contract)
+                                              int(spec['n']), cfg['energy_config'], contract,
+                                              smiles=smiles)
     cond_rel = f"{spec['set_id']}/{CONDITIONS_FILE}"
     prior_local = pathlib.Path(base['energy_config']['internal_prior_path'])
     if not prior_local.is_absolute():
@@ -595,13 +675,14 @@ def build_arm(base, rung, spec, local_sets, local_es, contract):
     cfg['prior_path'] = None
     cfg['test_molecules_path'] = None
     cfg['run_name'] = arm_name(rung, spec, arm_digest(cfg, artifacts, rdkit))
-    return dict(cfg=cfg, artifacts=artifacts, rung=rung, rdkit=rdkit, conditions=n_conditions)
+    return dict(cfg=cfg, artifacts=artifacts, rung=rung, rdkit=rdkit, conditions=n_conditions,
+                validation=smiles is not None)
 
 
 def build(base, mk_dev, contract, rungs, local_sets=LOCAL_SETS, local_es=ES,
           committed=committed_at_head):
-    """{arm: {'cfg', 'artifacts', 'rung', 'rdkit', 'conditions'}} for the named rungs, every
-    arm checked."""
+    """{arm: {'cfg', 'artifacts', 'rung', 'rdkit', 'conditions', 'validation'}} for the named
+    rungs, every arm checked."""
     if base.get('protocol') != PROTOCOL or PROTOCOL not in (base.get('protocols') or {}):
         raise SystemExit(f'REFUSING: the base does not select protocol {PROTOCOL!r} (it selects '
                          f'{base.get("protocol")!r}). The base is the COMMITTED '
@@ -754,7 +835,8 @@ def main(argv):
     write(HERE, arms)
     for i, (name, arm) in enumerate(arms.items()):
         cfg = arm['cfg']
-        print(f"[{i}] {name:<24} M={RUNGS[arm['rung']]['n']:<5} C={arm['conditions']:<5} phase-1 bound "
+        kind = 'VALIDATION (hand-picked)' if arm['validation'] else 'training (walk)'
+        print(f"[{i}] {name:<24} {kind} M={RUNGS[arm['rung']]['n']:<5} C={arm['conditions']:<5} phase-1 bound "
               f"{stage(cfg, 'train_prior')['max_steps']:,} of epochs {cfg['epochs']:,} | RDKit "
               f"{arm['rdkit']} | " + ' '.join(f'{rel} ({size:,} B)' for rel, size, _h in arm['artifacts']))
         print(f"    buffer sidecars at the caps: {sidecar_disk_bytes(cfg) / 1e9:,.0f} GB on disk; the "
