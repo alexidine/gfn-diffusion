@@ -54,7 +54,8 @@ def engine(stages, **attrs):
         rebuild_prior_by_churn=lambda n=None: calls.append('rebuild_prior_by_churn'),
         lr_controller=SimpleNamespace(on_stage_change=lambda: 0),
         grad_guard=SimpleNamespace(refresh=lambda reason=None: None),
-        checkpointer=SimpleNamespace(save=lambda tag: calls.append(f'save:{tag}')))
+        checkpointer=SimpleNamespace(save=lambda tag: calls.append(f'save:{tag}'),
+                                     save_buffers=lambda: calls.append('save_buffers')))
     for k, v in attrs.items():
         setattr(m, k, v)
     return StageProtocol(m), m, calls

@@ -74,7 +74,7 @@ def engine(exit_block, second_stage=True):
         init_schedulers_optimizers=lambda: None, set_loss_coeffs=lambda: None,
         lr_controller=SimpleNamespace(on_stage_change=lambda: 0),
         grad_guard=SimpleNamespace(refresh=lambda reason=None: None),
-        checkpointer=SimpleNamespace(save=lambda tag: None))
+        checkpointer=SimpleNamespace(save=lambda tag: None, save_buffers=lambda: None))
     return StageProtocol(m), m
 
 

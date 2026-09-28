@@ -2148,7 +2148,9 @@ class StageProtocol:
         cadence at which those metrics exist, so one eval is one measurement),
         then tests the whole trigger. Clears any pending pulled-forward eval
         request (this eval satisfies it, whoever set it: the trigger arming
-        tick, or a reloaded pre-transition snapshot's stamped request_eval)."""
+        tick, or a reloaded pre-transition snapshot's stamped request_eval).
+        After a transition that entered a stage, re-writes the resume pair
+        (_persist_entered_stage)."""
         self.ctrl['request_eval'] = False
         for i, term in enumerate(self.stage.exit or []):
             if term['metric'].startswith('eval/'):
@@ -2165,7 +2167,41 @@ class StageProtocol:
                   f"its exit condition was NOT met; exit streaks "
                   f"{dict(self.ctrl['exit'])}")
         self.advance(eval_metrics)
+        if not getattr(self.m, '_stop_requested', False):
+            self._persist_entered_stage()
         return True
+
+    def _persist_entered_stage(self):
+        """Re-write the resume pair -- the rolling buffer sidecar, then 'running' --
+        once an eval-time transition's actions are done, so both files on disk
+        describe the stage just entered.
+
+        train.py writes the rolling sidecar BEFORE evaluation(), which is where the
+        transition fires, and writes 'running' and the step archive AFTER it. Without
+        this, the pair at and after the transition step joined the NEW stage (its
+        stage_ctrl, a P_B freeze) to the buffers from BEFORE on_exit/on_enter changed
+        them (rebuild_prior_by_churn, seed_prior_from_anchors, reseed_prior_from_dataset),
+        until the next eval. on_enter never re-fires on resume, so a requeue or a
+        CK_STEP archive in that window trained the new stage on the old stage's rows
+        (conformer G0 2026-09-27: step100.pt in tb_conditioning with P_B frozen, its
+        step100_buffers.pt holding the 2502 phase-1 prior rows where the rebuild had
+        just made 1562).
+
+        'running' is re-written too, not only on the 50-step grid: a transition pulled
+        forward by request_eval lands off it, and a refreshed sidecar beside the OLD
+        stage's 'running' is the same mismatch mirrored -- the old stage resumed on the
+        new stage's rows. The step archive needs nothing here: train.py links it from
+        'running' and the rolling sidecar after evaluation() returns. Sidecar first,
+        because it is the long write and atomic_save keeps the previous file whole until
+        it lands: a kill during it leaves the previous pair in place.
+
+        Only the eval path calls this. begin()'s step-0 skip chain has persisted nothing
+        of the run yet, and its first eval writes the sidecar before its first 'running'.
+        A stop entered no stage; train.py writes 'final' with its own buffers. Both
+        writes honour checkpoint_read_only (Checkpointer.read_only)."""
+        ck = self.m.checkpointer
+        ck.save_buffers()
+        ck.save('running')
 
     # ------------------------------------------------------------ transitions
 

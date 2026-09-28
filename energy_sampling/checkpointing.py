@@ -169,6 +169,9 @@ class Checkpointer:
     def __init__(self, modeller):
         self.modeller = modeller
         self._read_only_announced = False
+        # the step_ind a full load (load_full) restored in THIS process, else None. A
+        # resumed leg re-runs that step, and `archive` must not rewrite its archive.
+        self.resume_step: Optional[int] = None
 
     @property
     def read_only(self) -> bool:
@@ -558,6 +561,21 @@ class Checkpointer:
         steps stale. Without them an archive still restores the model and
         optimizers; the buffer state (which is part of the dynamics -- a
         corrupted replay buffer acts as hidden state) starts fresh.
+
+        THE STEP A LEG RESUMED AT IS NOT RE-ARCHIVED. A full load restores
+        step_ind and the loop re-runs that step, so a leg resumed at an archive
+        step reaches this call again at that step. Re-linking then replaced the
+        archive with the rerun's weights and the rolling sidecar -- which the
+        resume had filled from a LATER eval -- and a CK_STEP restart loaded that
+        replaced pair (G0 gate, 2026-09-27: step50_buffers.pt held leg 1's
+        step-75 rows). So at `resume_step`, whatever is on disk (model, frozen
+        sidecar, or both) is kept and nothing is written: writing only the
+        missing half would pair files from two legs. Kept files get a fresh
+        mtime: the sbatch seeds that pick the newest step archive with `ls -t`
+        ranked the old re-link as newest, and still do.
+        Every other step overwrites as before: a CK_STEP fork has to replace
+        the abandoned branch's later archives, or a later CK_STEP or
+        newest-archive seed would load that branch.
         """
         if self.read_only:
             return
@@ -566,6 +584,18 @@ class Checkpointer:
         if period <= 0 or step <= 0 or step % period != 0:
             return None
         tag = f'step{step}'
+        if step == self.resume_step:
+            kept = [p for p in (self.path_for(tag), self.buffers_path(tag)) if os.path.exists(p)]
+            if kept:
+                for p in kept:
+                    try:
+                        os.utime(p)
+                    except OSError as e:
+                        print(f'archive: could not refresh the mtime of kept {p} ({e}); '
+                              f'`ls -t` newest-archive seeds may not rank it newest')
+                print(f'archive: {tag} is the step this leg resumed at and is already on disk '
+                      f'({", ".join(os.path.basename(p) for p in kept)}) -- kept, not overwritten')
+                return tag
         self.link('running', tag)
         if getattr(m.args, 'archive_buffers', True):
             # HARDLINK the rolling sidecar too, for the same reason: it is
@@ -708,6 +738,7 @@ class Checkpointer:
                 f"compatibility is kept. Start fresh, or load just its weights with "
                 f"load_weights_only.")
         self.set_state_dict(checkpoint['modeller_state'])
+        self.resume_step = int(m.step_ind)
         m.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
 
         # checkpoints written before buffers moved to a sidecar carry them
