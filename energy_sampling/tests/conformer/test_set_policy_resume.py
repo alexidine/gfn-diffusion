@@ -383,8 +383,10 @@ def test_a_flat_checkpoint_without_the_stamp_under_a_set_config_is_refused(carri
     a set config would swap a new head over the loaded trunk; it is refused instead."""
     f = _modeller(carrier, _args(tmp_path, model__policy_kind='flat'), run_name='flat')
     f.init_gfn()
-    assert f.gfn_config['conformer'] == {'policy_kind': 'flat', 'carrier': True,
-                                         'block_width': [5, 4, 3]}
+    # the condition set rides in the same block (tests/conformer/test_condition_set_identity.py)
+    stamp = dict(f.gfn_config['conformer'])
+    assert stamp.pop('condition_set')['identifiers'] == sorted(SMIS)
+    assert stamp == {'policy_kind': 'flat', 'carrier': True, 'block_width': [5, 4, 3]}
     f.checkpointer.save('probe')
     path = f.checkpointer.path_for('probe')
     ck = torch.load(path, weights_only=False)

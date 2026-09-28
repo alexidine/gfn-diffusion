@@ -27,13 +27,17 @@ A mismatch is REFUSED (exit 2), not repaired:
     a config that changed one loads without refusal, and log R, the quadrature and the
     tracker and head gaps are then against another target than the one trained;
   * conditions file vs checkpoint: the carrier width, periodic columns and r|theta|phi split
-    (`_assert_checkpoint_layout`), and the tracker's library size against the number of
-    conditions;
+    (`_assert_checkpoint_layout`), the condition set -- its identifiers in mol_id order and
+    each member's signature -- against the one the checkpoint's gfn_config['conformer'] stamp
+    records (`ConformerModeller._assert_condition_set`, reached because the eval loads
+    through `load_full`, a full resume), and the tracker's library size against the number
+    of conditions;
   * conditions file vs config: the per-graph `ctree_stereo_coeff` against the energy's
     (`_refuse_stereo_mismatch`).
-The checkpoint stores no identifier list, so two condition files of equal layout and count
-that name different molecules are not told apart here; the conditions file's sha256 and
-identifiers are printed and written to the JSON for comparison with the run's provenance.
+A checkpoint written before the stamp carried the condition set is warned about, not refused;
+against such a checkpoint, two condition files of equal layout and count that name different
+molecules are not told apart here. The conditions file's sha256 and identifiers are printed
+and written to the JSON for comparison with the run's provenance.
 The checkpoint's `gfn_config['device']` is replaced by `--device` before the model is built:
 GFN places constant tensors on it at construction, so a GPU checkpoint cannot otherwise be
 built on the CPU. It carries no parameter.
@@ -638,7 +642,8 @@ def init_eval_modeller(m):
     except SystemExit as e:                      # _refuse_stereo_mismatch and kin
         raise Refused(f'the conditions file does not match this run: {e}') from None
     except (ValueError, NotImplementedError) as e:
-        # assert_problem_match, _assert_checkpoint_layout, _check_reloaded_policy
+        # assert_problem_match, _assert_checkpoint_layout, _assert_condition_set (a full
+        # resume onto another condition set), _check_reloaded_policy
         raise Refused(f'the checkpoint does not match this config or conditions file '
                       f'({type(e).__name__}): {e}') from None
     ef = m.energy_function
@@ -1392,9 +1397,11 @@ def format_report(res: dict) -> str:
     if rf_missing:
         notes.append(f"  (all): no reference entry for {rf_missing}")
     notes.append(f"  (all): conditions file {meta['conditions_file']} sha256 "
-                 f"{(meta['conditions_sha256'] or '?')[:16]}...; the checkpoint records no "
-                 f"identifiers, so its identity beyond layout, count and stereo coefficient is "
-                 f"this file's")
+                 f"{(meta['conditions_sha256'] or '?')[:16]}...; a checkpoint whose stamp names "
+                 f"its condition set was held to this file's identifiers and member signatures "
+                 f"at load (ConformerModeller._assert_condition_set); one written before that "
+                 f"stamp records no identifiers, so its identity beyond layout, count and "
+                 f"stereo coefficient is this file's")
     out.append('Notes:\n' + '\n'.join(notes))
     n_fail = sum(1 for r in rows if r['overall'] != PASS)
     n_pair = sum(1 for p in res['pairs'] if p['required'] and p['verdict'] != 'PASS')

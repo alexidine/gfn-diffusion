@@ -591,9 +591,11 @@ def test_the_loader_refuses_a_mismatched_conditions_file_or_config(tiny):
     _write_conditions(tmp / 'cond_wide.pt', ['N', 'C=O', 'CO'])
     _refused(_write_config(tmp, 'wide', tmp / 'cond_wide.pt'), ck,
              'does not match.*(width|layout)')
-    # one more molecule inside the same widths: equal layout, a tracker of the wrong size
+    # one more molecule inside the same widths: equal layout, refused by the checkpoint's
+    # condition-set stamp (ConformerModeller._assert_condition_set) before the tracker is read
     _write_conditions(tmp / 'cond_four.pt', SMIS + ['OO'])
-    _refused(_write_config(tmp, 'four', tmp / 'cond_four.pt'), ck, 'tracker holds 3')
+    _refused(_write_config(tmp, 'four', tmp / 'cond_four.pt'), ck,
+             r"condition set.*only in this run \['OO'\]")
     # the conditions are the checkpoint's, the energy's lock is not (energy_clip would not
     # do: utils._NON_IDENTITY_ENERGY_CONFIG_KEYS exempts it from the problem identity)
     _refused(_write_config(tmp, 'locked_cfg', tmp / 'cond.pt', stereo_coeff=300.0), ck,

@@ -163,5 +163,7 @@ def test_a_flat_policy_with_dplr_on_a_carrier_is_refused():
         ConformerModeller._install_set_policy(m)
     ok = _install_stub(['C', 'CO', 'N'], kind='flat', dplr_rank=0)
     ConformerModeller._install_set_policy(ok)
-    assert ok.gfn_config['conformer'] == {'policy_kind': 'flat', 'carrier': True,
-                                          'block_width': [5, 4, 3]}
+    # the condition set rides in the same block (tests/conformer/test_condition_set_identity.py)
+    stamp = dict(ok.gfn_config['conformer'])
+    assert stamp.pop('condition_set')['identifiers'] == ['C', 'CO', 'N']
+    assert stamp == {'policy_kind': 'flat', 'carrier': True, 'block_width': [5, 4, 3]}

@@ -571,12 +571,15 @@ class ConformerModeller(Modeller):
         return out_s, out_i
 
     def init_identifiers(self):
-        """Base registry, then hand it to a multi-molecule energy.
+        """Base registry, checked against the stamped condition set, then handed to the energy.
 
-        Without this a buffered row -- which carries `mol_id` but not `identifier` -- cannot be
-        matched to its chart, and the energy would have to guess.
+        Without the hand-over a buffered row -- which carries `mol_id` but not `identifier` --
+        cannot be matched to its chart, and the energy would have to guess. The check
+        (`_assert_registry_is_the_stamp`) is what makes the stamp's identifier list mol_id
+        order rather than an assumption about it.
         """
         super().init_identifiers()
+        self._assert_registry_is_the_stamp()
         binder = getattr(self.energy_function, 'bind_identifier_registry', None)
         if binder is not None:
             binder(self.identifier_registry)
@@ -750,6 +753,11 @@ class ConformerModeller(Modeller):
         writes it again and the leg after that can load too. The head is built from the
         STORED arguments, never from this config: the architecture follows the file, and
         _install_set_policy then checks the config against it field by field.
+
+        THE EARLIEST POINT A CHECKPOINT MEETS THIS RUN. load_full calls this before it restores
+        the modeller state, the buffer sidecar or condition_log_z, and init_energy_function
+        has already built this run's members off molecules_path -- so the layout and the
+        condition set are both judged here, ahead of every restore.
         """
         from models.conformer_gfn import ConformerGFN
         from models.gfn import GFN
@@ -757,6 +765,7 @@ class ConformerModeller(Modeller):
         cfg = dict(cfg)
         stamp = cfg.pop('conformer', None)
         self._assert_checkpoint_layout(cfg, stamp)
+        self._assert_condition_set(stamp)
         self._gfn_reloaded = True
         kind = 'flat' if stamp is None else str(stamp.get('policy_kind'))
         carrier = bool(stamp.get('carrier', False)) if stamp is not None else False
@@ -819,6 +828,198 @@ class ConformerModeller(Modeller):
                   f"existed). Width {want_dim} and the periodic columns match; the "
                   f"r|theta split cannot be verified from the file.")
 
+    # ------------------------------------------------------ the condition set in the stamp
+
+    #: how `_member_signature` digests a member. Stored beside the digests, so a checkpoint
+    #: signed by another recipe has its identifiers compared and its members left unjudged,
+    #: rather than every member read as changed.
+    _MEMBER_SIGNATURE = 'blake2b-64(smiles|block codes|placement z)'
+
+    @staticmethod
+    def _member_signature(smiles, member) -> str:
+        """16 hex characters for one member, from three fields the built member already holds.
+
+        Nothing is parsed, embedded or read from disk. The SMILES it was built from (the
+        conditions file's string, stereo marks included) names the molecule where the
+        identifier does not. Its per-column block codes in state order (`_free_block`, a
+        transverse u or v as 3) fix, with the stamped `block_width`, the carrier columns it
+        owns. Its placement-order atomic numbers (`spec.z`) are the atoms `_resolve_rows`
+        compares against every stored row. Another molecule under the same identifier, or the
+        same SMILES built into another chart, changes the digest.
+        """
+        import hashlib
+        codes = ''.join(str(int(c)) for c in np.asarray(member._free_block).reshape(-1))
+        z = ','.join(str(int(a)) for a in np.asarray(member.spec.z).reshape(-1))
+        return hashlib.blake2b(f'{smiles}|{codes}|{z}'.encode(), digest_size=8).hexdigest()
+
+    def _condition_set_identity(self):
+        """This run's condition set as `gfn_config['conformer']['condition_set']` stores it.
+
+        None on a single chart, which has no member set. `identifiers` are in mol_id order:
+        init_identifiers numbers the SORTED identifiers of the conditions and prior files, and
+        the prior's are the members' (`_assert_registry_is_the_stamp` checks that once the
+        registry exists), so identifier i is mol_id i -- and, with one space group and one Z',
+        condition_id i. Built from the energy's members because they exist before a checkpoint
+        loads, and the registry does not.
+        """
+        en = getattr(self, 'energy_function', None)
+        members = getattr(en, '_members', None)
+        if not members:
+            return None
+        smiles = getattr(en, '_member_smiles', None) or {}
+        idents = sorted(members)
+        return {'identifiers': idents,
+                'signatures': [self._member_signature(smiles.get(i, members[i].smiles),
+                                                      members[i]) for i in idents],
+                'signature_recipe': self._MEMBER_SIGNATURE}
+
+    def _with_condition_set(self, block):
+        """`block` plus this run's `condition_set`, when the energy holds a member set."""
+        ident = self._condition_set_identity()
+        return dict(block) if ident is None else {**block, 'condition_set': ident}
+
+    def _loading_weights_only(self) -> bool:
+        """Whether the load in progress is `Checkpointer.load_weights_only` rather than `load_full`.
+
+        gfn_from_config runs inside both, before either records anything that says which
+        (load_full's `resume_step`, load_weights_only's `weights_only_loaded`), so this reads the
+        branch train.py's Modeller.init_gfn takes: `checkpoint_name` with `load_weights_only` is
+        the weights-only load; `checkpoint_name` alone, and `continue_from_checkpoint` whatever
+        `load_weights_only` says, are full loads.
+        """
+        args = getattr(self, 'args', None)
+        return (getattr(args, 'checkpoint_name', None) is not None
+                and bool(getattr(args, 'load_weights_only', False)))
+
+    @staticmethod
+    def _name_some(items, quote: bool = True, limit: int = 10) -> str:
+        shown = [repr(i) if quote else str(i) for i in list(items)[:limit]]
+        more = f', +{len(items) - limit} more' if len(items) > limit else ''
+        return '[' + ', '.join(shown) + more + ']'
+
+    def _assert_condition_set(self, stamp):
+        """Refuse a FULL resume onto another condition set; on a weights-only load, say so.
+
+        mol_id is an identifier's position in the sorted condition set (init_identifiers), and
+        a full resume restores state keyed by it: condition_log_z's rows and the `mol_id` on
+        every stored buffer row. Against another set those rows are read as other molecules.
+        The tracker's size check (init_condition_log_z) sees an added or removed member only
+        after the sidecar is restored, and a same-size substitution not at all: that one
+        surfaced at the first backward draw, in MultiConformerTorsions._resolve_rows. So every
+        difference is refused here, ahead of every restore -- an identifier added or removed,
+        a mol_id moved, a member whose signature changed under the same identifier.
+
+        A weights-only load restores none of that state, and no weight is indexed by mol_id
+        (the heads read each molecule off its condition graph), so another set is legitimate
+        there and is named on one line. A checkpoint written before the stamp carried the set
+        is warned about on a full resume, not refused. A single chart has no member set, and
+        nothing is compared.
+        """
+        mine = self._condition_set_identity()
+        if mine is None:
+            return
+        weights_only = self._loading_weights_only()
+        stored = stamp.get('condition_set') if isinstance(stamp, dict) else None
+        if not isinstance(stored, dict) or stored.get('identifiers') is None:
+            if not weights_only:
+                print(f"WARNING: checkpoint carries no condition-set stamp (written before it "
+                      f"existed). This run's {len(mine['identifiers'])} identifiers cannot be "
+                      f"checked against the set it was trained on, so a different set of the "
+                      f"same size is not refused here; this leg's checkpoints carry the stamp.")
+            return
+        old, new = list(stored['identifiers']), list(mine['identifiers'])
+        old_pos = {i: k for k, i in enumerate(old)}
+        new_pos = {i: k for k, i in enumerate(new)}
+        removed = [i for i in old if i not in new_pos]
+        added = [i for i in new if i not in old_pos]
+        moved = [f'{i!r} {old_pos[i]} -> {new_pos[i]}' for i in new
+                 if i in old_pos and old_pos[i] != new_pos[i]]
+        comparable = (stored.get('signature_recipe') == mine['signature_recipe']
+                      and stored.get('signatures') is not None)
+        changed = []
+        if comparable:
+            old_sig = dict(zip(old, stored['signatures']))
+            changed = [i for i, s in zip(new, mine['signatures'])
+                       if i in old_sig and old_sig[i] != s]
+        diffs = [f'{label} {self._name_some(items, quote)}' for label, items, quote in (
+            ('only in the checkpoint', removed, True),
+            ('only in this run', added, True),
+            ('same identifier, another member (SMILES, block codes or placement-order atoms)',
+             changed, True),
+            ('mol_id moved', moved, False)) if items]
+        if not diffs:
+            print(f"condition set: {len(new)} identifiers in mol_id order"
+                  + (" and their member signatures" if comparable else
+                     f" (member signatures by another recipe, "
+                     f"{stored.get('signature_recipe')!r}, not compared)")
+                  + " match the checkpoint's")
+            return
+        what = '; '.join(diffs)
+        if weights_only:
+            print(f"condition set: weights-only load onto another set ({len(old)} -> {len(new)} "
+                  f"identifiers; {what}) -- allowed: no weight is indexed by mol_id, the "
+                  f"tracker and buffers start on this set, and this run's checkpoints carry it")
+            return
+        raise ValueError(
+            f"condition set: this full resume's conditions ({len(new)} identifiers) are not the "
+            f"set the checkpoint was trained on ({len(old)}) -- {what}. mol_id is an "
+            f"identifier's position in the sorted set, and a full resume restores "
+            f"condition_log_z's rows and the stored buffer rows keyed by it, so they would be "
+            f"read as other molecules. Start this run fresh (checkpoint_name: null, "
+            f"continue_from_checkpoint: false), or take the weights alone (checkpoint_name: "
+            f"this checkpoint, load_weights_only: true): no weight is indexed by mol_id, and "
+            f"the tracker and buffers then start on this set.")
+
+    def _restamp_condition_set(self):
+        """After a load, the block this run's saves write names THIS run's condition set.
+
+        A full resume has passed `_assert_condition_set`, so this rewrites the set that was
+        read. A weights-only load onto another set replaces the checkpoint's, to which this
+        run's tracker and buffers are not keyed. A block written before the stamp gains one,
+        and a pre-stamp flat checkpoint on a carrier, which carries no block, gets the block a
+        fresh build of this run writes. A flat policy off a carrier writes none, as fresh.
+        """
+        ident = self._condition_set_identity()
+        if ident is None:
+            return
+        block = self.gfn_config.get('conformer')
+        if block is None:
+            if not getattr(self.energy_function, 'is_carrier', False):
+                return
+            block = {'policy_kind': 'flat', 'carrier': True,
+                     'block_width': self._state_block_width()}
+        self.gfn_config['conformer'] = {**block, 'condition_set': ident}
+
+    def _assert_registry_is_the_stamp(self):
+        """The stamped identifier list must BE the mol_id registry init_identifiers built.
+
+        The stamp is computed from the energy's members, sorted, before any dataset loads; the
+        registry is the sorted union of every loaded dataset's identifiers. They differ only
+        when the prior file names an identifier the conditions file does not -- a row with no
+        member, which `_resolve_rows` refuses at its first draw -- or if registration stops
+        sorting. Either way the stamp would not be mol_id order, so it is refused at init.
+        """
+        block = (getattr(self, 'gfn_config', None) or {}).get('conformer') or {}
+        stamped = (block.get('condition_set') or {}).get('identifiers')
+        if stamped is None:
+            return
+        reg = self.identifier_registry
+        registered = sorted(reg, key=reg.get)
+        if registered == list(stamped):
+            return
+        only_reg = [i for i in registered if i not in set(stamped)]
+        only_stamp = [i for i in stamped if i not in reg]
+        raise ValueError(
+            f"the mol_id registry ({len(registered)} identifiers, over the conditions and prior "
+            f"files) is not the stamped condition set ({len(stamped)}, this run's energy "
+            f"members, sorted): only in the registry {self._name_some(only_reg)}, only among "
+            f"the members {self._name_some(only_stamp)}"
+            + ("" if only_reg or only_stamp else
+               "; the same identifiers in another order, so registration no longer sorts and "
+               "_condition_set_identity must follow it")
+            + ". A prior row whose identifier has no member cannot be scored; build the prior "
+              "and the conditions from one molecule list.")
+
     def _install_set_policy(self):
         """`model.policy_kind: set` -> swap the flat scalarMLP for a per-coordinate set head.
 
@@ -830,7 +1031,12 @@ class ConformerModeller(Modeller):
 
         ON A RELOAD THIS IS A CHECKED NO-OP (`_check_reloaded_policy`). The model, its EMA and
         the optimizers already hold the checkpoint's state; swapping here would replace the
-        loaded head with a fresh init, reset the EMA and discard the Adam moments.
+        loaded head with a fresh init, reset the EMA and discard the Adam moments. Only the
+        stamp's `condition_set` is rewritten to this run's (`_restamp_condition_set`).
+
+        THE STAMP ALSO NAMES THE CONDITION SET (`_with_condition_set`) on an energy that holds
+        members: the identifiers in mol_id order and a signature per member, which
+        `gfn_from_config` compares before a full resume restores anything keyed by mol_id.
 
         On a fresh build THREE THINGS HAVE TO HAPPEN IN THIS ORDER and the last is the one
         that bites: the base `init_gfn` has already deep-copied the EMA model and already
@@ -840,6 +1046,7 @@ class ConformerModeller(Modeller):
         """
         if getattr(self, '_gfn_reloaded', False):
             self._check_reloaded_policy()
+            self._restamp_condition_set()
             return
         spec = getattr(self, '_policy_spec', {})
         kind = str(spec.get('policy_kind', 'flat')).lower()
@@ -847,8 +1054,9 @@ class ConformerModeller(Modeller):
         if kind == 'flat':
             if carrier:
                 self._flat_on_carrier()
-                self.gfn_config['conformer'] = {'policy_kind': 'flat', 'carrier': True,
-                                                'block_width': self._state_block_width()}
+                self.gfn_config['conformer'] = self._with_condition_set(
+                    {'policy_kind': 'flat', 'carrier': True,
+                     'block_width': self._state_block_width()})
             return
         if kind != 'set':
             raise ValueError(
@@ -909,8 +1117,10 @@ class ConformerModeller(Modeller):
 
         self.ema_model = deepcopy(self.gfn_model)
         self.init_schedulers_optimizers()
-        # the ARCHITECTURE, for the checkpoint: Checkpointer.save stores gfn_config whole
-        self.gfn_config['conformer'] = stamp
+        # the ARCHITECTURE, for the checkpoint: Checkpointer.save stores gfn_config whole.
+        # `stamp` itself stays the plan _check_reloaded_policy compares field by field; the
+        # stored copy adds the condition set, which that comparison must not judge
+        self.gfn_config['conformer'] = self._with_condition_set(stamp)
 
         n_new = sum(p.numel() for p in policy.parameters())
         print(f"policy: {'CONDITIONAL ' if conditional else ''}SET over {policy.dim} "
