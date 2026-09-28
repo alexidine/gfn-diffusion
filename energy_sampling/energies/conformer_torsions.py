@@ -1815,6 +1815,17 @@ class ConformerTorsions(BaseSet):
         The BOX CLAMP in sample_prior_states is not represented here either: it puts
         finite mass exactly on the wall, which no continuous density can express. Callers
         must check ``stats['clip_frac']`` is ~0 before treating these weights as valid.
+
+        FREE INVERTIBLE CENTRES ARE A MIXTURE. With ``joint_torsions`` the draw reflects each
+        centre of energies/invertible_centres.py's `invertible_centres`, planar ones included,
+        on an independent half of its draws, so that centre's rows are scored as
+        ``(q_c(x) + q_c(R_c x)) / 2``; every other row keeps the term it had before, bitwise.
+        At a planar centre the two components nearly coincide and the sum is exact all the
+        same. A FRAME centre, or a SIBLING pivot that is not its group's leader, raises
+        NotImplementedError below; the table makes either only at a ring atom (a FRAME needs a
+        ring bond to its ring-closure neighbour, a pivot other than the leader is a ring
+        child), and a molecule with a ring is refused above first, so no acyclic molecule
+        reaches that refusal.
         """
         from mxtaltools.conformers.prior import R_RANGE, THETA_RANGE, PHI_RANGE
         spans = {'r': R_RANGE, 'theta': THETA_RANGE, 'phi': PHI_RANGE}
@@ -1879,13 +1890,25 @@ class ConformerTorsions(BaseSet):
 
         # ---- phi, mirroring the leader/follower structure exactly ----
         if joint_torsions:
+            from energies.invertible_centres import (ROOT, SIBLING, invertible_centres,
+                                                     reflect_phi)
             s_imp = self.improper_phi_sigma(float(self.temperature))
+            # the rows of a FREE INVERTIBLE CENTRE are scored at the end, as one mixture;
+            # `comp` keeps each one's own component (mean per draw, width) until then
+            inv = invertible_centres(self)
+            mixed = {j for c in inv for j in c.rows}
+            comp = {}
             # the HELD rows, as sample_prior_states draws them (held_phi_rows)
             for j in self.held_phi_rows():
+                if j in mixed:
+                    comp[j] = (np.full(n, ph0[j]), s_imp)
+                    continue
                 total += wrapped_gauss(dof[:, n_phi0 + j], ph0[j], s_imp)
+            leaders = set()
             for gi, rows_j in enumerate(groups):
                 grows = [n_phi0 + j for j in rows_j]
                 lead_i = 0
+                leaders.add(rows_j[lead_i])
                 _, hist, _, _ = types[grows[lead_i]]
                 total += marginal(grows[lead_i], 'phi', hist)
                 disp = ((dof[:, grows[lead_i]] - ph0[rows_j[lead_i]] + np.pi)
@@ -1893,7 +1916,39 @@ class ConformerTorsions(BaseSet):
                 for i, gr in enumerate(grows):
                     if i == lead_i:
                         continue
+                    if rows_j[i] in mixed:
+                        comp[rows_j[i]] = (ph0[rows_j[i]] + disp, g_sigma[gi])
+                        continue
                     total += wrapped_gauss(dof[:, gr], ph0[rows_j[i]] + disp, g_sigma[gi])
+
+            # FREE INVERTIBLE CENTRES. sample_prior_states flips each one (R_c, a ROOT or SIBLING
+            # flip of energies/invertible_centres.py: a FRAME flip needs a ring, refused above)
+            # on an independent half of its draws. R_c is an involution with |det| 1 that moves
+            # only the centre's own rows, and no other row's density reads them -- a pivot is its
+            # group's leader, whose value R_c keeps and every follower's mean is built from --
+            # so the density of those rows is (q_c(x) + q_c(R_c x)) / 2, each component the
+            # product of the rows' own wrapped Gaussians. Differences are wrapped onto the
+            # circle before the images are summed: a reflected sibling is not wrapped.
+            def circ_gauss(d, s):
+                d = (d + np.pi) % (2 * np.pi) - np.pi
+                acc = np.zeros_like(d)
+                for k in (-1, 0, 1):
+                    acc = acc + np.exp(gauss(d + 2 * np.pi * k, 0.0, s))
+                return np.log(np.clip(acc, 1e-300, None))
+
+            ph = dof[:, n_phi0:]
+            for c in inv:
+                if (c.kind not in (ROOT, SIBLING) or (c.kind == SIBLING and c.pivot not in leaders)
+                        or set(c.rows) - set(comp)):
+                    raise NotImplementedError(
+                        f'{self.smiles}: the invertible centre {c.name} ({c.kind}) flips about '
+                        f'a ring frame or a pivot that is not its group\'s drawn leader, or '
+                        f'moves a row this density does not draw as a held row or a follower; '
+                        f'the mixture below assumes neither (energies/invertible_centres.py)')
+                mirror = reflect_phi(ph.copy(), c)
+                own = sum(circ_gauss(ph[:, j] - comp[j][0], comp[j][1]) for j in c.rows)
+                mir = sum(circ_gauss(mirror[:, j] - comp[j][0], comp[j][1]) for j in c.rows)
+                total += np.logaddexp(own, mir) - np.log(2.0)
         return total
 
     def _global_row(self, kind: str, j: int) -> int:
@@ -1948,6 +2003,20 @@ class ConformerTorsions(BaseSet):
         The draws remain valid support, which is all TB strictly needs, but as a proposal
         they are broken -- so a benchmark quoting this path is measuring the disabled path,
         not the prior. ``stats['closure_err']`` is measured on BOTH, deliberately.
+
+        BOTH SIDES OF A FREE INVERTIBLE CENTRE. With ``joint_torsions`` each centre
+        energies/invertible_centres.py's `invertible_centres` names -- three-coordinate, left
+        free by the stereo lock, with a substituent offset whose sign can be negated as an
+        exact inversion without turning the centre's ring system, planar or not -- has that
+        offset negated on an independent half of the draws, after every other draw. At a
+        planar centre (an sp2 C, an aromatic ring atom) the flip moves a drawn row by twice its
+        distance from the plane. A free four-coordinate centre (``stereo_coeff`` 0) is not
+        flipped. ``stats['invertible_centres']`` names them, ``stats['reflected']`` ``[n, m]``
+        marks the flipped draws and ``stats['reflected_frac']`` gives each centre's share. A
+        molecule without one (CH4, ethanol) draws exactly as before, bitwise, generator state
+        included; one whose only such centres are planar (H2CO, benzene) draws differently bit
+        for bit, and in distribution only by its reference's own departure from the plane
+        (energies/invertible_centres.py, BITWISE WHERE NOTHING IS FLIPPED).
         """
         from mxtaltools.conformers.prior import R_RANGE, THETA_RANGE, PHI_RANGE
         spans = {'r': R_RANGE, 'theta': THETA_RANGE, 'phi': PHI_RANGE}
@@ -2170,6 +2239,44 @@ class ConformerTorsions(BaseSet):
                 kind, hist, _, _ = types[row]
                 dof[:, row] = draw(row, kind, hist)
 
+        # ---- FREE INVERTIBLE CENTRES: each on either side, with probability 1/2 ----
+        # The joint draw above holds every improper row and every substituent offset about the
+        # reference, sign included, so it proposes one side of each non-planar centre. Where
+        # the lock leaves a three-coordinate centre free the target holds both, and each one
+        # energies/invertible_centres.py qualifies, planar or not, has that offset negated on
+        # its own half of the draws; the eval's parity metric reads the same table and requires
+        # both sides of the non-planar ones. The coins come from `rng` AFTER every other draw,
+        # and a molecule with no such centre makes no call on it: its draw, and the generator's
+        # state after it, are bitwise what they were without this block. Only periodic phi rows
+        # move, so the box clamp below cannot bind on a flip, and every other atom moves
+        # rigidly, so no stereo element changes its indicator but a double bond the centre is an
+        # atom of, which the flip turns by twice the centre's distance from its plane
+        # (energies/invertible_centres.py, QUALIFIED). prior_log_prob scores the two-component
+        # mixture this makes.
+        stats['invertible_centres'] = []
+        stats['reflected'] = np.zeros((n, 0), dtype=bool)
+        if joint_torsions:
+            from energies.invertible_centres import (FRAME, frame_dihedral,
+                                                     invertible_centres, reflect_phi)
+            inv = invertible_centres(self)
+            if inv:
+                flip = rng.random((n, len(inv))) < 0.5
+                pos = None
+                if any(c.kind == FRAME for c in inv):
+                    # phi_ring of each draw, from its positions before any flip: no flip moves
+                    # the ring atoms it is measured on (energies/invertible_centres.py)
+                    tt = lambda a: torch.as_tensor(a, dtype=self.dtype, device=self.device)
+                    pos = self.build_positions(
+                        self.state_from_dof(tt(dof[:, :self.n_r]), tt(dof[:, self.n_r:n_phi0]),
+                                            tt(dof[:, n_phi0:])).clamp(-1.0, 1.0)
+                    ).reshape(n, -1, 3)
+                for k, c in enumerate(inv):
+                    reflect_phi(dof[:, n_phi0:], c, flip[:, k],
+                                ring=frame_dihedral(pos, c) if c.kind == FRAME else None)
+                stats['invertible_centres'] = [c.name for c in inv]
+                stats['reflected'] = flip
+        stats['reflected_frac'] = [float(f) for f in stats['reflected'].mean(0)] if n else []
+
         t = lambda a: torch.as_tensor(a, dtype=self.dtype, device=self.device)
         x = self.state_from_dof(t(dof[:, :self.n_r]),
                                 t(dof[:, self.n_r:self.n_r + self.n_th]),
@@ -2229,6 +2336,10 @@ class ConformerTorsions(BaseSet):
                       f"sigma {lo:.1f}-{hi:.1f} deg from the FF's own k_angle")
             else:
                 print(f"  phi drawn INDEPENDENTLY per DoF (pre-fix behaviour)")
+            if stats['invertible_centres']:
+                print("  free invertible centres reflected (share of draws): " + ', '.join(
+                    f'{nm} {fr:.1%}' for nm, fr in zip(stats['invertible_centres'],
+                                                      stats['reflected_frac'])))
             print(f"  clipped to box: r {stats['clip_frac']['r']:.1%}, "
                   f"theta {stats['clip_frac']['theta']:.1%}")
             if stats['n_rings']:

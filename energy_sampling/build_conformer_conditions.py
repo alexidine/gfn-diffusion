@@ -248,12 +248,25 @@ def stereo_mol(smiles: str):
 
     Tetrahedral N is not a stereo element here. RDKit's 3D perception does not recover N
     configuration, so an N-tagged isomer could not be verified, and ordinary amines invert.
-    WORKING ASSUMPTION (scope: this builder; revisit if aziridine or bridgehead-N molecules
-    show a prior-coverage defect): N invertomers stay together inside one condition. Where
-    inversion is hindered (an aziridine N, a ring-fused N) the two invertomers are separate
-    basins, one condition spans both, and the reference sits in one of them. A bridgehead N
-    in a cage has no second invertomer; its configuration follows from the C centres, which
-    keep their tags.
+    WORKING ASSUMPTION (scope: this builder, which strips N tags only (`_strip_n_tags`), and
+    the stereo lock, which leaves EVERY three-coordinate atom free -- a sulfoxide S or a
+    phosphine P as well as an N -- and when on refuses a tag on one; revisit if aziridine or
+    bridgehead-N molecules show a prior-coverage defect): the two sides of a three-coordinate
+    centre, N invertomers here, stay together inside one condition. Where inversion is
+    hindered (an aziridine N, a ring-fused N) the two invertomers are separate basins, one
+    condition spans both, and the reference sits in one of them. A bridgehead N in a cage has
+    no second invertomer; its configuration follows from the C centres, which keep their tags.
+    The fitted prior draws both invertomers of every three-coordinate centre
+    energies/invertible_centres.py qualifies, a ring N at its ring's closure (C1CN1, C1CCNC1,
+    C1CCNCC1) included, and the reference's alone at a ring N at the tree's root (C1COCCN1,
+    CN1CC1) or one the tree enters from its substituent (CCN1CC1); the caged N of DABCO has no
+    second invertomer.
+    THE REVISIT TRIGGER IS MET (2026-09-28): CN1CC1 is an aziridine whose ring N sits at the
+    tree's root, so the prior proposes one invertomer (energies/invertible_centres.py, NOT
+    COVERED) while the condition's target holds both -- the prior-coverage defect named above.
+    Whether to keep the assumption, split hindered invertomers into separate conditions, or
+    extend the prior's flip to a ring N at the root is an OPEN OWNER DECISION; until it is
+    made the assumption stands as written.
     """
     from rdkit import Chem
 

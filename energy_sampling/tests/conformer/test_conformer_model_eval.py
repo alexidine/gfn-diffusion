@@ -14,9 +14,9 @@ FAST (numbers and single member charts, no model):
     same holds on the marginal fallback where the product enumeration was skipped, and a
     skipped table without draws is UNAVAILABLE;
   * draws on one side of a free non-planar centre (NH3's pyramid, which the lock leaves free)
-    miss it and fail the parity bar, half of them reflected pass; a free centre whose mirror
-    is out of reach (DABCO's cage N) is not missed; a locked centre and a planar one are not
-    free centres;
+    miss it and fail the parity bar, half of them reflected pass; a caged centre with no
+    second side (DABCO's N) is not read, n/a; a locked centre and a planar one are not free
+    centres;
   * a stereo-lock-violating draw (the mirror image of a locked centre) is counted, active and
     inverted, and a molecule without a lock is n/a, not a pass;
   * the clash count reads the pair overlap against its threshold;
@@ -306,7 +306,7 @@ def test_draws_on_one_side_of_a_free_centre_miss_it():
     one = me.parity_coverage(nh3, x)
     assert one['n_centres'] == one['n_accessible'] == one['n_missed'] == 1
     assert one['centres'][0]['name'] == 'N0' and one['minority_frac'] == 0.0
-    assert one['centres'][0]['mirror_de_kt'] == pytest.approx(0.0, abs=1e-6)
+    assert one['centres'][0]['kind'] == 'root', "NH3's N is the root: its improper row flips"
     assert me.judge({'parity': one}, me.Bars())['parity']['status'] == me.FAIL
     both = me.parity_coverage(nh3, torch.cat([x[:128], _mirror(nh3, x[128:])]))
     assert both['n_missed'] == 0 and both['minority_frac'] == pytest.approx(0.5)
@@ -314,21 +314,18 @@ def test_draws_on_one_side_of_a_free_centre_miss_it():
 
 
 @pytest.mark.fast
-def test_a_free_centre_whose_mirror_is_out_of_reach_is_not_missed():
-    """DABCO: the lock leaves the three-coordinate cage N free, but reflecting it at the
-    reference geometry breaks the cage (about 1e5 kT), so the inverted side is not
-    accessible and draws on one side miss nothing. The same draws are missed once the
-    accessibility cut is raised past that energy."""
+def test_a_caged_centre_has_no_second_side_and_is_not_read():
+    """DABCO: the lock leaves the three-coordinate cage N free, but it has no exocyclic
+    substituent whose offset a flip could negate (its three neighbours are cage atoms), so the
+    cage fixes its side: energies/invertible_centres.py gives it no entry, and draws on one
+    side are n/a, not missed."""
     from energies.conformer_torsions import ConformerTorsions
     dabco = ConformerTorsions(smiles='C1CN2CCN1CC2', device='cpu', level='full',
                               force_field='mmff', dtype=torch.float64, stereo_coeff=300.0)
     x = torch.zeros(16, dabco.ndim, dtype=torch.float64)
     p = me.parity_coverage(dabco, x)
-    assert p['n_centres'] == 1 and p['n_accessible'] == 0 and p['n_missed'] == 0
-    assert p['centres'][0]['mirror_de_kt'] > 1e3 and p['minority_frac'] is None
-    assert me.judge({'parity': p}, me.Bars())['parity']['status'] == me.PASS
-    wide = me.parity_coverage(dabco, x, accessible_kt=1e9)
-    assert wide['n_accessible'] == wide['n_missed'] == 1
+    assert p['n_centres'] == 0 and 'lock' in p['na']
+    assert me.judge({'parity': p}, me.Bars())['parity']['status'] == me.N_A
 
 
 @pytest.mark.fast
@@ -345,6 +342,10 @@ def test_a_centre_the_lock_names_is_not_free_and_planar_is_not_a_centre(methane_
                              dtype=torch.float64)
     planar = me.parity_coverage(h2co, torch.zeros(4, h2co.ndim, dtype=torch.float64))
     assert planar['n_centres'] == 0
+    # the prior flips H2CO's C (energies/invertible_centres.py): in the table, marked planar,
+    # its own flip, so the eval does not require two sides of it
+    from energies.invertible_centres import centre_table
+    assert [(c.planar, c.invertible) for c in centre_table(h2co)] == [(True, True)]
 
 
 # ------------------------------------------------------------------ fast: lock and clash

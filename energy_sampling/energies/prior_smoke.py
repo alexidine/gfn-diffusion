@@ -1856,7 +1856,8 @@ def _prior_key_external(en, name, level, led):
 
 
 def _capture_prior_dof(en, prior, n, rng, **kw):
-    """``(r, theta, phi)`` as ``sample_prior_states`` actually emitted them, at EVERY level.
+    """``((r, theta, phi), stats)``: the DoF as ``sample_prior_states`` actually emitted
+    them, at EVERY level, and the draw's stats.
 
     ``sample_prior_states`` ends by calling ``state_from_dof``, which RAISES at `torsion`
     because the state -> DoF map is collective there. That single line is why the whole
@@ -1865,7 +1866,9 @@ def _capture_prior_dof(en, prior, n, rng, **kw):
     before that call, so shadowing ``state_from_dof`` on the instance intercepts it: the spy
     records the DoF, forwards to the real method where it works, and hands back a zero state
     where it does not. Nothing is reimplemented -- the code under test is the shipped
-    function, improper draw, group draw, ring handling and all.
+    function, improper draw, group draw, ring handling and all. The LAST call is the one
+    recorded: earlier ones (the ring-frame pass, the positions a ring-frame flip of
+    energies/invertible_centres.py reads) are the draw's own intermediate conversions.
     """
     box = {}
     real = en.state_from_dof
@@ -1879,10 +1882,10 @@ def _capture_prior_dof(en, prior, n, rng, **kw):
 
     en.state_from_dof = spy
     try:
-        en.sample_prior_states(prior, n, rng, report=False, **kw)
+        _, stats = en.sample_prior_states(prior, n, rng, report=False, **kw)
     finally:
         del en.state_from_dof                       # restore the class method
-    return box['dof']
+    return box['dof'], stats
 
 
 def _prior_draw_leg(en, name, level, led, prior, n, seed, inject=()):
@@ -1904,12 +1907,22 @@ def _prior_draw_leg(en, name, level, led, prior, n, seed, inject=()):
         return
     kw = {'thermal_rtheta': False} if 'prior-pooled-rtheta' in inject else {}
     try:
-        r, th, ph = _capture_prior_dof(en, prior, n, np.random.default_rng(seed + 31), **kw)
+        (r, th, ph), stats = _capture_prior_dof(en, prior, n,
+                                                np.random.default_rng(seed + 31), **kw)
     except Exception as ex:
         for k in ('prior_rtheta_width', 'prior_improper_sigma'):
             led.skip(k, name, level, f'sample_prior_states raised: {type(ex).__name__}: {ex}',
                      K_UNREACHABLE)
         return
+    # A FREE INVERTIBLE CENTRE is drawn on both sides: sample_prior_states flips it on the
+    # draws `stats['reflected']` marks (energies/invertible_centres.py). Only a ROOT flip moves
+    # improper rows, negating them; negating those draws again (the flip is its own inverse)
+    # puts every improper row back on the reference's side, where the width below is measured.
+    from energies.invertible_centres import ROOT, invertible_centres, reflect_phi
+    by_name = {c.name: c for c in invertible_centres(en)}
+    for k, nm in enumerate(stats.get('invertible_centres', [])):
+        if by_name[nm].kind == ROOT:
+            reflect_phi(ph, by_name[nm], stats['reflected'][:, k])
 
     T = float(en.temperature)
     s_r, s_th = en.thermal_rtheta_sigma(T)

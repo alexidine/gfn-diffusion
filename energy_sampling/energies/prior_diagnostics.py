@@ -91,6 +91,17 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     angles couple them -- which is measurably where most of the remaining cost sits, so a
     better construction would raise this number. Treat eta as "fraction of a conservative
     ceiling", and do not read eta = 1 as "nothing left to gain".
+
+    THE SAME SUPPORT AS THE FITTED PRIOR. ``sample_prior_states`` flips every free invertible
+    centre (energies/invertible_centres.py::invertible_centres), planar ones included, on an
+    independent half of its draws and ``prior_log_prob`` scores the two-component mixture; this
+    does the same, with coins drawn after every other draw, so eta and D_avoidable compare two
+    proposals over one support. Neither flips a free four-coordinate centre. The leader tables
+    are scanned on the reference's side. A FRAME centre, or a SIBLING pivot that is not its
+    group's leader, raises NotImplementedError here as in ``prior_log_prob``; the table makes
+    either only at a ring atom, and ``prior_report``, this function's caller, reaches it only
+    after ``prior_log_prob`` has refused every molecule with a ring, so no acyclic molecule
+    raises.
     """
     T = float(en.temperature)
     n_r, n_th = en.n_r, en.n_th
@@ -132,6 +143,13 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     rng = np.random.default_rng(seed)
     dof = np.repeat(ref[None], n, 0)
     logq = np.zeros(n)
+    # FREE INVERTIBLE CENTRES (docstring): their rows are scored at the end as one mixture,
+    # `comp` keeping each row's own component (mean per draw, width) until then. Empty at a
+    # collective level, where the table is empty too.
+    from energies.invertible_centres import ROOT, SIBLING, invertible_centres, reflect_phi
+    inv = [] if en.collective else invertible_centres(en)
+    mixed = {j for c in inv for j in c.rows}
+    comp = {}
     # AT A COLLECTIVE LEVEL THIS MACHINERY DROPS OUT, it is not translated. r, theta and
     # every improper row are FROZEN there, and dof_to_state reads only the leader columns --
     # so perturbing them would add logq terms with no counterpart in the state and the
@@ -147,6 +165,9 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
             logq += _gauss_lp(dof[:, n_r + j], th0[j], s_th[j])
         for j in imp:
             dof[:, n0 + j] = ph0[j] + rng.normal(0.0, s_imp, n)
+            if j in mixed:
+                comp[j] = (np.full(n, ph0[j]), s_imp)
+                continue
             logq += _wrapped_lp(dof[:, n0 + j], ph0[j], s_imp)
     step = grid[1] - grid[0]
     for gi, rows_j in enumerate(groups):
@@ -165,7 +186,36 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
                 dof[:, n0 + i] = ph0[i] + disp
                 continue
             dof[:, n0 + i] = ph0[i] + disp + rng.normal(0.0, g_sigma[gi], n)
+            if i in mixed:
+                comp[i] = (ph0[i] + disp, g_sigma[gi])
+                continue
             logq += _wrapped_lp(dof[:, n0 + i], ph0[i] + disp, g_sigma[gi])
+
+    if inv:
+        # each centre on either side with probability 1/2, as sample_prior_states draws it;
+        # a molecule without one makes no further call on the generator. The mixture below
+        # needs every pivot to be its group's leader, whose value the reflection keeps and
+        # every follower's mean is built from (ConformerTorsions.prior_log_prob, the same).
+        leaders = {rows_j[0] for rows_j in groups}
+        for c in inv:
+            if (c.kind not in (ROOT, SIBLING) or (c.kind == SIBLING and c.pivot not in leaders)
+                    or set(c.rows) - set(comp)):
+                raise NotImplementedError(
+                    f'{en.smiles}: the invertible centre {c.name} ({c.kind}) flips about a ring '
+                    f'frame or a pivot that is not its group\'s leader, or moves a row this '
+                    f'oracle does not draw as a held row or a follower '
+                    f'(energies/invertible_centres.py)')
+        ph = dof[:, n0:]
+        flip = rng.random((n, len(inv))) < 0.5
+        for k, c in enumerate(inv):
+            reflect_phi(ph, c, flip[:, k])
+        wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+        for c in inv:
+            mirror = reflect_phi(ph.copy(), c)
+            own = sum(_wrapped_lp(wrap(ph[:, j] - comp[j][0]), 0.0, comp[j][1]) for j in c.rows)
+            mir = sum(_wrapped_lp(wrap(mirror[:, j] - comp[j][0]), 0.0, comp[j][1])
+                      for j in c.rows)
+            logq += np.logaddexp(own, mir) - np.log(2.0)
 
     logw = -energy_of(dof) - logq
     return (logw, modes) if report_modes else logw

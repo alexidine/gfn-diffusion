@@ -11,16 +11,26 @@ WHAT IS LOCKED. Two kinds of element, both keyed on atoms of the condition graph
 
   * every atom with FOUR bonded neighbours (``TETRAHEDRAL``) -- not only RDKit's
     stereocentres. At a CH2 or CH3 the two labelled parities are exact copies (a permutation
-    of identical atoms), and the fitted prior visits only the reference's; locking the
+    of identical atoms), and the fitted prior's held rows visit only the reference's (it
+    reflects three-coordinate centres only, energies/invertible_centres.py); locking the
     labelled parity everywhere makes the target exactly one labelled copy, whose partition
     function differs from the unlocked one by the molecule's symmetry count (ln 2 per
     independent centre), instead of 2^m copies the prior never proposes;
   * every double bond RDKit reports as POTENTIAL stereo (``DOUBLE_BOND``) on the input
     molecule, perceived on both the heavy-atom and the explicit-H graph (`tagged_elements`).
 
-A three-coordinate centre (an amine N) is NOT locked: RDKit's perception from 3D does not
-recover N stereo, so an N-tagged isomer could not be verified, and N invertomers stay together
-inside one condition (a working assumption; see the wiki page on the force field). Its tags are
+A three-coordinate centre is NOT locked: RDKit's perception from 3D does not recover N stereo,
+so an N-tagged isomer could not be verified, and the two sides of a three-coordinate centre stay
+together inside one condition (a working assumption, stated for N invertomers in
+build_conformer_conditions.py::stereo_mol; see the wiki page on the force field). It covers
+EVERY three-coordinate atom, not only an amine N: a sulfoxide S or a phosphine P is left free
+too, although its inversion is slow and its configuration a real stereocentre, so a condition
+containing one holds both configurations, and with the lock on a tag on one is refused
+(`stereo_unsupported`, ConformerTorsions._init_stereo); QM9 has neither. The fitted prior draws
+both sides of each such centre energies/invertible_centres.py qualifies: one with a substituent
+offset whose sign can be negated as an exact inversion without turning its ring system, a ring
+N at its ring's closure included. That module names what it misses: a ring N at the tree's
+root, and one the tree enters from its substituent; a caged N has no second side. The tags are
 stripped wherever isomers are compared (`_strip_invertible`). A four-coordinate N+ is an
 ordinary locked centre.
 

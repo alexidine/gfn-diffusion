@@ -67,20 +67,31 @@ floor is ESTIMATE_ONLY. Table 2's gaps are left blank on a refused row.
 
 COVERAGE IS WHAT THE FLOOR CANNOT SEE. ESS is a functional of the draws obtained, so a basin
 the proposal never visits adds no large weight and no warning -- it biases log Z_IS low. The
-fitted prior is such a proposal BY CONSTRUCTION: it holds every improper row and every sibling
-offset tight about the reference, so at a non-planar centre it proposes the reference's parity
-only, while at level `full` an unlocked target holds both parities, the mirror image at equal
-energy. Measured on NH3 (this script, N = 20000, seed 0): the prior proposal read 0.72 nats
-below the quadrature at ESS/N 0.37, against ln 2 = 0.69 for the missing pyramid. The
-comparison with quadrature catches that; a PAIR DOES NOT -- two conditions whose proposals
-miss their mirrors alike carry equal bias, and their difference reads clean. So under
-`--proposal prior` a row whose member has such a centre (`prior_coverage_bias`) is
-KNOWN_BIASED, the centres named in its notes, never ESTIMATE_ONLY; a pair on it is KNOWN_BIASED
-too, and a row with an exact value keeps the comparison's verdict, which sees the gap. The
-label follows the TARGET: once a condition's energy carries the stereo lock (`stereo_coeff` >
-0), a centre its table names holds one parity in the target as well and drops out, while one
-the lock leaves free -- a three-coordinate N -- keeps the label. The policy proposal holds no
-row by construction and is not labelled; its coverage is still what the floor cannot see.
+fitted prior holds every improper row and every sibling offset tight about the reference, so
+unreflected it proposes one side of each non-planar centre, while at level `full` an unlocked
+target holds both parities, the mirror image at equal energy. Measured on NH3 (this script,
+N = 20000, seed 0) before the prior reflected anything: 0.72 nats below the quadrature at
+ESS/N 0.37, against ln 2 = 0.69 for the missing pyramid. Since 2026-09-28
+`ConformerTorsions.sample_prior_states` flips each INVERTIBLE centre of
+energies/invertible_centres.py (three-coordinate, free under the lock, with a substituent
+offset whose sign can be negated as an exact inversion, planar or not) on half its draws and
+`prior_log_prob` scores the mixture, which closes that gap. The comparison with quadrature
+catches a remaining one; a PAIR DOES NOT -- two conditions whose proposals miss their mirrors
+alike carry equal bias, and their difference reads clean. So under `--proposal prior` a row
+whose member keeps a free, non-planar centre of that table the prior does not flip
+(`prior_coverage_bias`: a four-coordinate one, as at every sp3 centre of an unlocked target,
+or one whose lock table is unreadable) is KNOWN_BIASED, the centres named in its notes, never
+ESTIMATE_ONLY; a pair on it is KNOWN_BIASED too, and a row with an exact value keeps the
+comparison's verdict, which sees the gap. A centre the table leaves out
+(energies/invertible_centres.py, NOT COVERED) is not named, and no prior estimate needs it
+named: every case listed there is a ring atom, or the planar far atom of a locked double bond,
+its own flip. A caged N has no second side; a ring N the prior leaves one-sided, as the root N
+of C1COCCN1, has one, but `prior_log_prob` refuses every molecule with a ring block, so on such
+a row `run_check` records 'IS not run' and there is no prior estimate to read low. The label
+follows the TARGET: once a condition's energy carries the stereo lock (`stereo_coeff` > 0), a
+centre its table names holds one parity in the target as well and drops out. The policy
+proposal holds no row by construction and is not labelled; its coverage is still what the
+floor cannot see.
 
 PAIRS. `--pair A B` names two conditions that must share log Z, an enantiomer pair being the
 case in view: their IS difference is compared with the combined SE under the same floor.
@@ -131,6 +142,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+#: the width bar of an entry's `planar` mark, which `prior_held_parity_centres` reads: a planar
+#: centre is its own flip, so not a parity to label. A WORKING ASSUMPTION defined, with its
+#: measurements, in energies/invertible_centres.py; the prior's flip does not read it.
+from energies.invertible_centres import MIRROR_WIDTHS
+
 #: Per-block grid order. ConformerTorsions._free_block codes columns 0 r, 1 theta, 2 phi,
 #: 3 transverse; a transverse member is refused (no block count, no disc wall here).
 BLOCKS = ('r', 'theta', 'phi')
@@ -152,12 +168,6 @@ KNOWN_BIASED = 'KNOWN_BIASED'
 #: check; every other one fails the exit status
 VERDICTS = ('PASS', ESTIMATE_ONLY, 'FAIL', KNOWN_BIASED, 'UNCONVERGED', 'BELOW_ESS_FLOOR',
             'INVALID_PROPOSAL', 'NONFINITE_ROWS', 'NOT_RUN')
-
-#: a held prior row whose mirror (phi -> -phi) lies more than this many of the row's own prior
-#: widths from its reference value is a parity the prior never proposes. Measured at level full
-#: on 20 small molecules: planar centres (C=O, C=C, formamide) at 0 to 0.2 widths, a
-#: near-planar amide N at 3.9, every tetrahedral centre and amine N at 9.7 to 28
-MIRROR_WIDTHS = 1.0
 
 #: exit statuses (module docstring)
 EXIT_PASS, EXIT_FAIL, EXIT_REFUSED, EXIT_UNCHECKED = 0, 1, 2, 3
@@ -464,54 +474,65 @@ def prior_estimate(modeller, ident: str, n: int, seed: int) -> dict:
 
 
 def prior_held_parity_centres(member) -> List[int]:
-    """Placement slots of the centres whose PARITY the fitted prior never flips.
+    """Placement slots of the non-planar centres whose PARITY the fitted prior never flips.
 
     `ConformerTorsions.sample_prior_states` -- and `prior_log_prob`, which scores exactly its
     draws -- holds two kinds of phi row tight about the reference: an improper row about its
-    ph0 at `improper_phi_sigma`, and each non-leader row of a sibling group (`torsion_groups`)
-    at its reference offset from the leader, at the group's `sibling_jitter_sigma`. The
-    mirror (every phi negated) takes a held value v to -v, |wrap(2 v)| away; beyond
-    `MIRROR_WIDTHS` of the row's width the prior draws the reference's side only. The row's
-    centre is its parent atom, torsion_index[j, 2]. A planar centre holds v at 0 or pi: its
-    own mirror, so not a parity.
+    ph0 at `improper_phi_sigma`, and each substituent of a group (`torsion_groups`) at its
+    reference offset from the group's leader or ring frame, at the group's
+    `sibling_jitter_sigma`. The flip takes an offset v to -v, |wrap(2 v)| away. The centres
+    considered are energies/invertible_centres.py's `centre_table`: those whose offset can be
+    negated as an exact inversion without turning their ring system. The prior flips every
+    INVERTIBLE centre of that table (three-coordinate and free under the lock, planar or not)
+    on half its draws. The centres returned are the rest, less the `planar` ones: a centre
+    whose every flipped row sits within `MIRROR_WIDTHS` of its width of its flip holds v near
+    0 or pi, its own flip, so not a parity. That leaves the centres the lock names, every
+    four-coordinate one, and free ones whose lock table could not be read.
     """
-    ph0 = member.ph0.detach().cpu().numpy().astype(np.float64)
-    ti = np.asarray(member.spec.torsion_index)
-    t = float(member.temperature)
-    held = [(j, ph0[j], member.improper_phi_sigma(t)) for j in member.improper_phi_rows()]
-    groups = member.torsion_groups()
-    for rows, width in zip(groups, member.sibling_jitter_sigma(groups, t)):
-        held += [(j, ph0[j] - ph0[rows[0]], width) for j in rows[1:]]
-    gap = lambda v: abs((2.0 * v + math.pi) % (2.0 * math.pi) - math.pi)
-    return sorted({int(ti[j, 2]) for j, v, w in held if gap(v) > MIRROR_WIDTHS * w})
+    from energies.invertible_centres import centre_table
+    return sorted(c.slot for c in centre_table(member) if not c.invertible and not c.planar)
 
 
 def prior_coverage_bias(member) -> Optional[str]:
     """Why IS with the fitted prior as proposal reads LOW on this member, or None.
 
-    The target at level `full` holds both parities of every centre nothing locks; the prior
-    proposes one (`prior_held_parity_centres`). With the stereo lock on (`stereo_coeff` > 0)
-    a centre its table names (`stereo.key`, placement slots) holds one parity in the target
-    too and drops out; one the lock leaves free, a three-coordinate N in the lock's design,
-    stays. A locked member whose table cannot be read here drops NOTHING: a renamed interface
-    keeps the label rather than lifting it.
+    The target at level `full` holds both parities of every non-planar centre nothing locks.
+    The prior proposes both sides of every invertible centre of energies/invertible_centres.py
+    and one side of the rest (`prior_held_parity_centres`). With the stereo lock on
+    (`stereo_coeff` > 0) a centre the lock's table names holds one parity in the target too and
+    drops out: one whose `Centre.lock` is LOCKED, the table holding a tetrahedral element keyed
+    on it (`stereo.kind`, `stereo.key`, placement slots; energies/invertible_centres.py, LOCK
+    AND SCOPE), the reading the prior's flip uses too. What stays is a free, non-planar centre
+    of the table the prior does not flip: a four-coordinate one (every sp3 centre of an
+    unlocked target: the prior flips three-coordinate centres only). The estimate omits whatever
+    mass the target holds on its other side, and the label names each centre with its kind. A
+    locked member whose table cannot be read here drops NOTHING, and `invertible_centres` names
+    none of its centres: a renamed interface keeps the label rather than lifting it.
     """
-    centres = prior_held_parity_centres(member)
-    target = 'the unlocked target holds both'
-    if float(getattr(member, 'stereo_coeff', 0.0) or 0.0) > 0.0:
-        keys = getattr(getattr(member, 'stereo', None), 'key', None)
-        named = set() if keys is None else {int(k) for k in np.asarray(keys).reshape(-1)}
-        centres = [c for c in centres if c not in named]
-        target = ('the lock leaves them free' if keys is not None else
-                  "the lock's table (stereo.key) is unreadable here, so none counts as locked")
+    from energies.invertible_centres import FREE, LOCKED, centre_table
+
+    by_slot = {c.slot: c for c in centre_table(member)}
+    centres = [s for s in prior_held_parity_centres(member) if by_slot[s].lock != LOCKED]
     if not centres:
         return None
+    target = 'the unlocked target holds both'
+    if float(getattr(member, 'stereo_coeff', 0.0) or 0.0) > 0.0:
+        target = ('the lock leaves them free' if all(by_slot[s].lock == FREE for s in centres)
+                  else "the lock's table (stereo.key, stereo.kind) is unreadable here, so none "
+                       "counts as locked")
+
+    def kind(slot):
+        c = by_slot[slot]
+        if c.lock != FREE:
+            return ' (lock state unread)'
+        return f' ({c.n_bonded}-coordinate: the prior flips three-coordinate centres only)'
+
     from rdkit import Chem
     table, z = Chem.GetPeriodicTable(), np.asarray(member.spec.z)
-    names = ', '.join(f'{table.GetElementSymbol(int(z[c]))}{c}' for c in centres)
+    names = ', '.join(f'{table.GetElementSymbol(int(z[c]))}{c}{kind(c)}' for c in centres)
     return (f'{KNOWN_BIASED}: the fitted prior proposes one parity at {names} (placement '
-            f'slots) and {target}, so the estimate reads LOW (NH3, one centre: 0.72 nats '
-            f'below the quadrature)')
+            f'slots) and {target}, so the estimate reads LOW by the target\'s mass on each '
+            f'unproposed side (ln 2 where the two sides hold equal mass)')
 
 
 def tracker_reading(state: Optional[dict], condition_id: Optional[int]) -> dict:

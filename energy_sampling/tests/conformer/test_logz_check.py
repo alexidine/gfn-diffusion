@@ -7,9 +7,11 @@ unconverged flag, the integrand refusal, the verdict precedence (a row under the
 never PASS, however close it lands), the floors on rows WITHOUT an exact value and the exit
 statuses, the tracker read against the real tracker's own trust mask, the partition identity
 on an exact partition, the `--partition-identity` refusal, the compute guard on a CPU check,
-and the prior proposal's coverage label: which centres the prior holds at one parity, which a
-stereo lock's table lifts, that a prior row without an exact value is KNOWN_BIASED rather than
-ESTIMATE_ONLY and a pair on it never passes, and the refusal below level `full`.
+and the prior proposal's coverage label: which centres the prior holds at one parity (none it
+reflects and no planar one: energies/invertible_centres.py), which a stereo lock's table lifts
+(its tetrahedral elements; a table that does not say which keys those are is unreadable), that
+a prior row without an exact value is KNOWN_BIASED rather than ESTIMATE_ONLY and a pair on it
+never passes, and the refusal below level `full`.
 
 SLOW, through the REAL modeller path (config loader, ConformerModeller, init_gfn, the eval's
 own rollout function) on a width-9 CARRIER set {NH3, H2CO, CH4} at level `full`:
@@ -18,7 +20,9 @@ own rollout function) on a width-9 CARRIER set {NH3, H2CO, CH4} at level `full`:
     NH3 and H2CO are padded rows of the carrier, so the masked log-probs are in the test;
   * CH4 (d = 9) gets an IS estimate, judged by the floors alone;
   * too few rollouts give BELOW_ESS_FLOOR and a failing exit status, not a pass;
-  * the fitted prior as proposal: NH3 FAILs against the quadrature, CH4 is KNOWN_BIASED;
+  * the fitted prior as proposal, which reflects NH3's N on half its draws and no
+    four-coordinate centre: NH3 lands on the quadrature (it read ~ln 2 low before the
+    reflection), and unlocked CH4 is KNOWN_BIASED;
   * a saved checkpoint is read through the CLI: step, tracker rows and the EMA weights.
 
 THE UNTRAINED PROPOSAL. `zero_init` zeroes the set head's bias-free output layer
@@ -394,6 +398,15 @@ def small():
                                  dtype=torch.float64) for s in ('C', 'C=O', 'CN')}
 
 
+@pytest.fixture(scope='module')
+def dabco():
+    """DABCO under the lock at level full: its cage N is free, but it has no exocyclic
+    substituent whose offset a flip could negate, so the cage fixes its side."""
+    from energies.conformer_torsions import ConformerTorsions
+    return ConformerTorsions(smiles='C1CN2CCN1CC2', device='cpu', level='full',
+                             force_field='mmff', dtype=torch.float64, stereo_coeff=300.0)
+
+
 def _four_coordinate(member):
     """Placement slots with four bonded neighbours: what the stereo lock's design locks."""
     deg = np.bincount(np.asarray(member.bond_index_slot).reshape(-1),
@@ -403,42 +416,70 @@ def _four_coordinate(member):
 
 class _Locked:
     """A real member seen through a stereo lock: `stereo_coeff` and a lock table (`stereo`,
-    keys in placement slots) over it, everything else the member's own."""
+    keys in placement slots, each a tetrahedral element unless `kinds` is False, which leaves
+    the table without the `kind` field the lock's names are read from) over it, everything
+    else the member's own."""
 
-    def __init__(self, member, keys, coeff=300.0):
+    def __init__(self, member, keys, coeff=300.0, kinds=True):
+        from energies.stereo_lock import TETRAHEDRAL
         self._member, self.stereo_coeff = member, coeff
         self.stereo = None if keys is None else SimpleNamespace(key=np.asarray(keys))
+        if keys is not None and kinds:
+            self.stereo.kind = np.full(len(keys), TETRAHEDRAL)
 
     def __getattr__(self, name):
         return getattr(self._member, name)
 
 
 @pytest.mark.fast
-def test_the_prior_holds_one_parity_at_every_non_planar_centre(nh3, small):
-    """The held rows' mirrors: at an sp3 centre and an amine N far outside the prior's width,
-    at a planar centre on the reference itself."""
-    z = lambda m: [int(np.asarray(m.spec.z)[c]) for c in lzc.prior_held_parity_centres(m)]
-    assert z(nh3) == [7] and z(small['C']) == [6]
-    assert z(small['C=O']) == [] and lzc.prior_coverage_bias(small['C=O']) is None
-    assert sorted(z(small['CN'])) == [6, 7]
+def test_the_prior_holds_a_parity_only_where_it_does_not_reflect(nh3, small, dabco):
+    """energies/invertible_centres.py's table holds every centre whose flip is an exact
+    inversion, and marks the planar ones: an sp3 centre and an amine N sit far outside the
+    prior's width from their flips, H2CO's C on its own flip. The prior flips each free
+    three-coordinate centre of the table, planar or not, and no four-coordinate one, so
+    unlocked it holds the C of CH4 and of CH3NH2 but not their N or NH3's; H2CO's C it flips,
+    and the label would not name it anyway, a planar centre being its own flip. DABCO's cage
+    N, with no exocyclic substituent to flip, has no second side and no entry, so nothing
+    labels it."""
+    from energies.invertible_centres import centre_table
+    z = lambda m, slots: sorted(int(np.asarray(m.spec.z)[c]) for c in slots)
+    cands = lambda m: [c.slot for c in centre_table(m) if not c.planar]
+    assert z(nh3, cands(nh3)) == [7] and z(small['C'], cands(small['C'])) == [6]
+    assert cands(small['C=O']) == [] and z(small['CN'], cands(small['CN'])) == [6, 7]
+    (h,) = centre_table(small['C=O'])
+    assert h.planar and h.invertible, "H2CO's C: in the table, planar, and flipped"
+    assert lzc.prior_held_parity_centres(nh3) == [] and lzc.prior_coverage_bias(nh3) is None
+    assert z(small['C'], lzc.prior_held_parity_centres(small['C'])) == [6]
+    assert z(small['CN'], lzc.prior_held_parity_centres(small['CN'])) == [6]
+    assert lzc.prior_held_parity_centres(small['C=O']) == []
+    assert lzc.prior_coverage_bias(small['C=O']) is None
+    assert 7 not in z(dabco, cands(dabco)) and lzc.prior_coverage_bias(dabco) is None
+    assert lzc.prior_held_parity_centres(dabco) == cands(dabco), 'every entry a locked C'
 
 
 @pytest.mark.fast
-def test_a_lock_lifts_the_label_only_on_the_centres_its_table_names(nh3, small):
-    """The lock's design locks four-coordinate centres and leaves an amine N free, so a locked
-    CH3NH2 is still biased at its N; an unreadable table lifts nothing."""
+def test_a_lock_lifts_the_label_only_on_the_centres_its_table_names(nh3, small, dabco):
+    """The lock's design locks four-coordinate centres and leaves an amine N free. The prior
+    flips the free N and no four-coordinate centre, so unlocked CH3NH2 carries the label at
+    its C only, and a locked one carries none; so does every centre of a locked member whose
+    table cannot be read, a table without the `kind` that says which keys are tetrahedral
+    elements included. DABCO's cage N, free but without a second side, has no entry and
+    carries none."""
     cn = small['CN']
     four = _four_coordinate(cn)
-    (n_slot,) = [c for c in lzc.prior_held_parity_centres(cn) if c not in four]
+    assert lzc.prior_held_parity_centres(cn) == four, 'unlocked: the prior reflects the N'
     assert 'unlocked target holds both' in lzc.prior_coverage_bias(cn)
-    locked = lzc.prior_coverage_bias(_Locked(cn, four))
-    assert f'N{n_slot} ' in locked and 'C' not in locked.split('parity at ')[1].split(' (')[0]
-    assert lzc.prior_coverage_bias(_Locked(cn, four + [n_slot])) is None
+    assert lzc.prior_held_parity_centres(_Locked(cn, four)) == four, 'the locked C is held'
+    assert lzc.prior_coverage_bias(_Locked(cn, four)) is None
     assert lzc.prior_coverage_bias(_Locked(small['C'], _four_coordinate(small['C']))) is None
     assert 'unreadable' in lzc.prior_coverage_bias(_Locked(small['C'], None))
-    assert lzc.prior_coverage_bias(_Locked(nh3, [])) is not None, 'NH3 has no locked centre'
-    # a table without the lock on locks nothing
-    assert 'unlocked' in lzc.prior_coverage_bias(_Locked(small['C'], [0], coeff=0.0))
+    unread = lzc.prior_coverage_bias(_Locked(cn, four, kinds=False))
+    assert 'unreadable' in unread and 'N4 (lock state unread)' in unread, unread
+    assert lzc.prior_coverage_bias(_Locked(nh3, [])) is None, 'NH3: free, and reflected'
+    # a table without the lock on locks nothing, and the prior does not flip the free C
+    label = lzc.prior_coverage_bias(_Locked(small['C'], [0], coeff=0.0))
+    assert 'unlocked' in label and 'parity at C0 (4-coordinate' in label
+    assert lzc.prior_coverage_bias(dabco) is None
 
 
 class _Graphs:
@@ -689,16 +730,20 @@ def test_too_few_rollouts_are_below_the_floor_not_a_pass(untrained):
 
 
 @pytest.mark.slow
-def test_the_prior_proposal_is_known_biased_where_it_holds_a_parity(untrained):
-    """The real prior on the real path: NH3's missing pyramid FAILs against the quadrature and
-    carries the label; CH4, with no exact value, is KNOWN_BIASED (it read ESTIMATE_ONLY at ESS
-    6014 before); planar H2CO carries none and passes."""
+def test_the_prior_proposal_covers_both_pyramids(untrained):
+    """The real prior on the real path. It flips every free three-coordinate centre of
+    energies/invertible_centres.py's table on half its draws and scores the mixture, so NH3's
+    prior IS lands on the quadrature and carries no label, where one-sided it read 0.72 nats
+    low at this seed (~ln 2, the missing pyramid). It flips no four-coordinate centre, so
+    unlocked CH4, with no exact value, is KNOWN_BIASED (it read ESTIMATE_ONLY at ESS 6014
+    before the label); H2CO, whose planar C the prior flips too (its own flip: the mixture's
+    two components sit 8e-7 rad apart), carries none and passes."""
     m, _ = untrained
     res = lzc.run_check(m, SMIS, proposal='prior', n=20_000, seed=0)
     rows = {r['condition']: r for r in res['conditions']}
     n, c, h2co = rows['N'], rows['C'], rows['C=O']
-    assert n['verdict'] == 'FAIL' and n['is_status'] == lzc.KNOWN_BIASED and n['bias']
-    assert n['is']['log_z'] - n['exact']['log_z'] < -0.5, 'the missing pyramid, ~ln 2'
+    assert n['bias'] is None and n['is_status'] != lzc.KNOWN_BIASED
+    assert abs(n['is']['log_z'] - n['exact']['log_z']) < 0.1, 'both pyramids proposed'
     assert c['exact'] is None and c['verdict'] == lzc.KNOWN_BIASED and 'C0' in c['bias']
     assert c['is']['ess'] >= 100, 'the floors clear it: only the label refuses it'
     assert h2co['verdict'] == 'PASS' and h2co['bias'] is None

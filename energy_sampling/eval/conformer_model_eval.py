@@ -89,9 +89,31 @@ MARGINAL coverage instead (`marginal_coverage`: each group's rotamer centres fro
 1-D scans, a centre missed when no draw's group label reaches it -- a weaker check, a lower
 bound on missed basins, and labelled 'marginal' wherever it is printed); without a member to
 scan it is UNAVAILABLE, never n/a. Those basins do not include the two sides of a non-planar
-centre: `parity_coverage` reads, for each such centre the stereo lock leaves free (an amine N,
-or any centre when stereo_coeff is 0), the share of draws on each side, and counts the centre
-MISSED when its reflected side is within 10 kT at the reference geometry and holds no draw.
+centre: `parity_coverage` reads, for each such centre the stereo lock leaves free (a
+three-coordinate centre, or any centre when stereo_coeff is 0), the share of draws on each
+side, and counts the centre MISSED when every draw sits on one side. The centres are the entries
+of energies/invertible_centres.py's structural table, which the fitted prior's two-sided draw
+reads too, that are not `planar` (`free_centres`): a centre with a substituent offset whose
+sign can be negated as an exact inversion without turning the centre's ring system, whose
+reference offset sits more than `MIRROR_WIDTHS` prior widths from its flip (a working
+assumption; a planar centre is its own flip). No energy enters. The prior draws both sides of
+every free THREE-coordinate centre of the table, planar or not; a free four-coordinate one
+(stereo_coeff 0) it draws on one side, and this metric still counts it. A caged N, with no
+exocyclic substituent, has no entry.
+PARITY ROWS FROM BEFORE 2026-09-28 ARE NOT COMPARABLE WITH LATER ONES on ring molecules, on
+crowded centres and, under the lock, at a locked double bond's key atom: a checkpoint that
+passed the parity bar before can fail it after, on the same draws. The earlier table reflected
+a ring atom's siblings about the group's first row, which at a ring atom whose first row is not
+its ring child moves the ring child and opens the ring, so the side read inaccessible; the table
+now pivots on the ring child, covers a ring atom at its ring's closure through the ring frame,
+and leaves out a centre whose flip would turn its ring system (a caged N, but also the root N
+of C1COCCN1). The earlier rule also counted a centre only when its reflected reference
+geometry, every rotor held, scored within 10 kT, so a crowded acyclic centre -- the N of
+CCCN(C)C scores 150 kT there while the target holds half its mass on each side -- could not be
+missed; every non-planar centre in the table is required on both sides now. And the earlier
+table read a double-bond element's key atom as locked; it is free now, so under the lock it is
+required on both sides where the width bar reads it non-planar, as the root C of
+C/C=C/C(=O)N(C)C at 1.08 widths.
 
 TB / LOG Z (the forward log-weight log w = log R + log P_B - log P_F):
   mean, std (the within-condition spread `logw_std_within` reads), ESS/N (Kish), the gap
@@ -478,70 +500,46 @@ def coverage_block(phys_row: Mapping, ref: Mapping, member=None, x=None) -> dict
 
 
 @torch.no_grad()
-def parity_coverage(member, x, accessible_kt: float = 10.0) -> dict:
+def parity_coverage(member, x) -> dict:
     """Which side of each FREE non-planar centre the draws sit on.
 
-    The centres are `conformer_logz_check.prior_held_parity_centres`' rows: each improper phi
-    row, and each non-leader row of a sibling group as an offset from its leader, whose
-    reflection (v -> -v) lies more than `MIRROR_WIDTHS` of the row's thermal width from its
-    reference value v; a planar centre (v at 0 or pi) is its own reflection. A centre the
-    stereo lock names (`stereo.key`, when `stereo_coeff` > 0) is dropped: the target holds one
-    side there. A draw is on the REFERENCE side of a centre when sin of its first row's value
-    has the sign of sin v. The other side is ACCESSIBLE when every held row of that centre
-    reflected, everything else at the reference geometry, scores within `accessible_kt` kT of
-    the reference (basin_reference's rule for rotamer basins). A centre is MISSED when it is
-    accessible and every draw is on one side. Rotamer basins do not include these sides: a
-    molecule with no rotor (NH3) has one basin and full basin coverage whatever its draws.
+    The centres are energies/invertible_centres.py's `free_centres`: the entries of the table
+    the fitted prior's flip reads too -- each centre with a substituent offset whose sign can
+    be negated as an exact inversion without turning the centre's ring system, taken from the
+    chart's structure -- that the lock leaves free and that are not `planar` (reference offset
+    within `MIRROR_WIDTHS` prior widths of its flip, a working assumption: a planar centre is
+    its own flip). The target holds both sides of every one of them, so each must be two-sided
+    (`n_accessible` = `n_centres`): a centre is MISSED when every draw sits on one side. A
+    centre the stereo lock names (a tetrahedral element of its table, `stereo.kind` and
+    `stereo.key`, when `stereo_coeff` > 0) is not free: the target holds one side there. A draw
+    is on the REFERENCE side of a centre when the triple product of three of its neighbours
+    about it has the sign it has at the reference (`reference_side`, on the draw's built
+    positions). Rotamer basins do not include these sides: a molecule with no rotor (NH3) has
+    one basin and full basin coverage whatever its draws. Each row carries `kind` (the flip:
+    root, sibling or frame) and `n_bonded`; the prior flips the three-coordinate centres,
+    planar ones too, and a four-coordinate one appears only when `stereo_coeff` is 0. At a
+    collective level (`torsion`) no row moves alone, the target holds the reference's side of
+    every centre, and the metric is n/a.
     """
-    from energies.prior_diagnostics import dof_to_state
+    from energies.invertible_centres import free_centres, reference_side
 
-    ph0 = member.ph0.detach().cpu().numpy().astype(np.float64)
-    ti = np.asarray(member.spec.torsion_index)
-    t = float(member.temperature)
-    held = [(j, None, ph0[j], member.improper_phi_sigma(t)) for j in member.improper_phi_rows()]
-    groups = member.torsion_groups()
-    for rows, width in zip(groups, member.sibling_jitter_sigma(groups, t)):
-        held += [(j, rows[0], ph0[j] - ph0[rows[0]], width) for j in rows[1:]]
-    wrap = lambda a: (a + np.pi) % (2.0 * np.pi) - np.pi
-    locked = set()
-    if float(getattr(member, 'stereo_coeff', 0.0) or 0.0) > 0.0:
-        keys = getattr(getattr(member, 'stereo', None), 'key', None)
-        locked = set() if keys is None else {int(k) for k in np.asarray(keys).reshape(-1)}
-    centres = defaultdict(list)                 # centre -> its held rows, first row first
-    for j, lead, v, w in held:
-        c = int(ti[j, 2])
-        if abs(wrap(2.0 * v)) > lzc.MIRROR_WIDTHS * w and c not in locked:
-            centres[c].append((int(j), lead, float(v)))
+    centres = free_centres(member)
     if not centres:
-        return dict(na='no non-planar centre the lock leaves free', n_centres=0)
+        if getattr(member, 'collective', False):
+            return dict(na=f'collective level {member.level!r}: no row moves a centre alone, '
+                           f'so the target holds the reference side of each', n_centres=0)
+        return dict(na='no non-planar centre with a flip that the lock leaves free', n_centres=0)
     xs = torch.as_tensor(x, dtype=member.dtype, device=member.device)
-    ph = member.dof_from_state(xs)[2].double().cpu().numpy().reshape(xs.shape[0], -1)
-    ref = np.concatenate([member.r0.detach().cpu().numpy(), member.th0.detach().cpu().numpy(),
-                          ph0]).astype(np.float64)
-    n0 = int(member.n_r + member.n_th)
-    energy = lambda d: float(member.potential_energy(dof_to_state(member, d[None]), t)[0])
-    e_ref = energy(ref)
-    z = np.asarray(member.spec.z)
-    from rdkit import Chem
-    table = Chem.GetPeriodicTable()
+    pos = member.build_positions(xs).reshape(xs.shape[0], -1, 3)
     rows = []
-    for c, held_rows in sorted(centres.items()):
-        j, lead, v = min(held_rows)
-        val = ph[:, j] - (ph[:, lead] if lead is not None else 0.0)
-        frac = float((np.sign(np.sin(val)) == np.sign(np.sin(v))).mean())
-        d = ref.copy()
-        for jj, ll, vv in held_rows:           # the whole centre reflected
-            d[n0 + jj] = (ph0[ll] - vv) if ll is not None else -vv
-        de = (energy(d) - e_ref) / t
-        acc = bool(de <= accessible_kt)
-        rows.append(dict(centre=c, name=f'{table.GetElementSymbol(int(z[c]))}{c}', row=j,
-                         ref_side_frac=frac, mirror_de_kt=float(de), accessible=acc,
-                         missed=bool(acc and frac in (0.0, 1.0))))
-    acc_rows = [r for r in rows if r['accessible']]
-    return dict(n_centres=len(rows), n_accessible=len(acc_rows),
+    for c in centres:
+        frac = float(reference_side(pos, c).mean())
+        rows.append(dict(centre=c.slot, name=c.name, kind=c.kind, n_bonded=int(c.n_bonded),
+                         ref_side_frac=frac, missed=bool(frac in (0.0, 1.0))))
+    return dict(n_centres=len(rows), n_accessible=len(rows),
                 n_missed=sum(r['missed'] for r in rows),
-                minority_frac=(min(min(r['ref_side_frac'], 1.0 - r['ref_side_frac'])
-                                   for r in acc_rows) if acc_rows else None),
+                minority_frac=min(min(r['ref_side_frac'], 1.0 - r['ref_side_frac'])
+                                  for r in rows),
                 missed_names=[r['name'] for r in rows if r['missed']], centres=rows)
 
 
@@ -1214,10 +1212,10 @@ def format_report(res: dict) -> str:
         f"nonthermal worst basin = over occupied basins, the largest fraction of a basin's draws "
         f"with excess above u* (basin_nonthermal). '-' = unavailable (one group, one accessible "
         f"or one occupied basin, or kind marginal). free centres = non-planar centres the "
-        f"stereo lock leaves free (parity_coverage); missed = those whose reflected side is "
-        f"within 10 kT at the reference geometry and holds no draw (bar: <= "
+        f"stereo lock leaves free with a substituent offset to flip (parity_coverage), each "
+        f"required on both sides; missed = those whose other side holds no draw (bar: <= "
         f"{b['max_parity_missed']}); minority side = the smaller side's share of the draws, "
-        f"worst accessible centre (the target's is 0.5 where the sides are mirror images).",
+        f"worst centre (the target's is 0.5 where the sides are mirror images).",
         ['condition', 'kind', 'rotor groups (count)', 'basins (count)', 'accessible (count)',
          'visited (count)', 'missed (count)', 'worst/uniform (ratio)',
          'occupancy entropy (0-1)', 'TC debiased (nats)', 'target TC (nats)',
