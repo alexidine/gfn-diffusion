@@ -1,6 +1,6 @@
 # Typed intermolecular force field for molecular crystals — implementation and benchmarks
 
-**Date:** 2026-08-25 · **Status:** exploratory; nothing landed in either repo · **Compute:** CPU only
+**Date:** 2026-08-25 · **Status:** exploratory; the CCDC-table field described here landed in neither repo. A field with the published W99/FIT parameters, evaluated by default in the ELJ form of section 1.2, landed on 2026-09-28 as `mxtaltools/analysis/exp6_ff.py` (mxtaltools `76ae5c60`; wiki: crystal-force-fields) · **Compute:** CPU only
 
 This records what was built, why it was built that way, and what was measured. It is not a
 recommendation and it is not a conclusion — several quantities below are unmeasured or
