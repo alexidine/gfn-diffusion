@@ -33,10 +33,14 @@ shards refer to basin ids.
 
     python -m energy_sampling.eval.campaign_compack calibrate CAMPAIGN_DIR [--budget 240] [--band_kT 3]
     python -m energy_sampling.eval.campaign_compack dedup CAMPAIGN_DIR --band_kT 2 [--calibration CAL.pt] --out OUT.pt
+    (either with --mol_path LOCAL_CONFORMER.pt on a campaign directory copied from the cluster)
 
 Run with energy_sampling's parent directory and mxtaltools on PYTHONPATH. CPU only (CUDA_VISIBLE_DEVICES=-1); needs
 the ccdc Python API. Works in CAMPAIGN_DIR/compack/: one CIF per crystal and a per-pair result cache, both keyed by the
 crystal's stored parameters, so a rerun, a larger budget or a dedup after a calibration reuses every comparison made.
+Only final COMPACK results are cached (a match count, or the engine's own (0, 0) failure); an error or a timeout is run
+again next time. dedup refuses a registry that has not ingested every shard on disk (run the coordinator's export, which
+catches up, first).
 """
 import argparse
 import contextlib
@@ -170,9 +174,13 @@ def crystal_key(params, hand):
     return h.hexdigest()[:20]
 
 
-def load_campaign(coord_dir):
+def load_campaign(coord_dir, mol_path=None):
+    """(coordinator module, CampaignConfig, registry or None). mol_path replaces coord.yaml's conformer path, which
+    names a cluster path in a campaign copied from the cluster."""
     from mxtaltools.crystal_search import coordinator as co
     cfg = co.CampaignConfig.load(os.path.join(coord_dir, 'coord.yaml'))
+    if mol_path:
+        cfg.mol_path = mol_path
     rp = os.path.join(coord_dir, 'registry.pt')
     reg = torch.load(rp, weights_only=False) if os.path.exists(rp) else None
     return co, cfg, reg
@@ -223,6 +231,7 @@ def write_cifs(co, cfg, params, hand, keys, cif_dir, crystals=None):
     from mxtaltools.dataset_utils.utils import collate_data_list
     os.makedirs(cif_dir, exist_ok=True)
     todo = [i for i, k in enumerate(keys) if not os.path.exists(os.path.join(cif_dir, f'{k}.cif'))]
+    tmp = f'tmp_{os.getpid()}_cif'  # per process: two runs on one campaign never rename each other's files
     cwd = os.getcwd()
     try:
         os.chdir(cif_dir)
@@ -236,9 +245,9 @@ def write_cifs(co, cfg, params, hand, keys, cif_dir, crystals=None):
             cb.box_analysis()
             cb.mol2ucell()
             with contextlib.redirect_stdout(io.StringIO()):
-                cb.write_cif(list(range(len(chunk))), 'tmp_cif', mode='unit cell')
+                cb.write_cif(list(range(len(chunk))), tmp, mode='unit cell')
             for j, i in enumerate(chunk):
-                os.replace(f'tmp_cif_{j}.cif', f'{keys[i]}.cif')
+                os.replace(f'{tmp}_{j}.cif', f'{keys[i]}.cif')
     finally:
         os.chdir(cwd)
     return [os.path.join(cif_dir, f'{k}.cif') for k in keys]
@@ -251,16 +260,20 @@ def pair_key(ka, kb):
     return f'{ka}|{kb}' if ka <= kb else f'{kb}|{ka}'
 
 
+FINAL = ('ok', 'failed')  # COMPACK outcomes fixed for a given pair of CIFs; errors and timeouts are retried
+
+
 def load_cache(path):
     return torch.load(path, weights_only=False) if os.path.exists(path) else {}
 
 
 def compare(pairs, cif_dir, cache_path, n_proc, pair_timeout):
     """pairs: list of (key_a, key_b). Returns {pair_key: dict(rmsd, n_matched, status, seconds)}; results are cached
-    under pair_key, so a pair already compared is never run again. The lower key is the reference."""
+    under pair_key. A pair with a final result ('ok', or the engine's deterministic (0, 0) 'failed') is never run again;
+    an 'error' or 'timeout' is reported now and run again next time. The lower key is the reference."""
     cache = load_cache(cache_path)
     want = list(dict.fromkeys(pair_key(a, b) for a, b in pairs))
-    todo = [k for k in want if k not in cache]
+    todo = [k for k in want if k not in cache or cache[k]['status'] not in FINAL]
     log(f'COMPACK: {len(want)} pairs, {len(want) - len(todo)} cached, {len(todo)} to run on {n_proc} processes')
     if todo:
         pool = mp.Pool(n_proc)
@@ -278,8 +291,9 @@ def compare(pairs, cif_dir, cache_path, n_proc, pair_timeout):
                     rmsd, nm, status, dt = float('nan'), -1, 'timeout', float('nan')
                 cache[k] = dict(rmsd=rmsd, n_matched=nm, status=status, seconds=dt)
                 if (n + 1) % 25 == 0 or n + 1 == len(handles):
-                    torch.save(cache, cache_path + '.tmp')
-                    os.replace(cache_path + '.tmp', cache_path)
+                    tmp = f'{cache_path}.{os.getpid()}.tmp'
+                    torch.save(cache, tmp)
+                    os.replace(tmp, cache_path)
                     log(f'   {n + 1}/{len(handles)} compared ({(time.time() - t0) / (n + 1):.2f} s per pair wall)')
         finally:
             pool.terminate()
@@ -350,7 +364,7 @@ def setting_controls(co, cfg, st, rows, rng):
 # calibrate
 # ----------------------------------------------------------------------------
 def calibrate(a):
-    co, cfg, reg = load_campaign(a.coord_dir)
+    co, cfg, reg = load_campaign(a.coord_dir, a.mol_path)
     work = os.path.join(a.coord_dir, 'compack')
     cif_dir, cache_path = os.path.join(work, 'cif'), os.path.join(work, 'cache.pt')
     os.makedirs(cif_dir, exist_ok=True)
@@ -487,14 +501,22 @@ def calibrate(a):
 # dedup
 # ----------------------------------------------------------------------------
 def dedup(a):
-    co, cfg, reg = load_campaign(a.coord_dir)
+    co, cfg, reg = load_campaign(a.coord_dir, a.mol_path)
     if reg is None:
         raise SystemExit('no registry.pt: run the curate pass first')
+    left = co.pending_shards(a.coord_dir, reg)
+    if left and not a.allow_pending:
+        raise SystemExit(f'{len(left)} shard(s) on disk are not in registry.pt (e.g. {left[:3]}): run the coordinator '
+                         f'export (it ingests them first), or pass --allow_pending to deduplicate the registry as it is')
     work = os.path.join(a.coord_dir, 'compack')
     cif_dir, cache_path = os.path.join(work, 'cif'), os.path.join(work, 'cache.pt')
     cal = torch.load(a.calibration, weights_only=False) if a.calibration else {}
+    if cal and cal.get('energy_model_id') not in (None, cfg.energy_model_id):
+        raise SystemExit(f"calibration scored by {cal.get('energy_model_id')!r}, campaign by {cfg.energy_model_id!r}")
     d_hi = a.d_hi if a.d_hi is not None else cal.get('d_hi', 2 * cfg.identity_cut)
     dE = a.dE if a.dE is not None else cal.get('dE_gate', float('inf'))
+    if not np.isfinite(d_hi) or d_hi <= 0:
+        raise SystemExit(f'd_hi {d_hi} is not a usable distance: pass --d_hi')
     ref = co._energy_ref(cfg, reg)
     E = np.asarray(reg['basin_E'], dtype=float)
     idx = np.nonzero(E <= ref + a.band_kT * cfg.kT)[0]
@@ -508,7 +530,8 @@ def dedup(a):
     iu, ju = np.nonzero(np.triu(D < d_hi, 1) & (np.abs(Eb[:, None] - Eb[None, :]) <= dE))
     order = np.lexsort((D[iu, ju], np.maximum(Eb[iu], Eb[ju])))  # lowest energies first, then closest
     cand = [(int(iu[k]), int(ju[k])) for k in order]
-    run = cand[:a.budget]
+    run = cand if a.budget is None else cand[:a.budget]
+    skipped = cand[len(run):]
     log(f'{len(idx)} basins within {a.band_kT} kT; {len(cand)} pairs with d < {d_hi:.4f} and |dE| <= {dE:.4g}; '
         f'comparing {len(run)}')
     need = sorted({i for p in run for i in p})
@@ -534,22 +557,29 @@ def dedup(a):
         groups.setdefault(find(i), []).append(i)
     reps = sorted(groups)
     out = []
-    rows = ['group,basin,energy,above_ref_kT,merged_basins']
+    unchecked = np.zeros(len(idx), dtype=np.int64)  # candidate pairs a budget left out, per group
+    for i, j in skipped:
+        if find(i) != find(j):
+            unchecked[find(i)] += 1
+            unchecked[find(j)] += 1
+    rows = ['group,basin,energy,above_ref_kT,merged_basins,uncompared_candidate_pairs']
     for g in reps:
         c = crystals[g].clone()
         setattr(c, cfg.energy_key, torch.tensor([Eb[g]]))
         c.basin_id = torch.tensor([int(idx[g])])
         c.merged_basins = [int(idx[m]) for m in groups[g]]
+        c.uncompared_candidate_pairs = torch.tensor([int(unchecked[g])])
         c.energy_model_id = cfg.energy_model_id
         out.append(c)
         rows.append(f'{len(out) - 1},{idx[g]},{Eb[g]:.5f},{(Eb[g] - ref) / cfg.kT:.4f},'
-                    f'{" ".join(str(int(idx[m])) for m in groups[g])}')
+                    f'{" ".join(str(int(idx[m])) for m in groups[g])},{int(unchecked[g])}')
     torch.save(out, a.out)
     with open(os.path.splitext(a.out)[0] + '.csv', 'w') as fh:
         fh.write('\n'.join(rows) + '\n')
     fails = sum(res[pair_key(keys[i], keys[j])]['status'] != 'ok' for i, j in run)
     log(f'dedup: {len(idx)} basins -> {len(reps)} distinct packings ({matched} matched pairs of {len(run)} compared, '
-        f'{fails} engine failures); {len(cand) - len(run)} candidate pairs NOT compared (budget {a.budget}); '
+        f'{fails} engine failures or timeouts); {len(skipped)} candidate pairs NOT compared (budget '
+        f'{a.budget or "none"}); '
         f'wrote {a.out} and its .csv')
 
 
@@ -562,6 +592,8 @@ def main():
         p.add_argument('--n_proc', type=int, default=6)
         p.add_argument('--pair_timeout', type=float, default=300.0)
         p.add_argument('--seed', type=int, default=0)
+        p.add_argument('--mol_path', default=None,
+                       help="local copy of the campaign conformer (coord.yaml's may be a cluster path)")
     c = sub.choices['calibrate']
     c.add_argument('--budget', type=int, default=240, help='COMPACK pairs over both rounds (controls extra)')
     c.add_argument('--band_kT', type=float, default=3.0)
@@ -578,7 +610,9 @@ def main():
     d.add_argument('--calibration', default=None, help='a calibrate output (.pt): the RULE\'s d_hi and the dE gate')
     d.add_argument('--d_hi', type=float, default=None)
     d.add_argument('--dE', type=float, default=None)
-    d.add_argument('--budget', type=int, default=2000)
+    d.add_argument('--budget', type=int, default=None, help='cap on COMPACK pairs (default: every candidate pair)')
+    d.add_argument('--allow_pending', action='store_true',
+                   help='deduplicate even though some shards on disk are not in the registry')
     d.add_argument('--out', required=True)
     a = ap.parse_args()
     calibrate(a) if a.cmd == 'calibrate' else dedup(a)
