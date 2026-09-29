@@ -1,4 +1,4 @@
-"""Build a conformer CONDITION SET: QM9 molecules outside the encoder's pool, split train /
+"""Build a conformer CONDITION SET: QM9 molecules, split train /
 held-out by constitution, stereoisomers enumerated as separate conditions, one carrier
 layout over both files, every refusal recorded, and a manifest that pins it all.
 
@@ -14,11 +14,17 @@ writes into ``--out-dir``:
     rejections.tsv          one row per refused molecule and per refused stereoisomer
     manifest.json           provenance, layout, counts per reason code, sha256 per artifact
 
-THE UNIVERSE. QM9 file indices at or past the end of the frozen encoder's training pool, with
-every constitution the pool contains removed. The pool is reproduced, not assumed: the
-encoder checkpoint is matched to the results file that trained it (``encoder_pool``), its
-``need`` is recomputed from that file's metadata, and ``encoder_probe.load_qm9``'s selection
--- the first ``need`` distinct raw SMILES in file order -- is replayed on the source.
+THE UNIVERSE. By default (``--pool-need 0``, owner decision 2026-09-29: the frozen encoder is
+a black box whose train/test overlap is accepted) every QM9 row, deduplicated by key and
+split as below; ``pool_rows`` returns an empty pool and the manifest records ``need`` 0.
+With ``--pool-need N > 0`` (or ``--pool-from-encoder``, which derives N) the universe is the
+file indices at or past the end of the frozen encoder's training pool, with every
+constitution the pool contains removed. That pool is reproduced, not assumed: the encoder
+checkpoint is matched to the results file that trained it (``encoder_pool``), its ``need``
+is recomputed from that file's metadata, and ``encoder_probe.load_qm9``'s selection -- the
+first ``need`` distinct raw SMILES in file order -- is replayed on the source.
+build_conformer_database.py plans its universe through the same two functions and the same
+default, so a set built here finds its rows there.
 
 THE KEY is the canonical stereo-free SMILES (``constitution_key``, which is
 ``encoder_probe.parent_skeleton`` with explicit hydrogens dropped first). It dedupes QM9's 87
@@ -95,6 +101,8 @@ SET_REASON_CODES = {
                                   'columns the run rebuilds from the training file alone',
 }
 ALL_CODES = {**REASON_CODES, **SET_REASON_CODES}
+#: ``pool_rows``'s rule at need 0: the universe is every row (owner decision 2026-09-29)
+NO_POOL_RULE = 'no pool (need 0): the encoder pool is not excluded; every row is in the universe'
 
 #: refusals decided by the bond graph alone under force_field mmff (atom count, MMFF typing,
 #: MMFF-typed linearity), so every stereoisomer fails them identically and the walk stops at
@@ -158,13 +166,18 @@ def read_source(path) -> List[Tuple[int, str]]:
     A ``.pt`` is the QM9 MolData list itself, indexed by position. A ``.csv`` / ``.tsv``
     needs ``dataset_index`` and ``smiles`` columns -- a slice of QM9 written with its own
     indices, which is what the tests and a quick rebuild use instead of the 360 MB file.
+    Either may be gzipped (``.csv.gz`` / ``.tsv.gz``, read through ``gzip``), as the full
+    index table configs/conformer_db_sep29/qm9_index.tsv.gz is.
     """
+    import gzip
+
     path = Path(path)
     if path.suffix == '.pt':
         data = torch.load(path, weights_only=False, map_location='cpu')
         return [(i, str(getattr(d, 'smiles'))) for i, d in enumerate(data)]
-    delim = '\t' if path.suffix == '.tsv' else ','
-    with open(path, 'r', encoding='utf-8', newline='') as f:
+    gz = path.suffix == '.gz'
+    delim = '\t' if (Path(path.stem).suffix if gz else path.suffix) == '.tsv' else ','
+    with (gzip.open if gz else open)(path, 'rt', encoding='utf-8', newline='') as f:
         rows = [(int(r['dataset_index']), r['smiles'].strip())
                 for r in csv.DictReader(f, delimiter=delim)]
     return rows
@@ -221,8 +234,13 @@ def pool_rows(rows: Sequence[Tuple[int, str]], need: int) -> Tuple[set, int, str
     Exact when the source starts at file index 0 (the QM9 .pt, or a full index table): the
     first ``need`` DISTINCT raw SMILES, so a duplicate inside the range pushes the end past
     ``need``. A slice that does not start at 0 cannot replay it, and falls back to the
-    index rule ``[0, need)`` -- recorded as such in the manifest.
+    index rule ``[0, need)`` -- recorded as such in the manifest. ``need`` 0 is NO POOL (the
+    default since 2026-09-29): an empty pool ending at index 0, whatever the source.
     """
+    if int(need) < 0:
+        raise SystemExit(f'pool need {need} is negative')
+    if int(need) == 0:
+        return set(), 0, NO_POOL_RULE
     if rows and rows[0][0] == 0 and all(i == j for j, (i, _) in enumerate(rows[:need])):
         seen, idx, end = set(), set(), 0
         for i, smi in rows:
@@ -805,7 +823,7 @@ def parse_args(argv=None):
     ap.add_argument('--split-salt', default='conformer_set_v1')
     ap.add_argument('--index-min', type=int, default=None,
                     help='first dataset index of the universe; default and minimum: the end '
-                         "of the encoder's pool")
+                         "of the excluded encoder pool, 0 when none is excluded")
     ap.add_argument('--index-max', type=int, default=None, help='exclusive')
     ap.add_argument('--max-stereoisomers-per-molecule', default='2',
                     help="conditions per molecule, or 'all'. A chiral pick brings its mirror")
@@ -813,10 +831,15 @@ def parse_args(argv=None):
     ap.add_argument('--encoder-ckpt', type=Path, default=None,
                     help='default models/encoder_cache.DEFAULT_CKPT')
     ap.add_argument('--no-encoder', action='store_true',
-                    help='no embeddings (test and debugging builds); needs --pool-need')
-    ap.add_argument('--pool-need', type=int, default=None,
-                    help="the encoder battery's `need`; derived from the encoder's results "
-                         'file when omitted, and must agree with it when both exist')
+                    help='no embeddings (test and debugging builds)')
+    ap.add_argument('--pool-need', type=int, default=0,
+                    help="leading distinct QM9 SMILES excluded as the encoder's training pool. "
+                         '0 (default, owner decision 2026-09-29) excludes none: the universe '
+                         "is all of QM9. N > 0 excludes the first N (pool_rows) and every "
+                         'constitution among them')
+    ap.add_argument('--pool-from-encoder', action='store_true',
+                    help="exclude the encoder's pool, its `need` derived from the encoder's "
+                         'results file (encoder_pool); a --pool-need above 0 must then agree')
     ap.add_argument('--prior-rows-per-condition', type=int, default=0,
                     help='write prior_train.pt with this many rows per training condition')
     ap.add_argument('--internal-prior', type=Path, default=None,
@@ -865,26 +888,28 @@ def main(argv=None):
     if cap is not None and cap < 1:
         raise SystemExit('--max-stereoisomers-per-molecule must be >= 1 or all')
 
-    # ---- encoder, and the pool it was trained on
+    # ---- encoder, and (only when asked) the pool it was trained on
     bundle, enc_info, pool_info = None, None, {}
-    need = args.pool_need
-    if not args.no_encoder:
-        from models import encoder_cache
-        ckpt = args.encoder_ckpt or Path(encoder_cache.DEFAULT_CKPT)
-        bundle = encoder_cache.load_encoder(str(ckpt), device='cpu')
+    need = int(args.pool_need)
+    if need < 0:
+        raise SystemExit('--pool-need must be >= 0')
+    from models import encoder_cache
+    ckpt = args.encoder_ckpt or Path(encoder_cache.DEFAULT_CKPT)
+    if args.pool_from_encoder:
         need_meta, pool_info = encoder_pool(ckpt)
-        if need is not None and need != need_meta:
+        if need and need != need_meta:
             raise SystemExit(f'--pool-need {need} disagrees with the encoder metadata '
                              f'({need_meta}, {pool_info["results_file"]})')
         need = need_meta
+    if not args.no_encoder:
+        bundle = encoder_cache.load_encoder(str(ckpt), device='cpu')
         enc_info = {k: bundle[k] for k in ('arm', 'hidden', 'layers', 'k', 'attention',
                                            'ckpt_path', 'sha256')}
         enc_info['embedding_dim'] = 2 * int(bundle['hidden'])
-        print(f"encoder {bundle['arm']} @ {bundle['sha256'][:12]}, pool need {need} from "
-              f"{pool_info['results_file']}")
-    elif need is None:
-        raise SystemExit('--no-encoder needs --pool-need: without the encoder there is no '
-                         'metadata to reconstruct its pool from')
+        print(f"encoder {bundle['arm']} @ {bundle['sha256'][:12]}")
+    print(f'encoder pool: need {need}'
+          + (f" from {pool_info['results_file']}" if pool_info else
+             ' (none excluded)' if need == 0 else ' (given)'))
 
     rows = read_source(args.source)
     pool_idx, pool_end, pool_rule = pool_rows(rows, need)

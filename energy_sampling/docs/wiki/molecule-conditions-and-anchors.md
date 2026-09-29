@@ -1,6 +1,6 @@
 # Molecule conditions and anchors
 
-*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20; the last paragraph of the split section written 2026-09-26 against commit `9c532ac` plus uncommitted working-tree changes. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20; the last paragraph of the split section written 2026-09-26 against commit `9c532ac` plus uncommitted working-tree changes, and its universe sentence re-verified on 2026-09-29 against commit `48c1241` plus uncommitted working-tree changes. Sources at the end.*
 
 A *condition* on the crystal route is a molecule: the policy is handed a fixed description of it and asked for a packing. That description is read from files on disk, not from a live encoder. This page covers which keys name those files, what a file must contain, how the QM9-derived sets are built, and which key enters problem identity. The encoder that produced the embeddings is [molecule-encoder](molecule-encoder.md); what training does with a condition is [conditional-route](conditional-route.md); the runtime anchor store is [anchor-buffer](anchor-buffer.md).
 
@@ -53,7 +53,7 @@ The anchor leg builds structures instead. `prep_qm9_anchor_mols.py` samples mole
 
 The probe path splits one level coarser. `models/encoder_probe.py::parent_skeleton` strips stereochemistry and returns the canonical SMILES; `encoder_probe.main` groups rows by skeleton, shuffles the groups, emits each group's members contiguously, advances the held-out boundary to the next group edge, and asserts no group spans the split. Its docstring records 67.9% of held-out rows carrying a same-skeleton sibling in training at `n_train = 4000` under a row-wise split, rising 14.0% to 50.5% to 67.9% with `n`. Raw QM9 carries no stereo tags; `load_qm9_stereo` assigns one configuration per molecule at each tetrahedral centre rather than enumerating.
 
-On the conformer route `build_conformer_set.py` splits on the constitution as well, by a salted `blake2b` hash of `build_conformer_set.py::constitution_key` (`parent_skeleton` after explicit hydrogens are removed) rather than by a shuffle, and every stereoisomer it builds is a separate condition on its molecule's side. It draws from QM9 file indices past the encoder's reconstructed pool and refuses rows whose constitution the pool contains; [conformer-conditioning-and-carrier](conformer-conditioning-and-carrier.md) has the build.
+On the conformer route `build_conformer_set.py` splits on the constitution as well, by a salted `blake2b` hash of `build_conformer_set.py::constitution_key` (`parent_skeleton` after explicit hydrogens are removed) rather than by a shuffle, and every stereoisomer it builds is a separate condition on its molecule's side. By default (`--pool-need 0`) it draws from every row of the source except the rows `build_conformer_set.py::plan_split` refuses (duplicate keys); with a positive `--pool-need` or `--pool-from-encoder` it draws from file indices past the encoder's reconstructed pool and refuses rows whose constitution the pool contains; [conformer-conditioning-and-carrier](conformer-conditioning-and-carrier.md) has the build.
 
 ## Prior identity
 
