@@ -15,6 +15,11 @@ fixed, so there is no stored orientation to invalidate and the whole QM9 set is 
 
 CPU-only. Usage:
     python prep_qm9_anchor_mols.py --n-mols 200 --out D:\\crystal_datasets\\conditional\\priors\\qm9_anchor_mols_200.pt
+
+Continuing a chunk family with the rest of the pool (every molecule not already in it, fixed-size chunks numbered on
+from the family's last one, written under the family's stem beside a separate combined file):
+    python prep_qm9_anchor_mols.py --n-mols 0 --exclude <family combined .pt> --chunk-size 780 --chunk-start 50
+        --chunk-stem qm9_cluster_mols --out <dir>\\qm9_cluster_mols_rest.pt
 """
 import argparse
 import warnings
@@ -35,7 +40,11 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--src", type=Path, default=DEFAULT_SRC,
                    help="molecule pool (list of MolData)")
-    p.add_argument("--n-mols", type=int, default=200)
+    p.add_argument("--n-mols", type=int, default=200,
+                   help="molecules to draw; 0 draws every molecule left in the pool")
+    p.add_argument("--exclude", type=Path, nargs="+", default=[],
+                   help="molecule files (lists of MolData) whose identifiers leave the pool before the draw, so "
+                        "the new set is disjoint from sets already searched")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--fixed-point-tol", type=float, default=1e-4,
@@ -46,7 +55,25 @@ def parse_args():
                         "mol_seed is deliberate: that path draws with replacement "
                         "(np.random.randint), so separate seeds neither partition the pool "
                         "nor guarantee distinct molecules across jobs.")
+    p.add_argument("--chunk-size", type=int, default=0,
+                   help="molecules per chunk file, in place of --chunks equal parts; the last chunk holds the "
+                        "remainder")
+    p.add_argument("--chunk-start", type=int, default=0,
+                   help="number of the first chunk file, so a new set can continue an existing chunk family")
+    p.add_argument("--chunk-stem", default=None,
+                   help="chunk file stem (default: the --out stem): chunk k is <stem>_chunk<k> beside --out. A "
+                        "continuation names the family's stem and its own --out, so the family's combined file "
+                        "is not replaced")
     return p.parse_args()
+
+
+def _refuse_to_replace(path, mols):
+    """A file already at path is replaced only by the same molecules in the same order: a wrong --chunk-start or
+    stem would otherwise overwrite chunks that searches and priors already name."""
+    if path.exists():
+        old = [str(m.identifier) for m in torch.load(path, map_location="cpu", weights_only=False)]
+        if old != [str(m.identifier) for m in mols]:
+            raise SystemExit(f"{path} exists and holds other molecules; not replacing it")
 
 
 def main():
@@ -54,8 +81,25 @@ def main():
     pool = torch.load(args.src, map_location="cpu", weights_only=False)
     print(f"pool: {len(pool)} molecules from {args.src.name}")
 
+    excluded_smiles = set()
+    if args.exclude:
+        drop = set()
+        for path in args.exclude:
+            drop |= {str(m.identifier) for m in torch.load(path, map_location="cpu", weights_only=False)}
+        # an excluded identifier the pool does not hold means the files name molecules differently, and the
+        # exclusion would then remove nothing without saying so
+        absent = drop - {str(m.identifier) for m in pool}
+        if absent:
+            raise SystemExit(f"{len(absent)} of {len(drop)} excluded identifiers are not in the pool, "
+                             f"e.g. {sorted(absent)[:3]}")
+        excluded_smiles = {str(m.smiles) for m in pool if str(m.identifier) in drop}
+        pool = [m for m in pool if str(m.identifier) not in drop]
+        print(f"excluded {len(drop)} molecules named in {', '.join(p.name for p in args.exclude)}; "
+              f"{len(pool)} remain")
+
     g = torch.Generator().manual_seed(args.seed)
-    idx = torch.randperm(len(pool), generator=g)[:args.n_mols]
+    n_draw = len(pool) if args.n_mols <= 0 else args.n_mols
+    idx = torch.randperm(len(pool), generator=g)[:n_draw]
     mols = [pool[int(i)].clone() for i in idx]
     print(f"sampled {len(mols)} molecules (seed {args.seed}, without replacement)")
 
@@ -90,26 +134,38 @@ def main():
           f"median {float(per_mol.median()):.3e} A")
     print(f"  unstable (> {args.fixed_point_tol:g} A): {len(unstable)} of {batch.num_graphs}")
 
-    keep = [i for i in range(batch.num_graphs) if i not in set(unstable)]
+    unstable_set = set(unstable)
+    keep = [i for i in range(batch.num_graphs) if i not in unstable_set]
     if not keep:
         raise SystemExit("every sampled molecule failed the fixed-point check")
 
     out_list = batch.to_data_list()
-    kept = [out_list[i] for i in keep]
+    # to_data_list returns views into the collated batch, and torch.save writes a view's whole storage: without the
+    # clone every chunk file carries every molecule's coordinates
+    kept = [out_list[i].clone() for i in keep]
+    if excluded_smiles:
+        shared = sum(str(m.smiles) in excluded_smiles for m in kept)
+        print(f"{shared} kept molecules share a SMILES with an excluded one (stereoisomers or repeated graphs); "
+              f"a molecule-level split should group them")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    if args.chunks > 1:
+    if args.chunks > 1 and args.chunk_size > 0:
+        raise SystemExit("--chunks and --chunk-size are alternatives; give one")
+    if args.chunks > 1 or args.chunk_size > 0:
         if args.chunks > len(kept):
             raise SystemExit(f"--chunks {args.chunks} exceeds {len(kept)} kept molecules")
         # contiguous slices of an already-shuffled list: disjoint by construction, and
-        # chunk k is reproducible from (seed, chunks, k) alone
-        per = -(-len(kept) // args.chunks)
+        # chunk k is reproducible from (seed, excluded files, chunks or chunk size, k) alone
+        per = args.chunk_size if args.chunk_size > 0 else -(-len(kept) // args.chunks)
+        stem = args.chunk_stem or args.out.stem
+        parts = [kept[i:i + per] for i in range(0, len(kept), per)]
+        paths = [args.out.with_name(f"{stem}_chunk{args.chunk_start + j}{args.out.suffix}")
+                 for j in range(len(parts))]
+        for path, part in zip(paths, parts):
+            _refuse_to_replace(path, part)
+        _refuse_to_replace(args.out, kept)
         written = []
-        for k in range(args.chunks):
-            part = kept[k * per:(k + 1) * per]
-            if not part:
-                continue
-            path = args.out.with_name(f"{args.out.stem}_chunk{k}{args.out.suffix}")
+        for path, part in zip(paths, parts):
             torch.save(part, path)
             written.append((path, len(part)))
         total = sum(n for _, n in written)
@@ -125,10 +181,12 @@ def main():
         print(f"KEPT {len(kept)} standardized molecules -> {len(written)} disjoint chunks "
               f"of ~{per} (verified: no overlap, none lost)")
         for path, n in written[:4]:
-            print(f"   {path.name}  {n}")
+            print(f"   {path.name}  {n}  ({path.stat().st_size / 1e6:.2f} MB)")
         if len(written) > 4:
-            print(f"   ... {len(written) - 4} more")
-        print(f"   {args.out.name}  {len(kept)}  (combined, for build_anchor_conditions.py)")
+            print(f"   ... {len(written) - 5} more, then {written[-1][0].name}  {written[-1][1]}")
+        print(f"   {args.out.name}  {len(kept)}  (combined, for build_anchor_conditions.py; "
+              f"{args.out.stat().st_size / 1e6:.2f} MB)")
+        print(f"distinct SMILES: {len(set(str(m.smiles) for m in kept))}")
         return
 
     torch.save(kept, args.out)
