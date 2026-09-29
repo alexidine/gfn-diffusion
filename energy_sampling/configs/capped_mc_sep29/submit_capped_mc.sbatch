@@ -6,7 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-15
+#SBATCH --array=0-7
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=cmc
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/capped_mc_sep29/joblogs/%x_%A_%a.out
@@ -15,7 +15,9 @@
 # training energy (UMA / MACE), for the thermal-band prior rebuild. One task = one (system, shard) row of INDEX.tsv
 # (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue every shard from its state.pt (--resume).
-# PILOT=1 sbatch ... runs a small version (64 seeds, 20 steps) into <name>_pilot/ to measure throughput first.
+# PILOT=1 sbatch --time=00:30:00 ... runs a small version (64 minima, 20 steps) into <name>_pilot/: a smoke test of the
+# cluster setup. Throughput and coverage come from the full run's log and each shard's exploration.jsonl (report:
+# python data_processing/capped_mc_explore.py /scratch/mk8347/data/crystal_datasets/capped_mc/<name>).
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -37,6 +39,9 @@ PRIOR=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${INDEX})
 PRIOR_BYTES=$(awk -F'\t' -v n=${ROW} 'NR==n {print $6}' ${INDEX})
 EF=$(awk -F'\t' -v n=${ROW} 'NR==n {print $7}' ${INDEX})
 MLIP=$(awk -F'\t' -v n=${ROW} 'NR==n {print $8}' ${INDEX})
+RDF_MODE=$(awk -F'\t' -v n=${ROW} 'NR==n {print $9}' ${INDEX})
+RDF_DCUT=$(awk -F'\t' -v n=${ROW} 'NR==n {print $10}' ${INDEX})
+REPLICAS=$(awk -F'\t' -v n=${ROW} 'NR==n {print $11}' ${INDEX})
 if [ -z "${NAME}" ]; then echo "no task at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 
 HAVE=$(stat -c %s ${DATA}/${PRIOR} 2>/dev/null || echo 0)
@@ -73,5 +78,6 @@ srun singularity exec --nv \
         export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         export GPU_MEM_FRACTION=0.9
         python -u data_processing/capped_mc.py --prior ${DATA}/${PRIOR} --energy_function ${EF} --mlip_path ${MLIP} \
-            --out ${OUT} --n_shards ${NSH} --shard ${SHARD} --resume ${EXTRA}
+            --out ${OUT} --n_shards ${NSH} --shard ${SHARD} --rdf_mode ${RDF_MODE} --rdf_dcut ${RDF_DCUT} \
+            --replicas ${REPLICAS} --resume ${EXTRA}
     " 2>&1 | tee ${J}.log

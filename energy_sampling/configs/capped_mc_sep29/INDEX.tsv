@@ -1,17 +1,9 @@
-task	name	shard	n_shards	prior	prior_bytes	energy_function	mlip_path
-0	mipu_uma	0	4	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt
-1	mipu_uma	1	4	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt
-2	mipu_uma	2	4	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt
-3	mipu_uma	3	4	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt
-4	nehu_uma	0	4	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt
-5	nehu_uma	1	4	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt
-6	nehu_uma	2	4	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt
-7	nehu_uma	3	4	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt
-8	acr_mace	0	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-9	acr_mace	1	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-10	acr_mace	2	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-11	acr_mace	3	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-12	acr_mace	4	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-13	acr_mace	5	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-14	acr_mace	6	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
-15	acr_mace	7	8	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+task	name	shard	n_shards	prior	prior_bytes	energy_function	mlip_path	rdf_mode	rdf_dcut	replicas
+0	mipu_uma	0	2	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt	atomwise	0.116	2
+1	mipu_uma	1	2	mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt	232846061	uma	/scratch/mk8347/models/uma/esen_s.pt	atomwise	0.116	2
+2	nehu_uma	0	2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt	atomwise	0.133	2
+3	nehu_uma	1	2	nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt	252737846	uma	/scratch/mk8347/models/uma/esen_s.pt	atomwise	0.133	2
+4	acr_mace	0	4	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model	envwise	0.085	2
+5	acr_mace	1	4	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model	envwise	0.085	2
+6	acr_mace	2	4	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model	envwise	0.085	2
+7	acr_mace	3	4	acridine_sg14_zp1_mace_prior_dataset_w3.pt	270223697	mace	/scratch/mk8347/data/acr_112025_mh1_stagetwo.model	envwise	0.085	2

@@ -33,6 +33,17 @@ Moves
     from the chain's own states at --cov_updates (keep the last one well before --adapt_end: each update re-zeroes
     log_scale); from --adapt_end on both are frozen, so the rest is a plain Metropolis chain.
 
+Seeds and walkers
+    The windowed minima are THINNED first (greedy atomwise-RDF cover in ascending energy at --dedupe_radius, default
+    the same-packing radius --rdf_dcut: the lowest member of each group of near-duplicates survives), then each distinct
+    minimum gets --replicas walkers per temperature rung.
+
+Exploration
+    At every checkpoint the walkers' current states are added to a greedy RDF cover per radius (--explore_radii, in
+    units of --rdf_dcut), seeded with the minima. The share landing farther than r from everything seen before is the
+    new fraction; exploration % = 1 - new fraction (a Good-Turing-style coverage estimate at that resolution). Rows go
+    to exploration.jsonl against cumulative walker-steps, energy evaluations and wall time.
+
 Acceptance
     min(1, exp(-(E' - E) / T_c)) with T_c = temper_c * T_train, and a HARD cap: E' > E_spawn + cap_local or
     E' > E_min_seeds + cap_global is rejected outright (caps in units of kT_train). Non-finite energies are rejected.
@@ -43,6 +54,8 @@ Output (--out)
                  coeff, reduction_en, chain, seed, rung, step. Folding by symmetry, dedup and symmetrisation happen
                  downstream.
     state.pt     resume point, written at start and with each shard (chains in unfolded coordinates).
+    exploration.jsonl  one row per checkpoint: effort so far and, per radius, the new fraction and cover size (the
+                 cover restarts from the minima and the current states after a resume; rows carry `resumed`).
     meta.json    settings and provenance.
 
 OOM
@@ -152,10 +165,10 @@ class Energy:
     For an MLIP the gas-phase leg is computed once (set_gas_reference) and attached to every batch."""
     REGROW_AFTER = 20
 
-    def __init__(self, mol, sg, ef, lj_coeff, device, chunk, predictor=None, pc_max=None):
+    def __init__(self, mol, sg, ef, lj_coeff, device, chunk, predictor=None, pc_max=None, rdf_mode='atomwise'):
         self.mol, self.sg, self.ef, self.lj_coeff, self.dev = mol, sg, ef, float(lj_coeff), device
         self.chunk = self.max_chunk = int(chunk)
-        self.pred, self.pc_max, self.gas = predictor, pc_max, None
+        self.pred, self.pc_max, self.gas, self.rdf_mode = predictor, pc_max, None, rdf_mode
         self.tmpl, self.n_eval, self.n_oom, self.n_ok = {}, 0, 0, 0
         if ef in MLIPS and predictor is None:
             raise ValueError(f'energy_function {ef!r} needs an MLIP predictor')
@@ -215,13 +228,37 @@ class Energy:
         del b
         return res
 
+    @torch.no_grad()
+    def _rdf_eval(self, L):
+        """RDF features of chart points: the per-channel normalised CDFs, flattened (fp16), and the active-channel
+        mask. Distance between two crystals = (10/99) x L1(CDF_a, CDF_b) / |channels active in either| (the pipeline
+        metric; analysis route: cutoff 10, rdf_cutoff 10, 100 bins, std_orientation True)."""
+        n = len(L)
+        if n < self.chunk:
+            L = torch.cat([L, L[:1].expand(self.chunk - n, -1)])
+        b = self._template(self.chunk).to(self.dev)
+        b.latent_to_cell_params(L.to(self.dev, torch.float32))
+        o = b.analyze(['rdf'], cutoff=10, rdf_cutoff=10, supercell_size=10, bins=100, rdf_mode=self.rdf_mode,
+                      std_orientation=True)
+        r = (o['rdf'][0] if isinstance(o['rdf'], (tuple, list)) else o['rdf'])[:n].float()
+        sm = r.sum(-1, keepdim=True)
+        res = dict(C=torch.cumsum(r / (sm + 1e-10), -1).flatten(1).half(), A=(sm[..., 0] > 1e-12))
+        del b, o, r
+        return res
+
+    def rdf(self, L):
+        return self._chunked(self._rdf_eval, L, count=False)
+
     def __call__(self, L):
+        return self._chunked(self._eval, L)
+
+    def _chunked(self, fn, L, count=True):
         outs, s = [], 0
         while s < len(L):
             n = min(self.chunk, len(L) - s)
             oom = False
             try:
-                outs.append(self._eval(L[s:s + n]))
+                outs.append(fn(L[s:s + n]))
                 s += n
                 self.n_ok += 1
                 if self.n_ok >= self.REGROW_AFTER and self.chunk < self.max_chunk:
@@ -242,8 +279,66 @@ class Energy:
                 self.n_oom += 1
                 self.n_ok = 0
                 print(f'  OOM in energy call: chunk -> {self.chunk}', flush=True)
-        self.n_eval += len(L)
+        if count:
+            self.n_eval += len(L)
         return {k: torch.cat([o[k] for o in outs]) for k in outs[0]}
+
+
+BW = 10 / 99
+
+
+def rdf_nn(C, A, blocks):
+    """min RDF distance from each row of (C, A) to the rows held in `blocks` [(C_blk, A_blk), ...] (device tensors)"""
+    d = torch.full((len(C),), float('inf'), device=C.device)
+    if not blocks:
+        return d
+    Cq, Aq = C.float(), A.float()
+    aq = Aq.sum(1)
+    for Cb, Ab in blocks:
+        union = (aq[:, None] + Ab.sum(1)[None] - Aq @ Ab.T).clamp_min(1)
+        d = torch.minimum(d, (torch.cdist(Cq, Cb.float(), p=1) * BW / union).min(1).values)
+    return d
+
+
+class Cover:
+    """A greedy RDF cover at radius r, grown in arrival order: a row joins as a representative when it is farther than
+    r from every representative so far (and from those admitted earlier in the same batch). `add` returns the new-row
+    mask, so the new fraction of a batch is the share of it that landed outside everything seen before."""
+
+    def __init__(self, r, cap=200000, block=4096):
+        self.r, self.cap, self.block, self.blocks, self.n, self.full = r, cap, block, [], 0, False
+
+    def add(self, C, A, q=512):
+        new = torch.zeros(len(C), dtype=torch.bool, device=C.device)
+        for s in range(0, len(C), q):
+            c, a = C[s:s + q], A[s:s + q].float()
+            cand = torch.nonzero(rdf_nn(c, a, self.blocks) > self.r).flatten()
+            if len(cand):
+                cc, ca = c[cand].float(), a[cand]
+                union = (ca.sum(1)[:, None] + ca.sum(1)[None] - ca @ ca.T).clamp_min(1)
+                Dc = (torch.cdist(cc, cc, p=1) * BW / union).cpu()
+                keep = []
+                for k in range(len(cand)):
+                    if all(Dc[k, j] > self.r for j in keep):
+                        keep.append(k)
+                kk = cand[keep]
+                new[s + kk] = True
+                if not self.full:
+                    self._append(c[kk].half(), a[kk])
+        return new
+
+    def _append(self, c, a):
+        while len(c):
+            if self.n >= self.cap:
+                self.full = True
+                return
+            if not self.blocks or len(self.blocks[-1][0]) >= self.block:
+                self.blocks.append((c[:0], a[:0]))
+            room = min(self.block - len(self.blocks[-1][0]), self.cap - self.n)
+            Cb, Ab = self.blocks[-1]
+            self.blocks[-1] = (torch.cat([Cb, c[:room]]), torch.cat([Ab, a[:room]]))
+            self.n += len(c[:room])
+            c, a = c[room:], a[room:]
 
 
 def load_seeds(path, ef):
@@ -299,7 +394,9 @@ def run(a, resume):
     window = a.seed_window if a.seed_window is not None else a.seed_window_kT * a.t_train
     pc_max = a.pc_max if a.pc_max is not None else (0.9 if ef in MLIPS else None)
     predictor = load_predictor(ef, a.mlip_path, dev) if ef in MLIPS else None
-    en = Energy(mol, sg, ef, lj, dev, a.chunk, predictor, pc_max)
+    en = Energy(mol, sg, ef, lj, dev, a.chunk, predictor, pc_max, rdf_mode=a.rdf_mode)
+    radii = [float(x) * a.rdf_dcut for x in a.explore_radii.split(',') if x]
+    ded_r = a.rdf_dcut if a.dedupe_radius is None else a.dedupe_radius
     state_path = os.path.join(a.out, 'state.pt')
 
     if resume and os.path.exists(state_path):
@@ -312,6 +409,7 @@ def run(a, resume):
         gen.set_state(st['gen'].cpu() if hasattr(st['gen'], 'cpu') else st['gen'])
         en.chunk = min(en.chunk, st.get('chunk', en.chunk))
         en.gas = st.get('gas')
+        effort0 = st.get('effort', dict(walker_steps=0, evals=0, wall=0.0))
         if ef in MLIPS and en.gas is None:
             en.set_gas_reference(S['L'][0].cpu())
         print(f'resumed at step {step0} (shard {shard_i}), {len(X)} chains, chunk {en.chunk}', flush=True)
@@ -341,6 +439,16 @@ def run(a, resume):
         Emin_rank = float(Er[fin].min())
         keep = torch.nonzero(fin & (Er <= Emin_rank + window)).flatten()
         keep = keep[torch.argsort(Er[keep])]
+        # THIN THE MINIMA, THEN ASSIGN WALKERS: a greedy RDF cover in ascending energy at the same-packing radius keeps
+        # the lowest member of each group of near-duplicates (a prior file re-finds the same crystal many times and in
+        # several pose copies; their walkers would re-walk one band). Deterministic, so every shard gets the same list.
+        n_window = len(keep)
+        if ded_r > 0:
+            fk = en.rdf(L0[keep].to(dev))
+            keep = keep[Cover(ded_r, cap=len(keep) + 1).add(fk['C'], fk['A']).cpu()]
+            del fk
+        print(f'  minima in the window: {n_window}; distinct at RDF radius {ded_r:g} ({a.rdf_mode}): {len(keep)}',
+              flush=True)
         idx = keep[a.shard::a.n_shards]
         if a.max_seeds and len(idx) > a.max_seeds:
             pick = torch.randperm(len(idx), generator=torch.Generator().manual_seed(a.rng))[:a.max_seeds]
@@ -376,8 +484,9 @@ def run(a, resume):
                    os.path.join(a.out, 'seeds.pt'))
         R = len(tempers)
         n_seed = len(idx)
-        S['chain_seed'] = torch.arange(n_seed, device=dev).repeat_interleave(R)
-        S['chain_rung'] = torch.arange(R, device=dev).repeat(n_seed)
+        S['chain_seed'] = torch.arange(n_seed, device=dev).repeat_interleave(R * a.replicas)
+        S['chain_rung'] = torch.arange(R, device=dev).repeat_interleave(a.replicas).repeat(n_seed)
+        effort0 = dict(walker_steps=0, evals=0, wall=0.0)
         X = S['L'][S['chain_seed']].clone()
         E = S['E'][S['chain_seed']].clone()
         N = len(X)
@@ -393,7 +502,7 @@ def run(a, resume):
             mlip = dict(path=a.mlip_path, bytes=os.path.getsize(a.mlip_path))
         meta = dict(vars(a), prior=prior, sg=sg, periodic_dims=per, dead_rows=dead, active_dims=act, lj_coeff=lj,
                     E_glob=E_glob, E_min_stored_or_ranked=Emin_rank, fresh_minus_stored=off, n_seeds=n_seed,
-                    n_seeds_in_window=len(keep), n_chains=N, T_rungs=T_rung.tolist(), cap_local_abs=cap_local,
+                    n_seeds_in_window=n_window, n_distinct_minima=len(keep), dedupe_radius=ded_r, n_chains=N, T_rungs=T_rung.tolist(), cap_local_abs=cap_local,
                     cap_global_abs=cap_global, seed_window_abs=window, pc_max_used=pc_max, gas_reference=en.gas,
                     mlip=mlip, energy=f'{ef}; analyze([reduction_en, {ef}], cutoff=10, supercell_size=10, '
                                       f'std_orientation=False); molecule = first crystal of the file',
@@ -417,15 +526,50 @@ def run(a, resume):
             shard_i += 1
             buf = []
         save_atomic(dict(seeds=S, X=X, E=E, log_scale=log_scale, Sig=Sig, acc_ema=acc_ema, s1=s1, s2=s2, nwin=nwin,
-                         ref=ref, step=step, shard_i=shard_i, gen=gen.get_state(), chunk=en.chunk, gas=en.gas),
-                    state_path)
+                         ref=ref, step=step, shard_i=shard_i, gen=gen.get_state(), chunk=en.chunk, gas=en.gas,
+                         effort=effort()), state_path)
 
+    # EXPLORATION: a greedy RDF cover per radius, seeded with the minima; at every checkpoint the walkers' current
+    # states are added and the share landing farther than r from everything seen before is the new fraction.
+    # exploration % = 1 - new fraction: the Good-Turing-style estimate of how much of what the walkers now visit was
+    # already covered at that resolution. One jsonl row per checkpoint against walker-steps, evaluations and wall time.
+    covers = [Cover(r) for r in radii]
+    fs = en.rdf(S['L'])
+    for cv in covers:
+        cv.add(fs['C'], fs['A'])
+    del fs
+    xlog = os.path.join(a.out, 'exploration.jsonl')
+    t_start = time.time()
+
+    def effort():
+        return dict(walker_steps=effort0['walker_steps'] + N * max(0, cur_step[0] + 1 - step0),
+                    evals=effort0['evals'] + en.n_eval - n_eval0, wall=effort0['wall'] + time.time() - t_start)
+
+    def explore(step):
+        ft = en.rdf(fold(X, per))
+        row = dict(step=step, **effort(), resumed=bool(step0 > 0), n_walkers=N)
+        parts = []
+        for cv in covers:
+            nf = float(cv.add(ft['C'], ft['A']).float().mean())
+            row[f'new_{cv.r:.4g}'] = nf
+            row[f'reps_{cv.r:.4g}'] = cv.n
+            row[f'full_{cv.r:.4g}'] = cv.full
+            parts.append(f'r {cv.r:.3g}: {100 * (1 - nf):5.1f}% ({cv.n}{" FULL" if cv.full else ""})')
+        del ft
+        with open(xlog, 'a') as fh:
+            print(json.dumps(row), file=fh)
+        print(f'  exploration at step {step} ({row["walker_steps"]} walker-steps, {row["evals"]} evals, '
+              f'{row["wall"]:.0f} s): ' + ' | '.join(parts), flush=True)
+
+    cur_step = [step0 - 1]
+    n_eval0 = en.n_eval
     if step0 == 0:
         flush(-1)  # this run's own resume point exists before the first step, so an early restart resumes THIS run
 
-    t0, n_eval0 = time.time(), en.n_eval
+    t0 = time.time()
     tot = dict(prop=0, box=0, cap=0, nonfin=0, acc=0)
     for step in range(step0, a.steps):
+        cur_step[0] = step
         z = torch.randn(N, d_act, generator=gen, device=dev, dtype=torch.float64)
         dx = torch.exp(log_scale)[:, None] * torch.einsum('nij,nj->ni', chol, z)
         Xn = X.clone()  # unfolded chain coordinates
@@ -492,6 +636,7 @@ def run(a, resume):
                   f'nonfinite {tot["nonfin"]}  | {msg}', flush=True)
         if (step + 1) % a.shard_every == 0 or step == a.steps - 1:
             flush(step)
+            explore(step)
     print(f'done: {en.n_eval - n_eval0} MC evaluations, {tot["acc"]} accepted moves, {time.time() - t0:.0f} s, '
           f'{en.n_oom} OOM halvings', flush=True)
 
@@ -517,6 +662,13 @@ def main():
     p.add_argument('--pc_max', type=float, default=None, help='reject denser proposals unscored (default 0.9 for MLIPs)')
     p.add_argument('--max_spread', type=float, default=1.0,
                    help='max median |fresh - stored - offset| over the seeds before refusing (training units)')
+    p.add_argument('--replicas', type=int, default=2, help='walkers per distinct minimum per temperature rung')
+    p.add_argument('--rdf_mode', default='atomwise', choices=['atomwise', 'envwise'])
+    p.add_argument('--rdf_dcut', type=float, default=0.12,
+                   help='same-packing RDF radius (COMPACK-calibrated per system): seed thinning and exploration unit')
+    p.add_argument('--dedupe_radius', type=float, default=None,
+                   help='thin the minima at this RDF radius before assigning walkers (default --rdf_dcut; 0 = off)')
+    p.add_argument('--explore_radii', default='1,2,3', help='exploration radii, in units of --rdf_dcut')
     p.add_argument('--n_shards', type=int, default=1)
     p.add_argument('--shard', type=int, default=0)
     p.add_argument('--max_seeds', type=int, default=0, help='0 = every seed of this shard')
