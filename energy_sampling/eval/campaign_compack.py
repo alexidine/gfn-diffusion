@@ -378,7 +378,7 @@ def calibrate(a):
         n = a.max_pool
     t = time.time()
     crystals = co.rebuild_crystals(cfg, st['params'], st['hand'])
-    R = co.compute_rdfs(crystals, cfg.rdf_batch)
+    R = co.compute_rdfs(crystals, cfg.rdf_batch, getattr(cfg, 'rdf_mode', 'envwise'))  # the campaign's own RDF mode
     D = co.rdf_distance_matrix(R, R).double().numpy()
     log(f'{n} states: RDFs and distances in {time.time() - t:.0f} s')
     cut0 = float(a.cut if a.cut is not None else cfg.identity_cut)
@@ -434,7 +434,8 @@ def calibrate(a):
     lines = [f'# COMPACK identity calibration: {os.path.basename(os.path.abspath(a.coord_dir))}', '',
              f'Energy model `{cfg.energy_model_id}`; sg {cfg.sg}, Z\'={cfg.z_prime}; states within {a.band_kT} kT of '
              f'{st["ref"]:.4f}: {n} (from the shards, exact repeats removed); RDF as the coordinator computes it '
-             f'(envwise, 10 A); campaign identity cut {cfg.identity_cut}. Pairs stratified over RDF distance, at most '
+             f"({getattr(cfg, 'rdf_mode', 'envwise')}, 10 A); campaign identity cut {cfg.identity_cut}. Pairs stratified "
+             f'over RDF distance, at most '
              f'{a.cap} pairs per state, round 1 on [0, {hi:.3f}), round 2 on [{lo2:.3f}, {hi2:.3f}) ({why}). '
              f'A match is {MATCH_MIN}/{SHELL} molecules (COMPACK PackingSimilarity, shell {SHELL}). Seed {a.seed}.', '',
              f'Pairs compared: {len(pairs)}; engine failures or timeouts {int((~ok).sum())} (excluded). COMPACK wall '
@@ -454,7 +455,8 @@ def calibrate(a):
                                E_b=float(st['energy'][j]), **res[pair_key(st['key'][i], st['key'][j])])
                           for i, j in pairs],
                    controls=[dict(key=st['key'][i], N=N.tolist(), **c) for i, N, c in zip(ctl_rows, ctl_N, ctl)],
-                   campaign_cut=cfg.identity_cut, energy_model_id=cfg.energy_model_id, band_kT=a.band_kT, n_states=n)
+                   campaign_cut=cfg.identity_cut, energy_model_id=cfg.energy_model_id, band_kT=a.band_kT, n_states=n,
+                   rdf_mode=getattr(cfg, 'rdf_mode', 'envwise'))
     lines.append('')
     if len(yy) > 4 and 0 < yy.sum() < len(yy):
         (d50, b), s, nb = logistic_summary(dd, yy, nboot=a.nboot, seed=a.seed)
@@ -513,6 +515,9 @@ def dedup(a):
     cal = torch.load(a.calibration, weights_only=False) if a.calibration else {}
     if cal and cal.get('energy_model_id') not in (None, cfg.energy_model_id):
         raise SystemExit(f"calibration scored by {cal.get('energy_model_id')!r}, campaign by {cfg.energy_model_id!r}")
+    if cal and cal.get('rdf_mode', 'envwise') != getattr(cfg, 'rdf_mode', 'envwise'):
+        raise SystemExit(f"calibration distances are {cal.get('rdf_mode', 'envwise')}, the campaign's are "
+                         f"{getattr(cfg, 'rdf_mode', 'envwise')}: a cut in one mode does not transfer to the other")
     d_hi = a.d_hi if a.d_hi is not None else cal.get('d_hi', 2 * cfg.identity_cut)
     dE = a.dE if a.dE is not None else cal.get('dE_gate', float('inf'))
     if not np.isfinite(d_hi) or d_hi <= 0:
@@ -525,7 +530,8 @@ def dedup(a):
     hand = torch.stack([reg['basin_hand'][j] for j in idx]).float()
     keys = [crystal_key(p, h) for p, h in zip(params, hand)]
     crystals = co.rebuild_crystals(cfg, params, hand)
-    D = co.rdf_distance_matrix(*(2 * [co.compute_rdfs(crystals, cfg.rdf_batch)])).double().numpy()
+    R = co.compute_rdfs(crystals, cfg.rdf_batch, getattr(cfg, 'rdf_mode', 'envwise'))  # the campaign's own RDF mode
+    D = co.rdf_distance_matrix(R, R).double().numpy()
     Eb = E[idx]
     iu, ju = np.nonzero(np.triu(D < d_hi, 1) & (np.abs(Eb[:, None] - Eb[None, :]) <= dE))
     order = np.lexsort((D[iu, ju], np.maximum(Eb[iu], Eb[ju])))  # lowest energies first, then closest
