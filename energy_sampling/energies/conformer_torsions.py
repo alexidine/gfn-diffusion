@@ -1596,9 +1596,13 @@ class ConformerTorsions(BaseSet):
     def ring_blocks(self, prior):
         """Ring-system DoF blocks in SPEC numbering, paired with their fitted bank.
 
-        Returns ``[(order, bank)]`` where ``order`` is ``[(kind, row), ...]`` in exactly
-        the sequence InternalPrior fitted the block in (all r, then all theta, then all
-        phi), and ``bank`` is the RingBank or None.
+        Returns ``[(order, bank, extra)]`` where ``order`` is ``[(kind, row), ...]`` in
+        exactly the sequence InternalPrior fitted the block in (all r, then all theta, then
+        all phi), ``bank`` is the RingBank, RingModes or None, and ``extra`` the rows that
+        place a ring atom but name an atom outside the system, less the dihedral that places
+        the system's entry atom (see below). Each block's record on ``ring_block_info``
+        carries its atoms, ``rotation_rows``, the extra phi rows of its rotation about the
+        bond attaching it to the tree's parent side, and ``entry_rows``, that dihedral.
 
         Ring systems are the second place a product of marginals cannot work: closure is a
         hard constraint, so independently-drawn ring DoF violate it by construction --
@@ -1651,6 +1655,10 @@ class ConformerTorsions(BaseSet):
         # branch, free to drift from it; energies/ring_metrics.py reads this instead. See
         # that module for what each class means.
         self.ring_block_info = []
+        # tree parent of every slot, for the attaching-bond rows below (-1 at the root)
+        parent = np.full(self.spec.n_atoms, -1, dtype=np.int64)
+        parent[bi[:, 1]] = bi[:, 0]
+        held_rows = set(self.held_phi_rows())
         out = []
         for s, cols in blocks.items():
             order = ([('r', int(j)) for j in cols['r']]
@@ -1722,12 +1730,36 @@ class ConformerTorsions(BaseSet):
             # dihedral whose reference atom sits outside is excluded -- and then moves
             # freely and breaks closure. Proline's closure error was 1.5 A at ANY jitter
             # scale for exactly this reason. These extras are held, never banked, since
-            # the bank was fitted against the narrower set.
+            # the bank was fitted against the narrower set -- all but the rotation rows
+            # below, and the rows a per-molecule ring shape writes (energies/ring_shapes.py).
             in_sys = {int(a) for a in range(len(sysid)) if int(sysid[a]) == int(s)}
             placing = ([('r', j) for j in range(self.n_r) if int(bi[j, 1]) in in_sys]
                        + [('theta', j) for j in range(self.n_th) if int(ai[j, 2]) in in_sys]
                        + [('phi', j) for j in range(self.n_ph) if int(ti[j, 3]) in in_sys])
             extra = [kj for kj in placing if kj not in set(order)]
+            # THE DIHEDRAL THAT PLACES THE SYSTEM'S ENTRY ATOM is not an extra. Where the tree
+            # enters the system from outside, the phi row placing the entry atom turns about
+            # a bond one further out, (a, b): a change moves the entry atom's whole subtree,
+            # the system included, rigidly about a-b and no distance inside it, so it is drawn
+            # as an ordinary member of its sibling group -- a rotor, a substituent following
+            # another ring's own rows, or a child in another ring's rotation. Held, it froze
+            # that rotor at its reference and, where the bond belongs to another ring, kept
+            # this system's entry atom at its reference dihedral whatever shape that ring took.
+            entry = [j for k, j in extra if k == 'phi' and int(ti[j, 2]) not in in_sys]
+            extra = [kj for kj in extra if not (kj[0] == 'phi' and kj[1] in entry)]
+            # THE RING'S ROTATION ABOUT THE BOND THAT ATTACHES IT. Where the tree enters the
+            # system from outside, at atom c from its parent b, the phi rows whose central
+            # bond is (b, c) place c's children on the frame (a, b, c): a displacement common
+            # to that bond's sibling group turns c's whole subtree -- the ring and everything
+            # placed on frames holding it -- rigidly about b-c, and moves no distance inside
+            # the ring. sample_prior_states draws that displacement like any other rotor
+            # instead of holding it; the ring rows keep their offsets from one another,
+            # which is what closes the ring. A held phi row (an improper, or a locked
+            # double bond) is not in a sibling group and is left out.
+            rotation = [j for k, j in extra if k == 'phi'
+                        and int(ti[j, 2]) in in_sys and int(ti[j, 1]) not in in_sys
+                        and int(parent[int(ti[j, 2])]) == int(ti[j, 1])
+                        and j not in held_rows]
             self.ring_block_info.append({
                 'system': int(s), 'aromatic': aromatic, 'key': (sigs[s], len(order)),
                 'ring_class': ('held_aromatic' if aromatic else
@@ -1739,6 +1771,10 @@ class ConformerTorsions(BaseSet):
                 # bank_refused 'polycyclic' means a key DID resolve and was refused for
                 # topology, not that no bank exists for this ring
                 'n_cycles': int(n_cycles), 'bank_refused': bank_refused,
+                # the system's atoms (slot numbering), the phi rows of its rotation about the
+                # attaching bond, and the phi row placing its entry atom (both empty when the
+                # tree's root is in the system)
+                'atoms': sorted(in_sys), 'rotation_rows': rotation, 'entry_rows': entry,
             })
             out.append((order, bank, extra))
         return out
@@ -1984,7 +2020,7 @@ class ConformerTorsions(BaseSet):
 
     def sample_prior_states(self, prior, n: int, rng, report: bool = True,
                             joint_torsions: bool = True, thermal_rtheta: bool = True,
-                            joint_rings: bool = True):
+                            joint_rings: bool = True, ring_shapes=None):
         """``[n, d]`` states drawn from a fitted InternalPrior. Returns ``(x, stats)``.
 
         Per-DoF marginals for the acyclic part, joint draws where a product of marginals
@@ -1993,8 +2029,27 @@ class ConformerTorsions(BaseSet):
         ``joint_rings`` DEFAULTS TO TRUE and is the real ring path -- each ring block is
         drawn from its fitted pucker subspace or discrete bank, aromatic rings are held
         planar by design, an unsupported ring is held at a fraction of thermal width, and
-        the ring-positioning DoF outside the block are held either way. See ``ring_blocks``
-        for the four classes and energies/ring_metrics.py for how they are reported.
+        the ring-positioning DoF outside the block are held, except the ring's rotation
+        about the bond attaching it (below); the dihedral placing a system's entry atom is
+        not among them and is drawn with its sibling group like any other row (see
+        ``ring_blocks``). See ``ring_blocks`` for the four classes and energies/ring_metrics.py
+        for how they are reported.
+
+        ``ring_shapes`` (None, the default, draws as above) is energies/ring_shapes.py's
+        per-block list for THIS molecule, aligned with ``ring_blocks``. A block with stored
+        shapes takes one of them per draw, uniformly and independently per block and per
+        draw: the shape's theta and phi rows plus jitter at ``ring_jitter_scale`` times the
+        thermal width, as the hold jitters, and r held about the reference as the bank path
+        holds it. Its other rows, and every block without shapes, are drawn as above.
+        ``stats['ring_shapes']`` gives, per block, the shapes available, how many draws
+        took each, and each draw's shape (``pick``, -1 without shapes).
+
+        THE RING'S ROTATION ABOUT ITS ATTACHING BOND. With ``joint_torsions``, where the tree
+        enters a ring system from outside, the phi rows about the entering bond
+        (``ring_block_info``'s ``rotation_rows``) are not held: their sibling group takes one
+        displacement per draw, its leader drawn from the central bond's marginal like any
+        other rotor, and the ring rows keep their offsets from one another, so the ring is
+        turned rigidly and stays closed. ``stats['n_ring_rotations']`` counts those groups.
 
         ``joint_rings=False`` IS A NEGATIVE CONTROL, NOT A SAMPLING MODE. Every ring DoF
         then gets an independent marginal, which violates closure by construction: measured
@@ -2045,8 +2100,13 @@ class ConformerTorsions(BaseSet):
         # ---- ring systems FIRST: closure is a hard constraint, so their DoF are joint,
         # and substituents hanging off a ring atom then lock to what the ring chose ----
         ring_rows = set()
+        # phi row -> [n] value its ring's rotation about the attaching bond displaces: the
+        # reference, or the drawn shape's value. Drawn with the sibling groups below.
+        # `rot_ring` holds the rows that place a ring atom (ring_block_info's rotation_rows).
+        rot_base, rot_ring = {}, set()
         stats.update(n_rings=0, n_ring_banked=0, n_ring_thermal=0, n_ring_extra_held=0,
-                     n_ring_remapped=0)
+                     n_ring_remapped=0, n_ring_shaped=0, n_ring_rotation_rows=0,
+                     n_ring_rotations=0, ring_shapes=[])
         if joint_rings:
             ref = {'r': r0, 'theta': th0, 'phi': ph0}
             sig = {'r': s_r, 'theta': s_th}
@@ -2068,10 +2128,61 @@ class ConformerTorsions(BaseSet):
                 dof[:, gr] = ref[kind][j] + rng.normal(0.0, s, n)
                 return gr
 
-            for order, bank, extra in self.ring_blocks(prior):
+            blocks = self.ring_blocks(prior)
+            if ring_shapes is not None and len(ring_shapes) != len(blocks):
+                raise ValueError(
+                    f'{self.smiles}: ring_shapes has {len(ring_shapes)} entries but ring_blocks '
+                    f'gives {len(blocks)} blocks; the shapes were built for another chart')
+            for bk, ((order, bank, extra), binfo) in enumerate(zip(blocks,
+                                                                  self.ring_block_info)):
                 rows = [self._global_row(k, j) for k, j in order]
                 stats['n_rings'] += 1
-                if isinstance(bank, RingModes):
+                # the rotation is drawn with the sibling groups, which only joint_torsions has
+                rotation = set(binfo['rotation_rows']) if joint_torsions else set()
+                rot_ring |= rotation
+                stats['n_ring_rotation_rows'] += len(rotation)
+                shp = None if ring_shapes is None else ring_shapes[bk]
+                n_avail = 0 if shp is None else int(len(shp.values))
+                # per block: shapes available, draws per shape, and each draw's shape (-1: none)
+                rec = {'block': bk, 'available': n_avail, 'drawn': np.zeros(n_avail, np.int64),
+                       'pick': np.full(n, -1, np.int64)}
+                if n_avail:
+                    # PER-MOLECULE RING SHAPES (energies/ring_shapes.py): this molecule's own
+                    # relaxed ring conformers, measured in this chart. A shape is written into
+                    # every row it carries -- the block, and the extras that set the ring's
+                    # internal geometry, without which a ring the tree enters from outside is
+                    # not determined by its block -- except r, which stays with the thermal
+                    # path as the bank's does, and the rows of the rotation's sibling group,
+                    # whose values are the base the drawn rotation displaces.
+                    srows = [(str(k), int(j)) for k, j in shp.rows]
+                    rgroup = {('phi', j) for g in groups
+                              if set(g) & set(binfo['rotation_rows']) for j in g}
+                    own = set(order) | set(extra) | rgroup
+                    miss = (set(order) | rgroup) - set(srows)
+                    if not set(srows) <= own or miss:
+                        raise ValueError(
+                            f'{self.smiles}: ring block {bk}\'s shapes carry rows '
+                            f'{sorted(set(srows) - own)} outside the block and lack '
+                            f'{sorted(miss)}; they were measured in another chart')
+                    pick = rng.integers(n_avail, size=n)
+                    rec['drawn'], rec['pick'] = np.bincount(pick, minlength=n_avail), pick
+                    vals = np.asarray(shp.values, dtype=np.float64)[pick]
+                    for col, (kind, j) in enumerate(srows):
+                        if kind == 'r':
+                            continue
+                        if rotation and (kind, j) in rgroup:
+                            rot_base[j] = vals[:, col]
+                            continue
+                        gr = self._global_row(kind, j)
+                        s = (sig[kind][j] if kind in sig else phi_sig) * sc
+                        v = vals[:, col] + rng.normal(0.0, s, n)
+                        dof[:, gr] = ((v + np.pi) % (2 * np.pi) - np.pi) if kind == 'phi' else v
+                        ring_rows.add(gr)
+                    for kj in order:
+                        if self._global_row(*kj) not in ring_rows:
+                            ring_rows.add(hold(kj))
+                    stats['n_ring_shaped'] += 1
+                elif isinstance(bank, RingModes):
                     # subspace draw: theta/phi from the pucker manifold, r from the
                     # thermal path, everything else in the block held
                     stats['ring_fill'] = self.ring_mode_fill
@@ -2137,10 +2248,16 @@ class ConformerTorsions(BaseSet):
                         ring_rows.add(hold(kj))
                     stats['n_ring_thermal'] += 1
                 # ring-POSITIONING DoF outside the block are held either way: banked or
-                # not, letting them float re-opens the ring (see ring_blocks)
+                # not, letting them float re-opens the ring (see ring_blocks). Not the
+                # rotation rows, which the sibling groups draw, nor a row a shape wrote.
                 for kj in extra:
-                    ring_rows.add(hold(kj))
-                stats['n_ring_extra_held'] += len(extra)
+                    if kj[0] == 'phi' and kj[1] in rotation:
+                        rot_base.setdefault(kj[1], np.full(n, ph0[kj[1]]))
+                        continue
+                    if self._global_row(*kj) not in ring_rows:
+                        ring_rows.add(hold(kj))
+                        stats['n_ring_extra_held'] += 1
+                stats['ring_shapes'].append(rec)
 
         # ---- r / theta ----
         if thermal_rtheta:
@@ -2151,8 +2268,11 @@ class ConformerTorsions(BaseSet):
                 if self.n_r + j not in ring_rows:
                     dof[:, self.n_r + j] = rng.normal(th0[j], s_th[j], n)
             stats['rtheta_sigma_deg'] = (float(np.degrees(s_th.mean())), float(s_r.mean()))
+        # the rotation rows are drawn jointly with their sibling group, not from a marginal
+        rot_rows = {n_phi0 + j for j in rot_base}
         for row, (kind, hist, key, is_ring) in enumerate(types):
-            stats['n_ring_marginal'] += int(is_ring and row not in ring_rows)
+            stats['n_ring_marginal'] += int(is_ring and row not in ring_rows
+                                            and row not in rot_rows)
             if row in ring_rows:
                 continue
             if (joint_torsions and row >= n_phi0) or (thermal_rtheta and row < n_phi0):
@@ -2185,8 +2305,29 @@ class ConformerTorsions(BaseSet):
             stats['n_groups'] = len(groups)
             stats['sigma_deg'] = ((float(np.degrees(min(g_sigma))),
                                    float(np.degrees(max(g_sigma)))) if g_sigma else (0.0, 0.0))
+            s_rot = phi_sig * self.ring_jitter_scale      # the hold's own phi jitter
             for gi, rows_j in enumerate(groups):
                 grows = [n_phi0 + j for j in rows_j]
+                if any(j in rot_ring for j in rows_j):
+                    # A RING'S ROTATION ABOUT THE BOND ATTACHING IT (ring_blocks). The leader,
+                    # the group's first row as for any rotor, is drawn from the central bond's
+                    # marginal and every row takes its displacement. The ring rows keep their
+                    # offsets from one another -- the reference's, or the drawn shape's -- at
+                    # the hold's jitter, so the ring turns rigidly and stays closed. The
+                    # entry atom's other children, another system's entry atom among them, keep
+                    # their offsets from the ring rows -- the reference's, or the shape's, which
+                    # carries this group whole -- at the sibling jitter.
+                    base = [rot_base[j] if j in rot_base else ph0[j] for j in rows_j]
+                    _, hist, _, _ = types[grows[0]]
+                    dof[:, grows[0]] = draw(grows[0], 'phi', hist)
+                    disp = (dof[:, grows[0]] - base[0] + np.pi) % (2 * np.pi) - np.pi
+                    for i, (j, gr) in enumerate(zip(rows_j, grows)):
+                        if i == 0:
+                            continue
+                        jit = rng.normal(0.0, s_rot if j in rot_ring else g_sigma[gi], n)
+                        dof[:, gr] = base[i] + disp + jit
+                    stats['n_ring_rotations'] += 1
+                    continue
                 in_ring = [i for i, gr in enumerate(grows) if gr in ring_rows]
                 if in_ring and len(in_ring) == len(grows):
                     continue                       # wholly intra-ring: the bank owns it
@@ -2211,7 +2352,8 @@ class ConformerTorsions(BaseSet):
             # atoms, placed by the ring block, which sits upstream of every row corrected
             # here in the tree order. So the provisional build below fixes their positions
             # no matter what these rows currently hold, and one measurement is enough.
-            frame_groups = self.ring_frame_groups(ring_rows) if joint_rings else []
+            # the rotation rows place ring atoms too: their groups are the rotation's, above
+            frame_groups = self.ring_frame_groups(ring_rows | rot_rows) if joint_rings else []
             stats['n_ring_frame_groups'] = len(frame_groups)
             if frame_groups:
                 tt = lambda a: torch.as_tensor(a, dtype=self.dtype, device=self.device)
@@ -2343,11 +2485,15 @@ class ConformerTorsions(BaseSet):
             print(f"  clipped to box: r {stats['clip_frac']['r']:.1%}, "
                   f"theta {stats['clip_frac']['theta']:.1%}")
             if stats['n_rings']:
-                print(f"  rings: {stats['n_rings']} system(s) -- {stats['n_ring_banked']} "
+                print(f"  rings: {stats['n_rings']} system(s) -- {stats['n_ring_shaped']} "
+                      f"from this molecule's own ring shapes (shapes available per block: "
+                      f"{[r['available'] for r in stats['ring_shapes']]}), "
+                      f"{stats['n_ring_banked']} "
                       f"from a fitted RingBank (joint, samples pucker), "
                       f"{stats['n_ring_thermal']} held at thermal jitter about the "
                       f"reference (closure preserved, pucker NOT sampled; aromatic rings "
-                      f"take this path by design, being rigid)")
+                      f"take this path by design, being rigid); {stats['n_ring_rotations']} "
+                      f"ring(s) turned about the bond attaching them")
             elif stats['n_closure_bonds'] and not joint_rings:
                 print(f"  rings: joint ring sampling is OFF -- {stats['n_closure_bonds']} "
                       f"closure bond(s) are being violated by construction. This is the "

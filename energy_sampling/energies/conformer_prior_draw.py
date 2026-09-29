@@ -29,7 +29,7 @@ import torch
 
 
 def draw_member_prior(member, n: int, rng, relax_steps: int = 0, prior=None,
-                      report: bool = False, chunk: int = 4096):
+                      report: bool = False, chunk: int = 4096, ring_shapes=None):
     """``(states [n, k_member], energies [n], stats)`` for one molecule.
 
     ``member`` is a ``ConformerTorsions`` (a carrier member, never the dispatcher: a draw
@@ -38,7 +38,9 @@ def draw_member_prior(member, n: int, rng, relax_steps: int = 0, prior=None,
     is deliberately no uniform fallback: at `flex` and `full` a uniform box draw is not a
     weaker prior, it is not a prior (see the module docstring). ``rng`` is a
     ``numpy.random.Generator``; the caller owns its seeding, so a per-molecule seed stays
-    a per-molecule seed.
+    a per-molecule seed. ``ring_shapes`` is passed to ``sample_prior_states`` unchanged:
+    energies/ring_shapes.py's per-block list for this member, or None (the default), which
+    is the draw the modeller makes.
     """
     if prior is None:
         raise ValueError(
@@ -47,7 +49,8 @@ def draw_member_prior(member, n: int, rng, relax_steps: int = 0, prior=None,
             f'level {member.level!r}: a box draw over bond lengths and angles is not a '
             f'prior')
     n = int(n)
-    states, stats = member.sample_prior_states(prior, n, rng, report=report)
+    states, stats = member.sample_prior_states(prior, n, rng, report=report,
+                                               ring_shapes=ring_shapes)
     x = torch.as_tensor(states, dtype=member.dtype, device=member.device)
     steps = int(relax_steps or 0)
     stats = dict(stats)

@@ -20,7 +20,10 @@ The arm is not renamed in place; it is SPLIT, and both halves say which they are
 
     prior-rings-on    joint_rings=True, the real path -- pucker subspace or bank where one
                       resolves, aromatic rings held planar by design, unsupported rings
-                      held at a fraction of thermal width, ring-positioning DoF held.
+                      held at a fraction of thermal width, ring-positioning DoF held but for
+                      a ring's rotation about the bond attaching it and the dihedral placing
+                      its entry atom, which are drawn (see ConformerTorsions.ring_blocks and
+                      .sample_prior_states). No per-molecule ring shapes.
     prior-rings-off   joint_rings=False. A NEGATIVE CONTROL whose job is to make the ring
                       columns falsifiable: if it does not measurably worsen closure on a
                       ring molecule, the ring measurements are not live and nothing else in

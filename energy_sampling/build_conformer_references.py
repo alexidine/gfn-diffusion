@@ -526,12 +526,16 @@ def _embed(tmpl, seed: int, mmff: bool) -> Optional[np.ndarray]:
 
 def _state_of_positions(member, tree, rd) -> torch.Tensor:
     """``[1, k]``: RDKit-order positions measured in the member's OWN tree (not a tree rebuilt
-    from the new geometry, which may infer a different spanning tree). Not clamped."""
+    from the new geometry, which may infer a different spanning tree). Not clamped.
+
+    A dummy-frame row is measured against its dummy atom, as the member measures its ``ph0``
+    (``member._dummy_t``, None when it has none): measured against the collinear real atom it
+    reads noise, 0.19 in state units at the reference of CC#CC1CC1."""
     from mxtaltools.conformers.builder import measure
 
     pos = torch.as_tensor(np.asarray(rd)[np.asarray(member.spec.perm)], dtype=member.dtype,
                           device=member.device)
-    r, th, ph = measure(tree, pos)
+    r, th, ph = measure(tree, pos, dummy_frame=member._dummy_t)
     return member.state_from_dof(r.reshape(1, -1), th.reshape(1, -1), ph.reshape(1, -1))
 
 
