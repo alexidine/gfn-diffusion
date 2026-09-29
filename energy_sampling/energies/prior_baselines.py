@@ -195,6 +195,11 @@ def descend(en, x0, steps, lr=None, optimizer='rprop'):
     normalises per parameter by the gradient's running RMS, so it divides any constant
     diagonal rescaling straight back out. Preconditioning would have to change the geometry
     (non-diagonal), or ride on SGD, to be worth anything.
+
+    PHI WRAPS, THE BOX CLAMPS. After each step every column `en.periodic_dims` marks is
+    wrapped onto [-1, 1), one full turn about its reference, and every other column is
+    clamped into [-1, 1], so a torsion can descend through ph0 +/- pi while r and theta stay
+    in the box. `en` must declare `periodic_dims`.
     """
     if lr is None:
         lr = 0.02 if optimizer == 'rprop' else 0.05
@@ -206,6 +211,13 @@ def descend(en, x0, steps, lr=None, optimizer='rprop'):
     # benchmark runs on CPU; the trainer calls this on the card.
     best_u = torch.full((len(x0),), float('inf'), dtype=en.dtype, device=x0.device)
     best_x = x0.clone().detach()
+    # A phi column is an angle: `dof_from_state` reads it as ph0 + pi * x, so [-1, 1) is one
+    # full turn about the reference and the column WRAPS, as `state_from_dof` writes it. A
+    # clamp there pinned every torsion that descended across ph0 +/- pi on the seam, a false
+    # minimum: 8 to 19% of relaxed starts by generator, measured 2026-09-29 on a 240-molecule
+    # QM9 sample (artifacts/conformer_coverage_2026-09-29/report.md). r and theta keep the
+    # box clamp.
+    per = torch.as_tensor(en.periodic_dims, dtype=torch.bool, device=x0.device)
     for _ in range(steps):
         opt.zero_grad()
         u = en.potential_energy(x, float(en.temperature), keep_grads=True)
@@ -217,7 +229,7 @@ def descend(en, x0, steps, lr=None, optimizer='rprop'):
         u.sum().backward()
         opt.step()
         with torch.no_grad():
-            x.clamp_(-1.0, 1.0)
+            x.copy_(torch.where(per, (x + 1.0) % 2.0 - 1.0, x.clamp(-1.0, 1.0)))
     return best_x, best_u
 
 
