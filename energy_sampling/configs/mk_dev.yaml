@@ -639,6 +639,8 @@ conditional_worst_quantile: 0.25  # fraction of conditions allowed to sit beyond
 # per-row bar; conditional_worst_quantile above is how many conditions may miss it.
 nonthermal_entropy_per_dim: 4.0  # nats/DoF defining the excess-energy bar u_star, against each condition's own energy floor. Publishes Excess Energy Nats {Mean,P50,P90,P99,Max} and Nonthermal fractions. 0 or null = the whole excess-energy channel is off
 nonthermal_cond_bar: 0.1     # a condition FAILS when more than this fraction of its rows sit above u_star (higher is worse)
+nonthermal_equipartition_p: 1.0e-6  # tail probability p of the per-row equipartition bar u_star_i = Gamma(k_i/2, 1) quantile at 1 - p, plus nonthermal_basin_window_kT; k_i = the row's live state columns. Publishes Nonthermal Fraction (equipartition), its Cond family (against nonthermal_cond_bar) and Nonthermal Threshold (equipartition) Mean. 0 or null = off
+nonthermal_basin_window_kT: 10.0  # kT added to every equipartition bar u_star_i
 reasonable_cond_bar: 0.5     # a condition FAILS when fewer than this fraction of its rows pass _reasonable_sample_mask (higher is better)
 per_step_probe_steps: 0      # log this many RAW per-step fwd values after arming -- no EMA, no tracker, which is the point: the tracker's smoothing destroys a 2-step mode. 0 = off
 

@@ -245,6 +245,72 @@ def _origin_fracs(origin, prefix: str):
             for code, name in ORIGIN_NAMES.items()}
 
 
+#: (k, p) -> the Gamma(k/2, 1) quantile at 1 - p; see equipartition_bar
+_EQUIPARTITION_QUANTILES = {}
+
+
+def equipartition_bar(k, p: float, window: float) -> torch.Tensor:
+    """
+    Per-row excess-energy bar for `Nonthermal Fraction (equipartition)`, in kT:
+
+        u*_i = Q_{Gamma(k_i/2, 1)}(1 - p) + W
+
+    MECHANISM. Near a minimum each quadratic degree of freedom holds about
+    kT/2, so under the Boltzmann target the excess over the basin minimum, in
+    kT, is distributed as the sum of k_i halved chi-square(1) variables,
+    Gamma(k_i/2, 1). A row above its bar is one that target puts at tail
+    probability <= p from its own basin floor, after the basin floor itself is
+    allowed to sit up to W above the condition's best-known energy (higher
+    accepted basins). For torsions, which are bounded and hold LESS than kT/2,
+    the Gamma tail is an over-estimate, so the bar is conservative there.
+
+    WORKING ASSUMPTIONS (scoped to this metric, revisable): p =
+    `nonthermal_equipartition_p` and W = `nonthermal_basin_window_kT` (the
+    conformer database keeps basins within a 10 kT window).
+
+    `k` is the row's REAL degree-of-freedom count (a tensor or int per row);
+    k <= 0 has no excess to hold and gets a quantile of 0. The quantile is
+    computed with scipy.stats.gamma.ppf once per distinct (k, p) and cached.
+    """
+    p = float(p)
+    if not 0.0 < p < 1.0:
+        raise ValueError(f'nonthermal_equipartition_p must be in (0, 1), got {p}')
+    k = torch.as_tensor(k).detach().cpu().flatten().long()
+    out = torch.zeros(k.shape, dtype=torch.float64)
+    for kk in torch.unique(k).tolist():
+        q = _EQUIPARTITION_QUANTILES.get((kk, p))
+        if q is None:
+            if kk <= 0:
+                q = 0.0
+            else:
+                from scipy.stats import gamma
+                q = float(gamma.ppf(1.0 - p, kk / 2.0))
+            _EQUIPARTITION_QUANTILES[(kk, p)] = q
+        out[k == kk] = q
+    return out + float(window)
+
+
+def row_dof_count(sample_batch, n_rows: int, n_dof) -> torch.Tensor:
+    """
+    Per-row real degree-of-freedom count, [n_rows] long.
+
+    A batch carrying `state_mask` (the conformer CARRIER, energies/
+    conformer_carrier.py::carrier_pad_condition) owns only the True columns
+    of each row; the rest are pads pinned to 0 (ConformerGFN._pin_dead), so a
+    row's count is its mask's row sum. Every other batch gives each row
+    `n_dof`, the count log_nonthermal_tail already uses (gfn_model.live_dim,
+    else data_ndim). A mask that does not tile the rows raises.
+    """
+    mask = getattr(sample_batch, 'state_mask', None) if sample_batch is not None else None
+    if mask is None:
+        return torch.full((int(n_rows),), int(n_dof), dtype=torch.long)
+    mask = torch.as_tensor(mask).detach().cpu()
+    if n_rows <= 0 or mask.numel() % n_rows:
+        raise RuntimeError(f'state_mask has {mask.numel()} entries, which does not tile '
+                           f'{n_rows} rows; the eval batch and the scored rows disagree')
+    return mask.reshape(int(n_rows), -1).bool().sum(-1).long()
+
+
 class Modeller:
     def __init__(self, args=None):
         self.step_ind = None
@@ -8203,7 +8269,8 @@ class Modeller:
         # physical window. This is the distribution-relative counterpart: how
         # much of the batch is so far above its own condition's best known
         # energy that no realisable density of states could explain it.
-        self.log_nonthermal_tail(arr, fwd_stats, log_T_tensor, log_r, metrics)
+        self.log_nonthermal_tail(arr, fwd_stats, log_T_tensor, log_r, metrics,
+                                 sample_batch=sample_batch)
 
     def _reasonable_sample_mask(self, sample_batch):
         """
@@ -8296,7 +8363,8 @@ class Modeller:
             metrics[key] = value
             self._settings_log_cache[key] = value
 
-    def log_nonthermal_tail(self, arr, fwd_stats, log_T_tensor, log_r, metrics):
+    def log_nonthermal_tail(self, arr, fwd_stats, log_T_tensor, log_r, metrics,
+                            sample_batch=None):
         """
         The high-energy tail stated DIRECTLY, rather than inferred from mean
         energy, reasonable-sample fraction or an effective temperature.
@@ -8355,6 +8423,17 @@ class Modeller:
         Conditions with no record yet are excluded and counted in
         `Excess Energy Referenced Fraction`. Off when
         nonthermal_entropy_per_dim is 0 or null.
+
+        EQUIPARTITION VARIANT, alongside and not replacing the above: the same
+        u on the same scored rows, against a per-row bar from equipartition_bar
+        (Gamma(k_i/2) upper quantile at 1 - nonthermal_equipartition_p, plus
+        nonthermal_basin_window_kT), with k_i the row's real degree-of-freedom
+        count from row_dof_count -- the carrier row's own width read off
+        `sample_batch.state_mask`, else the n_dof above. Publishes
+        `Nonthermal Fraction (equipartition)`, its `Cond Nonthermal
+        (equipartition) *` family, and `Nonthermal Threshold (equipartition)
+        Mean`, the mean bar over the scored rows. Off, additionally, when
+        nonthermal_equipartition_p is 0 or null.
         """
         s_per_dim = getattr(self.args, 'nonthermal_entropy_per_dim', 4.0)
         s_per_dim = 0.0 if s_per_dim is None else float(s_per_dim)
@@ -8408,6 +8487,22 @@ class Modeller:
         # uninterpretable later without the threshold it was scored against
         # (module_metrics.md S3), but it is a setting, not a series
         self._log_setting(metrics, 'Nonthermal Threshold', u_star)
+
+        # EQUIPARTITION bar, per row (equipartition_bar): the same u, a bar from
+        # each row's own degree-of-freedom count rather than the padded width
+        p_eq = getattr(self.args, 'nonthermal_equipartition_p', 1e-6)
+        if p_eq is None or float(p_eq) <= 0:
+            return
+        window = getattr(self.args, 'nonthermal_basin_window_kT', 10.0)
+        k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
+        u_star_row = equipartition_bar(k_row, float(p_eq),
+                                       0.0 if window is None else float(window)).to(u.dtype)
+        hot_eq = u > u_star_row
+        metrics['Nonthermal Fraction (equipartition)'] = hot_eq.float().mean().item()
+        self.log_condition_fraction(metrics, arr, 'Nonthermal (equipartition)', hot_eq,
+                                    cid_seen, getattr(self.args, 'nonthermal_cond_bar', 0.1),
+                                    higher_is_worse=True)
+        metrics['Nonthermal Threshold (equipartition) Mean'] = u_star_row.mean().item()
 
     def update_mle_gate(self):
         """

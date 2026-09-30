@@ -43,6 +43,17 @@ The `quick_tb_stats` docstring states the criterion for its control family: its 
 
 `replay/val_*` is the replay buffer's own split. `train.py::_val_flags` marks each admission batch Bernoulli(`cfg:buffers.replay_buffer.val_frac`), once at admission, and `Modeller._replay_val_stats` re-runs the replay loss on a capped subset of those rows (`cfg:buffers.replay_buffer.val_cap`, also clipped to the live batch size), unweighted and with the Z tracker read-only, scoring stored trajectories through the prebuilt path so no energy call is made. It writes `val_loss`; `val_gap`, mean Huber loss val minus train, in nats squared; `val_gap_nats`, median absolute residual val minus train in nats, the train side using the importance-weighted median; `val_gap_nats_se`, 1.858 times the val side's MAD over $\sqrt{n}$; `val_n`; and `val_skips`, which a CUDA OOM in the probe sets to 1.0.
 
+## The non-thermal tail
+
+`train.py::Modeller.log_nonthermal_tail`, called from `.log_thermo_properties` on the train-condition eval batch, scores each row with a record by $u = \max(0, (E - E_{\min}(c))/T)$ in nats, $E_{\min}(c)$ being `Modeller._condition_energy_floor`. Rows without a record are dropped and counted in `Excess Energy Referenced Fraction`; the family is absent when `cfg:nonthermal_entropy_per_dim` is 0 or null or no floor exists. It publishes two bars on the same $u$ and the same rows.
+
+- `Nonthermal Fraction` is the fraction with $u > u^* = s\,n$, $s$ = `cfg:nonthermal_entropy_per_dim` and $n$ = `gfn_model.live_dim`, else `data_ndim`, one $n$ for every row. `Nonthermal Threshold` is $u^*$, logged on change. On a conformer carrier $n$ is the padded width $K$.
+- `Nonthermal Fraction (equipartition)` is the fraction with $u > u^*_i$ = `train.py::equipartition_bar`: the $\mathrm{Gamma}(k_i/2, 1)$ quantile at $1-p$ (`scipy.stats.gamma.ppf`, cached per distinct $(k, p)$) plus $W$, with $p$ = `cfg:nonthermal_equipartition_p` and $W$ = `cfg:nonthermal_basin_window_kT` in the units of $u$. $k_i$ is `::row_dof_count`: the row sum of the batch's `state_mask` when it carries one, else the same $n$. `Nonthermal Threshold (equipartition) Mean` is the mean of $u^*_i$ over the scored rows. The family is absent when $p$ is 0 or null.
+
+Each bar has its `Cond <name> *` family through `Modeller.log_condition_fraction`, `Cond Nonthermal` and `Cond Nonthermal (equipartition)`, both against `cfg:nonthermal_cond_bar`.
+
+The mechanism the equipartition bar encodes: near a minimum each quadratic degree of freedom holds about $\tfrac12 kT$, so under the Boltzmann target the excess over the basin minimum in units of $kT$ is $\mathrm{Gamma}(k/2, 1)$. For a torsion, bounded and holding less than $\tfrac12 kT$, the Gamma tail over-states the excess, so the bar is conservative there. $W$ lets the row sit in a higher basin up to $W$ above the condition's floor. *Working assumptions, scoped to this metric:* $p = 10^{-6}$ and $W = 10$, the latter matching the conformer database's 10 kT basin window. Bars at those values: 35.4, 51.0, 65.6 and 84.1 nats for $k$ = 12, 30, 49 and 75, against $4k$ = 48, 120, 196 and 300 for `Nonthermal Threshold`. Pinned by `tests/protocol/test_nonthermal_equipartition.py`.
+
 ## Relations the code states
 
 - $\mathbb{E}[r^2] = \mathrm{mean}(r)^2 + \mathrm{Var}(r)$: the level and spread halves of one square, `z_grad_worst` being the level half and the excess of `tb_err_worst` over it the spread half.
@@ -77,7 +88,7 @@ Settings are emitted on change only, not as series: `Modeller._log_setting` for 
 
 ## Config keys
 
-`cfg:figs_period`, `cfg:eval_period`, `cfg:test_molecules_path`, `cfg:test_eval_num_samples`, `cfg:conditional_worst_quantile`, `cfg:per_step_probe_steps`, `cfg:reasonable_cond_bar`, `cfg:buffers.replay_buffer.val_frac`, `cfg:buffers.replay_buffer.val_cap`.
+`cfg:figs_period`, `cfg:eval_period`, `cfg:test_molecules_path`, `cfg:test_eval_num_samples`, `cfg:conditional_worst_quantile`, `cfg:per_step_probe_steps`, `cfg:reasonable_cond_bar`, `cfg:nonthermal_entropy_per_dim`, `cfg:nonthermal_cond_bar`, `cfg:nonthermal_equipartition_p`, `cfg:nonthermal_basin_window_kT`, `cfg:buffers.replay_buffer.val_frac`, `cfg:buffers.replay_buffer.val_cap`.
 
 Code: `train.py::Modeller.ten_step_reporting`, `.log_metrics`, `.evaluation`, `._update_rolling`, `._per_step_probe`, `._eval_conditional_stats`, `.log_test_metrics`, `.log_condition_fraction`, `._log_setting`, `._replay_val_stats`, `.vram_metrics`, `.train`; `train.py::_val_flags`; `utils.py::MetricTracker.update`, `.written_step`, `.snapshot`, `.rebase`, `::quick_tb_stats`, `::per_condition_fraction`; `buffer.py::ConditionLogZTracker.delta_stats`, `.pooled_levels`; `protocol.py::StageProtocol.report`, `._resolve`, `.publish_gate`; `controller.py::LRController.report`; `eval/evaluations.py::_hist_bar`, `::_thin_idx`, `::adjust_fig_filesize`, `::condition_tracker_figs`, `::fig_guard`; `analysis/keys.py::resolve`; `analysis/pull.py::pull`; `analysis/checks.py::check_r2`, `::check_r14`, `::check_confounds`, `::check_r11`; `analysis/features.py::theil_sen`; `conformer_modeller.py::ConformerModeller`; `train_conformer.py`.
 
