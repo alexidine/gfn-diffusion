@@ -870,7 +870,20 @@ def summarize(out_dir, *, mirror_de_tol: float = 0.05, mirror_count_rel: float =
     files = sorted(Path(out_dir).glob('shard_*_of_*.pt'))
     if not files:
         raise SystemExit(f'{out_dir}: no shard files')
-    blobs = [torch.load(f, weights_only=False, map_location='cpu') for f in files]
+    # ONE SHARD AT A TIME, kept slim: a full run's shard files hold every basin's positions
+    # (2.9 GB on disk for the 400-shard QM9 run), and loading them all at once was killed on a
+    # login node. Only the fields read below are kept.
+    heavy = ('basins', 'ref_pos', 'z', 'perm', 'ring_shapes', 'stereo_pin')
+
+    def _slim(blob):
+        for r in blob['keys'].values():
+            r['conditions'] = [{k: v for k, v in c.items() if k not in heavy}
+                               for c in r['conditions']]
+        return blob
+
+    blobs = []
+    for f in files:
+        blobs.append(_slim(torch.load(f, weights_only=False, map_location='cpu')))
     runs = {b['run_hash'] for b in blobs}
     if len(runs) != 1:
         raise SystemExit(f'{out_dir} mixes {len(runs)} runs (different headers); summarize one')
