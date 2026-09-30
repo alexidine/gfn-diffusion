@@ -97,6 +97,18 @@ def test_one_layout_spreads_singleton_groups_across_the_images():
     assert torch.bincount(k[face], minlength=8).tolist() == [100] * 8
 
 
+def test_wrapped_pairs_sees_across_the_y_and_z_seams():
+    import numpy as np
+    from energy_sampling.data_processing.symmetrize_prior import greedy_thin, wrapped_pairs
+    X = np.zeros((4, 12))
+    X[0, 7], X[1, 7] = -0.999, 0.999            # 0.002 apart across the y seam
+    X[2, 8], X[3, 8] = 0.5, -0.5                # 1.0 apart in z, no seam involved
+    pairs = wrapped_pairs(X, 0.01)
+    assert pairs.tolist() == [[0, 1]]
+    kept = greedy_thin(4, pairs, np.array([1, 0, 2, 3]))     # row 1 visited first keeps, retiring row 0
+    assert kept.tolist() == [False, True, True, True]
+
+
 def test_the_constant_matches_mxtaltools():
     from mxtaltools.crystal_search.crystal_opt_utils import CELL_EDGE as MXT_EDGE
     assert CELL_EDGE == MXT_EDGE

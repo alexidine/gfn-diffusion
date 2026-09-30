@@ -124,6 +124,87 @@ def nearest_anchor(latents, anchors, chunk=1024):
     return out
 
 
+def wrapped_pairs(X, r):
+    """Every pair (i < j) of rows of the [n, 12] latent array X within Euclidean distance r, with the centroid y and z
+    coordinates (columns 7 and 8, whole-cell axes) periodic with period 2: rows within r of a seam are also entered as
+    their images across it, so a pair straddling the wrap is found."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    n = len(X)
+    pts, idx = [X], [np.arange(n)]
+    for dy in (-2.0, 0.0, 2.0):
+        for dz in (-2.0, 0.0, 2.0):
+            if dy == 0 and dz == 0:
+                continue
+            m = np.ones(n, bool)
+            if dy:
+                m &= X[:, 7] * np.sign(dy) < -1 + r
+            if dz:
+                m &= X[:, 8] * np.sign(dz) < -1 + r
+            if m.any():
+                Y = X[m].copy()
+                Y[:, 7] += dy
+                Y[:, 8] += dz
+                pts.append(Y)
+                idx.append(np.nonzero(m)[0])
+    ids = np.concatenate(idx)
+    pr = cKDTree(np.concatenate(pts)).query_pairs(r, output_type='ndarray')
+    i, j = ids[pr[:, 0]], ids[pr[:, 1]]
+    keep = i != j
+    i, j = np.minimum(i[keep], j[keep]), np.maximum(i[keep], j[keep])
+    return np.unique(np.stack([i, j], 1), axis=0) if len(i) else np.zeros((0, 2), dtype=np.int64)
+
+
+def greedy_thin(n, pairs, order):
+    """Leader clustering: visit rows in `order`, keep a row unless a kept row already lies within the cutoff (a pair),
+    and retire its neighbours. Returns the kept-row mask. With a group-invariant metric and an order in which every
+    row of one source precedes every row of the next, the decision is the same at every image, so orbits survive or
+    fall together (asserted by the caller)."""
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    adj = coo_matrix((np.ones(len(pairs), bool), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    adj = (adj + adj.T).tocsr()
+    alive = np.ones(n, bool)
+    kept = np.zeros(n, bool)
+    indptr, indices = adj.indptr, adj.indices
+    for k in order:
+        if alive[k]:
+            kept[k] = True
+            alive[indices[indptr[k]:indptr[k + 1]]] = False
+    return kept
+
+
+def thin_orbits(orbits, prov, cutoff):
+    """The orbit batch thinned at `cutoff` in the wrapped 12-D latent: exact duplicates go first, then leader clustering
+    over the distinct rows in (source energy, source index, image) order. Returns (batch, provenance, report) and
+    asserts that every surviving row's in-box y/z orbit survived whole; opposite-face pairings may split (an interior
+    row near one face retires the same-face images of a face row and cannot reach the other face) and are counted."""
+    import numpy as np
+    distinct = torch.nonzero(~prov['duplicate']).flatten().numpy()
+    X = _latents(orbits).numpy()[distinct]
+    src = prov['source'].numpy()[distinct]
+    e = orbits.elj.double().flatten().numpy()[distinct]
+    order = np.lexsort((np.arange(len(distinct)), src, e))        # energy, then source index, then image
+    kept = greedy_thin(len(distinct), wrapped_pairs(X, cutoff), order)
+    sel = distinct[kept]
+    out = orbits.subsample_new_batch(torch.as_tensor(sel))
+    newprov = {k: v[torch.as_tensor(sel)] for k, v in prov.items()}
+    # y/z orbit closure: within each (source, face side) the four shifts live or die together
+    side = newprov['face_copy'].long()
+    key = newprov['source'] * 2 + side
+    counts = torch.bincount(key)
+    counts = counts[counts > 0]
+    assert bool((counts == 4).all()), f'thinning split a y/z orbit: sides with {sorted(set(counts.tolist()))} rows'
+    n_src = int(prov['source'].max()) + 1
+    face_src = prov['source'][prov['face_copy']].unique()
+    has_side = torch.zeros(n_src, 2, dtype=torch.bool)
+    has_side[newprov['source'], side] = True
+    kept_face = has_side[face_src].any(1)
+    split = kept_face & ~has_side[face_src].all(1)
+    return out, newprov, dict(cutoff=cutoff, distinct_in=len(distinct), rows=out.num_graphs, sources_kept=int(newprov['source'].unique().numel()),
+                              face_sources_kept=int(kept_face.sum()), face_pairs_split=int(split.sum()))
+
+
 def symmetrize_batch(batch):
     """The symmetrised batch (8 rows per source, see the module docstring) and its provenance dict."""
     sgs = set(batch.sg_ind.reshape(-1).tolist())
@@ -283,7 +364,12 @@ def main(argv=None):
                     help="orbits: every source row as its 8 rows (exact; 8x the size). one: every source row ONCE, written as one "
                          "of its valid descriptions chosen by choose_one (same size as the source; symmetric in the aggregate, "
                          "balanced within each anchor's rows)")
+    ap.add_argument('--thin', type=float, default=None,
+                    help='orbits layout only: leader-cluster the distinct orbit rows at this cutoff in the wrapped 12-D latent, '
+                         'lowest energy kept first (exact duplicates go first); y/z orbits are asserted to survive whole')
     args = ap.parse_args(argv)
+    if args.thin is not None and args.layout != 'orbits':
+        sys.exit('--thin applies to --layout orbits')
     if os.path.exists(args.out):
         sys.exit(f'{args.out} exists -- refusing to overwrite')
     data = torch.load(args.src, map_location='cpu', weights_only=False)
@@ -315,6 +401,10 @@ def main(argv=None):
             report[key]['layout'] = dict(rows=out.num_graphs, groups=int(group.unique().numel()), image_counts=hist,
                                          face_sources=int(face_ok.sum()), opposite_face_rows=int(prov['face_copy'].sum()))
             assert not prov['duplicate'].any() and out.num_graphs == src.num_graphs, key
+        elif args.thin is not None:
+            t0 = time.time()
+            out, prov, report[key]['thin'] = thin_orbits(orbits, prov, args.thin)
+            report[key]['thin']['seconds'] = time.time() - t0
         else:
             out = orbits
         report[key]['energy'] = check_energy(src, out, prov, args.device, args.rescore_chunk, key)
@@ -324,7 +414,7 @@ def main(argv=None):
         provenance[key] = prov
     torch.save(out_data, args.out)
     stem = args.out[:-3] if args.out.endswith('.pt') else args.out
-    torch.save(dict(source_file=os.path.abspath(args.src), layout=args.layout, rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS,
+    torch.save(dict(source_file=os.path.abspath(args.src), layout=args.layout, thin=args.thin, rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS,
                     x_box=X_BOX, face_tol=FACE_TOL, limit=args.limit, report=report, **provenance), stem + '_provenance.pt')
     print(f'wrote {args.out} ({os.path.getsize(args.out):,} bytes) and {stem}_provenance.pt')
 
