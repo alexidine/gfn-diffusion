@@ -1022,6 +1022,19 @@ def test_condition_draws_are_judged_on_the_resolved_config(canonical):
     assert not _fires(canonical, 'condition_draw_is_well_formed')
 
 
+def test_a_global_untrusted_z_without_an_energy_reference_is_an_error(canonical):
+    # one all-condition level only stands in for conditions whose depth was removed
+    cfg = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference=None)
+    assert _fires(cfg, 'energy_reference_is_consistent')
+    ok = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference='seed_min')
+    assert not _fires(ok, 'energy_reference_is_consistent')
+
+
+def test_an_energy_reference_with_temperature_conditioning_is_an_error(canonical):
+    cfg = broken(canonical, energy_config__energy_reference='seed_min', temperature_conditioning=True)
+    assert _fires(cfg, 'energy_reference_is_consistent')
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check

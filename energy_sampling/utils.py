@@ -870,7 +870,13 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # it is strictly smaller than the reward_range and
                                     # energy_clip reshapes already exempt above.
                                     'mlip_compile', 'mlip_edge_chunk_size',
-                                    'mlip_activation_checkpointing')
+                                    'mlip_activation_checkpointing',
+                                    # a constant per condition subtracted from the physical
+                                    # leg: every condition's target at T is unchanged, only
+                                    # its log Z moves -- so, as for reward_range, log Z is
+                                    # NOT comparable across settings. A full resume across a
+                                    # change is refused separately, by resolve_energy_reference.
+                                    'energy_reference')
 
 # Explicit version of the problem_def SCHEMA (the set of fields below that
 # constitute a problem's identity). It rides in the dict and therefore in the
@@ -1762,13 +1768,26 @@ def drain_elapsed_times(times):
 
 class MetricTracker:
     """Step-aware EMA over arbitrary scalars, keyed by (direction, name).
-    Also tracks running min/max of the EMA per key."""
+    Also tracks running min/max of the EMA per key.
+
+    EACH KEY RUNS ITS OWN CLOCK: alpha = 1 - exp(-dt/period) with dt the steps
+    since THAT KEY's last applied write, so a key's time constant is `period`
+    steps whatever its writer's cadence and whatever else writes the same
+    direction. A per-direction clock made it depend on the interleaving: 'replay'
+    has two writers on a 10-step cadence (train.py's rolling stats and the
+    replay step's absorption/drift/held-out payload), and whichever wrote second
+    in a 10-step window saw dt = the offset from the other, not 10. A resume
+    re-runs the saved step and shifts that offset from 0 to 9, which moved the
+    two families' smoothing ~10x in opposite directions across a requeue."""
 
     def __init__(self, period: float = 25.0):
         self.period = period
         self.values = {}  # (direction, name) -> float
         self.best = {}  # (direction, name) -> [min, max]
-        self.last_it = {}  # direction -> step
+        # (direction, name) -> step of that key's last applied (finite) write.
+        # A skipped non-finite value does not advance it, so the next finite
+        # write decays the old value over the whole gap.
+        self.last_it = {}
         self.changed_keys = set()
         # (direction, name) -> the step of that key's most recent FRESH write.
         #
@@ -1787,18 +1806,21 @@ class MetricTracker:
         self.written_at = {}
 
     def update(self, direction, scalars: dict, step: int):
-        dt = max(step - self.last_it.get(direction, step), 1)
-        alpha = 1.0 - np.exp(-dt / self.period)
-
         for name, v in scalars.items():
             v = v.item() if torch.is_tensor(v) else float(v)
             if not np.isfinite(v):
                 continue
             key = (direction, name)
             prev = self.values.get(key)
-            nv = v if prev is None else (1 - alpha) * prev + alpha * v
+            if prev is None:
+                nv = v
+            else:
+                dt = max(step - self.last_it.get(key, step), 1)
+                alpha = 1.0 - np.exp(-dt / self.period)
+                nv = (1 - alpha) * prev + alpha * v
 
             self.values[key] = nv
+            self.last_it[key] = step
             self.changed_keys.add(key)  # mark as changed
             self.written_at[key] = int(step)
 
@@ -1808,8 +1830,6 @@ class MetricTracker:
             else:
                 if nv < b[0]: b[0] = nv
                 if nv > b[1]: b[1] = nv
-
-        self.last_it[direction] = step
 
     def get(self, direction, name, default=None):
         return self.values.get((direction, name), default)
@@ -1835,25 +1855,36 @@ class MetricTracker:
         return {f'{d}/{n}': v for (d, n), v in self.values.items() if v is not None}
 
     def state_dict(self):
-        nested, best = {}, {}
+        nested, best, last_it = {}, {}, {}
         for (d, n), v in self.values.items():
             nested.setdefault(d, {})[n] = v
         for (d, n), mm in self.best.items():
             best.setdefault(d, {})[n] = list(mm)
-        return {'period': self.period, 'last_it': dict(self.last_it),
+        for (d, n), s in self.last_it.items():
+            last_it.setdefault(d, {})[n] = s
+        return {'period': self.period, 'last_it': last_it,
                 'values': nested, 'best': best}
 
     def load_state_dict(self, sd):
         self.period = sd.get('period', self.period)
-        self.last_it = dict(sd.get('last_it', {}))
         self.values = {(d, n): v for d, kv in sd.get('values', {}).items() for n, v in kv.items()}
         self.best = {(d, n): list(mm) for d, kv in sd.get('best', {}).items() for n, mm in kv.items()}
+        self.last_it = {}
+        for d, s in sd.get('last_it', {}).items():
+            if isinstance(s, dict):
+                self.last_it.update({(d, n): step for n, step in s.items()})
+            else:
+                # a checkpoint from the per-direction clock ({direction: step}):
+                # every key of that direction shared it, so each inherits it.
+                # Exact for a key written at that update, one write short of
+                # exact for the other writer of a two-writer direction.
+                self.last_it.update({key: s for key in self.values if key[0] == d})
 
     def rebase(self, step):
         """After restoring values from a checkpoint, reset the EMA clock to `step`
         so the first post-reload update uses a small dt, not the gap since the save."""
-        for d in self.last_it:
-            self.last_it[d] = step
+        for key in self.last_it:
+            self.last_it[key] = step
 
 
 def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=None,

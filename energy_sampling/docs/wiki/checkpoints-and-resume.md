@@ -88,6 +88,8 @@ Currency is enforced in two halves. `buffer.py::CrystalBuffer._refuse_unknown_cu
 
 The step clock is `trange(init_step, self.args.epochs + 1)` with `init_step` the restored `step_ind` (`train.py::Modeller.train`). `cfg:epochs` is a ceiling on the absolute counter, not a run length: a resumed leg whose seed step exceeds `cfg:epochs` runs zero iterations and exits through the normal finish path, having written a `final` checkpoint.
 
+A `running` save and a step archive are written at the end of their step, after that step has trained and advanced `fwd_step_count`, `bwd_step_count` and `replay_step_count`. A resume starts the loop at that same `step_ind`, so the saved step runs a second time, and each counter it trains ends one ahead of the uninterrupted run at every later `step_ind`. A gate on a `*_step_count % 10` therefore shifts phase by one step against gates on `step_ind % 10` at every resume. The metric tracker is independent of that phase (see [run-reading](run-reading.md)).
+
 ## The global RNG is reset when a GFN is constructed
 
 `mxtaltools/models/modules/components.py::scalarMLP.__init__` calls `torch.manual_seed(seed)` with a default of `0`, and `mxtaltools/models/modules/components.py::vectorMLP.__init__` does the same. A GFN builds several, so *constructing the model* puts torch's global RNG in a fixed state. `utils.py::set_seed` runs in `Modeller.__init__`, before `init_gfn`, so `cfg:seed` is overwritten by model construction on every path. A draw taken after `init_gfn` is governed by the construction seed, not by `cfg:seed`.

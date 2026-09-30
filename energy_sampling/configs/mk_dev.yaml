@@ -576,6 +576,8 @@ condition_log_z:
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
+  untrusted_z: head  # the Z a TB residual uses for a condition below min_visits: head = the learned flow head; global = the all-condition EMA of the log w that feeds ema_logw (requires energy_config.energy_reference)
+  global_half_life_updates: 50.0  # half-life, in update() calls, of that all-condition EMA
   # {fwd,bwd,replay}_tb_z_source MOVED -> {fwd,bwd,replay}_loss_coeffs.tb_z_source.
   # It is a property of what a branch's loss does, and loss_coeffs is the one place
   # a protocol stage can override per branch -- so the conditional route now adopts
@@ -1287,6 +1289,7 @@ energy_config:
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   physical_energy_clip: null # absolute crystal-energy cutoff above which the PHYSICAL leg is log-compressed (cutoff + log1p). Valid under lambda mixing (the flow leg is untouched); reward_range is not. Logs physical_clip_active_frac
+  energy_reference: null  # 'seed_min': the reward's physical leg is scored against each condition's lowest seed energy (prior rows + conditions-file crystals, rescored at init without the Jacobian); a per-condition constant, so only each condition's log Z moves. Absolute reward floors are judged on the unreferenced log R. null: no reference
   analyze_kwargs: { }  # elj: none
   # MLIP EXECUTION, uma route only; all three are the behaviour every run has had.
   mlip_compile: false            # torch.compile the MLIP. Needs mlip_edge_chunk_size set, or every distinct edge count is a recompile and dynamo silently falls back to eager. Unconditional/single-molecule arms only: a molecule-conditioned run makes atoms-per-batch dynamic too, which edge padding cannot fix. Changes float summation order, so energies move at ULP level

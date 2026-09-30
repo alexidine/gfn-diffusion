@@ -533,6 +533,11 @@ class Checkpointer:
             'metrics': m.metric_tracker.state_dict(),
             'optimizers': {k: opt.state_dict() for k, opt in m.optimizers.items()},
             'condition_log_z': m.condition_log_z.state_dict() if hasattr(m, 'condition_log_z') else None,
+            # the per-condition energy reference the rewards were scored against (mode +
+            # table); a full resume must match it (Modeller.init_energy_reference)
+            'energy_reference': (m.energy_function.energy_reference_state()
+                                 if hasattr(getattr(m, 'energy_function', None), 'energy_reference_state')
+                                 else None),
         }
         path = self.path_for(tag)
         atomic_save(checkpoint, path)
@@ -754,6 +759,9 @@ class Checkpointer:
         if checkpoint.get('condition_log_z') is not None:
             m.condition_log_z = ConditionLogZTracker.from_state_dict(
                 checkpoint['condition_log_z'], current_step=m.step_ind)
+        # judged against the live config by Modeller.init_energy_reference once the
+        # identifier registry exists; absent (older checkpoints) = trained unreferenced
+        m._resumed_energy_reference = checkpoint.get('energy_reference') or {'mode': None, 'table': None}
 
         # NB no override_loss_coeffs any more: checkpoints carry only the stage
         # NAME, and live coefficients are always re-derived from the current
