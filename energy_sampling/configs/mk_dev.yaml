@@ -160,7 +160,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # run trains at 0.05 x seed_lr with only a print to say so. The factor is
   # read from the optimizer's own step counter, not from burn_in_steps, so a
   # stage that never rebuilt its optimizers passes it trivially and correctly.
-  min_root_bias_correction: 0.9   # at burn_in_steps 3000 the factor is ~0.975, so this cannot fire; lower burn_in_steps far enough and it does
+  min_root_bias_correction: 0.9   # mode: bracket only -- fixed mode takes no root. At burn_in_steps 3000 the factor is ~0.975, so this cannot fire; lower burn_in_steps far enough and it does
 
   # ---- 2. THE CANDIDATE GRID -------------------------------------------
   # todo goes with the bracket -- docs/TODO.md #1
@@ -217,7 +217,8 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # from -25 to +318, eight orders under that bar. It is a SPAN, hi + k x (hi-lo)
   # over the burn-in window, not a ratio: the MLE channel crosses zero, so a
   # running minimum has no positive scale to divide by.
-  # config_invariants.lr_bracket_is_well_formed refuses a bar that high.
+  # config_invariants.lr_bracket_is_well_formed refuses a bar that high in
+  # mode: bracket only.
   #
   # ONE CHANNEL PER step_type (fwd/bwd/replay/fused), judging the scalar that
   # step backpropagates -- so the channels differ by orders of magnitude and in
@@ -226,7 +227,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   hard_failure:
     loss_excursion_k: 10.0   # bar = root_hi + k x (root_hi - root_lo), per branch
     grad_excursion_x: 100.0  # bar = x  x  the largest pre-clip grad norm seen at the root
-    loss_abs: 1.0e+6         # numerical backstop only; >= 1e8 is refused at load
+    loss_abs: 1.0e+6         # numerical backstop only; >= 1e8 is refused at load in mode: bracket
     grad_abs: 1.0e+6
     # THE BARS ARE DRAWN TWICE. Above they are fitted to the tail of burn-in, at
     # burn_in_scale -- right for judging a trial (every trial restores that root),

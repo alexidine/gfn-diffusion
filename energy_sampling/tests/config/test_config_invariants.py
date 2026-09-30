@@ -261,18 +261,34 @@ def test_auto_lr_with_an_unknown_mode_is_also_an_error(canonical):
     assert _fires(cfg, 'auto_lr_requires_lr_control')
 
 
+def _bracket(canonical):
+    """A copy of canonical in `lr_control.mode: bracket`, required clean first.
+
+    The grid, the absolute bars and the root bias correction are judged in
+    bracket mode only, as at runtime: `LRBracket` validates the grid and bars
+    in that mode only, and `fixed` never takes a root. mk_dev's mode is an
+    operational choice, so a test of those checks sets the mode rather than
+    inheriting it -- and a fire after one mutation is then that mutation's."""
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['mode'] = 'bracket'
+    assert not _fires(cfg, 'lr_bracket_is_well_formed'), \
+        [str(v) for v in check(cfg) if v.rule == 'lr_bracket_is_well_formed']
+    assert not _fires(cfg, 'burn_in_reaches_adam_steady_state', severity=BASELINE)
+    return cfg
+
+
 def test_a_grid_that_cannot_fail_is_an_error(canonical):
     """The bracket's only reading is "did this detonate", so its top rungs have
     to be EXPECTED to fail. A grid inside the safe region finds no boundary on
     any cycle, reports unbracketed_high every time and selects one rung below its
     own ceiling -- a number this config chose, dressed as a measurement."""
-    cfg = copy.deepcopy(canonical)
+    cfg = _bracket(canonical)
     cfg['lr_control']['candidate_scales'] = [0.1, 0.15, 0.2]
     assert _fires(cfg, 'lr_bracket_is_well_formed')
 
 
 def test_an_unsorted_grid_is_an_error(canonical):
-    cfg = copy.deepcopy(canonical)
+    cfg = _bracket(canonical)
     cfg['lr_control']['candidate_scales'] = [0.05, 0.4, 0.2, 1.6]
     assert _fires(cfg, 'lr_bracket_is_well_formed')
 
@@ -282,7 +298,7 @@ def test_a_divergence_bar_that_cannot_fire_is_an_error(canonical):
     -25 to +318 -- finite, and eight orders of magnitude under a 1e9 bar. Under
     it every rung completes, counts as a survivor, and the bracket returns the
     same answer forever while every seam fires correctly."""
-    cfg = copy.deepcopy(canonical)
+    cfg = _bracket(canonical)
     cfg['lr_control']['hard_failure']['loss_abs'] = 1.0e9
     assert _fires(cfg, 'lr_bracket_is_well_formed')
 
@@ -293,7 +309,7 @@ def test_a_control_arm_declaring_bracket_mode_is_an_error(canonical):
     the wrong way to spell it and it fails LATE: the config loads, and `LRBracket`
     then refuses the absent candidate grid when the controller is CONSTRUCTED, so
     a queued job dies at step 0 instead of saying so at load."""
-    cfg = copy.deepcopy(canonical)
+    cfg = _bracket(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
     assert _fires(cfg, 'lr_bracket_is_well_formed')
@@ -316,7 +332,7 @@ def test_a_burn_in_short_of_adam_steady_state_is_reported(canonical):
     hears of it -- and it cannot be an ERROR, because a stage that does not
     rebuild its optimizers enters with t already large, which the config cannot
     see."""
-    cfg = copy.deepcopy(canonical)
+    cfg = _bracket(canonical)
     cfg['lr_control']['burn_in_steps'] = 100      # bias correction 0.309
     assert _fires(cfg, 'burn_in_reaches_adam_steady_state', severity=ci.BASELINE)
 
@@ -824,14 +840,25 @@ def test_unconditional_route_is_left_alone(canonical):
     """The SAME values are correct on the unconditional route. A rule that fired
     there would flag the canonical config and every unconditional battery.
 
-    Note what the precondition now asserts: z_calibration is enabled by the STAGE
-    FLAG, not a global `enabled`, which is the state-5 spelling."""
-    eq = [s for s in canonical['protocols']['unconditional_tb']['stages']
-          if s['name'] == 'equilibration'][0]
-    assert eq['flags']['z_calibration'] is True, 'precondition: mk_dev is unconditional'
+    z_calibration is enabled by the STAGE FLAG, not a global `enabled`, which is
+    the state-5 spelling. The flag is SET here rather than read off mk_dev, whose
+    equilibration stage may run without it (it is refused beside
+    fwd_rollout_every > 0); the conditional control at the end shows the rule
+    sees it."""
+    assert not any(canonical.get(k) is True for k in
+                   ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning')), \
+        'precondition: mk_dev is unconditional'
     assert 'enabled' not in canonical['z_calibration'], \
         'precondition: z_calibration.enabled is a pre-state-5 spelling'
+    cfg = copy.deepcopy(canonical)
+    eq = [s for s in cfg['protocols']['unconditional_tb']['stages']
+          if s['name'] == 'equilibration'][0]
+    eq.setdefault('flags', {})['z_calibration'] = True
+    assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
     assert _fired(canonical, 'conditional_z_settings_are_conditional') == []
+    cfg['embedding_conditioning'] = True
+    assert any('z_calibration flag' in v.detail
+               for v in _fired(cfg, 'conditional_z_settings_are_conditional'))
 
 
 def _vg_stage(cfg):
@@ -970,10 +997,11 @@ def test_batch_root_is_forward_only_and_needs_a_cadence(canonical):
     cfg = copy.deepcopy(canonical)
     cfg['bwd_loss_coeffs']['tb_z_source'] = 'batch_root'
     assert _fires(cfg, 'batch_root_forward_is_well_formed')
-    # on fwd without a cadence: refused
+    # on fwd without a cadence: refused. mk_dev's stage may carry one, so zero it
     cfg = copy.deepcopy(canonical)
     stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
                  if s.get('train_mode', 'fused') == 'fused' and 'fracs' in s)
+    stage['fwd_rollout_every'] = 0
     stage.setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(
         {'tb_z_source': 'batch_root', 'freeze_policy': 0.0})
     assert _fires(cfg, 'batch_root_forward_is_well_formed')
