@@ -2800,7 +2800,7 @@ class ConformerTorsions(BaseSet):
         mol_batch.condition_id = condition_id
         return mol_batch, log_T.flatten(), condition, condition_id
 
-    def prebuilt_sample_to_reward(self, mols, temperature):
+    def prebuilt_sample_to_reward(self, mols, temperature, raw_latents=None):
         """log reward for samples whose energy is already attached to the graphs.
 
         The crystal version re-scores from stored energy terms; the conformer equivalent
@@ -2808,6 +2808,10 @@ class ConformerTorsions(BaseSet):
         buffer. Raising rather than silently rescoring is deliberate: a silent recompute
         here would hide a prep bug behind plausible numbers.
         """
+        if raw_latents is not None:
+            # the trainer's replay re-score passes raw_latents on every route; only the crystal
+            # energy scores a bounding term from them, and a conformer state has none
+            raise ValueError('the conformer energy has no raw latents; got a non-None raw_latents')
         e = getattr(mols, 'conformer_energy', None)
         if e is None:
             raise AttributeError(

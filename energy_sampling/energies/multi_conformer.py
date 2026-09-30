@@ -689,7 +689,7 @@ class MultiConformerTorsions(ConformerTorsions):
 
     # ------------------------------------------------------------------ prebuilt rewards
 
-    def prebuilt_sample_to_reward(self, mols, temperature):
+    def prebuilt_sample_to_reward(self, mols, temperature, raw_latents=None):
         """log reward from a baked `conformer_energy`, with EACH ROW'S OWN measure terms.
 
         The parent's arithmetic, ``-(U / T) + log J + log|dq/dx|``, with both measure terms
@@ -703,6 +703,10 @@ class MultiConformerTorsions(ConformerTorsions):
         over the molecules present, on EVERY backward draw. `torsion` and `dihedral`: r and
         theta are frozen, log J is each member's constant, and no geometry is read.
         """
+        if raw_latents is not None:
+            # the trainer's replay re-score passes raw_latents on every route; only the crystal
+            # energy scores a bounding term from them, and a conformer state has none
+            raise ValueError('the conformer energy has no raw latents; got a non-None raw_latents')
         e = getattr(mols, 'conformer_energy', None)
         if e is None:
             raise AttributeError(
