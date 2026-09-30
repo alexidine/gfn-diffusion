@@ -1277,24 +1277,42 @@ class ConformerModeller(Modeller):
         No orientation step: the stored orientation of a conformer graph is never read
         (see ConformerGraphHooks._orient_stored_batch), and no sg_ind/z_prime, which do
         not exist on this graph.
+
+        ``tile: 'thermal'`` replaces the isotropic kick with `_thermal_displace`: each
+        coordinate at its own thermal width (energies/thermal_tile.py), scaled per row by
+        ``10 ** U(buffers.anchor_buffer.thermal_noise_log_range)``. ``noise_log_range`` is
+        then unread. The clip, the zeroed pads and the phi wrap are the same for both tiles.
         """
         from energies.conformer_data import batch_states, set_batch_states
 
         # `anchor_inds` is the crystal shaped tile's key into its sidecar; that tile is
         # built over CELL latents and has no conformer form, so it is refused here
         # rather than dropped (which would silently run the isotropic draw instead).
-        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'shaped':
+        tile = getattr(self.args.buffers.anchor_buffer, 'tile', 'iso')
+        if tile == 'shaped':
             raise NotImplementedError(
                 "buffers.anchor_buffer.tile: 'shaped' is a crystal-latent tile "
                 "(x_min/evals/evecs over cell parameters) and has no conformer form.")
-        log_min, log_max = float(noise_log_range[0]), float(noise_log_range[1])
+        if tile not in ('iso', 'thermal'):
+            raise ValueError(f"buffers.anchor_buffer.tile must be 'iso' or 'thermal' on the "
+                             f"conformer route, got {tile!r}")
         state = batch_states(batch)
-        direction = torch.randn_like(state)
-        direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        u = torch.rand(state.shape[0], device=state.device)
-        magnitude = 10 ** (log_min + (log_max - log_min) * u)
-        noised = state + direction * magnitude[:, None]
+        if tile == 'thermal':
+            noised = self._thermal_displace(batch, state)
+        else:
+            log_min, log_max = float(noise_log_range[0]), float(noise_log_range[1])
+            direction = torch.randn_like(state)
+            direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            u = torch.rand(state.shape[0], device=state.device)
+            magnitude = 10 ** (log_min + (log_max - log_min) * u)
+            noised = self._clip_and_pad(batch, state + direction * magnitude[:, None])
+        set_batch_states(batch, noised, periodic=self.energy_function.periodic_dims)
 
+        batch, log_T_tensor, condition, condition_id =             self.energy_function.condition_samples(batch)
+        return batch, log_T_tensor, condition, condition_id
+
+    def _clip_and_pad(self, batch, noised):
+        """The box clip on the non-periodic columns, then the carrier pads back to exactly 0."""
         lin = self.energy_function._lin_free_idx.to(noised.device)
         if lin.numel():
             noised[:, lin] = noised[:, lin].clip(min=-1, max=1)
@@ -1304,10 +1322,32 @@ class ConformerModeller(Modeller):
         if smask is not None:
             smask = smask.reshape(noised.shape).bool().to(noised.device)
             noised = torch.where(smask, noised, torch.zeros_like(noised))
-        set_batch_states(batch, noised, periodic=self.energy_function.periodic_dims)
+        return noised
 
-        batch, log_T_tensor, condition, condition_id =             self.energy_function.condition_samples(batch)
-        return batch, log_T_tensor, condition, condition_id
+    @property
+    def _thermal_tile(self):
+        """ONE `ThermalTile` for the run, built on first use; its widths are cached per member."""
+        if getattr(self, '_thermal_tile_obj', None) is None:
+            from energies.thermal_tile import ThermalTile
+            self._thermal_tile_obj = ThermalTile(self.energy_function)
+        return self._thermal_tile_obj
+
+    def _thermal_displace(self, batch, state, c=None):
+        """``state`` displaced by the thermal tile, clipped and padded; not written back.
+
+        ``c`` None: each row's multiplier is ``c = 10 ** U(log_min, log_max)`` from
+        ``buffers.anchor_buffer.thermal_noise_log_range`` (default [-0.5, 0.5]); c = 1 puts
+        a row one thermal width out in every coordinate. A number fixes c for every row.
+        Periodic columns are left unwrapped here; `set_batch_states` wraps them.
+        """
+        if c is None:
+            rng = getattr(self.args.buffers.anchor_buffer, 'thermal_noise_log_range', None)
+            log_min, log_max = (-0.5, 0.5) if rng is None else (float(rng[0]), float(rng[1]))
+            u = torch.rand(state.shape[0], device=state.device)
+            c = 10 ** (log_min + (log_max - log_min) * u)
+        else:
+            c = torch.full((state.shape[0],), float(c), device=state.device)
+        return self._clip_and_pad(batch, state + self._thermal_tile.draw(batch, state, c))
 
     # ----------------------------------------------------------- prior draws
 
@@ -1689,18 +1729,34 @@ class ConformerModeller(Modeller):
         energies then warm condition_log_z's best_energy -- so moving the states without
         rescoring would seed the buffer, and the admission gate, with new geometry
         carrying old energies.
+
+        Under ``prior_dataset_noise: thermal`` with no relax steps, the base method is handed
+        the prior rows as they were BEFORE the noise (`_maybe_noise_prior_rows`), by the same
+        stand-in.
         """
         import types
 
         from energies.conformer_data import (attach_states, bake_energies,
                                              condition_from_energy)
 
+        # the UNNOISED prior rows under prior_dataset_noise (`_maybe_noise_prior_rows`), popped
+        # whether or not they are used, so a restored anchor buffer does not keep them alive
+        raw = self.__dict__.pop('_prior_dataset_raw', None)
         if hasattr(self, 'anchor_buffer'):
             return
         cfg = self.args.buffers.anchor_buffer
         steps = int(getattr(cfg, 'seed_relax_steps', 0) or 0)
         if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset' or steps <= 0:
-            return super().init_anchor_buffer_seed()
+            if raw is None or getattr(cfg, 'seed_source', 'generated') != 'prior_dataset':
+                return super().init_anchor_buffer_seed()
+            # anchors mark where the good states are: seed them from the rows BEFORE the
+            # thermal noise, by the same stand-in as the relaxed seed below
+            saved = self.prior_dataset
+            self.prior_dataset = types.SimpleNamespace(batch=raw)
+            try:
+                return super().init_anchor_buffer_seed()
+            finally:
+                self.prior_dataset = saved
 
         n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
         states, _ = self._draw_prior_states(n, self._prior_rng, report=False, steps=steps)
@@ -1773,6 +1829,67 @@ class ConformerModeller(Modeller):
               f'(worst |delta| {worst:.2e} kcal/mol) -- provenance verified')
         return states, fresh.to(self.energy_function.dtype)
 
+    def _maybe_noise_prior_rows(self, batch):
+        """``prior_dataset_noise: thermal`` -- every prior-dataset row replaced by a noised copy.
+
+        'none' (the default, and absent) returns ``batch`` untouched. 'thermal' displaces
+        every row by the thermal tile at c = 1 (`_thermal_displace`: one thermal width in
+        every coordinate, NOT the anchor top-ups' multiplier range) and RE-BAKES its
+        ``conformer_energy``, which `prebuilt_sample_to_reward` reads and never recomputes.
+        One noised copy per row, drawn once at init: the dataset stays the same size.
+
+        What reads the prior dataset reads the noised rows: the warm-up's backward draws
+        (bwd_sampling_mode 'dataset'), the prior-buffer seed and `reseed_prior_from_dataset`
+        (both `_prior_dataset_seed_batch`), and the eval reads that sample it (the
+        sliced-Wasserstein reference, the eval figures, `_e_min`'s starts, the single-chart
+        `dof_class_stats` reference). The ANCHOR seed does not: the unnoised rows are kept
+        as `_prior_dataset_raw` and `init_anchor_buffer_seed` seeds from them, since anchors
+        mark where the good states are.
+        """
+        mode = getattr(self.args, 'prior_dataset_noise', None) or 'none'
+        if mode not in ('none', 'thermal'):
+            raise ValueError(f"prior_dataset_noise must be 'none' or 'thermal', got {mode!r}")
+        if mode == 'none':
+            return batch
+        from energies.conformer_data import batch_states, set_batch_states, wrap_state
+
+        self._prior_dataset_raw = batch
+        noised = batch.clone()
+        state = batch_states(noised).to(self.device)
+        x = self._thermal_displace(noised, state, c=1.0)
+        x = wrap_state(x, self.energy_function.periodic_dims)
+        e = self._bake_rows(noised, x)
+        raw_e = torch.as_tensor(batch.conformer_energy).reshape(-1).double().cpu()
+        excess = (e.double().cpu() - raw_e) / float(self.energy_function.temperature)
+        set_batch_states(noised, x.cpu(), energies=e.cpu(),
+                         periodic=self.energy_function.periodic_dims)
+        print(f'prior dataset: prior_dataset_noise THERMAL -- {batch.num_graphs:,} rows '
+              f'replaced by noised copies, median energy {float(raw_e.median()):.1f} -> '
+              f'{float(e.median()):.1f} kcal/mol, median excess '
+              f'{float(excess.median()):.1f} kT (the anchor seed keeps the unnoised rows)')
+        return noised
+
+    def _bake_rows(self, batch, states, chunk: int = 2048):
+        """Baked ``conformer_energy`` (T = 1) for ``states`` on ``batch``'s rows, ``[n]``.
+
+        One chart: `bake_energies`. A molecule SET: the one-pass energy in chunks, each row
+        through its own member, reading back the ``conformer_energy`` it writes.
+        """
+        from energies.conformer_data import bake_energies
+
+        en = self.energy_function
+        if not getattr(en, '_members', None) or en.n_charts <= 1:
+            return bake_energies(en, states).detach()
+        out = []
+        n = int(states.shape[0])
+        for i in range(0, n, chunk):
+            idx = torch.arange(i, min(i + chunk, n))
+            sub = batch.subsample_new_batch(idx).to(en.device)
+            _, sub = en.energy(states[i:i + chunk].to(en.device), sub,
+                               torch.zeros(len(idx), device=en.device), return_exp=True)
+            out.append(sub.conformer_energy.reshape(-1).detach())
+        return torch.cat(out)
+
     def init_prior_dataset(self):
         """Phase 1's dataset: a prebuilt set off disk, or draws from the fitted prior.
 
@@ -1819,6 +1936,7 @@ class ConformerModeller(Modeller):
                     f'reads it off the graph and REFUSES to recompute, so a file without it '
                     f'would train on rewards that were never scored')
             energies = torch.as_tensor(e_t).reshape(-1).to(self.energy_function.dtype)
+            batch = self._maybe_noise_prior_rows(batch)
             self.prior_dataset = ConformerBuffer(batch,
                                                  device=self.buffer_device,
                                                  **self._buffer_kwargs(),
@@ -1852,6 +1970,7 @@ class ConformerModeller(Modeller):
             print(f'prior dataset: CARRIER set, {n} rows split over '
                   f'{self.energy_function.n_charts} members')
             batch, energies = self._draw_carrier_prior(n, self._prior_rng, report=True)
+            batch = self._maybe_noise_prior_rows(batch)
             self.prior_dataset = ConformerBuffer(batch,
                                                  device=self.buffer_device,
                                                  **self._buffer_kwargs(),
@@ -1890,6 +2009,7 @@ class ConformerModeller(Modeller):
         # optional: log_buffer_stats reads `buff.y` for the energy readout, and during the
         # warm-start stage (bwd_sampling_mode 'dataset') the buffer it reads is THIS one,
         # not prior_buffer. Without it every prior energy metric is silently absent.
+        batch = self._maybe_noise_prior_rows(batch)
         self.prior_dataset = ConformerBuffer(batch,
                                              device=self.buffer_device,
                                              **self._buffer_kwargs(),

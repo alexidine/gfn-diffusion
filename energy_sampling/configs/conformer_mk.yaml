@@ -29,6 +29,7 @@ checkpoint_name: null        # null = fresh run. A name loads weights + optimize
 prior_model_name: null       # REFUSED non-null on this route: ConformerModeller never reads it, so skip_if: prior_loaded could not hold. The prior is energy_config.internal_prior_path
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
 prior_path: null             # null on a carrier set: the prior dataset is drawn per member from the fitted InternalPrior (energy_config.internal_prior_path). A graph-form prior file named here is read whole instead
+prior_dataset_noise: 'none'  # 'none' | 'thermal'. 'thermal' = at init every prior-dataset row is replaced by ONE copy displaced by the thermal tile (buffers.anchor_buffer.tile 'thermal') at multiplier 1, and re-baked; the warm-up's backward draws, the prior-buffer seed and reseed_prior_from_dataset read the noised rows, the anchor seed reads the unnoised ones (ConformerModeller._maybe_noise_prior_rows). 'none' = the rows as built
 molecules_path: 'D:\crystal_datasets\conformer_sets\qm9_r0\conditions_train.pt'  # the condition set the run trains over: build_conformer_set.py's conditions_train.pt. One energy member is built per distinct identifier in it; its embeddings condition the policy
 test_molecules_path: null    # held-out conditions. Inert on this route: ConformerModeller.init_mol_dataset builds no held-out dataset, so every eval_test metric is absent
 archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O  # todo on MLIP models set this to 1k
@@ -882,7 +883,7 @@ buffers:
   # config sets rather than on any per-row property. Residence works out as
   # mean_lifetime * max_size / churn_batch_ref = 5,000 train steps here.
   prior_buffer:
-    source: 'anchors'       # 'anchors' | 'prior_model'. WHERE top-ups (and rebuild_prior_by_churn) come from. 'anchors' = noised anchor_buffer rows at anchor_buffer.noise_log_range, no prior MODEL in the loop. Under 'anchors', snapshot_prior and prior_model_name are unnecessary -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only
+    source: 'anchors'       # 'anchors' | 'prior_model'. WHERE top-ups (and rebuild_prior_by_churn) come from. 'anchors' = anchor_buffer rows noised by anchor_buffer.tile, no prior MODEL in the loop. Under 'anchors', snapshot_prior and prior_model_name are unnecessary -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps: 5,000 at this max_size
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
@@ -974,10 +975,11 @@ buffers:
     health_gate_ceiling_metric: tb_resid_clipped  # signed pooled TB residual, clipped at beta. 0.5 is the Z-currency bar z_calibration holds
     health_gate_ceiling: 0.5
     replay_beta: 0.5           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors
-    noise_log_range: [ -1.0, 0.0 ]  # log10-uniform isotropic noise magnitude for prior top-ups. On a carrier the direction is normalised over the carrier width K, then the pad columns are zeroed
+    noise_log_range: [ -1.0, 0.0 ]  # log10-uniform isotropic noise magnitude for prior top-ups under tile 'iso'; unread under 'thermal'. On a carrier the direction is normalised over the carrier width K, then the pad columns are zeroed
     # --- the SHAPE of the jitter a drawn anchor gets before it is rescored ---
-    tile: 'iso'               # 'iso' = the log-uniform isotropic draw above, centred on the STORED anchor. 'shaped' is refused on this route (ConformerModeller._noise_and_condition). Absent = 'iso'
-    shape_path: null          # path to the tile sidecar (format_version 1; per anchor: x_min, evals, evecs, plus a sha1 of anchor_buffer.x). Read ONCE, when the anchor buffer is seeded or restored. Missing file, wrong format_version, row-count mismatch or sha mismatch RAISES -- there is no fallback to 'iso'. Inert while tile is 'iso'
+    tile: 'thermal'           # 'iso' = the log-uniform isotropic draw above, centred on the STORED anchor. 'thermal' = each coordinate at its own thermal width at the energy's temperature (energies/thermal_tile.py: sqrt(kT / curvature) along each column and each sibling group's rigid rotation, from the member's potential at its reference, capped at the coordinate's own-term width), times one multiplier per row. 'shaped' is refused on this route (ConformerModeller._noise_and_condition). Absent = 'iso'
+    thermal_noise_log_range: [ -0.5, 0.5 ]  # tile 'thermal': the per-row multiplier on every thermal width is 10**U(this range), so [-0.5, 0.5] = 0.32x to 3.2x thermal. Absent = [-0.5, 0.5]
+    shape_path: null          # path to the tile sidecar (format_version 1; per anchor: x_min, evals, evecs, plus a sha1 of anchor_buffer.x). Read ONCE, when the anchor buffer is seeded or restored. Missing file, wrong format_version, row-count mismatch or sha mismatch RAISES -- there is no fallback to 'iso'. Inert unless tile is 'shaped'
     tile_temperature: 1.0     # scales the tile variance: the width along eigenvector i is sqrt(tile_temperature / lambda_i)
     tile_width_cap: 0.15      # latent units. The width used for any direction with lambda <= 0, and the cap on every direction's width
     topup_admit_record_breakers: true  # noised children that STRICTLY lower their condition's Emin(c) stand for anchor admission
