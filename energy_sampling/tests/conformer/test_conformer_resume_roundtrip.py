@@ -290,6 +290,9 @@ def test_buffers_survive_the_whole_init_sequence(pair):
     for name in ('prior_buffer', 'replay_buffer', 'anchor_buffer'):
         ba, bb = getattr(a, name), getattr(b, name)
         assert len(ba) > 0, f'{name} is empty -- the comparison would be vacuous'
+        # the conditions file makes every store compact (buffer.py::ConformerCompactRows),
+        # so this also round-trips compact rows through the sidecar and the bind on load
+        assert ba.is_compact and bb.is_compact, name
         assert _diff(ba.state_dict(), bb.state_dict()) == [], name
         for key in ('torsion_state', 'state_mask', 'dof_static', 'mol_id'):
             assert torch.equal(getattr(ba.batch, key), getattr(bb.batch, key)), (name, key)
