@@ -214,6 +214,25 @@ def _uniform_draw(n: int, k: int) -> torch.Tensor:
     return torch.randperm(n)[:k]
 
 
+def _dataset_row_batches(source, limit: Optional[int] = None):
+    """The rows of a prior-dataset-like `source` (anything with a `.batch`) as full graph
+    batches, randomly subsampled to `limit` rows when there are more.
+
+    One batch, a clone of the resident one, unless the source offers `row_batches` and it
+    returns chunks: a compact conformer store (buffer.py::ConformerGraphHooks.row_batches)
+    hands its rows out a chunk at a time, so no caller holds every row in full at once.
+    """
+    chunks = getattr(source, 'row_batches', None)
+    chunks = chunks(limit) if chunks is not None else None
+    if chunks is not None:
+        return chunks
+    batch = source.batch.clone()
+    if limit is not None and batch.num_graphs > limit:
+        keep = torch.randperm(batch.num_graphs)[:limit]
+        batch = batch.subsample_new_batch(keep)
+    return [batch]
+
+
 def _val_flags(k: int, val_frac: float):
     """Per-row held-out flags for an admission batch of k rows, Bernoulli(val_frac).
 
@@ -10438,11 +10457,14 @@ class Modeller:
         if getattr(self.args.buffers.prior_buffer, 'seed_source', 'generated') != 'prior_dataset':
             return
 
-        seed_batch = self._prior_dataset_seed_batch(self.args.buffers.prior_buffer.max_size)
-        self.prior_buffer = self._fresh_prior_buffer(seed_batch)
+        for seed_batch in self._prior_dataset_seed_batches(self.args.buffers.prior_buffer.max_size):
+            if hasattr(self, 'prior_buffer'):
+                self.prior_buffer.add(seed_batch)
+            else:
+                self.prior_buffer = self._fresh_prior_buffer(seed_batch)
         print(f"Seeded prior_buffer with {len(self.prior_buffer)} prior-dataset samples (fresh loss records)")
 
-    def _prior_dataset_seed_batch(self, limit: int):
+    def _prior_dataset_seed_batches(self, limit: int):
         """
         The prior-dataset draw both seeding paths share (init_prior_buffer_seed
         and the reseed_prior_from_dataset stage action): clone, random-subsample
@@ -10454,18 +10476,19 @@ class Modeller:
         then drop the string keys candidates never carry (sample_graphs drops
         them at draw time; identifier was already consumed into mol_id by
         init_identifiers()).
+
+        Yields one batch, or on a compact conformer prior dataset one per chunk of
+        rows (_dataset_row_batches), so the draw is never held in full at once;
+        the first builds the buffer and the rest are added to it.
         """
-        seed_batch = self.prior_dataset.batch.clone()
-        if seed_batch.num_graphs > limit:
-            keep = torch.randperm(seed_batch.num_graphs)[:limit]
-            seed_batch = seed_batch.subsample_new_batch(keep)
-        seed_batch = seed_batch.to(self.device)
-        seed_batch, _, _, _ = self.energy_function.condition_samples(
-            seed_batch,
-            sg_inds=getattr(seed_batch, 'sg_ind', None),
-            z_primes=getattr(seed_batch, 'z_prime', None))
-        seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
-        return seed_batch
+        for seed_batch in _dataset_row_batches(self.prior_dataset, limit):
+            seed_batch = seed_batch.to(self.device)
+            seed_batch, _, _, _ = self.energy_function.condition_samples(
+                seed_batch,
+                sg_inds=getattr(seed_batch, 'sg_ind', None),
+                z_primes=getattr(seed_batch, 'z_prime', None))
+            seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
+            yield seed_batch
 
     def _fresh_prior_buffer(self, seed_batch):
         """Construct a new CrystalBuffer around seed_batch with clean
@@ -10505,15 +10528,19 @@ class Modeller:
         limit = max_size if flush else max_size - current
         if limit <= 0:
             return
-        seed_batch = self._prior_dataset_seed_batch(limit)
-        if flush or not hasattr(self, 'prior_buffer'):
-            self.prior_buffer = self._fresh_prior_buffer(seed_batch)
-        else:
-            self.prior_buffer.add(seed_batch)
-        self.prior_churn['from_seed'] += int(seed_batch.num_graphs)
+        replace = flush or not hasattr(self, 'prior_buffer')
+        n_seeded = 0
+        for seed_batch in self._prior_dataset_seed_batches(limit):
+            if replace:
+                self.prior_buffer = self._fresh_prior_buffer(seed_batch)
+                replace = False
+            else:
+                self.prior_buffer.add(seed_batch)
+            n_seeded += int(seed_batch.num_graphs)
+        self.prior_churn['from_seed'] += n_seeded
         mode = '(flush, replaced)' if flush else '(additive)'
         print(f"reseed_prior_from_dataset {mode}: prior_buffer {current} -> {len(self.prior_buffer)} rows "
-              f"({'replaced with ' if flush else '+'}{seed_batch.num_graphs} prior-dataset samples, "
+              f"({'replaced with ' if flush else '+'}{n_seeded} prior-dataset samples, "
               f"fresh loss records)")
 
     def apply_anchor_buffer_policy(self, source):
@@ -10675,7 +10702,8 @@ class Modeller:
             return
 
         if seed_source == 'prior_dataset':
-            seed_batch = self.prior_dataset.batch.clone().to(self.device)
+            # one batch, or one per chunk of a compact conformer prior dataset
+            seed_batches = (b.to(self.device) for b in _dataset_row_batches(self.prior_dataset))
         else:
             seed_data = torch.load(seed_source, weights_only=False)
             if isinstance(seed_data, dict):
@@ -10691,82 +10719,86 @@ class Modeller:
                 self.args.energy_config.temperature * torch.ones(
                     seed_batch.num_graphs, dtype=torch.float32, device=self.device),
                 return_batch=True, internal_oom_recovery=True)
-            seed_batch = seed_batch.to(self.device)
+            seed_batches = [seed_batch.to(self.device)]
 
-        # condition_samples resolves condition_id through mol_id (the dense
-        # integer init_identifiers() minted per identifier string), not the
-        # identifier itself. A side-loaded seed batch never went through
-        # init_identifiers(), so without this mapping every entry would
-        # collapse onto molecule index 0 (condition_samples' legacy fallback)
-        # and be tracked under the wrong condition -- and mol_id-less entries
-        # would break append_batch key parity against generated candidates,
-        # which do carry mol_id. Registry misses are fatal: they mean
-        # seed_source wasn't prepared alongside molecules_path/prior_path.
-        if not hasattr(seed_batch, 'mol_id'):
-            if not hasattr(seed_batch, 'identifier'):
-                raise KeyError(
-                    "anchor seed batch has neither mol_id nor identifier -- can't resolve "
-                    "condition_id; regenerate seed_source with generate_toy_prior.py")
-            missing = sorted({ident for ident in seed_batch.identifier
-                              if ident not in self.identifier_registry})
-            if missing:
-                raise KeyError(
-                    f"anchor seed batch has {len(missing)} identifiers absent from the identifier "
-                    f"registry (e.g. {missing[0]!r}) -- seed_source must be prepared with the same "
-                    f"identifiers as molecules_path/prior_path")
-            seed_batch.add_graph_attr(
-                torch.tensor([self.identifier_registry[ident] for ident in seed_batch.identifier],
-                             dtype=torch.long, device=seed_batch.device),
-                'mol_id')
+        for seed_batch in seed_batches:
+            # condition_samples resolves condition_id through mol_id (the dense
+            # integer init_identifiers() minted per identifier string), not the
+            # identifier itself. A side-loaded seed batch never went through
+            # init_identifiers(), so without this mapping every entry would
+            # collapse onto molecule index 0 (condition_samples' legacy fallback)
+            # and be tracked under the wrong condition -- and mol_id-less entries
+            # would break append_batch key parity against generated candidates,
+            # which do carry mol_id. Registry misses are fatal: they mean
+            # seed_source wasn't prepared alongside molecules_path/prior_path.
+            if not hasattr(seed_batch, 'mol_id'):
+                if not hasattr(seed_batch, 'identifier'):
+                    raise KeyError(
+                        "anchor seed batch has neither mol_id nor identifier -- can't resolve "
+                        "condition_id; regenerate seed_source with generate_toy_prior.py")
+                missing = sorted({ident for ident in seed_batch.identifier
+                                  if ident not in self.identifier_registry})
+                if missing:
+                    raise KeyError(
+                        f"anchor seed batch has {len(missing)} identifiers absent from the identifier "
+                        f"registry (e.g. {missing[0]!r}) -- seed_source must be prepared with the same "
+                        f"identifiers as molecules_path/prior_path")
+                seed_batch.add_graph_attr(
+                    torch.tensor([self.identifier_registry[ident] for ident in seed_batch.identifier],
+                                 dtype=torch.long, device=seed_batch.device),
+                    'mol_id')
 
-        seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            seed_batch, sg_inds=getattr(seed_batch, 'sg_ind', None), z_primes=getattr(seed_batch, 'z_prime', None))
-        temperature = 10 ** log_T_tensor
-        if getattr(self.energy_function, 'prior_flow', None) is not None:
-            # _anchor_energy below reads the legs off the rows, so they must be the
-            # legs of THIS rescore (at each row's conditioned temperature), not the
-            # ones the source batch was analysed with. Written back the same way
-            # analyze_crystal_batch attaches every ens_dict key.
-            reward, ens_dict = self.energy_function.prebuilt_sample_to_reward(
-                seed_batch, temperature, return_ens_dict=True)
-            for key in ens_dict.keys():
-                setattr(seed_batch, key, ens_dict[key].cpu().detach())
-        else:
-            reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
-        energy = -reward.detach() * temperature
-        energy_anchor, energy_phys = self._anchor_energy(seed_batch, energy)
+            seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
+                seed_batch, sg_inds=getattr(seed_batch, 'sg_ind', None), z_primes=getattr(seed_batch, 'z_prime', None))
+            temperature = 10 ** log_T_tensor
+            if getattr(self.energy_function, 'prior_flow', None) is not None:
+                # _anchor_energy below reads the legs off the rows, so they must be the
+                # legs of THIS rescore (at each row's conditioned temperature), not the
+                # ones the source batch was analysed with. Written back the same way
+                # analyze_crystal_batch attaches every ens_dict key.
+                reward, ens_dict = self.energy_function.prebuilt_sample_to_reward(
+                    seed_batch, temperature, return_ens_dict=True)
+                for key in ens_dict.keys():
+                    setattr(seed_batch, key, ens_dict[key].cpu().detach())
+            else:
+                reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
+            energy = -reward.detach() * temperature
+            energy_anchor, energy_phys = self._anchor_energy(seed_batch, energy)
 
-        # Warm each seeded condition's Emin(c) from these on-target seed
-        # energies. The anchor buffer and condition_log_z are distinct objects:
-        # seeding the former does NOT inform the latter, and BOTH the admission
-        # plausibility gate (screen_and_admit_anchors) and thin()'s purge gate
-        # calibrate against best_energy_phys(c), not against the anchor buffer's own
-        # energies. Without this, best_energy(c) stays inf until the terminal stage's prior
-        # churn warms it from broad, high-energy prior-model samples -- which
-        # then admits (and can't purge) those bad samples as each condition's
-        # "per-condition best", exactly the behaviour these good seeds are meant
-        # to pre-empt. best_energy is a protocol-independent running min, so
-        # folding in real scored seed samples is always valid.
-        if hasattr(self, 'condition_log_z'):
-            self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
+            # Warm each seeded condition's Emin(c) from these on-target seed
+            # energies. The anchor buffer and condition_log_z are distinct objects:
+            # seeding the former does NOT inform the latter, and BOTH the admission
+            # plausibility gate (screen_and_admit_anchors) and thin()'s purge gate
+            # calibrate against best_energy_phys(c), not against the anchor buffer's own
+            # energies. Without this, best_energy(c) stays inf until the terminal stage's prior
+            # churn warms it from broad, high-energy prior-model samples -- which
+            # then admits (and can't purge) those bad samples as each condition's
+            # "per-condition best", exactly the behaviour these good seeds are meant
+            # to pre-empt. best_energy is a protocol-independent running min, so
+            # folding in real scored seed samples is always valid.
+            if hasattr(self, 'condition_log_z'):
+                self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
-        # Generated candidates arrive without the string keys (sample_graphs
-        # drops them at draw time), and append_batch demands key parity, so the
-        # resident batch must not carry them either. identifier has already
-        # been consumed into mol_id above. symmetry_operators is NOT dropped:
-        # unlike the strings, condition_samples' reset_sg_info re-attaches it
-        # per graph, so candidates always carry it and parity needs it kept.
-        seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
-
-        self.anchor_buffer = self.anchor_buffer_cls(
-            seed_batch,  # function-owned transient; the buffer moves it to buffer_device itself
-            device=self.buffer_device,
-            reward=reward.cpu(),
-            energy=energy_anchor.cpu(),
-            **self._buffer_kwargs(),
-            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
-        )
+            # Generated candidates arrive without the string keys (sample_graphs
+            # drops them at draw time), and append_batch demands key parity, so the
+            # resident batch must not carry them either. identifier has already
+            # been consumed into mol_id above. symmetry_operators is NOT dropped:
+            # unlike the strings, condition_samples' reset_sg_info re-attaches it
+            # per graph, so candidates always carry it and parity needs it kept.
+            seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
+            if hasattr(self, 'anchor_buffer'):
+                self.anchor_buffer.add(seed_batch, reward=reward.cpu(), energy=energy_anchor.cpu())
+                continue
+            self.anchor_buffer = self.anchor_buffer_cls(
+                seed_batch,  # function-owned transient; the buffer moves it to buffer_device itself
+                device=self.buffer_device,
+                reward=reward.cpu(),
+                energy=energy_anchor.cpu(),
+                **self._buffer_kwargs(),
+                exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
+            )
         self.apply_anchor_buffer_policy('config seed')
+
 
     @torch.no_grad()
     def screen_and_admit_anchors(self, sample_batch, log_r, energy, log_pf_est):

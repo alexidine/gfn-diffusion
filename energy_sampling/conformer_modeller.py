@@ -84,8 +84,59 @@ class ConformerModeller(Modeller):
 
         It is not merely unused -- ``MXtalBase.__getattr__`` defers unknown attributes to
         the PyG store, so passing it RAISES rather than being ignored.
+
+        ``statics`` once the conditions table exists (`_init_conformer_statics`): every store
+        built from then on keeps its rows compact against it (buffer.py::ConformerCompactRows).
         """
-        return {}
+        statics = getattr(self, 'conformer_statics', None)
+        return {} if statics is None else {'statics': statics}
+
+    def _init_conformer_statics(self):
+        """The per-condition table compact stores join their rows to: `mol_dataset`'s batch,
+        when the conditions come from `molecules_path` and carry one identifier per graph.
+        None otherwise (the single-molecule route), and every store stays a full one."""
+        from buffer import ConformerStatics
+
+        self.conformer_statics = None
+        batch = getattr(getattr(self, 'mol_dataset', None), 'batch', None)
+        idents = None if batch is None else batch._store.get('identifier', None)
+        if not getattr(self.args, 'molecules_path', None) or not isinstance(idents, (list, tuple)) \
+                or len(idents) != int(batch.num_graphs) or int(batch.num_graphs) < 2:
+            return
+        self.conformer_statics = ConformerStatics(batch)
+        print(f'compact conformer stores: {batch.num_graphs} condition graph(s) in the '
+              f'conditions table; rows keep their state, energy and per-row fields only')
+
+    def _derive_condition_fields(self):
+        """Put `conditions` and `condition_id`, as `condition_samples` attaches them, on the
+        conditions table (`ConformerStatics.derive`), so a conditioned row reads them from
+        there rather than storing a copy of its molecule's embedding. Skipped under
+        temperature conditioning, where `conditions` carries a per-row temperature draw."""
+        statics = getattr(self, 'conformer_statics', None)
+        if statics is None or getattr(self.energy_function, 'temperature_conditioning', False):
+            return
+        probe = statics.batch.subsample_new_batch(torch.arange(statics.batch.num_graphs))
+        _, _, condition, condition_id = self.energy_function.condition_samples(probe)
+        statics.derive('conditions', condition.detach())
+        statics.derive('condition_id', condition_id.detach())
+
+    def _bind_restored_stores(self):
+        """Join every store restored from a sidecar (init_gfn) to the conditions table: compact
+        rows are bound by identifier, a full-row sidecar is compacted. Runs after
+        init_identifiers has put `mol_id` on the table, which full rows are keyed by."""
+        statics = getattr(self, 'conformer_statics', None)
+        for name in ('prior_buffer', 'replay_buffer', 'anchor_buffer'):
+            buf = getattr(self, name, None)
+            if buf is None:
+                continue
+            if statics is None:
+                if getattr(buf, 'is_compact', False):
+                    raise SystemExit(
+                        f'{name} was restored as compact conformer rows, and this run has no '
+                        f'conditions table to join them to (molecules_path unset)')
+                continue
+            print(f'{name}: {buf.bind_statics(statics)} to the conditions table '
+                  f'({len(buf)} rows)')
 
     def _buffer_y_fn(self):
         """``conformer_energy``, not the energy_function name.
@@ -590,6 +641,8 @@ class ConformerModeller(Modeller):
         binder = getattr(self.energy_function, 'bind_identifier_registry', None)
         if binder is not None:
             binder(self.identifier_registry)
+        self._derive_condition_fields()
+        self._bind_restored_stores()
 
     def init_gfn(self):
         """Base build or checkpoint load, then install -- or, on a reload, VERIFY -- the policy.
@@ -1925,7 +1978,7 @@ class ConformerModeller(Modeller):
 
         What reads the prior dataset reads the noised rows: the warm-up's backward draws
         (bwd_sampling_mode 'dataset'), the prior-buffer seed and `reseed_prior_from_dataset`
-        (both `_prior_dataset_seed_batch`), and the eval reads that sample it (the
+        (both `_prior_dataset_seed_batches`), and the eval reads that sample it (the
         sliced-Wasserstein reference, the eval figures, `_e_min`'s starts, the single-chart
         `dof_class_stats` reference). The ANCHOR seed does not: the unnoised rows are kept
         as `_prior_dataset_raw` and `init_anchor_buffer_seed` seeds from them, since anchors
@@ -1991,8 +2044,13 @@ class ConformerModeller(Modeller):
 
         The draw uses ``sample_prior_states`` at its defaults, so joint ring sampling is
         ON -- the path that benchmarks 32x-87000x over uniform-on-box.
+
+        With a conditions table (`_init_conformer_statics`, built here first) the dataset is a
+        compact store: each row keeps its state and energy, and joins the rest from the table.
         """
         from energies.conformer_data import attach_states, bake_energies, condition_from_energy
+
+        self._init_conformer_statics()
 
         # MULTI-MOLECULE GRAPH-FORM PRIOR, and it is the only intake that can carry a
         # molecule SET. Everything below this branch rebuilds the batch from
@@ -2082,7 +2140,7 @@ class ConformerModeller(Modeller):
         # defect, after init_mol_dataset (eval batch) and sample_from_prior (churn path).
         # `condition_from_energy` rebuilds a BARE graph: no `embedding`, no
         # `atom_embedding`, no `dof_atoms`. The prior dataset seeds the prior BUFFER
-        # (init_prior_buffer_seed -> _prior_dataset_seed_batch -> condition_samples), so on
+        # (init_prior_buffer_seed -> _prior_dataset_seed_batches -> condition_samples), so on
         # a conditional route a bare condition here is refused before the first train step.
         # `_condition_template` falls back to condition_from_energy when there is no
         # condition set, so the unconditional route is unchanged.

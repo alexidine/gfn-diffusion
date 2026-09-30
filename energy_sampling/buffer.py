@@ -1474,7 +1474,7 @@ class CrystalBuffer:
         # handler catches CUDA OOM mid-train-step and keeps going, so a partial
         # commit here (batch shrunk, side arrays not) leaves a corrupted buffer
         # that only detonates on a later draw.
-        new_resident = self.batch.subsample_new_batch(keep_idx)
+        new_resident = self._take_rows(keep_idx)
 
         keep_t = torch.as_tensor(keep_idx, device=self.device, dtype=torch.long)
         new_x = self.x[keep_t].contiguous()
@@ -1513,6 +1513,12 @@ class CrystalBuffer:
         self.ema_logw = new_ema_logw
         self.ema_logw_sq = new_ema_logw_sq
         self.ema_log_z_emp = new_ema_log_z_emp
+
+    def _take_rows(self, idx):
+        """The resident store cut to rows `idx`, in the store's own form: purge's one
+        storage operation. A draw goes through `self.batch.subsample_new_batch` instead,
+        which on a compact conformer store (ConformerCompactRows) materialises graphs."""
+        return self.batch.subsample_new_batch(idx)
 
     @torch.no_grad()
     def purge_lowest(
@@ -1870,6 +1876,592 @@ class CrystalBuffer:
         return p, w
 
 
+#: `format` of the compact row dict a compact conformer store writes into its state dict
+#: under `compact_rows` (its `batch` entry is then None).
+CONFORMER_COMPACT_FORMAT = 'conformer_compact_v1'
+#: Rows per chunk when compact rows are checked against the conditions table at admission,
+#: and when a compact store is handed out whole as full graphs (ConformerGraphHooks.row_batches).
+COMPACT_CHUNK_ROWS = 4096
+
+
+class CompactRowsError(RuntimeError):
+    """A conformer row the compact store cannot hold, or compact rows used unbound.
+
+    Raised at admission for a row whose condition is not in the conditions table, whose
+    atom count differs from its condition's, or whose list field differs from its
+    condition's, and for a field that is neither a per-graph nor a per-atom tensor and is
+    not in the table; at bind time for a stored identifier, static field or atom count the
+    live table does not match; and on a draw or a read of a static field before the rows
+    are bound to a table."""
+
+
+def _nan_equal(a, b) -> torch.Tensor:
+    """0-dim bool tensor: same shape, same dtype, values equal with NaN == NaN."""
+    if not (torch.is_tensor(a) and torch.is_tensor(b)) or a.shape != b.shape \
+            or a.dtype != b.dtype:
+        return torch.tensor(False)
+    if a.is_floating_point() or a.is_complex():
+        return ((a == b) | (torch.isnan(a) & torch.isnan(b))).all()
+    return (a == b).all()
+
+
+def _ragged_index(counts: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
+    """[sum counts[sel]] long (cpu): the element positions of segments `sel` (repeats
+    allowed) of a ragged array whose segment i holds counts[i] elements, in `sel` order."""
+    counts = counts.long()
+    ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    lengths = counts[sel]
+    new_ptr = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+    total = int(new_ptr[-1])
+    seg = torch.repeat_interleave(torch.arange(sel.numel()), lengths, output_size=total)
+    return ptr[sel][seg] + (torch.arange(total) - new_ptr[seg])
+
+
+def _index_to(idx: torch.Tensor, device) -> torch.Tensor:
+    """A host index tensor on `device`: through pinned memory, non-blocking, onto a GPU (a
+    pageable host-to-device copy waits on the stream, as MXtalBase._ptr_cpu describes)."""
+    device = torch.device(device)
+    if device.type == 'cuda':
+        return idx.pin_memory().to(device, non_blocking=True)
+    return idx.to(device)
+
+
+class ConformerStatics:
+    """The per-condition graph table that compact conformer stores join their rows to.
+
+    One graph per condition: the run's conditions set, `mol_dataset.batch`, held BY
+    REFERENCE, so a field attached to it later (`mol_id`, by train.py's
+    `Modeller.init_identifiers`) is visible to every store bound to it. A row is keyed
+    to a slot of the table by its `identifier` or, on a row without one (sample_graphs
+    drops it at draw time), by its `mol_id`; a repeated identifier keys to its first
+    slot.
+
+    `derive` adds a per-condition field that is not on the conditions batch -- the
+    conditioning `condition_samples` attaches, a deterministic function of the condition
+    -- so rows carrying it can read it from here too.
+    """
+
+    def __init__(self, batch):
+        idents = batch._store.get('identifier', None)
+        n = int(batch.num_graphs)
+        if not isinstance(idents, (list, tuple)) or len(idents) != n:
+            raise CompactRowsError(
+                'the conditions table needs one `identifier` per graph: rows are keyed to '
+                'their condition by it')
+        if n < 2:
+            raise CompactRowsError(
+                'the conditions table needs at least 2 graphs: a one-graph batch\'s '
+                'per-graph tensors read as shared metadata in subsample_new_batch')
+        if n == int(batch.num_nodes):
+            raise CompactRowsError(
+                'the conditions table has as many graphs as atoms, so its per-graph and '
+                'per-atom fields cannot be told apart by size(0)')
+        self.batch = batch
+        self.identifiers = list(idents)
+        self.slot_of = {}
+        for slot, ident in enumerate(self.identifiers):
+            self.slot_of.setdefault(ident, slot)
+        self._mol_lut = (None, None)       # (the table mol_id tensor it was built from, lut)
+        self.derived = {}                  # name -> [num_graphs, ...], see derive()
+
+    @property
+    def device(self):
+        return self.batch.device
+
+    def derive(self, name, values):
+        """Register a per-graph field of every condition that the conditions batch does not
+        carry. A row matching it there reads it from here; one that does not stores its own."""
+        values = torch.as_tensor(values)
+        if name in self.batch._store:
+            raise CompactRowsError(f'{name!r} is already a field of the conditions batch')
+        if values.dim() == 0 or values.size(0) != int(self.batch.num_graphs):
+            raise CompactRowsError(f'derived field {name!r} needs one row per condition, got '
+                                   f'{tuple(values.shape)}')
+        self.derived[name] = values.detach().to(self.device)
+
+    def fields(self):
+        return [k for k in self.batch._store.keys() if k not in ('ptr', 'batch')] \
+            + list(self.derived)
+
+    def value(self, name):
+        """A table field, derived or on the conditions batch."""
+        if name in self.derived:
+            return self.derived[name]
+        return self.batch._store[name]
+
+    def kind(self, name):
+        """'node', 'graph', 'list' or 'shared', by the table's own leading dimension."""
+        if name in self.derived:
+            return 'graph'
+        val = self.batch._store[name]
+        if torch.is_tensor(val):
+            if val.dim() == 0:
+                return 'shared'
+            if val.size(0) == int(self.batch.num_nodes):
+                return 'node'
+            if val.size(0) == int(self.batch.num_graphs):
+                return 'graph'
+            return 'shared'
+        if isinstance(val, (list, tuple)) and len(val) == int(self.batch.num_graphs):
+            return 'list'
+        return 'shared'
+
+    def slots_for(self, batch) -> torch.Tensor:
+        """[n] long (cpu): the table slot of every row of a full `batch`."""
+        n = int(batch.num_graphs)
+        idents = batch._store.get('identifier', None)
+        if isinstance(idents, (list, tuple)) and len(idents) == n:
+            missing = sorted({i for i in idents if i not in self.slot_of})
+            if missing:
+                raise CompactRowsError(
+                    f'{len(missing)} row identifier(s) are not in the conditions table '
+                    f'(e.g. {missing[0]!r}); a compact row joins its per-condition fields '
+                    f'from that table')
+            return torch.tensor([self.slot_of[i] for i in idents], dtype=torch.long)
+        mol_id = batch._store.get('mol_id', None)
+        if mol_id is None:
+            raise CompactRowsError(
+                'a row carries neither `identifier` nor `mol_id`, so its condition in the '
+                'conditions table cannot be found')
+        table_mol = self.batch._store.get('mol_id', None)
+        if table_mol is None:
+            raise CompactRowsError(
+                'rows are keyed by `mol_id` but the conditions table carries none yet '
+                '(init_identifiers attaches it)')
+        if self._mol_lut[0] is not table_mol:
+            ids = table_mol.detach().reshape(-1).cpu().numpy().astype(np.int64)
+            lut = np.full(int(ids.max()) + 1 if ids.size else 1, -1, dtype=np.int64)
+            for slot in range(ids.size - 1, -1, -1):     # first occurrence wins
+                lut[ids[slot]] = slot
+            self._mol_lut = (table_mol, lut)
+        lut = self._mol_lut[1]
+        vals = mol_id.detach().reshape(-1).cpu().numpy().astype(np.int64)
+        bad = (vals < 0) | (vals >= lut.size)
+        slots = np.full(vals.shape, -1, dtype=np.int64)
+        slots[~bad] = lut[vals[~bad]]
+        if (slots < 0).any():
+            raise CompactRowsError(
+                f'{int((slots < 0).sum())} row(s) carry a mol_id the conditions table does '
+                f'not hold (e.g. {int(vals[slots < 0][0])})')
+        return torch.from_numpy(slots)
+
+    def atom_counts(self, slots: torch.Tensor) -> torch.Tensor:
+        """[n] long (cpu): the atom count of the condition at each of `slots`."""
+        ptr = self.batch._ptr_cpu().long()
+        return ptr[slots + 1] - ptr[slots]
+
+    def node_index(self, slots: torch.Tensor) -> torch.Tensor:
+        """[atoms] long (cpu): the table atoms of the rows at `slots`, in row order."""
+        ptr = self.batch._ptr_cpu().long()
+        return _ragged_index(ptr[1:] - ptr[:-1], slots)
+
+
+class ConformerCompactRows:
+    """The resident rows of a compact conformer store, standing in for its PyG batch.
+
+    A conformer row is its condition's graph (atoms, internal-coordinate tree, frozen
+    embeddings: the same for every row of that condition) plus a few per-row values
+    (`torsion_state`, `conformer_energy`, whatever conditioning attached, and `pos` on a
+    row the trainer std-oriented). This holds the per-row values and a `ConformerStatics`
+    slot per row, and reads the rest from the table.
+
+    Fields are split at admission (`from_batch`) by checking every row against its
+    condition's graph. A field the table carries and every row matches is STATIC: read
+    from the table. Any other per-graph or per-atom tensor is stored PER ROW, per-atom ones
+    in row order (`_node_rows`, laid out by the rows' atom counts `_atoms`). A list field
+    that differs, or any other kind of field the table does not carry, is refused
+    (CompactRowsError). The set of fields is the store's, as a full store's would be:
+    exclude_keys are dropped, and `append_batch` keeps the fields both sides carry, a field
+    static on one side and per-row on the other becoming per-row.
+
+    Reads follow the full store's batch: `subsample_new_batch` and `clone` return
+    materialised graphs (the table cut to the rows' slots, the per-row fields put back);
+    attribute access returns a field over all rows; `add_graph_attr` (and attribute
+    assignment) sets a per-graph field. `take`, `to` and `append_batch` return compact rows.
+    """
+
+    _INTERNAL = ('_statics', '_keys', '_atoms', '_static', '_rows', '_node_rows', '_device',
+                 '_pending')
+
+    def __init__(self, statics, keys, atoms, static, rows, node_rows, device, pending=None):
+        object.__setattr__(self, '_statics', statics)
+        object.__setattr__(self, '_keys', torch.as_tensor(keys, dtype=torch.long).cpu())
+        # atom count of every row: the layout of the per-atom per-row fields
+        object.__setattr__(self, '_atoms', torch.as_tensor(atoms, dtype=torch.long).cpu())
+        object.__setattr__(self, '_static', tuple(static))
+        object.__setattr__(self, '_rows', dict(rows))
+        object.__setattr__(self, '_node_rows', dict(node_rows))
+        object.__setattr__(self, '_device', torch.device(device))
+        # identifiers the keys index while unbound (restored from a state dict), else None
+        object.__setattr__(self, '_pending', pending)
+
+    # ------------------------------------------------------------- construction
+
+    @classmethod
+    def from_batch(cls, batch, statics, exclude_keys=(), chunk: int = COMPACT_CHUNK_ROWS):
+        """Compact a full conformer `batch` against `statics`. The rows live on the
+        batch's device; the table's copy of every candidate static field is compared with
+        the batch's, `chunk` rows at a time."""
+        n = int(batch.num_graphs)
+        device = batch.device if n else statics.device
+        keys = statics.slots_for(batch) if n else torch.zeros(0, dtype=torch.long)
+        ptr = batch._ptr_cpu().long() if n else torch.zeros(1, dtype=torch.long)
+        atoms = ptr[1:] - ptr[:-1]
+        n_nodes = int(ptr[-1])
+        if n:
+            # every row must have its condition's atom count, so per-atom fields line up
+            want = statics.atom_counts(keys)
+            if not torch.equal(atoms, want):
+                bad = int(torch.nonzero(atoms != want)[0])
+                raise CompactRowsError(
+                    f'row {bad} has {int(atoms[bad])} atoms but its condition '
+                    f'{statics.identifiers[int(keys[bad])]!r} has {int(want[bad])}')
+        exclude = set(exclude_keys or ())
+        table_fields = set(statics.fields())
+        names = [k for k in batch._store.keys()
+                 if k not in ('ptr', 'batch') and k not in exclude]
+
+        def row_kind(val):
+            if torch.is_tensor(val) and val.dim() > 0:
+                if val.size(0) == n:
+                    return 'graph'
+                if val.size(0) == n_nodes:
+                    return 'node'
+            return None
+
+        candidates = [name for name in names if name in table_fields]
+        differs = cls._differing(batch, statics, keys, candidates, chunk) if n else set()
+        static, rows, node_rows = [], {}, {}
+        for name in names:
+            if name in table_fields and name not in differs:
+                static.append(name)
+                continue
+            val = batch._store[name]
+            kind = row_kind(val)
+            if kind == 'graph' and (name not in table_fields or statics.kind(name) == 'graph'):
+                rows[name] = val
+            elif kind == 'node' and (name not in table_fields or statics.kind(name) == 'node'):
+                node_rows[name] = val
+            else:
+                raise CompactRowsError(
+                    f'field {name!r} ({type(val).__name__}'
+                    f'{tuple(val.shape) if torch.is_tensor(val) else ""}) '
+                    + ('differs from the conditions table on some row'
+                       if name in table_fields else 'is not in the conditions table')
+                    + '; only per-graph and per-atom tensors are stored per row')
+        return cls(statics, keys, atoms, static, rows, node_rows, device)
+
+    @staticmethod
+    def _differing(batch, statics, keys, names, chunk):
+        """The subset of `names` on which some row of `batch` differs from the table."""
+        table = statics.batch
+        n = int(batch.num_graphs)
+        ptr = batch._ptr_cpu().long()
+        kinds = {name: statics.kind(name) for name in names}
+        differs = set()
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            ref = table.subsample_new_batch(keys[start:end])
+            flags, flagged = [], []
+            for name in names:
+                if name in differs:
+                    continue
+                kind = kinds[name]
+                got = batch._store[name]
+                want = (statics.derived[name][keys[start:end].to(statics.device)]
+                        if name in statics.derived else ref._store[name])
+                if kind == 'list':
+                    if not isinstance(got, (list, tuple)) or len(got) != n \
+                            or list(got[start:end]) != list(want):
+                        differs.add(name)
+                    continue
+                if not torch.is_tensor(got):
+                    differs.add(name)
+                    continue
+                if kind == 'node':
+                    got = got[int(ptr[start]):int(ptr[end])]
+                elif kind == 'graph':
+                    got = got[start:end]
+                flags.append(_nan_equal(got.to(want.device), want))
+                flagged.append(name)
+            if flags:
+                same = torch.stack([f.to('cpu') for f in flags]).tolist()   # one sync
+                differs.update(name for name, ok in zip(flagged, same) if not ok)
+        return differs
+
+    @classmethod
+    def from_state(cls, state: dict):
+        """Unbound rows from `to_state`'s dict; `bind` joins them to a live table."""
+        if state.get('format') != CONFORMER_COMPACT_FORMAT:
+            raise CompactRowsError(
+                f'compact rows of format {state.get("format")!r}; this build reads '
+                f'{CONFORMER_COMPACT_FORMAT!r}')
+        return cls(None, state['keys'], state['atoms'], state['static'], state['rows'],
+                   state['node_rows'], 'cpu', pending=list(state['identifiers']))
+
+    def to_state(self) -> dict:
+        """Plain tensors and strings; keys renumbered over the identifiers they use."""
+        idents = self._pending if self._pending is not None else self._statics.identifiers
+        used, inverse = torch.unique(self._keys, return_inverse=True)
+        return {'format': CONFORMER_COMPACT_FORMAT,
+                'identifiers': [idents[int(k)] for k in used.tolist()],
+                'keys': inverse.long().reshape(-1),
+                'atoms': self._atoms.clone(),
+                'static': list(self._static),
+                'rows': {k: v.detach().cpu() for k, v in self._rows.items()},
+                'node_rows': {k: v.detach().cpu() for k, v in self._node_rows.items()}}
+
+    def bind(self, statics):
+        """Join restored rows to the live conditions table, by identifier.
+
+        Refuses an identifier the table lacks, a static field it does not carry, and a
+        row whose condition there has another atom count than the row was stored with."""
+        if self._pending is not None:
+            missing = sorted({i for i in self._pending if i not in statics.slot_of})
+            if missing:
+                raise CompactRowsError(
+                    f'{len(missing)} stored condition(s) are not in this run\'s conditions '
+                    f'table (e.g. {missing[0]!r}); these rows cannot be joined to their '
+                    f'per-condition fields')
+            slots = torch.tensor([statics.slot_of[i] for i in self._pending], dtype=torch.long)
+            keys = slots[self._keys] if self._keys.numel() else self._keys
+        else:
+            keys = self._keys
+        fields = set(statics.fields())
+        absent = [f for f in self._static if f not in fields]
+        if absent:
+            raise CompactRowsError(
+                f'the stored rows read {absent} from the conditions table, which does not '
+                f'carry them')
+        if keys.numel() and not torch.equal(statics.atom_counts(keys), self._atoms):
+            raise CompactRowsError(
+                'a stored row\'s atom count differs from its condition\'s in this run\'s '
+                'conditions table')
+        object.__setattr__(self, '_statics', statics)
+        object.__setattr__(self, '_keys', keys)
+        object.__setattr__(self, '_pending', None)
+        return self
+
+    # --------------------------------------------------------------------- reads
+
+    @property
+    def is_bound(self) -> bool:
+        return self._statics is not None and self._pending is None
+
+    @property
+    def num_graphs(self) -> int:
+        return int(self._keys.numel())
+
+    @property
+    def device(self):
+        return self._device
+
+    @property
+    def keys(self) -> torch.Tensor:
+        """[n] long (cpu): each row's slot in the conditions table."""
+        return self._keys
+
+    @property
+    def _store(self):
+        """Field names, in the key-membership form `_drop_keys` / `_batch_x` test."""
+        return dict.fromkeys(list(self._static) + list(self._rows) + list(self._node_rows))
+
+    def _require_bound(self, what):
+        if not self.is_bound:
+            raise CompactRowsError(
+                f'{what}: these compact conformer rows are not bound to a conditions table '
+                f'yet (a restored store is bound by ConformerModeller.init_identifiers)')
+
+    def _node_index(self, sel: torch.Tensor) -> torch.Tensor:
+        """[atoms] long (cpu): the positions in the per-atom per-row fields of rows `sel`."""
+        return _ragged_index(self._atoms, sel)
+
+    def _static_values(self, name, sel: Optional[torch.Tensor] = None):
+        """A static field over rows `sel` (default all), gathered from the table."""
+        self._require_bound(f'reading {name!r}')
+        statics = self._statics
+        keys = self._keys if sel is None else self._keys[sel]
+        val = statics.value(name)
+        kind = statics.kind(name)
+        if kind == 'graph':
+            return val[_index_to(keys, val.device)].to(self._device)
+        if kind == 'list':
+            return type(val)(val[k] for k in keys.tolist())
+        if kind == 'node':
+            return val[_index_to(statics.node_index(keys), val.device)].to(self._device)
+        return val
+
+    def __getattr__(self, name):
+        if name.startswith('__') or name in ConformerCompactRows._INTERNAL:
+            raise AttributeError(name)
+        for store in ('_rows', '_node_rows'):
+            held = self.__dict__.get(store)
+            if held is not None and name in held:
+                return held[name]
+        if name in self.__dict__.get('_static', ()):
+            return self._static_values(name)
+        raise AttributeError(name)
+
+    def __getitem__(self, name):
+        if not isinstance(name, str):
+            raise TypeError('compact rows are indexed by field name; draw rows with '
+                            'subsample_new_batch')
+        try:
+            return getattr(self, name)
+        except AttributeError:
+            raise KeyError(name) from None
+
+    def __setattr__(self, name, value):
+        if name.startswith('_'):
+            object.__setattr__(self, name, value)
+        else:
+            self.add_graph_attr(value, name)
+
+    def __delattr__(self, name):
+        if name in self._rows:
+            del self._rows[name]
+        elif name in self._node_rows:
+            del self._node_rows[name]
+        elif name in self._static:
+            object.__setattr__(self, '_static', tuple(f for f in self._static if f != name))
+        else:
+            raise AttributeError(name)
+
+    def __delitem__(self, name):
+        try:
+            delattr(self, name)
+        except AttributeError:
+            raise KeyError(name) from None
+
+    def add_graph_attr(self, values, name, slice_dict=None, inc_dict=None):
+        """Set a per-graph field: static when the table carries it and every row matches
+        it there, per row otherwise. slice_dict / inc_dict are accepted and unused."""
+        values = torch.as_tensor(values)
+        if values.dim() == 0 or values.size(0) != self.num_graphs:
+            raise ValueError(f'{name} must have shape [num_graphs, ...], got '
+                             f'{tuple(values.shape)}')
+        static = [f for f in self._static if f != name]
+        self._rows.pop(name, None)
+        self._node_rows.pop(name, None)
+        if self.is_bound and name in self._statics.fields() \
+                and self._statics.kind(name) == 'graph':
+            table = self._statics.value(name)
+            want = table[self._keys.to(table.device)]
+            if bool(_nan_equal(values.to(want.device), want)):
+                object.__setattr__(self, '_static', tuple(static + [name]))
+                return self
+        object.__setattr__(self, '_static', tuple(static))
+        self._rows[name] = values.to(self._device)
+        return self
+
+    def subsample_new_batch(self, idx):
+        """Materialised graphs for rows `idx` (repeats allowed): the table cut to their
+        slots, the fields this store does not carry dropped, the per-row fields set."""
+        self._require_bound('drawing graphs')
+        sel = self._index(idx)
+        out = self._statics.batch.subsample_new_batch(self._keys[sel])
+        keep = set(self._static)
+        for key in list(out._store.keys()):
+            if key not in ('ptr', 'batch') and key not in keep:
+                del out[key]
+        for key in self._static:
+            if key in self._statics.derived:
+                out[key] = self._static_values(key, sel)
+        dev_sel = _index_to(sel, self._device)
+        for key, val in self._rows.items():
+            out[key] = val[dev_sel]
+        if self._node_rows:
+            node_sel = _index_to(self._node_index(sel), self._device)
+            for key, val in self._node_rows.items():
+                out[key] = val[node_sel]
+        out.rebuild_simple_slice_inc_()
+        return out
+
+    def clone(self):
+        """Every row, materialised: the full store's batch.clone()."""
+        return self.subsample_new_batch(torch.arange(self.num_graphs))
+
+    def _index(self, idx) -> torch.Tensor:
+        if isinstance(idx, slice):
+            return torch.arange(*idx.indices(self.num_graphs), dtype=torch.long)
+        if isinstance(idx, int):
+            return torch.tensor([idx], dtype=torch.long)
+        if torch.is_tensor(idx) and idx.dtype == torch.bool:
+            return idx.nonzero(as_tuple=False).reshape(-1).cpu()
+        return torch.as_tensor(np.asarray(idx.cpu() if torch.is_tensor(idx) else idx),
+                               dtype=torch.long).reshape(-1)
+
+    # ------------------------------------------------------------------ storage
+
+    def take(self, idx):
+        """Compact rows `idx`: purge's cut."""
+        sel = self._index(idx)
+        dev_sel = _index_to(sel, self._device)
+        node_sel = _index_to(self._node_index(sel), self._device) if self._node_rows else None
+        return ConformerCompactRows(self._statics, self._keys[sel], self._atoms[sel],
+                                    self._static,
+                                    {k: v[dev_sel] for k, v in self._rows.items()},
+                                    {k: v[node_sel] for k, v in self._node_rows.items()},
+                                    self._device, pending=self._pending)
+
+    def to(self, device, *args, **kwargs):
+        device = torch.device(device)
+        if device == self._device:
+            return self
+        return ConformerCompactRows(self._statics, self._keys, self._atoms, self._static,
+                                    {k: v.to(device) for k, v in self._rows.items()},
+                                    {k: v.to(device) for k, v in self._node_rows.items()},
+                                    device, pending=self._pending)
+
+    def cpu(self):
+        return self.to('cpu')
+
+    def _column(self, name):
+        """A per-row field over all rows, gathered from the table if it is static here."""
+        for held in (self._rows, self._node_rows):
+            if name in held:
+                return held[name]
+        if self._statics.kind(name) not in ('graph', 'node'):
+            raise CompactRowsError(
+                f'field {name!r} is static on one side of an append and per-row on the '
+                f'other, and is not a tensor field')
+        return self._static_values(name)
+
+    def append_batch(self, other, *, validate=True):
+        """Rows of self then other, as compact rows. With validate=False the fields both
+        carry are kept (append_batch's rule for a full batch); with validate=True a field
+        on one side only raises."""
+        if not isinstance(other, ConformerCompactRows):
+            raise TypeError('compact rows append compact rows; admit through the store')
+        self._require_bound('admission')
+        other._require_bound('admission')
+        if other._statics is not self._statics:
+            raise CompactRowsError('appending rows joined to another conditions table')
+        mine = list(self._store)
+        theirs = set(other._store)
+        if validate and set(mine) != theirs:
+            raise KeyError(f'fields differ: {sorted(set(mine) ^ theirs)}')
+        static = [f for f in self._static if f in other._static]
+        rows, node_rows = {}, {}
+        for name in mine:
+            if name not in theirs or name in static:
+                continue
+            node = name in self._node_rows or name in other._node_rows or \
+                (name in self._static and self._statics.kind(name) == 'node')
+            (node_rows if node else rows)[name] = torch.cat(
+                [self._column(name), other._column(name).to(self._device)], dim=0)
+        return ConformerCompactRows(self._statics, torch.cat([self._keys, other._keys]),
+                                    torch.cat([self._atoms, other._atoms]), static, rows,
+                                    node_rows, self._device)
+
+    def nbytes(self) -> int:
+        """Bytes these rows hold: keys, atom counts and per-row fields, not the table."""
+        held = list(self._rows.values()) + list(self._node_rows.values())
+        return int(self._keys.numel() * self._keys.element_size()
+                   + self._atoms.numel() * self._atoms.element_size()
+                   + sum(v.numel() * v.element_size() for v in held))
+
+
 class ConformerGraphHooks:
     """The three hooks that make a CrystalBuffer-family store work on conformer graphs
     (``MolData`` + internal-coordinate tree).
@@ -1895,17 +2487,86 @@ class ConformerGraphHooks:
     -- the same call made for ``ConformerModeller(Modeller)``. Rolling the split back into
     the base class is a separate decision, once there is a second non-crystal consumer to
     tell which parts are genuinely shared.
+
+    COMPACT STORAGE. Constructed with ``statics`` (a ``ConformerStatics``), or bound to one
+    later (``bind_statics``), the store keeps its rows as ``ConformerCompactRows`` in
+    ``self.batch``: ``_as_batch`` compacts every admission, ``_take_rows`` cuts compact
+    rows on purge, draws materialise graphs, and ``state_dict`` writes the rows under
+    ``compact_rows``. Without ``statics`` it is a full store, row for row a PyG batch.
     """
 
+    _statics = None
+
+    def __init__(self, data, device, *args, statics=None, **kwargs):
+        self._statics = statics
+        super().__init__(data, device, *args, **kwargs)
+
+    @property
+    def is_compact(self) -> bool:
+        return isinstance(getattr(self, 'batch', None), ConformerCompactRows)
+
     def _as_batch(self, data):
-        """Collate if needed; no cell/Z' normalisation to do."""
+        """Collate if needed; no cell/Z' normalisation to do. Compact rows when bound."""
         from energies.conformer_data import require_conformer_fields
 
+        if isinstance(data, ConformerCompactRows):
+            return data
         if isinstance(data, list):
             batch = collate_data_list(data)
         else:
             batch = data
-        return require_conformer_fields(batch)
+        batch = require_conformer_fields(batch)
+        if self._statics is None:
+            return batch
+        return ConformerCompactRows.from_batch(batch, self._statics,
+                                               exclude_keys=getattr(self, 'exclude_keys', ()))
+
+    def _take_rows(self, idx):
+        if self.is_compact:
+            return self.batch.take(idx)
+        return super()._take_rows(idx)
+
+    def bind_statics(self, statics) -> str:
+        """Join this store to `statics`: 'bound' for restored compact rows, 'converted' for
+        a full store (a sidecar written before compact storage), whose rows are compacted
+        here. Admissions from now on are compacted."""
+        self._statics = statics
+        if self.is_compact:
+            self.batch.bind(statics)
+            return 'bound'
+        self.batch = ConformerCompactRows.from_batch(
+            self.batch, statics, exclude_keys=getattr(self, 'exclude_keys', ())).to(self.device)
+        return 'converted'
+
+    def row_batches(self, limit: Optional[int] = None, chunk: int = COMPACT_CHUNK_ROWS):
+        """The rows as materialised graphs, `chunk` rows at a time, randomly subsampled to
+        `limit` rows when there are more (torch.randperm). None on a full store: its caller
+        clones the resident batch whole (train.py::_dataset_row_batches)."""
+        if not self.is_compact:
+            return None
+        n = len(self)
+        keep = torch.randperm(n)[:limit] if (limit is not None and n > limit) else torch.arange(n)
+        return (self.batch.subsample_new_batch(keep[i:i + chunk])
+                for i in range(0, int(keep.numel()), chunk))
+
+    def state_dict(self):
+        state = super().state_dict()
+        rows = state.get('batch')
+        if isinstance(rows, ConformerCompactRows):
+            state['batch'] = None
+            state['compact_rows'] = rows.to_state()
+        return state
+
+    @classmethod
+    def from_state_dict(cls, state, device):
+        """A `compact_rows` dict restores UNBOUND compact rows (`bind_statics` joins them to
+        the run's conditions table); a dict with a full `batch` restores a full store."""
+        compact = state.get('compact_rows')
+        if compact is None:
+            return super().from_state_dict(state, device)
+        state = dict(state)
+        state['batch'] = ConformerCompactRows.from_state(compact)
+        return super().from_state_dict(state, device)
 
     @staticmethod
     def _orient_stored_batch(batch):
