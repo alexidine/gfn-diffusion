@@ -109,6 +109,12 @@ def test_wrapped_pairs_sees_across_the_y_and_z_seams():
     assert kept.tolist() == [False, True, True, True]
 
 
+def test_children_of_keeps_the_rows_of_surviving_parents():
+    from energy_sampling.data_processing.symmetrize_prior import children_of
+    parent = torch.tensor([0, 2, 2, 1, 3, 0])
+    assert children_of(parent, torch.tensor([0, 3]), 4).tolist() == [True, False, False, False, True, True]
+
+
 def test_the_constant_matches_mxtaltools():
     from mxtaltools.crystal_search.crystal_opt_utils import CELL_EDGE as MXT_EDGE
     assert CELL_EDGE == MXT_EDGE
