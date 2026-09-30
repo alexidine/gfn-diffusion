@@ -57,6 +57,13 @@ _NON_ENERGY_KEYS = ('internal_prior_path', 'prior_sample_size', 'reward_range',
 from progress_metrics import (_PROGRESS_GATE, _column_w1, _column_w1_ratio,  # noqa: F401
                               progress_gate)
 
+#: Angstrom. The largest |stored - rebuilt| reference coordinate a conditions or graph-form
+#: prior file may carry against the member this run rebuilds for its identifier
+#: (`_refuse_reference_mismatch`). A rebuild under the same RDKit reproduces the reference to
+#: float32 storage rounding (~1e-6 A); another RDKit re-embeds 45 of 88 small-rung members,
+#: by up to 3.6 A (2025.03.5 against 2025.09.4).
+REFERENCE_POS_TOL = 1e-3
+
 
 
 class ConformerModeller(Modeller):
@@ -1601,6 +1608,83 @@ class ConformerModeller(Modeller):
                 f'belong to the other target. Rebuild it with build_conformer_conditions.py '
                 f'--stereo-coeff {want:g}.')
 
+    def _refuse_reference_mismatch(self, batch, path, what):
+        """SystemExit when any graph's stored reference conformer (`pos`) is not the one this
+        run rebuilt for its identifier.
+
+        A stored state is a DELTA from its member's reference, and each member's reference is
+        re-embedded here from the SMILES (RDKit ETKDG + MMFF). Another RDKit embeds another
+        reference for many members, and the file's `z` and chart flags -- all
+        `MultiConformerTorsions._resolve_rows` compares -- still agree, so every stored state
+        would be read against a geometry it was not built from, with no error. Compared on
+        every graph, atom by atom in placement order (`condition_from_energy` writes
+        `pos = energy.ref_pos`), against REFERENCE_POS_TOL.
+        """
+        en = self.energy_function
+        members = getattr(en, '_members', None) or {}
+        pos = getattr(batch, 'pos', None)
+        idents = getattr(batch, 'identifier', None)
+        if pos is None:
+            raise SystemExit(f'{what} file {path}: its graphs carry no `pos`, so their reference '
+                             f'conformers cannot be checked against this run\'s members')
+        n_graphs = int(batch.num_graphs)
+        if idents is None:
+            if members:
+                raise SystemExit(f'{what} file {path}: its graphs carry no `identifier`, so '
+                                 f'their reference conformers cannot be matched to a member')
+            idents = [None] * n_graphs
+        idents = list(idents)
+        refs, lib_of = [], {}
+        missing = []
+        for ident in dict.fromkeys(idents):
+            member = members.get(ident) if members else en
+            if member is None:
+                missing.append(ident)
+                continue
+            lib_of[ident] = len(refs)
+            refs.append(member.ref_pos.detach().to('cpu', torch.float64).reshape(-1, 3))
+        if missing:
+            raise SystemExit(f'{what} file {path}: {len(missing)} identifier(s) have no member '
+                             f'in this run\'s energy, e.g. {ConformerModeller._name_some(missing)}')
+        n_ref = torch.tensor([r.shape[0] for r in refs], dtype=torch.long)
+        ref_ptr = torch.cat([torch.zeros(1, dtype=torch.long), n_ref.cumsum(0)])
+        ref_cat = torch.cat(refs)
+        lib = torch.tensor([lib_of[i] for i in idents], dtype=torch.long)
+        ptr = batch.ptr.detach().cpu().long()
+        n_atoms = ptr[1:] - ptr[:-1]
+        dev = torch.zeros(n_graphs, dtype=torch.float64)
+        bad_count = n_atoms != n_ref[lib]
+        dev[bad_count] = float('inf')
+        ok = ~bad_count
+        if bool(ok.any()):
+            graph = torch.repeat_interleave(torch.arange(n_graphs), n_atoms)
+            slot = torch.arange(int(ptr[-1])) - ptr[:-1][graph]
+            keep = ok[graph]
+            at = ref_ptr[lib[graph[keep]]] + slot[keep]
+            gap = (pos.detach().cpu().double().reshape(-1, 3)[keep]
+                   - ref_cat[at]).abs().amax(-1)
+            dev.scatter_reduce_(0, graph[keep], gap, reduce='amax')
+        bad = dev > REFERENCE_POS_TOL
+        if bool(bad.any()):
+            worst = {}
+            for g in torch.nonzero(bad).reshape(-1).tolist():
+                worst[idents[g]] = max(worst.get(idents[g], 0.0), float(dev[g]))
+            ranked = sorted(worst.items(), key=lambda kv: -kv[1])
+            listed = ', '.join(f'{i!r} ({"atom count differs" if d == float("inf") else f"{d:.3g} A"})'
+                               for i, d in ranked[:10])
+            raise SystemExit(
+                f'{what} file {path}: {len(worst)} of {len(lib_of)} condition(s) store a '
+                f'reference conformer that is not the one this run rebuilt (max deviation '
+                f'{ranked[0][1]:.3g} A, tolerance {REFERENCE_POS_TOL:g} A): {listed}'
+                f'{" ..." if len(ranked) > 10 else ""}. Every stored state is a delta from its '
+                f'member\'s reference, so these rows would be read against another geometry. '
+                f'The file was built under another RDKit or builder version than this '
+                f'environment; rebuild the rung IN THIS ENVIRONMENT (build_conformer_set.py, '
+                f'then build_conformer_references.py).')
+        print(f'{what} file {path}: reference conformers match the rebuilt members on all '
+              f'{n_graphs:,} graph(s) of {len(lib_of)} condition(s) (max deviation '
+              f'{float(dev.max()) if n_graphs else 0.0:.2g} A)')
+
     def _prior_row_energy(self):
         """The prior buffer's current per-row training energy, conformer currency.
 
@@ -1638,6 +1722,7 @@ class ConformerModeller(Modeller):
         if path:
             batch = self._as_run_dtype(self._read_graph_file(path, 'conditions')['prior'])
             self._refuse_stereo_mismatch(batch, path, 'conditions')
+            self._refuse_reference_mismatch(batch, path, 'conditions')
             self.mol_dataset = ConformerBuffer(batch,
                                                device=self.buffer_device,
                                                **self._buffer_kwargs(),
@@ -1929,6 +2014,7 @@ class ConformerModeller(Modeller):
             # dtype` at the first matmul rather than merely wasting memory.
             batch = self._as_run_dtype(batch)
             self._refuse_stereo_mismatch(batch, graph_prior, 'prior')
+            self._refuse_reference_mismatch(batch, graph_prior, 'prior')
             e_t = getattr(batch, 'conformer_energy', None)
             if e_t is None:
                 raise SystemExit(
