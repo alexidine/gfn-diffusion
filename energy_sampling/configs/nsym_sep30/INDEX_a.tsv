@@ -1,0 +1,4 @@
+arm	family	start	warm_src	prior	prior_bytes
+ns30_mip_x2	mip	switch	p23_mip_ft	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt	1292550405
+ns30_mip_x5	mip	switch	p23_mip_ft	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt	1292550405
+ns30_mip_x10	mip	switch	p23_mip_ft	mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt	1292550405

@@ -418,6 +418,10 @@ fi
 # (full load); only a first launch seeds. REFUSES AN AMBIGUOUS MATCH.
 # CK_STEP=<N> (env) seeds this leg from the arm's OWN _step<N>.pt archive and its frozen _step<N>_buffers.pt
 # instead of the live _running.pt -- the way back from a poisoned leg (cancel it first). The archive must exist.
+# A WEIGHTS-ONLY ARM (its yaml carries load_weights_only: WEIGHTS_ONLY_PLACEHOLDER) takes the weights alone from its
+# seed on a FIRST launch and resumes itself in full afterwards: a resubmission that loaded weights only would restart
+# the arm at step 0 with empty buffers. A yaml without the placeholder is untouched by the substitution.
+WO=false
 OWN=$(ls -t ${{CKPTS}}/*${{ARM}}_*_running.pt 2>/dev/null | head -1)
 if [ -n "${{CK_STEP:-}}" ]; then
     NA=$(ls ${{CKPTS}}/*${{ARM}}_*_step${{CK_STEP}}.pt 2>/dev/null | grep -v '_buffers.pt$' | wc -l)
@@ -434,6 +438,7 @@ elif [ -n "${{OWN}}" ]; then
     CK=${{OWN}}
 else
 {seed_block}
+    WO=true
 fi
 
 # THE PRIOR MODEL IS NEVER HANDED TO A LEG. These arms churn the prior buffer from noised ANCHORS
@@ -445,8 +450,9 @@ fi
 PM=null; echo "  prior model <- null (anchors-only churn; never loaded)"
 
 sed -e "s|WARM_CHECKPOINT_PLACEHOLDER|$(basename ${{CK}})|" \\
-    -e "s|PRIOR_MODEL_PLACEHOLDER|${{PM}}|" ${{CONFIG}} > ${{RESOLVED}}
-if grep -q 'WARM_CHECKPOINT_PLACEHOLDER\\|PRIOR_MODEL_PLACEHOLDER' ${{RESOLVED}}; then
+    -e "s|PRIOR_MODEL_PLACEHOLDER|${{PM}}|" \\
+    -e "s|WEIGHTS_ONLY_PLACEHOLDER|${{WO}}|" ${{CONFIG}} > ${{RESOLVED}}
+if grep -q 'WARM_CHECKPOINT_PLACEHOLDER\\|PRIOR_MODEL_PLACEHOLDER\\|WEIGHTS_ONLY_PLACEHOLDER' ${{RESOLVED}}; then
     echo "FATAL: placeholder left in ${{RESOLVED}}" >&2; exit 1
 fi
 
