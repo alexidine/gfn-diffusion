@@ -1033,6 +1033,175 @@ def summarize(out_dir, *, mirror_de_tol: float = 0.05, mirror_count_rel: float =
     return out
 
 
+# ------------------------------------------------------------------ read (consumers)
+
+
+#: the fields of a condition record ``read_conditions`` keeps; the rest (counts, seconds, ring
+#: shapes, the stereo pin) describe the search, not the rows
+READ_FIELDS = ('identifier', 'isomer_rank', 'mirror_of', 'n_atoms', 'k', 'z', 'perm', 'ref_pos',
+               'signature', 'kT', 'window_kcal', 'refusal', 'e_min', 'basins')
+
+
+def database_identity(blobs_or_headers) -> dict:
+    """The identity a consumer records for a whole database: its run hash (every shard of one
+    run shares it; ``hashed_view`` without the shard) and the sha256 over its shards' sorted
+    header hashes, which names the exact set of shard files."""
+    hashes = sorted(h for h in blobs_or_headers)
+    return {'header_hashes_sha256': hashlib.sha256('\n'.join(hashes).encode()).hexdigest(),
+            'n_header_hashes': len(hashes)}
+
+
+def first_header(db_dir) -> dict:
+    """The header of the database's first shard file, for checks made before a full read."""
+    files = sorted(Path(db_dir).glob('shard_*_of_*.pt'))
+    if not files:
+        raise SystemExit(f'{db_dir}: no database shard files')
+    b = torch.load(files[0], weights_only=False, map_location='cpu')
+    if b.get('format') != FORMAT:
+        raise SystemExit(f'{files[0]}: format {b.get("format")!r}, this reader takes {FORMAT!r}')
+    return {'path': str(Path(db_dir).resolve()), 'energy_kwargs': b['header']['config'][
+        'energy_kwargs'], 'set_builder': b['header']['set_builder']}
+
+
+def read_conditions(db_dir, identifiers=None, *, log=print):
+    """``(info, {identifier: condition record})`` for a finished database.
+
+    One shard at a time; only the conditions named in ``identifiers`` are kept (all when None),
+    each with ``READ_FIELDS`` plus its key's ``key`` and ``side``. REFUSES a directory whose
+    shards are not one complete run: no shard file, a shard count other than the header's
+    ``n_shards``, shards of different runs (``run_hash``), an incomplete shard, another format,
+    or one identifier in two records. ``info`` carries the path, format, run hash, the digest
+    over the shard header hashes (``database_identity``), the member kwargs the run was built
+    under and the set builder's defaults it planned its universe with.
+    """
+    db_dir = Path(db_dir)
+    files = sorted(db_dir.glob('shard_*_of_*.pt'))
+    if not files:
+        raise SystemExit(f'{db_dir}: no database shard files')
+    want = None if identifiers is None else set(identifiers)
+    out: Dict[str, dict] = {}
+    runs, hashes, incomplete, h0 = set(), [], [], None
+    t0 = time.time()
+    for f in files:
+        b = torch.load(f, weights_only=False, map_location='cpu')
+        if b.get('format') != FORMAT:
+            raise SystemExit(f'{f}: format {b.get("format")!r}, this reader takes {FORMAT!r}')
+        runs.add(b['run_hash'])
+        hashes.append(b['header_hash'])
+        if not b['complete']:
+            incomplete.append(f.name)
+        if h0 is None:
+            h0 = b['header']
+        for r in b['keys'].values():
+            for c in r['conditions']:
+                ident = c['identifier']
+                if want is not None and ident not in want:
+                    continue
+                if ident in out:
+                    raise SystemExit(f'{db_dir}: identifier {ident!r} has two records')
+                rec = {k: c[k] for k in READ_FIELDS}
+                rec.update(key=r['key'], side=r['side'])
+                out[ident] = rec
+        del b
+    n_shards = int(h0['shard']['n_shards'])
+    problems = []
+    if len(runs) != 1:
+        problems.append(f'{len(runs)} runs (different headers) in one directory')
+    if len(files) != n_shards:
+        problems.append(f'{len(files)} shard files of {n_shards}')
+    if incomplete:
+        problems.append(f'{len(incomplete)} incomplete shard(s), e.g. {incomplete[0]}')
+    if problems:
+        raise SystemExit(f'{db_dir} is not one finished database: ' + '; '.join(problems))
+    info = {'path': str(db_dir.resolve()), 'format': FORMAT, 'run_hash': runs.pop(),
+            **database_identity(hashes), 'n_shards': n_shards,
+            'created_utc': h0.get('created_utc'), 'git': h0.get('git'),
+            'energy_kwargs': h0['config']['energy_kwargs'],
+            'set_builder': h0['set_builder'], 'source_sha256': h0['source']['sha256'],
+            'window_kt': h0['args'].get('window_kt')}
+    log(f'database {db_dir}: {len(files)} shard(s), {len(out)} condition record(s) kept, '
+        f'{time.time() - t0:.0f} s')
+    return info, out
+
+
+def refuse_other_member_kwargs(info: dict, energy_kw: dict, what: str):
+    """SystemExit when the database's members were built under other member-defining
+    ConformerTorsions arguments than ``energy_kw`` (``build_conformer_references.
+    defining_energy``, resolved against the signature defaults)."""
+    import build_conformer_references as bcr
+
+    have = bcr.defining_energy(bcr.member_kwargs(info['energy_kwargs']))
+    want = bcr.defining_energy(bcr.member_kwargs(energy_kw))
+    diff = [f'{k}: database {have.get(k, "<absent>")!r}, {what} {want.get(k, "<absent>")!r}'
+            for k in sorted(set(have) | set(want))
+            if have.get(k, '<absent>') != want.get(k, '<absent>')]
+    if diff:
+        raise SystemExit(f"{info['path']} was built under other member arguments than the "
+                         f'{what}:\n  ' + '\n  '.join(diff))
+
+
+#: why a consumer takes no rows from the database for a condition
+MATCH_CODES = {
+    'db_absent': 'the database holds no record of this identifier',
+    'db_refused': 'the database refused the condition (its code in the message)',
+    'db_signature': "the database member's signature (ConformerModeller._member_signature: "
+                    'SMILES, block codes, placement z) or placement z differs from this member',
+    'db_outside_box': 'a stored row, measured into this member, lies outside the state box on a '
+                      'non-periodic column',
+    'db_rescore': 'a stored row, measured into this member, re-scores more than the tolerance '
+                  'from its stored energy',
+}
+
+
+def match_rows(member, identifier: str, rec: Optional[dict], cap: Optional[int], tol: float):
+    """``(states [m, k] float64, stored energies [m], info)`` of one condition's lowest ``cap``
+    database rows, measured into ``member``'s own chart (``states_of_rows``), or
+    ``(None, None, info)`` with ``info['code']`` one of ``MATCH_CODES``.
+
+    Matched by identifier and member signature. Every taken row is re-scored through
+    ``member`` (``bake_energies``, raw potential at T = 1) and the condition is refused when the
+    worst gap to the stored energy exceeds ``tol`` kcal/mol, or when a row falls outside the
+    box on a non-periodic column. ``info`` records the gap and the reference-geometry gap.
+    """
+    from energies.conformer_data import bake_energies
+
+    info = {'identifier': identifier, 'code': None, 'message': ''}
+    if rec is None:
+        info.update(code='db_absent', message='no record')
+        return None, None, info
+    if rec['refusal'] is not None:
+        info.update(code='db_refused',
+                    message=f"{rec['refusal']['code']}: {rec['refusal']['message']}"[:300])
+        return None, None, info
+    sig = member_signature(identifier, member)
+    z = np.asarray(member.spec.z, dtype=np.int64)
+    if sig != rec['signature'] or not np.array_equal(z, np.asarray(rec['z'])):
+        info.update(code='db_signature', message=f"member {sig}, database {rec['signature']}")
+        return None, None, info
+    ref = member.ref_pos.detach().cpu().double().numpy()
+    info['ref_pos_gap'] = float(np.abs(ref - np.asarray(rec['ref_pos'])).max())
+    n = len(rec['basins']['energy']) if cap is None else min(int(cap),
+                                                              len(rec['basins']['energy']))
+    pos = np.asarray(rec['basins']['pos'][:n], dtype=np.float64)
+    stored = np.asarray(rec['basins']['energy'][:n], dtype=np.float64)
+    x = states_of_rows(member, pos)
+    per = np.asarray(member.periodic_dims, dtype=bool)
+    if (~per).any() and bool((x[:, torch.as_tensor(~per)].abs() > 1.0).any()):
+        info.update(code='db_outside_box',
+                    message=f'max |x| {float(x[:, torch.as_tensor(~per)].abs().max()):.6g}')
+        return None, None, info
+    with torch.no_grad():
+        e = bake_energies(member, x).detach().cpu().double().numpy()
+    gap = float(np.max(np.abs(e - stored))) if n else 0.0
+    info['rescore_gap'] = gap
+    if not gap <= float(tol):
+        info.update(code='db_rescore', message=f're-score gap {gap:.3g} kcal/mol > {tol:g}')
+        return None, None, info
+    info.update(rows=int(n), rows_available=int(len(rec['basins']['energy'])),
+                e_min=float(stored[0]) if n else None)
+    return x, stored, info
+
+
 # ------------------------------------------------------------------ CLI
 
 

@@ -8,7 +8,10 @@ writes into ``--out-dir``:
 
     conditions_train.pt     cfg:molecules_path       (carrier form, embeddings baked)
     conditions_heldout.pt   cfg:test_molecules_path  (same K, same block widths)
-    prior_train.pt          cfg:prior_path, only with --prior-rows-per-condition > 0
+    prior_train.pt          cfg:prior_path, only with --prior-rows-per-condition > 0 (prior
+                            draws) or --database DIR (each training condition's lowest
+                            --rows-per-condition-cap database rows, ``build_database_prior``)
+    prior_refusals.tsv      with --database: the training conditions that took no rows, and why
     split.tsv               every universe key: its side and its place in the walk order
     molecules.tsv           one row per kept CONDITION (stereoisomer)
     rejections.tsv          one row per refused molecule and per refused stereoisomer
@@ -81,7 +84,15 @@ from build_conformer_conditions import (REASON_CODES, Member, MemberRefused, bui
 QM9_PATH = 'D:/crystal_datasets/qm9_dataset.pt'
 FORMAT = 'conformer_set_v1'
 ARTIFACT_NAMES = ('conditions_train.pt', 'conditions_heldout.pt', 'prior_train.pt',
-                  'split.tsv', 'molecules.tsv', 'rejections.tsv')
+                  'split.tsv', 'molecules.tsv', 'rejections.tsv', 'prior_refusals.tsv')
+#: kcal/mol: the largest gap allowed between a database row's stored energy and its re-score in
+#: this build's member (``--database-rescore-tol``); the database's own bar
+#: (build_conformer_database.RESCORE_TOL). The energy is a function of the positions, so a
+#: member whose REFERENCE differs from the database's (another RDKit embeds another reference:
+#: 15 of 33 conditions of a 20-molecule rung, RDKit 2025.03.5 here against the database's
+#: 2025.09.4) still re-scores the stored rows to within 5e-14 kcal/mol -- unless a row lands on
+#: this member's box wall, which is what this bar refuses (one such condition, 251 kcal/mol).
+DATABASE_RESCORE_TOL = 1e-6
 DEFAULT_CONFIG = Path(__file__).resolve().parent / 'configs' / 'conformer_mk.yaml'
 
 #: set-level codes, beside the per-member REASON_CODES
@@ -708,10 +719,60 @@ def build_prior(padded: Dict[str, object], members: Dict[str, Member], layout, n
     return _cast_floats(batch, dtype), stats
 
 
-def verify_prior_file(path, layout, members: Dict[str, Member], n: int):
+def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], layout,
+                         records: Dict[str, dict], cap: int, *, tol: float, dtype):
+    """``(batch or None, per-condition stats, refusals)``: each training condition's lowest
+    ``cap`` rows of the conformer DATABASE, in carrier form, instead of prior draws.
+
+    Per condition ``build_conformer_database.match_rows``: the record found by identifier and
+    member signature, its stored positions measured into THIS member's chart, every taken row
+    re-scored against its stored energy (refused above ``tol`` kcal/mol). A condition without
+    rows -- absent from the database, refused there, or refused by the match -- is returned in
+    ``refusals`` with its ``MATCH_CODES`` code, never skipped silently. As ``build_prior``, each
+    state is rounded to the STORAGE dtype before the energy written beside it is scored, so the
+    stored energy is the stored state's; that energy is the member's re-score, which agrees
+    with the database's within ``tol``.
+    """
+    from build_conformer_database import match_rows
+    from energies.conformer_data import bake_energies, collate_conditions, wrap_state
+
+    rows, stats, refusals = [], {}, []
+    periodic = [bool(b == 2) for b in layout.free_block]
+    for ident, pm in padded.items():
+        en = members[ident].energy
+        x, stored, info = match_rows(en, ident, records.get(ident), cap, tol)
+        if x is None:
+            refusals.append({'identifier': ident, 'reason_code': info['code'],
+                             'message': ' '.join(str(info['message']).split())})
+            continue
+        x = wrap_state(x, en.periodic_dims).to(dtype).to(en.dtype)
+        with torch.no_grad():
+            e = bake_energies(en, x)
+        xc = wrap_state(layout.to_carrier(ident, x), periodic)
+        for i in range(len(x)):
+            row = pm.__copy__()
+            row.torsion_state = xc[i:i + 1]
+            row.conformer_energy = e[i:i + 1]
+            row.identifier = ident
+            rows.append(row)
+        stats[ident] = {'rows': info['rows'], 'rows_available': info['rows_available'],
+                        'e_min_database': info['e_min'],
+                        'rescore_gap': info['rescore_gap'],
+                        'stored_gap': float(np.max(np.abs(e.detach().cpu().double().numpy()
+                                                          - stored))),
+                        'ref_pos_gap': info['ref_pos_gap']}
+    if len(rows) < 2:
+        return None, stats, refusals
+    batch = collate_conditions(rows, require_state=True)
+    return _cast_floats(batch, dtype), stats, refusals
+
+
+def verify_prior_file(path, layout, members: Dict[str, Member], n):
     """Refuse a prior file whose width, pads, row counts or stored energies are wrong.
 
-    Width K; pad columns exactly 0; exactly ``n`` rows per condition; and EVERY row
+    ``n`` is the row count of every condition, or a ``{identifier: rows}`` map (a database
+    prior, whose conditions hold up to its cap each); ``members`` are exactly the conditions
+    that must have rows. Width K; pad columns exactly 0; exactly ``n`` rows per condition; and EVERY row
     re-scored through its member from the STORED state, the result cast to the storage
     dtype and required BIT-EQUAL to the stored energy. Bit-equal is attainable because
     ``build_prior`` scores the storage-rounded state in the same n-row batch this re-scores,
@@ -739,8 +800,9 @@ def verify_prior_file(path, layout, members: Dict[str, Member], n: int):
         problems.append('non-zero pad columns (or a state_mask of another shape)')
     for ident, en in ((i, m.energy) for i, m in members.items()):
         rows = rows_of.get(ident, [])
-        if len(rows) != n:
-            problems.append(f'{ident}: {len(rows)} rows, expected {n}')
+        want = n[ident] if isinstance(n, dict) else n
+        if len(rows) != want:
+            problems.append(f'{ident}: {len(rows)} rows, expected {want}')
             continue
         if x.shape[1] != layout.K:
             continue
@@ -750,7 +812,7 @@ def verify_prior_file(path, layout, members: Dict[str, Member], n: int):
         bad = torch.nonzero(e[rows] != e2).reshape(-1)
         if len(bad):
             j = int(bad[0])
-            problems.append(f'{ident}: {len(bad)} of {n} stored energies differ from the '
+            problems.append(f'{ident}: {len(bad)} of {want} stored energies differ from the '
                             f're-score of the stored state, e.g. row {rows[j]}: '
                             f'{float(e[rows[j]])!r} against {float(e2[j])!r}')
     if problems:
@@ -848,6 +910,17 @@ def parse_args(argv=None):
                     help="default: the config's energy_config.prior_relax_steps, else 0")
     ap.add_argument('--prior-seed', type=int, default=0)
     ap.add_argument('--prior-dtype', choices=('float32', 'float64'), default='float32')
+    ap.add_argument('--database', type=Path, default=None,
+                    help='write prior_train.pt from this conformer database '
+                         '(build_conformer_database.py output directory): each training '
+                         "condition's lowest --rows-per-condition-cap rows, instead of prior "
+                         'draws. Excludes --prior-rows-per-condition')
+    ap.add_argument('--rows-per-condition-cap', type=int, default=16,
+                    help='with --database: at most this many rows per condition, lowest '
+                         'energy first')
+    ap.add_argument('--database-rescore-tol', type=float, default=DATABASE_RESCORE_TOL,
+                    help='kcal/mol; a database row re-scoring further from its stored energy '
+                         'refuses its condition (db_rescore)')
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--no-check', action='store_true',
                     help='skip the graph-vs-energy geometry checks (don\'t)')
@@ -887,6 +960,16 @@ def main(argv=None):
     cap = _n(args.max_stereoisomers_per_molecule)
     if cap is not None and cap < 1:
         raise SystemExit('--max-stereoisomers-per-molecule must be >= 1 or all')
+    if args.database is not None:
+        # checked BEFORE the walk, which is the expensive part: a database of other members
+        # would refuse every condition at the re-score, after the whole build
+        if args.prior_rows_per_condition > 0:
+            raise SystemExit('--database and --prior-rows-per-condition both write '
+                             'prior_train.pt; pass one')
+        if int(args.rows_per_condition_cap) < 1:
+            raise SystemExit('--rows-per-condition-cap must be >= 1')
+        from build_conformer_database import first_header, refuse_other_member_kwargs
+        refuse_other_member_kwargs(first_header(args.database), energy_kw, 'set builder')
 
     # ---- encoder, and (only when asked) the pool it was trained on
     bundle, enc_info, pool_info = None, None, {}
@@ -1076,6 +1159,53 @@ def main(argv=None):
                       'relax_steps': relax, 'seed': args.prior_seed, 'dtype': args.prior_dtype,
                       'per_condition': pstats}
         print(f'wrote {out / "prior_train.pt"}: {n} rows x {len(tmembers)} conditions')
+    elif args.database is not None:
+        from build_conformer_database import MATCH_CODES, read_conditions
+        db_info, records = read_conditions(args.database, identifiers=list(tmembers))
+        dcap = int(args.rows_per_condition_cap)
+        dtype = getattr(torch, args.prior_dtype)
+        tpadded = {i: padded[i] for i in tmembers}
+        pbatch, pstats, prefused = build_database_prior(
+            tpadded, tmembers, run_layout, records, dcap, tol=args.database_rescore_tol,
+            dtype=dtype)
+        _write_tsv(out / 'prior_refusals.tsv', ['identifier', 'reason_code', 'message'],
+                   prefused)
+        files['prior_refusals.tsv'] = out / 'prior_refusals.tsv'
+        if pbatch is None:
+            raise SystemExit(f'the database gave fewer than 2 rows over {len(tmembers)} '
+                             f'training conditions ({_count(r["reason_code"] for r in prefused)})'
+                             f'; prior_train.pt not written')
+        counts = {i: s['rows'] for i, s in pstats.items()}
+        from energies.conformer_data import save_prior_file
+        _write_then_verify(
+            lambda p: save_prior_file(pbatch, p, source='conformer_database',
+                                      rows_per_condition_cap=dcap, format=FORMAT),
+            out / 'prior_train.pt',
+            lambda p: verify_prior_file(p, run_layout, {i: tmembers[i] for i in counts},
+                                        counts))
+        files['prior_train.pt'] = out / 'prior_train.pt'
+        gaps = [s['rescore_gap'] for s in pstats.values()]
+        prior_info = {'source': 'database', 'database': db_info,
+                      'rows_per_condition_cap': dcap, 'dtype': args.prior_dtype,
+                      'rescore_tol_kcal': float(args.database_rescore_tol),
+                      'rows': int(sum(counts.values())),
+                      'conditions_with_rows': len(counts),
+                      'conditions_refused': len(prefused),
+                      'refused': _count(r['reason_code'] for r in prefused),
+                      'codes': MATCH_CODES,
+                      'max_rescore_gap_kcal': max(gaps) if gaps else None,
+                      'max_ref_pos_gap_A': max((s['ref_pos_gap'] for s in pstats.values()),
+                                               default=None),
+                      # the member's reference conformer is not the database's (another RDKit
+                      # embeds another one); its rows are still re-measured and re-scored here
+                      'reference_differs_from_database': sum(
+                          1 for s in pstats.values() if s['ref_pos_gap'] > 1e-5),
+                      'rows_per_condition_hist': _count(counts.values()),
+                      'per_condition': pstats}
+        print(f'wrote {out / "prior_train.pt"}: {prior_info["rows"]} database rows over '
+              f'{len(counts)} of {len(tmembers)} training conditions (cap {dcap}); refused '
+              f'{prior_info["refused"] or "none"}; worst re-score gap '
+              f'{prior_info["max_rescore_gap_kcal"]:.3g} kcal/mol')
 
     # ---- tables and manifest
     header = ['identifier', 'key', 'dataset_index', 'split', 'molecule_rank',
@@ -1112,7 +1242,8 @@ def main(argv=None):
                   'attempted': {'train': att_t, 'heldout': att_h}},
         'seeds': {'etkdg': energy_kw.get('seed', 0), 'split_salt': args.split_salt,
                   'stereo_salt': args.stereo_salt,
-                  'prior_seed': args.prior_seed if prior_info else None},
+                  'prior_seed': (args.prior_seed if prior_info
+                                 and prior_info.get('source') != 'database' else None)},
         'rungs': {s: {'molecules': len(bl), 'conditions': len(mrows[s])}
                   for s, bl in (('train', train), ('heldout', admitted))},
         'stereo': {'policy': 'each stereoisomer a condition, identified by its stereo-tagged '

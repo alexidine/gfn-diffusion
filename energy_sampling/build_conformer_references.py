@@ -31,6 +31,10 @@ of start, all clamped into the box so the floor is a state the sampler can reach
   uniform  uniform on the box (``prior_baselines.draw_uniform``);
   prior    fitted ``InternalPrior`` draws (``prior_baselines.draw_prior``).
 
+THE DATABASE FLOOR (``--database DIR``) replaces the search: each condition's floor is its
+lowest row in a build_conformer_database.py directory, measured into the member and re-scored
+(``database_floor``); the stamp's ``floor`` and each entry's ``floor_source`` say which.
+
 The ETKDG starts exist because the other three are one family: a search that draws more of
 the same kinds cannot see a basin none of them reaches, so comparing 64 against 256 such
 starts cannot measure adequacy. Re-embedded references do reach such basins. See
@@ -678,12 +682,53 @@ def basin_block(member, max_modes: int = BASIN_MAX_MODES) -> dict:
                 n_accessible=n_acc, basin_skipped='skipped' in br)
 
 
+def database_floor(member, identifier: str, rec, pin: Mapping, tol: float) -> dict:
+    """The condition's floor from the conformer DATABASE: its lowest stored row, measured into
+    ``member``'s own chart (``build_conformer_database.match_rows``: matched by identifier and
+    member signature, re-scored against the stored energy within ``tol`` kcal/mol, refused
+    otherwise). ``e_min`` is this member's re-score of that state, raw potential at T = 1.
+
+    The row passed the database's own screen (every start whose configuration broke the pin
+    was excluded before clustering), and is checked against this member's pin again here. The
+    fields a search fills and the database does not record -- the lowest candidate of any
+    stereo, how many candidates below the floor broke the pin, the start counts -- are None.
+    """
+    from build_conformer_database import match_rows
+    from energies.conformer_data import bake_energies, wrap_state
+
+    x, stored, info = match_rows(member, identifier, rec, 1, tol)
+    if x is None:
+        raise RuntimeError(f"database floor refused, {info['code']}: {info['message']}")
+    x = wrap_state(x, member.periodic_dims)
+    if not bool((x.abs() <= 1.0 + 1e-12).all()):
+        raise RuntimeError('the database floor state lies outside the box')
+    if _pinned(pin) and stereo_labels(member, x, pin)[0] != pin['target']:
+        raise RuntimeError("the database floor state is not the condition's stereoisomer at "
+                           f"its pinned elements ({pin['pinned']})")
+    with torch.no_grad():
+        e = float(bake_energies(member, x)[0])
+    return dict(e_min=e, e_min_state=x[0].detach().cpu().double().clone(),
+                e_min_start_kind='database',
+                e_min_stereo=stereo_signatures(member, x)[0], e_min_unpinned=None,
+                n_below_other_stereo=None, worst_start=None, n_starts=None, n_nonfinite=None,
+                e_min_database=float(stored[0]), floor_rescore_gap=abs(e - float(stored[0])),
+                ref_pos_gap_database=info['ref_pos_gap'])
+
+
 def compute_entry(identifier: str, smiles: str, z, pos, kwargs: Mapping, search: Mapping,
-                  prior=None, max_modes: int = BASIN_MAX_MODES) -> dict:
-    """One molecule's entry. float64 throughout; the caller's default dtype is restored."""
+                  prior=None, max_modes: int = BASIN_MAX_MODES, floor: str = 'search',
+                  db_rec=None, db_tol: Optional[float] = None) -> dict:
+    """One molecule's entry. float64 throughout; the caller's default dtype is restored.
+
+    ``floor`` 'search' runs the multi-start floor search; 'database' takes the floor from
+    ``db_rec``, the condition's database record (None when the database holds none, which
+    raises) (``database_floor``). ``basin_ref`` is computed the same way under both.
+    """
     from energies.conformer_data import bake_energies
     from energies.ring_metrics import ring_cycles
 
+    if floor not in ('search', 'database'):
+        raise ValueError(f'floor {floor!r}: search or database')
     cost = {}
     with _float64():
         t = time.perf_counter()
@@ -695,16 +740,23 @@ def compute_entry(identifier: str, smiles: str, z, pos, kwargs: Mapping, search:
             u_ref = float(bake_energies(member, torch.zeros(1, k))[0])
         cost['build'] = time.perf_counter() - t
 
-        t = time.perf_counter()
-        starts, kinds, info = search_starts(
-            member, identifier, n_uniform=search['n_uniform'], n_prior=search['n_prior'],
-            n_seeds=search['n_seeds'], prior=prior, ref_seed=int(kwargs.get('seed', 0)),
-            pin=pin, mmff=bool(kwargs.get('mmff_reference', True)))
-        cost['starts'] = time.perf_counter() - t
+        if floor == 'database':
+            info = {}
+            cost['starts'] = 0.0
+            t = time.perf_counter()
+            floor_d = database_floor(member, identifier, db_rec, pin, float(db_tol))
+            cost['descend'] = time.perf_counter() - t
+        else:
+            t = time.perf_counter()
+            starts, kinds, info = search_starts(
+                member, identifier, n_uniform=search['n_uniform'], n_prior=search['n_prior'],
+                n_seeds=search['n_seeds'], prior=prior, ref_seed=int(kwargs.get('seed', 0)),
+                pin=pin, mmff=bool(kwargs.get('mmff_reference', True)))
+            cost['starts'] = time.perf_counter() - t
 
-        t = time.perf_counter()
-        floor = floor_search(member, starts, kinds, search['steps'], pin)
-        cost['descend'] = time.perf_counter() - t
+            t = time.perf_counter()
+            floor_d = floor_search(member, starts, kinds, search['steps'], pin)
+            cost['descend'] = time.perf_counter() - t
 
         t = time.perf_counter()
         basin = basin_block(member, max_modes)
@@ -717,8 +769,10 @@ def compute_entry(identifier: str, smiles: str, z, pos, kwargs: Mapping, search:
     return dict(identifier=identifier, smiles=smiles, k=k, n_atoms=int(member.spec.n_atoms),
                 n_rings=n_rings, stereo=pin['stereo'], stereo_pin=pin['pin'],
                 stereo_pinned=pin['pinned'], stereo_open=pin['open'], u_ref=u_ref,
-                ref_pos_gap=pos_gap, steps=int(search['steps']), seed=molecule_seed(identifier),
-                starts=info, **floor, **basin, cost_s=cost)
+                ref_pos_gap=pos_gap,
+                steps=int(search['steps']) if floor == 'search' else None,
+                seed=molecule_seed(identifier), floor_source=floor,
+                starts=info, **floor_d, **basin, cost_s=cost)
 
 
 # ----------------------------------------------------------------------------- build
@@ -777,6 +831,12 @@ def _resume_key(stamp: dict) -> str:
     # resumes; a different one with the same name does not
     keep['conditions'] = {'sha256': stamp['conditions']['sha256']}
     keep['internal_prior'] = (stamp['internal_prior'] or {}).get('sha256')
+    # a DATABASE floor is another table: its identity joins the key. A search floor adds
+    # nothing, so a parts directory written before floors had a source still resumes
+    fl = stamp.get('floor') or {}
+    if fl.get('source') == 'database':
+        keep['floor'] = {'source': 'database', 'tol': fl['rescore_tol_kcal'],
+                         **{k: fl['database'][k] for k in ('run_hash', 'header_hashes_sha256')}}
     return hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -784,12 +844,20 @@ def build_references(conditions_path, out_path, kwargs: Mapping, *,
                      search: Optional[Mapping] = None, internal_prior_path=None,
                      workers: int = 0, threads: int = 1, molecule_timeout: float = 900.0,
                      max_modes: int = BASIN_MAX_MODES, identifiers=None,
-                     keep_parts: bool = False, log=print) -> dict:
+                     keep_parts: bool = False, database=None,
+                     database_tol: Optional[float] = None, log=print) -> dict:
     """Build (or resume) the table. Returns ``{path, stamp, n_ok, failures, stalled, entries}``.
 
     ``workers=0`` computes in this process (tests); otherwise a spawn pool of that many
     processes, ``threads`` torch threads each. ``identifiers`` restricts the build to a
     subset (the stamp still names the whole conditions file).
+
+    ``database`` (a build_conformer_database.py output directory) takes each condition's
+    FLOOR from the database instead of the search (``database_floor``), within
+    ``database_tol`` kcal/mol of the stored energy; the search parameters are then unused
+    and the stamp's ``search`` is None. A condition the database holds no usable row for is
+    a recorded failure. The stamp's ``floor`` names the source either way, and each entry's
+    ``floor_source``.
     """
     search = dict(DEFAULT_SEARCH if search is None else search)
     missing = {'n_uniform', 'n_prior', 'n_seeds', 'steps'} - set(search)
@@ -806,6 +874,26 @@ def build_references(conditions_path, out_path, kwargs: Mapping, *,
             raise ValueError(f'{len(unknown)} identifier(s) not in {conditions_path}, e.g. '
                              f'{sorted(unknown)[0]!r}')
         mols = [m for m in mols if m['identifier'] in want]
+    db_recs, floor = None, {'source': 'search'}
+    if database is not None:
+        from build_conformer_database import read_conditions as read_database
+        from build_conformer_database import refuse_other_member_kwargs
+        if database_tol is None:
+            raise ValueError('a database floor needs database_tol')
+        db_info, db_recs = read_database(database, identifiers=[m['identifier'] for m in mols],
+                                         log=log)
+        refuse_other_member_kwargs(db_info, kwargs, 'reference build')
+        # only the lowest row travels to a worker
+        for r in db_recs.values():
+            r['basins'] = {k: v[:1] for k, v in r['basins'].items()}
+        floor = {'source': 'database', 'rescore_tol_kcal': float(database_tol),
+                 'database': {k: db_info[k] for k in ('path', 'format', 'run_hash',
+                                                      'header_hashes_sha256', 'n_shards',
+                                                      'created_utc', 'git', 'window_kt')},
+                 'rule': 'the lowest stored row of the condition, measured into the member '
+                         '(build_conformer_database.match_rows) and re-scored; e_min is the '
+                         're-score'}
+        search = {k: 0 for k in search}                  # no search is run: no prior needed
     if search['n_prior'] > 0:
         if internal_prior_path is None:
             raise ValueError('n_prior > 0 needs internal_prior_path (or n_prior 0, stamped)')
@@ -824,12 +912,14 @@ def build_references(conditions_path, out_path, kwargs: Mapping, *,
         'energy_kwargs': _plain(kwargs),
         'level': kwargs.get('level'), 'force_field': kwargs.get('force_field', 'reference'),
         'energy_clip': kwargs.get('energy_clip'),
-        'search': {**{k: int(v) for k, v in search.items()}, 'optimizer': 'rprop',
+        'search': None if db_recs is not None else {
+                   **{k: int(v) for k, v in search.items()}, 'optimizer': 'rprop',
                    'seed_rule': 'blake2b(salt + identifier) mod 2^31-1 = s; uniform draws at '
                                 's, prior draws at s + 1; ETKDG seeds seed+1 .. seed+n_seeds',
                    'stereo': 'pinned at the elements the condition SMILES specifies, at the '
                              'reference conformer\'s configuration (legacy RDKit 3D '
                              'perception); elements it leaves open are free'},
+        'floor': floor,
         'basin': {'max_modes': int(max_modes), 'accessible_kt': 10.0},
         'internal_prior': (None if internal_prior_path is None else
                            {'path': str(internal_prior_path),
@@ -861,7 +951,11 @@ def build_references(conditions_path, out_path, kwargs: Mapping, *,
         f'{"this process" if workers <= 0 else f"{workers} worker(s)"}')
 
     jobs = [dict(identifier=m['identifier'], smiles=m['smiles'], z=m['z'], pos=m['pos'],
-                 kwargs=kwargs, search=search, max_modes=max_modes) for m in todo]
+                 kwargs=kwargs, search=search, max_modes=max_modes,
+                 **({} if db_recs is None else
+                    dict(floor='database', db_rec=db_recs.get(m['identifier']),
+                         db_tol=float(database_tol))))
+            for m in todo]
     failures: Dict[str, str] = {}
     stalled = False
     t0 = time.time()
@@ -1124,6 +1218,14 @@ def main(argv=None) -> int:
     ap.add_argument('--molecule-timeout', type=float, default=900.0,
                     help='seconds without any molecule finishing before the pool is stopped')
     ap.add_argument('--keep-parts', action='store_true')
+    ap.add_argument('--database', default=None,
+                    help='take each e_min FLOOR from this conformer database '
+                         '(build_conformer_database.py output directory) instead of the '
+                         'search; basin_ref is computed as without it')
+    ap.add_argument('--database-rescore-tol', type=float, default=None,
+                    help='kcal/mol; a database floor row re-scoring further from its stored '
+                         'energy is a failure (default build_conformer_set.'
+                         'DATABASE_RESCORE_TOL)')
     args = ap.parse_args(argv)
 
     _quiet(args.threads)
@@ -1131,7 +1233,13 @@ def main(argv=None) -> int:
     kwargs = member_kwargs(ec)
     search = {k: getattr(args, k) for k in DEFAULT_SEARCH}
     prior = args.internal_prior or ec.get('internal_prior_path')
-    if search['n_prior'] > 0:
+    db_tol = args.database_rescore_tol
+    if args.database is not None:
+        if db_tol is None:
+            from build_conformer_set import DATABASE_RESCORE_TOL
+            db_tol = DATABASE_RESCORE_TOL
+        prior = None                       # no search, so no prior starts
+    elif search['n_prior'] > 0:
         if not prior or not Path(prior).exists():
             raise SystemExit(f'REFUSING: n_prior {search["n_prior"]} needs the fitted '
                              f'InternalPrior, and {prior!r} does not exist. Pass '
@@ -1145,14 +1253,18 @@ def main(argv=None) -> int:
     res = build_references(cond, out, kwargs, search=search, internal_prior_path=prior,
                            workers=args.workers, threads=args.threads,
                            molecule_timeout=args.molecule_timeout, max_modes=args.max_modes,
-                           keep_parts=args.keep_parts)
+                           keep_parts=args.keep_parts, database=args.database,
+                           database_tol=db_tol)
     ents = res['entries']
+    how = (f'floor from the database {args.database} (descend = measuring its lowest row)'
+           if args.database is not None else
+           f'{sum(search[k] for k in ("n_uniform", "n_prior", "n_seeds")) + 1} starts x '
+           f'{search["steps"]} steps')
     print()
     print(f'Per-molecule wall time of this build, by molecule size k (level '
           f'{kwargs.get("level")!r}, force field {kwargs.get("force_field", "reference")!r}; '
-          f'{args.workers} worker(s) x {args.threads} thread(s); {sum(search[k] for k in ("n_uniform", "n_prior", "n_seeds")) + 1} '
-          f'starts x {search["steps"]} steps). Resumed molecules keep the cost of the run that '
-          f'computed them.')
+          f'{args.workers} worker(s) x {args.threads} thread(s); {how}). Resumed molecules '
+          f'keep the cost of the run that computed them.')
     print(cost_table(ents))
     if ents:
         tot = sum(e['cost_s']['total'] for e in ents.values())
@@ -1165,7 +1277,8 @@ def main(argv=None) -> int:
               f'{sum(e["stereo_open"]["imine_nh"] for e in ents.values() if e["stereo_pin"] == "partial")}), '
               f'{pins["none"]} none (floor over every stereoisomer). Molecules with a candidate '
               f'below the floor that breaks the pin: '
-              f'{sum(1 for e in ents.values() if e["n_below_other_stereo"] > 0)}.')
+              f'{sum(1 for e in ents.values() if (e["n_below_other_stereo"] or 0) > 0)}'
+              f' (not recorded for a database floor).')
         if res['prior_fallbacks']:
             print(f'{len(res["prior_fallbacks"])} molecule(s) fell back to uniform starts '
                   f'because the prior draw raised (entry starts.prior_error), e.g. '
