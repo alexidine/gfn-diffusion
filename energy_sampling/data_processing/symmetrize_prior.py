@@ -205,6 +205,13 @@ def thin_orbits(orbits, prov, cutoff):
                               face_sources_kept=int(kept_face.sum()), face_pairs_split=int(split.sum()))
 
 
+def children_of(parent, kept_anchors, n_anchors):
+    """Boolean mask over noised rows: True where the row's nearest anchor (`parent`, [n] long) is one of `kept_anchors`."""
+    keep = torch.zeros(n_anchors, dtype=torch.bool)
+    keep[torch.as_tensor(kept_anchors, dtype=torch.long)] = True
+    return keep[parent]
+
+
 def symmetrize_batch(batch):
     """The symmetrised batch (8 rows per source, see the module docstring) and its provenance dict."""
     sgs = set(batch.sg_ind.reshape(-1).tolist())
@@ -367,18 +374,33 @@ def main(argv=None):
     ap.add_argument('--thin', type=float, default=None,
                     help='orbits layout only: leader-cluster the distinct orbit rows at this cutoff in the wrapped 12-D latent, '
                          'lowest energy kept first (exact duplicates go first); y/z orbits are asserted to survive whole')
+    ap.add_argument('--thin-anchors', type=float, default=None,
+                    help='thin the ANCHOR set (prior) at this cutoff the same way, then keep only the noised rows whose nearest '
+                         'anchor survived, with every image the layout gives them; the noised rows themselves are not thinned')
     args = ap.parse_args(argv)
     if args.thin is not None and args.layout != 'orbits':
         sys.exit('--thin applies to --layout orbits')
+    if args.thin is not None and args.thin_anchors is not None:
+        sys.exit('--thin and --thin-anchors are alternatives')
     if os.path.exists(args.out):
         sys.exit(f'{args.out} exists -- refusing to overwrite')
     data = torch.load(args.src, map_location='cpu', weights_only=False)
     out_data, provenance, report = dict(data), {}, {}
     anchors = data['prior']
+    kept_anchors = None
     for key in ('prior', 'equalized_prior'):
         src = data[key]
         if args.limit:
             src = src.subsample_new_batch(torch.arange(min(args.limit, src.num_graphs)))
+        kept_rows = None
+        if args.thin_anchors is not None and key == 'equalized_prior':
+            parent = nearest_anchor(_latents(src), _latents(anchors))
+            keep = children_of(parent, kept_anchors, anchors.num_graphs)
+            kept_rows = torch.nonzero(keep).flatten()
+            print(f'[{key}] parents thinned at {args.thin_anchors}: {len(kept_anchors):,} of {anchors.num_graphs:,} anchors keep '
+                  f'{int(keep.sum()):,} of {src.num_graphs:,} noised rows', flush=True)
+            src = src.subsample_new_batch(kept_rows)
+            parent = parent[kept_rows]
         t0 = time.time()
         orbits, prov = symmetrize_batch(src)
         print(f'[{key}] {src.num_graphs} rows -> {orbits.num_graphs} orbit rows ({time.time() - t0:.1f}s); checking...', flush=True)
@@ -401,12 +423,18 @@ def main(argv=None):
             report[key]['layout'] = dict(rows=out.num_graphs, groups=int(group.unique().numel()), image_counts=hist,
                                          face_sources=int(face_ok.sum()), opposite_face_rows=int(prov['face_copy'].sum()))
             assert not prov['duplicate'].any() and out.num_graphs == src.num_graphs, key
-        elif args.thin is not None:
+        elif args.thin is not None or (args.thin_anchors is not None and key == 'prior'):
             t0 = time.time()
-            out, prov, report[key]['thin'] = thin_orbits(orbits, prov, args.thin)
+            out, prov, report[key]['thin'] = thin_orbits(orbits, prov, args.thin if args.thin is not None else args.thin_anchors)
             report[key]['thin']['seconds'] = time.time() - t0
+            if key == 'prior':
+                kept_anchors = prov['source'].unique()
         else:
             out = orbits
+        if kept_rows is not None:
+            prov['row_in_source_file'] = kept_rows[prov['source']]
+            prov['parent_anchor'] = parent[prov['source']]
+            report[key]['parents'] = dict(cutoff=args.thin_anchors, anchors_kept=int(len(kept_anchors)), noised_rows_kept=int(len(kept_rows)))
         report[key]['energy'] = check_energy(src, out, prov, args.device, args.rescore_chunk, key)
         for part, vals in report[key].items():
             print(f'    {part:<9} ' + ', '.join(f'{k} {v:.4g}' if isinstance(v, float) else f'{k} {v}' for k, v in vals.items()), flush=True)
@@ -414,7 +442,8 @@ def main(argv=None):
         provenance[key] = prov
     torch.save(out_data, args.out)
     stem = args.out[:-3] if args.out.endswith('.pt') else args.out
-    torch.save(dict(source_file=os.path.abspath(args.src), layout=args.layout, thin=args.thin, rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS,
+    torch.save(dict(source_file=os.path.abspath(args.src), layout=args.layout, thin=args.thin, thin_anchors=args.thin_anchors,
+                    rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS,
                     x_box=X_BOX, face_tol=FACE_TOL, limit=args.limit, report=report, **provenance), stem + '_provenance.pt')
     print(f'wrote {args.out} ({os.path.getsize(args.out):,} bytes) and {stem}_provenance.pt')
 

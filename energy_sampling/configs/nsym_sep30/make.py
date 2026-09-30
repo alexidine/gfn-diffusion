@@ -7,12 +7,13 @@ restart from our best current model").
 THE ARMS: ns30_mip_x2 / _x5 / _x10 = p23_mip_ft's config (the prod_sep20 production shape: every 5th step, P_B frozen,
 replay pinned 0.3 / bwd 0.7, tau 600, rate 0.5, batch 1600) with
   * prior_path and molecules_path -> PRIOR_NEW, the symmetrised prior (data_processing/symmetrize_prior.py, layout
-    `one`: every row of `prior` and `equalized_prior` written once, as one of the descriptions the trainer can build
-    -- its four half-cell y/z shifts, plus the opposite x face for a row sitting on one -- with the description index
-    cycling within the rows that share a nearest anchor, so the file keeps the source's size and row statistics while
-    the x faces and the y/z images come out balanced; handedness +1 throughout; every row rescored through the
-    trainer's analyze call against its source. The exact 8-rows-per-source `orbits` build of the same file exists
-    beside it as *_nsym.pt, 1.6M rows).
+    `orbits` thinned at 0.01: every row of `prior` and `equalized_prior` written as all the descriptions the trainer
+    can build -- its four half-cell y/z shifts, plus the opposite x face for a row sitting on one -- then leader-
+    clustered at radius 0.01 in the wrapped latent (0.4 of a thermal kick) so that no two rows sit closer than that:
+    the over-represented dense spots are capped and the rest of the file is untouched (74% of rows had no neighbour
+    at that radius). Handedness +1 throughout; every written row rescored through the trainer's analyze call against
+    its source; y/z orbits asserted whole. Owner 2026-09-30: "thin out over-representation within very high density
+    latent regions -- that's it").
   * a WEIGHTS-ONLY first launch from p23_mip_ft (prior_path is part of the problem identity;
     warm_start_ignore_problem_keys: [prior_path] exempts it on the weights-only path and nowhere else). It carries the
     weights and the frozen P_B snapshot; optimiser, buffers, log Z bootstrap and the step count start fresh. The yaml
@@ -59,9 +60,9 @@ N = 5
 SRC_ARM = 'p23_mip_ft'
 SRC_YAML = 'prod_sep23_ft/p23_mip_ft.yaml'
 PRIOR_OLD = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt'
-PRIOR_NEW = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym1.pt'
-PRIOR_NEW_BYTES = 165_623_885   # from the 2026-09-30 build (the sbatch refuses a file of any other size)
-PRIOR_NEW_ROWS = 201_503     # equalized_prior rows, one description per source row
+PRIOR_NEW = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym_t010.pt'
+PRIOR_NEW_BYTES = 627_551_917   # from the 2026-09-30 build (the sbatch refuses a file of any other size)
+PRIOR_NEW_ROWS = 791_068     # equalized_prior rows after the 0.01 thinning of the 8-image orbits
 LOCAL_PRIOR = pathlib.Path('D:/crystal_datasets/conditional/priors') / PRIOR_NEW
 NOISE_BASE = [-2.5, -1.5]
 FACTORS = {'x2': 2.0, 'x5': 5.0, 'x10': 10.0}
@@ -177,7 +178,7 @@ def main(argv):
     with (HERE / f'submit_{BATTERY}.sbatch').open('w', encoding='utf-8', newline='\n') as f:
         f.write(fin.SBATCH.format(wall=fin.WALL, last=len(arms) - 1, tag=TAG, battery=BATTERY, leg='a',
                                   ckpts=fin.w3.CLUSTER_CKPTS, data=fin.w3.CLUSTER_DATA, seed_block=fin.SEED_B,
-                                  what=f'fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior ({PRIOR_NEW}, one description per row) at 2x / 5x / 10x anchor noise: weights-only first launch from {SRC_ARM}, full resume afterwards.'))
+                                  what=f'fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior ({PRIOR_NEW}, 8-image orbits thinned at 0.01) at 2x / 5x / 10x anchor noise: weights-only first launch from {SRC_ARM}, full resume afterwards.'))
     for i, (name, (cfg, factor)) in enumerate(arms.items()):
         lo, hi = cfg['buffers']['anchor_buffer']['noise_log_range']
         print(f"[{i}] {name:<12} anchor noise x{factor:g}: log10 range [{lo}, {hi}] = latent {10 ** lo:.4f} to {10 ** hi:.4f}; "
