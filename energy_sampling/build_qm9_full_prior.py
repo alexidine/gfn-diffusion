@@ -17,7 +17,9 @@ Stages, each resumable from its files in --work-dir:
        measure (audit: dup_pairs, dup_pairs_screened);
      - chunks below --diverse-below keep the --keep most diverse survivors: farthest-point sampling in RDF distance,
        seeded with the lowest-eLJ crystal.
-  3. assemble: hold out a random --holdout-frac of the molecules (distinct SMILES drawn under --holdout-seed; all of
+  3. assemble: re-describe every crystal in the trainer's chart (to_trainer_chart: handedness +1, centroid x in
+     [0, 1/2]; the search draws handedness at random and the trainer reads every row at +1), then
+     hold out a random --holdout-frac of the molecules (distinct SMILES drawn under --holdout-seed; all of
      their crystals leave the prior), write the three training files, <tag>_test_prior.pt (every kept crystal of the
      held-out molecules, in the prior's envelope, for offline evaluation; the trainer does not read it) and a
      provenance file (search chunk, seed and row of every prior and held-out row).
@@ -249,6 +251,70 @@ def stage_chunks(args):
 
 
 # ------------------------------------------------------------------------------------------------ stage 3: assemble
+FIT_TOL = 1e-2  # Angstrom RMSD: the source molecule must superimpose on one of the two copies this closely
+
+
+def _proper_fit(M, X, batch, n):
+    """Per graph, the proper rotation R (det +1) minimising |R m_i - x_i| over its atoms (batched Kabsch), and the
+    RMSD it leaves. M, X: [n_atoms, 3], each graph's atoms centred; batch: [n_atoms] graph index."""
+    H = torch.zeros(n, 3, 3, dtype=torch.float64).index_add_(0, batch, M[:, :, None] * X[:, None, :])
+    U, _, Vt = torch.linalg.svd(H)
+    d = torch.sign(torch.linalg.det(Vt.transpose(1, 2) @ U.transpose(1, 2)))
+    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+    R = Vt.transpose(1, 2) @ D @ U.transpose(1, 2)
+    res = ((R[batch] @ M[:, :, None])[..., 0] - X).pow(2).sum(-1)
+    cnt = torch.zeros(n, dtype=torch.float64).index_add_(0, batch, torch.ones_like(res))
+    return R, (torch.zeros(n, dtype=torch.float64).index_add_(0, batch, res) / cnt).sqrt()
+
+
+def to_trainer_chart(b, mol_pos):
+    """Re-describe every P-1, Z'=1 crystal in the chart the trainer reads, in place: the stored molecule IS the source
+    molecule (mol_pos[identifier], its std-orientation fixed point, the molecule the conditions were embedded from),
+    handedness +1, centroid x in [0, 1/2], y and z in [0, 1). The trainer builds every crystal at handedness +1
+    (energies/molecular_crystal.py::MolecularCrystal.init_blank_crystal_batch) and ignores a row's stored handedness;
+    the search draws handedness at random and stores the molecule mirrored on a quarter of its rows, so its rows cannot
+    be read as they are (a handedness -1 row: eLJ a median ~280 raw units higher; flipping the flag alone leaves the
+    mirrored rows' molecule the enantiomer). So each row is refitted: its asymmetric unit is posed as the search scored
+    it (pose_aunit, std_orientation=True, with its handedness); the source molecule is fitted onto it by a proper
+    rotation, or, in P-1, onto its inversion partner at -centroid, whichever it superimposes on (FIT_TOL); a centroid
+    with x > 1/2 moves by -1/2 (the same crystal, translated). Returns (rows refitted onto the inversion partner, rows
+    moved in x, rows no copy fitted -- which are left out by the caller, via the returned keep mask)."""
+    from mxtaltools.common.geometry_utils import rotmat2rotvec
+    from mxtaltools.crystal_building.utils import canonicalize_rotvec
+    n = b.num_graphs
+    assert bool((b.sg_ind.reshape(-1) == 2).all()) and bool((b.z_prime.reshape(-1) == 1).all()), 'P-1, Z\'=1 only'
+    src = torch.cat([mol_pos[i] for i in b.identifier]).double()
+    assert src.shape == b.pos.shape, 'a row and its source molecule differ in atom count'
+    posed = b.clone()
+    posed.pose_aunit(std_orientation=True)
+    batch, heavy = b.batch, (b.z.reshape(-1) > 1).double()[:, None]
+
+    def centred(P):
+        w = torch.zeros(n, 1, dtype=torch.float64).index_add_(0, batch, heavy)
+        c = torch.zeros(n, 3, dtype=torch.float64).index_add_(0, batch, P * heavy) / w
+        return P - c[batch]
+
+    X = centred(posed.pos.double())
+    M = centred(src)
+    R1, e1 = _proper_fit(M, X, batch, n)
+    R2, e2 = _proper_fit(M, -X, batch, n)
+    use1, use2 = e1 < FIT_TOL, (e1 >= FIT_TOL) & (e2 < FIT_TOL)
+    keep = use1 | use2
+    R = torch.where(use1[:, None, None], R1, R2)
+    c = b.aunit_centroid[:, :3].double().clone()
+    c[use2] = -c[use2]
+    c = c - torch.floor(c)
+    shift = c[:, 0] > 0.5
+    c[shift, 0] -= 0.5
+    rv = canonicalize_rotvec(rotmat2rotvec(R.float(), warn_on_bad_determinant=False))
+    b.pos = torch.cat([mol_pos[i] for i in b.identifier]).to(b.pos.dtype)
+    b.aunit_centroid = c.to(b.aunit_centroid.dtype)
+    b.aunit_orientation = rv.to(b.aunit_orientation.dtype)
+    b.aunit_handedness = torch.ones_like(b.aunit_handedness)
+    del posed
+    return keep, int(use2.sum()), int(shift.sum()), int((~keep).sum())
+
+
 def _merge(batches):
     """one batch from many, by MXtalTools append_batch in a balanced tree (log2 copies, not n)"""
     batches = [b for b in batches if b is not None and b.num_graphs > 0]
@@ -272,9 +338,19 @@ def stage_assemble(args, audits, emb):
           f"{args.holdout_seed})", flush=True)
     prior_parts, cond_parts, test_parts, test_prior_parts, prov, test_prov = [], [], [], [], [], []
     per_mol_rows = Counter()
+    n_flipped = n_shifted = n_unfit = 0
     for k in range(args.n_chunks):
         d = torch.load(args.work_dir / f"chunk{k}.pt", weights_only=False)
         b, pv = d['batch'], d['provenance']
+        mol_pos = {str(m.identifier): m.pos for m in torch.load(args.mol_dir / f"qm9_cluster_mols_chunk{k}.pt",
+                                                                 map_location="cpu", weights_only=False)}
+        keep, flipped, shifted, unfit = to_trainer_chart(b, mol_pos)
+        n_flipped += flipped
+        n_shifted += shifted
+        n_unfit += unfit
+        if unfit:
+            rows = torch.nonzero(keep).flatten().tolist()
+            b, pv = b.subsample_new_batch(rows), [pv[i] for i in rows]
         ids = [p[0] for p in pv]
         energy = [p[3] for p in pv]
         best = {}
@@ -297,6 +373,8 @@ def stage_assemble(args, audits, emb):
     prior, cond, test = _merge(prior_parts), _merge(cond_parts), _merge(test_parts)
     test_prior = _merge(test_prior_parts)
     del prior_parts, cond_parts, test_parts, test_prior_parts
+    print(f"trainer chart: {n_flipped:,} rows refitted onto their inversion partner, {n_shifted:,} moved by -1/2 in x, "
+          f"{n_unfit:,} left out (the source molecule fitted neither copy within {FIT_TOL} A)", flush=True)
 
     # the trainer assumes these; check them here, where they are cheap
     p_ids, c_ids, t_ids = set(prior.identifier), set(cond.identifier), set(test.identifier)
@@ -332,7 +410,10 @@ def stage_assemble(args, audits, emb):
         "build": {"script": "build_qm9_full_prior.py", "gfn_commit": gfn_commit, "mxtaltools_commit": mxt_commit,
                   "standardize": "mxtaltools.crystal_search.standardize.standardize_cells",
                   "dup_cut_rdf_envwise": args.dup_cut, "screen_de": args.screen_de, "screen_dpc": args.screen_dpc,
-                  "diverse_below_chunk": args.diverse_below, "keep": args.keep},
+                  "diverse_below_chunk": args.diverse_below, "keep": args.keep,
+                  "trainer_chart": "source molecule refitted, handedness +1, centroid x in [0, 1/2] "
+                                   f"(to_trainer_chart); {n_flipped} onto the inversion partner, {n_shifted} shifted, "
+                                   f"{n_unfit} left out"},
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cond_path, prior_path = args.out_dir / f"{args.tag}_conditions.pt", args.out_dir / f"{args.tag}_prior.pt"
