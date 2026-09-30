@@ -11,8 +11,8 @@ checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling
 checkpoint_name: WARM_CHECKPOINT_PLACEHOLDER
 prior_model_name: PRIOR_MODEL_PLACEHOLDER
 load_weights_only: WEIGHTS_ONLY_PLACEHOLDER
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym1.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym1.pt
 test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
@@ -531,7 +531,7 @@ buffers:
     thin_every_n_evals: 0
     refresh_every_n_evals: 0
     seed_source: prior_dataset
-    max_size: 1612024
+    max_size: 201503
     dup_cutoff: 0.05
     screen_energy_window: 20
     thin_energy_window: 50

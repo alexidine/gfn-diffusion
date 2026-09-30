@@ -11,7 +11,7 @@
 #SBATCH --job-name=ns30
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/nsym_sep30/joblogs/%x_%A_%a.out
 
-# nsym_sep30 leg a: fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior (mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt) at 2x / 5x / 10x anchor noise: weights-only first launch from p23_mip_ft, full resume afterwards.
+# nsym_sep30 leg a: fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior (mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym1.pt, one description per row) at 2x / 5x / 10x anchor noise: weights-only first launch from p23_mip_ft, full resume afterwards.
 # Arm = row of INDEX_a.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge

@@ -1,14 +1,20 @@
 """Symmetrise a crystal prior file under the Euclidean normaliser, in the chart the trainer actually uses.
 
-    python -m data_processing.symmetrize_prior SRC.pt OUT.pt [--device cuda] [--rescore-chunk 1000] [--limit N]
+    python -m data_processing.symmetrize_prior SRC.pt OUT.pt [--layout orbits|one] [--device cuda] [--rescore-chunk 1000] [--limit N]
 
 SCOPE: space group 2 (P-1), Z' = 1, handedness +1 on every row. Anything else is refused.
 
 WHAT IT WRITES. SRC's train.py layout ({prior, equalized_prior, thermal_scaling_factor, ...}; `prior_path` reads
-equalized_prior, `molecules_path` reads prior) with every row of both datasets replaced by ROWS_PER_SOURCE = 8
-consecutive rows, identity first, and OUT's `_provenance.pt` beside it (per row: source index, y/z shift, whether it
-is an opposite-face copy, whether it is a duplicate). Only `aunit_centroid` differs between a row and its source; the
-stored energies are carried over, which the full rescoring below proves is right.
+equalized_prior, `molecules_path` reads prior) with every row of both datasets rewritten, and OUT's `_provenance.pt`
+beside it (per row: source index, y/z shift, whether it is an opposite-face copy, whether it is a duplicate, and under
+`one` the image index). Two layouts:
+  orbits  every source row becomes ROWS_PER_SOURCE = 8 consecutive rows, identity first: exact symmetry, 8x the size.
+  one     every source row is written ONCE, as one of its valid descriptions chosen by `choose_one`: the same size as
+          the source, and the same distribution as `orbits` in the aggregate. The image index cycles within the rows
+          that share a nearest anchor (the file stores noised rows shuffled; `nearest_anchor` recovers the grouping),
+          so an anchor's dozen noised rows spread evenly over its descriptions; the anchor set itself cycles globally.
+Only `aunit_centroid` differs between a row and its source; the stored energies are carried over, which the rescoring
+below proves is right.
 
 THE CHART, and why it is not simply the 8 cosets. N_E(P-1)/P-1 has 8 cosets, the half-cell origin shifts. The trainer
 builds every crystal with aunit_handedness +1 (energies/molecular_crystal.py::MolecularCrystal.init_blank_crystal_batch)
@@ -86,6 +92,36 @@ def image_centroids(centroid: torch.Tensor):
     out[:, 0] = torch.where(second & low, torch.full_like(x, X_BOX), torch.where(second & high, torch.zeros_like(x), x))
     duplicate = second & ~(low | high)
     return out.to(centroid.dtype), source, shift_id, face_copy, duplicate
+
+
+def choose_one(face_copy_ok, group):
+    """One image index in [0, 8) per source row for the `one` layout: rows are visited group by group (a group is the
+    rows sharing a nearest anchor; the anchor set itself is one group) and, separately for a group's rows on an x face
+    (all eight descriptions valid) and its interior rows (four), the image index cycles through the valid set, starting
+    at an offset that itself cycles with the group, so that a group's rows spread evenly over the descriptions its
+    members can take AND groups of one or two rows spread evenly across groups. Deterministic; no row is dropped."""
+    n = len(face_copy_ok)
+    key = group * 2 + face_copy_ok.long()
+    order = torch.argsort(key, stable=True)
+    pos = torch.empty(n, dtype=torch.long)
+    g_sorted = key[order]
+    starts = torch.cat([torch.tensor([0]), torch.nonzero(g_sorted[1:] != g_sorted[:-1]).flatten() + 1, torch.tensor([n])])
+    for a, b in zip(starts[:-1].tolist(), starts[1:].tolist()):
+        pos[order[a:b]] = torch.arange(b - a)
+    return torch.where(face_copy_ok, (pos + group) % ROWS_PER_SOURCE, (pos + group) % 4)
+
+
+def nearest_anchor(latents, anchors, chunk=1024):
+    """Index of the nearest anchor in the 12-D latent (y and z wrapped), for grouping noised rows by the anchor they
+    were noised from. The file stores them shuffled, so this is the only way back to that grouping."""
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    L, A = latents.float().to(dev), anchors.float().to(dev)
+    out = torch.empty(len(L), dtype=torch.long)
+    for lo in range(0, len(L), chunk):
+        x = (L[lo:lo + chunk, None, :] - A[None, :, :]).abs()
+        x[..., 7:9] = torch.minimum(x[..., 7:9], 2 - x[..., 7:9])
+        out[lo:lo + chunk] = x.norm(dim=-1).argmin(1).cpu()
+    return out
 
 
 def symmetrize_batch(batch):
@@ -172,12 +208,18 @@ def check_energy(src, out, prov, device, chunk, name):
     e[distinct] = rescore(out.subsample_new_batch(distinct), device, chunk)
     dup = torch.nonzero(prov['duplicate']).flatten()
     e[dup] = e[dup - 4]
-    # an image against ITS OWN SOURCE ROW rescored the same way (row 8i), and separately the float noise between a
-    # source row's stored and rescored energy. A description the trainer reads as another crystal is off by ~100.
     assert bool(torch.isfinite(e).all()), f'{name}: non-finite rescored energy'
-    own = e[prov['source'] * ROWS_PER_SOURCE, 0]
+    if out.num_graphs == ROWS_PER_SOURCE * src.num_graphs:
+        # orbits layout: an image against ITS OWN SOURCE ROW rescored the same way (row 8i), and separately the float
+        # noise between a source row's stored and rescored energy. A description the trainer reads as another crystal
+        # is off by ~100.
+        own = e[prov['source'] * ROWS_PER_SOURCE, 0]
+        base = (e[::ROWS_PER_SOURCE, 0] - src.elj.float().flatten()).abs()
+    else:
+        # one layout: the source rows are not all present, so rescore them too (same call, same float regime)
+        own = rescore(src, device, chunk)[prov['source'], 0]
+        base = (own - src.elj.float().flatten()[prov['source']]).abs()
     d = (e[:, 0] - own).abs()
-    base = (e[::ROWS_PER_SOURCE, 0] - src.elj.float().flatten()).abs()
     worst = {k: float(d[m].max()) for k, m in (('in-box shift', ~prov['face_copy']), ('opposite-face copy', prov['face_copy'])) if m.any()}
     assert float(d.max()) < ENERGY_TOL, f'{name}: |eLJ(image) - eLJ(source)| up to {float(d.max()):.4f} raw (tolerance {ENERGY_TOL}); {worst}'
     assert float(base.max()) < ENERGY_TOL, f'{name}: stored vs rescored source eLJ differ by up to {float(base.max()):.4f} raw'
@@ -237,30 +279,53 @@ def main(argv=None):
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--rescore-chunk', type=int, default=1000)
     ap.add_argument('--limit', type=int, default=None, help='build from the first N rows of each dataset (a smoke; not a prior)')
+    ap.add_argument('--layout', choices=('orbits', 'one'), default='orbits',
+                    help="orbits: every source row as its 8 rows (exact; 8x the size). one: every source row ONCE, written as one "
+                         "of its valid descriptions chosen by choose_one (same size as the source; symmetric in the aggregate, "
+                         "balanced within each anchor's rows)")
     args = ap.parse_args(argv)
     if os.path.exists(args.out):
         sys.exit(f'{args.out} exists -- refusing to overwrite')
     data = torch.load(args.src, map_location='cpu', weights_only=False)
     out_data, provenance, report = dict(data), {}, {}
+    anchors = data['prior']
     for key in ('prior', 'equalized_prior'):
         src = data[key]
         if args.limit:
             src = src.subsample_new_batch(torch.arange(min(args.limit, src.num_graphs)))
         t0 = time.time()
-        out, prov = symmetrize_batch(src)
-        print(f'[{key}] {src.num_graphs} rows -> {out.num_graphs} rows ({time.time() - t0:.1f}s); checking...', flush=True)
-        report[key] = dict(structure=check_structure(src, out, prov, key),
-                           tool=check_against_tool(src, out, prov, key),
-                           crystal=check_same_crystal(src, out, prov, key),
-                           energy=check_energy(src, out, prov, args.device, args.rescore_chunk, key))
+        orbits, prov = symmetrize_batch(src)
+        print(f'[{key}] {src.num_graphs} rows -> {orbits.num_graphs} orbit rows ({time.time() - t0:.1f}s); checking...', flush=True)
+        # the orbit checks prove every one of the 8 rows; the `one` layout then keeps a subset of proven rows
+        report[key] = dict(structure=check_structure(src, orbits, prov, key),
+                           tool=check_against_tool(src, orbits, prov, key),
+                           crystal=check_same_crystal(src, orbits, prov, key))
+        if args.layout == 'one':
+            if key == 'prior':
+                group = torch.zeros(src.num_graphs, dtype=torch.long)      # the anchors themselves: one group, cycle globally
+            else:
+                group = nearest_anchor(_latents(src), _latents(anchors))
+            face_ok = prov['face_copy'].reshape(-1, ROWS_PER_SOURCE).any(1)
+            k = choose_one(face_ok, group)
+            sel = torch.arange(src.num_graphs) * ROWS_PER_SOURCE + k
+            out = orbits.subsample_new_batch(sel)
+            prov = {name: t[sel] for name, t in prov.items()}
+            prov['image'] = k
+            hist = torch.bincount(k, minlength=ROWS_PER_SOURCE).tolist()
+            report[key]['layout'] = dict(rows=out.num_graphs, groups=int(group.unique().numel()), image_counts=hist,
+                                         face_sources=int(face_ok.sum()), opposite_face_rows=int(prov['face_copy'].sum()))
+            assert not prov['duplicate'].any() and out.num_graphs == src.num_graphs, key
+        else:
+            out = orbits
+        report[key]['energy'] = check_energy(src, out, prov, args.device, args.rescore_chunk, key)
         for part, vals in report[key].items():
             print(f'    {part:<9} ' + ', '.join(f'{k} {v:.4g}' if isinstance(v, float) else f'{k} {v}' for k, v in vals.items()), flush=True)
         out_data[key] = out
         provenance[key] = prov
     torch.save(out_data, args.out)
     stem = args.out[:-3] if args.out.endswith('.pt') else args.out
-    torch.save(dict(source_file=os.path.abspath(args.src), rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS, x_box=X_BOX,
-                    face_tol=FACE_TOL, limit=args.limit, report=report, **provenance), stem + '_provenance.pt')
+    torch.save(dict(source_file=os.path.abspath(args.src), layout=args.layout, rows_per_source=ROWS_PER_SOURCE, yz_shifts=YZ_SHIFTS,
+                    x_box=X_BOX, face_tol=FACE_TOL, limit=args.limit, report=report, **provenance), stem + '_provenance.pt')
     print(f'wrote {args.out} ({os.path.getsize(args.out):,} bytes) and {stem}_provenance.pt')
 
 

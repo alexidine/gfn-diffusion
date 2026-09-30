@@ -8,7 +8,7 @@ through the energy function is the proof on real data (the module's own checks).
 import pytest
 import torch
 
-from energy_sampling.data_processing.symmetrize_prior import (CELL_EDGE, ROWS_PER_SOURCE, X_BOX, YZ_SHIFTS,
+from energy_sampling.data_processing.symmetrize_prior import (CELL_EDGE, ROWS_PER_SOURCE, X_BOX, YZ_SHIFTS, choose_one,
                                                                image_centroids)
 
 INTERIOR = [0.20, 0.30, 0.70]
@@ -69,6 +69,32 @@ def test_a_shift_landing_in_the_clip_sliver_snaps_to_zero():
 def test_a_centroid_outside_the_box_is_refused(bad):
     with pytest.raises(ValueError):
         _images(bad)
+
+
+def test_one_layout_cycles_the_valid_images_within_each_group():
+    # group 0: five interior rows cycle 0..3 from offset 0; group 1: three face rows cycle 0..7 from offset 1
+    face = torch.tensor([False, True, False, True, False, True, False, False])
+    group = torch.tensor([0, 1, 0, 1, 0, 1, 0, 0])
+    k = choose_one(face, group)
+    assert k[group == 0].tolist() == [0, 1, 2, 3, 0]
+    assert k[group == 1].tolist() == [1, 2, 3]
+    assert bool((k[~face] < 4).all())                        # an interior row never takes an x-shifted image
+
+
+def test_one_layout_mixed_group_cycles_interior_and_face_rows_separately():
+    # one group, interior and face rows interleaved: each class cycles its own valid set from its own offset
+    face = torch.tensor([False, True] * 8)
+    k = choose_one(face, torch.zeros(16, dtype=torch.long))
+    assert k[~face].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert k[face].tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_one_layout_spreads_singleton_groups_across_the_images():
+    # 4000 groups of one interior row and 800 of one face row: the offsets alone must balance the images
+    face = torch.tensor([False] * 4000 + [True] * 800)
+    k = choose_one(face, torch.arange(4800))
+    assert torch.bincount(k[~face], minlength=4).tolist() == [1000] * 4
+    assert torch.bincount(k[face], minlength=8).tolist() == [100] * 8
 
 
 def test_the_constant_matches_mxtaltools():

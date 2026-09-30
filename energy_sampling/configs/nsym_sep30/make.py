@@ -1,4 +1,4 @@
-"""nsym_sep30 -- fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior at 2x, 5x and 10x the usual anchor noise
+﻿"""nsym_sep30 -- fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior at 2x, 5x and 10x the usual anchor noise
 (owner 2026-09-30: "symmetrized prior runs on mip+ELJ, at 2x, 5x, 10x our usual anchor noise"; "a weights-only
 restart from our best current model").
 
@@ -6,10 +6,13 @@ restart from our best current model").
 
 THE ARMS: ns30_mip_x2 / _x5 / _x10 = p23_mip_ft's config (the prod_sep20 production shape: every 5th step, P_B frozen,
 replay pinned 0.3 / bwd 0.7, tau 600, rate 0.5, batch 1600) with
-  * prior_path and molecules_path -> PRIOR_NEW, the symmetrised prior (data_processing/symmetrize_prior.py: every row
-    of `prior` and `equalized_prior` written as 8 rows -- its four half-cell y/z shifts, then the same four again, on
-    the opposite x face for a row sitting on one and as duplicates otherwise; handedness +1 throughout; every distinct
-    row rescored through the trainer's analyze call against its source).
+  * prior_path and molecules_path -> PRIOR_NEW, the symmetrised prior (data_processing/symmetrize_prior.py, layout
+    `one`: every row of `prior` and `equalized_prior` written once, as one of the descriptions the trainer can build
+    -- its four half-cell y/z shifts, plus the opposite x face for a row sitting on one -- with the description index
+    cycling within the rows that share a nearest anchor, so the file keeps the source's size and row statistics while
+    the x faces and the y/z images come out balanced; handedness +1 throughout; every row rescored through the
+    trainer's analyze call against its source. The exact 8-rows-per-source `orbits` build of the same file exists
+    beside it as *_nsym.pt, 1.6M rows).
   * a WEIGHTS-ONLY first launch from p23_mip_ft (prior_path is part of the problem identity;
     warm_start_ignore_problem_keys: [prior_path] exempts it on the weights-only path and nowhere else). It carries the
     weights and the frozen P_B snapshot; optimiser, buffers, log Z bootstrap and the step count start fresh. The yaml
@@ -17,8 +20,8 @@ replay pinned 0.3 / bwd 0.7, tau 600, rate 0.5, batch 1600) with
     resubmission, which then resumes the arm's own checkpoint in full.
   * buffers.anchor_buffer.noise_log_range shifted up by log10(factor): the churn's log-uniform isotropic latent noise,
     [-2.5, -1.5] in mk_dev, i.e. magnitudes 0.003-0.032 against a measured 1 kT kick of ~0.025.
-  * buffers.anchor_buffer.max_size = the symmetrised row count, so no path can trim an orbit (the buffer is frozen and
-    its thin pass is off, so nothing does today; the seed is every prior-dataset row).
+  * buffers.anchor_buffer.max_size = the row count, so no path can trim the seed (the buffer is frozen and its thin
+    pass is off, so nothing does today; the seed is every prior-dataset row).
   * the box and reduction penalties at p23's ramp target 1000 as plain config values, no coeff_schedule.
 The entry is the production one: the train_prior stub exits at the first eval (step 50 of a fresh step count) and
 equilibration's on_enter rebuilds the prior buffer by churn from the symmetrised anchors at the arm's noise, bootstraps
@@ -26,9 +29,6 @@ log Z from 4000 rollouts and keeps the restored P_B snapshot (freeze_pb:full on 
 
 SYMMETRY UNDER NOISE: the images differ from their source by latent shifts in y/z and a swap of the two x faces, all
 latent isometries, so isotropic latent noise on a symmetrised anchor set is symmetric in distribution at any amplitude.
-The seeded prior buffer is a random 250k of the 1.6M rows (statistically symmetric) and is replaced at step 50.
-
-COST: the startup re-analysis scans 1,612,024 rows (8x p23's), on every launch.
 
 SEED: the sbatch takes p23_mip_ft's newest 5000-step archive, or its _running.pt with SRC_RUNNING=1 (the arm must not
 be running then). PRIOR_NEW must be on the cluster at the production priors directory with exactly PRIOR_NEW_BYTES.
@@ -59,9 +59,9 @@ N = 5
 SRC_ARM = 'p23_mip_ft'
 SRC_YAML = 'prod_sep23_ft/p23_mip_ft.yaml'
 PRIOR_OLD = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt'
-PRIOR_NEW = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym.pt'
-PRIOR_NEW_BYTES = 1_292_550_405   # from the 2026-09-30 build (the sbatch refuses a file of any other size)
-PRIOR_NEW_ROWS = 1_612_024   # equalized_prior rows = 8 x 201,503
+PRIOR_NEW = 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2_nsym1.pt'
+PRIOR_NEW_BYTES = 165_623_885   # from the 2026-09-30 build (the sbatch refuses a file of any other size)
+PRIOR_NEW_ROWS = 201_503     # equalized_prior rows, one description per source row
 LOCAL_PRIOR = pathlib.Path('D:/crystal_datasets/conditional/priors') / PRIOR_NEW
 NOISE_BASE = [-2.5, -1.5]
 FACTORS = {'x2': 2.0, 'x5': 5.0, 'x10': 10.0}
@@ -177,7 +177,7 @@ def main(argv):
     with (HERE / f'submit_{BATTERY}.sbatch').open('w', encoding='utf-8', newline='\n') as f:
         f.write(fin.SBATCH.format(wall=fin.WALL, last=len(arms) - 1, tag=TAG, battery=BATTERY, leg='a',
                                   ckpts=fin.w3.CLUSTER_CKPTS, data=fin.w3.CLUSTER_DATA, seed_block=fin.SEED_B,
-                                  what=f'fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior ({PRIOR_NEW}) at 2x / 5x / 10x anchor noise: weights-only first launch from {SRC_ARM}, full resume afterwards.'))
+                                  what=f'fine-tuning on the normaliser-symmetrised MIPCAS eLJ prior ({PRIOR_NEW}, one description per row) at 2x / 5x / 10x anchor noise: weights-only first launch from {SRC_ARM}, full resume afterwards.'))
     for i, (name, (cfg, factor)) in enumerate(arms.items()):
         lo, hi = cfg['buffers']['anchor_buffer']['noise_log_range']
         print(f"[{i}] {name:<12} anchor noise x{factor:g}: log10 range [{lo}, {hi}] = latent {10 ** lo:.4f} to {10 ** hi:.4f}; "
