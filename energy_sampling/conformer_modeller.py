@@ -1726,13 +1726,17 @@ class ConformerModeller(Modeller):
         return batch
 
     @staticmethod
-    def _read_graph_file(path, what):
-        blob = torch.load(path, weights_only=False, map_location='cpu')
+    def _require_graph_file(blob, path, what):
         if not isinstance(blob, dict) or 'prior' not in blob:
             raise SystemExit(
                 f'{path} is not a graph-form {what} file; expected a dict with a `prior` key '
                 f'as written by build_conformer_conditions.py')
         return blob
+
+    @staticmethod
+    def _read_graph_file(path, what):
+        blob = torch.load(path, weights_only=False, map_location='cpu')
+        return ConformerModeller._require_graph_file(blob, path, what)
 
     def _refuse_stereo_mismatch(self, batch, path, what):
         """SystemExit when any graph of a file was built under another stereo-lock coefficient.
@@ -1982,12 +1986,24 @@ class ConformerModeller(Modeller):
         cfg = self.args.buffers.anchor_buffer
         steps = int(getattr(cfg, 'seed_relax_steps', 0) or 0)
         if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset' or steps <= 0:
-            if raw is None or getattr(cfg, 'seed_source', 'generated') != 'prior_dataset':
+            if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset':
                 return super().init_anchor_buffer_seed()
-            # anchors mark where the good states are: seed them from the rows BEFORE the
-            # thermal noise, by the same stand-in as the relaxed seed below
+            # anchors mark where the good states are: under prior_dataset_noise they are
+            # seeded from the rows BEFORE the noise. A COMPACT source hands the base method
+            # its bounded selection (_anchor_seed_row_batches) through `row_batches`, which
+            # train.py::_dataset_row_batches reads; a graph batch is handed over whole. Both
+            # by the same stand-in as the relaxed seed below.
+            source = self.prior_dataset if raw is None else raw
+            if getattr(source, 'is_compact', False):
+                stand_in = types.SimpleNamespace(
+                    batch=source.batch,
+                    row_batches=lambda limit=None: self._anchor_seed_row_batches(source))
+            elif raw is None:
+                return super().init_anchor_buffer_seed()
+            else:
+                stand_in = types.SimpleNamespace(batch=raw)
             saved = self.prior_dataset
-            self.prior_dataset = types.SimpleNamespace(batch=raw)
+            self.prior_dataset = stand_in
             try:
                 return super().init_anchor_buffer_seed()
             finally:
@@ -2104,6 +2120,177 @@ class ConformerModeller(Modeller):
               f'{float(excess.median()):.1f} kT (the anchor seed keeps the unnoised rows)')
         return noised
 
+    def _prior_noise_mode(self):
+        mode = getattr(self.args, 'prior_dataset_noise', None) or 'none'
+        if mode not in ('none', 'thermal'):
+            raise ValueError(f"prior_dataset_noise must be 'none' or 'thermal', got {mode!r}")
+        return mode
+
+    def _compact_prior_store(self, keys, columns):
+        """A compact prior-dataset store from per-row columns and each row's slot in the
+        conditions table (buffer.py::ConformerCompactRows.from_columns)."""
+        from buffer import ConformerCompactRows
+
+        rows = ConformerCompactRows.from_columns(self.conformer_statics, keys, columns,
+                                                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
+        return ConformerBuffer(rows,
+                               device=self.buffer_device,
+                               **self._buffer_kwargs(),
+                               x_fn=None,
+                               y_fn=self._buffer_y_fn(),
+                               exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
+                               )
+
+    def _init_compact_prior_dataset(self, blob, path):
+        """The prior dataset from a COMPACT prior file (`energies/conformer_data.py::
+        compact_prior`): each row's state and energy, joined to the conditions table by its
+        condition's identifier. No graph is built per row; the steps that need graphs (the
+        thermal noise) take `COMPACT_CHUNK_ROWS` rows at a time.
+
+        Refused: a run without a conditions table (`molecules_path` unset or without
+        identifiers); an identifier the table lacks; a state width, a condition's
+        free-column mask or its atom count that is not the table's; a non-zero pad column.
+        The reference-conformer and stereo-lock checks the graph form runs per row are the
+        conditions file's own here (`init_mol_dataset`): a compact row has no graph of its
+        own to differ from its condition's.
+
+        Under `prior_dataset_noise: thermal` the rows as stored are kept as a second compact
+        store, `_prior_dataset_raw`, for the anchor seed, as `_maybe_noise_prior_rows` keeps
+        the graph form's.
+        """
+        from buffer import COMPACT_CHUNK_ROWS, chunk_bounds
+        from energies.conformer_data import (PRIOR_COMPACT_FORMAT, batch_states,
+                                             check_compact_prior, state_dim, wrap_state)
+
+        statics = getattr(self, 'conformer_statics', None)
+        if statics is None:
+            raise SystemExit(
+                f'{path} is a compact prior file ({PRIOR_COMPACT_FORMAT}): its rows carry a '
+                f'state, an energy and a condition, and read everything else from the '
+                f'conditions table, which this run does not have (molecules_path must name '
+                f'the conditions file the prior was built with, one identifier per graph)')
+        try:
+            check_compact_prior(blob, path)
+        except ValueError as err:
+            raise SystemExit(str(err)) from None
+        idents = list(blob['identifiers'])
+        missing = [i for i in idents if i not in statics.slot_of]
+        if missing:
+            raise SystemExit(
+                f'{path}: {len(missing)} of its {len(idents)} condition(s) are not in the '
+                f'conditions table ({self.args.molecules_path}), e.g. '
+                f'{self._name_some(missing)}. The prior file and the conditions file must '
+                f'come from one build_conformer_set.py run')
+        slots = torch.tensor([statics.slot_of[i] for i in idents], dtype=torch.long)
+        table = statics.batch
+        x, e = blob['torsion_state'], blob['conformer_energy'].reshape(-1)
+        ci = blob['condition_index'].long()
+        n, K = int(x.shape[0]), int(x.shape[1])
+        if n < 2:
+            raise SystemExit(f'{path}: {n} prior row(s); a prior dataset needs at least 2')
+        table_mask = table._store.get('state_mask', None)
+        if K != state_dim(table) or table_mask is None:
+            raise SystemExit(
+                f'{path}: states are {K} wide; the conditions table '
+                f'({self.args.molecules_path}) is {state_dim(table)} wide'
+                + ('' if table_mask is not None else ' and carries no state_mask'))
+        want_mask = table_mask.reshape(int(table.num_graphs), -1).bool()[
+            slots.to(table_mask.device)].cpu()
+        bad = (want_mask != blob['state_mask'].bool()).any(1) \
+            | (statics.atom_counts(slots) != blob['n_atoms'].long())
+        if bool(bad.any()):
+            raise SystemExit(
+                f'{path}: {int(bad.sum())} of its {len(idents)} condition(s) record a '
+                f'free-column mask or an atom count that is not the conditions table\'s '
+                f'({self.args.molecules_path}), e.g. '
+                f'{self._name_some([idents[j] for j in torch.nonzero(bad).reshape(-1).tolist()])}'
+                f'. The prior file and the conditions file must come from one '
+                f'build_conformer_set.py run')
+        mask = blob['state_mask'].bool()
+        for i in range(0, n, 16 * COMPACT_CHUNK_ROWS):
+            j = slice(i, i + 16 * COMPACT_CHUNK_ROWS)
+            if bool((x[j][~mask[ci[j]]] != 0).any()):
+                raise SystemExit(f'{path}: a prior row has a non-zero PAD column (rows '
+                                 f'{i}..{min(n, j.stop) - 1}); pads are 0 in every stored state')
+
+        # CAST TO THE RUN'S DTYPE, as the graph form is: states feed the policy
+        want = torch.get_default_dtype()
+        columns = {'torsion_state': x.to(want), 'conformer_energy': e.to(want)}
+        for name, val in (blob.get('rows') or {}).items():
+            columns[name] = val.to(want) if val.is_floating_point() else val
+        keys = slots[ci]
+        store = self._compact_prior_store(keys, columns)
+
+        if self._prior_noise_mode() == 'thermal':
+            # every row replaced by ONE noised copy, re-baked, a chunk of graphs at a time
+            self._prior_dataset_raw = store
+            periodic = self.energy_function.periodic_dims
+            xs, es = [], []
+            for i, j in chunk_bounds(n, COMPACT_CHUNK_ROWS):
+                sub = store.batch.subsample_new_batch(torch.arange(i, j))
+                state = batch_states(sub).to(self.device)
+                xn = wrap_state(self._thermal_displace(sub, state, c=1.0), periodic)
+                es.append(self._bake_rows(sub, xn).detach().cpu().reshape(-1).to(want))
+                xs.append(xn.detach().cpu().to(want))
+            noised = dict(columns, torsion_state=torch.cat(xs), conformer_energy=torch.cat(es))
+            raw_e = columns['conformer_energy'].double()
+            excess = (noised['conformer_energy'].double() - raw_e) \
+                / float(self.energy_function.temperature)
+            print(f'prior dataset: prior_dataset_noise THERMAL -- {n:,} rows replaced by '
+                  f'noised copies, median energy {float(raw_e.median()):.1f} -> '
+                  f'{float(noised["conformer_energy"].double().median()):.1f} kcal/mol, '
+                  f'median excess {float(excess.median()):.1f} kT (the anchor seed keeps the '
+                  f'unnoised rows)')
+            columns = noised
+            store = self._compact_prior_store(keys, columns)
+        self.prior_dataset = store
+
+        en = columns['conformer_energy'].double().numpy()
+        teff = 1 + 2 * (float(np.median(en)) - float(en.min())) / self.energy_function.ndim
+        print(f'prior dataset: {n:,} rows over {len(idents)} MOLECULES from {path} '
+              f'(compact form, {store.batch.nbytes() / max(n, 1):.0f} B per row) -- median '
+              f'{np.median(en):.1f}, p10 {np.percentile(en, 10):.1f}, '
+              f'p90 {np.percentile(en, 90):.1f} kcal/mol, T_eff/T = {teff:.2f}')
+        if 'embedding' in table._store:
+            print(f'               molecular embeddings present on the conditions table '
+                  f'({tuple(table.embedding.shape)}), so the backward branch is '
+                  f'condition-aware')
+
+    def _anchor_seed_row_batches(self, source):
+        """The anchor seed's rows from a COMPACT prior-dataset store `source`: at most
+        `buffers.anchor_buffer.max_size` of them, each condition's lowest-energy rows
+        (buffer.py::lowest_rows_per_condition), a chunk of graphs at a time.
+
+        `buffers.anchor_buffer.seed_rows_per_condition` sets the rows per condition; null
+        or absent takes every row when the dataset fits `max_size`, and otherwise the most
+        rows per condition that fit. Refused when even that does not fit: more conditions
+        than `max_size`, or the configured count times the conditions above it. A full
+        (graph-row) prior dataset does not come through here (`init_anchor_buffer_seed`):
+        it is handed over whole, as on the crystal route, and is the single-molecule draw
+        or a relaxed re-draw, `energy_config.prior_sample_size` rows.
+        """
+        from buffer import COMPACT_CHUNK_ROWS, chunk_bounds, lowest_rows_per_condition
+
+        cfg = self.args.buffers.anchor_buffer
+        max_size = int(cfg.max_size)
+        per_condition = getattr(cfg, 'seed_rows_per_condition', None)
+        keys = source.batch.keys
+        energy = torch.as_tensor(source.batch.conformer_energy).detach().reshape(-1).cpu()
+        try:
+            rows, k, n_cond = lowest_rows_per_condition(keys, energy, max_size, per_condition)
+        except ValueError as err:
+            raise SystemExit(
+                f'anchor seed from the prior dataset ({len(source):,} rows): {err}. Set '
+                f'buffers.anchor_buffer.max_size and '
+                f'buffers.anchor_buffer.seed_rows_per_condition so that the seed fits') \
+                from None
+        print(f'anchor seed: {len(rows):,} of {len(source):,} prior-dataset rows, the '
+              f'lowest-energy {k} per condition over {n_cond:,} condition(s) '
+              f'(buffers.anchor_buffer.max_size {max_size:,}, seed_rows_per_condition '
+              f'{per_condition})')
+        return (source.batch.subsample_new_batch(rows[i:j])
+                for i, j in chunk_bounds(int(rows.numel()), COMPACT_CHUNK_ROWS))
+
     def _bake_rows(self, batch, states, chunk: int = 2048):
         """Baked ``conformer_energy`` (T = 1) for ``states`` on ``batch``'s rows, ``[n]``.
 
@@ -2159,8 +2346,19 @@ class ConformerModeller(Modeller):
         # read by nothing.
         graph_prior = getattr(self.args, 'prior_path', None)
         if graph_prior:
-            blob = self._read_graph_file(graph_prior, 'prior')
+            from energies.conformer_data import PRIOR_GRAPH_FORMAT, is_compact_prior
+            blob = torch.load(graph_prior, weights_only=False, map_location='cpu')
+            if is_compact_prior(blob):
+                # COMPACT FORM: state, energy and condition per row. Joined to the conditions
+                # table without a graph per row ever being built.
+                self._init_compact_prior_dataset(blob, graph_prior)
+                return
+            self._require_graph_file(blob, graph_prior, 'prior')
             batch = blob.get('equalized_prior', None) or blob['prior']
+            print(f'prior file {graph_prior}: GRAPH form ({PRIOR_GRAPH_FORMAT}), one full '
+                  f'condition graph per row, read WHOLE ({batch.num_graphs:,} rows) before it '
+                  f'is compacted. build_conformer_set.py now writes the compact form, which '
+                  f'is joined to the conditions table without that.')
             # CAST TO THE RUN'S DTYPE. build_conformer_conditions runs under float64 for its
             # geometry checks, so every float tensor on the file is double while the run is
             # float32. Storage precision is only free where the tensor never meets a

@@ -152,11 +152,30 @@ RUNGS = {
 #: the anchor buffer >= 40 (stage-0 audit TRK-8).
 BUFFER_CAPS = dict(prior=100_000, anchor=100_000, replay=50_000, prior_sample=50_000)
 FLOOR_PER_CONDITION = dict(prior_rebuild=20, prior_sample=20, anchor=40)
-#: Bytes of one stored conformer row: the top of the stage-0 measurement, 23-41 KB per row at
-#: float32, QM9 at `full` (audit CFG-8). Every budget below multiplies it.
+#: Bytes of one conformer row stored as a FULL graph (a run without a conditions table,
+#: cfg:molecules_path unset; buffer.py::ConformerGraphHooks): the top of the stage-0
+#: measurement, 23-41 KB per row at float32, QM9 at `full` (audit CFG-8).
 BYTES_PER_ROW_MAX = 41_000
-#: VRAM budget for the rows held on cfg:buffer_device (the three buffers at their caps and
-#: the prior dataset): card x cfg:cuda_memory_fraction x BUFFER_SHARE. LOCAL_CARD_BYTES is
+#: A COMPACT row (buffer.py::ConformerCompactRows; every store of a run with cfg:molecules_path)
+#: is its state and energy, K + 1 float32, and row_bytes builds each store's figure from that.
+#: K_MAX is QM9's widest carrier at `full`, the 3 x 29 - 6 internal coordinates of its largest
+#: molecule, and ATOMS_MAX that molecule's atoms: the ceilings used for every set.
+K_MAX = 81
+ATOMS_MAX = 29
+#: stored force legs per replay row (buffer.py::N_FORCE_LEGS)
+FORCE_LEGS = 3
+#: Host bytes of a compact row beside its device bytes: its key and atom count and the
+#: per-row bookkeeping columns. MEASURED 58 (prior buffer) and 72 (anchor buffer) on the
+#: buffer sidecar of a CPU run of conformer_mk on 88 conditions, 2026-10-01
+#: (artifacts/conformer_compact_prior_2026-10-01/footprint.py). Counted in the sidecars.
+COMPACT_HOST_BYTES_PER_ROW = 72
+#: Bytes per condition of the conditions table compact rows join (mol_dataset's batch, on
+#: cfg:buffer_device, float32). MEASURED 39,183 at K = 75 over the 3,486 conditions of a QM9
+#: database rung (the same script, 2026-10-01); 42,000 is that scaled to K_MAX.
+TABLE_BYTES_PER_CONDITION_MAX = 42_000
+#: VRAM budget for what the stores hold on cfg:buffer_device (the three buffers at their
+#: caps, the prior dataset, and under compact storage the conditions table; vram_bytes): card
+#: x cfg:cuda_memory_fraction x BUFFER_SHARE. LOCAL_CARD_BYTES is
 #: the local card (audit CFG-8), which tests/config/test_conformer_canonical_contract.py
 #: holds configs/conformer_mk.yaml to. CARD_BYTES (the smaller A100) and BUFFER_SHARE are
 #: WORKING ASSUMPTIONS; revisit from the vram ledger of the first R1 leg.
@@ -164,8 +183,8 @@ CARD_BYTES = 40e9
 LOCAL_CARD_BYTES = 16.3e9
 BUFFER_SHARE = 0.5
 #: Disk budget for the ladder's buffer sidecars: per arm, one frozen copy per archive
-#: (epochs // archive_period) plus the rolling one, each (prior + anchor + replay max_size)
-#: x BYTES_PER_ROW_MAX. WORKING ASSUMPTION: the ladder's share of the cluster scratch quota,
+#: (epochs // archive_period) plus the rolling one, each the prior, anchor and replay buffers
+#: at max_size x their row_bytes (sidecar_disk_bytes). WORKING ASSUMPTION: the ladder's share of the cluster scratch quota,
 #: which no file in the repository records.
 DISK_BUDGET_BYTES = 1.0e12
 
@@ -352,40 +371,78 @@ def refuse_local_paths(cfg, name, committed=committed_at_head):
                              f'committed at HEAD, so a cluster clone does not have it')
 
 
-def buffer_rows(cfg):
-    """Rows the run holds on cfg:buffer_device at its caps: the three buffers and the prior
-    dataset."""
-    b = cfg['buffers']
-    return (int(b['prior_buffer']['max_size']) + int(b['anchor_buffer']['max_size'])
-            + int(b['replay_buffer']['max_size']) + int(cfg['energy_config']['prior_sample_size']))
+def stores_compact(cfg):
+    """True when the run's stores hold compact rows: ConformerModeller builds the conditions
+    table from cfg:molecules_path (_init_conformer_statics), and every store joins it."""
+    return bool(cfg.get('molecules_path'))
 
 
-def sidecar_rows(cfg):
-    """Rows in one buffer sidecar at the caps (checkpointing.Checkpointer.buffer_state)."""
+def row_bytes(cfg, K=K_MAX):
+    """Bytes of one row on cfg:buffer_device, per store, in the form the run stores it.
+
+    Full graph rows: BYTES_PER_ROW_MAX everywhere. Compact rows, K the carrier width: the
+    prior dataset holds a row's state and energy once (twice under prior_dataset_noise
+    'thermal', which keeps the rows as built beside the noised ones); the churned prior and
+    anchor buffers hold them twice (the row fields, and the buffer's own x and y once a row
+    has been admitted or purged) plus one more per-row scalar; a replay row adds its stored
+    trajectory (integrator.T + 1 states), its force legs and its oriented positions."""
+    if not stores_compact(cfg):
+        return dict.fromkeys(('prior', 'anchor', 'replay', 'prior_sample'), BYTES_PER_ROW_MAX)
+    state = 4 * K + 4
+    churned = 2 * state + 4
+    steps = int(cfg['integrator']['T']) + 1
+    return {'prior': churned, 'anchor': churned,
+            'replay': churned + 4 * K * (steps + FORCE_LEGS) + 12 * ATOMS_MAX,
+            'prior_sample': state * (2 if cfg.get('prior_dataset_noise') == 'thermal' else 1)}
+
+
+def store_rows(cfg):
+    """Rows each store holds on cfg:buffer_device at its cap: the three buffers and the prior
+    dataset. A buffer sidecar holds the three buffers' (checkpointing.Checkpointer.buffer_state)."""
     b = cfg['buffers']
-    return (int(b['prior_buffer']['max_size']) + int(b['anchor_buffer']['max_size'])
-            + int(b['replay_buffer']['max_size']))
+    return {'prior': int(b['prior_buffer']['max_size']),
+            'anchor': int(b['anchor_buffer']['max_size']),
+            'replay': int(b['replay_buffer']['max_size']),
+            'prior_sample': int(cfg['energy_config']['prior_sample_size'])}
 
 
 def sidecar_disk_bytes(cfg):
     """Bytes of every buffer sidecar a run leaves on disk at its caps: one frozen copy per
-    archive, plus the rolling one."""
+    archive, plus the rolling one. Each holds the three buffers' rows as the run stores them
+    (row_bytes), a compact row with its host columns."""
     period = int(cfg.get('archive_period') or 0)
     n_frozen = int(cfg['epochs']) // period if period > 0 and cfg.get('archive_buffers') else 0
-    return (n_frozen + 1) * sidecar_rows(cfg) * BYTES_PER_ROW_MAX
+    per, rows = row_bytes(cfg), store_rows(cfg)
+    host = COMPACT_HOST_BYTES_PER_ROW if stores_compact(cfg) else 0
+    one = sum(rows[k] * (per[k] + host) for k in ('prior', 'anchor', 'replay'))
+    return (n_frozen + 1) * one
 
 
-def refuse_over_vram(cfg, name, card_bytes):
-    """Buffer rows x BYTES_PER_ROW_MAX must fit card x cuda_memory_fraction x BUFFER_SHARE
-    when the buffers live on the card."""
+def vram_bytes(cfg, n_conditions=0):
+    """Bytes the run's stores hold on cfg:buffer_device at their caps: each store's rows at
+    row_bytes, and under compact storage the conditions table, n_conditions x
+    TABLE_BYTES_PER_CONDITION_MAX."""
+    per, rows = row_bytes(cfg), store_rows(cfg)
+    table = n_conditions * TABLE_BYTES_PER_CONDITION_MAX if stores_compact(cfg) else 0
+    return sum(rows[k] * per[k] for k in rows) + table
+
+
+def refuse_over_vram(cfg, name, card_bytes, n_conditions=0):
+    """What the stores hold on the card (vram_bytes: the rows in the form the run stores
+    them, compact or full, plus the conditions table of n_conditions) must fit card x
+    cuda_memory_fraction x BUFFER_SHARE when the buffers live on the card."""
     if not str(cfg['buffer_device']).startswith('cuda'):
         return
-    need = buffer_rows(cfg) * BYTES_PER_ROW_MAX
+    need = vram_bytes(cfg, n_conditions)
     budget = card_bytes * float(cfg['cuda_memory_fraction']) * BUFFER_SHARE
     if need > budget:
-        raise SystemExit(f'REFUSING {name}: {buffer_rows(cfg):,} rows on {cfg["buffer_device"]} '
-                         f'(prior, anchor and replay max_size and prior_sample_size) x '
-                         f'{BYTES_PER_ROW_MAX:,} B = {need / 1e9:.1f} GB, above the '
+        per, rows = row_bytes(cfg), store_rows(cfg)
+        form = 'compact' if stores_compact(cfg) else 'full graph'
+        detail = ', '.join(f'{k} {rows[k]:,} x {per[k]:,} B' for k in rows)
+        raise SystemExit(f'REFUSING {name}: the stores on {cfg["buffer_device"]} hold '
+                         f'{need / 1e9:.1f} GB at their caps ({form} rows: {detail}; conditions '
+                         f'table {n_conditions:,} x {TABLE_BYTES_PER_CONDITION_MAX:,} B'
+                         f'{"" if stores_compact(cfg) else ", not held"}), above the '
                          f'{budget / 1e9:.1f} GB buffer budget of a {card_bytes / 1e9:.1f} GB card')
 
 
@@ -578,7 +635,7 @@ def check_arm(cfg, name, spec, n_conditions, mk_dev, contract, committed=committ
         if rows[key] < floor * n:
             raise SystemExit(f'REFUSING {name}: {key} holds {rows[key]:,.0f} rows, below '
                              f'{floor} per condition x {n} conditions')
-    refuse_over_vram(cfg, name, CARD_BYTES)
+    refuse_over_vram(cfg, name, CARD_BYTES, n_conditions)
 
     # --- the rule set, every severity: this is a canonical-derived production arm
     sys.path.insert(0, str(ES))
@@ -840,7 +897,7 @@ def main(argv):
               f"{stage(cfg, 'train_prior')['max_steps']:,} of epochs {cfg['epochs']:,} | RDKit "
               f"{arm['rdkit']} | " + ' '.join(f'{rel} ({size:,} B)' for rel, size, _h in arm['artifacts']))
         print(f"    buffer sidecars at the caps: {sidecar_disk_bytes(cfg) / 1e9:,.0f} GB on disk; the "
-              f"rolling one, {sidecar_rows(cfg) * BYTES_PER_ROW_MAX / 1e9:.1f} GB, is rewritten every "
+              f"rolling one, {sidecar_disk_bytes(dict(cfg, archive_period=0)) / 1e9:.1f} GB, is rewritten every "
               f"{cfg['eval_period']} steps")
     print(f'stage to {CLUSTER_SETS}/ before submitting: the files above, same relative paths')
     return 0

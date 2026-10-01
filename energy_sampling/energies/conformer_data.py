@@ -1039,22 +1039,113 @@ def save_condition_file(batch, path):
     return path
 
 
-def save_prior_file(batch, path, equalized=None, **extra):
-    """Write the ``prior_path`` form: ``{'prior': ..., 'equalized_prior': ...}``.
+#: `prior_format` of a COMPACT conformer prior file: per row its state, its energy and the
+#: index of its condition, with nothing a condition's rows share (`compact_prior`).
+PRIOR_COMPACT_FORMAT = 'conformer_prior_compact_v1'
+#: `prior_format` recorded for the graph form, one full condition graph per row
+#: (`{'prior': batch, 'equalized_prior': batch}`). A file without the key is this form.
+PRIOR_GRAPH_FORMAT = 'conformer_prior_graph_v1'
 
-    ``init_prior_dataset`` reads ``equalized_prior`` and nothing else, so that key is the
-    one that matters; 'prior' rides along for symmetry with the crystal/toy files. When
-    ``equalized`` is None the same batch serves both roles -- for a mode-covering
-    conformer prior, the distinction the crystal files draw (Boltzmann-weighted vs
-    per-condition-equalised) has no content yet.
+
+def compact_prior(identifiers, counts, states, energies, state_masks, n_atoms, rows=None):
+    """The compact prior form: rows grouped by condition, in ``identifiers`` order.
+
+    ``identifiers`` are the conditions that hold rows and ``counts`` their row counts;
+    ``states`` ``[n, K]`` (carrier form) and ``energies`` ``[n]`` are the rows, condition by
+    condition; ``state_masks`` ``[len(identifiers), K]`` and ``n_atoms`` are each condition's
+    free-column mask and atom count, which the loader holds against the conditions table it
+    joins the rows to. ``rows`` is any further per-row field, ``{name: [n, ...]}``. Everything
+    else a row needs (atoms, internal-coordinate tree, embeddings) is its condition's and is
+    read from the conditions file.
+    """
+    identifiers = list(identifiers)
+    counts = torch.as_tensor(counts, dtype=torch.long).reshape(-1)
+    states = torch.as_tensor(states)
+    energies = torch.as_tensor(energies).reshape(-1)
+    state_masks = torch.as_tensor(state_masks).bool()
+    n_atoms = torch.as_tensor(n_atoms, dtype=torch.long).reshape(-1)
+    n = int(counts.sum())
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError('compact prior: a condition is listed twice')
+    if not (len(identifiers) == counts.numel() == n_atoms.numel() == state_masks.shape[0]):
+        raise ValueError('compact prior: identifiers, counts, state_masks and n_atoms differ '
+                         'in length')
+    if states.dim() != 2 or states.shape[0] != n or energies.numel() != n             or state_masks.shape[1] != states.shape[1]:
+        raise ValueError(f'compact prior: {n} rows by the counts, states '
+                         f'{tuple(states.shape)}, energies {tuple(energies.shape)}, '
+                         f'state_masks {tuple(state_masks.shape)}')
+    rows = {k: torch.as_tensor(v) for k, v in (rows or {}).items()}
+    for name, val in rows.items():
+        if val.dim() == 0 or val.shape[0] != n:
+            raise ValueError(f'compact prior: per-row field {name!r} is {tuple(val.shape)}, '
+                             f'not one entry per row ({n})')
+    return {'prior_format': PRIOR_COMPACT_FORMAT,
+            'identifiers': identifiers,
+            'condition_index': torch.repeat_interleave(torch.arange(len(identifiers)), counts),
+            'torsion_state': states,
+            'conformer_energy': energies,
+            'state_mask': state_masks,
+            'n_atoms': n_atoms,
+            'rows': rows}
+
+
+def is_compact_prior(blob) -> bool:
+    return isinstance(blob, dict) and blob.get('prior_format') == PRIOR_COMPACT_FORMAT
+
+
+def check_compact_prior(blob, path='the prior file'):
+    """``blob`` (a loaded compact prior) with its shapes checked against each other; raises
+    ``ValueError`` naming ``path`` on a file whose row tensors disagree in length, whose
+    condition index runs off its identifier list, or whose masks are of another width."""
+    need = ('identifiers', 'condition_index', 'torsion_state', 'conformer_energy',
+            'state_mask', 'n_atoms')
+    missing = [k for k in need if k not in blob]
+    if missing:
+        raise ValueError(f'{path}: a {PRIOR_COMPACT_FORMAT} file without {missing}')
+    x, e, ci = blob['torsion_state'], blob['conformer_energy'], blob['condition_index']
+    n, n_cond = int(ci.numel()), len(blob['identifiers'])
+    bad = []
+    if x.dim() != 2 or x.shape[0] != n or e.reshape(-1).numel() != n:
+        bad.append(f'{n} condition indices, states {tuple(x.shape)}, energies '
+                   f'{tuple(e.shape)}')
+    if n and (int(ci.min()) < 0 or int(ci.max()) >= n_cond):
+        bad.append(f'condition_index spans {int(ci.min())}..{int(ci.max())} over {n_cond} '
+                   f'identifiers')
+    if tuple(blob['state_mask'].shape) != (n_cond, x.shape[-1])             or int(blob['n_atoms'].numel()) != n_cond:
+        bad.append(f'state_mask {tuple(blob["state_mask"].shape)} and n_atoms '
+                   f'{tuple(blob["n_atoms"].shape)} for {n_cond} identifiers of width '
+                   f'{x.shape[-1]}')
+    for name, val in (blob.get('rows') or {}).items():
+        if not torch.is_tensor(val) or val.dim() == 0 or val.shape[0] != n:
+            bad.append(f'per-row field {name!r} is not one entry per row')
+    if bad:
+        raise ValueError(f'{path}: inconsistent compact prior: ' + '; '.join(bad))
+    return blob
+
+
+def save_prior_file(batch, path, equalized=None, **extra):
+    """Write the ``prior_path`` file, in the form ``batch`` is in.
+
+    A ``compact_prior`` dict is written as it stands (``prior_format``
+    PRIOR_COMPACT_FORMAT): ``ConformerModeller.init_prior_dataset`` joins its rows to the
+    run's conditions table. A graph batch is written as ``{'prior': ..., 'equalized_prior':
+    ...}`` (PRIOR_GRAPH_FORMAT), one full condition graph per row; ``init_prior_dataset``
+    reads ``equalized_prior`` and nothing else, 'prior' rides along for symmetry with the
+    crystal/toy files, and when ``equalized`` is None the same batch serves both roles.
 
     ``thermal_scaling_factor`` is deliberately NOT written: in ``init_prior_dataset`` that
     key silently replaces the config's ``lj_coeff`` for the whole run. The conformer force
     field is already in kcal/mol, so there is no unit conversion to apply and writing the
     key would mean a scale factor nobody chose.
     """
+    if is_compact_prior(batch):
+        if equalized is not None:
+            raise ValueError('a compact prior has one row set; `equalized` does not apply')
+        torch.save({**batch, **extra}, path)
+        return path
     torch.save({'prior': batch,
                 'equalized_prior': batch if equalized is None else equalized,
+                'prior_format': PRIOR_GRAPH_FORMAT,
                 **extra}, path)
     return path
 

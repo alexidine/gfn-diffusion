@@ -13,7 +13,9 @@ What each test would catch:
     carrying another ring must not lock out, and a chain bond next to a ring must turn;
   * any change to the draw where it should not change: an empty shape list, and a molecule with
     no ring entered from outside, draw bit for bit as before;
-  * the rotation still held, or drawn so that the ring opens.
+  * the rotation still held, or drawn so that the ring opens;
+  * an embedding call that reaches RDKit's timeout raising `Bad Conformer Id` out of ring_shapes,
+    or its conformers being lost: the call is retried one conformer at a time, bounded.
 """
 import numpy as np
 import pytest
@@ -311,8 +313,8 @@ def test_an_embedding_of_the_other_stereoisomer_is_dropped(prior, monkeypatch):
     real = rs._embed
 
     def mirrored(template, n, seed, timeout_s):
-        pos, e, nc = real(template, n, seed, timeout_s)
-        return pos * np.array([-1.0, 1.0, 1.0]), e, nc
+        pos, e, nc, info = real(template, n, seed, timeout_s)
+        return pos * np.array([-1.0, 1.0, 1.0]), e, nc, info
 
     monkeypatch.setattr(rs, '_embed', mirrored)
     (shp,) = rs.ring_shapes(_member(PROLINE), prior, n_embed=16, seed=3)
@@ -402,3 +404,65 @@ def test_a_ring_entered_from_outside_turns_about_its_attaching_bond(prior, smi, 
     assert st['closure_sigma'] < 3.0
     assert st['closure_err'] <= 1.1 * st0['closure_err'] + 0.002, (st['closure_err'],
                                                                    st0['closure_err'])
+
+
+# ------------------------------------------------- an embedding call that times out
+#
+# RDKit's EmbedParameters.timeout bounds a whole EmbedMultipleConfs call, and a call that
+# reaches it returns the id -1 and leaves the molecule without conformers. Reading that id
+# raised `ValueError: Bad Conformer Id` out of ring_shapes, which refused 1,356 conditions of
+# the QM9 conformer database (2026-09-29), all but one of them fused rings.
+
+FUSED_NO_EMBEDDING = 'CO[C@@H]1[C@@H]2NCCO[C@H]21'    # no attempt embeds with the knowledge terms off
+
+
+def _timed_out_call(monkeypatch):
+    """EmbedMultipleConfs as it returns after its timeout: no conformer kept, the id -1."""
+    from rdkit.Chem import AllChem
+
+    def timed_out(mol, numConfs=0, params=None, **kw):
+        mol.RemoveAllConformers()
+        return [-1]
+
+    monkeypatch.setattr(AllChem, 'EmbedMultipleConfs', timed_out)
+
+
+def test_a_timed_out_embedding_call_is_retried_one_conformer_at_a_time(prior, monkeypatch):
+    _timed_out_call(monkeypatch)
+    (shp,) = rs.ring_shapes(_member(CYCLOHEXANE), prior, n_embed=16, seed=3)
+    assert shp.reason is None and len(shp) >= 2          # the two chairs, at least
+    assert shp.info['embed_timed_out'] is True
+    assert shp.info['n_embed_one_at_a_time'] == 16
+    assert shp.info['n_embed_attempts_timed_out'] == 0
+    assert 0 < shp.info['n_embedded'] <= 16
+
+
+def test_a_call_that_does_not_time_out_is_not_retried(prior):
+    (shp,) = rs.ring_shapes(_member(CYCLOHEXANE), prior, n_embed=16, seed=3)
+    assert shp.info['embed_timed_out'] is False and 'n_embed_one_at_a_time' not in shp.info
+    assert shp.info['n_embedded'] == 16
+
+
+def test_the_retry_stops_after_a_bounded_number_of_stuck_attempts(prior, monkeypatch):
+    """Every one-at-a-time attempt runs to the timeout: the retry ends after
+    EMBED_MAX_TIMED_OUT of them and the block has no embedding, as when every attempt fails."""
+    from rdkit.Chem import AllChem
+
+    _timed_out_call(monkeypatch)
+    calls = []
+    monkeypatch.setattr(AllChem, 'EmbedMolecule', lambda mol, params: calls.append(1) or -1)
+    monkeypatch.setattr(rs, 'EMBED_TIMEOUT_S', 0)          # every attempt reads as timed out
+    (shp,) = rs.ring_shapes(_member(CYCLOHEXANE), prior, n_embed=16, seed=3)
+    assert len(calls) == rs.EMBED_MAX_TIMED_OUT
+    assert shp.reason == 'no_embedding' and len(shp) == 0
+    assert shp.info['n_embed_attempts_timed_out'] == rs.EMBED_MAX_TIMED_OUT
+
+
+def test_a_fused_ring_that_never_embeds_gets_no_shapes_instead_of_raising(prior, monkeypatch):
+    """The database's failure on the real molecule: at a 1 s timeout the call over 8 conformers
+    either times out (-1) or returns nothing, and in both cases the block is 'no_embedding'."""
+    monkeypatch.setattr(rs, 'EMBED_TIMEOUT_S', 1)
+    shapes = rs.ring_shapes(_member(FUSED_NO_EMBEDDING), prior, n_embed=8,
+                            seed=bcr.molecule_seed(FUSED_NO_EMBEDDING))
+    assert shapes and all(s.reason == 'no_embedding' and len(s) == 0 for s in shapes)
+    assert all(s.info['n_embedded'] == 0 for s in shapes)

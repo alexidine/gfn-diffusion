@@ -152,11 +152,46 @@ def test_the_protocol_check_refuses_a_seat_off_the_baseline(raw, dotted, value, 
 
 
 def test_the_canonical_buffers_fit_the_local_card(raw):
+    """The budget is the footprint of the store form the config runs: compact rows and the
+    conditions table with molecules_path set, full graph rows without it."""
+    assert make.stores_compact(raw)
     make.refuse_over_vram(copy.deepcopy(raw), 'canonical', make.LOCAL_CARD_BYTES)
+    budget = make.LOCAL_CARD_BYTES * raw['cuda_memory_fraction'] * make.BUFFER_SHARE
+    # compact rows: 250,000 prior rows are a few hundred MB, where full rows would not fit
     over = copy.deepcopy(raw)
     over['buffers']['prior_buffer']['max_size'] = 250_000
+    make.refuse_over_vram(over, 'compact', make.LOCAL_CARD_BYTES)
+    full = copy.deepcopy(over)
+    full['molecules_path'] = None
+    assert make.row_bytes(full)['prior'] == make.BYTES_PER_ROW_MAX
+    with pytest.raises(SystemExit, match='full graph rows.*buffer budget'):
+        make.refuse_over_vram(full, 'full', make.LOCAL_CARD_BYTES)
+    # what binds a compact run: the conditions table, and replay rows with their trajectories
+    n_over = int(budget // make.TABLE_BYTES_PER_CONDITION_MAX) + 1
+    with pytest.raises(SystemExit, match='compact rows.*conditions table.*buffer budget'):
+        make.refuse_over_vram(copy.deepcopy(raw), 'table', make.LOCAL_CARD_BYTES, n_over)
+    replay = copy.deepcopy(raw)
+    replay['buffers']['replay_buffer']['max_size'] = int(budget // make.row_bytes(raw)['replay']) + 1
     with pytest.raises(SystemExit, match='buffer budget'):
-        make.refuse_over_vram(over, 'mutant', make.LOCAL_CARD_BYTES)
+        make.refuse_over_vram(replay, 'replay', make.LOCAL_CARD_BYTES)
+
+
+def test_row_bytes_follow_the_store_form(raw):
+    K, T = make.K_MAX, int(raw['integrator']['T'])
+    per = make.row_bytes(raw)
+    assert per['prior_sample'] == 4 * K + 4
+    assert per['prior'] == per['anchor'] == 2 * (4 * K + 4) + 4
+    assert per['replay'] == per['prior'] + 4 * K * (T + 1 + make.FORCE_LEGS) + 12 * make.ATOMS_MAX
+    noised = dict(copy.deepcopy(raw), prior_dataset_noise='thermal')
+    assert make.row_bytes(noised)['prior_sample'] == 2 * (4 * K + 4)
+    assert make.row_bytes(raw, K=66)['prior'] == 2 * (4 * 66 + 4) + 4
+    full = dict(copy.deepcopy(raw), molecules_path=None)
+    assert set(make.row_bytes(full).values()) == {make.BYTES_PER_ROW_MAX}
+    # a sidecar holds the three buffers, a compact row with its host columns
+    one = dict(copy.deepcopy(raw), archive_period=0)
+    rows = make.store_rows(raw)
+    assert make.sidecar_disk_bytes(one) == sum(
+        rows[k] * (per[k] + make.COMPACT_HOST_BYTES_PER_ROW) for k in ('prior', 'anchor', 'replay'))
 
 
 def test_replay_is_dormant_in_phase_two(raw):

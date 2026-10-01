@@ -948,8 +948,9 @@ buffers:
     # at every construction and restore, and the anchor draw falls through to UNIFORM --
     seed_source: 'prior_dataset'   # domain rule (configs/problems.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
     seed_relax_steps: 0        # > 0 = seed from prior draws relaxed this many steps, stored as rows of the energy's own `smiles` condition (ConformerModeller.init_anchor_buffer_seed); 0 = seed from the prior dataset itself
+    seed_rows_per_condition: null  # seed_source 'prior_dataset' on a compact prior dataset (a condition set): each condition's lowest-energy N rows are seeded, and N x conditions above max_size is refused. null = every row when the dataset fits max_size, otherwise the most rows per condition that fit (ConformerModeller._anchor_seed_row_batches). Unread on a graph-row prior dataset (one molecule, or seed_relax_steps > 0), which seeds every row
     max_size: 40000
-    dup_cutoff: 0.05          # state L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates
+    dup_cutoff: 0.05         # state L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates
     # Energy windows above that condition's Emin(c), in the energy function's units
     # (kcal/mol on this route): screen spends confirm budget only inside its window;
     # thin discards what lies outside its looser one.

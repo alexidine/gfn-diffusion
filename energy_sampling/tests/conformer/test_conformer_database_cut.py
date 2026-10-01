@@ -115,10 +115,14 @@ def _members(idents):
 
 
 def _prior_rows(path):
-    b = torch.load(path, weights_only=False, map_location='cpu')['equalized_prior']
+    """The compact prior file as (rows with `torsion_state` and `conformer_energy`, row
+    indices per identifier)."""
+    blob = torch.load(path, weights_only=False, map_location='cpu')
+    b = types.SimpleNamespace(torsion_state=blob['torsion_state'],
+                              conformer_energy=blob['conformer_energy'])
     rows = {}
-    for j, s in enumerate(b.identifier):
-        rows.setdefault(s, []).append(j)
+    for j, c in enumerate(blob['condition_index'].tolist()):
+        rows.setdefault(blob['identifiers'][c], []).append(j)
     return b, rows
 
 
@@ -260,20 +264,32 @@ def test_the_prior_file_loads_through_the_modellers_prior_path_branch(cut):
     from buffer import ConformerBuffer
     from conformer_modeller import ConformerModeller
     torch.set_default_dtype(torch.float32)
+    from energies.conformer_data import PRIOR_COMPACT_FORMAT
+    assert cut.man['prior']['prior_format'] == PRIOR_COMPACT_FORMAT
     m = ConformerModeller.__new__(ConformerModeller)
     m.args = types.SimpleNamespace(prior_path=str(cut.set / 'prior_train.pt'),
+                                   molecules_path=str(cut.set / 'conditions_train.pt'),
                                    buffer_device='cpu')
+    m.device = 'cpu'
     k = int(cut.man['layout']['K'])
     # the reference guard reads each member's ref_pos: the database's stored references
     members = {i: types.SimpleNamespace(ref_pos=torch.as_tensor(r['ref_pos']))
                for i, r in cut.recs.items()}
     m.energy_function = types.SimpleNamespace(stereo_coeff=300.0, dtype=torch.float32, ndim=k,
                                               _members=members)
+    # the conditions table the compact rows join: the set's own conditions file
+    cond = ConformerModeller._as_run_dtype(
+        torch.load(cut.set / 'conditions_train.pt', weights_only=False)['prior'])
+    m.mol_dataset = ConformerBuffer(cond, device='cpu')
     m.init_prior_dataset()
-    assert isinstance(m.prior_dataset, ConformerBuffer)
+    assert isinstance(m.prior_dataset, ConformerBuffer) and m.prior_dataset.is_compact
     assert len(m.prior_dataset) == cut.man['prior']['rows']
     assert m.prior_dataset.x.shape == (cut.man['prior']['rows'], k)
     assert m.prior_dataset.x.dtype == torch.float32
+    # a run without the conditions table cannot take a compact prior file
+    m.args.molecules_path = None
+    with pytest.raises(SystemExit, match='compact prior file'):
+        m.init_prior_dataset()
 
 
 # ------------------------------------------------------------------ stored references

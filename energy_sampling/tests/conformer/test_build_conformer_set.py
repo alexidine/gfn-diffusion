@@ -713,14 +713,24 @@ def test_prior_file_contract(tmp_path):
     from energies.conformer_torsions import ConformerTorsions
     out, man = _build(tmp_path, 'p', 3, 0, '--prior-rows-per-condition', 4,
                       '--internal-prior', _prior_path())
-    b = torch.load(out / 'prior_train.pt', weights_only=False)['equalized_prior']
-    x = torch.as_tensor(b.torsion_state)
-    e = torch.as_tensor(b.conformer_energy).reshape(-1)
+    from energies.conformer_data import PRIOR_COMPACT_FORMAT
+    b = torch.load(out / 'prior_train.pt', weights_only=False)
+    # the COMPACT form, named in the file and in the manifest; no graph per row
+    assert b['prior_format'] == man['prior']['prior_format'] == PRIOR_COMPACT_FORMAT
+    assert 'prior' not in b and 'equalized_prior' not in b
+    x = torch.as_tensor(b['torsion_state'])
+    e = torch.as_tensor(b['conformer_energy']).reshape(-1)
     assert x.dtype == torch.float32 and e.dtype == torch.float32
     K = man['layout']['K']
     assert x.shape[1] == K
-    assert bool((x[~torch.as_tensor(b.state_mask).bool()] == 0).all())
-    idents = list(b.identifier)
+    assert bool((x[~b['state_mask'][b['condition_index']]] == 0).all())
+    idents = [b['identifiers'][c] for c in b['condition_index'].tolist()]
+    # each condition's mask and atom count are the conditions file's own
+    cond = torch.load(out / 'conditions_train.pt', weights_only=False)['prior']
+    slot = {s: j for j, s in enumerate(cond.identifier)}
+    at = [slot[s] for s in b['identifiers']]
+    assert torch.equal(b['state_mask'], torch.as_tensor(cond.state_mask).bool()[at])
+    assert torch.equal(b['n_atoms'], (cond.ptr[1:] - cond.ptr[:-1])[at])
     kw = man['energy']['kwargs']
     members = {m['identifier']: ConformerTorsions(smiles=m['identifier'], device='cpu', **kw)
                for m in man['members']['train']}
@@ -741,27 +751,50 @@ def test_prior_file_contract(tmp_path):
 
     def tampered(name, edit):
         blob = torch.load(out / 'prior_train.pt', weights_only=False)
-        blob['equalized_prior'] = edit(blob['equalized_prior'])
+        blob = edit(blob)
         torch.save(blob, tmp_path / name)
         return tmp_path / name
 
     def one_ulp(pb):
-        e = pb.conformer_energy
+        e = pb['conformer_energy']
         before = float(e[0])
         e[0] = torch.nextafter(e[0], torch.tensor(float('inf'), dtype=e.dtype))
         assert float(e[0]) != before     # the edit took (a float64 nextafter rounds back)
         return pb
 
     def pad(pb):
-        sm = torch.as_tensor(pb.state_mask).bool()
+        sm = pb['state_mask'][pb['condition_index']]
         r, c = map(int, torch.nonzero(~sm)[0])
-        pb.torsion_state[r, c] = 0.5
+        pb['torsion_state'][r, c] = 0.5
         return pb
+
+    def drop_first_row(pb):
+        for key in ('condition_index', 'torsion_state', 'conformer_energy'):
+            pb[key] = pb[key][1:]
+        return pb
+
+    def other_mask(pb):
+        pb['state_mask'][0] = ~pb['state_mask'][0]
+        return pb
+
+    def other_atoms(pb):
+        pb['n_atoms'][0] += 1
+        return pb
+
+    def ragged(pb):
+        pb['conformer_energy'] = pb['conformer_energy'][1:]
+        return pb
+
+    def graph_form(pb):
+        return {'prior': None, 'equalized_prior': None}
 
     cases = {'ulp.pt': (one_ulp, 'stored energies differ'),
              'pad.pt': (pad, 'non-zero pad'),
-             'rows.pt': (lambda pb: pb.subsample_new_batch(np.arange(1, pb.num_graphs)),
-                         'rows, expected 4')}
+             'rows.pt': (drop_first_row, 'rows, expected 4'),
+             'mask.pt': (other_mask, 'state_mask is not the layout'),
+             'atoms.pt': (other_atoms, 'atoms recorded'),
+             'ragged.pt': (ragged, 'inconsistent compact prior'),
+             'graph.pt': (graph_form, 'prior_format')}
     for name, (edit, why) in cases.items():
         with pytest.raises(SystemExit, match=why):
             bcs.verify_prior_file(tampered(name, edit), lay, wrapped, 4)

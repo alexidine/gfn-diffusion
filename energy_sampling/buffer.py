@@ -1888,6 +1888,18 @@ CONFORMER_COMPACT_FORMAT = 'conformer_compact_v1'
 COMPACT_CHUNK_ROWS = 4096
 
 
+def chunk_bounds(n: int, chunk: int = COMPACT_CHUNK_ROWS):
+    """``[(start, end)]`` covering ``range(n)`` in runs of ``chunk`` rows (at least 2), with
+    a single leftover row joined to the run before it: a one-graph batch's per-graph tensors
+    read as shared metadata in ``subsample_new_batch``, so no chunk of graphs is one row
+    unless ``n`` is 1."""
+    n, chunk = int(n), max(int(chunk), 2)
+    edges = list(range(0, n, chunk)) + [n]
+    if len(edges) > 2 and edges[-1] - edges[-2] == 1:
+        del edges[-2]
+    return list(zip(edges[:-1], edges[1:]))
+
+
 class CompactRowsError(RuntimeError):
     """A conformer row the compact store cannot hold, or compact rows used unbound.
 
@@ -2154,6 +2166,37 @@ class ConformerCompactRows:
                        if name in table_fields else 'is not in the conditions table')
                     + '; only per-graph and per-atom tensors are stored per row')
         return cls(statics, keys, atoms, static, rows, node_rows, device)
+
+    @classmethod
+    def from_columns(cls, statics, keys, rows, exclude_keys=(), device='cpu'):
+        """Compact rows built from their per-row columns alone, with no graph per row.
+
+        `keys` [n] is each row's slot in the conditions table and `rows` its per-graph
+        tensors by name ([n, ...]: a compact prior file's state and energy). Every field
+        of the conditions batch that is neither excluded nor given per row is static, as
+        `from_batch` finds for rows that are their condition's graph plus those columns.
+        The table's derived fields are not taken: a row of the graph form does not carry
+        them either."""
+        keys = torch.as_tensor(keys, dtype=torch.long).reshape(-1).cpu()
+        n = int(keys.numel())
+        if n and (int(keys.min()) < 0 or int(keys.max()) >= int(statics.batch.num_graphs)):
+            raise CompactRowsError(
+                f'row keys span {int(keys.min())}..{int(keys.max())}, outside the '
+                f'{int(statics.batch.num_graphs)} slots of the conditions table')
+        exclude = set(exclude_keys or ())
+        held = {}
+        for name, val in rows.items():
+            if not torch.is_tensor(val) or val.dim() == 0 or val.size(0) != n:
+                raise CompactRowsError(
+                    f'per-row field {name!r} is not a tensor with one entry per row ({n})')
+            if name in statics.batch._store and statics.kind(name) != 'graph':
+                raise CompactRowsError(
+                    f'per-row field {name!r} is not a per-graph field of the conditions table')
+            if name not in exclude:
+                held[name] = val.to(device)
+        static = [k for k in statics.batch._store.keys()
+                  if k not in ('ptr', 'batch') and k not in exclude and k not in held]
+        return cls(statics, keys, statics.atom_counts(keys), static, held, {}, device)
 
     @staticmethod
     def _differing(batch, statics, keys, names, chunk):
@@ -2550,8 +2593,8 @@ class ConformerGraphHooks:
             return None
         n = len(self)
         keep = torch.randperm(n)[:limit] if (limit is not None and n > limit) else torch.arange(n)
-        return (self.batch.subsample_new_batch(keep[i:i + chunk])
-                for i in range(0, int(keep.numel()), chunk))
+        return (self.batch.subsample_new_batch(keep[i:j])
+                for i, j in chunk_bounds(int(keep.numel()), chunk))
 
     def state_dict(self):
         state = super().state_dict()
@@ -2609,6 +2652,108 @@ class ConformerGraphHooks:
 
 class ConformerBuffer(ConformerGraphHooks, CrystalBuffer):
     """The churned stores -- prior, replay, mol/prior datasets -- over conformer graphs."""
+
+
+def lowest_rows_per_condition(keys, energy, max_rows: int, per_condition=None):
+    """``(rows, k, n_conditions)``: each condition's ``k`` lowest-energy rows, as ascending
+    row indices (long), at most ``max_rows`` in all.
+
+    ``keys`` [n] is each row's condition and ``energy`` [n] its energy; ties and NaN keep
+    row order, NaN last. With ``per_condition`` None, every row when ``n <= max_rows``, and
+    otherwise the largest ``k`` whose total, sum over conditions of min(rows held, k), fits
+    ``max_rows``. With a number, that ``k``. Raises ValueError when no ``k >= 1`` fits (more
+    conditions than ``max_rows``) or the given ``k`` does not.
+    """
+    keys = np.asarray(torch.as_tensor(keys).cpu(), dtype=np.int64).reshape(-1)
+    energy = np.asarray(torch.as_tensor(energy).cpu(), dtype=np.float64).reshape(-1)
+    n, max_rows = int(keys.size), int(max_rows)
+    if energy.size != n:
+        raise ValueError(f'{n} row keys and {energy.size} energies')
+    if n == 0:
+        return torch.zeros(0, dtype=torch.long), 0, 0
+    _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    total = lambda k: int(np.minimum(counts, k).sum())
+    if per_condition is None:
+        if n <= max_rows:
+            return torch.arange(n), int(counts.max()), int(counts.size)
+        if total(1) > max_rows:
+            raise ValueError(f'{counts.size:,} conditions hold rows and one row of each is '
+                             f'more than max_size {max_rows:,}')
+        lo, hi = 1, int(counts.max())           # total(lo) fits; total(hi) = n does not
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (mid, hi) if total(mid) <= max_rows else (lo, mid)
+        k = lo
+    else:
+        k = int(per_condition)
+        if k < 1:
+            raise ValueError(f'seed_rows_per_condition must be >= 1, got {per_condition!r}')
+        if total(k) > max_rows:
+            raise ValueError(f'{k} row(s) of each of {counts.size:,} conditions is '
+                             f'{total(k):,} rows, more than max_size {max_rows:,}')
+    order = np.lexsort((np.arange(n), energy, inverse))     # condition, then energy, then row
+    rank = np.arange(n) - np.repeat(np.cumsum(counts) - counts, counts)
+    return torch.from_numpy(np.sort(order[rank < k])), k, int(counts.size)
+
+
+def store_footprint(buf) -> dict:
+    """Bytes a store holds, read off its tensors: ``{'rows', 'compact', 'device_bytes',
+    'host_bytes'}``.
+
+    `device_bytes` are the tensors on the store's own device (`cfg:buffer_device`: the rows
+    or graphs, `x`, `y`, the stored trajectories and force legs), `host_bytes` those on the
+    host whatever that device is (the per-row bookkeeping columns, and a compact store's
+    keys and atom counts); on a host store the two are told apart the same way, by whether
+    the tensor follows the store's device. A compact store's rows are its per-row fields;
+    the conditions table they join is counted by `table_footprint`, once. A full store's
+    graphs include the batch's slice and increment tables. A tensor shared between two
+    attributes (the state as a row field and as `x`) is counted once.
+    """
+    seen, total = set(), {'device': 0, 'host': 0}
+
+    def take(t, side):
+        if not torch.is_tensor(t) or t.numel() == 0:
+            return
+        ptr = t.untyped_storage().data_ptr()
+        if ptr in seen:
+            return
+        seen.add(ptr)
+        total[side] += int(t.untyped_storage().nbytes())
+
+    batch = buf.batch
+    compact = isinstance(batch, ConformerCompactRows)
+    if compact:
+        for t in list(batch._rows.values()) + list(batch._node_rows.values()):
+            take(t, 'device')
+        take(batch._keys, 'host')
+        take(batch._atoms, 'host')
+    else:
+        for t in batch._store.values():
+            take(t, 'device')
+        for table in (getattr(batch, '_slice_dict', None), getattr(batch, '_inc_dict', None)):
+            for t in (table or {}).values():
+                take(t, 'device')
+    on_device = ('x', 'y', 'traj', 'force_legs')
+    for name, val in vars(buf).items():
+        if name != 'batch':
+            take(val, 'device' if name in on_device else 'host')
+    return {'rows': len(buf), 'compact': compact,
+            'device_bytes': total['device'], 'host_bytes': total['host']}
+
+
+def table_footprint(statics) -> int:
+    """Bytes of the conditions table compact stores join: every tensor of the conditions
+    batch, its slice and increment tables, and the derived fields."""
+    batch = statics.batch
+    tensors = [v for v in batch._store.values()] + list(statics.derived.values())
+    for table in (getattr(batch, '_slice_dict', None), getattr(batch, '_inc_dict', None)):
+        tensors += list((table or {}).values())
+    seen, total = set(), 0
+    for t in tensors:
+        if torch.is_tensor(t) and t.numel() and t.untyped_storage().data_ptr() not in seen:
+            seen.add(t.untyped_storage().data_ptr())
+            total += int(t.untyped_storage().nbytes())
+    return total
 
 
 def _upper_tail(quantile: float) -> float:

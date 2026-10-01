@@ -10,7 +10,9 @@ writes into ``--out-dir``:
     conditions_heldout.pt   cfg:test_molecules_path  (same K, same block widths)
     prior_train.pt          cfg:prior_path, only with --prior-rows-per-condition > 0 (prior
                             draws) or --database DIR (each training condition's lowest
-                            --rows-per-condition-cap database rows, ``build_database_prior``)
+                            --rows-per-condition-cap database rows, ``build_database_prior``).
+                            Compact form: per row its state, energy and condition index
+                            (``energies.conformer_data.compact_prior``)
     prior_refusals.tsv      with --database: the training conditions that took no rows, and why
     split.tsv               every universe key: its side and its place in the walk order
     molecules.tsv           one row per kept CONDITION (stereoisomer)
@@ -797,45 +799,57 @@ def _cast_floats(batch, dtype):
     return batch
 
 
+def _compact_rows(padded, per_condition, dtype):
+    """``energies.conformer_data.compact_prior`` over ``per_condition`` =
+    ``[(identifier, carrier states [n, K], energies [n])]``, cast to the storage ``dtype``;
+    each condition's free-column mask and atom count are read off its padded graph."""
+    from energies.conformer_data import compact_prior
+
+    idents = [i for i, _, _ in per_condition]
+    return compact_prior(
+        idents, [int(x.shape[0]) for _, x, _ in per_condition],
+        torch.cat([x.detach().cpu().to(dtype) for _, x, _ in per_condition]),
+        torch.cat([e.detach().cpu().reshape(-1).to(dtype) for _, _, e in per_condition]),
+        torch.cat([torch.as_tensor(padded[i].state_mask).bool().reshape(1, -1)
+                   for i in idents]),
+        [int(padded[i].num_nodes) for i in idents])
+
+
 def build_prior(padded: Dict[str, object], members: Dict[str, Member], layout, n: int, *,
                 prior, relax_steps: int, seed: int, dtype):
-    """``(batch, stats)``: ``n`` prior rows per training condition, in carrier form.
+    """``(compact prior, stats)``: ``n`` prior rows per training condition, in carrier form,
+    as ``energies.conformer_data.compact_prior`` (state, energy and condition per row; no
+    per-condition graph).
 
     EQUAL ROWS PER CONDITION, so the buffer represents the set rather than whichever
     molecule drew first. Each state is rounded to the STORAGE dtype before it is scored, so
     the stored energy is the energy of the stored state, not of a neighbour that no longer
-    exists after the cast. One collate over every row, not an append loop.
+    exists after the cast.
     """
-    from energies.conformer_data import bake_energies, collate_conditions, wrap_state
+    from energies.conformer_data import bake_energies, wrap_state
     from energies.conformer_prior_draw import draw_member_prior, member_prior_seed
 
-    rows, stats = [], {}
+    per_condition, stats = [], {}
     periodic = [bool(b == 2) for b in layout.free_block]
-    for ident, pm in padded.items():
+    for ident in padded:
         en = members[ident].energy
         rng = np.random.default_rng(member_prior_seed(ident, seed))
         x, _, _ = draw_member_prior(en, n, rng, relax_steps=relax_steps, prior=prior)
         x = wrap_state(x, en.periodic_dims).to(dtype).to(en.dtype)
         with torch.no_grad():
             e = bake_energies(en, x)
-        xc = wrap_state(layout.to_carrier(ident, x), periodic)
-        for i in range(n):
-            row = pm.__copy__()
-            row.torsion_state = xc[i:i + 1]
-            row.conformer_energy = e[i:i + 1]
-            row.identifier = ident
-            rows.append(row)
+        per_condition.append((ident, wrap_state(layout.to_carrier(ident, x), periodic), e))
         stats[ident] = {'energy_median': float(e.median()),
                         'energy_p90': float(torch.quantile(e, 0.9)),
                         'relax_steps': int(relax_steps)}
-    batch = collate_conditions(rows, require_state=True)
-    return _cast_floats(batch, dtype), stats
+    return _compact_rows(padded, per_condition, dtype), stats
 
 
 def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], layout,
                          records: Dict[str, dict], cap: int, *, tol: float, dtype):
-    """``(batch or None, per-condition stats, refusals)``: each training condition's lowest
-    ``cap`` rows of the conformer DATABASE, in carrier form, instead of prior draws.
+    """``(compact prior or None, per-condition stats, refusals)``: each training condition's
+    lowest ``cap`` rows of the conformer DATABASE, in carrier form, instead of prior draws,
+    as ``energies.conformer_data.compact_prior``.
 
     Per condition ``build_conformer_database.match_rows``: the record found by identifier and
     member signature, its stored positions measured into THIS member's chart, every taken row
@@ -847,11 +861,11 @@ def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], 
     with the database's within ``tol``.
     """
     from build_conformer_database import match_rows
-    from energies.conformer_data import bake_energies, collate_conditions, wrap_state
+    from energies.conformer_data import bake_energies, wrap_state
 
-    rows, stats, refusals = [], {}, []
+    per_condition, stats, refusals = [], {}, []
     periodic = [bool(b == 2) for b in layout.free_block]
-    for ident, pm in padded.items():
+    for ident in padded:
         en = members[ident].energy
         x, stored, info = match_rows(en, ident, records.get(ident), cap, tol)
         if x is None:
@@ -861,31 +875,26 @@ def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], 
         x = wrap_state(x, en.periodic_dims).to(dtype).to(en.dtype)
         with torch.no_grad():
             e = bake_energies(en, x)
-        xc = wrap_state(layout.to_carrier(ident, x), periodic)
-        for i in range(len(x)):
-            row = pm.__copy__()
-            row.torsion_state = xc[i:i + 1]
-            row.conformer_energy = e[i:i + 1]
-            row.identifier = ident
-            rows.append(row)
+        per_condition.append((ident, wrap_state(layout.to_carrier(ident, x), periodic), e))
         stats[ident] = {'rows': info['rows'], 'rows_available': info['rows_available'],
                         'e_min_database': info['e_min'],
                         'rescore_gap': info['rescore_gap'],
                         'stored_gap': float(np.max(np.abs(e.detach().cpu().double().numpy()
                                                           - stored))),
                         'ref_pos_gap': info['ref_pos_gap']}
-    if len(rows) < 2:
+    if sum(int(x.shape[0]) for _, x, _ in per_condition) < 2:
         return None, stats, refusals
-    batch = collate_conditions(rows, require_state=True)
-    return _cast_floats(batch, dtype), stats, refusals
+    return _compact_rows(padded, per_condition, dtype), stats, refusals
 
 
 def verify_prior_file(path, layout, members: Dict[str, Member], n):
-    """Refuse a prior file whose width, pads, row counts or stored energies are wrong.
+    """Refuse a prior file whose form, width, pads, row counts or stored energies are wrong.
 
+    The file must be the compact form (``energies.conformer_data.PRIOR_COMPACT_FORMAT``).
     ``n`` is the row count of every condition, or a ``{identifier: rows}`` map (a database
     prior, whose conditions hold up to its cap each); ``members`` are exactly the conditions
-    that must have rows. Width K; pad columns exactly 0; exactly ``n`` rows per condition; and EVERY row
+    that must have rows. Width K; pad columns exactly 0; each condition's mask the layout's
+    and its atom count the member's; exactly ``n`` rows per condition; and EVERY row
     re-scored through its member from the STORED state, the result cast to the storage
     dtype and required BIT-EQUAL to the stored energy. Bit-equal is attainable because
     ``build_prior`` scores the storage-rounded state in the same n-row batch this re-scores,
@@ -894,23 +903,46 @@ def verify_prior_file(path, layout, members: Dict[str, Member], n):
     yet changes the stored float32 value of 424 of 1,280 prior rows (5 molecules at `full`,
     mmff, 256 draws each; the largest shift 0.06 kcal/mol, on a clashing draw).
     """
-    from energies.conformer_data import bake_energies
+    from energies.conformer_data import (PRIOR_COMPACT_FORMAT, bake_energies,
+                                         check_compact_prior, is_compact_prior)
 
-    b = torch.load(path, weights_only=False, map_location='cpu')['equalized_prior']
-    x = torch.as_tensor(b.torsion_state)
-    e = torch.as_tensor(b.conformer_energy).reshape(-1)
-    rows_of: Dict[str, List[int]] = {}
-    for j, s in enumerate(b.identifier):
-        rows_of.setdefault(s, []).append(j)
+    b = torch.load(path, weights_only=False, map_location='cpu')
+    if not is_compact_prior(b):
+        raise SystemExit(f'{path}: prior file refused: prior_format '
+                         f'{b.get("prior_format") if isinstance(b, dict) else None!r}, not '
+                         f'{PRIOR_COMPACT_FORMAT!r}')
+    try:
+        check_compact_prior(b, path)
+    except ValueError as err:
+        raise SystemExit(f'{path}: prior file refused: {err}') from None
+    x = torch.as_tensor(b['torsion_state'])
+    e = torch.as_tensor(b['conformer_energy']).reshape(-1)
+    idents = list(b['identifiers'])
+    ci = b['condition_index'].long()
+    # rows of each condition, in file order, from one stable sort
+    order = torch.argsort(ci, stable=True)
+    counts = torch.bincount(ci, minlength=len(idents))
+    rows_of: Dict[str, List[int]] = {
+        ident: rows.tolist()
+        for ident, rows in zip(idents, torch.split(order, counts.tolist())) if len(rows)}
     problems = []
     if set(rows_of) != set(members):
         problems.append(f'identifiers {sorted(set(rows_of) ^ set(members))[:5]} are in only '
                         f'one of the prior file and the training conditions')
     if x.shape[1] != layout.K:
         problems.append(f'torsion_state width {x.shape[1]} != K {layout.K}')
-    sm = torch.as_tensor(b.state_mask).bool()
+    sm = b['state_mask'].bool()[ci]
     if sm.shape != x.shape or bool((x[~sm] != 0).any()):
         problems.append('non-zero pad columns (or a state_mask of another shape)')
+    for c, ident in enumerate(idents):
+        if ident not in members or x.shape[1] != layout.K:
+            continue
+        if not torch.equal(b['state_mask'][c].bool(), torch.as_tensor(layout.valid(ident))):
+            problems.append(f'{ident}: its state_mask is not the layout\'s free columns')
+        spec = getattr(members[ident].energy, 'spec', None)
+        if spec is not None and int(b['n_atoms'][c]) != int(spec.n_atoms):
+            problems.append(f'{ident}: {int(b["n_atoms"][c])} atoms recorded, the member '
+                            f'has {int(spec.n_atoms)}')
     for ident, en in ((i, m.energy) for i, m in members.items()):
         rows = rows_of.get(ident, [])
         want = n[ident] if isinstance(n, dict) else n
@@ -1307,7 +1339,8 @@ def main(argv=None):
             out / 'prior_train.pt',
             lambda p: verify_prior_file(p, run_layout, tmembers, n))
         files['prior_train.pt'] = out / 'prior_train.pt'
-        prior_info = {'path': str(Path(internal_prior).resolve()),
+        prior_info = {'prior_format': pbatch['prior_format'],
+                      'path': str(Path(internal_prior).resolve()),
                       'sha256': _sha256(internal_prior), 'rows_per_condition': n,
                       'relax_steps': relax, 'seed': args.prior_seed, 'dtype': args.prior_dtype,
                       'per_condition': pstats}
@@ -1338,7 +1371,8 @@ def main(argv=None):
                                         counts))
         files['prior_train.pt'] = out / 'prior_train.pt'
         gaps = [s['rescore_gap'] for s in pstats.values()]
-        prior_info = {'source': 'database', 'database': db_info,
+        prior_info = {'prior_format': pbatch['prior_format'],
+                      'source': 'database', 'database': db_info,
                       'rows_per_condition_cap': dcap, 'dtype': args.prior_dtype,
                       'rescore_tol_kcal': float(args.database_rescore_tol),
                       'rows': int(sum(counts.values())),

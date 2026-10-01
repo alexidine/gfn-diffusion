@@ -431,3 +431,301 @@ def test_row_batches_hand_out_every_row_in_chunks(conditions):
         for p in parts[1:]:
             merged = merged.append_batch(p)
         assert _same(whole[0], merged) == []
+
+
+# ------------------------------------------------------- the compact prior FILE
+#
+# energies/conformer_data.py::compact_prior: per row its state, energy and condition index.
+# ConformerModeller.init_prior_dataset joins it to the conditions table without a graph per
+# row (ConformerCompactRows.from_columns).
+
+
+def _masked_rows(conditions, **kw):
+    """_prior_rows with pad columns zeroed (a stored state's pads are 0), grouped by
+    condition in table order, as a prior file holds them."""
+    rows = _prior_rows(conditions, **kw)
+    slot = {s: j for j, s in enumerate(conditions.identifier)}
+    at = torch.tensor([slot[s] for s in rows.identifier])
+    n = rows.num_graphs
+    mask = conditions.state_mask.reshape(conditions.num_graphs, -1).bool()[at]
+    rows.torsion_state = rows.torsion_state.reshape(n, -1) * mask
+    return rows.subsample_new_batch(torch.argsort(at, stable=True))
+
+
+def _compact_blob(conditions, rows):
+    from energies.conformer_data import compact_prior
+
+    slot = {s: j for j, s in enumerate(conditions.identifier)}
+    idents = list(dict.fromkeys(rows.identifier))
+    at = [slot[s] for s in idents]
+    return compact_prior(
+        idents, [list(rows.identifier).count(s) for s in idents],
+        rows.torsion_state.reshape(rows.num_graphs, -1).double(),      # a float64 builder
+        rows.conformer_energy.reshape(-1).double(),
+        conditions.state_mask.reshape(conditions.num_graphs, -1).bool()[at],
+        (conditions.ptr[1:] - conditions.ptr[:-1])[at])
+
+
+def _modeller(conditions, prior_path, k, anchor=None, table=True):
+    import types
+
+    from conformer_modeller import ConformerModeller
+
+    m = ConformerModeller.__new__(ConformerModeller)
+    m.device = 'cpu'
+    m.args = types.SimpleNamespace(
+        prior_path=str(prior_path), molecules_path='conditions.pt' if table else None,
+        prior_dataset_noise=None, buffer_device='cpu',
+        buffers=types.SimpleNamespace(anchor_buffer=types.SimpleNamespace(**(anchor or {}))))
+    m.energy_function = types.SimpleNamespace(ndim=k, dtype=torch.float32)
+    m.mol_dataset = ConformerBuffer(_table(conditions), 'cpu', exclude_keys=BULKY)
+    return m
+
+
+@pytest.fixture
+def float32_default():
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    yield
+    torch.set_default_dtype(old)
+
+
+def test_a_compact_prior_file_loads_as_the_store_its_graph_rows_give(conditions, tmp_path,
+                                                                     float32_default):
+    from energies.conformer_data import (PRIOR_COMPACT_FORMAT, PRIOR_GRAPH_FORMAT,
+                                         save_prior_file)
+
+    rows = _masked_rows(conditions)
+    k = int(conditions.n_torsions[0])
+    path = save_prior_file(_compact_blob(conditions, rows), tmp_path / 'prior.pt', source='t')
+    blob = torch.load(path, weights_only=False)
+    assert blob['prior_format'] == PRIOR_COMPACT_FORMAT and blob['source'] == 't'
+    assert 'prior' not in blob and 'equalized_prior' not in blob
+
+    m = _modeller(conditions, path, k)
+    m.init_prior_dataset()
+    got = m.prior_dataset
+    assert got.is_compact and len(got) == rows.num_graphs
+    assert set(got.batch._rows) == {'torsion_state', 'conformer_energy'}
+    assert got.x.dtype == torch.float32 and got.y.dtype == torch.float32
+    # the same store the graph rows build: the same static fields, and equal draws
+    full = ConformerBuffer(rows, 'cpu', exclude_keys=BULKY, y_fn='conformer_energy')
+    from_graphs = ConformerBuffer(rows, 'cpu', exclude_keys=BULKY, y_fn='conformer_energy',
+                                  statics=m.conformer_statics)
+    assert set(got.batch._static) == set(from_graphs.batch._static)
+    _check_draws(full, got)
+    # and the mol_id init_identifiers attaches later is read from the table for these rows too
+    _attach_mol_id(m.mol_dataset.batch, SMIS)
+    _attach_mol_id(got.batch, SMIS)
+    _attach_mol_id(full.batch, SMIS)
+    assert 'mol_id' in got.batch._static
+    _check_draws(full, got)
+
+    # the graph form is still written for a graph batch, and names itself
+    graph = save_prior_file(rows, tmp_path / 'graph.pt')
+    assert torch.load(graph, weights_only=False)['prior_format'] == PRIOR_GRAPH_FORMAT
+
+
+def _edit(conditions, tmp_path, edit, table=True):
+    from energies.conformer_data import save_prior_file
+
+    rows = _masked_rows(conditions)
+    blob = _compact_blob(conditions, rows)
+    edit(blob)
+    path = save_prior_file(blob, tmp_path / 'prior.pt')
+    return _modeller(conditions, path, int(conditions.n_torsions[0]), table=table)
+
+
+def _set(key, value):
+    def edit(blob):
+        blob[key] = value(blob[key])
+    return edit
+
+
+def _nonzero_pad(blob):
+    r, c = map(int, torch.nonzero(~blob['state_mask'][blob['condition_index']])[0])
+    blob['torsion_state'][r, c] = 0.5
+
+
+@pytest.mark.parametrize('edit, why', [
+    (_set('identifiers', lambda v: ['CCCC'] + v[1:]), 'not in the conditions table'),
+    (_set('state_mask', lambda v: ~v), 'free-column mask or an atom count'),
+    (_set('n_atoms', lambda v: v + 1), 'free-column mask or an atom count'),
+    (_nonzero_pad, 'non-zero PAD column'),
+    (_set('conformer_energy', lambda v: v[1:]), 'inconsistent compact prior'),
+    (_set('condition_index', lambda v: v + 100), 'inconsistent compact prior'),
+])
+def test_a_compact_prior_file_that_is_not_the_tables_is_refused(conditions, tmp_path, edit, why,
+                                                                float32_default):
+    m = _edit(conditions, tmp_path, edit)
+    with pytest.raises(SystemExit, match=why):
+        m.init_prior_dataset()
+
+
+def test_a_compact_prior_file_needs_the_conditions_table(conditions, tmp_path, float32_default):
+    m = _edit(conditions, tmp_path, lambda blob: None, table=False)
+    with pytest.raises(SystemExit, match='compact prior file'):
+        m.init_prior_dataset()
+
+
+def test_from_columns_refuses_columns_that_are_not_rows(conditions):
+    statics = ConformerStatics(_table(conditions))
+    keys = torch.tensor([0, 1, 1, 3])
+    k = int(conditions.n_torsions[0])
+    cols = {'torsion_state': torch.zeros(4, k), 'conformer_energy': torch.zeros(4)}
+    rows = ConformerCompactRows.from_columns(statics, keys, cols, exclude_keys=BULKY)
+    assert rows.num_graphs == 4 and torch.equal(rows.keys, keys)
+    with pytest.raises(CompactRowsError, match='outside the'):
+        ConformerCompactRows.from_columns(statics, torch.tensor([0, 9]), {})
+    with pytest.raises(CompactRowsError, match='one entry per row'):
+        ConformerCompactRows.from_columns(statics, keys, {'torsion_state': torch.zeros(3, k)})
+    with pytest.raises(CompactRowsError, match='not a per-graph field'):
+        ConformerCompactRows.from_columns(statics, keys, {'pos': torch.zeros(4, 3)})
+
+
+# ----------------------------------------------------------- the anchor seed's rows
+
+
+def test_lowest_rows_per_condition():
+    from buffer import lowest_rows_per_condition as pick
+
+    keys = torch.tensor([7, 7, 7, 2, 2, 5, 7, 2])
+    e = torch.tensor([3., 1., 2., 9., 8., 0., 0.5, 8.])
+    # everything fits: every row, in row order
+    rows, k, n = pick(keys, e, 8)
+    assert rows.tolist() == list(range(8)) and (k, n) == (4, 3)
+    # the largest k that fits 6 rows is 2 (2 + 2 + 1 = 5; k = 3 would take 7)
+    rows, k, n = pick(keys, e, 6)
+    assert (k, n) == (2, 3) and rows.tolist() == [1, 4, 5, 6, 7]     # tie at 8.0: the earlier row
+    rows, k, _ = pick(keys, e, 3)
+    assert k == 1 and rows.tolist() == [4, 5, 6]
+    # an explicit count, taken even where everything would fit
+    rows, k, _ = pick(keys, e, 100, per_condition=1)
+    assert k == 1 and rows.tolist() == [4, 5, 6]
+    rows, k, _ = pick(keys, e, 100, per_condition=50)
+    assert rows.tolist() == list(range(8))
+    with pytest.raises(ValueError, match='one row of each'):
+        pick(keys, e, 2)
+    with pytest.raises(ValueError, match='more than max_size'):
+        pick(keys, e, 4, per_condition=2)
+    with pytest.raises(ValueError, match='>= 1'):
+        pick(keys, e, 4, per_condition=0)
+    rows, k, n = pick(torch.zeros(0, dtype=torch.long), torch.zeros(0), 4)
+    assert rows.numel() == 0 and (k, n) == (0, 0)
+    # NaN energies are taken last
+    rows, _, _ = pick(torch.tensor([0, 0, 0]), torch.tensor([float('nan'), 2., 1.]), 2,
+                      per_condition=2)
+    assert rows.tolist() == [1, 2]
+
+
+def test_the_anchor_seed_takes_bounded_rows_of_a_compact_prior_dataset(conditions, tmp_path,
+                                                                       float32_default, capsys,
+                                                                       monkeypatch):
+    import buffer
+    from energies.conformer_data import save_prior_file
+
+    # two rows per chunk, so the load's pad check and the seed both run over several chunks
+    monkeypatch.setattr(buffer, 'COMPACT_CHUNK_ROWS', 2)
+    rows = _masked_rows(conditions)                 # 5, 7, 3 and 6 rows over four conditions
+    k = int(conditions.n_torsions[0])
+    path = save_prior_file(_compact_blob(conditions, rows), tmp_path / 'prior.pt')
+    e = rows.conformer_energy.reshape(-1)
+    at = torch.tensor([list(conditions.identifier).index(s) for s in rows.identifier])
+
+    def seed(**anchor):
+        m = _modeller(conditions, path, k, anchor=anchor)
+        m.init_prior_dataset()
+        parts = list(m._anchor_seed_row_batches(m.prior_dataset))
+        # chunks of two rows, a single leftover row joined to the last of them
+        assert len(parts) > 1 and all(part.num_graphs in (2, 3) for part in parts)
+        out = parts[0]
+        for part in parts[1:]:
+            out = out.append_batch(part)
+        return out
+
+    # the dataset fits max_size: every row, in order, as before
+    everything = seed(max_size=21)
+    assert torch.equal(everything.conformer_energy.reshape(-1), e)
+    # it does not: the most rows per condition that fit, each condition's lowest
+    bounded = seed(max_size=14)                     # k = 3 -> 12 rows; k = 4 would take 15
+    assert bounded.num_graphs == 12
+    want = torch.cat([torch.sort(e[at == c]).values[:3] for c in range(4)])
+    assert torch.equal(torch.sort(bounded.conformer_energy.reshape(-1)).values,
+                       torch.sort(want).values)
+    assert 'lowest-energy 3 per condition over 4 condition(s)' in capsys.readouterr().out
+    # the configured count
+    one = seed(max_size=1000, seed_rows_per_condition=1)
+    assert torch.equal(torch.sort(one.conformer_energy.reshape(-1)).values,
+                       torch.sort(torch.stack([e[at == c].min() for c in range(4)])).values)
+    for anchor, why in (({'max_size': 3}, 'one row of each'),
+                        ({'max_size': 10, 'seed_rows_per_condition': 3}, 'more than max_size')):
+        with pytest.raises(SystemExit, match=why):
+            seed(**anchor)
+
+
+def test_the_anchor_seed_hands_the_base_method_its_rows_by_standing_in(conditions, tmp_path,
+                                                                      float32_default,
+                                                                      monkeypatch):
+    """ConformerModeller.init_anchor_buffer_seed: a compact prior dataset stands in with the
+    bounded selection as its `row_batches`, which train.py::_dataset_row_batches reads; a
+    graph-row dataset reaches the base method as itself; and prior_dataset is put back."""
+    import train
+    from energies.conformer_data import save_prior_file
+
+    rows = _masked_rows(conditions)
+    path = save_prior_file(_compact_blob(conditions, rows), tmp_path / 'prior.pt')
+    seen = []
+    monkeypatch.setattr(train.Modeller, 'init_anchor_buffer_seed', lambda self: seen.append(
+        sum(b.num_graphs for b in train._dataset_row_batches(self.prior_dataset))))
+
+    m = _modeller(conditions, path, int(conditions.n_torsions[0]),
+                  anchor={'max_size': 14, 'seed_source': 'prior_dataset'})
+    m.init_prior_dataset()
+    compact = m.prior_dataset
+    m.init_anchor_buffer_seed()
+    assert seen == [12] and m.prior_dataset is compact       # 3 rows of each of 4 conditions
+    # the rows before the thermal noise, when they were kept, are the ones selected from
+    m._prior_dataset_raw = rows                                # a graph batch: handed over whole
+    m.init_anchor_buffer_seed()
+    assert seen[-1] == rows.num_graphs and '_prior_dataset_raw' not in m.__dict__
+    m.prior_dataset = full = ConformerBuffer(rows, 'cpu', exclude_keys=BULKY,
+                                             y_fn='conformer_energy')
+    m.init_anchor_buffer_seed()
+    assert seen[-1] == rows.num_graphs and m.prior_dataset is full
+
+
+def test_chunk_bounds_never_leave_one_row_alone():
+    from buffer import chunk_bounds
+
+    assert chunk_bounds(0, 4) == []
+    assert chunk_bounds(1, 4) == [(0, 1)]
+    assert chunk_bounds(8, 4) == [(0, 4), (4, 8)]
+    assert chunk_bounds(9, 4) == [(0, 4), (4, 9)]             # the ninth row joins the second chunk
+    assert chunk_bounds(10, 4) == [(0, 4), (4, 8), (8, 10)]
+    assert chunk_bounds(5, 1) == [(0, 2), (2, 5)]             # a chunk is at least two rows
+
+
+# ------------------------------------------------------------------- footprints
+
+
+def test_store_footprint_counts_what_each_store_holds(conditions):
+    from buffer import store_footprint, table_footprint
+
+    rows = _prior_rows(conditions)
+    n, k = rows.num_graphs, int(conditions.n_torsions[0])
+    full, compact, statics = _pair(rows, _table(conditions), y_fn='conformer_energy')
+    f, c = store_footprint(full), store_footprint(compact)
+    assert (f['rows'], c['rows']) == (n, n) and c['compact'] and not f['compact']
+    # a compact row on the device: its state and its energy (x and y share their storage)
+    assert c['device_bytes'] == n * (4 * k + 4)
+    # on the host: key and atom count, and the per-row bookkeeping columns
+    columns = sum(v.numel() * v.element_size() for name, v in vars(compact).items()
+                  if torch.is_tensor(v) and name not in ('x', 'y'))
+    assert c['host_bytes'] == 16 * n + columns and f['host_bytes'] == columns
+    # a full row carries its condition's graph as well
+    assert f['device_bytes'] > 10 * c['device_bytes']
+    assert table_footprint(statics) > 0
+    # after an admission x and y are their own tensors: twice the state and energy
+    compact.add(_prior_rows(conditions, seed=3))
+    c2 = store_footprint(compact)
+    assert c2['device_bytes'] == 2 * (2 * n) * (4 * k + 4)
