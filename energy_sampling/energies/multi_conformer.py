@@ -58,7 +58,12 @@ class MultiConformerTorsions(ConformerTorsions):
     """
 
     def __init__(self, smiles: Sequence[str], identifiers: Optional[Sequence[str]] = None,
-                 **kw):
+                 reference_positions: Optional[Dict[str, object]] = None, **kw):
+        """``reference_positions`` maps an identifier to its STORED reference conformer, in
+        the RDKit atom order ``ConformerTorsions(reference_positions=...)`` takes; a member
+        whose identifier it names is built from it (no embedding), the rest are embedded.
+        """
+        refs = dict(reference_positions or {})
         smiles = list(smiles)
         if not smiles:
             raise ValueError('MultiConformerTorsions needs at least one molecule')
@@ -74,12 +79,13 @@ class MultiConformerTorsions(ConformerTorsions):
         self._by_mol_id: Dict[int, str] = {}
         self._member_smiles: Dict[str, str] = {}
         self._carrier = None
-        super().__init__(smiles=smiles[0], **kw)
+        super().__init__(smiles=smiles[0], reference_positions=refs.get(idents[0]), **kw)
         for smi, ident in zip(smiles, idents):
             if ident in self._members:
                 continue
             member = (self if smi == smiles[0] and ident == idents[0]
-                      else ConformerTorsions(smiles=smi, **kw))
+                      else ConformerTorsions(smiles=smi, reference_positions=refs.get(ident),
+                                             **kw))
             self._members[ident] = member
             self._member_smiles[ident] = smi
 
@@ -92,7 +98,8 @@ class MultiConformerTorsions(ConformerTorsions):
         layout = CarrierLayout(self._members)
         if not layout.is_identity:
             ref_ident = idents[0]
-            self._members[ref_ident] = ConformerTorsions(smiles=smiles[0], **kw)
+            self._members[ref_ident] = ConformerTorsions(
+                smiles=smiles[0], reference_positions=refs.get(ref_ident), **kw)
             self._carrier = layout
             self.data_ndim = layout.K
             self._free_block = layout.free_block

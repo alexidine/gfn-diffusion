@@ -123,6 +123,10 @@ REASON_CODES = {
     'stereo_lock_in_band': "an element's indicator sits too near zero at the reference, or "
                            "the lock fired on a thermal sample of the correct isomer",
     'stereo_torsion_double_bond': 'at torsion a rotatable column turns a locked double bond',
+    'stored_reference': 'a member built from a STORED reference (a conformer database record) '
+                        'is not that record: its reference, placement order or signature '
+                        '(block codes, placement z) differs, or the stored geometry is not '
+                        'this molecule in any atom order',
     'other': 'anything else; the message is recorded',
 }
 
@@ -536,14 +540,55 @@ def untagged_realisations(constitution: str, seed: int, n_seeds: int = 4) -> fro
 
 
 @dataclass
+class StoredReference:
+    """A member's reference conformer as a source stored it, for ``build_member(reference=)``.
+
+    ``pos`` ``[N, 3]`` float64 in PLACEMENT order; ``perm`` maps a placement slot to its RDKit
+    atom (None: derived from the bond graph, ``rdkit_order_reference``); ``z`` the stored
+    placement-order atomic numbers and ``signature`` the stored
+    ``ConformerModeller._member_signature``, each checked against the built member when given.
+    ``thermal_check`` is WHY the stereo lock's thermal check is known to pass on this reference
+    (the source's record of it), or None to run it. ``source`` names the store, for messages.
+    """
+    pos: np.ndarray
+    perm: Optional[np.ndarray] = None
+    z: Optional[np.ndarray] = None
+    signature: Optional[str] = None
+    thermal_check: Optional[str] = None
+    source: str = 'stored reference'
+
+
+@dataclass
+class StoredRefusal:
+    """An isomer a store's own build refused: its ``REASON_CODES`` code and message.
+
+    ``build_conformer_set.build_molecule`` records it as this isomer's refusal instead of
+    attempting the build, so a set built from a conformer database refuses what the database
+    refused whatever this environment's RDKit would do.
+    """
+    code: str
+    message: str
+    source: str = 'stored refusal'
+
+
+@dataclass
 class Member:
-    """A molecule that passed every check: its chart, and its member-width condition."""
+    """A molecule that passed every check: its chart, and its member-width condition.
+
+    ``reference`` is 'embedded' (seeded ETKDG + MMFF94 in this process) or 'stored' (built
+    from a ``StoredReference``). ``thermal_check`` is None with the stereo lock off, else
+    ``{'status': 'passed', 'n', 'min_excess', 'seed', 'steps'}`` when it ran here, or
+    ``{'status': 'skipped', 'reason'}`` when the stored reference's record of a pass stood
+    for it.
+    """
     identifier: str
     smiles: str
     energy: object
     condition: object
     atoms: Optional[np.ndarray] = None       # free_dof_atom_index, when embedded
     mask: Optional[np.ndarray] = None
+    reference: str = 'embedded'
+    thermal_check: Optional[dict] = None
 
 
 def _bond_graph_mismatch(energy):
@@ -565,7 +610,8 @@ def _bond_graph_mismatch(energy):
 
 
 def build_member(smiles: str, identifier: str, energy_kw: dict, *, bundle=None,
-                 carrier: bool = False, check: bool = True) -> Member:
+                 carrier: bool = False, check: bool = True,
+                 reference: Optional[StoredReference] = None) -> Member:
     """One molecule's chart and condition graph, or ``MemberRefused`` naming why not.
 
     THE ORDER IS CONSTITUTION FIRST, ISOMER LAST. The refusals that are properties of the
@@ -575,10 +621,19 @@ def build_member(smiles: str, identifier: str, energy_kw: dict, *, bundle=None,
     (build_conformer_set.CONSTITUTION_CODES). The builder's stereo checks read the embedded
     reference, so they come after it exists. ANY exception, from any step, leaves as
     ``MemberRefused``.
+
+    ``reference`` builds the member FROM A STORED REFERENCE CONFORMER instead of embedding one
+    (``ConformerTorsions(reference_positions=...)``); the built member must reproduce the
+    stored reference, placement order and signature exactly (``stored_reference``). Every
+    other check runs as on an embedded member, except the stereo lock's thermal check when
+    ``reference.thermal_check`` records that it passed on this reference: the check reads
+    only the reference geometry, the stereo table built from it and RDKit's MMFF94 (a seeded
+    chain), so the stored pass is the verdict for this geometry, and ``Member.thermal_check``
+    says it was skipped and why.
     """
     try:
         return _build_member(smiles, identifier, energy_kw, bundle=bundle, carrier=carrier,
-                             check=check)
+                             check=check, reference=reference)
     except MemberRefused:
         raise
     except Exception as exc:                                   # noqa: BLE001 - classified
@@ -601,9 +656,38 @@ def _embed_failure(smiles: str, seed: int, message: str):
                             f'constitution realises ({seeds})')
 
 
-def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check) -> Member:
+def _stored_positions(smiles, energy_kw, reference: Optional[StoredReference]):
+    """``(RDKit-order positions, perm)`` of ``reference``, or ``(None, None)`` without one."""
+    if reference is None:
+        return None, None
+    from energies.conformer_torsions import rdkit_order_reference
     try:
-        energy = ConformerTorsions(smiles=smiles, device='cpu', **energy_kw)
+        return rdkit_order_reference(smiles, reference.pos, level=energy_kw.get('level'),
+                                     perm=reference.perm, z=reference.z)
+    except ValueError as exc:
+        raise MemberRefused('stored_reference', f'{reference.source}: {exc}') from None
+
+
+def _stored_reference_problem(identifier, energy, reference: StoredReference, perm) -> str:
+    """``''`` when ``energy`` is the member ``reference`` was stored from, else what differs."""
+    from energies.conformer_torsions import stored_reference_mismatch
+    why = stored_reference_mismatch(energy, reference.pos, perm)
+    if not why and reference.signature is not None:
+        from build_conformer_database import member_signature
+        sig = member_signature(identifier, energy)
+        if sig != reference.signature:
+            why = (f'signature {sig} against the stored {reference.signature}: the chart built '
+                   f'on the stored reference is not the stored member\'s (block codes or '
+                   f'placement z differ)')
+    return why
+
+
+def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check,
+                  reference=None) -> Member:
+    stored_rd, stored_perm = _stored_positions(smiles, energy_kw, reference)
+    try:
+        energy = ConformerTorsions(smiles=smiles, device='cpu', reference_positions=stored_rd,
+                                   **energy_kw)
     except Exception as exc:                                   # noqa: BLE001 - classified
         code, msg = classify_failure(exc), f'{type(exc).__name__}: {exc}'
         # A CHART REFUSAL CARRIES ITS CAUSE AS A CODE (conformer_torsions.ChartRefused), which
@@ -615,6 +699,10 @@ def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check) -> M
         if code == 'embed_failed':
             code, msg = _embed_failure(smiles, energy_kw.get('seed', 0), msg)
         raise MemberRefused(code, msg) from None
+    if reference is not None:
+        why = _stored_reference_problem(identifier, energy, reference, stored_perm)
+        if why:
+            raise MemberRefused('stored_reference', f'{reference.source}: {why}')
     level = energy.level
 
     # THE CHART AND THE COLLECTIVE MAP MUST AGREE ON HOW MANY COLUMNS THERE ARE -- at
@@ -649,14 +737,24 @@ def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check) -> M
     # chain independent of the chart (stereo_lock.mmff_thermal_samples); a molecule on which
     # the lock fires is refused under the in-band code, since the cause is the same -- an
     # indicator the correct isomer's own motion carries into its band.
+    # A STORED REFERENCE WHOSE SOURCE RECORDS A PASS IS NOT RE-CHECKED (build_member says why);
+    # the member records the skip and its reason instead of a result.
+    thermal = None
     if float(energy_kw.get('stereo_coeff', 0) or 0) > 0:
-        from energies.stereo_lock import thermal_check
-        tc = thermal_check(energy, seed=int(energy_kw.get('seed', 0) or 0))
-        if tc['fired']:
-            raise MemberRefused('stereo_lock_in_band',
-                                f"thermal check: the lock fired on {tc['fired']} of {tc['n']} "
-                                f"MMFF94 samples of its own isomer "
-                                f"(min s*v - lo {tc['min_excess']:.3f})")
+        if reference is not None and reference.thermal_check:
+            thermal = {'status': 'skipped', 'reason': reference.thermal_check}
+        else:
+            from energies.stereo_lock import THERMAL_CHECK_STEPS, thermal_check
+            seed = int(energy_kw.get('seed', 0) or 0)
+            tc = thermal_check(energy, seed=seed)
+            if tc['fired']:
+                raise MemberRefused('stereo_lock_in_band',
+                                    f"thermal check: the lock fired on {tc['fired']} of "
+                                    f"{tc['n']} MMFF94 samples of its own isomer "
+                                    f"(min s*v - lo {tc['min_excess']:.3f})")
+            thermal = {'status': 'passed', 'n': int(tc['n']),
+                       'min_excess': float(tc['min_excess']), 'seed': seed,
+                       'steps': int(THERMAL_CHECK_STEPS)}
 
     layout1 = None
     if carrier:
@@ -698,7 +796,12 @@ def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check) -> M
         mol.embedding = g[None, :].to(torch.get_default_dtype())
         mol.atom_embedding = h.to(torch.get_default_dtype())
         atoms, mask = free_dof_atom_index(energy)
-    return Member(identifier, smiles, energy, mol, atoms, mask)
+    # the checks above evaluated the member at their own batch sizes; the cached batched force
+    # field they leave (ConformerTorsions._batch) is 1 to 2 MB a member, held by a set builder
+    # for every member and copied to the parent by a --workers process
+    energy.release_batch_cache()
+    return Member(identifier, smiles, energy, mol, atoms, mask,
+                  reference=energy.reference_source, thermal_check=thermal)
 
 
 def _check_stereo(smiles: str, energy):

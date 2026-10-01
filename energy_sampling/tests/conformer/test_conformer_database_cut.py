@@ -16,6 +16,11 @@ descent steps) over four QM9 molecules plus water:
   * a database of other member arguments, or a half-finished one, accepted;
   * a manifest that does not name the database (run hash, shard header digest) and the cap;
   * a prior file the modeller's ``prior_path`` loader cannot take;
+  * a set that retries an isomer the database's walk refused instead of recording its code;
+  * a set whose members are not built FROM THE DATABASE'S STORED REFERENCES (a rigidly rotated
+    stored reference must come out as the conditions file's ``pos``), a thermal check re-run
+    where the database records its pass, or a stored reference whose rebuilt member is not the
+    database's (another signature) accepted instead of refused (``stored_reference``);
   * a reference floor that is not the database's lowest row re-scored through the member, a
     stamp that does not say where the floor came from, and a database-floor table resuming a
     search table's parts (or a search table's resume key changing).
@@ -259,12 +264,97 @@ def test_the_prior_file_loads_through_the_modellers_prior_path_branch(cut):
     m.args = types.SimpleNamespace(prior_path=str(cut.set / 'prior_train.pt'),
                                    buffer_device='cpu')
     k = int(cut.man['layout']['K'])
-    m.energy_function = types.SimpleNamespace(stereo_coeff=300.0, dtype=torch.float32, ndim=k)
+    # the reference guard reads each member's ref_pos: the database's stored references
+    members = {i: types.SimpleNamespace(ref_pos=torch.as_tensor(r['ref_pos']))
+               for i, r in cut.recs.items()}
+    m.energy_function = types.SimpleNamespace(stereo_coeff=300.0, dtype=torch.float32, ndim=k,
+                                              _members=members)
     m.init_prior_dataset()
     assert isinstance(m.prior_dataset, ConformerBuffer)
     assert len(m.prior_dataset) == cut.man['prior']['rows']
     assert m.prior_dataset.x.shape == (cut.man['prior']['rows'], k)
     assert m.prior_dataset.x.dtype == torch.float32
+
+
+# ------------------------------------------------------------------ stored references
+
+
+def _conditions(path):
+    b = torch.load(path, weights_only=False, map_location='cpu')['prior']
+    ptr = b.ptr.tolist()
+    return {ident: b.pos[ptr[j]:ptr[j + 1]].double().numpy()
+            for j, ident in enumerate(b.identifier)}
+
+
+def test_members_are_built_from_the_database_references(cut):
+    n = sum(cut.man['rungs'][s]['conditions'] for s in cut.man['rungs'])
+    r = cut.man['references']
+    assert r['source'] == 'database' and r['database_run_hash'] == cut.blob['run_hash']
+    assert r['reference'] == {'stored': n}
+    # the database ran the check when it built each member, and the set did not re-run it
+    assert all(c['thermal_check']['status'] == 'passed' for c in cut.recs.values())
+    assert r['thermal_check'] == {'skipped': n} and len(r['thermal_check_skipped_because']) == 1
+    for ident, pos in _conditions(cut.set / 'conditions_train.pt').items():
+        assert np.array_equal(pos, cut.recs[ident]['ref_pos']), ident
+    # the isomers the database's walk refused (water: lt4_atoms) are refused with its code
+    # and not rebuilt
+    tag = f"database {cut.blob['run_hash'][:12]}:"
+    want = sorted((j['identifier'], j['reason_code']) for r in cut.blob['keys'].values()
+                  for j in r['rejections'] if j['level'] == 'isomer' and j['identifier'])
+    with open(cut.set / 'rejections.tsv', encoding='utf-8') as f:
+        got = [r for r in csv.DictReader(f, delimiter='\t') if r['level'] == 'isomer']
+    assert want and sorted((r['identifier'], r['reason_code']) for r in got) == want
+    assert all(r['message'].startswith(tag) for r in got)
+    assert cut.man['references']['refusals_from_database'] == len(want)
+
+
+def test_a_rotated_stored_reference_is_the_one_the_set_uses(cut, tmp_path, monkeypatch):
+    """A rigid rotation changes no chart, energy or stereo element, but no embedding here
+    would produce it: the conditions file carrying it proves the member was built from it."""
+    import dataclasses
+
+    import build_conformer_database as db
+    real = db.read_references
+    c, s_ = np.cos(0.7), np.sin(0.7)
+    rot = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+
+    def rotated(path, **kw):
+        info, refs = real(path, **kw)
+        return info, {k: {i: (dataclasses.replace(r, pos=r.pos @ rot.T)
+                              if hasattr(r, 'pos') else r) for i, r in v.items()}
+                      for k, v in refs.items()}
+
+    monkeypatch.setattr(db, 'read_references', rotated)
+    man = _set(cut.src, tmp_path / 'set', cut.db)
+    got = _conditions(tmp_path / 'set' / 'conditions_train.pt')
+    assert set(got) == {m['identifier'] for m in cut.man['members']['train']}
+    for ident, pos in got.items():
+        assert np.array_equal(pos, cut.recs[ident]['ref_pos'] @ rot.T), ident
+    # the database rows are frame-free internal coordinates: they still re-score exactly
+    assert man['prior']['conditions_refused'] == 0
+    assert man['prior']['max_rescore_gap_kcal'] <= 1e-6
+
+
+def test_a_stored_reference_that_builds_another_member_is_refused(cut, tmp_path, monkeypatch):
+    import dataclasses
+
+    import build_conformer_database as db
+    real = db.read_references
+    bad = sorted(cut.recs)[0]
+
+    def resigned(path, **kw):
+        info, refs = real(path, **kw)
+        for v in refs.values():
+            if bad in v:
+                v[bad] = dataclasses.replace(v[bad], signature='0' * 16)
+        return info, refs
+
+    monkeypatch.setattr(db, 'read_references', resigned)
+    _set(cut.src, tmp_path / 'set', cut.db)
+    with open(tmp_path / 'set' / 'rejections.tsv', encoding='utf-8') as f:
+        rows = [r for r in csv.DictReader(f, delimiter='\t') if r['identifier'] == bad]
+    assert [r['reason_code'] for r in rows] == ['stored_reference']
+    assert 'signature' in rows[0]['message']
 
 
 # ------------------------------------------------------------------ reference floors

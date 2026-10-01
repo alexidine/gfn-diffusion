@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=48G
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
@@ -11,7 +11,7 @@
 #SBATCH --job-name=mle30
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/conformer_mle_sep30/joblogs/%x_%A_%a.out
 
-# conformer_mle_sep30 leg a: PILOT: 1000 training steps (epochs) on the pilot rung.
+# conformer_mle_sep30 leg a: ONE JOB (builds the rung first when it is missing). PILOT: 1000 training steps (epochs) on the pilot rung.
 # Arm = row of INDEX_a.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
@@ -52,9 +52,25 @@ fi
 # on this route.
 NIG_EXPORT=""
 RUNG=${DATA}/${SET}
+# ONE JOB: a rung with a file missing is built here, by build_${SET}.sbatch run as a script
+# (its #SBATCH lines are comments; it uses this job's CPUs), before training.
+MISSING=""
 for F in manifest.json conditions_train.pt conditions_heldout.pt prior_train.pt conditions_train.references.pt conditions_heldout.references.pt; do
-    if [ ! -s ${RUNG}/${F} ]; then echo "FATAL: ${RUNG}/${F} is missing; run build_${SET}.sbatch first" >&2; exit 1; fi
+    [ -s ${RUNG}/${F} ] || MISSING="${MISSING} ${F}"
 done
+if [ -n "${MISSING}" ]; then
+    echo "rung ${SET}: missing${MISSING} -- building it in this job"
+    mkdir -p ${DATA}
+    if ! mkdir ${RUNG}.building 2>/dev/null; then
+        echo "FATAL: ${RUNG}.building exists: another job is building this rung, or one died building it (then: rmdir ${RUNG}.building)" >&2; exit 1
+    fi
+    bash ${ARMS}/build_${SET}.sbatch; BUILD_RC=$?
+    rmdir ${RUNG}.building
+    if [ ${BUILD_RC} -ne 0 ]; then echo "FATAL: the build of rung ${SET} exited ${BUILD_RC}" >&2; exit 1; fi
+    for F in manifest.json conditions_train.pt conditions_heldout.pt prior_train.pt conditions_train.references.pt conditions_heldout.references.pt; do
+        if [ ! -s ${RUNG}/${F} ]; then echo "FATAL: the build left ${RUNG}/${F} missing" >&2; exit 1; fi
+    done
+fi
 RDKIT=$(grep -o '"rdkit": *"[^"]*"' ${RUNG}/manifest.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 if [ -z "${RDKIT}" ]; then echo "FATAL: ${RUNG}/manifest.json names no RDKit version" >&2; exit 1; fi
 if [ "$(sha256sum ${WORKDIR}/conformer_prior_v2.pt | cut -d' ' -f1)" != "e6c2953f2f874f83f5fab84793d1339288f6efd26a3bc157d2c8251f0ddb6153" ]; then

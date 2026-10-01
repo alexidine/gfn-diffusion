@@ -3,24 +3,34 @@ r"""conformer_mle_sep30 -- converge the conformer MLE warm-up (stage `train_prio
 
     python configs/conformer_mle_sep30/make.py
 
-TWO JOBS PER RUNG, chained by submit.sh:
+ONE JOB PER RUNG (run_<rung>.sbatch), or TWO chained by submit.sh:
   * build_<rung>.sbatch (CPU): build_conformer_set.py --database DB --rows-per-condition-cap 16
-    cuts the rung (train + held-out conditions, the database prior) into RUNGS_ROOT/<rung>, then
-    build_conformer_references.py --database DB writes both reference tables (the per-condition
-    floors the offline eval reads). IT MUST RUN ON THE CLUSTER, in the training container: the
-    run re-embeds every member with its own RDKit, and ConformerModeller refuses a file whose
-    stored reference conformers another RDKit embedded (_refuse_reference_mismatch). Rerunning
-    it skips what is already on disk (a set with a manifest, a written table).
+    --workers <the job's CPUs> cuts the rung (train + held-out conditions, the database prior)
+    into RUNGS_ROOT/<rung>, then build_conformer_references.py --database DB writes both
+    reference tables (the per-condition floors the offline eval reads). Every member is built
+    from the database's stored reference conformer (no embedding, the stereo lock's thermal
+    check skipped on the database's record of its pass), and the run builds each member from the
+    reference the conditions file stores, so the rung no longer depends on which RDKit embeds
+    it; it still runs in the training container, whose RDKit types the MMFF94 terms and whose
+    version the training job asserts against the rung's manifest. Rerunning it skips what is
+    already on disk (a set with a manifest, a written table).
   * train_<rung>.sbatch (GPU): configs/final_sep19/make.py::SBATCH through
     configs/conformer_cond/make.py::conformer_template (the RESUME / FRESH / CK_STEP block, the
     dead-arm sentinel, the RDKit / MMFF import guard, the nvidia-smi and sacct sidecars), pinned
     to its row of INDEX_a.tsv, with the data guard replaced by RUNG_GUARD (the rung's files
     present, the RDKit version read from its manifest, the committed prior's sha256). A first
     launch is FRESH; RESUBMITTING THE SAME FILE continues the arm from its own _running.pt.
+  * run_<rung>.sbatch (GPU, ONE JOB, no dependency): train_<rung>.sbatch with ONE_JOB_GUARD in
+    place of RUNG_GUARD -- when a file of the rung is missing it runs build_<rung>.sbatch as a
+    script inside the job (under the lock directory RUNGS_ROOT/<rung>.building, which a second
+    job refuses rather than waits on), then trains. It asks for the build's CPUs and the larger
+    of the two memory requests, and the build's time comes out of the training wall.
+    NOT YET RUN ON THE CLUSTER.
 
-    bash configs/conformer_mle_sep30/submit.sh pilot    # build -> train, afterok
+    bash configs/conformer_mle_sep30/submit.sh pilot       # build -> train, afterok
     bash configs/conformer_mle_sep30/submit.sh r20k
-    sbatch configs/conformer_mle_sep30/train_r20k.sbatch   # every later leg
+    bash configs/conformer_mle_sep30/submit.sh r20k one    # ONE job: build if missing, then train
+    sbatch configs/conformer_mle_sep30/train_r20k.sbatch   # every later leg (or run_r20k.sbatch)
 
 EACH ARM is the committed configs/conformer_mk.yaml (git HEAD, never the working tree) with only
   run_name mle30_<rung>; molecules_path / test_molecules_path / prior_path = the rung's
@@ -38,9 +48,9 @@ template span it substitutes that is not there exactly once; an arm the loader, 
 the stage protocol reject (configs/final_sep19/make.py::load_check).
 
 PROJECTIONS (printed and written to INDEX_a.tsv; WORKING ASSUMPTIONS from the local 2000/200
-database rung of 2026-09-30, not cluster measurements): conditions and prior rows per molecule,
-the set builder's and reference builder's CPU seconds, the builder's peak host memory, and the
-training footprint model -- ROW_KB per prior row, COND_KB per train condition, the prior
+database rung of 2026-09-30 and the local 450/50 builds of 2026-10-01, not cluster
+measurements): conditions and prior rows per molecule, the set builder's and reference builder's
+CPU seconds, the builder's peak host memory, and the training footprint model -- ROW_KB per prior row, COND_KB per train condition, the prior
 dataset held once as loaded, once cloned into the anchor buffer (whole: anchor thinning is off),
 and once more transiently while the prior buffer seed is cut to its max_size.
 """
@@ -89,11 +99,23 @@ ENCODER_REL = 'models/results/encoder_ckpt/mp+attn+spd_n20000_s0.pt'   # models/
 PRIOR_REL = 'conformer_prior_v2.pt'     # energy_config.internal_prior_path
 
 # --- the build job (CPU)
-BUILD_CPUS = 4                          # the set builder is one process (2 torch threads); the references use them all
-SET_THREADS = 2
-#: CPU seconds per molecule of the set builder, walk refusals included: the owner's 0.71 s per
-#: key; locally 1503 s for 2,200 kept molecules (0.68 s)
-SET_S_PER_MOLECULE = 0.71
+BUILD_CPUS = 16                         # both builders run one worker process per CPU of the job
+SET_THREADS = 1                         # torch threads per set-builder worker
+#: THE SET BUILDER, members from the database's stored references and the thermal check skipped
+#: on its recorded pass (local 450/50 build, 2026-10-01, 24-thread desktop; the same build embedding
+#: every member and running every thermal check walked at 0.55 s per molecule):
+#:   SET_FIXED_S         what does not scale with the rung -- the split plan over the whole source
+#:                       table and two reads of the 400-shard database
+#:   SET_WALK_S          CPU seconds per kept molecule of the walk, which --workers divides
+#:                       (35 s serial against about 4 s on 8 workers for 450 molecules)
+#:   SET_SERIAL_S        seconds per kept molecule after the walk, in the parent process alone
+#:                       (layout, files, the database prior and their verification)
+#: CLUSTER_SLOWDOWN scales all three: the r20k build of 2026-09-30 ran at 1.04 s per molecule on
+#: the cluster against 0.68 s locally for the same code.
+SET_FIXED_S = 90.0
+SET_WALK_S = 0.08
+SET_SERIAL_S = 0.06
+CLUSTER_SLOWDOWN = 1.5
 #: CPU seconds per condition of the database-floor reference build: locally 803 s over 3,353
 REFS_S_PER_CONDITION = 0.24
 #: conditions per molecule (stereoisomers): locally 3,486 / 2,000 train and 355 / 200 held-out
@@ -101,11 +123,16 @@ CONDITIONS_PER_MOLECULE = 1.75
 #: prior rows per train molecule at cap 16: locally 22,760 / 2,000
 ROWS_PER_MOLECULE = 11.4
 #: the set builder's peak host memory, GB = BUILD_MEM_BASE_GB + BUILD_MEM_PER_1K_MOL_GB x
-#: molecules / 1000 (train + held-out): the peak resident set of local builds of 110 and 440
-#: molecules (1.41 and 2.45 GB, 2026-09-30), extrapolated linearly. The same builds ran at 1.9 to
-#: 4.6 s per molecule on a shared, busy CPU, hence the wall margin.
-BUILD_MEM_BASE_GB = 1.06
-BUILD_MEM_PER_1K_MOL_GB = 3.15
+#: molecules / 1000 (train + held-out) + BUILD_MEM_PER_WORKER_GB x workers. Base: the 3.0 GB peak
+#: of the local 450/50 build, most of it the whole database's reference table (218,473 references
+#: and 204,253 recorded refusals, read whatever the rung's size). Per molecule: 1.75 conditions at
+#: about 0.3 MB (a member's 0.22 MB of resident memory as the trainer holds it, and its 0.07 MB
+#: condition graph) -- an ESTIMATE, not measured at rung size; the 3.15 GB per 1,000 molecules of
+#: 2026-09-30 was each member's cached batched force field, which build_member now releases.
+#: Per worker: (8.9 - 3.0) / 8 GB of the 8-worker build's process tree.
+BUILD_MEM_BASE_GB = 3.0
+BUILD_MEM_PER_1K_MOL_GB = 0.6
+BUILD_MEM_PER_WORKER_GB = 0.75
 BUILD_WALL_MARGIN = 4.0
 BUILD_MEM_MARGIN = 2.0
 
@@ -225,15 +252,25 @@ def check_arm(cfg, base, name, pilot):
 
 # ----------------------------------------------------------------------------- projections
 
+def build_seconds(n_mol, workers=BUILD_CPUS):
+    """(projected wall seconds, CPU seconds) of a build of n_mol molecules on ``workers`` CPUs,
+    before any margin: the set builder's fixed part, its walk over the workers, its serial tail,
+    and the reference builder over the workers."""
+    n_cond = CONDITIONS_PER_MOLECULE * n_mol
+    walk_s, serial_s = SET_WALK_S * n_mol, SET_FIXED_S + SET_SERIAL_S * n_mol
+    refs_s = REFS_S_PER_CONDITION * n_cond
+    return (CLUSTER_SLOWDOWN * (serial_s + (walk_s + refs_s) / workers),
+            CLUSTER_SLOWDOWN * (serial_s + walk_s + refs_s))
+
+
 def build_cost(n_mol):
     """(wall 'HH:MM:SS', mem 'NG', CPU-hours) for a build of n_mol molecules (train + held-out)."""
-    n_cond = CONDITIONS_PER_MOLECULE * n_mol
-    set_s = SET_S_PER_MOLECULE * n_mol
-    refs_s = REFS_S_PER_CONDITION * n_cond
-    wall_s = BUILD_WALL_MARGIN * (set_s + refs_s / BUILD_CPUS) + 1800
+    wall, cpu = build_seconds(n_mol)
+    wall_s = BUILD_WALL_MARGIN * wall + 1800
     hours = min(47, max(1, math.ceil(wall_s / 3600)))
-    mem = BUILD_MEM_MARGIN * (BUILD_MEM_BASE_GB + BUILD_MEM_PER_1K_MOL_GB * n_mol / 1000)
-    return f'{hours:02d}:00:00', f'{max(8, math.ceil(mem))}G', (set_s + refs_s) / 3600
+    mem = BUILD_MEM_MARGIN * (BUILD_MEM_BASE_GB + BUILD_MEM_PER_1K_MOL_GB * n_mol / 1000
+                              + BUILD_MEM_PER_WORKER_GB * BUILD_CPUS)
+    return f'{hours:02d}:00:00', f'{max(8, math.ceil(mem))}G', cpu / 3600
 
 
 def train_footprint(n_train, prior_buffer_cap):
@@ -267,11 +304,12 @@ BUILD_TEMPLATE = r'''#!/bin/bash
 
 # @@BATTERY@@ BUILD, rung @@RUNG@@: @@N_TRAIN@@ train / @@N_HELDOUT@@ held-out molecules cut from the
 # QM9 conformer database at @@CAP@@ rows per condition, with both reference tables, into
-# @@OUT@@. CPU only, IN THE TRAINING CONTAINER: the training run re-embeds every member with
-# this RDKit and refuses a file whose reference conformers another RDKit embedded.
+# @@OUT@@. CPU only, IN THE TRAINING CONTAINER. Members are built from the database's stored
+# reference conformers, and the training run builds each member from the conditions file's.
 # WRITTEN BY make.py: do not edit by hand. Rerunning skips a set that has its manifest and a
 # table already written (the reference builder resumes from its .parts directory).
-# Projected: @@CPU_H@@ CPU-hours (set builder single-process, references on @@CPUS@@ workers).
+# Projected: @@CPU_H@@ CPU-hours; both builders run one worker per CPU of the job
+# (SLURM_CPUS_PER_TASK, @@CPUS@@ as submitted here). run_@@RUNG@@.sbatch runs this file as a script.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -281,6 +319,7 @@ WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
 LOGS=${WORKDIR}/configs/@@BATTERY@@/joblogs
 DB=@@DATABASE@@
 OUT=@@OUT@@
+NCPU=${SLURM_CPUS_PER_TASK:-@@CPUS@@}
 mkdir -p ${LOGS}
 J=${LOGS}/build_@@RUNG@@_${SLURM_JOB_ID}
 
@@ -317,13 +356,14 @@ srun singularity exec \
         else
             python -u build_conformer_set.py --out-dir ${OUT} --source @@SOURCE_REL@@ \
                 --config configs/conformer_mk.yaml --n-train @@N_TRAIN@@ --n-heldout @@N_HELDOUT@@ \
-                --database ${DB} --rows-per-condition-cap @@CAP@@ --threads @@SET_THREADS@@ || exit 1
+                --database ${DB} --rows-per-condition-cap @@CAP@@ --threads @@SET_THREADS@@ \
+                --workers ${NCPU} || exit 1
         fi
         for SIDE in train heldout; do
             TABLE=${OUT}/conditions_\${SIDE}.references.pt
             if [ -f \${TABLE} ]; then echo \"REFERENCES: \${TABLE} exists, skipping\"; continue; fi
             python -u build_conformer_references.py --conditions ${OUT}/conditions_\${SIDE}.pt \
-                --config configs/conformer_mk.yaml --database ${DB} --workers @@CPUS@@ --threads 1
+                --config configs/conformer_mk.yaml --database ${DB} --workers ${NCPU} --threads 1
             RC=\$?
             # 1 = the table is written and some conditions failed (a condition the database cannot
             # floor, recorded in the table's failures); anything else is a failed build
@@ -340,23 +380,52 @@ exit ${PIPESTATUS[0]}
 #: the train template's index read of its rdkit column, replaced by the read of the rung
 _SET_COLUMN = r"""SET=$(awk -F'\t' -v n=${{ROW}} 'NR==n {{print $5}}' ${{INDEX}})
 """
-RUNG_GUARD = r"""# RUNG GUARD. The rung was built ON THE CLUSTER by build_${{SET}}.sbatch (the dependency submit.sh
-# sets). Every file the run and the offline eval read must be there; the RDKit version the
-# conformer guard below asserts is the one the rung's manifest records, since the run re-embeds
-# every member and ConformerModeller refuses reference conformers another RDKit embedded. The
-# fitted prior is committed: its sha256 is HEAD's. NIG_EXPORT is the crystal template's
-# MXtalTools export, empty on this route.
+_RUNG_FILES = ('manifest.json conditions_train.pt conditions_heldout.pt prior_train.pt '
+               'conditions_train.references.pt conditions_heldout.references.pt')
+_GUARD_HEAD = r"""# RUNG GUARD. The rung is built ON THE CLUSTER by build_${{SET}}.sbatch. Every file the run and
+# the offline eval read must be there; the RDKit version the conformer guard below asserts is the
+# one the rung's manifest records (the run builds each member from the reference conformer the
+# conditions file stores, and types its MMFF94 terms with this RDKit). The fitted prior is
+# committed: its sha256 is HEAD's. NIG_EXPORT is the crystal template's MXtalTools export, empty
+# on this route.
 NIG_EXPORT=""
 RUNG=${{DATA}}/${{SET}}
-for F in manifest.json conditions_train.pt conditions_heldout.pt prior_train.pt conditions_train.references.pt conditions_heldout.references.pt; do
+"""
+_GUARD_REFUSE = r"""for F in @@RUNG_FILES@@; do
     if [ ! -s ${{RUNG}}/${{F}} ]; then echo "FATAL: ${{RUNG}}/${{F}} is missing; run build_${{SET}}.sbatch first" >&2; exit 1; fi
 done
-RDKIT=$(grep -o '"rdkit": *"[^"]*"' ${{RUNG}}/manifest.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+"""
+#: ONE JOB: build the rung here when a file of it is missing. NO WAIT: a second job that finds
+#: the lock directory exits at once (the builder's own job is running, or one died building --
+#: the message says how to clear it), so nothing can pend on a build that never finishes.
+_GUARD_BUILD = r"""# ONE JOB: a rung with a file missing is built here, by build_${{SET}}.sbatch run as a script
+# (its #SBATCH lines are comments; it uses this job's CPUs), before training.
+MISSING=""
+for F in @@RUNG_FILES@@; do
+    [ -s ${{RUNG}}/${{F}} ] || MISSING="${{MISSING}} ${{F}}"
+done
+if [ -n "${{MISSING}}" ]; then
+    echo "rung ${{SET}}: missing${{MISSING}} -- building it in this job"
+    mkdir -p ${{DATA}}
+    if ! mkdir ${{RUNG}}.building 2>/dev/null; then
+        echo "FATAL: ${{RUNG}}.building exists: another job is building this rung, or one died building it (then: rmdir ${{RUNG}}.building)" >&2; exit 1
+    fi
+    bash ${{ARMS}}/build_${{SET}}.sbatch; BUILD_RC=$?
+    rmdir ${{RUNG}}.building
+    if [ ${{BUILD_RC}} -ne 0 ]; then echo "FATAL: the build of rung ${{SET}} exited ${{BUILD_RC}}" >&2; exit 1; fi
+    for F in @@RUNG_FILES@@; do
+        if [ ! -s ${{RUNG}}/${{F}} ]; then echo "FATAL: the build left ${{RUNG}}/${{F}} missing" >&2; exit 1; fi
+    done
+fi
+"""
+_GUARD_TAIL = r"""RDKIT=$(grep -o '"rdkit": *"[^"]*"' ${{RUNG}}/manifest.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 if [ -z "${{RDKIT}}" ]; then echo "FATAL: ${{RUNG}}/manifest.json names no RDKit version" >&2; exit 1; fi
 if [ "$(sha256sum ${{WORKDIR}}/@@PRIOR_REL@@ | cut -d' ' -f1)" != "@@PRIOR_SHA@@" ]; then
     echo "FATAL: ${{WORKDIR}}/@@PRIOR_REL@@ is not HEAD's (sha256 @@PRIOR_SHA@@); git pull" >&2; exit 1
 fi
 """
+RUNG_GUARD = _GUARD_HEAD + _GUARD_REFUSE + _GUARD_TAIL
+ONE_JOB_GUARD = _GUARD_HEAD + _GUARD_BUILD + _GUARD_TAIL
 
 
 def fill(text, values, where):
@@ -378,11 +447,16 @@ def refuse_local(text, where):
                          + '\n  '.join(bad))
 
 
-def train_sbatch(row, rung, wall, mem, prior_sha, pilot=False):
+def train_sbatch(row, rung, wall, mem, prior_sha, pilot=False, one_job=False):
+    """The training job; ``one_job`` builds the rung first when it is missing (ONE_JOB_GUARD)
+    and asks for the build's CPUs."""
     text = cc.conformer_template(fin.SBATCH)
-    text = cc._replace_once(text, cc.DATA_GUARD, fill(RUNG_GUARD, {'PRIOR_REL': PRIOR_REL,
-                                                                   'PRIOR_SHA': prior_sha}, 'guard'),
-                            'conformer data guard')
+    guard = fill(ONE_JOB_GUARD if one_job else RUNG_GUARD,
+                 {'PRIOR_REL': PRIOR_REL, 'PRIOR_SHA': prior_sha, 'RUNG_FILES': _RUNG_FILES}, 'guard')
+    text = cc._replace_once(text, cc.DATA_GUARD, guard, 'conformer data guard')
+    if one_job:
+        text = cc._replace_once(text, '#SBATCH --cpus-per-task=8',
+                                f'#SBATCH --cpus-per-task={max(8, BUILD_CPUS)}', 'cpus line')
     text = cc._replace_once(text, cc._RDKIT_COLUMN, _SET_COLUMN, 'rdkit index column')
     text = cc._replace_once(text, '#SBATCH --array=0-{last}', f'#SBATCH --array={row}', 'array line')
     text = cc._replace_once(text, '#SBATCH --gres=gpu:a100:1', f'#SBATCH --gres={TRAIN_GRES}', 'gres line')
@@ -390,24 +464,33 @@ def train_sbatch(row, rung, wall, mem, prior_sha, pilot=False):
     return text.format(
         wall=wall, tag=TAG, battery=BATTERY, ckpts=CLUSTER_CKPTS, data=RUNGS_ROOT, leg=LEG,
         seed_block=cc.SEED_FRESH, last=row,
-        what=(f'PILOT: {PILOT_EPOCHS} training steps (epochs) on the pilot rung.' if pilot else
-              f'MLE warm-up (train_prior, max_steps {TRAIN_PRIOR_MAX_STEPS:,}) on rung {rung}, '
-              f'FRESH on the first launch; resubmit this file to continue.'))
+        what=(('ONE JOB (builds the rung first when it is missing). ' if one_job else '')
+              + (f'PILOT: {PILOT_EPOCHS} training steps (epochs) on the pilot rung.' if pilot else
+                 f'MLE warm-up (train_prior, max_steps {TRAIN_PRIOR_MAX_STEPS:,}) on rung {rung}, '
+                 f'FRESH on the first launch; resubmit this file to continue.')))
 
 
 SUBMIT = r'''#!/bin/bash
-# @@BATTERY@@: submit one rung's build (CPU) and its training (GPU, afterok on the build).
-#     bash configs/@@BATTERY@@/submit.sh <rung>        rungs: @@RUNGS@@
+# @@BATTERY@@: submit one rung's build (CPU) and its training (GPU, afterok on the build), or with
+# `one` ONE job that builds the rung when it is missing and then trains (no dependency).
+#     bash configs/@@BATTERY@@/submit.sh <rung> [one]      rungs: @@RUNGS@@
 # Later legs: sbatch configs/@@BATTERY@@/train_<rung>.sbatch (it resumes the arm's own _running.pt).
 # WRITTEN BY make.py.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 R=${1:-}
-case " @@RUNGS@@ " in *" ${R} "*) ;; *) echo "usage: bash $0 <rung>, rung one of: @@RUNGS@@" >&2; exit 2;; esac
+MODE=${2:-two}
+case " @@RUNGS@@ " in *" ${R} "*) ;; *) echo "usage: bash $0 <rung> [one], rung one of: @@RUNGS@@" >&2; exit 2;; esac
+case "${MODE}" in one|two) ;; *) echo "usage: bash $0 <rung> [one]" >&2; exit 2;; esac
 if [ "${R}" = "pilot" ] && ls @@CKPTS@@/*@@TAG@@_pilot_*_running.pt >/dev/null 2>&1; then
     echo "the pilot arm already has checkpoints, and a new pilot would RESUME them; to re-pilot:" >&2
     echo "    rm @@CKPTS@@/*@@TAG@@_pilot_* ; rm -r @@RUNGS_ROOT@@/pilot" >&2
     exit 1
+fi
+if [ "${MODE}" = "one" ]; then
+    T=$(sbatch --parsable configs/@@BATTERY@@/run_${R}.sbatch); T=${T%%;*}
+    echo "rung ${R}: ONE job ${T} (builds the rung if it is missing, then trains)"
+    exit 0
 fi
 B=$(sbatch --parsable configs/@@BATTERY@@/build_${R}.sbatch); B=${B%%;*}
 # --kill-on-invalid-dep: a failed build cancels the training job instead of leaving it pending forever
@@ -449,7 +532,7 @@ def main(argv=None):
         check_arm(cfg, base, name, pilot)
         b_wall, b_mem, cpu_h = build_cost(n_train + n_heldout)
         if pilot:
-            b_wall, b_mem = '01:00:00', '8G'
+            b_wall = '01:00:00'
         n_rows, n_cond, resident, peak, host, sidecar = train_footprint(n_train, pb_cap)
         n_archives = (PILOT_EPOCHS if pilot else TRAIN_PRIOR_MAX_STEPS) // archive_period
         t_mem = TRAIN_MEM.get(rung) or f'{max(TRAIN_MEM_DEFAULT_GB, 16 * math.ceil(TRAIN_MEM_MARGIN * (host + HOST_BASE_GB) / 16))}G'
@@ -465,6 +548,12 @@ def main(argv=None):
                   'SET_THREADS': SET_THREADS}
         written[f'build_{rung}.sbatch'] = fill(BUILD_TEMPLATE, values, f'build_{rung}.sbatch')
         written[f'train_{rung}.sbatch'] = train_sbatch(i, rung, t_wall, t_mem, prior_sha, pilot=pilot)
+        # ONE JOB: the larger memory request of the two; the build's wall comes out of the
+        # training wall, and the pilot's is the two added
+        one_mem = f'{max(int(t_mem[:-1]), int(b_mem[:-1]))}G'
+        one_wall = '02:00:00' if pilot else t_wall
+        written[f'run_{rung}.sbatch'] = train_sbatch(i, rung, one_wall, one_mem, prior_sha,
+                                                     pilot=pilot, one_job=True)
         written[f'{name}.yaml'] = yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
         assert yaml.safe_load(written[f'{name}.yaml']) == cfg, name
         rows.append([name, rung, 'fresh', '-', rung, str(n_train), str(n_heldout), b_wall, b_mem,
@@ -492,8 +581,9 @@ def main(argv=None):
         (HERE / fname).write_text(text, encoding='utf-8', newline='\n')
 
     print(f'wrote {len(written)} files into {HERE}')
-    print(f'\nProjected cost per rung. Build: CPU job, {BUILD_CPUS} CPUs; wall = {BUILD_WALL_MARGIN:g}x the '
-          f'projected CPU time + 30 min, memory = {BUILD_MEM_MARGIN:g}x the projected peak. Training: '
+    print(f'\nProjected cost per rung. Build: CPU job, {BUILD_CPUS} CPUs, one builder process per CPU; wall = '
+          f'{BUILD_WALL_MARGIN:g}x the projected wall time ({CLUSTER_SLOWDOWN:g}x the local rates) + 30 min, '
+          f'memory = {BUILD_MEM_MARGIN:g}x the projected peak. Training: '
           f'GPU memory from the footprint model ({ROW_KB} KB per prior row, {COND_KB} KB per train '
           f'condition; the prior dataset once as loaded, once in the anchor buffer, once transiently '
           f'while the prior buffer seed is cut to {pb_cap:,} rows), before the model and its '

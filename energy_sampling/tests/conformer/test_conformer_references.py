@@ -516,12 +516,17 @@ def test_member_reference_mismatch_is_refused():
         bcr.check_member_matches(member, z[::-1], member.ref_pos.numpy())
 
 
-def test_compute_entry_refuses_a_conditions_reference_the_member_does_not_reproduce():
+def test_compute_entry_builds_its_member_on_the_conditions_reference():
+    """The member is built FROM the conditions file's stored reference, as the run builds it:
+    a reference no embedding produces is reproduced exactly, and one that is not this
+    molecule's atoms is refused."""
     member = _member('CCO')
+    z = np.asarray(member.spec.z)
     pos = member.ref_pos.numpy().copy()
     pos[2, 1] += 1e-3
-    with pytest.raises(ValueError, match='reference conformer differs'):
-        bcr.compute_entry('CCO', 'CCO', np.asarray(member.spec.z), pos, KW, SEARCH)
+    assert bcr.compute_entry('CCO', 'CCO', z, pos, KW, SEARCH)['ref_pos_gap'] == 0.0
+    with pytest.raises(ValueError, match='atomic numbers'):
+        bcr.compute_entry('CCO', 'CCO', z[::-1].copy(), pos, KW, SEARCH)
 
 
 def test_an_identifier_naming_two_molecules_is_refused(tmp_path):

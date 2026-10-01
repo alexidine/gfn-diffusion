@@ -38,6 +38,8 @@ broaden the policy space, and must not displace a prior that is already good.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import torch
 
@@ -519,13 +521,31 @@ class ConformerModeller(Modeller):
         set_smiles, set_idents = self._condition_set_molecules()
         print(f'condition set: {0 if not set_idents else len(set(set_idents))} distinct '
               f'molecule(s) read from molecules_path')
+        # EVERY MEMBER FROM THE REFERENCE THE FILE STORES, not from a fresh embedding. A
+        # stored state is a displacement from its member's reference, and the same tagged
+        # SMILES embeds to another reference under another RDKit build; the file's `pos` is
+        # the reference its states were written against. No ETKDG embedding or MMFF
+        # relaxation runs for such a member.
+        if 'reference_positions' in cfg:
+            raise SystemExit('energy_config.reference_positions: not a config key. Each member '
+                             'takes its reference conformer from the conditions file')
+        refs = self._stored_references(set_smiles, set_idents, cfg.get('level'))
+        t0 = time.perf_counter()
         if set_smiles and len(set(set_idents)) > 1:
             from energies.multi_conformer import MultiConformerTorsions
             cfg.pop('smiles', None)
             self.energy_function = MultiConformerTorsions(
-                set_smiles, identifiers=set_idents, **cfg)
+                set_smiles, identifiers=set_idents,
+                reference_positions={i: rd for i, (rd, _, _) in refs.items()}, **cfg)
         else:
-            self.energy_function = ConformerTorsions(**cfg)
+            # one chart: the file's reference only when the file's one member IS the
+            # configured molecule
+            one = (refs.get(set_idents[0]) if set_idents and set_smiles[0] == cfg.get('smiles')
+                   else None)
+            refs = {set_idents[0]: one} if one is not None else {}
+            self.energy_function = ConformerTorsions(
+                reference_positions=None if one is None else one[0], **cfg)
+        self._check_stored_references(refs, time.perf_counter() - t0)
         print(self.energy_function.describe())
         # THE BASE METHOD ALSO BUILDS THE TRACE WINDOW, and this override does not call
         # super(). Dropping it left profiling.trace silently INERT on the whole conformer
@@ -603,10 +623,17 @@ class ConformerModeller(Modeller):
         Read straight off `molecules_path` because that file IS the set the run trains over;
         a separate config list could disagree with it, and the failure would be a chart
         mismatch discovered rows later.
+
+        READ ONCE PER PATH: the lists, and each identifier's stored reference (`pos` and `z`
+        of its first graph, placement order), are kept on `_condition_set_cache`; this is
+        called more than once at startup.
         """
         path = getattr(self.args, 'molecules_path', None)
         if not path:
             return None, None
+        cached = getattr(self, '_condition_set_cache', None)
+        if cached is not None and cached['path'] == str(path):
+            return list(cached['smiles']), list(cached['identifiers'])
         try:
             blob = torch.load(path, weights_only=False, map_location='cpu')
         except Exception as exc:                              # noqa: BLE001 - reported
@@ -619,14 +646,84 @@ class ConformerModeller(Modeller):
         if smis is None or idents is None:
             return None, None
         smis, idents = list(smis), list(idents)
-        seen, out_s, out_i = set(), [], []
-        for smi, ident in zip(smis, idents):
+        ptr = getattr(batch, 'ptr', None)
+        pos, z = getattr(batch, 'pos', None), getattr(batch, 'z', None)
+        stored = ptr is not None and pos is not None and z is not None
+        seen, out_s, out_i, refs = set(), [], [], {}
+        for j, (smi, ident) in enumerate(zip(smis, idents)):
             if ident in seen:
                 continue
             seen.add(ident)
             out_s.append(smi)
             out_i.append(ident)
-        return out_s, out_i
+            if stored:
+                at = slice(int(ptr[j]), int(ptr[j + 1]))
+                refs[ident] = (pos[at].detach().cpu().double().numpy().copy(),
+                               z[at].detach().cpu().numpy().copy())
+        self._condition_set_cache = {'path': str(path), 'smiles': out_s,
+                                     'identifiers': out_i, 'references': refs}
+        return list(out_s), list(out_i)
+
+    def _stored_references(self, smiles, identifiers, level):
+        """`{identifier: (RDKit-order positions, perm, placement-order pos)}` for every
+        condition-set member whose reference the conditions file stores (`pos`, `z`).
+
+        `energies/conformer_torsions.py::rdkit_order_reference` derives each member's placement
+        order from its bond graph; `_check_stored_references` then confirms each built member
+        against the stored `pos`. A file with no stored reference gives `{}`, and every member
+        is embedded.
+        """
+        from energies.conformer_torsions import rdkit_order_reference
+
+        cache = getattr(self, '_condition_set_cache', None) or {}
+        stored = cache.get('references') or {}
+        if not identifiers or not stored:
+            if identifiers:
+                print('condition set: the conditions file stores no reference geometry; every '
+                      'member is EMBEDDED (seeded ETKDG + MMFF), which another RDKit build can '
+                      'resolve to another reference')
+            return {}
+        out, bad = {}, []
+        for smi, ident in zip(smiles, identifiers):
+            if ident not in stored or ident in out:
+                continue
+            pos, z = stored[ident]
+            try:
+                rd, perm = rdkit_order_reference(smi, pos, level=level, z=z)
+            except ValueError as exc:
+                bad.append(f'{ident}: {exc}')
+                continue
+            out[ident] = (rd, perm, pos)
+        if bad:
+            raise SystemExit(f'{len(bad)} condition(s) of molecules_path store a reference that '
+                             f'is not their molecule in any atom order, e.g.:\n  '
+                             + '\n  '.join(bad[:10]))
+        return out
+
+    def _check_stored_references(self, refs, seconds: float):
+        """Refuse a member built from a stored reference that is not that stored member.
+
+        Each must reproduce the stored placement order and the stored `pos` exactly
+        (`stored_reference_mismatch`); a derived placement order that differed would put every
+        stored state on other atoms.
+        """
+        from energies.conformer_torsions import stored_reference_mismatch
+
+        en = self.energy_function
+        members = getattr(en, '_members', None) or {}
+        if not members and refs:
+            members = {next(iter(refs)): en}
+        bad = []
+        for ident, (_, perm, pos) in refs.items():
+            why = stored_reference_mismatch(members[ident], pos, perm)
+            if why:
+                bad.append(f'{ident}: {why}')
+        if bad:
+            raise SystemExit(f'{len(bad)} member(s) built from the stored reference of '
+                             f'molecules_path do not reproduce it:\n  ' + '\n  '.join(bad[:10]))
+        n = max(len(members), 1)
+        print(f'condition set: {len(refs)} of {n} member(s) built from the stored reference '
+              f'(no embedding), {n - len(refs)} embedded; members built in {seconds:.1f} s')
 
     def init_identifiers(self):
         """Base registry, checked against the stamped condition set, then handed to the energy.

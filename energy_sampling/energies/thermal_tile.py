@@ -216,6 +216,11 @@ class ThermalTile:
         if ident not in self._tables:
             member = self._member(ident)
             sigma, rot = member_widths(member, self.temperature)
+            # A SET MEMBER KEEPS NO BATCH CACHE: `curvatures` evaluated it at 2M + 1 points,
+            # and the set scores through its one-pass library, so that entry (1.7 MB a
+            # member, on the energy's device) would never be read again
+            if member is not self.energy:
+                member.release_batch_cache()
             layout = getattr(self.energy, 'carrier', None)
             if layout is not None:
                 cols = np.asarray(layout.cols[ident])

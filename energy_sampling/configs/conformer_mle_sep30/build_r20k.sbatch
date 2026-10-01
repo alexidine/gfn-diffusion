@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --time=21:00:00
-#SBATCH --mem=141G
-#SBATCH --cpus-per-task=4
+#SBATCH --time=04:00:00
+#SBATCH --mem=57G
+#SBATCH --cpus-per-task=16
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
@@ -11,11 +11,12 @@
 
 # conformer_mle_sep30 BUILD, rung r20k: 20000 train / 2000 held-out molecules cut from the
 # QM9 conformer database at 16 rows per condition, with both reference tables, into
-# /scratch/mk8347/data/conformer_datasets/rungs_sep30/r20k. CPU only, IN THE TRAINING CONTAINER: the training run re-embeds every member with
-# this RDKit and refuses a file whose reference conformers another RDKit embedded.
+# /scratch/mk8347/data/conformer_datasets/rungs_sep30/r20k. CPU only, IN THE TRAINING CONTAINER. Members are built from the database's stored
+# reference conformers, and the training run builds each member from the conditions file's.
 # WRITTEN BY make.py: do not edit by hand. Rerunning skips a set that has its manifest and a
 # table already written (the reference builder resumes from its .parts directory).
-# Projected: 6.9 CPU-hours (set builder single-process, references on 4 workers).
+# Projected: 5.2 CPU-hours; both builders run one worker per CPU of the job
+# (SLURM_CPUS_PER_TASK, 16 as submitted here). run_r20k.sbatch runs this file as a script.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -25,6 +26,7 @@ WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
 LOGS=${WORKDIR}/configs/conformer_mle_sep30/joblogs
 DB=/scratch/mk8347/data/conformer_datasets/qm9_db_sep29
 OUT=/scratch/mk8347/data/conformer_datasets/rungs_sep30/r20k
+NCPU=${SLURM_CPUS_PER_TASK:-16}
 mkdir -p ${LOGS}
 J=${LOGS}/build_r20k_${SLURM_JOB_ID}
 
@@ -61,13 +63,14 @@ srun singularity exec \
         else
             python -u build_conformer_set.py --out-dir ${OUT} --source configs/conformer_db_sep29/qm9_index.tsv.gz \
                 --config configs/conformer_mk.yaml --n-train 20000 --n-heldout 2000 \
-                --database ${DB} --rows-per-condition-cap 16 --threads 2 || exit 1
+                --database ${DB} --rows-per-condition-cap 16 --threads 1 \
+                --workers ${NCPU} || exit 1
         fi
         for SIDE in train heldout; do
             TABLE=${OUT}/conditions_\${SIDE}.references.pt
             if [ -f \${TABLE} ]; then echo \"REFERENCES: \${TABLE} exists, skipping\"; continue; fi
             python -u build_conformer_references.py --conditions ${OUT}/conditions_\${SIDE}.pt \
-                --config configs/conformer_mk.yaml --database ${DB} --workers 4 --threads 1
+                --config configs/conformer_mk.yaml --database ${DB} --workers ${NCPU} --threads 1
             RC=\$?
             # 1 = the table is written and some conditions failed (a condition the database cannot
             # floor, recorded in the table's failures); anything else is a failed build

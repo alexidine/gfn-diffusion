@@ -28,6 +28,7 @@ discontinuity there. Everything public here takes and returns [-1, 1]; the conve
 to radians happens once, in ``build_positions``.
 """
 
+import contextlib
 from typing import Optional
 
 import networkx as nx
@@ -73,7 +74,113 @@ class ChartRefused(ValueError):
         self.code = code
 
 
+def _attach_reference(mol, positions, smiles: str):
+    """Give ``mol`` (hydrogens explicit, no conformer) ``positions`` as its one 3D conformer.
+
+    Float64 in and out: RDKit stores a conformer's coordinates as doubles, so the conformer
+    holds exactly the stored values and the reference an embedding would have produced is
+    reproduced bit for bit when the stored values are that embedding's.
+    """
+    from rdkit import Chem
+    from rdkit.Geometry import Point3D
+
+    pos = np.asarray(positions, dtype=np.float64)
+    n = mol.GetNumAtoms()
+    if pos.shape != (n, 3):
+        raise ValueError(f'{smiles}: reference_positions has shape {tuple(pos.shape)}, the '
+                         f'molecule with explicit hydrogens has {n} atoms ({n}, 3)')
+    if not np.isfinite(pos).all():
+        raise ValueError(f'{smiles}: reference_positions holds a non-finite coordinate')
+    conf = Chem.Conformer(n)
+    for i, (x, y, z) in enumerate(pos.tolist()):
+        conf.SetAtomPosition(i, Point3D(x, y, z))
+    conf.Set3D(True)
+    mol.RemoveAllConformers()
+    mol.AddConformer(conf, assignId=True)
+    return mol
+
+
+def rdkit_order_reference(smiles: str, pos, *, level: str, perm=None, z=None):
+    """``(positions in RDKit atom order, perm)`` from a PLACEMENT-order stored reference.
+
+    ``pos`` ``[N, 3]`` is in placement order, as a conditions file's ``pos`` and a conformer
+    database's ``ref_pos`` store it; slot ``i`` holds RDKit atom ``perm[i]`` of
+    ``Chem.AddHs(Chem.MolFromSmiles(smiles))``. A database stores ``perm``. A conditions file
+    does not, so it is DERIVED here without any geometry: the member's tree is built with
+    ``spec_from_graph(..., use_geometry=False)``, a function of the atomic numbers, the bond
+    graph and the atom numbering alone, so the placement order of the RDKit bond graph is the
+    member's whenever the geometry-inferred graph the member is built on equals RDKit's --
+    which ``build_conformer_conditions.build_member`` refuses otherwise (``graph_broken``).
+    ``z``, when given, is the stored placement-order atomic numbers and must be the RDKit
+    atoms read through ``perm``. The caller confirms the built member with
+    ``stored_reference_mismatch``, which is what makes a derived ``perm`` safe to use.
+    """
+    from rdkit import Chem
+
+    from mxtaltools.conformers.topology import spec_from_graph
+
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    z_rd = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int64)
+    pos = np.asarray(pos, dtype=np.float64)
+    if pos.shape != (len(z_rd), 3):
+        raise ValueError(f'{smiles}: stored reference has shape {tuple(pos.shape)}, the '
+                         f'molecule with explicit hydrogens has {len(z_rd)} atoms')
+    if perm is None:
+        edges = np.array([[b.GetBeginAtomIdx(), b.GetEndAtomIdx()] for b in mol.GetBonds()],
+                         dtype=np.int64).reshape(-1, 2).T
+        perm = spec_from_graph(z_rd, edges, None, use_geometry=False,
+                               avoid_sp_root=level in ConformerTorsions.CHART_TIERS).perm
+    perm = np.asarray(perm, dtype=np.int64)
+    if sorted(perm.tolist()) != list(range(len(z_rd))):
+        raise ValueError(f'{smiles}: perm is not a permutation of its {len(z_rd)} atoms')
+    if z is not None and not np.array_equal(np.asarray(z, dtype=np.int64).reshape(-1),
+                                            z_rd[perm]):
+        raise ValueError(f'{smiles}: the stored atomic numbers are not its RDKit atoms read '
+                         f'through perm; the reference belongs to another atom order')
+    out = np.empty_like(pos)
+    out[perm] = pos
+    return out, perm
+
+
+def stored_reference_mismatch(energy, pos, perm=None) -> str:
+    """``''`` when ``energy`` IS the member ``pos`` (placement order) was stored from.
+
+    Its placement order is ``perm`` (when given) and its reference ``energy.ref_pos`` equals
+    ``pos`` exactly, as float64. Otherwise the difference, as text.
+    """
+    out = []
+    if perm is not None and not np.array_equal(np.asarray(energy.spec.perm),
+                                               np.asarray(perm)):
+        out.append('placement order differs from the stored perm')
+    ref = energy.ref_pos.detach().cpu().double().numpy()
+    pos = np.asarray(pos, dtype=np.float64)
+    if ref.shape != pos.shape:
+        out.append(f'reference shape {ref.shape} against stored {pos.shape}')
+    elif not np.array_equal(ref, pos):
+        out.append(f'reference differs from the stored one by up to '
+                   f'{float(np.abs(ref - pos).max()):.3g} A')
+    return '; '.join(out)
+
+
 class ConformerTorsions(BaseSet):
+    #: THE TRAINER'S ENERGY-REFERENCE SURFACE: train.py reads `energy_reference_mode`
+    #: (Modeller.init_energy_reference), `allow_unreferenced` (the prior intake in
+    #: Modeller.train) and `unreferenced_log_r` (its absolute reward floors) off whatever energy
+    #: the run holds. This route has no per-condition reference energy: the mode is None, which
+    #: energies/molecular_crystal.py::resolve_energy_reference reads as "install nothing".
+    energy_reference_mode = None
+
+    @contextlib.contextmanager
+    def allow_unreferenced(self):
+        """No-op: there is no energy reference on this route whose absence scoring could
+        refuse (MolecularCrystal.allow_unreferenced is the one that lifts a refusal)."""
+        yield
+
+    def unreferenced_log_r(self, log_r, condition_id=None):
+        """``log_r`` itself: no reference is ever installed on this route, so there is none
+        to undo (MolecularCrystal.unreferenced_log_r with no table installed)."""
+        return log_r
+
     # Free-DoF levels, as freeze sets over InternalParams.CLASSES = ("r","theta","phi").
     # These are NOT a ladder of approximations: freezing a DoF at a constant gives
     # p_full(free | frozen = c0), a conditional slice, which differs from the
@@ -158,6 +265,14 @@ class ConformerTorsions(BaseSet):
                  # changes: the table is still built (condition graphs and the per-coordinate
                  # features carry it), but no term is added and nothing is refused.
                  stereo_coeff: float = 0.0,
+                 # A STORED REFERENCE CONFORMER, [N, 3] Angstrom in the atom order of
+                 # Chem.AddHs(Chem.MolFromSmiles(smiles)). None (the default) embeds one:
+                 # seeded ETKDGv3, then MMFF94 relaxation when mmff_reference. Given, it IS the
+                 # reference -- no embedding and no relaxation, so `seed` is not read -- and
+                 # every later step runs on it exactly as on an embedded one. A conditions file
+                 # stores it in placement order (`pos`) and a conformer database with `perm`
+                 # beside it; `rdkit_order_reference` puts either back in this order.
+                 reference_positions=None,
                  ):
         """
         `level` is keyword-only and has NO default, and there is deliberately no
@@ -166,6 +281,12 @@ class ConformerTorsions(BaseSet):
         and `**kwargs` is exactly the mechanism that swallows it (it is also what would
         make a `chirality_coeff` passed through energy_config never become an attribute,
         so `set_energy_coeffs`' hasattr guard silently skips the ramp).
+
+        ``reference_positions`` makes the member a function of the stored geometry rather
+        than of the RDKit build that embeds it: the same tagged SMILES embeds to different
+        references under different RDKit versions, and a stored state is a displacement
+        from the reference. ``reference_source`` records which path built the member
+        ('embedded' or 'stored').
         """
         super().__init__()
         if level not in self.LEVELS:
@@ -213,12 +334,23 @@ class ConformerTorsions(BaseSet):
         self.log_temperature = log_temperature
 
         mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
-        params = AllChem.ETKDGv3()
-        params.randomSeed = seed
-        if AllChem.EmbedMolecule(mol, params) != 0:
-            raise ValueError(f"could not embed {smiles}")
-        if mmff_reference:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=2000)
+        if reference_positions is None:
+            params = AllChem.ETKDGv3()
+            params.randomSeed = seed
+            if AllChem.EmbedMolecule(mol, params) != 0:
+                raise ValueError(f"could not embed {smiles}")
+            if mmff_reference:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=2000)
+            self.reference_source = 'embedded'
+        else:
+            _attach_reference(mol, reference_positions, smiles)
+            # THE RELAXATION'S SIDE EFFECT, WITHOUT THE RELAXATION. Setting up MMFF94 re-types
+            # the molecule's aromaticity IN PLACE (MMFF's own model: a 4-pyridone ring becomes
+            # aromatic), and `atom_is_aromatic` below reads those flags. The embedded path set
+            # it up to relax; typing here leaves the flags as that path leaves them.
+            if mmff_reference:
+                AllChem.MMFFGetMoleculeProperties(mol)
+            self.reference_source = 'stored'
         self.mol = mol
 
         z = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int64)
@@ -1199,6 +1331,20 @@ class ConformerTorsions(BaseSet):
             self._tree_cache.pop(stale, None)
             self._ff_cache.pop(stale, None)
         return self._tree_cache[batch_size], self._ff_cache[batch_size]
+
+    def release_batch_cache(self) -> None:
+        """Drop the cached batched trees and force fields of ``_batch`` (all but batch size 1).
+
+        The cache keeps the last batch size evaluated, on the member's device, and nothing
+        but ``_batch`` reads it, so the next evaluation rebuilds what it needs. A member of a
+        set is evaluated on its own only now and then (a builder's checks, the thermal tile's
+        curvatures) while the set scores through its one-pass library, so an entry left on
+        each member is dead weight: measured 1.7 MB per member of 3,486 QM9 conditions after
+        the thermal tile's 2M + 1 point evaluation, against 41 KB for everything else the
+        member's tensors hold.
+        """
+        self._tree_cache = {k: v for k, v in self._tree_cache.items() if k == 1}
+        self._ff_cache = {k: v for k, v in self._ff_cache.items() if k == 1}
 
     def dof_from_state(self, x: torch.Tensor):
         """State ``[B, d]`` on [-1, 1] -> ``(r, theta, phi)``, each ``[B, n_block]``.

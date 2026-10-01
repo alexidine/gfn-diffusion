@@ -44,12 +44,12 @@ if [ -f ${CKPTS}/${ARM}.dead ]; then
     exit 0
 fi
 
-# RUNG GUARD. The rung was built ON THE CLUSTER by build_${SET}.sbatch (the dependency submit.sh
-# sets). Every file the run and the offline eval read must be there; the RDKit version the
-# conformer guard below asserts is the one the rung's manifest records, since the run re-embeds
-# every member and ConformerModeller refuses reference conformers another RDKit embedded. The
-# fitted prior is committed: its sha256 is HEAD's. NIG_EXPORT is the crystal template's
-# MXtalTools export, empty on this route.
+# RUNG GUARD. The rung is built ON THE CLUSTER by build_${SET}.sbatch. Every file the run and
+# the offline eval read must be there; the RDKit version the conformer guard below asserts is the
+# one the rung's manifest records (the run builds each member from the reference conformer the
+# conditions file stores, and types its MMFF94 terms with this RDKit). The fitted prior is
+# committed: its sha256 is HEAD's. NIG_EXPORT is the crystal template's MXtalTools export, empty
+# on this route.
 NIG_EXPORT=""
 RUNG=${DATA}/${SET}
 for F in manifest.json conditions_train.pt conditions_heldout.pt prior_train.pt conditions_train.references.pt conditions_heldout.references.pt; do

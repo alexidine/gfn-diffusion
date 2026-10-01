@@ -587,6 +587,9 @@ def process_condition(mb, built, prior, args) -> dict:
            'perm': np.asarray(en.spec.perm, dtype=np.int64).copy(),
            'ref_pos': en.ref_pos.detach().cpu().double().numpy().copy(),
            'signature': member_signature(ident, en), 'kT': float(en.temperature),
+           # the stereo lock's build-time thermal check on this reference (build_member): its
+           # result, or why it was skipped; None with the lock off
+           'thermal_check': mb.thermal_check,
            'window_kcal': float(args.window_kt) * float(en.temperature), 'refusal': None,
            'stereo_pin': None, 'ring_shapes': [], 'stop': None, 'e_min': None,
            'basins': {'pos': np.zeros((0, n_atoms, 3)), 'energy': np.zeros(0),
@@ -1040,6 +1043,10 @@ def summarize(out_dir, *, mirror_de_tol: float = 0.05, mirror_count_rel: float =
 #: shapes, the stereo pin) describe the search, not the rows
 READ_FIELDS = ('identifier', 'isomer_rank', 'mirror_of', 'n_atoms', 'k', 'z', 'perm', 'ref_pos',
                'signature', 'kT', 'window_kcal', 'refusal', 'e_min', 'basins')
+#: fields a reader may ask for that an older record lacks (read as None)
+OPTIONAL_FIELDS = ('thermal_check',)
+#: what ``read_references`` keeps of a condition record: the member's reference and identity
+REFERENCE_FIELDS = ('identifier', 'z', 'perm', 'ref_pos', 'signature', 'thermal_check')
 
 
 def database_identity(blobs_or_headers) -> dict:
@@ -1063,16 +1070,20 @@ def first_header(db_dir) -> dict:
         'energy_kwargs'], 'set_builder': b['header']['set_builder']}
 
 
-def read_conditions(db_dir, identifiers=None, *, log=print):
+def read_conditions(db_dir, identifiers=None, *, log=print, fields=READ_FIELDS,
+                    refusals: Optional[dict] = None):
     """``(info, {identifier: condition record})`` for a finished database.
 
     One shard at a time; only the conditions named in ``identifiers`` are kept (all when None),
-    each with ``READ_FIELDS`` plus its key's ``key`` and ``side``. REFUSES a directory whose
+    each with ``fields`` (default ``READ_FIELDS``; one of ``OPTIONAL_FIELDS`` an older record
+    lacks reads as None) plus its key's ``key`` and ``side``. REFUSES a directory whose
     shards are not one complete run: no shard file, a shard count other than the header's
     ``n_shards``, shards of different runs (``run_hash``), an incomplete shard, another format,
     or one identifier in two records. ``info`` carries the path, format, run hash, the digest
     over the shard header hashes (``database_identity``), the member kwargs the run was built
-    under and the set builder's defaults it planned its universe with.
+    under and the set builder's defaults it planned its universe with. A ``refusals`` dict,
+    when passed, is filled with ``{identifier: (key, reason_code, message)}`` for every
+    isomer-level rejection of the keys read (``identifiers`` filters these too).
     """
     db_dir = Path(db_dir)
     files = sorted(db_dir.glob('shard_*_of_*.pt'))
@@ -1093,13 +1104,18 @@ def read_conditions(db_dir, identifiers=None, *, log=print):
         if h0 is None:
             h0 = b['header']
         for r in b['keys'].values():
+            if refusals is not None:
+                for j in r['rejections']:
+                    ident = j['identifier']
+                    if j['level'] == 'isomer' and ident and (want is None or ident in want):
+                        refusals[ident] = (r['key'], j['reason_code'], j['message'])
             for c in r['conditions']:
                 ident = c['identifier']
                 if want is not None and ident not in want:
                     continue
                 if ident in out:
                     raise SystemExit(f'{db_dir}: identifier {ident!r} has two records')
-                rec = {k: c[k] for k in READ_FIELDS}
+                rec = {k: (c.get(k) if k in OPTIONAL_FIELDS else c[k]) for k in fields}
                 rec.update(key=r['key'], side=r['side'])
                 out[ident] = rec
         del b
@@ -1121,6 +1137,55 @@ def read_conditions(db_dir, identifiers=None, *, log=print):
             'window_kt': h0['args'].get('window_kt')}
     log(f'database {db_dir}: {len(files)} shard(s), {len(out)} condition record(s) kept, '
         f'{time.time() - t0:.0f} s')
+    return info, out
+
+
+def read_references(db_dir, *, log=print):
+    """``(info, {key: {identifier: StoredReference | StoredRefusal}})``: every condition's
+    stored reference, and every isomer the database's walk refused.
+
+    What ``build_conformer_set.py --database`` builds its members from, so a set built in any
+    environment has the database's charts rather than its own RDKit's embeddings, and refuses
+    the isomers the database's walk refused (with the database's code) rather than retrying
+    them under its own RDKit. Read with ``read_conditions``' checks (one finished run),
+    keeping ``REFERENCE_FIELDS`` only. Only member-level codes (``REASON_CODES``) are kept as
+    refusals; the set-level ones are decided by the walk itself.
+
+    ``thermal_check`` on each reference is the database's record of the stereo lock's
+    thermal check on that geometry: the record's own result where it carries one, and
+    otherwise, with the lock on in the database's member kwargs, the fact that every
+    condition record of a ``conformer_database/1`` is a member ``build_member`` returned, which
+    refuses one whose check fires (the check predates the database builder). None with the
+    lock off, where no check runs.
+    """
+    from build_conformer_conditions import REASON_CODES, StoredReference, StoredRefusal
+
+    refused: Dict[str, tuple] = {}
+    info, recs = read_conditions(db_dir, None, log=log, fields=REFERENCE_FIELDS,
+                                 refusals=refused)
+    ekw = info['energy_kwargs']
+    lock = float(ekw.get('stereo_coeff', 0) or 0)
+    tag = f"database {info['run_hash'][:12]}"
+    implied = (f"{tag}: built by build_member, which refuses a member whose thermal check "
+               f"fires (stereo_coeff {lock:g}, seed {int(ekw.get('seed', 0) or 0)})")
+    out: Dict[str, dict] = {}
+    for ident, r in recs.items():
+        tc = r['thermal_check']
+        if lock <= 0:
+            why = None
+        elif tc is None:
+            why = implied
+        elif tc.get('status') == 'passed':
+            why = (f"{tag}: passed when the database built this member ({tc['n']} samples, "
+                   f"seed {tc['seed']}, {tc['steps']} steps)")
+        else:
+            why = str(tc.get('reason')) if tc.get('reason') else None
+        out.setdefault(r['key'], {})[ident] = StoredReference(
+            pos=np.asarray(r['ref_pos'], dtype=np.float64), perm=np.asarray(r['perm']),
+            z=np.asarray(r['z']), signature=r['signature'], thermal_check=why, source=tag)
+    for ident, (key, code, message) in refused.items():
+        if code in REASON_CODES and ident not in out.get(key, {}):
+            out.setdefault(key, {})[ident] = StoredRefusal(code, message, tag)
     return info, out
 
 

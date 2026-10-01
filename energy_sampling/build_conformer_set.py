@@ -52,6 +52,21 @@ mirror when chiral). The mirror pair has equal log Z in expectation -- the energ
 -- which is a correctness check at `full`, where no exact log Z exists. Only in expectation:
 the two references are independent ETKDG embeddings, not reflections of one another.
 
+REFERENCES. With ``--database DIR`` every member the conformer database holds a record of is
+built FROM THE DATABASE'S STORED REFERENCE (``build_conformer_database.read_references``,
+``build_conformer_conditions.build_member(reference=)``): no ETKDG embedding, no MMFF
+relaxation, and the stereo lock's thermal check skipped where the database records its pass.
+An isomer the database's walk refused is refused here with its code, its message prefixed
+with the database's run hash, and not rebuilt. An isomer the database holds neither is
+embedded here. The same tagged SMILES embeds to different
+references under different RDKit builds, so only the database-built members are the same in
+every environment; molecules.tsv records each member's ``reference`` and ``thermal_check``.
+
+WORKERS. ``--workers N`` builds the molecules of a walk in N processes, in walk order with a
+bounded lookahead, and consumes the results in that order, so every file the serial build
+writes is written identically (the manifest differs only in its argv, time stamp and
+duration); molecules past the rung's end that were already started are discarded.
+
 REFUSALS. Every per-molecule refusal is a code from ``REASON_CODES`` (per member) or
 ``SET_REASON_CODES`` (set level). Linear groups are not refused here: the builder admits
 whatever ``ConformerTorsions`` and ``CarrierLayout`` admit, and records what they refuse
@@ -66,6 +81,7 @@ import csv
 import hashlib
 import json
 import os
+import pickle
 import platform
 import subprocess
 import sys
@@ -77,9 +93,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from build_conformer_conditions import (REASON_CODES, Member, MemberRefused, build_member,
-                                        energy_kwargs_from_config, smiles_identity,
-                                        stereoisomer_classes)
+from build_conformer_conditions import (REASON_CODES, Member, MemberRefused, StoredRefusal,
+                                        build_member, energy_kwargs_from_config,
+                                        smiles_identity, stereoisomer_classes)
+
+#: ``--workers``: molecules submitted ahead of the one being consumed, per worker
+LOOKAHEAD_PER_WORKER = 2
 
 QM9_PATH = 'D:/crystal_datasets/qm9_dataset.pt'
 FORMAT = 'conformer_set_v1'
@@ -377,8 +396,12 @@ def stereo_plan(key: str):
 
 
 def build_molecule(entry: Entry, energy_kw: dict, *, bundle, cap: Optional[int],
-                   stereo_salt: str, check: bool = True):
+                   stereo_salt: str, check: bool = True, references: Optional[dict] = None):
     """``(Built or None, rejections)`` -- the molecule's conditions, or why there are none.
+
+    ``references`` maps an identifier to the ``StoredReference`` its member is built from, or
+    to a ``StoredRefusal``, recorded as the isomer's refusal (its message prefixed with the
+    store) without a build; an isomer it does not name is embedded.
 
     TERMINATION: the walk is over the enumerated list (``stereoisomer_classes`` refuses more
     than 1024 assignments) plus at most one mirror per pick, and each identifier is
@@ -400,9 +423,12 @@ def build_molecule(entry: Entry, energy_kw: dict, *, bundle, cap: Optional[int],
 
     def attempt(ident) -> bool:
         tried.add(ident)
+        ref = (references or {}).get(ident)
         try:
+            if isinstance(ref, StoredRefusal):
+                raise MemberRefused(ref.code, f'{ref.source}: {ref.message}')
             mb = build_member(ident, ident, energy_kw, bundle=bundle, carrier=True,
-                              check=check)
+                              check=check, reference=ref)
         except MemberRefused as exc:
             codes.append(exc.code)
             rej.append(_rej('isomer', entry.key, entry.index, entry.side, ident,
@@ -447,26 +473,113 @@ def build_molecule(entry: Entry, energy_kw: dict, *, bundle, cap: Optional[int],
 
 
 def walk_side(entries: Sequence[Entry], n: Optional[int], energy_kw, *, bundle, cap,
-              stereo_salt, check=True, label=''):
+              stereo_salt, check=True, label='', references: Optional[dict] = None,
+              executor=None, lookahead: int = 0):
     """The first ``n`` molecules of ``entries`` (hash order) that yield a condition.
 
-    ``n=None`` walks the whole side. Bounded by ``len(entries)``.
+    ``n=None`` walks the whole side. Bounded by ``len(entries)``. ``references`` is
+    ``{key: {identifier: StoredReference}}``. With an ``executor`` (``--workers``) the
+    molecules are built in its processes, at most ``lookahead`` ahead of the one consumed, and
+    consumed in walk order, so the walk, its stopping point and every result are the serial
+    walk's; the serial path builds each molecule only when it is consumed.
     """
     kept, rej, attempted = [], [], 0
     t0 = time.time()
-    for e in entries:
-        if n is not None and len(kept) >= n:
-            break
-        attempted += 1
-        b, r = build_molecule(e, energy_kw, bundle=bundle, cap=cap,
-                              stereo_salt=stereo_salt, check=check)
-        rej.extend(r)
-        if b is not None:
-            kept.append(b)
-        if attempted % 50 == 0:
-            print(f'  {label}: {attempted} attempted, {len(kept)} kept, '
-                  f'{time.time() - t0:.0f} s', flush=True)
+    refs = (lambda e: None) if references is None else (lambda e: references.get(e.key, {}))
+    if executor is None:
+        results = (build_molecule(e, energy_kw, bundle=bundle, cap=cap,
+                                  stereo_salt=stereo_salt, check=check, references=refs(e))
+                   for e in entries)
+    else:
+        results = _in_walk_order(executor, entries, refs, max(1, int(lookahead)))
+    try:
+        while n is None or len(kept) < n:
+            try:
+                b, r = next(results)
+            except StopIteration:
+                break
+            attempted += 1
+            rej.extend(r)
+            if b is not None:
+                kept.append(b)
+            if attempted % 50 == 0:
+                print(f'  {label}: {attempted} attempted, {len(kept)} kept, '
+                      f'{time.time() - t0:.0f} s', flush=True)
+    finally:
+        results.close()
     return kept, rej, attempted
+
+
+#: a worker process's walk arguments, set once by ``_init_worker``
+_WORKER: dict = {}
+
+
+def _init_worker(threads: int, energy_kw: dict, walk: dict, encoder_ckpt: Optional[str]):
+    """A ``--workers`` process: the serial build's process-wide state, then its arguments.
+
+    The encoder is LOADED HERE from its checkpoint rather than pickled in ``walk``: on
+    Windows a spawned child reads its arguments only after importing the parent's main
+    module, so a large argument blocks the parent's submitting thread for that whole start,
+    and every worker started on demand stalled the walk (measured: ~18 s per worker, the
+    8-worker walk no faster than the serial one).
+    """
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
+    torch.set_default_dtype(torch.float64)
+    torch.set_num_threads(int(threads))
+    bundle = None
+    if encoder_ckpt is not None:
+        from models import encoder_cache
+        bundle = encoder_cache.load_encoder(str(encoder_ckpt), device='cpu')
+    _WORKER.clear()
+    _WORKER.update(energy_kw=energy_kw, **{**walk, 'bundle': bundle})
+
+
+def _worker_ready(_):
+    """A no-op task: submitting one per worker starts every worker before the walk."""
+    time.sleep(0.5)
+    return os.getpid()
+
+
+def _build_task(entry: Entry, references) -> bytes:
+    """``build_molecule``'s result, PICKLED HERE. Returned as bytes because the executor's
+    own transport pickles with multiprocessing's ForkingPickler, for which torch registers
+    reducers that move every tensor through a shared-memory handle; a member holds about 80
+    small tensors, and the walk spent longer passing them than building them (measured: an
+    8-worker walk slower than the serial one). The plain pickle copies them by value.
+    """
+    w = _WORKER
+    return pickle.dumps(build_molecule(entry, w['energy_kw'], bundle=w['bundle'], cap=w['cap'],
+                                       stereo_salt=w['stereo_salt'], check=w['check'],
+                                       references=references),
+                        protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _in_walk_order(executor, entries, refs, depth: int):
+    """``build_molecule`` results for ``entries``, in order, at most ``depth`` in flight.
+
+    TERMINATION: one submission per entry, each a bounded ``build_molecule``; a worker that
+    dies raises (``BrokenProcessPool``) out of ``result()``. Closing the generator cancels
+    what has not started.
+    """
+    from collections import deque
+    src, pending = iter(entries), deque()
+
+    def submit():
+        e = next(src, None)
+        if e is not None:
+            pending.append(executor.submit(_build_task, e, refs(e)))
+
+    try:
+        for _ in range(depth):
+            submit()
+        while pending:
+            f = pending.popleft()
+            submit()
+            yield pickle.loads(f.result())
+    finally:
+        for f in pending:
+            f.cancel()
 
 
 def train_placement_change(train_layout, layout, train_idents) -> str:
@@ -921,7 +1034,11 @@ def parse_args(argv=None):
     ap.add_argument('--database-rescore-tol', type=float, default=DATABASE_RESCORE_TOL,
                     help='kcal/mol; a database row re-scoring further from its stored energy '
                          'refuses its condition (db_rescore)')
-    ap.add_argument('--threads', type=int, default=2)
+    ap.add_argument('--threads', type=int, default=2,
+                    help='torch threads per process (each --workers process takes as many)')
+    ap.add_argument('--workers', type=int, default=1,
+                    help='build molecules in this many processes; every file but the manifest\'s '
+                         'argv, time stamp and duration is the serial build\'s')
     ap.add_argument('--no-check', action='store_true',
                     help='skip the graph-vs-energy geometry checks (don\'t)')
     ap.add_argument('--force', action='store_true',
@@ -970,6 +1087,8 @@ def main(argv=None):
             raise SystemExit('--rows-per-condition-cap must be >= 1')
         from build_conformer_database import first_header, refuse_other_member_kwargs
         refuse_other_member_kwargs(first_header(args.database), energy_kw, 'set builder')
+    if int(args.workers) < 1:
+        raise SystemExit('--workers must be >= 1')
 
     # ---- encoder, and (only when asked) the pool it was trained on
     bundle, enc_info, pool_info = None, None, {}
@@ -1010,13 +1129,44 @@ def main(argv=None):
           f'{len(set_rej)} rows refused before any build')
     write_split_table(out / 'split.tsv', sides)
 
+    # ---- the database's stored references: its members, not this RDKit's embeddings
+    references, ref_info = None, None
+    if args.database is not None:
+        from build_conformer_database import read_references
+        ref_info, references = read_references(args.database)
+        n_refused = sum(isinstance(r, StoredRefusal) for v in references.values()
+                        for r in v.values())
+        print(f'database references: {sum(len(v) for v in references.values()) - n_refused} '
+              f'stored reference(s) and {n_refused} recorded isomer refusal(s) over '
+              f'{len(references)} key(s)')
+
     # ---- build
     check = not args.no_check
     walk = dict(bundle=bundle, cap=cap, stereo_salt=args.stereo_salt, check=check)
-    train, rej_t, att_t = walk_side(sides['train'], _n(args.n_train), energy_kw,
-                                    label='train', **walk)
-    held, rej_h, att_h = walk_side(sides['heldout'], _n(args.n_heldout), energy_kw,
-                                   label='heldout', **walk)
+    executor = None
+    if int(args.workers) > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        executor = ProcessPoolExecutor(
+            max_workers=int(args.workers), mp_context=multiprocessing.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(int(args.threads), energy_kw, dict(walk, bundle=None),
+                      None if bundle is None else str(ckpt)))
+        # EVERY WORKER STARTED BEFORE THE WALK: the executor starts one per submission while
+        # none is idle, and a start inside the walk holds the walk up
+        t_pool = time.time()
+        n_up = len(set(executor.map(_worker_ready, range(int(args.workers)))))
+        print(f'workers: {n_up} of {args.workers} started in {time.time() - t_pool:.0f} s')
+    try:
+        pool = dict(references=references, executor=executor,
+                    lookahead=LOOKAHEAD_PER_WORKER * int(args.workers))
+        train, rej_t, att_t = walk_side(sides['train'], _n(args.n_train), energy_kw,
+                                        label='train', **walk, **pool)
+        held, rej_h, att_h = walk_side(sides['heldout'], _n(args.n_heldout), energy_kw,
+                                       label='heldout', **walk, **pool)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
     rejections = set_rej + rej_t + rej_h
     if not train:
         raise SystemExit('no training molecule built; nothing to write')
@@ -1107,7 +1257,10 @@ def main(argv=None):
                 'n_transverse': int((layout.kind(ident) == TRANSVERSE).sum()),
                 'reference_energy': f'{e_ref:.6f}',
                 'encoder_parity_atoms': int(np.count_nonzero(graph_from_smiles(ident)[2])),
-                'encoder_group': min(grp) if grp else ''}
+                'encoder_group': min(grp) if grp else '',
+                # 'stored' = built from the database's reference, 'embedded' = here
+                'reference': m.reference,
+                'thermal_check': (m.thermal_check or {}).get('status', 'off')}
 
     mrows = {'train': [member_row(i) for i in tmembers],
              'heldout': [member_row(i) for i in hmembers]}
@@ -1210,7 +1363,8 @@ def main(argv=None):
     # ---- tables and manifest
     header = ['identifier', 'key', 'dataset_index', 'split', 'molecule_rank',
               'n_stereoisomers', 'isomer_rank', 'mirror', 'n_atoms', 'k', 'n_pad', 'blocks',
-              'n_transverse', 'reference_energy', 'encoder_parity_atoms', 'encoder_group']
+              'n_transverse', 'reference_energy', 'encoder_parity_atoms', 'encoder_group',
+              'reference', 'thermal_check']
     _write_tsv(out / 'molecules.tsv', header, mrows['train'] + mrows['heldout'])
     _write_tsv(out / 'rejections.tsv', ['level', 'key', 'dataset_index', 'split',
                                         'identifier', 'reason_code', 'message'], rejections)
@@ -1246,6 +1400,19 @@ def main(argv=None):
                                  and prior_info.get('source') != 'database' else None)},
         'rungs': {s: {'molecules': len(bl), 'conditions': len(mrows[s])}
                   for s, bl in (('train', train), ('heldout', admitted))},
+        # WHICH REFERENCE EACH KEPT MEMBER WAS BUILT ON, and whether the stereo lock's thermal
+        # check ran here or its stored pass stood for it (molecules.tsv per member)
+        'references': {
+            'source': 'database' if references is not None else 'embedded',
+            'database_run_hash': ref_info['run_hash'] if ref_info else None,
+            'reference': _count(r['reference'] for s in mrows for r in mrows[s]),
+            'thermal_check': _count(r['thermal_check'] for s in mrows for r in mrows[s]),
+            'refusals_from_database': sum(
+                1 for r in rejections if r['level'] == 'isomer' and ref_info
+                and str(r['message']).startswith(f"database {ref_info['run_hash'][:12]}:")),
+            'thermal_check_skipped_because': sorted({
+                (allm[r['identifier']].thermal_check or {}).get('reason')
+                for s in mrows for r in mrows[s] if r['thermal_check'] == 'skipped'})},
         'stereo': {'policy': 'each stereoisomer a condition, identified by its stereo-tagged '
                              'canonical SMILES; every element specified; reference '
                              're-perceived from 3D',

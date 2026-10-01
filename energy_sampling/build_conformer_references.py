@@ -323,11 +323,23 @@ def _float64():
         torch.set_default_dtype(old)
 
 
-def build_member(smiles: str, kwargs: Mapping):
+def build_member(smiles: str, kwargs: Mapping, pos=None, z=None):
     """The member exactly as ``MultiConformerTorsions`` builds it (``ConformerTorsions(smiles=
-    ..., **kw)``), on the CPU in float64."""
-    from energies.conformer_torsions import ConformerTorsions
-    return ConformerTorsions(smiles=smiles, device='cpu', dtype=torch.float64, **dict(kwargs))
+    ..., **kw)``), on the CPU in float64.
+
+    With ``pos`` (and ``z``), the conditions file's stored reference in placement order, the
+    member is built FROM IT, as the run builds it (``ConformerModeller.init_energy_function``):
+    no embedding, so the member is the file's under any RDKit. A stored geometry that is not
+    this molecule in the derived placement order raises ``ValueError``.
+    """
+    from energies.conformer_torsions import ConformerTorsions, rdkit_order_reference
+    kwargs = dict(kwargs)
+    rd = None
+    if pos is not None:
+        rd, _ = rdkit_order_reference(smiles, np.asarray(pos, dtype=np.float64),
+                                      level=kwargs.get('level'), z=z)
+    return ConformerTorsions(smiles=smiles, device='cpu', dtype=torch.float64,
+                             reference_positions=rd, **kwargs)
 
 
 def check_member_matches(member, z, pos, tol: float = REF_POS_TOL) -> float:
@@ -732,7 +744,7 @@ def compute_entry(identifier: str, smiles: str, z, pos, kwargs: Mapping, search:
     cost = {}
     with _float64():
         t = time.perf_counter()
-        member = build_member(smiles, kwargs)
+        member = build_member(smiles, kwargs, pos=pos, z=z)
         pos_gap = check_member_matches(member, z, pos)
         k = int(member.ndim)
         pin = condition_stereo(member)
