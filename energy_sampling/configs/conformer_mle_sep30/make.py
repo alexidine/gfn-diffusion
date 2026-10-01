@@ -50,9 +50,11 @@ the stage protocol reject (configs/final_sep19/make.py::load_check).
 PROJECTIONS (printed and written to INDEX_a.tsv; WORKING ASSUMPTIONS from the local 2000/200
 database rung of 2026-09-30 and the local 450/50 builds of 2026-10-01, not cluster
 measurements): conditions and prior rows per molecule, the set builder's and reference builder's
-CPU seconds, the builder's peak host memory, and the training footprint model -- ROW_KB per prior row, COND_KB per train condition, the prior
-dataset held once as loaded, once cloned into the anchor buffer (whole: anchor thinning is off),
-and once more transiently while the prior buffer seed is cut to its max_size.
+CPU seconds, the builder's peak host memory, and the training footprint model (train_footprint):
+compact rows at configs/conformer_cond/make.py::row_bytes, the conditions table at its
+TABLE_BYTES_PER_CONDITION_MAX per train condition, the prior dataset held twice (as built and
+thermal-noised), the anchor buffer at its resolved capacity (max of its max_size and the prior
+rows it is seeded with), the prior buffer at its max_size.
 """
 from __future__ import annotations
 
@@ -146,9 +148,12 @@ TRAIN_MEM_DEFAULT_GB = 48
 TRAIN_MEM_MARGIN = 2.5
 HOST_BASE_GB = 6.0
 PILOT_WALL = '01:00:00'
-#: the owner's training footprint model: KB per prior row in memory, KB per train condition
-ROW_KB = 35.6
-COND_KB = 35.4
+#: Host memory of the training process per train condition, KB: its member object (253 KB,
+#: the 247 KiB per member the 2026-09-30 compaction brief records; not re-measured since
+#: stored-reference members) and the float64 conditions file while it is read (73 KB,
+#: 72,626 B per condition on the 3,486-condition rung). WORKING ASSUMPTIONS.
+MEMBER_HOST_KB = 253.0
+COND_FILE_KB = 73.0
 CARDS_GB = {'a100-40': 40, 'l40s-48': 48, 'a100-80': 80}
 
 _spec = importlib.util.spec_from_file_location('cc_make', ROOT / 'conformer_cond' / 'make.py')
@@ -273,20 +278,37 @@ def build_cost(n_mol):
     return f'{hours:02d}:00:00', f'{max(8, math.ceil(mem))}G', cpu / 3600
 
 
-def train_footprint(n_train, prior_buffer_cap):
+def train_footprint(n_train, cfg):
     """(prior rows, train conditions, GB: GPU resident, GPU warm-up peak, host, one buffer
-    sidecar). The sidecar holds the prior and anchor buffers (replay is empty under train_prior)
-    at ROW_KB a row."""
+    sidecar) for an arm `cfg` on n_train molecules, from the compact-store model of
+    configs/conformer_cond/make.py (row_bytes at K_MAX, TABLE_BYTES_PER_CONDITION_MAX,
+    COMPACT_HOST_BYTES_PER_ROW).
+
+    GPU resident: the conditions table, the prior dataset (the file's rows; twice under
+    prior_dataset_noise 'thermal'), the anchor buffer at its resolved capacity (max of its
+    max_size and the prior rows, which seed it whole) and the prior buffer at min(rows,
+    max_size). The peak adds one chunk of COMPACT_CHUNK_ROWS materialised graphs. Host: the
+    members and the conditions file being read (MEMBER_HOST_KB, COND_FILE_KB per condition)
+    and the rows' host columns. The sidecar holds the prior and anchor buffers (replay is
+    empty under train_prior)."""
     rows = ROWS_PER_MOLECULE * n_train
     conds = CONDITIONS_PER_MOLECULE * n_train
-    one = rows * ROW_KB * 1e3 / 1e9
-    cond_gb = conds * COND_KB * 1e3 / 1e9
-    pb = min(rows, prior_buffer_cap) * ROW_KB * 1e3 / 1e9
-    resident = one + one + pb + cond_gb       # dataset, anchor buffer (whole), prior buffer, conditions
-    peak = resident + one                     # + the prior-buffer seed's transient whole clone
-    host = one + one + cond_gb                # the loaded file and its thermal-noised clone, the conditions
-    sidecar = pb + one
+    per = cc.row_bytes(cfg)
+    b = cfg['buffers']
+    anchor_rows = cc.anchor_capacity(cfg, seed_rows=rows)
+    prior_rows = min(rows, int(b['prior_buffer']['max_size']))
+    table = conds * cc.TABLE_BYTES_PER_CONDITION_MAX
+    buffers = anchor_rows * per['anchor'] + prior_rows * per['prior']
+    resident = (table + rows * per['prior_sample'] + buffers) / 1e9
+    peak = resident + COMPACT_CHUNK_ROWS * cc.TABLE_BYTES_PER_CONDITION_MAX / 1e9
+    host = (conds * (MEMBER_HOST_KB + COND_FILE_KB) * 1e3
+            + (2 * rows + anchor_rows + prior_rows) * cc.COMPACT_HOST_BYTES_PER_ROW) / 1e9
+    sidecar = (buffers + (anchor_rows + prior_rows) * cc.COMPACT_HOST_BYTES_PER_ROW) / 1e9
     return rows, conds, resident, peak, host, sidecar
+
+
+#: rows of graphs a compact store materialises at a time (buffer.py::COMPACT_CHUNK_ROWS)
+COMPACT_CHUNK_ROWS = 4096
 
 
 # ----------------------------------------------------------------------------- sbatch
@@ -533,7 +555,7 @@ def main(argv=None):
         b_wall, b_mem, cpu_h = build_cost(n_train + n_heldout)
         if pilot:
             b_wall = '01:00:00'
-        n_rows, n_cond, resident, peak, host, sidecar = train_footprint(n_train, pb_cap)
+        n_rows, n_cond, resident, peak, host, sidecar = train_footprint(n_train, cfg)
         n_archives = (PILOT_EPOCHS if pilot else TRAIN_PRIOR_MAX_STEPS) // archive_period
         t_mem = TRAIN_MEM.get(rung) or f'{max(TRAIN_MEM_DEFAULT_GB, 16 * math.ceil(TRAIN_MEM_MARGIN * (host + HOST_BASE_GB) / 16))}G'
         t_wall = PILOT_WALL if pilot else TRAIN_WALL
@@ -584,17 +606,18 @@ def main(argv=None):
     print(f'\nProjected cost per rung. Build: CPU job, {BUILD_CPUS} CPUs, one builder process per CPU; wall = '
           f'{BUILD_WALL_MARGIN:g}x the projected wall time ({CLUSTER_SLOWDOWN:g}x the local rates) + 30 min, '
           f'memory = {BUILD_MEM_MARGIN:g}x the projected peak. Training: '
-          f'GPU memory from the footprint model ({ROW_KB} KB per prior row, {COND_KB} KB per train '
-          f'condition; the prior dataset once as loaded, once in the anchor buffer, once transiently '
-          f'while the prior buffer seed is cut to {pb_cap:,} rows), before the model and its '
-          f'activations. Working assumptions from the local 2000/200 rung, not cluster measurements.')
+          f'GPU memory from the compact-store model (train_footprint: '
+          f'{cc.TABLE_BYTES_PER_CONDITION_MAX:,} B per train condition for the conditions table; '
+          f'the prior dataset as built and noised; the anchor buffer at max(its max_size, the prior '
+          f'rows); the prior buffer at up to {pb_cap:,} rows), before the model and its '
+          f'activations; host from {MEMBER_HOST_KB:g} + {COND_FILE_KB:g} KB per train condition. Working assumptions from the local 2000/200 rung, not cluster measurements.')
     print(f"{'rung':<7}{'train/held-out mol':>20}{'build wall':>11}{'build mem':>10}{'build CPU-h':>12}"
           f"{'prior rows':>12}{'train cond':>11}{'GPU resident GB':>16}{'GPU peak GB':>12}{'host GB':>9}"
           f"{'train --mem':>12}{'sidecar GB':>11}{'disk GB':>9}")
     for r in rows:
         print(f'{r[1]:<7}{r[5] + "/" + r[6]:>20}{r[7]:>11}{r[8]:>10}{r[9]:>12}{r[12]:>12}{r[13]:>11}'
               f'{r[14]:>16}{r[15]:>12}{r[16]:>9}{r[11]:>12}{r[17]:>11}{r[18]:>9}')
-    print(f'sidecar GB = one buffer sidecar (prior buffer + the whole anchor buffer at {ROW_KB} KB a row), '
+    print(f'sidecar GB = one buffer sidecar (prior buffer + the anchor buffer, compact rows), '
           f'rewritten every eval_period ({base["eval_period"]}) steps; disk GB = the rolling one plus one '
           f'frozen copy per archive (archive_period {archive_period}, archive_buffers '
           f'{base["archive_buffers"]}) up to train_prior max_steps (pilot: its epochs).')

@@ -139,6 +139,7 @@ class ConformerModeller(Modeller):
                 continue
             print(f'{name}: {buf.bind_statics(statics)} to the conditions table '
                   f'({len(buf)} rows)')
+        self._resolve_anchor_capacity('restored')
 
     def _buffer_y_fn(self):
         """``conformer_energy``, not the energy_function name.
@@ -1943,6 +1944,15 @@ class ConformerModeller(Modeller):
         return self._prior_rng_state
 
     def init_anchor_buffer_seed(self):
+        """`_seed_anchor_buffer`, then the capacity resolved from what it seeded
+        (`_resolve_anchor_capacity`). A restored anchor buffer is not re-seeded; its capacity
+        is resolved in `_bind_restored_stores`."""
+        seeded = not hasattr(self, 'anchor_buffer')
+        self._seed_anchor_buffer()
+        if seeded:
+            self._resolve_anchor_capacity('config seed')
+
+    def _seed_anchor_buffer(self):
         """Seed the anchor buffer from HARDER-RELAXED prior draws, not the prior dataset.
 
         The base method's `seed_source: prior_dataset` calls that dataset "the real
@@ -2257,39 +2267,44 @@ class ConformerModeller(Modeller):
                   f'condition-aware')
 
     def _anchor_seed_row_batches(self, source):
-        """The anchor seed's rows from a COMPACT prior-dataset store `source`: at most
-        `buffers.anchor_buffer.max_size` of them, each condition's lowest-energy rows
-        (buffer.py::lowest_rows_per_condition), a chunk of graphs at a time.
-
-        `buffers.anchor_buffer.seed_rows_per_condition` sets the rows per condition; null
-        or absent takes every row when the dataset fits `max_size`, and otherwise the most
-        rows per condition that fit. Refused when even that does not fit: more conditions
-        than `max_size`, or the configured count times the conditions above it. A full
-        (graph-row) prior dataset does not come through here (`init_anchor_buffer_seed`):
-        it is handed over whole, as on the crystal route, and is the single-molecule draw
-        or a relaxed re-draw, `energy_config.prior_sample_size` rows.
+        """The anchor seed's rows from a COMPACT prior-dataset store `source`, a chunk of
+        graphs at a time: every row, or with `buffers.anchor_buffer.seed_rows_per_condition`
+        set, each condition's lowest-energy rows up to that count
+        (buffer.py::lowest_rows_per_condition). `buffers.anchor_buffer.max_size` does not
+        limit the seed; `_resolve_anchor_capacity` raises it to the rows seeded. A full
+        (graph-row) prior dataset does not come through here (`init_anchor_buffer_seed`): it
+        is handed over whole.
         """
         from buffer import COMPACT_CHUNK_ROWS, chunk_bounds, lowest_rows_per_condition
 
-        cfg = self.args.buffers.anchor_buffer
-        max_size = int(cfg.max_size)
-        per_condition = getattr(cfg, 'seed_rows_per_condition', None)
+        per_condition = getattr(self.args.buffers.anchor_buffer, 'seed_rows_per_condition', None)
         keys = source.batch.keys
         energy = torch.as_tensor(source.batch.conformer_energy).detach().reshape(-1).cpu()
         try:
-            rows, k, n_cond = lowest_rows_per_condition(keys, energy, max_size, per_condition)
+            rows, k, n_cond = lowest_rows_per_condition(keys, energy, per_condition)
         except ValueError as err:
-            raise SystemExit(
-                f'anchor seed from the prior dataset ({len(source):,} rows): {err}. Set '
-                f'buffers.anchor_buffer.max_size and '
-                f'buffers.anchor_buffer.seed_rows_per_condition so that the seed fits') \
-                from None
-        print(f'anchor seed: {len(rows):,} of {len(source):,} prior-dataset rows, the '
-              f'lowest-energy {k} per condition over {n_cond:,} condition(s) '
-              f'(buffers.anchor_buffer.max_size {max_size:,}, seed_rows_per_condition '
-              f'{per_condition})')
+            raise SystemExit(f'anchor seed from the prior dataset ({len(source):,} rows): '
+                             f'{err} (buffers.anchor_buffer.seed_rows_per_condition)') from None
+        print(f'anchor seed: {len(rows):,} of {len(source):,} prior-dataset rows over '
+              f'{n_cond:,} condition(s)'
+              + (' (every row)' if per_condition is None else
+                 f', the lowest-energy {k} per condition (seed_rows_per_condition)'))
         return (source.batch.subsample_new_batch(rows[i:j])
                 for i, j in chunk_bounds(int(rows.numel()), COMPACT_CHUNK_ROWS))
+
+    def _resolve_anchor_capacity(self, source):
+        """The anchor buffer's capacity on this route: the larger of the configured
+        `buffers.anchor_buffer.max_size` and the rows the buffer holds when it is seeded or
+        restored (owner decision 2026-10-01). Written back to `args.buffers.anchor_buffer.
+        max_size`, which is what train.py's admission and thin read; printed either way."""
+        buf = getattr(self, 'anchor_buffer', None)
+        if buf is None:
+            return
+        cfg = self.args.buffers.anchor_buffer
+        configured, held = int(cfg.max_size), len(buf)
+        cfg.max_size = max(configured, held)
+        print(f'anchor_buffer [{source}]: capacity {int(cfg.max_size):,} rows = max(configured '
+              f'buffers.anchor_buffer.max_size {configured:,}, {held:,} rows held)')
 
     def _bake_rows(self, batch, states, chunk: int = 2048):
         """Baked ``conformer_energy`` (T = 1) for ``states`` on ``batch``'s rows, ``[n]``.

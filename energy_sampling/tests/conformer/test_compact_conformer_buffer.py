@@ -591,36 +591,27 @@ def test_lowest_rows_per_condition():
 
     keys = torch.tensor([7, 7, 7, 2, 2, 5, 7, 2])
     e = torch.tensor([3., 1., 2., 9., 8., 0., 0.5, 8.])
-    # everything fits: every row, in row order
-    rows, k, n = pick(keys, e, 8)
+    # no count: every row, in row order
+    rows, k, n = pick(keys, e)
     assert rows.tolist() == list(range(8)) and (k, n) == (4, 3)
-    # the largest k that fits 6 rows is 2 (2 + 2 + 1 = 5; k = 3 would take 7)
-    rows, k, n = pick(keys, e, 6)
+    rows, k, n = pick(keys, e, 2)
     assert (k, n) == (2, 3) and rows.tolist() == [1, 4, 5, 6, 7]     # tie at 8.0: the earlier row
-    rows, k, _ = pick(keys, e, 3)
+    rows, k, _ = pick(keys, e, 1)
     assert k == 1 and rows.tolist() == [4, 5, 6]
-    # an explicit count, taken even where everything would fit
-    rows, k, _ = pick(keys, e, 100, per_condition=1)
-    assert k == 1 and rows.tolist() == [4, 5, 6]
-    rows, k, _ = pick(keys, e, 100, per_condition=50)
+    rows, k, _ = pick(keys, e, 50)
     assert rows.tolist() == list(range(8))
-    with pytest.raises(ValueError, match='one row of each'):
-        pick(keys, e, 2)
-    with pytest.raises(ValueError, match='more than max_size'):
-        pick(keys, e, 4, per_condition=2)
     with pytest.raises(ValueError, match='>= 1'):
-        pick(keys, e, 4, per_condition=0)
-    rows, k, n = pick(torch.zeros(0, dtype=torch.long), torch.zeros(0), 4)
+        pick(keys, e, 0)
+    rows, k, n = pick(torch.zeros(0, dtype=torch.long), torch.zeros(0))
     assert rows.numel() == 0 and (k, n) == (0, 0)
     # NaN energies are taken last
-    rows, _, _ = pick(torch.tensor([0, 0, 0]), torch.tensor([float('nan'), 2., 1.]), 2,
-                      per_condition=2)
+    rows, _, _ = pick(torch.tensor([0, 0, 0]), torch.tensor([float('nan'), 2., 1.]), 2)
     assert rows.tolist() == [1, 2]
 
 
-def test_the_anchor_seed_takes_bounded_rows_of_a_compact_prior_dataset(conditions, tmp_path,
-                                                                       float32_default, capsys,
-                                                                       monkeypatch):
+def test_the_anchor_seed_takes_every_row_of_a_compact_prior_dataset(conditions, tmp_path,
+                                                                    float32_default, capsys,
+                                                                    monkeypatch):
     import buffer
     from energies.conformer_data import save_prior_file
 
@@ -643,55 +634,105 @@ def test_the_anchor_seed_takes_bounded_rows_of_a_compact_prior_dataset(condition
             out = out.append_batch(part)
         return out
 
-    # the dataset fits max_size: every row, in order, as before
-    everything = seed(max_size=21)
-    assert torch.equal(everything.conformer_energy.reshape(-1), e)
-    # it does not: the most rows per condition that fit, each condition's lowest
-    bounded = seed(max_size=14)                     # k = 3 -> 12 rows; k = 4 would take 15
-    assert bounded.num_graphs == 12
+    # every row, in order, whatever max_size says: it does not limit the seed
+    for max_size in (1000, 14, 3):
+        everything = seed(max_size=max_size)
+        assert torch.equal(everything.conformer_energy.reshape(-1), e)
+    assert '21 of 21 prior-dataset rows over 4 condition(s) (every row)' in capsys.readouterr().out
+    # the thinning knob: each condition's lowest rows
+    three = seed(max_size=3, seed_rows_per_condition=3)
+    assert three.num_graphs == 12
     want = torch.cat([torch.sort(e[at == c]).values[:3] for c in range(4)])
-    assert torch.equal(torch.sort(bounded.conformer_energy.reshape(-1)).values,
+    assert torch.equal(torch.sort(three.conformer_energy.reshape(-1)).values,
                        torch.sort(want).values)
-    assert 'lowest-energy 3 per condition over 4 condition(s)' in capsys.readouterr().out
-    # the configured count
+    assert 'the lowest-energy 3 per condition' in capsys.readouterr().out
     one = seed(max_size=1000, seed_rows_per_condition=1)
     assert torch.equal(torch.sort(one.conformer_energy.reshape(-1)).values,
                        torch.sort(torch.stack([e[at == c].min() for c in range(4)])).values)
-    for anchor, why in (({'max_size': 3}, 'one row of each'),
-                        ({'max_size': 10, 'seed_rows_per_condition': 3}, 'more than max_size')):
-        with pytest.raises(SystemExit, match=why):
-            seed(**anchor)
+    with pytest.raises(SystemExit, match='seed_rows_per_condition'):
+        seed(max_size=10, seed_rows_per_condition=0)
+
+
+def test_the_anchor_capacity_is_the_larger_of_max_size_and_the_rows_held(capsys):
+    """ConformerModeller._resolve_anchor_capacity, after a seed and after a restore: a set
+    larger than the configured max_size raises the capacity to its size, a smaller one
+    leaves the configured value, and no buffer leaves it untouched."""
+    import types
+
+    from conformer_modeller import ConformerModeller
+
+    def resolved(max_size, held):
+        m = ConformerModeller.__new__(ConformerModeller)
+        m.args = types.SimpleNamespace(buffers=types.SimpleNamespace(
+            anchor_buffer=types.SimpleNamespace(max_size=max_size)))
+        if held is not None:
+            m.anchor_buffer = [None] * held
+        m._resolve_anchor_capacity('config seed')
+        return m.args.buffers.anchor_buffer.max_size
+
+    assert resolved(40_000, 216_950) == 216_950
+    assert 'capacity 216,950 rows = max(configured buffers.anchor_buffer.max_size 40,000, ' \
+           '216,950 rows held)' in capsys.readouterr().out
+    assert resolved(40_000, 449) == 40_000
+    assert 'capacity 40,000 rows' in capsys.readouterr().out
+    assert resolved(40_000, None) == 40_000 and capsys.readouterr().out == ''
 
 
 def test_the_anchor_seed_hands_the_base_method_its_rows_by_standing_in(conditions, tmp_path,
                                                                       float32_default,
                                                                       monkeypatch):
-    """ConformerModeller.init_anchor_buffer_seed: a compact prior dataset stands in with the
-    bounded selection as its `row_batches`, which train.py::_dataset_row_batches reads; a
-    graph-row dataset reaches the base method as itself; and prior_dataset is put back."""
+    """ConformerModeller.init_anchor_buffer_seed: a compact prior dataset stands in with its
+    seed rows as `row_batches`, which train.py::_dataset_row_batches reads; a graph-row dataset
+    reaches the base method as itself; prior_dataset is put back; and the capacity is resolved
+    from the buffer the base method built, larger than the configured max_size or not."""
     import train
     from energies.conformer_data import save_prior_file
 
     rows = _masked_rows(conditions)
     path = save_prior_file(_compact_blob(conditions, rows), tmp_path / 'prior.pt')
     seen = []
-    monkeypatch.setattr(train.Modeller, 'init_anchor_buffer_seed', lambda self: seen.append(
-        sum(b.num_graphs for b in train._dataset_row_batches(self.prior_dataset))))
 
-    m = _modeller(conditions, path, int(conditions.n_torsions[0]),
-                  anchor={'max_size': 14, 'seed_source': 'prior_dataset'})
-    m.init_prior_dataset()
+    def base_seed(self):
+        n = sum(b.num_graphs for b in train._dataset_row_batches(self.prior_dataset))
+        seen.append(n)
+        self.anchor_buffer = [None] * n            # a stand-in with the seeded length
+
+    monkeypatch.setattr(train.Modeller, 'init_anchor_buffer_seed', base_seed)
+
+    def modeller(**anchor):
+        m = _modeller(conditions, path, int(conditions.n_torsions[0]),
+                      anchor={'seed_source': 'prior_dataset', **anchor})
+        m.init_prior_dataset()
+        return m
+
+    # a set LARGER than max_size seeds fully, and the capacity becomes its size
+    m = modeller(max_size=14)
     compact = m.prior_dataset
     m.init_anchor_buffer_seed()
-    assert seen == [12] and m.prior_dataset is compact       # 3 rows of each of 4 conditions
-    # the rows before the thermal noise, when they were kept, are the ones selected from
+    assert seen == [21] and m.prior_dataset is compact
+    assert m.args.buffers.anchor_buffer.max_size == 21
+    # a smaller one leaves the configured capacity
+    m = modeller(max_size=1000)
+    m.init_anchor_buffer_seed()
+    assert seen[-1] == 21 and m.args.buffers.anchor_buffer.max_size == 1000
+    # the thinning knob, and the capacity from what it seeded
+    m = modeller(max_size=5, seed_rows_per_condition=2)
+    m.init_anchor_buffer_seed()
+    assert seen[-1] == 8 and m.args.buffers.anchor_buffer.max_size == 8
+    # the rows before the thermal noise, when they were kept, are the ones seeded
+    m = modeller(max_size=14)
     m._prior_dataset_raw = rows                                # a graph batch: handed over whole
     m.init_anchor_buffer_seed()
     assert seen[-1] == rows.num_graphs and '_prior_dataset_raw' not in m.__dict__
+    m = modeller(max_size=14)
     m.prior_dataset = full = ConformerBuffer(rows, 'cpu', exclude_keys=BULKY,
                                              y_fn='conformer_energy')
     m.init_anchor_buffer_seed()
     assert seen[-1] == rows.num_graphs and m.prior_dataset is full
+    assert m.args.buffers.anchor_buffer.max_size == rows.num_graphs
+    # a restored anchor buffer is not re-seeded
+    m.init_anchor_buffer_seed()
+    assert len(seen) == 5
 
 
 def test_chunk_bounds_never_leave_one_row_alone():

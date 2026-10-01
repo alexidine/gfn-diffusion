@@ -2654,43 +2654,27 @@ class ConformerBuffer(ConformerGraphHooks, CrystalBuffer):
     """The churned stores -- prior, replay, mol/prior datasets -- over conformer graphs."""
 
 
-def lowest_rows_per_condition(keys, energy, max_rows: int, per_condition=None):
+def lowest_rows_per_condition(keys, energy, per_condition=None):
     """``(rows, k, n_conditions)``: each condition's ``k`` lowest-energy rows, as ascending
-    row indices (long), at most ``max_rows`` in all.
+    row indices (long).
 
     ``keys`` [n] is each row's condition and ``energy`` [n] its energy; ties and NaN keep
-    row order, NaN last. With ``per_condition`` None, every row when ``n <= max_rows``, and
-    otherwise the largest ``k`` whose total, sum over conditions of min(rows held, k), fits
-    ``max_rows``. With a number, that ``k``. Raises ValueError when no ``k >= 1`` fits (more
-    conditions than ``max_rows``) or the given ``k`` does not.
+    row order, NaN last. ``per_condition`` None takes every row (``k`` is then the most
+    rows any condition holds); a number is ``k``, and must be at least 1.
     """
     keys = np.asarray(torch.as_tensor(keys).cpu(), dtype=np.int64).reshape(-1)
     energy = np.asarray(torch.as_tensor(energy).cpu(), dtype=np.float64).reshape(-1)
-    n, max_rows = int(keys.size), int(max_rows)
+    n = int(keys.size)
     if energy.size != n:
         raise ValueError(f'{n} row keys and {energy.size} energies')
     if n == 0:
         return torch.zeros(0, dtype=torch.long), 0, 0
     _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
-    total = lambda k: int(np.minimum(counts, k).sum())
     if per_condition is None:
-        if n <= max_rows:
-            return torch.arange(n), int(counts.max()), int(counts.size)
-        if total(1) > max_rows:
-            raise ValueError(f'{counts.size:,} conditions hold rows and one row of each is '
-                             f'more than max_size {max_rows:,}')
-        lo, hi = 1, int(counts.max())           # total(lo) fits; total(hi) = n does not
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            lo, hi = (mid, hi) if total(mid) <= max_rows else (lo, mid)
-        k = lo
-    else:
-        k = int(per_condition)
-        if k < 1:
-            raise ValueError(f'seed_rows_per_condition must be >= 1, got {per_condition!r}')
-        if total(k) > max_rows:
-            raise ValueError(f'{k} row(s) of each of {counts.size:,} conditions is '
-                             f'{total(k):,} rows, more than max_size {max_rows:,}')
+        return torch.arange(n), int(counts.max()), int(counts.size)
+    k = int(per_condition)
+    if k < 1:
+        raise ValueError(f'seed_rows_per_condition must be >= 1, got {per_condition!r}')
     order = np.lexsort((np.arange(n), energy, inverse))     # condition, then energy, then row
     rank = np.arange(n) - np.repeat(np.cumsum(counts) - counts, counts)
     return torch.from_numpy(np.sort(order[rank < k])), k, int(counts.size)

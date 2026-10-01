@@ -396,12 +396,27 @@ def row_bytes(cfg, K=K_MAX):
             'prior_sample': state * (2 if cfg.get('prior_dataset_noise') == 'thermal' else 1)}
 
 
+def anchor_capacity(cfg, seed_rows=None):
+    """Rows the anchor buffer can hold: the larger of cfg:buffers.anchor_buffer.max_size and
+    the rows its seed puts in (ConformerModeller._resolve_anchor_capacity). With seed_source
+    'prior_dataset' the seed is `seed_rows`, default the whole prior dataset
+    (cfg:energy_config.prior_sample_size rows on an arm, whose prior_path is null); a
+    seed_rows_per_condition below that is not credited."""
+    a = cfg['buffers']['anchor_buffer']
+    if a.get('seed_source') != 'prior_dataset':
+        return int(a['max_size'])
+    if seed_rows is None:
+        seed_rows = int(cfg['energy_config']['prior_sample_size'])
+    return max(int(a['max_size']), int(seed_rows))
+
+
 def store_rows(cfg):
-    """Rows each store holds on cfg:buffer_device at its cap: the three buffers and the prior
-    dataset. A buffer sidecar holds the three buffers' (checkpointing.Checkpointer.buffer_state)."""
+    """Rows each store holds on cfg:buffer_device at its cap: the three buffers (the anchor
+    buffer at anchor_capacity) and the prior dataset. A buffer sidecar holds the three
+    buffers' (checkpointing.Checkpointer.buffer_state)."""
     b = cfg['buffers']
     return {'prior': int(b['prior_buffer']['max_size']),
-            'anchor': int(b['anchor_buffer']['max_size']),
+            'anchor': anchor_capacity(cfg),
             'replay': int(b['replay_buffer']['max_size']),
             'prior_sample': int(cfg['energy_config']['prior_sample_size'])}
 

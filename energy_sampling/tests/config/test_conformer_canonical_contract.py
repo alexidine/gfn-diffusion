@@ -187,6 +187,15 @@ def test_row_bytes_follow_the_store_form(raw):
     assert make.row_bytes(raw, K=66)['prior'] == 2 * (4 * 66 + 4) + 4
     full = dict(copy.deepcopy(raw), molecules_path=None)
     assert set(make.row_bytes(full).values()) == {make.BYTES_PER_ROW_MAX}
+    # the anchor buffer is budgeted at its resolved capacity: max_size, or the seed if larger
+    assert raw['buffers']['anchor_buffer']['seed_source'] == 'prior_dataset'
+    sample, cap = raw['energy_config']['prior_sample_size'], raw['buffers']['anchor_buffer']['max_size']
+    assert make.store_rows(raw)['anchor'] == make.anchor_capacity(raw) == max(sample, cap)
+    assert make.anchor_capacity(raw, seed_rows=cap + 7) == cap + 7
+    assert make.anchor_capacity(raw, seed_rows=1) == cap
+    lazy = copy.deepcopy(raw)
+    lazy['buffers']['anchor_buffer']['seed_source'] = 'generated'
+    assert make.anchor_capacity(lazy, seed_rows=10 ** 9) == cap
     # a sidecar holds the three buffers, a compact row with its host columns
     one = dict(copy.deepcopy(raw), archive_period=0)
     rows = make.store_rows(raw)
