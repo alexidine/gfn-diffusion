@@ -2,12 +2,13 @@
 import os
 from copy import copy
 
+import numpy as np
 import torch
 from ase.io import write
 from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
-    pes_cartoon, plot_dual_density_contour, combo_fig
+    pes_cartoon, plot_dual_density_contour, combo_fig, fused_duo_embedding_fig
 from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat2, clustering, clustering3, \
     dmat_row_indices
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
@@ -54,6 +55,17 @@ def require_log_r(results, tag):
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, out_dir=PAPER_FIG_DIR):
+    # ONLY_FIG=a,b regenerates just those figures. duo_embedding (UMAP over 5000x5000) and
+    # cluster_analysis (clustering + its own embedding) are the expensive steps; pes_cartoon needs no data,
+    # so asking for it alone skips loading the multi-GB results files entirely.
+    only_fig = {k.strip() for k in os.environ.get('ONLY_FIG', '').split(',') if k.strip()}
+    want = lambda *keys: (not only_fig) or bool(only_fig.intersection(keys))
+    DATA_FIGS = ('elj_TB_fig', 'uma_TB_fig', 'density_contours', 'energy_marginal', 'marginals_fig',
+                 'elj_staircase', 'uma_staircase', 'duo_embedding', 'cluster_analysis', 'crystals')
+    if not want(*DATA_FIGS):
+        print(f"  ONLY_FIG={sorted(only_fig)}: no data figure requested, skipping the results files")
+        export_figs({'pes_cartoon': pes_cartoon()}, mol_name, out_dir)
+        return
     uma_results = torch.load(uma_results_path, weights_only=False)
     elj_results = torch.load(elj_results_path, weights_only=False)
     rdf_mode = require_rdf_mode(uma_results, elj_results)
@@ -85,6 +97,12 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
     prior_data = torch.load(prior_path, weights_only=False)
     en_scaling_factor = elj_prescale_factor(elj_results, prior_data['thermal_scaling_factor'])
     for tag, res in (('elj', elj_results), ('uma', uma_results)):
+        # results saved before load_gfn installed the frozen P_B snapshot carry log P_B from the drifted live head
+        # (1-2.4 nats off, ~2 nats of extra scatter on the p23 arms); refuse them rather than plot them
+        if not (res.get('provenance') or {}).get('pb_frozen_installed'):
+            print(f"  !! {tag} TB parity SKIPPED: results predate the frozen-P_B fix (no pb_frozen_installed in "
+                  f"provenance); resample to regenerate it")
+            continue
         x = res['log_pbs'] + require_log_r(res, tag).to(res['log_pbs'].dtype)
         y = res['log_pfs'] + res['learned_log_z']
         fig_dict[f'{tag}_TB_fig'] = parity_fig(x, y,
@@ -92,8 +110,21 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
                                                "log(P<sub>f</sub>) + log(Z<sub>θ</sub>)",
                                                quantile_cut=0.99)
 
-    uma_batch = uma_results['sample_batch'].clone()
-    elj_batch = elj_results['sample_batch'].clone()
+    # A *_red0 results file keeps EVERY sample in sample_batch and applies max_reduction_en only to
+    # good_ens / dmat, so the density figures below must apply it themselves (the TB parity figure
+    # above stays on all samples: it checks the model's fit to the reward over everything it draws).
+    def reduced_only(res):
+        batch = res['sample_batch']
+        thr = res.get('max_reduction_en')
+        if thr is None:
+            return batch.clone()
+        keep = (batch.reduction_en.flatten() <= float(thr)).nonzero().flatten().tolist()
+        rows = batch.batch_to_list()
+        print(f"  density figures: reduced cells only, {len(keep)} of {len(rows)} samples (reduction_en <= {thr:g})")
+        return collate_data_list([rows[i] for i in keep])
+
+    uma_batch = reduced_only(uma_results)
+    elj_batch = reduced_only(elj_results)
     uma_en = uma_batch.uma
     elj_en = elj_batch.elj * en_scaling_factor
 
@@ -122,8 +153,8 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
                                                            )
 
     '''12 marginals'''
-    uma_batch = uma_results['sample_batch'].clone()
-    elj_batch = elj_results['sample_batch'].clone()
+    uma_batch = reduced_only(uma_results)
+    elj_batch = reduced_only(elj_results)
     marginals_fig = uma_batch.plot_batch_cell_params(
         space='latent',
         ref_dist=elj_batch.latent_params(),
@@ -153,25 +184,42 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
     fig_dict['marginals_fig'] = marginals_fig
 
     '''staircase plots'''
+    # axis_range=(-1, 1): the latent domain. Without it each panel bins over its OWN data range, so a
+    # near-delta dimension is binned across float noise and draws as stripes instead of a narrow peak.
     elj_staircase = elj_batch.plot_batch_staircase(space='latent',
                                                    ref_dist=ebatch.latent_params(),
+                                                   axis_range=(-1, 1),
                                                    return_fig=True,
                                                    show=False)
     uma_staircase = uma_batch.plot_batch_staircase(space='latent',
                                                    ref_dist=ebatch.latent_params(),
+                                                   axis_range=(-1, 1),
                                                    return_fig=True,
                                                    show=False)
     fig_dict['elj_staircase'] = elj_staircase
     fig_dict['uma_staircase'] = uma_staircase
 
-    fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch,
-                                                  uma_results)
+    # the embedding and clustering index by dmat_row_indices, i.e. rows of the FULL sample batch
+    # (the dmat itself already carries the energy window and any reduction filter)
+    uma_batch = uma_results['sample_batch'].clone()
+    elj_batch = elj_results['sample_batch'].clone()
+    if want('duo_embedding'):
+        fig_dict['duo_embedding'], duo = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor,
+                                                           uma_batch, uma_results)
+        # kept for the fused multi-molecule figure (fused_duo_embedding); the molecule is the first reference's
+        first = ebatch.batch == 0
+        np.savez(os.path.join(out_dir, f'{mol_name}_duo_embedding.npz'), z=ebatch.z[first].cpu().numpy(),
+                 pos=ebatch.pos[first].cpu().numpy(), **duo)
 
     # todo compute a summary statistic that makes this metric real/meaningful
     # todo consider then maybe whether to combine these as well
 
     '''Big 'ol combo plot'''
-    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters=6,min_basin_size=100)
+    if not want('cluster_analysis', 'crystals'):
+        fig_dict['pes_cartoon'] = pes_cartoon()
+        export_figs(fig_dict, mol_name, out_dir)
+        return
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters=4, min_basin_size=100)
     #cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering3(uma_results, uma_thermos, max_n_clusters=6,min_basin_size=100)
     # cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering2(uma_results, uma_thermos, n_clusters=10, n_keep=6)
 
@@ -233,11 +281,12 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
     # clustbatch.visualize(mode='convolve with')
     # clustbatch.visualize(mode='unit cell')
 
-    '''pes cartoon'''
     fig_dict['pes_cartoon'] = pes_cartoon()
+    export_figs(fig_dict, mol_name, out_dir)
 
-    """Exports"""
 
+def export_figs(fig_dict, mol_name, out_dir):
+    """one styling pass and one PNG per figure in fig_dict"""
     pub_style = dict(
         font=dict(family="Arial", size=18),
         width=1920,
@@ -253,8 +302,9 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         dd = {}
         if key == 'pes_cartoon':
             dd = {
-                'width': 1200,
-                'height': 500
+                'width': 900,
+                'height': 900,
+                'font_size': 22,
             }
         if key == 'summary_table' or key == 'polymorph_table':
             dd = {
@@ -304,11 +354,16 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
                 'font_size': 30,
                 'scale': 3,
                 'annotations_font_size': 30,
+                'pad': 24,  # white border added to the PNG: plotly's automargin puts the axis titles flush to the edge
             }
+        if key == 'duo_embedding':
+            dd = {'width': 1000, 'height': 1000, 'margin': dict(l=20, r=20, t=20, b=20)}
+        if key == 'duo_embedding_fused':
+            dd = {'width': 2000, 'height': 1000, 'margin': dict(l=20, r=20, t=20, b=20), 'annotations_font_size': 38}
         if key == 'cluster_analysis':
             dd = {
                 'width': 1500,
-                'height': 800,
+                'height': 800,  # the summary table carries four data rows
                 'annotations_font_size': 24,
                 'font_size': 24,
                 'legend_font_size': 16,
@@ -321,14 +376,19 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         style.update(custom_style(key))
         scale = style['scale']
         style.pop('scale')
+        pad = style.pop('pad', 0)
         for skey in style.keys():
             if 'annotation' in skey:
                 fs = style[skey]
-                fig.update_annotations(font_size=fs)
+                fig.update_annotations(font_size=fs, selector=lambda a: a.name != 'callout')
         style = {skey: value for skey, value in style.items() if 'annotation' not in skey}
         fig.update_layout(**style)
         fig.write_image(os.path.join(out_dir, f'{mol_name}_{key}.png'),
                         width=fig.layout.width, height=fig.layout.height, scale=scale)
+        if pad:
+            from PIL import Image, ImageOps
+            path = os.path.join(out_dir, f'{mol_name}_{key}.png')
+            ImageOps.expand(Image.open(path).convert('RGB'), border=int(pad * scale), fill='white').save(path)
 
     aa = 1
 
@@ -437,10 +497,29 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
     fig.update_layout(
         xaxis1_title='CV1', yaxis1_title='CV2',
         font_size=20,
+        # itemsizing keeps the swatches at one size instead of the (small) scatter marker size
+        legend=dict(font=dict(size=30), itemsizing='constant', x=0.99, y=0.99, xanchor='right', yanchor='top',
+                    bgcolor='rgba(255,255,255,0.65)'),
         plot_bgcolor='white',
         paper_bgcolor='white'
     )
-    return fig
+    # exported square (export_figs), so one data unit is the same length on both axes
+    fig.update_xaxes(title_font_size=40)
+    fig.update_yaxes(title_font_size=40, scaleanchor='x', scaleratio=1)
+    duo = dict(uma=uma_embed, lj=lj_embed, uma_alpha=uma_a, lj_alpha=lj_a,
+               poly=np.stack([poly_x, poly_y], axis=1))
+    return fig, duo
+
+
+def fused_duo_embedding(mol_names, out_dir):
+    """One figure from the per-molecule embeddings do_figs saved (`<mol>_duo_embedding.npz`)."""
+    paths = [os.path.join(out_dir, f'{m}_duo_embedding.npz') for m in mol_names]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        print(f"  fused LJ-vs-UMA figure SKIPPED: no saved embedding at {missing}")
+        return
+    fig = fused_duo_embedding_fig([dict(np.load(p)) for p in paths])
+    export_figs({'duo_embedding_fused': fig}, '_'.join(mol_names), out_dir)
 
 
 if __name__ == '__main__':
@@ -462,6 +541,29 @@ if __name__ == '__main__':
                        elj_results_path=os.path.join(RES, 'p12_neh_lr0p5_best_10k.pt'),
                        prior_path=os.path.join(PRIORS, 'nehzor_sg14_zp1_elj_prior_dataset.pt')),
     }
+    # PAIR_SET=p20: the converged prod_sep20 arms on their ROLLING checkpoints, scored under the
+    # post-change walls (mipcas *_niggli_v2 triclinic Niggli, nehzor *_w3 monoclinic per-class).
+    # p12 stays the default so the paper's existing figures regenerate unchanged.
+    PAIRS_P20 = {
+        'mipcas': dict(exp_path=r'D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt',
+                       uma_results_path=os.path.join(RES, 'p20_mipu_n5_running_10k.pt'),
+                       elj_results_path=os.path.join(RES, 'p20_mip_n5_running_10k.pt'),
+                       prior_path=os.path.join(PRIORS, 'mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt')),
+        'nehzor': dict(exp_path=r'D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt',
+                       uma_results_path=os.path.join(RES, 'p20_nehu_n5_running_10k.pt'),
+                       elj_results_path=os.path.join(RES, 'p20_neh_n5_running_10k.pt'),
+                       prior_path=os.path.join(PRIORS, 'nehzor_sg14_zp1_elj_prior_dataset_w3.pt')),
+    }
+    # PAIR_SET=p23 / p23_red0: the prod_sep23_ft fine-tunes of those arms (box and reduction penalties
+    # ramped 10 -> 1000), all samples / reduced cells only (reduction_en <= 1e-6, *_red0 results).
+    PAIRS_P23 = {mol: dict(p, uma_results_path=p['uma_results_path'].replace('p20_', 'p23_').replace('_n5_', '_ft_'),
+                           elj_results_path=p['elj_results_path'].replace('p20_', 'p23_').replace('_n5_', '_ft_'))
+                 for mol, p in PAIRS_P20.items()}
+    PAIRS_P23_RED0 = {mol: dict(p, uma_results_path=p['uma_results_path'].replace('.pt', '_red0.pt'),
+                                elj_results_path=p['elj_results_path'].replace('.pt', '_red0.pt'))
+                      for mol, p in PAIRS_P23.items()}
+    PAIRS = {'p12': PAIRS, 'p20': PAIRS_P20, 'p23': PAIRS_P23,
+             'p23_red0': PAIRS_P23_RED0}[os.environ.get('PAIR_SET', 'p12')]
     only = {m.strip() for m in os.environ.get('ONLY_MOL', '').split(',') if m.strip()}
     out_dir = os.environ.get('FIG_OUT_DIR', PAPER_FIG_DIR)
     for mol_name, paths in PAIRS.items():
@@ -469,3 +571,6 @@ if __name__ == '__main__':
             continue
         print(f"\n=== {mol_name} -> {out_dir} ===")
         do_figs(mol_name, out_dir=out_dir, **paths)
+    only_fig = {k.strip() for k in os.environ.get('ONLY_FIG', '').split(',') if k.strip()}
+    if not only_fig or only_fig.intersection(('duo_embedding', 'duo_embedding_fused')):
+        fused_duo_embedding([m for m in PAIRS if not only or m in only], out_dir)

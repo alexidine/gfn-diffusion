@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from scipy.signal import argrelmin
 from scipy.stats import gaussian_kde
 from scipy.stats import linregress
+from scipy.stats import rankdata
 from umap import UMAP
 
 from mxtaltools.common.utils import get_point_density_knn
@@ -1525,12 +1526,16 @@ def combo_fig(num_polymorphs,
     y_bot = bot_left_basin.yaxis.domain[0]
     x_left = top_left_basin.xaxis.domain[0]
     x_right = bot_right_basin.xaxis.domain[1]
+    # the colorbar covers the scatter rows, not the table below them
+    for tr in fig.data:
+        if tr.type == 'scatter' and tr.marker.showscale:
+            tr.marker.colorbar.update(lenmode='fraction', len=y_top - y_bot, y=y_top, yanchor='top')
 
     # y-axis label, centered vertically on basin grid
     fig.add_annotation(
         text="E (kJ/mol)",
         xref="paper", yref="paper",
-        x=x_left - 0.05,
+        x=x_left - 0.065,
         y=(y_top + y_bot) / 2,
         showarrow=False,
         textangle=-90,
@@ -1579,7 +1584,7 @@ def combo_fig(num_polymorphs,
     fig.update_xaxes(showgrid=False, showticklabels=False, row=1, col=1)
     fig.update_yaxes(showgrid=False, showticklabels=False, row=1, col=1)
 
-    fig.update_annotations(font_size=24)
+    fig.update_annotations(font_size=24, selector=lambda a: a.name != 'callout')
 
     return fig
 
@@ -1613,12 +1618,12 @@ def make_specs_fig(n_basins):
 
         fig = make_subplots(
             rows=total_rows, cols=total_cols,
-            row_heights=[1/3, 1/3, 1/3],
+            row_heights=[0.33, 0.33, 0.34],  # the table row holds four data rows
             column_widths=[0.3, 0.3, 0.4 / 3, 0.4 / 3, 0.4 / 3],
             specs=specs,
             subplot_titles=subplot_titles,
             horizontal_spacing=0.05,
-            vertical_spacing=0.1,
+            vertical_spacing=0.08,
         )
     elif n_basins <= 4:
         total_rows = 3
@@ -1647,12 +1652,12 @@ def make_specs_fig(n_basins):
 
         fig = make_subplots(
             rows=total_rows, cols=total_cols,
-            row_heights=[1 / 3, 1 / 3, 1 / 3],
+            row_heights=[0.33, 0.33, 0.34],  # the table row holds four data rows
             column_widths=[0.3, 0.3, 0.4 / 2, 0.4 / 2],
             specs=specs,
             subplot_titles=subplot_titles,
             horizontal_spacing=0.05,
-            vertical_spacing=0.1,
+            vertical_spacing=0.08,
         )
 
     return basin_positions, fig, total_cols
@@ -1753,17 +1758,58 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     # two references can land on top of each other.
     heads = polymorph_labels(len(polymorph_inds), poly_labels)
     fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
-                    mode='markers+text',
-                    text=heads,
-                    textposition='top right',
-                    textfont=dict(size=marker_font_size, color='black'),
+                    mode='markers',
                     marker_symbol='x-thin',
                     marker_color='black',
                     marker_line_color='black',
                     marker_line_width=4,
                     marker_size=18,
-                    opacity=0.75,
+                    opacity=1.0,
                     showlegend=False, row=1, col=1)
+    # callout tail: the direction around each X with the fewest samples under the label, kept clear of the
+    # other labels. Named 'callout' so the figure-wide annotation font size leaves it alone.
+    pts = sample_embedding[sample_inds]
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    span = float((hi - lo).max())
+    tails = []
+    for idx, label in zip(polymorph_inds, heads):
+        head = sample_embedding[idx]
+        best, best_score = None, None
+        for r_frac in (0.14, 0.20):
+            for ang in np.linspace(0, 2 * np.pi, 24, endpoint=False):
+                tail = head + r_frac * span * np.array([np.cos(ang), np.sin(ang)])
+                if np.any(tail < lo - 0.02 * span) or np.any(tail > hi + 0.02 * span):
+                    continue
+                score = int((np.linalg.norm(pts - tail, axis=1) < 0.06 * span).sum())
+                score += sum(10 ** 6 for other in tails if np.linalg.norm(other - tail) < 0.10 * span)
+                if best_score is None or score < best_score:
+                    best, best_score = tail, score
+        tails.append(best)
+        fig.add_annotation(x=head[0], y=head[1], ax=best[0], ay=best[1], xref='x', yref='y', axref='x', ayref='y',
+                           text=label, name='callout', showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=3,
+                           arrowcolor='black', standoff=10,
+                           font=dict(size=38, color='black', family='Times New Roman'))
+    # legend, overlaid on the emptiest corner of the embedding panel
+    for name, color, size, symbol, width in (("Probability maximum", "rgb(150,150,150)", 16, "circle", 4),
+                                             ("Energy minimum", "white", 16, "circle", 4),
+                                             ("Experimental polymorph", "black", 14, "x-thin", 3),
+                                             ("Size ∝ local density", "rgb(170,170,170)", 10, "circle", 0)):
+        fig.add_scatter(x=[None], y=[None], mode='markers', name=name, showlegend=True,
+                        marker=dict(size=size, color=color, symbol=symbol, line=dict(color='black', width=width)),
+                        row=1, col=1)
+    dom_x, dom_y = fig.layout.xaxis.domain, fig.layout.yaxis.domain
+    every = np.concatenate([pts, np.asarray(tails)])
+    corners = {}
+    for right in (True, False):
+        for top in (False, True):
+            in_x = every[:, 0] > hi[0] - 0.42 * (hi[0] - lo[0]) if right else every[:, 0] < lo[0] + 0.42 * (hi[0] - lo[0])
+            in_y = every[:, 1] > hi[1] - 0.22 * (hi[1] - lo[1]) if top else every[:, 1] < lo[1] + 0.22 * (hi[1] - lo[1])
+            corners[(right, top)] = int((in_x & in_y).sum())
+    right, top = min(corners, key=corners.get)
+    fig.update_layout(legend=dict(x=dom_x[1] - 0.01 if right else dom_x[0] + 0.03, xanchor='right' if right else 'left',
+                                  y=dom_y[1] - 0.01 if top else dom_y[0] + 0.02, yanchor='top' if top else 'bottom',
+                                  bgcolor='rgba(255,255,255,0.85)', bordercolor='black', borderwidth=1.5,
+                                  itemsizing='trace'))
     if extra_refs is not None:
         embedding_references(fig, sample_embedding, extra_refs, marker_font_size, already_labelled=heads)
     #
@@ -1808,19 +1854,21 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
         row, col = basin_positions[i]
 
         bb = indexed_cluster_labels == basin_ind
+        # % of the model's own (filtered) draws that are less dense than each point
+        density_pct = 100 * (rankdata(thermo_metrics['density']) - 0.5) / len(thermo_metrics['density'])
         fig.add_trace(go.Scatter(
             x=packing_coeffs[bb],
             y=sample_energy[bb],
             mode='markers',
             marker=dict(
                 size=5,
-                color=thermo_metrics['density'][bb] / np.amax(thermo_metrics['density']),
+                color=density_pct[bb],
                 colorscale='Viridis',
                 cmin=0,
-                cmax=1,
+                cmax=100,
                 opacity=0.6,
                 showscale=(i == 0),  # only once
-                colorbar_title="P(x)",
+                colorbar_title="Density<br>percentile",
             ),
             showlegend=False
         ), row=row, col=col)
@@ -1892,27 +1940,53 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     p2 = stats['elj_density']
     # e_var = stats['local_en_var']
     cp = stats['sample_cp']
-    row_labels = ["Min Energy (kJ/mol)",
-                  "Normed UMA P(x*)",
-                  "Normed LJ P(x*)",
-                  "c<sub>p</sub>(E<sub>min</sub>)",
-                  ]
-    raw_values = [e_min,
-                  p,
-                  p2,
-                  cp
-                  ]  # , e_var]
-    formatters = [
-        lambda v: f"{v:.1f}" if not np.isnan(v) else "",
-        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
-        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
-        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
-
-    ]
+    # A single-run figure has only ONE density: stats['elj_density'] is then a copy of
+    # stats['density'], so showing it as a second 'LJ' row reports the same number twice under
+    # the wrong name. Paired figures (generate_figs.py) keep both rows.
+    ENERGY_LABELS = {'uma': 'UMA', 'elj': 'LJ', 'lj': 'LJ', 'qlj': 'LJ', 'mace': 'MACE'}
+    ef = stats.get('energy_function')
+    primary = ENERGY_LABELS.get(ef, (ef or 'model').upper())
+    paired = stats.get('paired_density', True)
+    fmt1 = lambda v: f"{v:.1f}" if not np.isnan(v) else ""
+    fmt2 = lambda v: f"{v:.2f}" if not np.isnan(v) else ""
+    # the local density is reported as a PERCENTILE of the model's own draws; stats written before the
+    # percentile keys existed fall back to the normed density
+    has_pct = 'density_pct' in stats
+    row_labels = ["Min Energy (kJ/mol)"]
+    raw_values = [e_min]
+    formatters = [fmt1]
+    if has_pct:
+        # pre-formatted because a below-resolution point prints a bound
+        below = stats['below_resolution']
+        f_pct = stats['density_pct_floor']
+        row_labels.append(f"{'UMA' if paired else primary} density percentile")
+        raw_values.append([f"< {np.ceil(f_pct):.0f}" if b else f"{v:.0f}"
+                           for v, b in zip(stats['density_pct'], below)])
+        formatters.append(str)
+    else:
+        row_labels.append(f"Normed {'UMA' if paired else primary} P(x*)")
+        raw_values.append(p)
+        formatters.append(fmt2)
+    if paired:
+        if 'elj_density_pct' not in stats:
+            row_labels.append("Normed LJ P(x*)")
+            raw_values.append(p2)
+            formatters.append(fmt2)
+        if 'elj_density_pct' in stats:
+            eb, ef_ = stats['elj_below_resolution'], stats['elj_density_pct_floor']
+            row_labels.append("LJ density percentile")
+            raw_values.append([f"< {np.ceil(ef_):.0f}" if b else f"{v:.0f}"
+                               for v, b in zip(stats['elj_density_pct'], eb)])
+            formatters.append(str)
+    # c_p of the table's point x*: a basin's density maximum, or the polymorph itself (not the basin's
+    # lowest-energy sample, whatever the old E_min label said)
+    row_labels.append("c<sub>p</sub>(x*)")
+    raw_values.append(cp)
+    formatters.append(fmt2)
     # Which rows should have the *minimum* bolded vs the *maximum*?
     # For most quantities lower is "best"; for TΔS higher (less negative) is notable.
     bold_min_rows = {0}  # E
-    bold_max_rows = {1}  # P
+    bold_max_rows = set() if has_pct else {1}  # normed P; the percentile rows are pre-formatted strings
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
     heads = polymorph_labels(num_polymorphs, poly_labels)
     for ind in range(num_polymorphs):
@@ -1921,6 +1995,9 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     for i in range(n_basins + num_polymorphs):
         col = []
         for r, (vals, fmt) in enumerate(zip(raw_values, formatters)):
+            if isinstance(vals[i], str):  # pre-formatted row: no min/max bolding
+                col.append(vals[i])
+                continue
             txt = fmt(vals[i])
             is_min = not np.isnan(vals[i]) and vals[i] == np.nanmin(vals)
             is_max = not np.isnan(vals[i]) and vals[i] == np.nanmax(vals)
@@ -1948,16 +2025,16 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
         header=dict(
             values=header_vals,
             align="center",
-            font=dict(size=22, color="black"),
+            font=dict(size=20, color="black"),
             fill_color=header_fill,
-            height=64,
+            height=56,
         ),
         cells=dict(
             values=cell_vals,
             align="center",
-            font=dict(size=18),
+            font=dict(size=16),
             fill_color=fill_colors,
-            height=34,
+            height=28,
         ),
     )])
     table_trace = f2.data[0]
@@ -1972,8 +2049,9 @@ def pes_cartoon():
     base = np.minimum(well_L, well_R) + 0.12 * x ** 2
     rng = np.random.default_rng(42)
 
-    # Place sub-basins with controlled randomness
-    n_sub = 30
+    # Place sub-basins with controlled randomness. 20, down from 30: with only two distributions drawn
+    # over the landscape, 30 wells made the figure read as noise rather than as a rugged PES.
+    n_sub = 20
     centers = rng.uniform(-5.5, 5.5, n_sub)
     depths = -rng.uniform(0.3, 2.5, n_sub)
     widths = rng.uniform(5, 18, n_sub)
@@ -1999,66 +2077,44 @@ def pes_cartoon():
     )
     p_cold /= np.trapz(p_cold, x)
 
-    # 2: correct Boltzmann weights, but only near minima
-    p_local = sum(
-        np.exp(-vm / kT) * np.exp(-0.5 * ((x - xm) / 0.25) ** 2)
-        for xm, vm in zip(local_min_x, local_min_V)
-    )
-    p_local /= np.trapz(p_local, x)
-
-    # 3: full Boltzmann
+    # 2: full Boltzmann -- the equilibrium distribution
     logp = -V / kT
     logp -= logp.max()
     p_full = np.exp(logp)
     p_full /= np.trapz(p_full, x)
 
-    # --- Plot ---
-    # fig = make_subplots(
-    #     rows=2, cols=3,
-    #     row_heights=[0.38, 0.62],
-    #     vertical_spacing=0.06,
-    #     horizontal_spacing=0.07,
-    #     subplot_titles=["Phase 1: Prior Distribution",
-    #                     "Phase 2: Prior Thermalization",
-    #                     "Phase 3: Global Thermalization"],
-    # )
-    fig = make_subplots(rows=2, cols=1,
-                        row_heights=[0.62, 0.38])
-    colors = ["#c44e52", "#dd8452", "#4c72b0"]
+    # --- Plot: one square panel, P(x) drawn over V(x) ---
+    # The distributions live on a hidden secondary axis scaled so the tallest peak reaches the top of the
+    # frame; V keeps the left axis. Only the SHAPE of P matters in a cartoon, and sharing one axis with V
+    # would squash whichever of the two has the smaller range.
+    fig = go.Figure()
+    prior_c, eq_c = "#c44e52", "#4c72b0"
+    rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
-    for col, (p, c) in enumerate(zip([p_cold, p_local, p_full], colors), 1):
-        fig.add_trace(go.Scatter(x=x, y=p + col * 0.25, fill='toself',
-                                 fillcolor=f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},0.25)",
-                                 line=dict(color=c, width=2), showlegend=False), row=1, col=1, )
-        fig.add_trace(go.Scatter(x=x, y=V, line=dict(color="#555", width=2),
-                                 showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=x, y=V, line=dict(color="#555", width=2.5),
+                             name="V(x)", hoverinfo='skip'))
+    # P is drawn on its own axis with the SAME span as V, so the tallest P peak meets the top of V's range
+    for p, c, name in ((p_cold, prior_c, "Prior Distribution"),
+                       (p_full, eq_c, "Equilibrium Distribution")):
+        fig.add_trace(go.Scatter(x=x, y=p / p.max(), fill='tozeroy', fillcolor=rgba(c, 0.30),
+                                 line=dict(color=c, width=2.5), name=name, yaxis='y2'))
 
-    for name, c in zip(["Prior Distribution", "Thermalized Prior", "Equilibrium Distribution"], colors):
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode='lines',
-            line=dict(color=c, width=3),
-            name=name,
-        ))
-    fig.update_layout(legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.05,
-        xanchor="center",
-        x=0.5
-    ), )
-
-    for col in range(1, 4):
-        for row in [1, 2]:
-            fig.update_xaxes(showticklabels=False, row=row, col=col)
-            fig.update_yaxes(showticklabels=False, row=row, col=col)
-
-    fig.update_yaxes(title_text="P(x)", row=1, col=1)
-    fig.update_yaxes(title_text="V(x)", row=2, col=1)
-    fig.update_xaxes(title_text="x ", row=2, col=2)
-    fig.update_layout(  # width=1000, height=550,
+    fig.update_layout(
         template="plotly_white",
-        margin=dict(l=60, r=30, t=50, b=50))
+        width=760, height=760,                      # square
+        xaxis=dict(title_text="x", showticklabels=False, ticks='', zeroline=False, showgrid=False),
+        # the frame ends at V's maximum: no white space above the landscape
+        yaxis=dict(title_text="V(x)", showticklabels=False, ticks='', zeroline=False, showgrid=False,
+                   range=[-0.03 * V.max(), V.max()], title_font=dict(color="#555")),
+        # max P(x) reaches 65% of max V(x): P=1 sits at the same frame fraction as V = 0.65 V.max(), and
+        # P=0 on V's own zero line, so the two curves share a baseline. Titled on the right so which axis
+        # is which is readable off the frame, with the curves themselves named in the legend.
+        yaxis2=dict(overlaying='y', side='right', showticklabels=False, ticks='', showgrid=False,
+                    zeroline=False, range=[-0.03 / 0.65, 1 / 0.65], title_text="P(x)",
+                    title_font=dict(color=eq_c)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        margin=dict(l=60, r=60, t=60, b=50),
+    )
     return fig
 
 
@@ -2264,4 +2320,122 @@ def stacked_kde_histograms(
         template="plotly_white",
         margin=dict(l=60, r=30, t=40, b=50),
     )
+    return fig
+
+
+def render_molecule_image(z, pos, px=600):
+    """Ball-and-stick picture of one molecule as an RGBA PIL image, viewed down its thinnest principal axis.
+
+    z: [n] atomic numbers, pos: [n, 3] Cartesian. Bonds are drawn between atoms closer than 1.2x the sum of
+    their covalent radii."""
+    import io
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    from ase.data import covalent_radii
+    from ase.data.colors import jmol_colors
+    from PIL import Image
+
+    z = np.asarray(z).astype(int)
+    x = np.asarray(pos, dtype=float)
+    x = x - x.mean(0)
+    _, vecs = np.linalg.eigh(x.T @ x)  # ascending: column 0 is the thinnest direction
+    xy = x @ vecs[:, [2, 1]]
+    depth = x @ vecs[:, 0]
+    depth = depth - depth.min()
+    rad = np.array([0.42 if zi == 1 else 0.62 for zi in z]) * 0.62
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=px / 4)
+    cov = covalent_radii[z]
+    for i in range(len(z)):
+        for j in range(i + 1, len(z)):
+            if np.linalg.norm(x[i] - x[j]) < 1.2 * (cov[i] + cov[j]):
+                ax.plot(xy[[i, j], 0], xy[[i, j], 1], color='0.35', lw=5, solid_capstyle='round',
+                        zorder=0.5)  # under every atom
+    for i in np.argsort(depth):
+        c = jmol_colors[z[i]]
+        ax.add_patch(Circle(xy[i], rad[i], facecolor=c, edgecolor='0.2', lw=1.2, zorder=1 + depth[i]))
+        ax.add_patch(Circle(xy[i] + rad[i] * np.array([-0.3, 0.3]), 0.3 * rad[i], facecolor='white', alpha=0.55,
+                            edgecolor='none', zorder=1 + depth[i] + 0.001))
+    pad = 0.6
+    ax.set_xlim(xy[:, 0].min() - pad, xy[:, 0].max() + pad)
+    ax.set_ylim(xy[:, 1].min() - pad, xy[:, 1].max() + pad)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', transparent=True, bbox_inches='tight', pad_inches=0.02)
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert('RGBA')
+
+
+def fused_duo_embedding_fig(panels, callout='EXP'):
+    """LJ-vs-UMA embeddings for several molecules side by side, each panel square.
+
+    panels: list of dicts with 'uma' [n, 2] and 'lj' [m, 2] embeddings, their 'uma_alpha' / 'lj_alpha' point
+    opacities, 'poly' [k, 2] experimental positions, and 'z' / 'pos' of the molecule to draw. Each panel gets a
+    letter, one callout with an arrow to every experimental structure, and the molecule drawn in the emptiest
+    part of a band added above the data."""
+    n = len(panels)
+    fig = make_subplots(rows=1, cols=n, horizontal_spacing=0.06)
+    for k, pan in enumerate(panels):
+        col = k + 1
+        uma, lj, poly = np.asarray(pan['uma']), np.asarray(pan['lj']), np.atleast_2d(pan['poly'])
+        pts = np.concatenate([uma, lj])
+        fig.add_scatter(x=uma[:, 0], y=uma[:, 1], mode='markers', name='UMA', legendgroup='UMA', showlegend=k == 0,
+                        marker=dict(size=5, color=[f'rgba(65,105,225,{a:.3f})' for a in pan['uma_alpha']]),
+                        row=1, col=col)
+        fig.add_scatter(x=lj[:, 0], y=lj[:, 1], mode='markers', name='LJ', legendgroup='LJ', showlegend=k == 0,
+                        marker=dict(size=5, color=[f'rgba(220,20,60,{a:.3f})' for a in pan['lj_alpha']]),
+                        row=1, col=col)
+        fig.add_scatter(x=poly[:, 0], y=poly[:, 1], mode='markers', marker_symbol='x-thin', marker_color='black',
+                        marker_line_color='black', marker_line_width=6, marker_size=22, showlegend=False,
+                        row=1, col=col)
+        lo, hi = pts.min(0), pts.max(0)
+        span = (hi - lo).max()  # one span on both axes: the panel is square in data units too
+        mid = 0.5 * (lo + hi)
+        band = 0.24 * span  # room above the data for the molecule
+        half = 0.54 * span + 0.5 * band
+        x_rng = [mid[0] - half, mid[0] + half]
+        y_rng = [mid[1] + 0.54 * span + band - 2 * half, mid[1] + 0.54 * span + band]
+        fig.update_xaxes(range=x_rng, row=1, col=col)
+        fig.update_yaxes(range=y_rng, row=1, col=col)
+        ax = '' if col == 1 else str(col)
+
+        # molecule: the stretch of the top band with the fewest points under it (the left end holds the letter)
+        size = 0.30 * (x_rng[1] - x_rng[0])
+        cands = np.linspace(x_rng[0] + 0.22 * (x_rng[1] - x_rng[0]), x_rng[1] - size, 12)
+        top = pts[:, 1] > y_rng[1] - size
+        counts = [int((top & (pts[:, 0] > c) & (pts[:, 0] < c + size)).sum()) for c in cands]
+        cx = cands[int(np.argmin(counts))]
+        fig.add_layout_image(source=render_molecule_image(pan['z'], pan['pos']), xref=f'x{ax}', yref=f'y{ax}',
+                             x=cx, y=y_rng[1], sizex=size, sizey=size, xanchor='left', yanchor='top',
+                             sizing='contain', layer='above')
+
+        # callout: the direction from the experimental structures with the fewest points at its tail
+        pc_ = poly.mean(0)
+        best, best_score = None, None
+        for r_frac in (0.16, 0.22):
+            for ang in np.linspace(0, 2 * np.pi, 24, endpoint=False):
+                tail = pc_ + r_frac * span * np.array([np.cos(ang), np.sin(ang)])
+                if not (x_rng[0] + 0.08 * span < tail[0] < x_rng[1] - 0.08 * span
+                        and y_rng[0] + 0.04 * span < tail[1] < y_rng[1] - size):
+                    continue
+                score = int((np.linalg.norm(pts - tail, axis=1) < 0.07 * span).sum())
+                if best_score is None or score < best_score:
+                    best, best_score = tail, score
+        for j, pt in enumerate(poly):
+            fig.add_annotation(x=pt[0], y=pt[1], ax=best[0], ay=best[1], xref=f'x{ax}', yref=f'y{ax}',
+                               axref=f'x{ax}', ayref=f'y{ax}', text=f'<i>{callout}</i>' if j == 0 else '',
+                               showarrow=True, arrowhead=0, arrowwidth=2.5, arrowcolor='black', standoff=14,
+                               font=dict(size=34, color='black'), bgcolor='white' if j == 0 else None)
+        fig.add_annotation(text=f'({chr(97 + k)})', xref=f'x{ax} domain', yref=f'y{ax} domain', x=0.02, y=0.98,
+                           xanchor='left', yanchor='top', showarrow=False, font=dict(size=40, color='black'))
+        fig.update_xaxes(title_text='CV1', row=1, col=col)
+        fig.update_yaxes(title_text='CV2', row=1, col=col)
+    fig.update_xaxes(showgrid=False, showticklabels=False, zeroline=False, title_font_size=40)
+    fig.update_yaxes(showgrid=False, showticklabels=False, zeroline=False, title_font_size=40)
+    fig.update_layout(plot_bgcolor='white', paper_bgcolor='white',
+                      legend=dict(font=dict(size=32), itemsizing='constant', x=0.995, y=0.995, xanchor='right',
+                                  yanchor='top', bgcolor='rgba(255,255,255,0.7)'))
     return fig
