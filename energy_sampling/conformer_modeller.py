@@ -613,7 +613,20 @@ class ConformerModeller(Modeller):
     #: exist in the model block as the FLAT policy's own GFN arguments; popping either
     #: would silently unbuild the flat path.
     _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
-                    'set_policy_corr_dim')
+                    'set_policy_corr_dim', 'backward_policy_kind')
+
+    #: `model.backward_policy_kind`. 'flat' (absent means flat): P_B is the base model's flat
+    #: network over the state encoding, for which a coordinate is its column index. 'set': P_B
+    #: is a second ragged set head of the forward policy's architecture, reading the same
+    #: per-coordinate tokens and molecule. Needs the ragged forward head.
+    _BACKWARD_KINDS = ('flat', 'set')
+
+    def _backward_policy_kind(self, spec) -> str:
+        kind = str(spec.get('backward_policy_kind', 'flat') or 'flat').lower()
+        if kind not in self._BACKWARD_KINDS:
+            raise ValueError(f"model.backward_policy_kind must be one of "
+                             f"{self._BACKWARD_KINDS}, got {spec.get('backward_policy_kind')!r}")
+        return kind
 
     #: the set head's sizes when the config omits them. ONE definition, read by the fresh
     #: build and by the reload check alike, so the two cannot disagree about a default and
@@ -906,7 +919,8 @@ class ConformerModeller(Modeller):
                 'n_static': len(state_feature_names()),
                 'enc_dim': mol_dim // 2, 'mol_dim': int(mol_dim),
                 'frame_size': int(MAX_FRAME), 'norm': None, 'dropout': 0,
-                'carrier': True, 'block_width': self._state_block_width()}
+                'carrier': True, 'block_width': self._state_block_width(),
+                'backward_policy_kind': self._backward_policy_kind(spec)}
 
     @staticmethod
     def _ragged_policy_from_stamp(stamp, angular_mask, t_dim, zero_init: bool = False):
@@ -945,6 +959,10 @@ class ConformerModeller(Modeller):
                     'the set policy needs the width to build its context input')
         if ragged:
             return 'ragged', self._ragged_policy_stamp(spec, mol_dim), mol_dim
+        if self._backward_policy_kind(spec) == 'set':
+            raise NotImplementedError(
+                "model.backward_policy_kind 'set' needs the ragged set head (a carrier state "
+                "or a multi-molecule set): the dense heads bind one molecule's chart")
         sizes = {k: int(spec.get(k, d)) for k, d in self._SET_POLICY_DEFAULTS.items()}
         # the dense heads bind the energy's chart at construction, so there is nothing to
         # rebuild them from; the stamp names them so a reload is refused BY NAME
@@ -991,6 +1009,10 @@ class ConformerModeller(Modeller):
             model = ConformerGFN(**cfg)
             model.forward_policy = self._ragged_policy_from_stamp(
                 stamp, cfg['angular_mask'], cfg['t_dim'])
+            # a stamp written before the key existed holds the flat backward policy
+            if stamp.get('backward_policy_kind', 'flat') == 'set':
+                model.backward_policy = self._ragged_policy_from_stamp(
+                    stamp, cfg['angular_mask'], cfg['t_dim'])
             model._carrier = True
             return model
         raise NotImplementedError(
@@ -1309,6 +1331,14 @@ class ConformerModeller(Modeller):
         else:
             policy = set_policy_for(self.energy_function, t_dim, **common).to(self.device)
         self.gfn_model.forward_policy = policy
+        pb_set = stamp.get('backward_policy_kind', 'flat') == 'set'
+        if pb_set:
+            # THE SAME ARCHITECTURE AND INPUTS AS THE FORWARD HEAD, its own weights. Its two
+            # outputs per coordinate are P_B's corrections to the reference bridge
+            # (GFN.fwd_get_back_correction); ConformerGFN._pb_net calls it
+            self.gfn_model.backward_policy = self._ragged_policy_from_stamp(
+                stamp, self.energy_function.periodic_dims, t_dim,
+                zero_init=zero_init).to(self.device)
 
         conditional = mol_dim is not None
         if conditional:
@@ -1341,6 +1371,11 @@ class ConformerModeller(Modeller):
         if conditional:
             print(f"        f_j is LEARNED from per-atom embeddings (DoFCorrelator); the "
                   f"pooled {mol_dim}-d molecular embedding joins rho's context")
+        print("backward policy: " + (
+            "SET head of the same architecture and inputs as the forward one, own weights"
+            if pb_set else
+            "FLAT network over the state encoding (a coordinate is its column index); "
+            "model.backward_policy_kind: set gives it the forward policy's tokens"))
 
     def _flat_on_carrier(self):
         """A flat policy on the carrier: refuse DPLR, then re-class both copies.
@@ -1397,6 +1432,8 @@ class ConformerModeller(Modeller):
         _, expected, _ = self._set_policy_plan(spec)
         for field, want in expected.items():
             got = stored.get(field, '<absent>')
+            if field == 'backward_policy_kind' and got == '<absent>':
+                got = 'flat'                     # written before the key existed
             if got != want:
                 raise ValueError(
                     f"set policy field {field!r}: the checkpoint was built with {got!r}, "

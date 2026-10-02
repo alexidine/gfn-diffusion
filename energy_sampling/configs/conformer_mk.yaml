@@ -349,6 +349,7 @@ model:
   # (ConformerModeller._SET_POLICY_KEYS) and stamped into gfn_config['conformer'], which
   # the checkpointer rebuilds the head from.
   policy_kind: set             # 'flat' | 'set'. On a carrier or multi-molecule set, 'set' builds RaggedConditionalSetPolicy: tokens over each row's valid columns, conditioned on the molecule embedding
+  backward_policy_kind: set    # 'flat' | 'set'. flat: P_B is the flat network over the state encoding (a coordinate is its carrier column). set: P_B is a second RaggedConditionalSetPolicy of the forward head's sizes, on the raw state, the time embedding and the molecule (ConformerGFN._pb_net); needs the ragged forward head. Stored in the checkpoint's conformer block; absent there or here means flat
   set_policy_hidden: 128       # per-token width
   set_policy_layers: 4         # token-mixing layers
   set_policy_corr_dim: 32      # width of the learned per-column correlation features
