@@ -1,0 +1,36 @@
+device: cuda
+mol_path: /scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+dataset_path: /scratch/mk8347/data/crystal_datasets/pooled_oct02/mipcas_elj/starts.pt
+target_path: null
+out_dir: /scratch/mk8347/data/crystal_datasets/pooled_oct02/mipcas_elj/polish/runs
+run_name: polish_TASK
+target_identifier: null
+save_trajs: false
+uma_predictor_path: /scratch/mk8347/models/uma/esen_s.pt
+init_sample_method: data
+force_restart_run: false
+mol_seed: 0
+opt_seed: 7000000
+sampling_mode: all
+mols_to_sample: 1
+num_samples: 10070
+batch_size: 2000
+grow_batch_size: true
+opt:
+- optim_target: elj
+  enforce_reduced: false
+  compression_factor: 0.0
+  cutoff: 10
+  init_lr: 0.001
+  convergence_eps: 1.0e-06
+  optimizer_func: rprop
+  anneal_lr: true
+  grad_norm_clip: 0.1
+  show_tqdm: false
+  max_num_steps: 500
+  target_packing_coeff: null
+  centroid_boundary: wrap
+oom_ceiling: true
+coord_dir: /scratch/mk8347/data/crystal_datasets/pooled_oct02/mipcas_elj/polish
+coord_stream: polish
+coord_curate_every_s: null

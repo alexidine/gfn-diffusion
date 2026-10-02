@@ -1,0 +1,7 @@
+task	name	sub	n_sub	num_samples	n_starts	sg	key	tsf	mol
+0	mipcas_elj	0	2	10070	20139	2	elj	0.3635836825309169	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+1	mipcas_elj	1	2	10070	20139	2	elj	0.3635836825309169	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+2	mipcas_uma	0	4	1906	7624	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+3	mipcas_uma	1	4	1906	7624	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+4	mipcas_uma	2	4	1906	7624	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
+5	mipcas_uma	3	4	1906	7624	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt
