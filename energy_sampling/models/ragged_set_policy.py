@@ -147,6 +147,75 @@ class RaggedSetPolicy(nn.Module):
         return self.rho(torch.cat([h, ctx], dim=-1))                    # [sum_k, K]
 
 
+# ------------------------------------------------------------------ token mixing
+
+#: relation buckets between two coordinates of one molecule: the number of defining atoms
+#: they share (0..MAX_FRAME), and one bucket for a coordinate with itself
+N_SHARED_BUCKETS = 4 + 1
+
+
+def shared_atom_relation(dof_atoms: torch.Tensor) -> torch.Tensor:
+    """``[B, K, K]`` long: how many DISTINCT defining atoms coordinates i and j share, with
+    the diagonal set to ``N_SHARED_BUCKETS`` (a coordinate with itself).
+
+    ``dof_atoms`` is ``[B, K, R, F]`` (`ConformerGFN.bind_molecular_conditioning`): each
+    coordinate's frame atoms, a 2- or 3-atom frame repeating its last atom, so a repeated atom
+    is counted once. Only the first collective row is read (R is 1 at `full`). Two adjacent
+    ring dihedrals or two siblings on one bond share 3, a bond and the angle holding it 2,
+    unrelated coordinates 0. Pad columns get a value too; the attention masks them.
+    """
+    a = dof_atoms[:, :, 0, :]                                         # [B, K, F]
+    f = a.shape[-1]
+    # a frame position repeating an earlier one is not a new atom
+    earlier = torch.zeros_like(a, dtype=torch.bool)
+    for p in range(1, f):
+        earlier[..., p] = (a[..., p:p + 1] == a[..., :p]).any(-1)
+    eq = a[:, :, None, :, None] == a[:, None, :, None, :]               # [B, K, K, F, F]
+    shared = (eq.any(-1) & ~earlier[:, :, None, :]).sum(-1)           # [B, K, K]
+    k = a.shape[1]
+    eye = torch.eye(k, dtype=torch.bool, device=a.device)
+    return shared.masked_fill(eye, N_SHARED_BUCKETS).long()
+
+
+class TokenMixer(nn.Module):
+    """Attention among one molecule's coordinate tokens, biased by how related they are.
+
+    Pre-norm residual block: attention over the row's VALID tokens, with a learned bias per
+    head and per relation bucket (`shared_atom_relation`), then a two-layer MLP. Both output
+    projections start at zero, so a freshly built mixer is the identity and the head starts
+    as the unmixed one. Pads are never attended to and their output is discarded.
+    """
+
+    def __init__(self, hidden: int, heads: int = 4):
+        super().__init__()
+        if hidden % heads:
+            raise ValueError(f'hidden width {hidden} is not divisible by {heads} heads')
+        self.heads, self.d = int(heads), hidden // int(heads)
+        self.norm1, self.norm2 = nn.LayerNorm(hidden), nn.LayerNorm(hidden)
+        self.qkv = nn.Linear(hidden, 3 * hidden)
+        self.out = nn.Linear(hidden, hidden)
+        self.rel_bias = nn.Embedding(N_SHARED_BUCKETS + 1, self.heads)
+        self.mlp = nn.Sequential(nn.Linear(hidden, 2 * hidden), nn.SiLU(),
+                                 nn.Linear(2 * hidden, hidden))
+        for layer in (self.out, self.mlp[-1]):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.rel_bias.weight)
+
+    def forward(self, h: torch.Tensor, valid: torch.Tensor, rel: torch.Tensor):
+        """``h`` ``[B, K, H]`` dense tokens, ``valid`` ``[B, K]`` bool, ``rel`` ``[B, K, K]``."""
+        b, k, _ = h.shape
+        q, kk, v = self.qkv(self.norm1(h)).reshape(b, k, 3, self.heads, self.d).unbind(2)
+        logits = torch.einsum('bihd,bjhd->bhij', q, kk) / self.d ** 0.5
+        logits = logits + self.rel_bias(rel).permute(0, 3, 1, 2)
+        logits = logits.masked_fill(~valid[:, None, None, :], float('-inf'))
+        w = torch.softmax(logits, dim=-1)
+        w = torch.nan_to_num(w) * valid[:, None, :, None]                # a pad row attends to nothing
+        mixed = torch.einsum('bhij,bjhd->bihd', w, v).reshape(b, k, -1)
+        h = h + self.out(mixed)
+        return h + self.mlp(self.norm2(h))
+
+
 # ------------------------------------------------------------------ conditional, on a carrier
 
 class RaggedConditionalSetPolicy(RaggedSetPolicy):
@@ -170,7 +239,8 @@ class RaggedConditionalSetPolicy(RaggedSetPolicy):
     def __init__(self, n_static: int, angular_mask, t_dim: int, enc_dim: int, mol_dim: int,
                  corr_dim: int = 32, frame_size: int = 4, hidden_dim: int = 64,
                  layers: int = 4, out_per_token: int = 2, dropout: Optional[float] = 0,
-                 norm: Optional[str] = None, zero_init: bool = False, device=None):
+                 norm: Optional[str] = None, zero_init: bool = False, device=None,
+                 mix_layers: int = 0, mix_heads: int = 4):
         super().__init__(n_static, t_dim, hidden_dim=hidden_dim, layers=layers,
                          out_per_token=out_per_token, dropout=dropout, norm=norm,
                          zero_init=False)
@@ -186,6 +256,12 @@ class RaggedConditionalSetPolicy(RaggedSetPolicy):
         self.rho = scalarMLP(layers=layers, input_dim=3 * hidden_dim + t_dim + self.mol_dim,
                              filters=hidden_dim, output_dim=self.out_per_token,
                              dropout=dropout, norm=norm)
+        #: attention among a molecule's tokens before pooling (TokenMixer); 0 = none, the
+        #: head as it was. Each token then sees the others' current values with their relation
+        #: to it, not only through the molecule-wide pooled sums.
+        self.mix_layers, self.mix_heads = int(mix_layers), int(mix_heads)
+        self.mixers = nn.ModuleList([TokenMixer(hidden_dim, self.mix_heads)
+                                     for _ in range(self.mix_layers)])
         if zero_init:
             self.rho.output_layer.weight.data.fill_(0.0)
         if device is not None:
@@ -193,7 +269,7 @@ class RaggedConditionalSetPolicy(RaggedSetPolicy):
 
     def forward(self, state, t_emb, atom_emb=None, dof_atoms=None, dof_mask=None,
                 mol_emb=None, state_mask=None, dof_static=None, flat_idx=None,
-                dof_batch=None):
+                dof_batch=None, token_rel=None):
         if any(v is None for v in (atom_emb, dof_atoms, mol_emb, flat_idx, dof_batch,
                                    dof_static)):
             raise ValueError('RaggedConditionalSetPolicy needs the carrier bindings '
@@ -208,6 +284,17 @@ class RaggedConditionalSetPolicy(RaggedSetPolicy):
                             dof_atoms.reshape(B * K, *dof_atoms.shape[-2:]).index_select(0, flat_idx),
                             dof_mask.reshape(B * K, -1).index_select(0, flat_idx).bool())
         h = self.phi(torch.cat([self.tokens(s, st, ang), f], dim=-1))            # [n, H]
+        if self.mix_layers:
+            if state_mask is None:
+                raise ValueError('token mixing needs state_mask to know each row\'s tokens')
+            if token_rel is None:
+                token_rel = shared_atom_relation(dof_atoms.reshape(B, K, *dof_atoms.shape[-2:]))
+            valid = state_mask.reshape(B, K).bool()
+            dense = h.new_zeros(B * K, h.shape[-1]).index_copy(0, flat_idx, h)
+            dense = dense.reshape(B, K, -1)
+            for mixer in self.mixers:
+                dense = mixer(dense, valid, token_rel)
+            h = dense.reshape(B * K, -1).index_select(0, flat_idx)
         a = segment_softmax(self.score(h).reshape(-1), dof_batch, B).unsqueeze(-1)
         pooled = torch.cat([segment_sum(a * h, dof_batch, B),
                             segment_sum(h, dof_batch, B)], dim=-1)               # [B, 2H]

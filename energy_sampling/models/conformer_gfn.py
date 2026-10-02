@@ -204,6 +204,11 @@ class ConformerGFN(GFN):
                 'flat_idx': flat,
                 'dof_batch': torch.div(flat, k, rounding_mode='floor'),
             })
+            if any(getattr(p, 'mix_layers', 0) for p in (self.forward_policy,
+                                                          self.backward_policy)):
+                # fixed for the trajectory, like the index vectors: computed once, not per step
+                from models.ragged_set_policy import shared_atom_relation
+                self._mol_cond['token_rel'] = shared_atom_relation(self._mol_cond['dof_atoms'])
 
     def _bind_state_mask(self, mol_batch) -> None:
         """Per-row carrier validity ``[B, K]``, or None on a non-carrier batch."""

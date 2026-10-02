@@ -353,6 +353,8 @@ model:
   set_policy_hidden: 128       # per-token width
   set_policy_layers: 4         # token-mixing layers
   set_policy_corr_dim: 32      # width of the learned per-column correlation features
+  set_policy_mix_layers: 2      # attention blocks among one molecule's coordinate tokens before pooling (models/ragged_set_policy.py::TokenMixer), biased per head by how many defining atoms two coordinates share; output projections start at zero, so a fresh block is the identity. 0 = none. Both policies. Stored in the checkpoint's conformer block; absent there means 0
+  set_policy_mix_heads: 4       # attention heads per mixing block; must divide set_policy_hidden
 
 # training params
 ################################################################

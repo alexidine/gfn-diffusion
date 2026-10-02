@@ -613,7 +613,12 @@ class ConformerModeller(Modeller):
     #: exist in the model block as the FLAT policy's own GFN arguments; popping either
     #: would silently unbuild the flat path.
     _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
-                    'set_policy_corr_dim', 'backward_policy_kind')
+                    'set_policy_corr_dim', 'backward_policy_kind', 'set_policy_mix_layers',
+                    'set_policy_mix_heads')
+
+    #: stamp fields added after checkpoints already existed, and what their absence means
+    _STAMP_ABSENT = {'backward_policy_kind': 'flat', 'set_policy_mix_layers': 0,
+                     'set_policy_mix_heads': 4}
 
     #: `model.backward_policy_kind`. 'flat' (absent means flat): P_B is the base model's flat
     #: network over the state encoding, for which a coordinate is its column index. 'set': P_B
@@ -920,7 +925,10 @@ class ConformerModeller(Modeller):
                 'enc_dim': mol_dim // 2, 'mol_dim': int(mol_dim),
                 'frame_size': int(MAX_FRAME), 'norm': None, 'dropout': 0,
                 'carrier': True, 'block_width': self._state_block_width(),
-                'backward_policy_kind': self._backward_policy_kind(spec)}
+                'backward_policy_kind': self._backward_policy_kind(spec),
+                # attention among a molecule's coordinate tokens (TokenMixer); 0 = none
+                'set_policy_mix_layers': int(spec.get('set_policy_mix_layers', 0) or 0),
+                'set_policy_mix_heads': int(spec.get('set_policy_mix_heads', 4) or 4)}
 
     @staticmethod
     def _ragged_policy_from_stamp(stamp, angular_mask, t_dim, zero_init: bool = False):
@@ -934,7 +942,9 @@ class ConformerModeller(Modeller):
             corr_dim=int(stamp['set_policy_corr_dim']), frame_size=int(stamp['frame_size']),
             hidden_dim=int(stamp['set_policy_hidden']),
             layers=int(stamp['set_policy_layers']), out_per_token=2,
-            dropout=stamp['dropout'], norm=stamp['norm'], zero_init=bool(zero_init))
+            dropout=stamp['dropout'], norm=stamp['norm'], zero_init=bool(zero_init),
+            mix_layers=int(stamp.get('set_policy_mix_layers', 0)),
+            mix_heads=int(stamp.get('set_policy_mix_heads', 4)))
 
     def _set_policy_plan(self, spec):
         """`(head, stamp, mol_dim)` for a `policy_kind: set` config against THIS energy.
@@ -1432,8 +1442,8 @@ class ConformerModeller(Modeller):
         _, expected, _ = self._set_policy_plan(spec)
         for field, want in expected.items():
             got = stored.get(field, '<absent>')
-            if field == 'backward_policy_kind' and got == '<absent>':
-                got = 'flat'                     # written before the key existed
+            if got == '<absent>' and field in self._STAMP_ABSENT:
+                got = self._STAMP_ABSENT[field]  # written before the key existed
             if got != want:
                 raise ValueError(
                     f"set policy field {field!r}: the checkpoint was built with {got!r}, "
