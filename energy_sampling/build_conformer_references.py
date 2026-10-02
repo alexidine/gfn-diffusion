@@ -1159,7 +1159,13 @@ def load_references(path, *, conditions_path, energy_kwargs,
                         f'table was built from {stamp["conditions"]["path"]} with '
                         f'{stamp["conditions"]["sha256"][:16]}...')
     want = defining_energy(member_kwargs(energy_kwargs))
-    have = stamp['energy']
+    # AN ARGUMENT THE STAMP DOES NOT NAME TAKES ITS CODE DEFAULT, the rule `defining_energy`
+    # applies to a config: a table stamped before an argument existed was built under what is
+    # now that argument's default (`double_bond_box_deg`, None), not under "absent".
+    have = dict(stamp['energy'])
+    for name, p in _ct_parameters().items():
+        if name in want and name not in have and p.default is not inspect.Parameter.empty:
+            have[name] = _plain(p.default)
     for k in sorted(set(want) | set(have)):
         if want.get(k, '<absent>') != have.get(k, '<absent>'):
             problems.append(f'energy {k}: run has {want.get(k, "<absent>")!r}, table has '

@@ -202,7 +202,8 @@ def descend(en, x0, steps, lr=None, optimizer='rprop'):
     PHI WRAPS, THE BOX CLAMPS. After each step every column `en.periodic_dims` marks is
     wrapped onto [-1, 1), one full turn about its reference, and every other column is
     clamped into [-1, 1], so a torsion can descend through ph0 +/- pi while r and theta stay
-    in the box. `en` must declare `periodic_dims`.
+    in the box. A bounded double-bond dihedral (`double_bond_box_deg`) is not periodic and is
+    clamped with them. `en` must declare `periodic_dims`.
     """
     if lr is None:
         lr = 0.02 if optimizer == 'rprop' else 0.05

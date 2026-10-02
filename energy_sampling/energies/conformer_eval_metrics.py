@@ -323,9 +323,14 @@ def thermal_stats(en, energies, e_min: float, prefix: str = 'E/') -> dict:
 def _dof_class_columns(en):
     """State columns per DoF class, as ``{class_name: index array}``."""
     block = _host(en._free_block)
-    return {'r': np.flatnonzero(block == 0),
-            'theta': np.flatnonzero(block == 1),
-            'phi': np.flatnonzero(block == 2)}
+    out = {'r': np.flatnonzero(block == 0),
+           'theta': np.flatnonzero(block == 1),
+           'phi': np.flatnonzero(block == 2)}
+    # a bounded double-bond dihedral (block 4) is its own class, present only on a chart
+    # that has one, so every other chart's key set is unchanged
+    if (block == 4).any():
+        out['double_bond'] = np.flatnonzero(block == 4)
+    return out
 
 
 def geometry_stats(en, x, prefix: str = 'geom/') -> dict:
@@ -497,7 +502,9 @@ def dof_element_stats(en, x, reference=None, prefix: str = 'dof_elem/') -> dict:
     out = {}
     # 'transverse' groups a linear bend's u and v by the element of its vertex; it appears
     # only on a molecule that has one, so every other molecule's key set is unchanged
-    for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi'), (3, 'transverse')):
+    # 'double_bond' likewise groups the bounded dihedrals of locked double bonds (block 4)
+    for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi'), (3, 'transverse'),
+                       (4, 'double_bond')):
         for zval in np.unique(owner):
             idx = np.flatnonzero((block == cls) & (owner == zval))
             if idx.size == 0:

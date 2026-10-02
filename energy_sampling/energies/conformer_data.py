@@ -399,7 +399,9 @@ def condition_from_energy(energy, identifier: Optional[str] = None,
     # frozen reference and cannot leave the domain.
     mol.ctree_r_floor = torch.tensor([float(energy.r_floor)], dtype=dtype)
     mol.ctree_theta_floor = torch.tensor([float(energy.theta_floor)], dtype=dtype)
-    mol.ctree_clamp = torch.tensor([bool(energy._lin_free_idx.numel())])
+    # `_rtheta_free`, not "a walled column exists": a bounded double-bond dihedral (block 4)
+    # is walled but moves no r or theta, so at `dihedral` it must not switch the clamp on.
+    mol.ctree_clamp = torch.tensor([bool(energy._rtheta_free)])
 
     closure, closure_r0 = _closure_fields(spec, mol.pos, n)
     mol.ctree_closure = closure
@@ -529,7 +531,8 @@ def _dof_state_map(energy):
     where the energy drives 39.
 
     The authority is `energy._M` (which columns actually survive at this level) with
-    `energy._free_scale` (0.3 A for r, 0.5 rad for theta, pi for phi) -- NOT `mask`, and NOT a
+    `energy._free_scale` (0.3 A for r, 0.5 rad for theta, pi for phi, the box half-width for a
+    bounded double-bond dihedral) -- NOT `mask`, and NOT a
     hardcoded pi. `_M` is a 0/1 selection with at most one column per row, already asserted
     below, so a per-row `(column, scale)` pair is a complete description at EVERY tier; no dense
     matrix is needed and nothing here is torsion-specific.

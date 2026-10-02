@@ -308,6 +308,15 @@ class ConformerTorsions(BaseSet):
                  # changes: the table is still built (condition graphs and the per-coordinate
                  # features carry it), but no term is added and nothing is refused.
                  stereo_coeff: float = 0.0,
+                 # THE BOX OF A LOCKED DOUBLE BOND'S DIHEDRAL, in degrees. None (the default)
+                 # leaves every column as it was: a phi column is periodic, one full turn
+                 # about its reference. A value W in (0, 90) makes each state column driving a
+                 # PROPER dihedral row about a double bond the stereo lock holds a BOUNDED
+                 # column instead -- reference +/- W degrees at x = +/-1, no wrap, the box
+                 # wall outside (block code 4; see the block-4 note below). Needs the lock
+                 # (stereo_coeff > 0): without it no double bond is held and the box would
+                 # cut a free rotor's support, so the pair is refused.
+                 double_bond_box_deg: Optional[float] = None,
                  # A STORED REFERENCE CONFORMER, [N, 3] Angstrom in the atom order of
                  # Chem.AddHs(Chem.MolFromSmiles(smiles)). None (the default) embeds one:
                  # seeded ETKDGv3, then MMFF94 relaxation when mmff_reference. Given, it IS the
@@ -544,6 +553,24 @@ class ConformerTorsions(BaseSet):
         # a condition graph and the per-coordinate features are the same object either way.
         self.stereo_coeff = stereo_coeff             # validated by the property's setter
         self._init_stereo(smiles, slot, pos_np, level)
+        if double_bond_box_deg is not None:
+            _w = float(double_bond_box_deg)
+            if not (np.isfinite(_w) and 0.0 < _w < 90.0):
+                raise ValueError(
+                    f'double_bond_box_deg must lie in (0, 90) degrees, got '
+                    f'{double_bond_box_deg!r}: at 90 and beyond the box reaches the plane '
+                    f'that separates E from Z, so the other isomer is inside it')
+            if self.stereo_coeff <= 0.0:
+                raise ValueError(
+                    f'double_bond_box_deg {_w:g} with stereo_coeff 0: the box bounds the '
+                    f'dihedrals about the double bonds the stereo lock holds, and with the '
+                    f'lock off none is held. Refused for every molecule, with or without a '
+                    f'double bond, so a set fails on its first member. Set stereo_coeff > 0 '
+                    f'or leave double_bond_box_deg unset.')
+            double_bond_box_deg = _w
+        #: half-width, in degrees, of the bounded column of a locked double bond's dihedral;
+        #: None = those columns are ordinary periodic phi columns
+        self.double_bond_box_deg = double_bond_box_deg
         self.rotatable_cols = (np.argmax(mask_np, axis=0).astype(np.int64)
                                if mask_np.shape[1] else np.zeros(0, dtype=np.int64))
 
@@ -694,6 +721,30 @@ class ConformerTorsions(BaseSet):
             block[self.n_r + self.n_th + partner[_tv_rows]] = 3
             col_block = block[sel]
 
+        # BLOCK 4 = the BOUNDED dihedral of a LOCKED DOUBLE BOND (double_bond_box_deg). The
+        # rows are the ones `held_phi_rows` adds to the improper rows: proper dihedrals whose
+        # central bond the stereo lock holds. Every other stage already keeps such a row in
+        # its isomer's basin (the prior rattles it about the reference, the lock prices the
+        # other side); with the box the state column does too. A distinct code for the
+        # reasons block 3 has one: unlike phi the column does NOT wrap (`periodic_dims`
+        # reads `block == 2`) and takes the box wall (`_lin_free_idx` reads `block != 2`),
+        # and unlike theta its row is a dihedral -- never clamped, measured on the circle
+        # (`state_from_dof`), scaled by the box half-width rather than delta_theta_max. An
+        # improper row about the same bond is an angle between two substituents and keeps
+        # code 2, as does a row that is already a transverse v. Not at `torsion`: its
+        # columns are collective, and the lock refuses one that turns a locked double bond
+        # (stereo_torsion_double_bond), so none drives such a row there.
+        #: per TORSION ROW: a proper dihedral about a locked double bond, carried bounded
+        self.double_bond_rows = np.zeros(self.n_ph, dtype=bool)
+        if self.double_bond_box_deg is not None and level != 'torsion':
+            _db = np.array(sorted(set(self.held_phi_rows()) - set(self.improper_phi_rows())),
+                           dtype=np.int64)
+            _db = _db[block[self.n_r + self.n_th + _db] == 2]
+            if _db.size:
+                self.double_bond_rows[_db] = True
+                block[self.n_r + self.n_th + _db] = 4
+                col_block = block[sel]
+
         # A DoF sitting on a parameterisation singularity is HELD, not driven: log sin
         # theta diverges as theta -> pi and the dependent dihedral frame is undefined
         # there. Zeroing the ROW (not dropping the column) is what makes this uniform
@@ -803,8 +854,11 @@ class ConformerTorsions(BaseSet):
 
         #: per STATE COLUMN: 0=r 1=th 2=phi 3=TRANSVERSE (a (u, v) component of a linear
         #: bend -- non-periodic like r/theta, unclamped like neither; see the block-3 note)
+        #: 4=the BOUNDED dihedral of a locked double bond (the block-4 note)
         self._free_block = col_block
         self.free_mask = m_full.any(axis=1)                # per DoF ROW: is it driven
+        # a double-bond row held on a collinear frame lost its column above: not carried
+        self.double_bond_rows &= self.free_mask[self.n_r + self.n_th:]
 
         # A COLLECTIVE column drives more than one DoF row (a `torsion` column rotates a
         # whole bond). The state -> DoF map is then not invertible row-wise, so
@@ -820,8 +874,10 @@ class ConformerTorsions(BaseSet):
         self._M = torch.as_tensor(m_full[self.free_mask], dtype=dtype, device=self.device)
 
         scale = np.select(
-            [col_block == 0, col_block == 1, col_block == 3],
-            [float(delta_r_max), float(delta_theta_max), float(delta_theta_max)],
+            [col_block == 0, col_block == 1, col_block == 3, col_block == 4],
+            [float(delta_r_max), float(delta_theta_max), float(delta_theta_max),
+             (np.pi if self.double_bond_box_deg is None
+              else float(np.deg2rad(self.double_bond_box_deg)))],
             default=np.pi)
 
         # THE REFERENCE IN CHART UNITS. A transverse row's stored reference is (u0, v0), not
@@ -892,9 +948,18 @@ class ConformerTorsions(BaseSet):
         self._free_scale = torch.as_tensor(scale, dtype=dtype, device=self.device)
         # indexes the STATE, not the DoF vector: the box wall applies to the non-periodic
         # blocks only. Empty at `torsion` and `dihedral`, which is what keeps those levels
-        # bitwise identical to the pre-ladder code.
+        # bitwise identical to the pre-ladder code -- unless a locked double bond's dihedral
+        # is bounded (block 4), which is a walled column at `dihedral` too.
         self._lin_free_idx = torch.as_tensor(np.flatnonzero(col_block != 2),
                                              dtype=torch.long, device=self.device)
+        #: an r, theta or transverse column is free: the r/theta domain clamp applies and
+        #: log J moves with the state. Equal to "`_lin_free_idx` is non-empty" on every
+        #: chart without a block-4 column; a block-4 column is walled but is a dihedral, so
+        #: it switches on neither.
+        self._rtheta_free = bool(np.isin(col_block, (0, 1, 3)).any())
+        #: STATE COLUMNS that are bounded double-bond dihedrals (block 4); empty without
+        self._db_cols = torch.as_tensor(np.flatnonzero(col_block == 4), dtype=torch.long,
+                                        device=self.device)
         #: per ANGLE ROW, for `build` / `log_jacobian` / the theta clamp. None when no row
         #: is transverse, which keeps every molecule without a linear centre on exactly the
         #: code path it was on before.
@@ -1024,7 +1089,7 @@ class ConformerTorsions(BaseSet):
         _pr, _pth, _pph = self.dof_from_state(_probe)
         self.log_jacobian_const = (
             float(self._log_jac(_tree, _pr, _pth, _pph, 1).item())
-            if self._lin_free_idx.numel() == 0 else None)
+            if not self._rtheta_free else None)
 
         # THE CHART VOLUME ELEMENT, log|dq/dx|. The sampler proposes x on [-1, 1]^d, but
         # the Boltzmann density lives on the internal coordinates q -- and dof_from_state
@@ -1249,6 +1314,7 @@ class ConformerTorsions(BaseSet):
         z = np.asarray(self.spec.z)
         name = lambda i: f"{sym.GetElementSymbol(int(z[i]))}{i}"
         n_free = [int((self._free_block == b).sum()) for b in (0, 1, 2, 3)]
+        n_db = int((self._free_block == 4).sum())
         lines = [f"{self.smiles}: {self.spec.n_atoms} atoms, {self.spec.n_dof} internal DoF",
                  f"   level {self.level!r}: {self.data_ndim} free "
                  f"(r {n_free[0]}/{self.n_r}, theta {n_free[1]}/{self.n_th}, "
@@ -1272,6 +1338,12 @@ class ConformerTorsions(BaseSet):
                 f"collinear real atom; min frame-angle sine over the box "
                 f"{self.dummy_frame_min_sin:.3f}. "
                 f"{int(np.asarray(self.held_frame_rows).sum())} collinear frame(s) held.")
+        if getattr(self, 'double_bond_box_deg', None) is not None:
+            lines.append(
+                f"   DOUBLE-BOND BOX: {n_db} column(s) drive a proper dihedral about a locked "
+                f"double bond, each BOUNDED to its reference +/-{self.double_bond_box_deg:g} "
+                f"deg (non-periodic, box wall {self.bounding_coeff}); they are not among the "
+                f"phi columns counted above")
         if getattr(self.spec, 'root_moved_from', -1) >= 0:
             lines.append(f"   ROOT moved off the sp carbon the default rule picks (input atom "
                          f"{self.spec.root_moved_from}); see topology.choose_root")
@@ -1420,7 +1492,7 @@ class ConformerTorsions(BaseSet):
         r = dof[:, :self.n_r]
         th = dof[:, self.n_r:self.n_r + self.n_th]
         ph = dof[:, self.n_r + self.n_th:]
-        if self._lin_free_idx.numel():
+        if self._rtheta_free:
             # only pay for the clamp where a linear block is actually free; at `torsion`
             # and `dihedral` r and th are the frozen reference and cannot leave the domain
             r = r.clamp_min(self.r_floor)
@@ -1635,6 +1707,16 @@ class ConformerTorsions(BaseSet):
         sel = self._sel_rows
         x = ((dof.index_select(1, sel) - self._ref_dof.index_select(0, sel).unsqueeze(0))
              / self._free_scale)
+        if self._db_cols.numel():
+            # A BOUNDED double-bond column is a dihedral: its displacement is taken on the
+            # circle, in (-pi, pi], BEFORE the division -- a measured phi and its reference
+            # can sit either side of the +/-pi seam (a trans bond's reference is near pi).
+            # The column itself does not wrap: |x| > 1 is outside its box.
+            delta = (dof.index_select(1, sel.index_select(0, self._db_cols))
+                     - self._ref_dof.index_select(0, sel.index_select(0, self._db_cols)))
+            delta = np.pi - (np.pi - delta) % (2.0 * np.pi)
+            x = x.index_copy(1, self._db_cols,
+                             delta / self._free_scale.index_select(0, self._db_cols))
         # phi columns are deltas on a circle: wrap, so a draw near the seam comes back as
         # a small latent instead of a large one the wall would then fight
         is_phi = torch.as_tensor(self._free_block == 2, dtype=torch.bool, device=x.device)
@@ -2626,6 +2708,11 @@ class ConformerTorsions(BaseSet):
             # clip rate that mixed the two would not say which box was too narrow.
             'transverse': float(outside[:, self._free_block == 3].to(self.dtype).mean()) if (self._free_block == 3).any() else 0.0,
         }
+        if (self._free_block == 4).any():
+            # a bounded double-bond column is walled too; its own key, present only on a
+            # chart that has one
+            stats['clip_frac']['double_bond'] = float(
+                outside[:, self._free_block == 4].to(self.dtype).mean())
         x = x.clamp(-1.0, 1.0)
 
         # CLOSURE MONITOR. Ring closure is the one constraint the state cannot express --
@@ -2872,7 +2959,8 @@ class ConformerTorsions(BaseSet):
 
     @property
     def periodic_dims(self):
-        """Which state dims live on a circle: the phi block, and only it.
+        """Which state dims live on a circle: the phi block, and only it. A bounded
+        double-bond dihedral (block 4, `double_bond_box_deg`) is not in it: it has a box.
 
         The base GFN infers this from `is_crystal`, which conflates "not a crystal" with
         "not periodic" and hands a non-crystal state ZERO wrapped dims -- silently, since

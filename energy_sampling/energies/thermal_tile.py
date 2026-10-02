@@ -37,7 +37,9 @@ the force field states outright for that coordinate alone:
     components. MMFF's linear form 2k (1 + cos theta) is k rho^2 + O(rho^4) in rho = pi -
     theta, and rho^2 = u^2 + v^2, so each component has variance kT / 2k.
   - a HELD phi row (an improper, or a locked double bond: ``held_phi_rows``):
-    ``improper_phi_sigma(T)``, the width ``sample_prior_states`` holds it at.
+    ``improper_phi_sigma(T)``, the width ``sample_prior_states`` holds it at. In state units
+    it is divided by the column's own scale like every width here: pi, or the box half-width
+    when the double bond's dihedral is bounded (``double_bond_box_deg``).
   - a FOLLOWER phi row: ``sibling_jitter_sigma``, the width of the redundant angle between
     siblings.
 

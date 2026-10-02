@@ -55,7 +55,9 @@ THE FLIP (`reflect_phi`), on the phi block in radians, by the centre's place in 
 Every atom below a flipped child, and every atom placed on a frame that holds one, moves with
 it as a rigid body turning about an axis through c (docs/design/internal_dof_ladder.md
 section 5). The flip moves periodic phi columns only, so no box clamp can bind on it; it is its
-own inverse, and |det| of the map is 1.
+own inverse, and |det| of the map is 1. That holds with `double_bond_box_deg` set: the one
+non-periodic dihedral column it makes drives a proper row about a locked double bond, which
+is held, in no group and no improper row, so no flip's `rows` hold it.
 
 QUALIFIED: a centre has an entry only when its flip is an EXACT INVERSION of c -- every bond
 length, bond angle and other centre's parity kept, and every stereo element's indicator but

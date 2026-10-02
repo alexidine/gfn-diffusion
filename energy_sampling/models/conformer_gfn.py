@@ -293,7 +293,7 @@ class ConformerGFN(GFN):
         group, the z_calibration sidecars' clip) picks the new head up unchanged -- with a
         `MolEmbFlowHead` over the batch's pooled ``embedding`` (``mol_dim`` wide). With
         ``column_blocks`` (the energy's per-column block code, e.g. ``_free_block``: 0 r,
-        1 theta, 2 phi, 3 transverse) it also reads each row's count of VALID columns per block, because
+        1 theta, 2 phi, 3 transverse, 4 bounded double-bond dihedral) it also reads each row's count of VALID columns per block, because
         log Z(c) grows with the number of free coordinates of each kind and a carrier row's
         count is otherwise only implicit in the embedding. Depth, width, norm, dropout and
         activation are copied from the head it replaces, so an A/B differs in the input only.

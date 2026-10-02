@@ -29,6 +29,14 @@ that reports or conditions on what a column IS. The pair's own properties -- the
 rho and the log sinc measure -- are per-atom and read off the condition graph
 (`ctree_transverse`), never off a carrier column.
 
+A BOUNDED DOUBLE-BOND DIHEDRAL (block code 4, ``ConformerTorsions(double_bond_box_deg=W)``:
+the proper dihedral about a double bond the stereo lock holds) is placed in the THETA region
+by the same rule and for the same two properties: it does not wrap and it takes the box wall.
+Its SCALE is its own (W degrees, not `delta_theta_max`), which costs nothing here: no reader
+takes a scale from the region, each row's scale travels with its atom on the condition graph
+(``ctree_ph_scale``) and the chart constant per member in the library. Its row is still a
+dihedral, read from the atom's phi slot; only its COLUMN moved. `kind` keeps the code.
+
 PADS ARE NOT COORDINATES. They are pinned to exactly 0 along the whole trajectory
 (``ConformerGFN._pin_dead``), excluded from every log-prob sum (``state_mask``), never
 tokenised by the policy, and the energy REFUSES a row whose pads are not exactly 0 -- a
@@ -47,10 +55,12 @@ import torch
 #: block codes, as ``ConformerTorsions._free_block`` spells them
 BLOCKS = (0, 1, 2)           # r, theta, phi -- the carrier's REGIONS
 TRANSVERSE = 3
+BOUNDED_DIHEDRAL = 4
 #: member block code -> the carrier region its column is placed in (module docstring)
-REGION = {0: 0, 1: 1, 2: 2, TRANSVERSE: 1}
+REGION = {0: 0, 1: 1, 2: 2, TRANSVERSE: 1, BOUNDED_DIHEDRAL: 1}
 #: labels for a member block code, for reporting; -1 is a pad
-KIND_NAMES = {0: 'r', 1: 'theta', 2: 'phi', TRANSVERSE: 'transverse'}
+KIND_NAMES = {0: 'r', 1: 'theta', 2: 'phi', TRANSVERSE: 'transverse',
+              BOUNDED_DIHEDRAL: 'double_bond'}
 
 
 class CarrierLayout:
@@ -85,8 +95,8 @@ class CarrierLayout:
                                for fb in kinds.values())
         if self.is_identity:
             self.K = int(len(first))
-            #: per carrier column, its REGION code (0 r, 1 theta -- transverse included --
-            #: 2 phi): what periodicity, the box wall and the `block_width` stamp read. In
+            #: per carrier column, its REGION code (0 r, 1 theta -- transverse and bounded
+            #: double-bond dihedrals included -- 2 phi): what periodicity, the box wall and the `block_width` stamp read. In
             #: column order, which on the identity is the members' own order
             self.free_block = next(iter(blocks.values()))
             self.block_width = [int((self.free_block == b).sum()) for b in BLOCKS]
@@ -172,13 +182,15 @@ class CarrierLayout:
     def describe(self) -> str:
         w = self.block_width
         lines = [f'   CARRIER K = {self.K}  (r {w[0]} | theta {w[1]} | phi {w[2]}; '
-                 f'transverse u/v sit in the theta region)'
+                 f'transverse u/v and bounded double-bond dihedrals sit in the theta region)'
                  + ('  -- identity, every member has the same per-column block codes'
                     if self.is_identity else '')]
         for ident, c in self.cols.items():
             n_tv = int((self.kinds[ident] == TRANSVERSE).sum())
+            n_db = int((self.kinds[ident] == BOUNDED_DIHEDRAL).sum())
             lines.append(f'      {ident}: k = {len(c)}, {self.K - len(c)} pad column(s)'
-                         + (f', {n_tv} transverse' if n_tv else ''))
+                         + (f', {n_tv} transverse' if n_tv else '')
+                         + (f', {n_db} bounded double-bond dihedral(s)' if n_db else ''))
         return '\n'.join(lines)
 
 

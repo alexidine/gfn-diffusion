@@ -148,7 +148,8 @@ import torch
 from energies.invertible_centres import MIRROR_WIDTHS
 
 #: Per-block grid order. ConformerTorsions._free_block codes columns 0 r, 1 theta, 2 phi,
-#: 3 transverse; a transverse member is refused (no block count, no disc wall here).
+#: 3 transverse, 4 a bounded double-bond dihedral; a member with a 3 or a 4 is refused (no
+#: block count for either, and no disc wall here).
 BLOCKS = ('r', 'theta', 'phi')
 
 #: The default two-grid pair: one grid and itself shifted by half a cell (module docstring).
@@ -239,8 +240,9 @@ def _blocks_of(member) -> np.ndarray:
     blocks = np.asarray(member._free_block).reshape(-1)
     if (blocks > 2).any():
         raise NotImplementedError(
-            'this member carries transverse columns (block 3): there is no block count for '
-            'them here, and the box rule would ignore their disc wall')
+            'this member carries transverse columns (block 3) or bounded double-bond '
+            'dihedrals (block 4, double_bond_box_deg): there is no block count for them '
+            'here, and the box rule would ignore a transverse disc wall')
     return blocks
 
 

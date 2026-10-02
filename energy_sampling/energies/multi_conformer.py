@@ -123,7 +123,11 @@ class MultiConformerTorsions(ConformerTorsions):
         # same kwargs, so they agree today; checked because one member that did not would be
         # scored against a wall that is not its own -- a plausible number, and the per-member
         # oracle would disagree silently.
-        for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff'):
+        # `double_bond_box_deg` joins them: it decides which of a member's columns are walled
+        # and their scale, and a member built under another box would sit in a layout, and
+        # under a chart constant, that are not the set's.
+        for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff',
+                     'double_bond_box_deg'):
             want = getattr(self, name)
             off = [i for i, m in self._members.items() if getattr(m, name) != want]
             if off:
@@ -587,7 +591,10 @@ class MultiConformerTorsions(ConformerTorsions):
             the stereo lock read off the rows' own ``ctree_stereo_*``
             (`stereo_lock.batch_lock_energy`), both before the clip;
           * the box wall over `_lin_free_idx`, the carrier's non-phi columns: pads are
-            exactly 0 (checked), so relu adds exactly 0 there and the wall is each member's;
+            exactly 0 (checked), so relu adds exactly 0 there and the wall is each member's.
+            A bounded double-bond dihedral sits in the theta region, so it is walled here
+            exactly as the member's `bounding_energy` walls it, and its scale is the graph's
+            per-atom ``ctree_ph_scale``;
           * the transverse DISC wall in rho, per ATOM off ``ctree_transverse`` (`_disc_wall`),
             added to the box before the T pre-multiplication exactly as the member's
             `bounding_energy` adds it -- so a pad, which owns no atom, cannot reach it;

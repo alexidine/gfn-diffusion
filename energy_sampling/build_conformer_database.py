@@ -235,13 +235,36 @@ def header_differences(old: dict, new: dict) -> List[str]:
             for k in sorted(set(a) | set(b)) if a.get(k, '<absent>') != b.get(k, '<absent>')]
 
 
+#: ConformerTorsions arguments a database does NOT depend on although they define a member's
+#: chart. A record stores POSITIONS and raw potentials (force field + lock, no wall), and a
+#: consumer measures them into its own member (``states_of_rows``), re-scores every row and
+#: refuses one outside its box (``match_rows``: ``db_outside_box``, ``db_rescore``).
+#: ``double_bond_box_deg`` changes the box and periodicity of a locked double bond's dihedral
+#: column and nothing a record holds.
+CHART_ONLY_KWARGS = ('double_bond_box_deg',)
+
+
+class _UnboxedCodes:
+    """``member`` as `_member_signature` reads it, with a bounded double-bond dihedral (block
+    code 4) read as the phi column (2) it is without ``double_bond_box_deg``."""
+
+    def __init__(self, member):
+        self.spec = member.spec
+        fb = np.asarray(member._free_block).reshape(-1).copy()
+        fb[fb == 4] = 2
+        self._free_block = fb
+
+
 def member_signature(identifier: str, member) -> str:
-    """``ConformerModeller._member_signature``: the run's condition-set digest of this member.
+    """``ConformerModeller._member_signature``: the run's condition-set digest of this member,
+    taken WITHOUT the double-bond box (``CHART_ONLY_KWARGS``), so a database's signature is
+    the same whether its builder, or the consumer matching against it, bounds those columns.
+    Equal to the run's digest for every member built without the box.
 
     Imported, not restated. The import pulls in the trainer (about 13 s, once per process)."""
     from conformer_modeller import ConformerModeller
 
-    return ConformerModeller._member_signature(identifier, member)
+    return ConformerModeller._member_signature(identifier, _UnboxedCodes(member))
 
 
 # ------------------------------------------------------------------ the universe
@@ -1197,6 +1220,9 @@ def refuse_other_member_kwargs(info: dict, energy_kw: dict, what: str):
 
     have = bcr.defining_energy(bcr.member_kwargs(info['energy_kwargs']))
     want = bcr.defining_energy(bcr.member_kwargs(energy_kw))
+    for name in CHART_ONLY_KWARGS:
+        have.pop(name, None)
+        want.pop(name, None)
     diff = [f'{k}: database {have.get(k, "<absent>")!r}, {what} {want.get(k, "<absent>")!r}'
             for k in sorted(set(have) | set(want))
             if have.get(k, '<absent>') != want.get(k, '<absent>')]
