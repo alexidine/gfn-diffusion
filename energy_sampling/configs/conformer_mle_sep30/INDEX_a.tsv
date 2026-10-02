@@ -1,3 +1,3 @@
 arm	rung	start	warm_src	set	n_train_molecules	n_heldout_molecules	build_wall	build_mem	build_cpu_hours	train_gres	train_host_mem	proj_prior_rows	proj_train_conditions	proj_gpu_resident_GB	proj_gpu_warmup_peak_GB	proj_host_GB	proj_sidecar_GB	proj_disk_GB_at_max_steps
-mle30_pilot	pilot	fresh	-	pilot	5	2	01:00:00	31G	0.0	gpu:a100:1	48G	57	9	0.0	0.0	0.0	0.0	0
-mle30_r20k	r20k	fresh	-	r20k	20000	2000	04:00:00	57G	5.2	gpu:a100:1	64G	228,000	35,000	19.3	27.4	17.5	9.9	406
+mle30_pilot	pilot	fresh	-	pilot	5	2	01:00:00	31G	0.0	gpu:a100:1	48G	57	9	0.0	0.2	0.0	0.0	0
+mle30_r20k	r20k	fresh	-	r20k	20000	2000	04:00:00	57G	5.2	gpu:a100:1	64G	228,000	35,000	1.8	2.0	11.5	0.2	8

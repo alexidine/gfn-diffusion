@@ -106,6 +106,19 @@ if grep -q 'WARM_CHECKPOINT_PLACEHOLDER\|PRIOR_MODEL_PLACEHOLDER\|WEIGHTS_ONLY_P
     echo "FATAL: placeholder left in ${RESOLVED}" >&2; exit 1
 fi
 
+# PHASE2=1 (env): this leg ends train_prior on its first step and enters tb_conditioning. The arm's own
+# checkpoint is resumed IN FULL (weights, buffers, the per-condition log Z table); a stage's max_steps is read
+# from the leg's config and its clock from the checkpoint, so a cap of 1 is already met. Later legs need no
+# flag: the checkpoint records the stage by name.
+if [ -n "${PHASE2:-}" ]; then
+    if [ "${CK}" = "null" ]; then echo "FATAL: PHASE2 needs the arm's own checkpoint and none exists" >&2; exit 1; fi
+    if [ "$(grep -c '^      max_steps: 200000$' ${RESOLVED})" -ne 1 ]; then
+        echo "FATAL: ${RESOLVED} does not carry exactly one line 'max_steps: 200000'" >&2; exit 1
+    fi
+    sed -i 's|^      max_steps: 200000$|      max_steps: 1|' ${RESOLVED}
+    echo "  PHASE2: train_prior max_steps -> 1 (this leg leaves the warm-up on its first step)"
+fi
+
 { nvidia-smi -L
   scontrol show job ${SLURM_JOB_ID}
   echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"

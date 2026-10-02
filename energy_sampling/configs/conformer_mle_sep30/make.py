@@ -141,7 +141,8 @@ BUILD_MEM_MARGIN = 2.0
 # --- the training job (GPU)
 TRAIN_WALL = '1-00:00:00'
 TRAIN_GRES = 'gpu:a100:1'               # the pattern of every recent GPU battery
-TRAIN_MEM = {'pilot': '48G'}            # host memory; the rest from host_gb below
+# host memory; the rest from host_gb below. r20k: the request its running legs were submitted under
+TRAIN_MEM = {'pilot': '48G', 'r20k': '64G'}
 TRAIN_MEM_DEFAULT_GB = 48
 #: host --mem = TRAIN_MEM_MARGIN x (projected host GB + HOST_BASE_GB for the interpreter, torch and
 #: the CUDA context), rounded up to 16 GB, at least TRAIN_MEM_DEFAULT_GB
@@ -469,6 +470,27 @@ def refuse_local(text, where):
                          + '\n  '.join(bad))
 
 
+_PLACEHOLDER_CHECK = """    echo "FATAL: placeholder left in ${{RESOLVED}}" >&2; exit 1
+fi
+"""
+#: the train_prior cap as the arm's yaml carries it: the one line PHASE2 rewrites
+CAP_LINE = f'      max_steps: {TRAIN_PRIOR_MAX_STEPS}'
+PHASE2_BLOCK = _PLACEHOLDER_CHECK + f"""
+# PHASE2=1 (env): this leg ends train_prior on its first step and enters tb_conditioning. The arm's own
+# checkpoint is resumed IN FULL (weights, buffers, the per-condition log Z table); a stage's max_steps is read
+# from the leg's config and its clock from the checkpoint, so a cap of 1 is already met. Later legs need no
+# flag: the checkpoint records the stage by name.
+if [ -n "${{{{PHASE2:-}}}}" ]; then
+    if [ "${{{{CK}}}}" = "null" ]; then echo "FATAL: PHASE2 needs the arm's own checkpoint and none exists" >&2; exit 1; fi
+    if [ "$(grep -c '^{CAP_LINE}$' ${{{{RESOLVED}}}})" -ne 1 ]; then
+        echo "FATAL: ${{{{RESOLVED}}}} does not carry exactly one line '{CAP_LINE.strip()}'" >&2; exit 1
+    fi
+    sed -i 's|^{CAP_LINE}$|      max_steps: 1|' ${{{{RESOLVED}}}}
+    echo "  PHASE2: train_prior max_steps -> 1 (this leg leaves the warm-up on its first step)"
+fi
+"""
+
+
 def train_sbatch(row, rung, wall, mem, prior_sha, pilot=False, one_job=False):
     """The training job; ``one_job`` builds the rung first when it is missing (ONE_JOB_GUARD)
     and asks for the build's CPUs."""
@@ -480,6 +502,7 @@ def train_sbatch(row, rung, wall, mem, prior_sha, pilot=False, one_job=False):
         text = cc._replace_once(text, '#SBATCH --cpus-per-task=8',
                                 f'#SBATCH --cpus-per-task={max(8, BUILD_CPUS)}', 'cpus line')
     text = cc._replace_once(text, cc._RDKIT_COLUMN, _SET_COLUMN, 'rdkit index column')
+    text = cc._replace_once(text, _PLACEHOLDER_CHECK, PHASE2_BLOCK, 'placeholder check')
     text = cc._replace_once(text, '#SBATCH --array=0-{last}', f'#SBATCH --array={row}', 'array line')
     text = cc._replace_once(text, '#SBATCH --gres=gpu:a100:1', f'#SBATCH --gres={TRAIN_GRES}', 'gres line')
     text = cc._replace_once(text, '#SBATCH --mem=48G', f'#SBATCH --mem={mem}', 'mem line')
@@ -577,6 +600,9 @@ def main(argv=None):
         written[f'run_{rung}.sbatch'] = train_sbatch(i, rung, one_wall, one_mem, prior_sha,
                                                      pilot=pilot, one_job=True)
         written[f'{name}.yaml'] = yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
+        if written[f'{name}.yaml'].splitlines().count(CAP_LINE) != 1:
+            raise SystemExit(f'REFUSING: {name}.yaml does not carry exactly one line {CAP_LINE!r}, '
+                             f'which PHASE2 rewrites in the resolved config')
         assert yaml.safe_load(written[f'{name}.yaml']) == cfg, name
         rows.append([name, rung, 'fresh', '-', rung, str(n_train), str(n_heldout), b_wall, b_mem,
                      f'{cpu_h:.1f}', TRAIN_GRES, t_mem, f'{n_rows:,.0f}', f'{n_cond:,.0f}',

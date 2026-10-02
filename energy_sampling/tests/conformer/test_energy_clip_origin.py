@@ -157,3 +157,17 @@ def test_excess_energy_stats_subtract_each_rows_baseline():
     assert 'prior_buffer_excess_energy_hist' in out
     assert Modeller.excess_energy_stats(None, 'p', energy, None) == {}
     assert Modeller._buffer_y_baseline(None, object()) is None, 'the crystal route has none'
+
+
+def test_clip_origin_is_not_part_of_the_checkpoint_identity():
+    """A checkpoint written without the key (or at 'absolute') loads under 'reference':
+    the origin is exempt with `energy_clip`, so `assert_problem_match` sees one problem."""
+    from utils import normalize_problem_def
+    old = {'energy_function': 'conformer_torsions',
+           'energy_config': {'level': 'full', 'force_field': 'mmff', 'energy_clip': 300.0}}
+    new = {'energy_function': 'conformer_torsions',
+           'energy_config': {'level': 'full', 'force_field': 'mmff', 'energy_clip': 300.0,
+                             'energy_clip_origin': 'reference'}}
+    assert normalize_problem_def(old) == normalize_problem_def(new)
+    other = {**new, 'energy_config': {**new['energy_config'], 'level': 'flex'}}
+    assert normalize_problem_def(old) != normalize_problem_def(other)

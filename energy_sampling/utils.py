@@ -849,6 +849,11 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # The cost is the same one reward_range already
                                     # carries -- log Z is NOT comparable across settings.
                                     'energy_clip',
+                                    # what energy_clip is measured from (the conformer
+                                    # route's absolute cutoff or one above each member's
+                                    # reference conformer): the same tail reshape, exempt
+                                    # with it
+                                    'energy_clip_origin',
                                     # THE MLIP EXECUTION KNOBS, exempt for exactly the
                                     # reason internal_oom_recovery is: they choose HOW the
                                     # energy is computed -- compiled or eager, edge dim

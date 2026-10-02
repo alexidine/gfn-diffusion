@@ -529,6 +529,7 @@ buffers:
     refresh_every_n_evals: 0
     seed_source: prior_dataset
     seed_relax_steps: 0
+    seed_rows_per_condition: null
     max_size: 40000
     dup_cutoff: 0.05
     screen_energy_window: 20
@@ -580,6 +581,7 @@ energy_config:
   - 0.0
   - 0.0
   energy_clip: 300.0
+  energy_clip_origin: reference
   stereo_coeff: 300.0
   internal_prior_path: conformer_prior_v2.pt
   prior_sample_size: 20000
