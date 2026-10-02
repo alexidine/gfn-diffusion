@@ -152,6 +152,20 @@ class MultiConformerTorsions(ConformerTorsions):
             self._log_jac_const_of_lib = torch.as_tensor(
                 np.asarray(consts, dtype=np.float64), device=self.device)
         self._lib_of_mol_id: Optional[torch.Tensor] = None
+        self._clip_floor_of_lib: Optional[torch.Tensor] = None
+
+    def install_clip_floor(self) -> torch.Tensor:
+        """`energy_clip_origin` 'reference' on the set: every member takes its own floor
+        (`ConformerTorsions.install_clip_floor`) and the one-pass energy reads them per row
+        from `_clip_floor_of_lib`, in `_members` order. Returns that table."""
+        floors = []
+        for m in self._members.values():
+            floors.append(ConformerTorsions.install_clip_floor(m))
+            m.release_batch_cache()
+        self._clip_floor_of_lib = torch.as_tensor(np.asarray(floors, dtype=np.float64),
+                                                  dtype=self.dtype, device=self.device)
+        self.energy_clip_origin = 'reference'
+        return self._clip_floor_of_lib
 
     @property
     def is_carrier(self) -> bool:
@@ -608,7 +622,12 @@ class MultiConformerTorsions(ConformerTorsions):
                 # the force field (and the lock) only, before the wall --
                 # ConformerTorsions.potential_energy
                 from mxtaltools.common.utils import log_rescale_positive
-                e = log_rescale_positive(e, self.energy_clip)
+                if self.energy_clip_origin == 'absolute':
+                    cutoff = self.energy_clip
+                else:
+                    # each row's own member's floor (install_clip_floor)
+                    cutoff = self._clip_floor_of_lib.index_select(0, lib_ids) + self.energy_clip
+                e = log_rescale_positive(e, cutoff)
             baked = e
             if self._lin_free_idx.numel():
                 xl = xs.index_select(-1, self._lin_free_idx)

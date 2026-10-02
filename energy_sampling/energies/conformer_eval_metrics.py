@@ -184,7 +184,7 @@ def energy_component_stats(en, x, prefix: str = 'E/', hist: bool = True) -> dict
             clipped = _host(en.potential_energy(
                 torch.as_tensor(x, dtype=en.dtype, device=en.device), one), np.float64)
         _quantiles(clipped, f'{prefix}clipped_total', out, hist=hist)
-        out[f'{prefix}clip_active_frac'] = float((total > en.energy_clip).mean())
+        out[f'{prefix}clip_active_frac'] = float((total > en.clip_cutoff).mean())
         out[f'{prefix}energy_clip'] = float(en.energy_clip)
     return out
 

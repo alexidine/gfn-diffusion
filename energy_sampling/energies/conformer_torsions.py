@@ -181,6 +181,49 @@ class ConformerTorsions(BaseSet):
         to undo (MolecularCrystal.unreferenced_log_r with no table installed)."""
         return log_r
 
+    #: WHERE `energy_clip` IS MEASURED FROM. 'absolute': the cutoff is `energy_clip` itself.
+    #: 'reference': the cutoff is `energy_clip` above `energy_clip_floor`, this member's own
+    #: unclipped potential at its reference conformer (`install_clip_floor`). Not constructor
+    #: arguments: the floor needs the built chart, and a member built without it scores a row
+    #: under the cutoff identically under both.
+    CLIP_ORIGINS = ('absolute', 'reference')
+    energy_clip_origin = 'absolute'
+    energy_clip_floor = None
+
+    def reference_potential(self) -> float:
+        """Force field + stereo lock at this member's reference conformer (state 0), kcal/mol:
+        `potential_energy` there with the clip off. The box wall is zero at the origin."""
+        held = self.energy_clip
+        self.energy_clip = None
+        try:
+            x = torch.zeros(1, int(self.ndim), dtype=self.dtype, device=self.device)
+            one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
+            return float(self.potential_energy(x, one)[0])
+        finally:
+            self.energy_clip = held
+
+    def install_clip_floor(self) -> float:
+        """Switch this chart to `energy_clip_origin` 'reference' and return its floor."""
+        if self.energy_clip is None:
+            raise ValueError("energy_clip_origin 'reference' needs energy_clip: there is no "
+                             "clip to measure from the reference")
+        floor = self.reference_potential()
+        if not np.isfinite(floor):
+            raise ValueError(f'{self.smiles}: the potential at the reference conformer is '
+                             f'{floor!r}; no clip can be measured from it')
+        self.energy_clip_floor = floor
+        self.energy_clip_origin = 'reference'
+        return floor
+
+    @property
+    def clip_cutoff(self):
+        """The potential above which the soft clip compresses, or None when the clip is off."""
+        if self.energy_clip is None:
+            return None
+        if self.energy_clip_origin == 'absolute':
+            return self.energy_clip
+        return self.energy_clip_floor + self.energy_clip
+
     # Free-DoF levels, as freeze sets over InternalParams.CLASSES = ("r","theta","phi").
     # These are NOT a ladder of approximations: freezing a DoF at a constant gives
     # p_full(free | frozen = c0), a conditional slice, which differs from the
@@ -2709,7 +2752,7 @@ class ConformerTorsions(BaseSet):
                 # element, log_chart_jacobian) are added later in energy(), so they are
                 # untouched here for the same reason.
                 from mxtaltools.common.utils import log_rescale_positive
-                e = log_rescale_positive(e, self.energy_clip)
+                e = log_rescale_positive(e, self.clip_cutoff)
             if self._lin_free_idx.numel():
                 # skipped, not added-as-zero, so the geometry path stays bitwise
                 e = e + self.bounding_energy(x, temperature)

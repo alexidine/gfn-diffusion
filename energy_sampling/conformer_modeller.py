@@ -51,7 +51,8 @@ from train import BULKY_ATTR_EXCLUDE_KEYS, Modeller
 #: to ConformerTorsions, which takes no **kwargs and would raise on any of them.
 _NON_ENERGY_KEYS = ('internal_prior_path', 'prior_sample_size', 'reward_range',
                     'density_coeff', 'reduction_coeff', 'analyze_kwargs',
-                    'internal_oom_recovery', 'prior_relax_steps', 'prior_dataset_path')
+                    'internal_oom_recovery', 'prior_relax_steps', 'prior_dataset_path',
+                    'energy_clip_origin')
 
 
 #: Re-exported so existing imports and tests keep resolving; the definitions live in
@@ -547,6 +548,7 @@ class ConformerModeller(Modeller):
             self.energy_function = ConformerTorsions(
                 reference_positions=None if one is None else one[0], **cfg)
         self._check_stored_references(refs, time.perf_counter() - t0)
+        self._install_clip_origin()
         print(self.energy_function.describe())
         # THE BASE METHOD ALSO BUILDS THE TRACE WINDOW, and this override does not call
         # super(). Dropping it left profiling.trace silently INERT on the whole conformer
@@ -725,6 +727,32 @@ class ConformerModeller(Modeller):
         n = max(len(members), 1)
         print(f'condition set: {len(refs)} of {n} member(s) built from the stored reference '
               f'(no embedding), {n - len(refs)} embedded; members built in {seconds:.1f} s')
+
+    def _install_clip_origin(self):
+        """`energy_config.energy_clip_origin`: 'absolute' (the default, and absent) leaves
+        `energy_clip` an absolute cutoff. 'reference' measures it from each member's own
+        potential at its reference conformer (`ConformerTorsions.install_clip_floor`).
+
+        Here, before any row of the run is scored: a stored `conformer_energy` is the clipped
+        potential and `prebuilt_sample_to_reward` never recomputes it.
+        """
+        origin = getattr(self.args.energy_config, 'energy_clip_origin', None) or 'absolute'
+        if origin not in ConformerTorsions.CLIP_ORIGINS:
+            raise SystemExit(f'energy_config.energy_clip_origin {origin!r}: one of '
+                             f'{ConformerTorsions.CLIP_ORIGINS}')
+        if origin == 'absolute':
+            return
+        en = self.energy_function
+        if en.energy_clip is None:
+            raise SystemExit("energy_config.energy_clip_origin 'reference' needs "
+                             "energy_config.energy_clip")
+        t0 = time.perf_counter()
+        floors = torch.as_tensor(en.install_clip_floor()).flatten().double().cpu()
+        q = torch.quantile(floors, torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64))
+        print(f"energy clip: {en.energy_clip:g} kcal/mol above each member's reference-conformer "
+              f"potential ({floors.numel()} member(s): min {float(q[0]):.1f}, median "
+              f"{float(q[1]):.1f}, max {float(q[2]):.1f} kcal/mol; "
+              f"{time.perf_counter() - t0:.1f} s)", flush=True)
 
     def init_identifiers(self):
         """Base registry, checked against the stamped condition set, then handed to the energy.
