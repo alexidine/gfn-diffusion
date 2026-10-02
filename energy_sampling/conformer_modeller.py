@@ -754,6 +754,30 @@ class ConformerModeller(Modeller):
               f"{float(q[1]):.1f}, max {float(q[2]):.1f} kcal/mol; "
               f"{time.perf_counter() - t0:.1f} s)", flush=True)
 
+    def _reference_potential_table(self):
+        """Each molecule's unclipped potential at its reference conformer
+        (`ConformerTorsions.reference_potential`), indexed by mol_id, float64 on the CPU:
+        the baseline of the buffers' `*_excess_energy` statistics."""
+        en = self.energy_function
+        n = max(len(self.identifier_registry), 1)
+        lib_of = getattr(en, '_lib_of_mol_id', None)
+        if lib_of is None:                                  # one chart: every row is its
+            return torch.full((n,), en.reference_potential(), dtype=torch.float64)
+        lib_of = lib_of.detach().cpu().long()
+        held = lib_of >= 0                                  # -1: a mol_id with no member
+        table = torch.full((int(lib_of.numel()),), float('nan'), dtype=torch.float64)
+        table[held] = en.reference_potentials()[lib_of[held]]
+        return table
+
+    def _buffer_y_baseline(self, buff):
+        """The row's molecule's reference-conformer potential: `y` is `conformer_energy`,
+        the same raw potential. None for rows that carry no `mol_id`."""
+        table = getattr(self, '_reference_potential_of_mol_id', None)
+        mol_id = getattr(getattr(buff, 'batch', None), 'mol_id', None)
+        if table is None or mol_id is None:
+            return None
+        return table[torch.as_tensor(mol_id).detach().cpu().long().flatten()]
+
     def init_identifiers(self):
         """Base registry, checked against the stamped condition set, then handed to the energy.
 
@@ -767,6 +791,7 @@ class ConformerModeller(Modeller):
         binder = getattr(self.energy_function, 'bind_identifier_registry', None)
         if binder is not None:
             binder(self.identifier_registry)
+        self._reference_potential_of_mol_id = self._reference_potential_table()
         self._derive_condition_fields()
         self._bind_restored_stores()
 

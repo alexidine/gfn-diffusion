@@ -153,6 +153,7 @@ class MultiConformerTorsions(ConformerTorsions):
                 np.asarray(consts, dtype=np.float64), device=self.device)
         self._lib_of_mol_id: Optional[torch.Tensor] = None
         self._clip_floor_of_lib: Optional[torch.Tensor] = None
+        self._reference_potential_of_lib: Optional[torch.Tensor] = None
 
     def install_clip_floor(self) -> torch.Tensor:
         """`energy_clip_origin` 'reference' on the set: every member takes its own floor
@@ -164,8 +165,21 @@ class MultiConformerTorsions(ConformerTorsions):
             m.release_batch_cache()
         self._clip_floor_of_lib = torch.as_tensor(np.asarray(floors, dtype=np.float64),
                                                   dtype=self.dtype, device=self.device)
+        self._reference_potential_of_lib = self._clip_floor_of_lib.detach().double().cpu()
         self.energy_clip_origin = 'reference'
         return self._clip_floor_of_lib
+
+    def reference_potentials(self) -> torch.Tensor:
+        """Every member's `reference_potential`, float64 on the CPU, in `_members` order.
+        Computed once."""
+        if getattr(self, '_reference_potential_of_lib', None) is None:
+            vals = []
+            for m in self._members.values():
+                vals.append(ConformerTorsions.reference_potential(m))
+                m.release_batch_cache()
+            self._reference_potential_of_lib = torch.as_tensor(
+                np.asarray(vals, dtype=np.float64))
+        return self._reference_potential_of_lib
 
     @property
     def is_carrier(self) -> bool:

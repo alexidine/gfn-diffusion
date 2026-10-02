@@ -112,3 +112,48 @@ def test_modeller_refuses_an_unknown_origin_and_a_missing_clip():
         ConformerModeller._install_clip_origin(_stub('floor', _member()))
     with pytest.raises(SystemExit, match='needs'):
         ConformerModeller._install_clip_origin(_stub('reference', _member(clip=None)))
+
+
+# ------------------------------------------------- the buffers' excess-energy statistics
+
+
+def test_set_reference_potentials_are_each_members_own():
+    s = _Set(SMIS, SIZES, torch.float64, scale=0.6, energy_clip=CLIP)
+    ref = s.multi.reference_potentials()
+    want = [ConformerTorsions.reference_potential(m) for m in s.multi._members.values()]
+    assert ref.dtype == torch.float64 and ref.tolist() == pytest.approx(want, abs=1e-12)
+    assert s.multi.energy_clip_origin == 'absolute', 'reading the table must not move the clip'
+    assert s.multi.install_clip_floor().double().tolist() == pytest.approx(want, abs=1e-12)
+
+
+def test_baseline_table_is_indexed_by_mol_id_and_marks_absent_members():
+    s = _Set(SMIS, SIZES, torch.float64, scale=0.6)
+    reg = dict(s.registry, **{'not_a_member': len(s.registry)})
+    s.multi.bind_identifier_registry(reg)
+    stub = types.SimpleNamespace(energy_function=s.multi, identifier_registry=reg)
+    table = ConformerModeller._reference_potential_table(stub)
+    ref = s.multi.reference_potentials()
+    for i, ident in enumerate(s.multi._members):
+        assert float(table[reg[ident]]) == pytest.approx(float(ref[i]), abs=1e-12)
+    assert torch.isnan(table[reg['not_a_member']])
+
+    stub._reference_potential_of_mol_id = table
+    mol_id = torch.tensor([reg[SMIS[3]], reg[SMIS[0]], reg[SMIS[3]]])
+    buff = types.SimpleNamespace(batch=types.SimpleNamespace(mol_id=mol_id))
+    assert torch.equal(ConformerModeller._buffer_y_baseline(stub, buff), table[mol_id])
+    assert ConformerModeller._buffer_y_baseline(
+        stub, types.SimpleNamespace(batch=types.SimpleNamespace())) is None
+
+
+def test_excess_energy_stats_subtract_each_rows_baseline():
+    from train import Modeller
+    energy = torch.tensor([10.0, -200.0, 31.0, 5.0])
+    baseline = torch.tensor([9.0, -203.0, 30.0, float('nan')])     # the last row has none
+    out = Modeller.excess_energy_stats(None, 'prior_buffer', energy, baseline)
+    assert out['prior_buffer_mean_excess_energy'] == pytest.approx(5.0 / 3.0)
+    assert out['prior_buffer_median_excess_energy'] == pytest.approx(1.0)
+    assert out['prior_buffer_min_excess_energy'] == pytest.approx(1.0)
+    assert out['prior_buffer_max_excess_energy'] == pytest.approx(3.0)
+    assert 'prior_buffer_excess_energy_hist' in out
+    assert Modeller.excess_energy_stats(None, 'p', energy, None) == {}
+    assert Modeller._buffer_y_baseline(None, object()) is None, 'the crystal route has none'

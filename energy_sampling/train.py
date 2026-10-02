@@ -8645,6 +8645,11 @@ class Modeller:
             return
         window = getattr(self.args, 'nonthermal_basin_window_kT', 10.0)
         k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
+        # the same u per degree of freedom of the row's own molecule: equipartition puts
+        # the thermal mean at 1/2 whatever the molecule's size
+        u_dof = u / k_row.to(u.dtype).clamp_min(1.0)
+        metrics['Excess Energy Nats Per DoF Mean'] = u_dof.mean().item()
+        metrics['Excess Energy Nats Per DoF P50'] = u_dof.median().item()
         u_star_row = equipartition_bar(k_row, float(p_eq),
                                        0.0 if window is None else float(window)).to(u.dtype)
         hot_eq = u > u_star_row
@@ -8990,6 +8995,7 @@ class Modeller:
             f'{prefix}_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
         }
         metrics.update(self.energy_stats(prefix, energy=buff.y))
+        metrics.update(self.excess_energy_stats(prefix, buff.y, self._buffer_y_baseline(buff)))
         valid_losses = buff.ema_loss[~torch.isnan(buff.ema_loss)].cpu().numpy()
         if len(valid_losses) > 0:
             metrics[f'{prefix}_loss_hist'] = safe_histogram(
@@ -9344,6 +9350,33 @@ class Modeller:
             f'{prefix}_min_energy': float(np.min(energy_np)),
             f'{prefix}_max_energy': float(np.max(energy_np)),
             f'{prefix}_energy_hist': safe_histogram(energy_np, num_bins=128),
+        }
+
+    def _buffer_y_baseline(self, buff):
+        """Per-row baseline for `buff.y`, in y's own currency, or None.
+
+        None here: on the crystal route `y` is the raw backend term (`_buffer_y_fn`) and
+        nothing in that currency is held per condition. A route that holds one returns it
+        and `_buffer_core_stats` adds the `*_excess_energy` family.
+        """
+        return None
+
+    def excess_energy_stats(self, prefix, energy, baseline):
+        """`energy - baseline` per row: mean, median, min/max and histogram, in energy
+        units. {} when there is no baseline or no row has a finite one."""
+        if baseline is None:
+            return {}
+        excess = (torch.as_tensor(energy).detach().cpu().flatten().double()
+                  - torch.as_tensor(baseline).detach().cpu().flatten().double())
+        excess = excess[torch.isfinite(excess)].numpy()
+        if excess.size == 0:
+            return {}
+        return {
+            f'{prefix}_mean_excess_energy': float(np.mean(excess)),
+            f'{prefix}_median_excess_energy': float(np.median(excess)),
+            f'{prefix}_min_excess_energy': float(np.min(excess)),
+            f'{prefix}_max_excess_energy': float(np.max(excess)),
+            f'{prefix}_excess_energy_hist': safe_histogram(excess, num_bins=128),
         }
 
     def manage_prior_buffer(self, sample_batch):
