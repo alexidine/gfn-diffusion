@@ -2695,7 +2695,7 @@ def dmat_row_indices(batch, results, energy_key, kT=2.5):
 
 def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
                        cluster_labels, p_maxima, n_basins, indexed_cluster_labels, extra_refs=None,
-                       umap_kwargs=None, kT=2.5):
+                       umap_kwargs=None, kT=2.5, uma_bundle=None, elj_bundle=None):
     """extra_refs: structures placed on the UMAP and nowhere else (see
     new_analysis.score_embedding_references). They enter a SEPARATE matrix used only
     for the UMAP fit, so every density, table value and basin assignment below is
@@ -2826,6 +2826,29 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     (stats['elj_density_pct'], stats['elj_density_pct_floor'],
      stats['elj_below_resolution']) = _rank(raw_old_elj, raw_new_elj[:n_basins + num_polymorphs])
     stats['elj_density'] = new_elj_dens[:num_polymorphs + n_basins].numpy()
+    # uma_bundle / elj_bundle: dens_engine bundles (many more draws of the same two models). The percentile rows are
+    # then read against the bundle's draws instead of this figure's own; basins, the embedding and the normed
+    # densities stay on the figure's samples. Each bundle must sit on this figure's kernel and checkpoint.
+    if uma_bundle is not None or elj_bundle is not None:
+        from energy_sampling.eval.paper1_results.dens_engine import point_sums
+        table_rdf = all_new_rdf[:n_basins + num_polymorphs]   # basin density maxima, then the polymorphs
+        for tag, bundle, results, keys in (
+                ('uma', uma_bundle, uma_results, ('density_pct', 'density_pct_floor', 'below_resolution')),
+                ('elj', elj_bundle, elj_results,
+                 ('elj_density_pct', 'elj_density_pct_floor', 'elj_below_resolution'))):
+            if bundle is None:
+                continue
+            ps = point_sums(bundle, table_rdf)
+            assert abs(ps['d_cut'] / float(uma_results['d_cuts'][0]) - 1) < 1e-6, (
+                f"{bundle} was streamed with d_cut {ps['d_cut']}, this figure's kernel is {float(uma_results['d_cuts'][0])}")
+            assert ps['rdf_mode'] == results.get('rdf_mode') and ps['step_ind'] == results['provenance']['step_ind'], (
+                f"{bundle} (rdf_mode {ps['rdf_mode']}, step {ps['step_ind']}) does not match the {tag} results")
+            old = np.array(stats[keys[0]], dtype=float)
+            stats[keys[0]], stats[keys[1]], stats[keys[2]] = _rank(ps['draw_sums'], ps['point_sums'])
+            stats[f'{tag}_bundle_n_draws'] = ps['n_draws']
+            print(f"  {tag} percentiles from {ps['n_draws']} bundle draws (was {len(raw_old_uma if tag == 'uma' else raw_old_elj)}): "
+                  + ', '.join(f"{o:.0f} -> {n:.1f}" for o, n in zip(old, stats[keys[0]]))
+                  + f"; floor {stats[keys[1]]:.2f}%; below resolution {int(np.sum(stats[keys[2]]))}")
     # the table labels its density rows from these: `paired_density` is False when the caller
     # passed one run in both slots (new_analysis.py's single-run figures), where 'elj_density'
     # is a copy of 'density' and must not be shown as a second, LJ measurement
@@ -2847,7 +2870,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
 
 
 def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int,
-               scan_device=None):
+               scan_device=None, return_anchors=False):
     """
     scan_device: where to run the cutoff scan ONLY. None picks cuda when
     available. The scan calls mean_shift_density up to 200 times and each call
@@ -2927,6 +2950,8 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     assert torch.all(cluster_labels[p_maxima] == p_maxima)
     assert len(cluster_labels) == num_filtered_samples, "cluster_labels mismatch"
 
+    if return_anchors:   # every mean-shift anchor (dmat rows), including those of basins killed as too small
+        return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins, np.asarray(anchors)
     return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins
 
 

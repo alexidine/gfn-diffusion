@@ -1459,6 +1459,7 @@ def combo_fig(num_polymorphs,
               polymorph_basin_index,
               energy_function,
               poly_labels=None,
+              marker_scale=1.0,
               ):
     """poly_labels: names for the experimental references (e.g. CSD refcodes).
     None falls back to generated Roman numerals of the right LENGTH -- the old
@@ -1470,18 +1471,27 @@ def combo_fig(num_polymorphs,
     basin_positions, fig, total_cols = make_specs_fig(n_basins)
 
     "embedding fig"
-    point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8)
+    # marker_scale < 1 for sample sets much larger than 10k, so the total ink stays about the same
+    point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8) * marker_scale
 
     embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds, poly_labels=poly_labels, extra_refs=stats.get('extra_refs'))
+              sample_embedding, sample_inds, poly_labels=poly_labels, extra_refs=stats.get('extra_refs'),
+              shade=(rankdata(uma_thermos['density']) / len(uma_thermos['density'])) if marker_scale < 1 else None)
 
     fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
              polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function,
-             poly_labels=poly_labels)
+             poly_labels=poly_labels, marker_scale=marker_scale)
 
     table_trace = new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins,
                                 poly_labels=poly_labels)
     fig.add_trace(table_trace, row=3, col=1)
+    # panel letters: (a) the embedding, (b...) the basin panels (in their titles), then the table
+    emb = fig.get_subplot(1, 1)
+    fig.add_annotation(text="(a)", xref="paper", yref="paper", x=emb.xaxis.domain[0], y=emb.yaxis.domain[1],
+                       xanchor="left", yanchor="top", showarrow=False)
+    tab = fig.data[-1].domain
+    fig.add_annotation(text=f"({chr(98 + len(basin_positions))})", xref="paper", yref="paper",
+                       x=tab.x[0] + 0.12, y=tab.y[1] - 0.01, xanchor="left", yanchor="top", showarrow=False)
 
     """
     Annotations and layout changes
@@ -1612,7 +1622,7 @@ def make_specs_fig(n_basins):
                 if specs[r][c] is not None:
                     if (r + 1, c + 1) in basin_positions:
                         basin_idx += 1
-                        subplot_titles.append(f"Basin {basin_idx}")
+                        subplot_titles.append(f"({chr(97 + basin_idx)}) Basin {basin_idx}")  # (a) is the embedding
                     else:
                         subplot_titles.append("")  # no title for non-basin panels
 
@@ -1646,7 +1656,7 @@ def make_specs_fig(n_basins):
                 if specs[r][c] is not None:
                     if (r + 1, c + 1) in basin_positions:
                         basin_idx += 1
-                        subplot_titles.append(f"Basin {basin_idx}")
+                        subplot_titles.append(f"({chr(97 + basin_idx)}) Basin {basin_idx}")  # (a) is the embedding
                     else:
                         subplot_titles.append("")  # no title for non-basin panels
 
@@ -1722,15 +1732,28 @@ def embedding_references(fig, sample_embedding, extra_refs, marker_font_size, al
 
 
 def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds, poly_labels=None, extra_refs=None):
-    fig.add_scatter(x=sample_embedding[sample_inds, 0],
-                    y=sample_embedding[sample_inds, 1],
-                    marker_color=sample_colors,
-                    mode='markers',
-                    marker_size=point_size,
-                    marker_sizemode='area',
-                    opacity=1.0,
-                    showlegend=False, row=1, col=1)
+              sample_embedding, sample_inds, poly_labels=None, extra_refs=None, shade=None):
+    """shade: [n] in [0, 1] (the density percentile / 100). When given, density is drawn as colour strength instead
+    of marker size -- markers are one small size, pale where sparse and saturated where dense, densest on top --
+    because at ~100k points a size difference cannot be seen."""
+    if shade is not None:
+        import re
+        order = np.argsort(shade)
+        rgb = {c: tuple(int(v) for v in re.findall(r'\d+', c)[:3]) for c in set(sample_colors)}
+        cols = [f"rgba({rgb[sample_colors[i]][0]},{rgb[sample_colors[i]][1]},{rgb[sample_colors[i]][2]},"
+                f"{0.10 + 0.90 * shade[i] ** 1.5:.3f})" for i in order]
+        fig.add_scatter(x=sample_embedding[sample_inds, 0][order], y=sample_embedding[sample_inds, 1][order],
+                        marker_color=cols, mode='markers', marker_size=float(np.median(point_size)) ** 0.5 * 1.6,
+                        marker_line_width=0, showlegend=False, row=1, col=1)
+    else:
+        fig.add_scatter(x=sample_embedding[sample_inds, 0],
+                        y=sample_embedding[sample_inds, 1],
+                        marker_color=sample_colors,
+                        mode='markers',
+                        marker_size=point_size,
+                        marker_sizemode='area',
+                        opacity=1.0,
+                        showlegend=False, row=1, col=1)
     fig.add_scatter(x=sample_embedding[p_maxima, 0], y=sample_embedding[p_maxima, 1],
                     mode='markers+text', text=np.arange(len(p_maxima)) + 1,
                     marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
@@ -1793,7 +1816,8 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     for name, color, size, symbol, width in (("Probability maximum", "rgb(150,150,150)", 16, "circle", 4),
                                              ("Energy minimum", "white", 16, "circle", 4),
                                              ("Experimental polymorph", "black", 14, "x-thin", 3),
-                                             ("Size ∝ local density", "rgb(170,170,170)", 10, "circle", 0)):
+                                             ("Shade ∝ P(x)" if shade is not None else "Size ∝ P(x)",
+                                              "rgb(170,170,170)", 10, "circle", 0)):
         fig.add_scatter(x=[None], y=[None], mode='markers', name=name, showlegend=True,
                         marker=dict(size=size, color=color, symbol=symbol, line=dict(color='black', width=width)),
                         row=1, col=1)
@@ -1849,7 +1873,7 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
 
 def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
              polymorph_basin_index, sample_energy, stats, thermo_metrics, energy_function,
-             poly_labels=None):
+             poly_labels=None, marker_scale=1.0):
     for i, basin_ind in enumerate(np.arange(n_basins)):  # enumerate(sorted_minima_inds[:4]):
         row, col = basin_positions[i]
 
@@ -1861,14 +1885,14 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
             y=sample_energy[bb],
             mode='markers',
             marker=dict(
-                size=5,
+                size=max(5 * marker_scale ** 0.5, 2),
                 color=density_pct[bb],
                 colorscale='Viridis',
                 cmin=0,
                 cmax=100,
                 opacity=0.6,
                 showscale=(i == 0),  # only once
-                colorbar_title="Density<br>percentile",
+                colorbar_title="P(x)<br>percentile",
             ),
             showlegend=False
         ), row=row, col=col)
@@ -1948,6 +1972,7 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     primary = ENERGY_LABELS.get(ef, (ef or 'model').upper())
     paired = stats.get('paired_density', True)
     fmt1 = lambda v: f"{v:.1f}" if not np.isnan(v) else ""
+    pct_text = lambda v: "< 1" if v < 0.5 else f"{v:.0f}"   # a resolved percentile that rounds to zero
     fmt2 = lambda v: f"{v:.2f}" if not np.isnan(v) else ""
     # the local density is reported as a PERCENTILE of the model's own draws; stats written before the
     # percentile keys existed fall back to the normed density
@@ -1959,8 +1984,8 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
         # pre-formatted because a below-resolution point prints a bound
         below = stats['below_resolution']
         f_pct = stats['density_pct_floor']
-        row_labels.append(f"{'UMA' if paired else primary} density percentile")
-        raw_values.append([f"< {np.ceil(f_pct):.0f}" if b else f"{v:.0f}"
+        row_labels.append(f"{'UMA' if paired else primary} P(x) percentile")
+        raw_values.append([f"< {np.ceil(f_pct):.0f}" if b else pct_text(v)
                            for v, b in zip(stats['density_pct'], below)])
         formatters.append(str)
     else:
@@ -1974,8 +1999,8 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
             formatters.append(fmt2)
         if 'elj_density_pct' in stats:
             eb, ef_ = stats['elj_below_resolution'], stats['elj_density_pct_floor']
-            row_labels.append("LJ density percentile")
-            raw_values.append([f"< {np.ceil(ef_):.0f}" if b else f"{v:.0f}"
+            row_labels.append("LJ P(x) percentile")
+            raw_values.append([f"< {np.ceil(ef_):.0f}" if b else pct_text(v)
                                for v, b in zip(stats['elj_density_pct'], eb)])
             formatters.append(str)
     # c_p of the table's point x*: a basin's density maximum, or the polymorph itself (not the basin's
@@ -2382,11 +2407,12 @@ def fused_duo_embedding_fig(panels, callout='EXP'):
         col = k + 1
         uma, lj, poly = np.asarray(pan['uma']), np.asarray(pan['lj']), np.atleast_2d(pan['poly'])
         pts = np.concatenate([uma, lj])
+        ms = 5 if len(pts) < 20000 else 2.5
         fig.add_scatter(x=uma[:, 0], y=uma[:, 1], mode='markers', name='UMA', legendgroup='UMA', showlegend=k == 0,
-                        marker=dict(size=5, color=[f'rgba(65,105,225,{a:.3f})' for a in pan['uma_alpha']]),
+                        marker=dict(size=ms, color=[f'rgba(65,105,225,{a:.3f})' for a in pan['uma_alpha']]),
                         row=1, col=col)
         fig.add_scatter(x=lj[:, 0], y=lj[:, 1], mode='markers', name='LJ', legendgroup='LJ', showlegend=k == 0,
-                        marker=dict(size=5, color=[f'rgba(220,20,60,{a:.3f})' for a in pan['lj_alpha']]),
+                        marker=dict(size=ms, color=[f'rgba(220,20,60,{a:.3f})' for a in pan['lj_alpha']]),
                         row=1, col=col)
         fig.add_scatter(x=poly[:, 0], y=poly[:, 1], mode='markers', marker_symbol='x-thin', marker_color='black',
                         marker_line_color='black', marker_line_width=6, marker_size=22, showlegend=False,

@@ -1,0 +1,625 @@
+# Shared across all runs
+base:
+  device: cuda
+  kT: 2.5
+  units: 'kJ/mol'
+
+  num_samples: 1000        # the RDF distance matrix is O(N^2)
+  sample_batch_size: 250   # GFN rollout batch; no MLIP, cheap
+  analysis_batch_size: 50  # crystal build + energy batch (grows itself, shrinks on OOM)
+  max_analysis_batch_size: 200  # ceiling on that growth; drop it hard for MLIP runs
+
+  # MUST be true, and the code raises if it is false on a non-standard conformer.
+  # Train time uses false, but only survives it because its conditioning molecule
+  # is already standard-oriented (measured: the two settings differ by 0.006 kJ/mol
+  # on samples). Experimental structures carry their own conformer frame, where the
+  # same switch moved ACRDIN04 from -60.06 to +3765.75 kJ/mol.
+  std_orientation: true
+
+  reload_results: true     # reuse <results_dir>/<run_name>.pt when its provenance (checkpoint step, rdf_mode, ...) matches
+  save_results: true
+  overwrite_results: true
+
+  # Data only by default: the paper figures come from generate_figs.py. Set true
+  # for the single-run combo figure + basin CIF export.
+  make_figures: false
+  show_fig: false
+
+  max_n_clusters: 6        # ALSO the panel count in the figure grid; not a measurement
+  min_basin_size: 10       # ~1% of num_samples; use 100 at 10k
+
+  checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
+  results_dir: D:\crystal_datasets\gfn_results
+
+# Per-run overrides.
+# `checkpoint` is a single-file checkpoint written by checkpointing.py. Its
+# gfn_config, model_eval (EMA weights), train_T, and problem_def (energy_function,
+# space groups, Z') are all read from the file -- nothing about the model or the
+# problem is restated here.
+# `rdf_mode` is REQUIRED per run and is a property of the molecule: atomwise for
+# mipcas/nehzor, envwise for acridine (C2-symmetric; atomwise is non-monotone there).
+# `train_config` is the arm's training yaml (relative to energy_sampling/). It builds
+# the arm's MolecularCrystal so results['log_r'] is the exact training reward.
+# `molecule_path` is an OPTIONAL override; by default the conditioning molecule is
+# taken from the prior's 'prior' key, which is what train.py conditions on.
+# `identifiers` filters the experimental reference file. Every surviving reference
+# must match the checkpoint's (space group, Z') or the run aborts.
+runs:
+
+  # ============ prod_sep12 paper arms (checkpoints in D:\crystal_datasets\checkpoints) ============
+  # References for all four are AS-DEPOSITED: no rigid-body relaxed MIPCAS or
+  # NEHZOR set exists on disk, so energy comparisons against them are provisional.
+  - run_name: p12_mip_lr1_best_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_mip_lr1_elj-mipcas_sg2_zp1_elj_200k_prior_dataset-T2.5-a8b328_best.pt
+    train_config: configs/prod_sep12/p12_mip_lr1.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset.pt
+    num_samples: 10000
+    min_basin_size: 100
+
+  - run_name: p12_mipu_lr0p0625_best_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_mipu_lr0p0625_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset-T2.5-614354_best.pt
+    train_config: configs/prod_sep12/p12_mipu_lr0p0625.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+
+  - run_name: p12_neh_lr0p5_best_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_neh_lr0p5_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-ea4072_best.pt
+    train_config: configs/prod_sep12/p12_neh_lr0p5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+
+  - run_name: p12_nehu_lr0p125_best_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_nehu_lr0p125_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset-T2.5-7ee7b3_best.pt
+    train_config: configs/prod_sep12/p12_nehu_lr0p125.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+
+  # 1k versions of the same four, for quick checks
+  - run_name: p12_mip_lr1_best_1k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_mip_lr1_elj-mipcas_sg2_zp1_elj_200k_prior_dataset-T2.5-a8b328_best.pt
+    train_config: configs/prod_sep12/p12_mip_lr1.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset.pt
+
+  - run_name: p12_mipu_lr0p0625_best_1k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_mipu_lr0p0625_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset-T2.5-614354_best.pt
+    train_config: configs/prod_sep12/p12_mipu_lr0p0625.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset.pt
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+
+  - run_name: p12_neh_lr0p5_best_1k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_neh_lr0p5_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-ea4072_best.pt
+    train_config: configs/prod_sep12/p12_neh_lr0p5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+
+  - run_name: p12_nehu_lr0p125_best_1k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_nehu_lr0p125_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset-T2.5-7ee7b3_best.pt
+    train_config: configs/prod_sep12/p12_nehu_lr0p125.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+
+  # ============ acridine, MACE (checkpoints in gfn_checkpoints) ============
+  # REFERENCE SET: opt_acrdin.pt, the rigid-body cell-relaxed forms. The
+  # std_acridine_polymorphs / std_opt_acridine_polymorphs pair are NOT relaxed --
+  # measured 2026-09-07, those two files carry byte-identical cells, angles,
+  # packing and stored eLJ as each other and as the CSD deposition.
+  # Small MACE batches: MACE is far heavier than eLJ and the GPU may be shared.
+  - run_name: p12_acr_lr0p05_best_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p12_p12_acr_lr0p05_mace-acridine_sg14_zp1_mace_prior_dataset-T2.5-625524_best.pt
+    train_config: configs/prod_sep12/p12_acr_lr0p05.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    # UMAP only -- never the table, densities or basin assignment. Every form in each
+    # file, including those outside sg14 Z'=1. Both files carry the SAMPLES' conformer
+    # (1.3668 A); std_opt_acridine_polymorphs.pt does NOT (0.199 A off) and is refused.
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: p02_acr_lr0p0125_best_10k
+    checkpoint: p02_p02_acr_lr0p0125_mace-acridine_sg14_zp1_mace_prior_dataset-T2.5-625524_best.pt
+    train_config: configs/prod_sep02/p02_acr_lr0p0125.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset.pt
+    # the file holds 7 forms across sg 9/14/19 and Z' 1/2/3; only these two are
+    # the sg14 Z'=1 cell this checkpoint samples
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+
+  - run_name: p02_acr_lr0p0125_best_1k
+    checkpoint: p02_p02_acr_lr0p0125_mace-acridine_sg14_zp1_mace_prior_dataset-T2.5-625524_best.pt
+    train_config: configs/prod_sep02/p02_acr_lr0p0125.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    analysis_batch_size: 4
+    max_analysis_batch_size: 12
+
+  # ============ older prod_sep02 arms ============
+  - run_name: p02_mip_lr1_best_10k
+    checkpoint: p02_p02_mip_lr1_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_best.pt
+    train_config: configs/prod_sep02/p02_mip_lr1.yaml
+    rdf_mode: atomwise
+    # kept as an explicit override so the 2026-09-07 run stays reproducible;
+    # the drift against the training molecule is printed at load
+    molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+    num_samples: 10000
+    min_basin_size: 100
+
+  - run_name: p02_nehu_lr0p125_best_10k
+    checkpoint: p02_p02_nehu_lr0p125_uma-nehzor_sg14_zp1_uma_f047_prior_dataset-T2.5-ef94ea_best.pt
+    train_config: configs/prod_sep02/p02_nehu_lr0p125.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_prior_dataset.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+
+  # ============ final_sep19 (fin19): trained on the niggli_v2 priors ============
+  # The triclinic walls changed on 2026-09-17 (mxtaltools 9e179673): sg 1/2 now use
+  # tri_niggli_reduction_penalty by default, with MXT_LEGACY_TRICLINIC_WALLS=1 as the
+  # way back. The reward's reduction term must match the walls the arm TRAINED under,
+  # or log_r is scored against a different penalty than the policy saw. Which rule an
+  # arm used is settled from its own draws by scratchpad/fin19_walls.py, and the value
+  # in force is written into the results as 'legacy_triclinic_walls'.
+  - run_name: fin19_mip_pb_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: fin19_fin19_mip_pb_elj-mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2-T2.5-99d02e_running.pt
+    train_config: configs/final_sep19/fin19_mip_pb.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: true
+
+  # ============ prod_sep20 (p20): the converged production arms, ROLLING checkpoints ============
+  # Priors are the post-wall-change rebuilds: mipcas on *_niggli_v2 (triclinic Niggli walls),
+  # nehzor on *_w3 (the per-class monoclinic walls). Current code scores both by default, so no
+  # MXT_LEGACY_TRICLINIC_WALLS here; 'legacy_triclinic_walls' is recorded with each result and the
+  # walls are re-checked against each arm's own draws after sampling.
+  - run_name: p20_mip_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_mip_n5_elj-mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2-T2.5-99d02e_running.pt
+    train_config: configs/prod_sep20/p20_mip_n5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: true
+
+  - run_name: p20_neh_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_neh_n5_elj-nehzor_sg14_zp1_elj_prior_dataset_w3-T2.5-af59d9_running.pt
+    train_config: configs/prod_sep20/p20_neh_n5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: true
+
+  - run_name: p20_mipu_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_mipu_n5_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2-T2.5-897009_running.pt
+    train_config: configs/prod_sep20/p20_mipu_n5.yaml
+    rdf_mode: atomwise
+    # the table's LJ density row comes from this run's eLJ partner, not from itself
+    elj_results_path: D:\crystal_datasets\gfn_results\p20_mip_n5_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  - run_name: p20_nehu_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_nehu_n5_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3-T2.5-3e8108_running.pt
+    train_config: configs/prod_sep20/p20_nehu_n5.yaml
+    rdf_mode: atomwise
+    # the table's LJ density row comes from this run's eLJ partner, not from itself
+    elj_results_path: D:\crystal_datasets\gfn_results\p20_neh_n5_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  # ============ p20, REDUCED CELLS ONLY: same samples, reduction_en <= 1e-6 ============
+  # Every sample with a nonzero reduction penalty is a (near-)duplicate of a crystal whose reduced
+  # cell is also in the box, and inside the zero-penalty region the reward IS the intended
+  # distribution, so this filter is an exact correction. 1e-6 sits above the 3e-7 float noise
+  # between stored and live penalties. source_results reuses each run's samples and dmat (subset).
+  - run_name: p20_mip_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p20_mip_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_mip_n5_elj-mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2-T2.5-99d02e_running.pt
+    train_config: configs/prod_sep20/p20_mip_n5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: p20_neh_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p20_neh_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_neh_n5_elj-nehzor_sg14_zp1_elj_prior_dataset_w3-T2.5-af59d9_running.pt
+    train_config: configs/prod_sep20/p20_neh_n5.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: p20_mipu_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p20_mipu_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_mipu_n5_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2-T2.5-897009_running.pt
+    train_config: configs/prod_sep20/p20_mipu_n5.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p20_mip_n5_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  - run_name: p20_nehu_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p20_nehu_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_nehu_n5_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3-T2.5-3e8108_running.pt
+    train_config: configs/prod_sep20/p20_nehu_n5.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p20_neh_n5_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  # ============ prod_sep23_ft (p23): the p20 arms fine-tuned with box + reduction penalties ramped
+  # 10 -> 1000 (coeff_schedule). The train_config holds the ramp's BASE (10); exact_log_rewards
+  # evaluates the schedule at the checkpoint's step, so the reward is scored at the live 1000. ============
+  - run_name: p23_mip_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_mip_ft_elj-mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2-T2.5-99d02e_running.pt
+    train_config: configs/prod_sep23_ft/p23_mip_ft.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: true
+
+  - run_name: p23_neh_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_neh_ft_elj-nehzor_sg14_zp1_elj_prior_dataset_w3-T2.5-af59d9_running.pt
+    train_config: configs/prod_sep23_ft/p23_neh_ft.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: true
+
+  - run_name: p23_mipu_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_mipu_ft_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2-T2.5-897009_running.pt
+    train_config: configs/prod_sep23_ft/p23_mipu_ft.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p23_mip_ft_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  - run_name: p23_nehu_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_nehu_ft_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3-T2.5-3e8108_running.pt
+    train_config: configs/prod_sep23_ft/p23_nehu_ft.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p23_neh_ft_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  - run_name: p23_mip_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p23_mip_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_mip_ft_elj-mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2-T2.5-99d02e_running.pt
+    train_config: configs/prod_sep23_ft/p23_mip_ft.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: p23_neh_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p23_neh_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_neh_ft_elj-nehzor_sg14_zp1_elj_prior_dataset_w3-T2.5-af59d9_running.pt
+    train_config: configs/prod_sep23_ft/p23_neh_ft.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_elj_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: p23_mipu_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p23_mipu_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_mipu_ft_uma-mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2-T2.5-897009_running.pt
+    train_config: configs/prod_sep23_ft/p23_mipu_ft.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p23_mip_ft_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_uma_f047_200k_prior_dataset_niggli_v2.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  - run_name: p23_nehu_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p23_nehu_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_nehu_ft_uma-nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3-T2.5-3e8108_running.pt
+    train_config: configs/prod_sep23_ft/p23_nehu_ft.yaml
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\p23_neh_ft_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_sg14_zp1_uma_f047_200k_prior_dataset_w3.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: true
+
+  # ============ p20 acridine (MACE, sg14 Z'=1), rolling checkpoint ============
+  - run_name: p20_acr_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_acr_n5_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep20/p20_acr_n5.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: p20_acr_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p20_acr_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p20_p20_acr_n5_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep20/p20_acr_n5.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  # ============ p23 acridine fine-tune (box + reduction 10 -> 1000), rolling checkpoint ============
+  - run_name: p23_acr_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: p23_acr_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\p23_acr_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  # ============ p23 acridine fine-tune: the standard landscape figure under other UMAP layouts (display only;
+  # same samples, dmat, densities and basins as p23_acr_ft_running_10k) ============
+  - run_name: p23_acr_ft_running_10k_umap_nn30_md01
+    source_results: D:\crystal_datasets\gfn_results\p23_acr_ft_running_10k.pt
+    umap_kwargs: {n_neighbors: 30, min_dist: 0.1}
+    save_results: false
+    export_structures: false
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: p23_acr_ft_running_10k_umap_nn30_md03_densmap
+    source_results: D:\crystal_datasets\gfn_results\p23_acr_ft_running_10k.pt
+    umap_kwargs: {n_neighbors: 30, min_dist: 0.3, densmap: true}
+    save_results: false
+    export_structures: false
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: p23_acr_ft_running_10k_umap_nn15_md005
+    source_results: D:\crystal_datasets\gfn_results\p23_acr_ft_running_10k.pt
+    umap_kwargs: {n_neighbors: 15, min_dist: 0.05}
+    save_results: false
+    export_structures: false
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  # ============ p23 acridine, SAME draws as p23_acr_ft_running_10k with ATOMWISE RDFs (acr_atomwise_rdf.py wrote
+  # the derived results file). Atomwise is not invariant to acridine's C2 atom relabelling: a comparison view. ============
+  - run_name: p23_acr_ft_running_10k_atomwise
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: p23_p23_acr_ft_mace-acridine_sg14_zp1_mace_prior_dataset_w3-T2.5-56fc10_running.pt
+    train_config: configs/prod_sep23_ft/p23_acr_ft.yaml
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_sg14_zp1_mace_prior_dataset_w3.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
+      - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
