@@ -202,12 +202,21 @@ def test_existing_family_is_unchanged():
     assert not any('equipartition' in k for k in off), sorted(off)
     assert set(on) - new == set(off), sorted(set(on) ^ set(off))
     for key, v in off.items():
+        if 'Per DoF' in key:         # reads the batch's own counts: checked below
+            continue
         a, b, c = on[key], v, no_batch[key]
         if hasattr(a, 'tolist'):
             a, b, c = a.tolist(), b.tolist(), c.tolist()
         assert a == b == c, (key, a, b, c)
     assert off['Nonthermal Threshold'] == 24.0
     assert abs(off['Nonthermal Fraction'] - 2 / 6) < 1e-6
+    # excess per degree of freedom of the row's own molecule, with the equipartition bar on
+    # or off: energy / [2, 4, 6, 2, 4, 6] here, and energy / K without a carrier batch
+    per_dof = (energy / torch.tensor([2., 4., 6., 2., 4., 6.], dtype=torch.float64))
+    for run in (on, off):
+        assert abs(run['Excess Energy Nats Per DoF Mean'] - float(per_dof.mean())) < 1e-9
+        assert abs(run['Excess Energy Nats Per DoF P50'] - float(per_dof.median())) < 1e-9
+    assert abs(no_batch['Excess Energy Nats Per DoF Mean'] - float((energy / K).mean())) < 1e-9
 
 
 def test_log_thermo_properties_hands_the_batch_through():

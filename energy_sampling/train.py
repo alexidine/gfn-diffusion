@@ -8632,6 +8632,12 @@ class Modeller:
         metrics['Excess Energy Nats P99'] = q[2].item()
         metrics['Excess Energy Nats Max'] = u.max().item()
         metrics['Excess Energy Nats'] = arr(torch.log10(1.0 + u))  # log10 hist: u is non-negative and heavy-tailed
+        # the same u per degree of freedom of the row's own molecule (row_dof_count):
+        # equipartition puts the thermal mean at 1/2 whatever the molecule's size
+        k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
+        u_dof = u / k_row.to(u.dtype).clamp_min(1.0)
+        metrics['Excess Energy Nats Per DoF Mean'] = u_dof.mean().item()
+        metrics['Excess Energy Nats Per DoF P50'] = u_dof.median().item()
 
         # the bar itself, emitted only when it moves: a reading in nats is
         # uninterpretable later without the threshold it was scored against
@@ -8644,12 +8650,6 @@ class Modeller:
         if p_eq is None or float(p_eq) <= 0:
             return
         window = getattr(self.args, 'nonthermal_basin_window_kT', 10.0)
-        k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
-        # the same u per degree of freedom of the row's own molecule: equipartition puts
-        # the thermal mean at 1/2 whatever the molecule's size
-        u_dof = u / k_row.to(u.dtype).clamp_min(1.0)
-        metrics['Excess Energy Nats Per DoF Mean'] = u_dof.mean().item()
-        metrics['Excess Energy Nats Per DoF P50'] = u_dof.median().item()
         u_star_row = equipartition_bar(k_row, float(p_eq),
                                        0.0 if window is None else float(window)).to(u.dtype)
         hot_eq = u > u_star_row
