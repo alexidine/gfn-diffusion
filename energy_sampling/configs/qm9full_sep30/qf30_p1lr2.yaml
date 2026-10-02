@@ -56,7 +56,7 @@ lr_control:
   fixed_scale: 2.0
   verbose: true
   hard_failure:
-    loss_excursion_k: 10.0
+    loss_excursion_k: 40.0
     grad_excursion_x: 100.0
     loss_abs: 1000000.0
     grad_abs: 50000000.0
@@ -78,7 +78,7 @@ lr_control:
     - 64
   trial_settle_steps: 10
   logz_detour_nats: null
-  fire_cut_factor: 0.5
+  fire_cut_factor: 1.0
   fire_cooldown_steps: 100
 profiling:
   enabled: false
@@ -142,7 +142,7 @@ max_batch_size: 20000
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 100000
+epochs: 1000000
 eval_period: 250
 figs_period: 500
 batch_growth_factor: 1.6

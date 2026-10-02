@@ -26,6 +26,13 @@ TWO LEGS, one INDEX row each; the job script's array is the second.
                   (LRController._open_bracket), so leg 0 resumed under a new fixed_scale keeps 0.05. A weights-only
                   load starts the step count, the optimizers and the controller fresh: burn_in_steps at
                   burn_in_scale, then the geometric ramp to fixed_scale.
+                  A leg that promotes above its burn-in scale also takes the controller guard the hot MLE batteries
+                  ran under (mle_sep09, mle_w3_sep16, mle_nig_sep17): hard_failure.loss_excursion_k 40 and
+                  fire_cut_factor 1.0. The base's 10 and 0.5 are the pair prod_aug28/make.py measured: the bar is
+                  fitted in burn-in, where the loss band is narrow, and held through the promotion, so the
+                  promotion transient fires it and each fire halves the rate for the rest of the stage (5 of 20
+                  prod_aug26 arms). And epochs 1,000,000: the step count restarts at 0 and the base's 100,000 would
+                  end a stage that is stopped by hand.
 
 PHASE 2, once the owner picks the seed: the extreme TB recipe from the seed, weights only, as two arms --
 A untrusted_z global, B untrusted_z head (the small learned head). Not generated here yet.
@@ -63,6 +70,14 @@ BASE_SCALE = 0.05
 LEGS = (('p1', BASE_SCALE, None),
         ('p1lr2', 2.0, 'p1'))
 LIVE = 1    # the INDEX row the job script's array launches
+# (hard_failure.loss_excursion_k, fire_cut_factor, epochs): the base's, and a promoting leg's
+BASE_GUARD = (10.0, 0.5, 100_000)
+HOT_GUARD = (40.0, 1.0, 1_000_000)
+
+
+def _guard(cfg):
+    lc = cfg['lr_control']
+    return lc['hard_failure']['loss_excursion_k'], lc['fire_cut_factor'], cfg['epochs']
 
 
 def build_p1(run_name, scale, warm):
@@ -75,7 +90,10 @@ def build_p1(run_name, scale, warm):
     cfg['continue_from_checkpoint'] = w3.CONT_PLACEHOLDER
     lc = cfg['lr_control']
     assert (lc['fixed_scale'], lc['seed_lr']) == (BASE_SCALE, SEED_LR), (lc['fixed_scale'], lc['seed_lr'])
+    assert _guard(cfg) == BASE_GUARD, _guard(cfg)
     lc['fixed_scale'] = scale
+    if scale != lc['burn_in_scale']:
+        lc['hard_failure']['loss_excursion_k'], lc['fire_cut_factor'], cfg['epochs'] = HOT_GUARD
     cfg['prior_path'] = f'{w3.CLUSTER_DATA}/{PRIOR}'
     cfg['molecules_path'] = f'{w3.CLUSTER_DATA}/{CONDITIONS}'
     cfg['test_molecules_path'] = f'{w3.CLUSTER_DATA}/{TEST}'
@@ -128,6 +146,7 @@ def check_p1(cfg, name, scale, warm):
     assert lc['mode'] == 'fixed' and lc['seed_lr'] == SEED_LR and lc['fixed_scale'] == scale, name
     # fixed_scale acts on the rate train_prior steps (lr_back, managed when 'auto') and no rail holds it
     assert st[0]['train_mode'] == 'bwd' and cfg['lr_back'] == 'auto' and cfg.get('max_lr') is None, name
+    assert _guard(cfg) == (BASE_GUARD if scale == lc['burn_in_scale'] else HOT_GUARD), (name, _guard(cfg))
     w3._scan_local_paths(cfg, name)
 
 
