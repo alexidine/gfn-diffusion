@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-0
+#SBATCH --array=1-1
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
 
-# qm9full_sep30: phase 1 (train_prior) of the conditional GFN on the full-QM9 prior, from scratch; stopped by hand, archives every 5000 steps are the phase-2 seeds.
+# qm9full_sep30: phase 1 (train_prior) of the conditional GFN on the full-QM9 prior; row 0 from scratch, row 1 weights-only from row 0; stopped by hand, archives every 5000 steps are the phase-2 seeds.
 # Arm = row of INDEX.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
@@ -61,7 +61,7 @@ if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
 fi
 
 # RESUME OR START. checkpoint_name always wins in train.py, so a requeue blanks it and auto-resumes
-# its own _running.pt. A first launch seeds weights-only from the mle09 _best.pt (warm) or from
+# its own _running.pt. A first launch seeds weights-only from the warm_src arm's _best.pt (warm) or from
 # nothing (fresh, SRC "-").
 OWN=$(ls -t ${CKPTS}/*${ARM}_*_running.pt 2>/dev/null | head -1)
 if [ -n "${OWN}" ]; then
