@@ -50,7 +50,7 @@ from models.graph_encodings import (
     bond_features_from_smiles, cycle_rank, degree_histogram, diameter, eccentricity,
     graph_from_smiles, lap_pe, orbit_sizes, ring_membership, rwse, shortest_paths,
     smallest_ring_size, spectral_moments, to_dense_adjacency, wiener_index,
-    cip_codes, wl_colours, pi_degree, mol_for_labels, canonical_root,
+    cip_codes, wl_colours, pi_degree, mol_for_labels, canonical_root, bond_stereo_codes,
 )
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
@@ -122,8 +122,12 @@ def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
     return out
 
 
-def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
-    """QM9 with chirality ASSIGNED ARBITRARILY at every genuine tetrahedral centre.
+def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40)),
+                    double_bonds: bool = False) -> List[str]:
+    """QM9 with chirality ASSIGNED ARBITRARILY at every genuine tetrahedral centre, and with
+    ``double_bonds`` E or Z likewise at every double bond `FindPotentialStereo` reports (bit
+    32 + j of the same per-molecule hash): raw QM9 carries no E/Z either, so without it the
+    bond-stereo column of stereo features 2 is identically zero in training.
 
     QM9 AS STORED HAS NO STEREOCHEMISTRY -- 0.0% of molecules carry a chiral tag, in the full
     133k set exactly as in the anchor subset -- so `graph_from_smiles`' parity column is
@@ -171,6 +175,21 @@ def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[st
                         Chem.ChiralType.CHI_TETRAHEDRAL_CW if (bits >> (j % 64)) & 1
                         else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
                 Chem.AssignStereochemistry(m, cleanIt=True, force=True)
+            if double_bonds:
+                # AFTER the tetrahedral pass: AssignStereochemistry(cleanIt) drops a bond
+                # stereo set this way, and MolToSmiles alone writes it
+                bonds = [e for e in Chem.FindPotentialStereo(m) if str(e.type) == 'Bond_Double']
+                if bonds:
+                    bits = int.from_bytes(
+                        hashlib.blake2b(smi.encode(), digest_size=8).digest(), 'big')
+                    no = Chem.StereoInfo.NOATOM
+                    for j, e in enumerate(bonds):
+                        ca = list(e.controllingAtoms)
+                        b = m.GetBondWithIdx(e.centeredOn)
+                        b.SetStereoAtoms(int(next(a for a in ca[:2] if a != no)),
+                                         int(next(a for a in ca[2:] if a != no)))
+                        b.SetStereo(Chem.BondStereo.STEREOCIS if (bits >> (32 + j % 32)) & 1
+                                    else Chem.BondStereo.STEREOTRANS)
             out.append(Chem.MolToSmiles(m))
         except Exception:
             continue
@@ -320,8 +339,10 @@ PROBES: List[Probe] = [
     #: mean 2p-1 at sign accuracy p, so exact-match-after-rounding reports EXACTLY 0% until
     #: p > 0.75. Harmless for a tripwire that should sit at ~100%; do NOT reuse this scoring
     #: for a hard +/-1 target -- use classification.
+    #: the label IS the parity input column (`graph_from_smiles` at the sample's stereo
+    #: features), so at features 2 it carries r/s where the input does.
     Probe('cip_code', 'E', 1,
-          lambda ctx: cip_codes(ctx['mol']).astype(float)[:, None], True,
+          lambda ctx: ctx['parity'].astype(float)[:, None], True,
           nonzero_only=True),
     #: THE REAL CHIRALITY TEST now that `cip_code` is a tripwire: the sign is an input column
     #: but the WL weight is not, so no copy of a single input reproduces it.
@@ -346,11 +367,39 @@ PROBES: List[Probe] = [
     #: over 600 distinct stereoisomer pairs is 90.7% against the hash's 91.2%, and the model
     #: already computes this exact quantity at 100/100 on `spd_to_marked`.
     Probe('chiral_moment', 'E', 1,
-          lambda ctx: np.array([float((cip_codes(ctx['mol']) *
+          lambda ctx: np.array([float((ctx['parity'] *
                                        (1.0 + np.where(ctx['spd'][ctx['root']] < 0, 0,
                                                        ctx['spd'][ctx['root']]))).sum())]),
           False),
 ]
+
+#: DOUBLE-BOND GEOMETRY, the bond-feature column of stereo features 2. NOT in `PROBES`: at
+#: features 1 the column does not exist and both labels are identically zero, so `main`
+#: appends these only at features 2. `ez_code` is the tripwire, per ATOM: each end of a
+#: labelled bond carries that bond's E/Z code, so it is the edge input moved one hop -- under
+#: ~100% the column is not surviving the encoder. `ez_moment` is `chiral_moment`'s
+#: counterpart: each labelled bond's code weighted by 1 + its nearer end's distance to the
+#: marked atom, so no sum of one input column reproduces it.
+EZ_PROBES: List[Probe] = [
+    Probe('ez_code', 'E', 1,
+          lambda ctx: _ez_per_atom(ctx).astype(float)[:, None], True, nonzero_only=True),
+    Probe('ez_moment', 'E', 1,
+          lambda ctx: np.array([_ez_moment(ctx)]), False),
+]
+
+
+def _ez_per_atom(ctx) -> np.ndarray:
+    out = np.zeros(ctx['n'], dtype=np.float64)
+    for (a, b), c in zip(ctx['e'].T.tolist(), ctx['bond_stereo'].tolist()):
+        out[a] += c
+        out[b] += c
+    return out
+
+
+def _ez_moment(ctx) -> float:
+    d = np.where(ctx['spd'][ctx['root']] < 0, 0, ctx['spd'][ctx['root']])
+    return float(sum(c * (1.0 + min(d[a], d[b]))
+                     for (a, b), c in zip(ctx['e'].T.tolist(), ctx['bond_stereo'].tolist())))
 
 #: RETIRED 2026-08-31 after a task-design audit, with reasons:
 #:   n_atoms       exactly formula.sum() and degree_hist.sum() (100% agreement)
@@ -405,8 +454,9 @@ def atom_features(z, edge_index, parity, n, root: int = 0) -> np.ndarray:
     return np.concatenate([el, dg, parity.astype(float)[:, None], is_root], axis=1)
 
 
-def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Sample:
-    z, e1, parity = graph_from_smiles(smiles)
+def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0,
+                 stereo: int = 1) -> Sample:
+    z, e1, parity = graph_from_smiles(smiles, stereo=stereo)
     n = len(z)
     # CANONICAL RANK, so the root is a function of the molecule and is REPRODUCIBLE. Atom
     # index 0 was a serialisation property (20.7% label survival); resampling per call fixed
@@ -414,7 +464,7 @@ def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Samp
     # memorisation measure at all.
     mol = mol_for_labels(smiles)
     root = canonical_root(mol)
-    bf = bond_features_from_smiles(smiles)
+    bf = bond_features_from_smiles(smiles, stereo=stereo)
     edge_index = np.concatenate([e1, e1[::-1]], axis=1)
     edge_attr = np.concatenate([bf, bf], axis=0)
     spd = shortest_paths(e1, n)
@@ -424,7 +474,9 @@ def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Samp
     s = Sample(smiles, n, atom_features(z, e1, parity, n, root), struct,
                edge_index, edge_attr, spd)
     ctx = {'z': z, 'e': e1, 'n': n, 'spd': spd, 'root': root, 'parity': parity,
-           'mol': mol}
+           'mol': mol,
+           'bond_stereo': (bond_stereo_codes(mol) if stereo >= 2
+                           else np.zeros(e1.shape[1], dtype=np.int64))}
     for p in PROBES:
         v = np.asarray(p.fn(ctx), dtype=np.float64)
         s.labels[p.name] = v.reshape(n, p.dim) if p.per_node else v.reshape(1, p.dim)
@@ -704,7 +756,7 @@ def probe_tolerances(samples):
 
 
 def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device,
-        save_to: Optional[str] = None, weighting: str = 'none'):
+        save_to: Optional[str] = None, weighting: str = 'none', stereo: int = 1):
     cfg = ARMS[arm]
     torch.manual_seed(seed); np.random.seed(seed)
     mu, sd = target_stats(train, device)
@@ -785,7 +837,10 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
         torch.save({'state_dict': model.state_dict(), 'arm': arm, 'seed': seed,
                     'n_train': len(train), 'hidden': hidden, 'layers': layers, 'k': k,
                     'attention': cfg['attention'], 'best_step': best_step,
-                    'best_heldout': best_ho, 'steps_run': steps}, save_to)
+                    'best_heldout': best_ho, 'steps_run': steps,
+                    # models/encoder_cache.load_encoder builds its inputs at this level; a
+                    # checkpoint without the key is level 1
+                    'stereo_features': int(stereo)}, save_to)
     return {'arm': arm, 'seed': seed, 'n_train': len(train), 'steps': steps, 'curve': curve,
             'best_step': best_step, 'best_heldout': best_ho,
             'n_params': int(sum(p.numel() for p in model.parameters())),
@@ -864,6 +919,11 @@ def main(argv=None):
                     help='stereo-enumerated QM9. ON by default: raw QM9 has 0.0%% chiral '
                          'tags, so the parity channel is dead and chirality untestable')
     ap.add_argument('--no-stereo', dest='stereo', action='store_false')
+    ap.add_argument('--stereo-features', type=int, default=2, choices=[1, 2],
+                    help='models/graph_encodings.STEREO_FEATURES. 2 (default): r/s at '
+                         'pseudo-asymmetric centres in the parity column, an E/Z bond '
+                         'column, E/Z assigned on the training molecules, and the two '
+                         'ez probes. 1: the inputs of checkpoints written before the flag')
     ap.add_argument('--match-params', action='store_true', default=True,
                     help='size each arm to a common parameter budget')
     ap.add_argument('--no-match-params', dest='match_params', action='store_false')
@@ -887,8 +947,10 @@ def main(argv=None):
         a.sizes, a.n_test, a.steps = [60], 60, 40
         a.hidden, a.layers, a.k, a.seeds = 32, 2, 6, [0]
 
+    global PROBES
+    if a.stereo_features >= 2:
+        PROBES = PROBES + [p for p in EZ_PROBES if p.name not in {q.name for q in PROBES}]
     if a.probes:
-        global PROBES
         unknown = set(a.probes) - {p.name for p in PROBES}
         if unknown:
             raise SystemExit(f'unknown probes {sorted(unknown)}; '
@@ -900,7 +962,7 @@ def main(argv=None):
     if a.ladder_only:
         smis = size_ladder()
     elif a.stereo:
-        smis = load_qm9_stereo(need)
+        smis = load_qm9_stereo(need, double_bonds=a.stereo_features >= 2)
     else:
         smis = load_qm9(need)
     print(f'{len(smis)} molecules; building samples per encoding ...')
@@ -910,7 +972,7 @@ def main(argv=None):
         built, skels = [], []
         for smi in smis:
             try:
-                sample = build_sample(smi, enc, a.k)
+                sample = build_sample(smi, enc, a.k, stereo=a.stereo_features)
             except Exception:
                 continue
             built.append(sample)
@@ -928,7 +990,9 @@ def main(argv=None):
         cache[enc] = [built[i] for i in order]
         group_ids[enc] = [key_id[skels[i]] for i in order]
         n_chiral = sum(1 for b in cache[enc] if (b.labels['cip_code'] != 0).any())
-        print(f'  {enc}: {len(built)} usable, {n_chiral} with a stereocentre')
+        n_ez = sum(1 for b in cache[enc] if (b.edge_attr[:, 4:] != 0).any())
+        print(f'  {enc}: {len(built)} usable, {n_chiral} with a stereocentre, '
+              f'{n_ez} with a labelled double bond')
 
     ref = cache[ARMS[a.arms[0]]['encoding']]
     # SNAP THE HELD-OUT BOUNDARY TO A GROUP EDGE. Groups are contiguous, so advancing to the
@@ -974,7 +1038,7 @@ def main(argv=None):
                 ck = os.path.join(a.save_dir, f'{arm}_n{n}_s{seed}.pt')
                 r = run(arm, rest[:n], test, a.steps, hidden[arm], a.layers, a.k,
                         a.batch_mols, a.lr, seed, a.device, save_to=ck,
-                        weighting=a.loss_weighting)
+                        weighting=a.loss_weighting, stereo=a.stereo_features)
                 rows.append(r)
                 per_seed.append(r)
                 params = r['n_params']
