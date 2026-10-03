@@ -89,12 +89,22 @@ is in every training row's residual. On top of the recipe, in every arm:
   - cluster budgets: final_sep19's eLJ eval budget, phase 1's held-out sample count, and an archive with buffers every
     10,000 steps and not 5000: a buffers file holds the whole anchor buffer, 2.8 KB a row on the smoke run's sidecar,
     so about 3.5 to 4 GB an arm here against phase 1's 1.19 GB
+LEG C, P_B LEFT TRAINABLE (owner 2026-10-03: "did we have unfrozen Pb on this battery? we should have"). Every
+leg-b arm freezes P_B on entering the TB stage (on_enter freeze_pb, the recipe's setting). Leg c is three leg-b arms
+with that action removed and nothing else changed (asserted), in their own INDEX_c.tsv and job script, so that
+submitting it cannot relaunch a leg-b arm that is running:
+  [0] qf30_upb_lr5   qf30_fwdF_lr5 with P_B live (6.25e-5; owner 2026-10-03, on forward Jensen: "qf30_fwdF_lr5 is
+                     winning")
+  [1] qf30_upb_lr2   qf30_tbg with P_B live (the baseline)
+  [2] qf30_upb_tbl   qf30_tbl with P_B live (learned Z, the arm whose backward residual carries the whole level gap)
+Forward seat only. Forward Jensen stays comparable across the two legs: E_PF[log R + log P_B - log P_F] is a lower
+bound on log Z under any P_B.
 THE SEED (final_sep19's job script, SEED_B): leg 1's newest 5000-step archive, or its _running.pt with SRC_RUNNING=1.
 Each arm resolves it at its own first launch, so the arms share a seed only if leg 1 is not writing meanwhile:
 cancel it first. A resubmission resumes the arm's own _running.pt in full.
 
     python configs/qm9full_sep30/make.py p1
-    python configs/qm9full_sep30/make.py arms [--dry]
+    python configs/qm9full_sep30/make.py arms [--dry]      # legs b and c
 """
 import copy
 import importlib.util
@@ -146,6 +156,9 @@ ARMS = (('tbg', 'fwd', True, 0.2, 'global'),
         ('repN_lr2', 'replay', False, 0.2, 'global'),
         ('repF_lr2', 'replay', True, 0.2, 'global'),
         ('tbl', 'fwd', True, 0.2, 'learned'))
+# leg c: (run_name, the leg-b run it is with the stage's freeze_pb removed). ROW ORDER IS THE ARRAY INDEX: append only.
+LIVE_PB = (('upb_lr5', 'fwdF_lr5'), ('upb_lr2', 'tbg'), ('upb_tbl', 'tbl'))
+ON_ENTER = ['rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb']
 P2_SCALES = (0.2, 0.5)
 BRANCHES = ('fwd', 'bwd', 'replay')
 # prod_sep20's replay seat: rollout period, replay share, mean residence in steps, the held-out split of final_sep19
@@ -278,7 +291,7 @@ def _replay_seat(cfg, vc, force):
     cfg['z_calibration']['fill_threshold'] = rs['fill_threshold']
 
 
-def build_arm(run, seat, force, scale, z, p1):
+def build_arm(run, seat, force, scale, z, p1, live_pb=False):
     cfg = yaml.safe_load(RECIPE.read_text(encoding='utf-8'))
     lc, ab = cfg['lr_control'], cfg['buffers']['anchor_buffer']
     recipe_is = (lc['fixed_scale'], lc['fire_cut_factor'], lc['hard_failure']['loss_excursion_k'], cfg['epochs'],
@@ -317,10 +330,12 @@ def build_arm(run, seat, force, scale, z, p1):
         _replay_seat(cfg, vc, force)
     elif not force:
         vc['loss_coeffs']['fwd'].update(reward_grads=0.0, path_grad_last_k=0)
+    if live_pb:
+        vc['on_enter'] = [a for a in vc['on_enter'] if a != 'freeze_pb']
     return cfg
 
 
-def check_arm(cfg, name, seat, force, scale, z, p1, n_prior_rows):
+def check_arm(cfg, name, seat, force, scale, z, p1, n_prior_rows, live_pb=False):
     assert seat in ('fwd', 'replay') and scale in P2_SCALES and z in ('global', 'head', 'learned'), name
     assert cfg['model'] == p1['model'] and cfg['integrator'] == p1['integrator'], f"{name}: the seed's model moved"
     assert cfg['integrator']['T'] == cfg['eval_T'] == p1['eval_T'] == T, f'{name}: the trajectory length moved'
@@ -356,7 +371,10 @@ def check_arm(cfg, name, seat, force, scale, z, p1, n_prior_rows):
     assert st[0]['exit'] == STUB_EXIT and 'skip_if' not in st[0] and st[0]['on_exit'] == ['snapshot_prior'], name
     vc = st[1]
     assert vc['train_mode'] == 'fused' and vc['flags']['update_log_z'] is True, name
-    assert vc['on_enter'] == ['rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb'], (name, vc['on_enter'])
+    assert vc['on_enter'] == (ON_ENTER[:-1] if live_pb else ON_ENTER), (name, vc['on_enter'])
+    # P_B trains unless the stage freezes it: its head is learned and no load-time freeze is set
+    assert cfg['model']['learn_pb'] is True and not cfg.get('freeze_backward_policy'), name
+    assert not (live_pb and seat == 'replay'), f'{name}: a live P_B is for the forward seat'
     for branch in BRANCHES:
         c = vc['loss_coeffs'][branch]
         assert c['tb'] == 1.0 and c['tb_z_source'] == ('learned' if z == 'learned' else 'persistent'), (name, branch)
@@ -442,6 +460,24 @@ def _baseline_notices(cfg):
     return [v for v in config_invariants.check(raw) if v.severity != config_invariants.ERROR]
 
 
+def _vet(cfg, name, z):
+    """Load the arm as the job script resolves it, both ways, account for its notices, and leave the placeholder."""
+    for weights_only in (True, False):  # the first launch and a resubmission
+        probe = copy.deepcopy(cfg)
+        probe['load_weights_only'] = weights_only
+        fin.load_check(probe, name, STAGES)
+    notices = _baseline_notices(cfg)
+    if z == 'learned':
+        # the battery's one departure from the conditional persistent-Z baseline, made on purpose: the trainer
+        # prints these at load and runs, and `config_snapshot --check` reports such an arm as contract FAILED
+        assert notices and all(v.rule == 'conditional_z_settings_are_conditional' and 'tb_z_source' in v.detail
+                               for v in notices), (name, [str(v) for v in notices])
+    else:
+        assert not notices, (name, [str(v) for v in notices])
+    cfg['load_weights_only'] = WO_PLACEHOLDER
+    return cfg
+
+
 def main_arms(argv):
     dry = '--dry' in argv
     dirty = w3.dirty_files()
@@ -460,23 +496,18 @@ def main_arms(argv):
         name = f'{TAG}_{run}'
         cfg = build_arm(run, seat, force, scale, z, p1)
         check_arm(cfg, name, seat, force, scale, z, p1, n_prior_rows)
-        for weights_only in (True, False):  # the first launch and a resubmission, as the job script resolves them
-            probe = copy.deepcopy(cfg)
-            probe['load_weights_only'] = weights_only
-            fin.load_check(probe, name, STAGES)
-        notices = _baseline_notices(cfg)
-        if z == 'learned':
-            # the battery's one departure from the conditional persistent-Z baseline, made on purpose: the trainer
-            # prints these at load and runs, and `config_snapshot --check` reports this arm as contract FAILED
-            assert notices and all(v.rule == 'conditional_z_settings_are_conditional' and 'tb_z_source' in v.detail
-                                   for v in notices), (name, [str(v) for v in notices])
-        else:
-            assert not notices, (name, [str(v) for v in notices])
-        cfg['load_weights_only'] = WO_PLACEHOLDER
-        arms[name] = cfg
+        arms[name] = _vet(cfg, name, z)
     check_battery(arms)
+    live, spec = {}, {run: rest for run, *rest in ARMS}
+    for run, base_run in LIVE_PB:
+        name = f'{TAG}_{run}'
+        cfg = build_arm(run, *spec[base_run], p1, live_pb=True)
+        check_arm(cfg, name, *spec[base_run], p1, n_prior_rows, live_pb=True)
+        live[name] = _vet(cfg, name, spec[base_run][3])
+        assert _moved(arms[f'{TAG}_{base_run}'], live[name]) == [f'{VC}.on_enter'], \
+            f'{name} differs from {TAG}_{base_run} beyond the freeze'
     # the job script finds an arm's files, and the seed leg's, by `*<arm>_*`: no name may match another's
-    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + list(arms)
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + list(arms) + list(live)
     assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
     print(f'phase-2 arms, each the baseline [0] with the named differences. INDEX_b row = array index. Anchor capacity '
           f'{ANCHOR_MAX:,} for {n_prior_rows:,} prior rows; weights-only first launch from *{seed_arm}_*')
@@ -485,10 +516,13 @@ def main_arms(argv):
         frc = ('stored force on replay rows' if seat == 'replay' else 'forward force') if force else 'no force'
         print(f"[{i}] {TAG}_{run:<9} {'forward' if seat == 'fwd' else 'replay '} seat | {frc:<27} | rate "
               f"{scale * SEED_LR:.3g} (fixed_scale {scale:g}) | Z: {z_text[z]}")
+    print(f'leg c, P_B left trainable (INDEX_c row = array index):')
+    for i, (run, base_run) in enumerate(LIVE_PB):
+        print(f'[{i}] {TAG}_{run:<9} {TAG}_{base_run} without freeze_pb on entering the TB stage')
     if dry:
         print('--dry: checks passed, nothing written')
         return
-    for name, cfg in arms.items():
+    for name, cfg in {**arms, **live}.items():
         path = HERE / f'{name}.yaml'
         with path.open('w', encoding='utf-8', newline='\n') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
@@ -503,7 +537,17 @@ def main_arms(argv):
                  f'launch from {seed_arm} (its newest step archive, or its _running.pt with SRC_RUNNING=1), full '
                  f'resume afterwards; {len(arms)} arms over the rate, the terminal force, the seat and the Z of the '
                  f'residual (make.py).'))
-    print(f'wrote {len(arms)} arms, INDEX_b.tsv and submit_{BATTERY}_b.sbatch')
+    fin._write_index(HERE / 'INDEX_c.tsv',
+                     [(name, 'qm9full', 'seeded', seed_arm, PRIOR, str(prior_bytes)) for name in live])
+    with (HERE / f'submit_{BATTERY}_c.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(fin.SBATCH.format(
+            wall=fin.WALL, last=len(live) - 1, tag=TAG + 'c', battery=BATTERY, leg='c', ckpts=w3.CLUSTER_CKPTS,
+            data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+            what=f'leg-b arms of phase 2 with P_B left trainable (no freeze_pb on entering the TB stage): '
+                 f'weights-only first launch from {seed_arm} (its newest step archive, or its _running.pt with '
+                 f'SRC_RUNNING=1), full resume afterwards (make.py).'))
+    print(f'wrote {len(arms)} leg-b arms with INDEX_b.tsv and submit_{BATTERY}_b.sbatch, and {len(live)} leg-c arms '
+          f'with INDEX_c.tsv and submit_{BATTERY}_c.sbatch')
     print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
 
 
