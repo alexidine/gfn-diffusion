@@ -1,20 +1,20 @@
 #!/bin/bash
 #SBATCH --time=04:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
 #SBATCH --array=0-3
 #SBATCH --account=torch_pr_226_chemistry
-#SBATCH --job-name=po_merge
+#SBATCH --job-name=po_assemble
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool_oct02/joblogs/%x_%A_%a.out
 
-# pool_oct02 merge: one task = one system of SYSTEMS.tsv: a coordinator curate pass over the polish campaign (every
-# polish shard, RDF leader clustering at the identity cut), then pool_anchors export -> the lowest state of every basin
-# within 12 kT, in the chart the trainer reads, as <system>/anchors_polished.pt (prior layout; the seeds of the flood).
-# The GPU is used only by the export's re-scoring (UMA). Safe to repeat: new shards are ingested, the export rewritten.
+# pool_oct02 assemble: one task = one system of SYSTEMS.tsv: data_processing/pool_assemble.py on anchors_polished.pt
+# and every flood shard -> <system>/<system>_pooled_oct02_prior.pt (anchors + flood, latent de-dupe, normaliser images;
+# 'prior' and 'equalized_prior' hold the same rows; a sample of rows re-scored). Environment: DEDUPE (default 0.01, the
+# latent radius), TARGET_ROWS (default 400000: the flood radius widens until the file holds at most that many rows).
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -31,9 +31,8 @@ ROW=$((SLURM_ARRAY_TASK_ID + 2))
 read -r NAME SG KEY TSF MOL PRE <<< "$(awk -F'\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7}' ${ARMS}/SYSTEMS.tsv)"
 if [ -z "${NAME}" ]; then echo "no system at task ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 
-CAMP=${DATA}/${NAME}/polish
-if [ ! -d "${CAMP}/shards" ]; then echo "${NAME}: no polish shards yet; nothing to merge"; exit 0; fi
-echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} merge ${NAME} (sg ${SG}, ${KEY}): $(find ${CAMP}/shards -name '*.pt' | wc -l) shards start=$(date -Is)"
+if [ ! -d "${DATA}/${NAME}/flood" ]; then echo "${NAME}: no flood yet; nothing to assemble"; exit 0; fi
+echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} assemble ${NAME} start=$(date -Is)"
 
 srun singularity exec --nv \
     --overlay ${OVERLAY}:ro \
@@ -45,9 +44,9 @@ srun singularity exec --nv \
     /bin/bash -c "
         source /ext3/env.sh
         export PYTHONPATH=${MXT_ROOT}:${PROJECT_ROOT}/gfn-diffusion:${PYLIBS}:\$PYTHONPATH
-        python -u -m mxtaltools.crystal_search.coordinator ${CAMP} || exit 1
-        python -u -m data_processing.pool_anchors export ${CAMP} ${DATA}/${NAME}/anchors_polished.pt \
-            --mol ${MOL} --sg ${SG} --key ${KEY} --tsf ${TSF} --window 12 --mlip_path ${UMA}
+        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors_polished.pt ${DATA}/${NAME}/flood \
+            ${DATA}/${NAME}/${NAME}_pooled_oct02_prior.pt --sg ${SG} --key ${KEY} --mol ${MOL} --mlip_path ${UMA} \
+            --dedupe ${DEDUPE:-0.01} --target-rows ${TARGET_ROWS:-400000}
     "
 RC=$?
 echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} status=${RC} end=$(date -Is)"

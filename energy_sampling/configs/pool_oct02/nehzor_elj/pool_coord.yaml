@@ -1,0 +1,25 @@
+bands_kT:
+  10kT: 10.0
+  1kT: 1.0
+  2kT: 2.0
+  3kT: 3.0
+  5kT: 5.0
+energy_key: elj
+energy_model_id: elj
+energy_ref: null
+hard_cap: .inf
+hops: null
+identity_calibrated: false
+identity_cut: 0.122
+identity_note: 'provisional atomwise cut for NEHZOR: min(UMA 1 kT thermal width, COMPACK
+  d(P=0.95)) of the paper calibration; recalibrate with campaign_compack on this campaign'
+kT: 16.030467154494144
+mol_path: /scratch/mk8347/data/crystal_datasets/nehzor/NEHZOR0_std_conf.pt
+passes_to_confirm: 2
+priors: []
+rdf_batch: 64
+rdf_mode: atomwise
+sg: 14
+streams: {}
+window_kT: 10.0
+z_prime: 1

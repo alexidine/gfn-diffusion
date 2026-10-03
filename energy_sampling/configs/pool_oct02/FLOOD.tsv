@@ -1,0 +1,16 @@
+task	name	shard	n_shards	key	cut	args
+0	mipcas_elj	0	1	elj	0.071	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+1	mipcas_uma	0	4	uma	0.071	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+2	mipcas_uma	1	4	uma	0.071	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+3	mipcas_uma	2	4	uma	0.071	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+4	mipcas_uma	3	4	uma	0.071	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+5	nehzor_elj	0	2	elj	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+6	nehzor_elj	1	2	elj	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+7	nehzor_uma	0	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+8	nehzor_uma	1	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+9	nehzor_uma	2	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+10	nehzor_uma	3	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+11	nehzor_uma	4	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+12	nehzor_uma	5	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+13	nehzor_uma	6	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise
+14	nehzor_uma	7	8	uma	0.122	--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 --seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise

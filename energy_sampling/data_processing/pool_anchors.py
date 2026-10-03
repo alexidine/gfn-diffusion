@@ -29,7 +29,8 @@ trainer's agree. Embedded rows are not minima; the polish relaxes them.
 `export` writes a prior file in train.py's layout: {'prior': batch, 'equalized_prior': the same batch,
 'thermal_scaling_factor': --tsf, 'uma_energy_state': 2 for uma}, every row's energy attribute (--key) its energy READ
 THE TRAINER'S WAY (raw eLJ, or the UMA lattice energy), and every row checked: trainer-read energy against the
-registry's stored energy (embedded rows are re-scored, so they are reported apart), and a zero reduction penalty.
+registry's stored energy (embedded rows are re-scored, so they are reported apart), and a zero reduction penalty. Rows
+failing a check are left out and counted; the export is refused when they exceed 2% of the rows.
 """
 import argparse
 import os
@@ -45,6 +46,7 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 
 EDGE = 0.9999  # mxtaltools crystal_opt_utils.CELL_EDGE: the builders clip a centre to [0, EDGE]
 ANALYZE_KW = dict(cutoff=10, supercell_size=10, std_orientation=False)  # MolecularCrystal.analyze_crystal_batch
+RED_TOL = 1e-6  # a row with a larger reduction penalty is outside the reduced-cell domain the trainer penalises leaving
 
 
 def vec(*v):
@@ -106,9 +108,21 @@ class Chart:
         c = (c - torch.floor(c)).clamp(0.0, EDGE)
         R, rms = proper_fit(self.M[None].expand(n, -1, -1), self.cen(X))
         out.aunit_centroid = c.to(like.aunit_centroid.dtype)
-        out.aunit_orientation = canonicalize_rotvec(rotmat2rotvec(R.float(), warn_on_bad_determinant=False)).to(
-            like.aunit_orientation.dtype)
+        # scipy's conversion: rotmat2rotvec loses the axis for rotation angles near pi (2 of 3000 MIPCAS images read
+        # back hundreds of eLJ units off, 2026-10-03)
+        from scipy.spatial.transform import Rotation
+        rv = torch.from_numpy(Rotation.from_matrix(R.numpy()).as_rotvec()).float()
+        out.aunit_orientation = canonicalize_rotvec(rv).to(like.aunit_orientation.dtype)
         out.pos = self.M[None].expand(n, -1, -1).reshape(-1, 3).to(like.pos.dtype)
+        # the stored pose must rebuild the atoms it was fitted to
+        back = self.frac_atoms(out)
+        dev = (torch.einsum('nij,naj->nai', out.T_fc.double(), back) - X - torch.einsum(
+            'nij,nj->ni', out.T_fc.double(), c - torch.einsum('nij,nj->ni', out.T_cf.double(), self.centre(X)))[:, None]
+               ).norm(dim=-1).amax(1)
+        exact = rms < 1e-3  # an embedded row's fit leaves a real residual; its pose is checked by re-scoring
+        if bool(exact.any()) and float(dev[exact].max()) > 5e-3:
+            raise RuntimeError(f'describe: a stored pose is {float(dev[exact].max()):.3g} A off the atoms it was '
+                               f'fitted to')
         return out, rms
 
     def frac_atoms(self, b):
@@ -243,8 +257,14 @@ def main(argv=None):
     print(f'trainer-read energy vs stored, exact rows: median |d| {float(d[ex].median()):.4f}, max {float(d[ex].max()):.4f} '
           f'({int((d[ex] > tol).sum())} over {tol:.3f}); embedded rows: median change {float((e - E)[emb].median()) / cfg.kT if bool(emb.any()) else 0:+.3f} kT; '
           f'reduction penalty max {float(red.max()):.3g}', flush=True)
-    if int((d[ex] > tol).sum()) or float(red.max()) > 0:
-        raise SystemExit('export refused: a row does not read back as stored, or carries a reduction penalty')
+    bad = (ex & (d > tol)) | (red > RED_TOL) | ~torch.isfinite(e)
+    if bool(bad.any()):  # a few such rows are left out; many mean the conversion is wrong
+        print(f'left out: {int((ex & (d > tol)).sum())} rows that do not read back as stored, {int((red > RED_TOL).sum())} '
+              f'with a reduction penalty over {RED_TOL}, {int((~torch.isfinite(e)).sum())} non-finite', flush=True)
+        if float(bad.double().mean()) > 0.02:
+            raise SystemExit(f'export refused: {int(bad.sum())} of {len(bad)} rows fail the read-back checks')
+        good = torch.nonzero(~bad).flatten()
+        tb, emb, e, keep = tb.subsample_new_batch(good), emb[good], e[good], keep[good]
     setattr(tb, a.key, e.float())
     blob = {'prior': tb, 'equalized_prior': tb, 'thermal_scaling_factor': a.tsf if a.tsf is not None else 1,
             'basin': keep, 'embedded': emb, 'registry': os.path.abspath(a.reg_dir)}
