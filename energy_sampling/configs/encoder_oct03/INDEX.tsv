@@ -1,0 +1,4 @@
+arm	hidden	layers
+enc03_w128	128	4
+enc03_w192	192	4
+enc03_w256l6	256	6

@@ -63,7 +63,8 @@ MAX_DEGREE = 5
 
 # --------------------------------------------------------------------------- molecules
 
-def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
+def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40)),
+             source: Optional[str] = None) -> List[str]:
     """SMILES from the FULL QM9 dataset -- 133,728 molecules, every SMILES distinct.
 
     USE THE FULL SET, NOT THE ANCHOR CHUNKS. Until 2026-09-01 this read
@@ -88,6 +89,22 @@ def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
     the subset. Anything touching chirality must go through :func:`load_qm9_stereo`.
     """
     import torch as _t
+    if source:
+        # a (dataset_index, smiles) table, tab-separated with a header, optionally gzipped:
+        # configs/conformer_db_sep29/qm9_index.tsv.gz is the full set in the repository
+        import csv
+        import gzip
+        opener = gzip.open if str(source).endswith('.gz') else open
+        out, seen = [], set()
+        with opener(source, 'rt', newline='') as f:
+            for row in csv.DictReader(f, delimiter='\t'):
+                smi = row['smiles']
+                if smi and smi not in seen:
+                    seen.add(smi)
+                    out.append(smi)
+                    if len(out) >= n:
+                        return out
+        raise RuntimeError('asked for %d unique molecules, %s holds %d.' % (n, source, len(out)))
     if os.path.exists(QM9_FULL):
         out, seen = [], set()
         for s in _t.load(QM9_FULL, weights_only=False, map_location='cpu'):
@@ -123,7 +140,7 @@ def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
 
 
 def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40)),
-                    double_bonds: bool = False) -> List[str]:
+                    double_bonds: bool = False, source: Optional[str] = None) -> List[str]:
     """QM9 with chirality ASSIGNED ARBITRARILY at every genuine tetrahedral centre, and with
     ``double_bonds`` E or Z likewise at every double bond `FindPotentialStereo` reports (bit
     32 + j of the same per-molecule hash): raw QM9 carries no E/Z either, so without it the
@@ -160,7 +177,7 @@ def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40)),
     import hashlib
 
     out = []
-    for smi in load_qm9(n, chunks):
+    for smi in load_qm9(n, chunks, source=source):
         m = Chem.MolFromSmiles(smi)
         if m is None:
             continue
@@ -756,7 +773,17 @@ def probe_tolerances(samples):
 
 
 def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device,
-        save_to: Optional[str] = None, weighting: str = 'none', stereo: int = 1):
+        save_to: Optional[str] = None, weighting: str = 'none', stereo: int = 1,
+        lr_schedule: str = 'constant', lr_final: float = 0.0, warmup: int = 0,
+        state_path: Optional[str] = None, save_every: int = 0, verbose: bool = False):
+    """One arm at one training-set size and seed.
+
+    ``lr_schedule`` 'cosine' takes the rate from ``lr`` to ``lr_final`` over the run, after
+    ``warmup`` linear steps from 0 ('constant' keeps ``lr`` after the warm-up). With
+    ``state_path`` and ``save_every`` the run writes its full training state there every
+    ``save_every`` steps and CONTINUES from that file when it exists, so a run longer than
+    one job is resubmitted unchanged; a state written by a different run is refused.
+    """
     cfg = ARMS[arm]
     torch.manual_seed(seed); np.random.seed(seed)
     mu, sd = target_stats(train, device)
@@ -765,10 +792,37 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
     model.weighting = weighting
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
+    if lr_schedule not in ('constant', 'cosine'):
+        raise ValueError(f"lr_schedule {lr_schedule!r}: 'constant' or 'cosine'")
+
+    def _lr(step):
+        if step < warmup:
+            return lr * (step + 1) / warmup
+        if lr_schedule == 'constant':
+            return lr
+        frac = (step - warmup) / max(1, steps - warmup)
+        return lr_final + 0.5 * (lr - lr_final) * (1.0 + np.cos(np.pi * min(1.0, frac)))
 
     model.train()
     curve = []
     best_ho, best_step, best_state = float('inf'), -1, None
+    identity = {'arm': arm, 'seed': seed, 'n_train': len(train), 'steps': steps,
+                'hidden': hidden, 'layers': layers, 'batch_mols': batch_mols, 'lr': lr,
+                'lr_schedule': lr_schedule, 'stereo': int(stereo),
+                'probes': [p.name for p in PROBES]}
+    step0 = 0
+    if state_path and os.path.exists(state_path):
+        st = torch.load(state_path, map_location=device, weights_only=False)
+        if st['identity'] != identity:
+            diff = {kk: (st['identity'].get(kk), v) for kk, v in identity.items()
+                    if st['identity'].get(kk) != v}
+            raise SystemExit(f'{state_path} was written by a different run (stored, this): {diff}')
+        model.load_state_dict(st['model'])
+        opt.load_state_dict(st['opt'])
+        rng.bit_generator.state = st['rng']
+        curve, best_ho, best_step = st['curve'], st['best_ho'], st['best_step']
+        best_state, step0 = st['best_state'], int(st['step'])
+        print(f'  RESUMED {state_path} at step {step0} of {steps}', flush=True)
     # HELD-OUT LOSS ALONG THE RUN, not just at the end. A train-only curve shows collapse and
     # under-training but is BLIND TO OVER-FITTING -- the one failure mode that looks perfectly
     # healthy from the training side, because train loss keeps falling while the model is
@@ -792,7 +846,11 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
         n = max(nb, 1)
         return tot / n, {kk: vv / n for kk, vv in acc.items()}
 
-    for step in range(steps):
+    scheduled = lr_schedule != 'constant' or warmup > 0
+    for step in range(step0, steps):
+        if scheduled:
+            for grp in opt.param_groups:
+                grp['lr'] = _lr(step)
         idx = rng.choice(len(train), size=min(batch_mols, len(train)), replace=False)
         b = collate([train[i] for i in idx], device, cfg['spd'])
         opt.zero_grad()
@@ -817,6 +875,18 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
                 best_ho = ho_total
                 best_step = step
                 best_state = {kk: v.detach().clone() for kk, v in model.state_dict().items()}
+            if verbose:
+                print(f'    step {step:>8d}  train loss {float(total.detach()):.4f}  held-out loss '
+                      f'{ho_total:.4f} (best {best_ho:.4f} at step {best_step})  lr '
+                      f'{opt.param_groups[0]["lr"]:.2e}', flush=True)
+        # the last step is written too, so resubmitting a finished run goes straight to scoring
+        if state_path and save_every and ((step + 1) % save_every == 0 or step + 1 == steps):
+            os.makedirs(os.path.dirname(state_path) or '.', exist_ok=True)
+            torch.save({'identity': identity, 'model': model.state_dict(),
+                        'opt': opt.state_dict(), 'rng': rng.bit_generator.state,
+                        'curve': curve, 'best_ho': best_ho, 'best_step': best_step,
+                        'best_state': best_state, 'step': step + 1}, state_path + '.tmp')
+            os.replace(state_path + '.tmp', state_path)
 
     # restore the best held-out state before SCORING, so the reported numbers and the saved
     # weights describe the same model. Scoring the last state and saving the best would be a
@@ -898,6 +968,31 @@ def report(agg, sizes, arms, baseline, tols, meta) -> str:
     return chr(10).join(L)
 
 
+def _set_probes(stereo_features: int, names=None):
+    """The probe list of a run: the E/Z probes join at stereo features 2, and ``names``
+    restricts it. Also the initializer of the sample-building worker processes, which under
+    the spawn start method import this module with the default list."""
+    global PROBES
+    if stereo_features >= 2:
+        PROBES = PROBES + [p for p in EZ_PROBES if p.name not in {q.name for q in PROBES}]
+    if names:
+        unknown = set(names) - {p.name for p in PROBES}
+        if unknown:
+            raise ValueError(f'unknown probes {sorted(unknown)}; '
+                             f'available: {[p.name for p in PROBES]}')
+        PROBES = [p for p in PROBES if p.name in set(names)]
+
+
+def _build_job(job):
+    """``(Sample, parent skeleton)`` for one ``(smiles, encoding, k, stereo)``; None when the
+    molecule cannot be built."""
+    smi, enc, k, stereo = job
+    try:
+        return build_sample(smi, enc, k, stereo=stereo), parent_skeleton(smi)
+    except Exception:
+        return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--arms', nargs='+', default=list(ARMS), choices=list(ARMS))
@@ -942,41 +1037,56 @@ def main(argv=None):
                          'is positive feedback, and it collapses training.')
     ap.add_argument('--smoke', action='store_true')
     ap.add_argument('--out', default=os.path.join(RESULTS, 'encoder_probe.json'))
+    ap.add_argument('--source', default=None,
+                    help='(dataset_index, smiles) table, .tsv or .tsv.gz, read in place of '
+                         'the local QM9 file: configs/conformer_db_sep29/qm9_index.tsv.gz '
+                         'is all of QM9')
+    ap.add_argument('--build-workers', type=int, default=1,
+                    help='processes building the molecule samples (labels included)')
+    ap.add_argument('--lr-schedule', default='constant', choices=['constant', 'cosine'])
+    ap.add_argument('--lr-final', type=float, default=0.0, help='cosine floor')
+    ap.add_argument('--warmup-steps', type=int, default=0)
+    ap.add_argument('--save-every', type=int, default=0,
+                    help='with --resume: write the training state every this many steps')
+    ap.add_argument('--resume', action='store_true',
+                    help='keep each run\'s training state beside its checkpoint '
+                         '(<save-dir>/<arm>_n<size>_s<seed>_state.pt) and continue from it')
+    ap.add_argument('--verbose', action='store_true', help='print every curve point')
     a = ap.parse_args(argv)
     if a.smoke:
         a.sizes, a.n_test, a.steps = [60], 60, 40
         a.hidden, a.layers, a.k, a.seeds = 32, 2, 6, [0]
+    if a.resume and a.save_every <= 0:
+        raise SystemExit('--resume needs --save-every')
 
-    global PROBES
-    if a.stereo_features >= 2:
-        PROBES = PROBES + [p for p in EZ_PROBES if p.name not in {q.name for q in PROBES}]
+    try:
+        _set_probes(a.stereo_features, a.probes)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     if a.probes:
-        unknown = set(a.probes) - {p.name for p in PROBES}
-        if unknown:
-            raise SystemExit(f'unknown probes {sorted(unknown)}; '
-                             f'available: {[p.name for p in PROBES]}')
-        PROBES = [p for p in PROBES if p.name in set(a.probes)]
         print(f'probes restricted to: {[p.name for p in PROBES]}')
 
     need = int((max(a.sizes) + a.n_test) * 1.1) + 64
     if a.ladder_only:
         smis = size_ladder()
     elif a.stereo:
-        smis = load_qm9_stereo(need, double_bonds=a.stereo_features >= 2)
+        smis = load_qm9_stereo(need, double_bonds=a.stereo_features >= 2, source=a.source)
     else:
-        smis = load_qm9(need)
-    print(f'{len(smis)} molecules; building samples per encoding ...')
+        smis = load_qm9(need, source=a.source)
+    print(f'{len(smis)} molecules; building samples per encoding ...', flush=True)
 
     cache, group_ids = {}, {}
     for enc in sorted({ARMS[arm]['encoding'] for arm in a.arms}):
-        built, skels = [], []
-        for smi in smis:
-            try:
-                sample = build_sample(smi, enc, a.k, stereo=a.stereo_features)
-            except Exception:
-                continue
-            built.append(sample)
-            skels.append(parent_skeleton(smi))
+        jobs = [(smi, enc, a.k, a.stereo_features) for smi in smis]
+        if a.build_workers > 1:
+            import multiprocessing as mp
+            with mp.Pool(a.build_workers, initializer=_set_probes,
+                         initargs=(a.stereo_features, a.probes)) as pool:
+                made = pool.map(_build_job, jobs, chunksize=256)
+        else:
+            made = [_build_job(j) for j in jobs]
+        built = [m[0] for m in made if m is not None]
+        skels = [m[1] for m in made if m is not None]
         # GROUP-CONTIGUOUS ORDER: shuffle the SKELETON GROUPS, then emit each group's members
         # together, so a prefix split can never put two stereoisomers of one parent on
         # opposite sides. Shuffling rows instead is what leaked 67.9% of the held-out set.
@@ -1038,7 +1148,11 @@ def main(argv=None):
                 ck = os.path.join(a.save_dir, f'{arm}_n{n}_s{seed}.pt')
                 r = run(arm, rest[:n], test, a.steps, hidden[arm], a.layers, a.k,
                         a.batch_mols, a.lr, seed, a.device, save_to=ck,
-                        weighting=a.loss_weighting, stereo=a.stereo_features)
+                        weighting=a.loss_weighting, stereo=a.stereo_features,
+                        lr_schedule=a.lr_schedule, lr_final=a.lr_final,
+                        warmup=a.warmup_steps,
+                        state_path=ck[:-3] + '_state.pt' if a.resume else None,
+                        save_every=a.save_every, verbose=a.verbose)
                 rows.append(r)
                 per_seed.append(r)
                 params = r['n_params']
