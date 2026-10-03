@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-1
+#SBATCH --array=0-7
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30b
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
 
-# qm9full_sep30 leg b: phase 2 of the conditional GFN on the full-QM9 prior, the extreme TB recipe: weights-only first launch from qf30_p1lr2 (its newest step archive, or its _running.pt with SRC_RUNNING=1), full resume afterwards; the arms differ in condition_log_z.untrusted_z (global, head).
+# qm9full_sep30 leg b: phase 2 of the conditional GFN on the full-QM9 prior, the extreme TB recipe: weights-only first launch from qf30_p1lr2 (its newest step archive, or its _running.pt with SRC_RUNNING=1), full resume afterwards; 8 arms over the rate, the terminal force, the seat and the Z of the residual (make.py).
 # Arm = row of INDEX_b.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
