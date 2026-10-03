@@ -160,7 +160,10 @@ def shared_atom_relation(dof_atoms: torch.Tensor) -> torch.Tensor:
 
     ``dof_atoms`` is ``[B, K, R, F]`` (`ConformerGFN.bind_molecular_conditioning`): each
     coordinate's frame atoms, a 2- or 3-atom frame repeating its last atom, so a repeated atom
-    is counted once. Only the first collective row is read (R is 1 at `full`). Two adjacent
+    is counted once. Only the first collective row is read (R is 1 at `full`, or the largest
+    sibling group under `sibling_offset_box_deg`, where a group leader's column drives the
+    whole group and its first row is the leader's own dihedral, so the relation read for it
+    is the one the default chart gives). Two adjacent
     ring dihedrals or two siblings on one bond share 3, a bond and the angle holding it 2,
     unrelated coordinates 0. Pad columns get a value too; the attention masks them.
     """

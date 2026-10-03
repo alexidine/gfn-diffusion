@@ -172,7 +172,8 @@ class ConformerModeller(Modeller):
     _DOF_CLASSES = ((0, 'r (bond length)', 1.0), (1, 'theta (angle)', 1.0),
                     (2, 'phi (torsion, deg)', 180.0),
                     (3, 'transverse (linear bend u, v)', 1.0),
-                    (4, 'double bond (bounded dihedral)', 1.0))
+                    (4, 'double bond (bounded dihedral)', 1.0),
+                    (5, 'sibling offset (bounded dihedral difference)', 1.0))
 
     def _domain_figs(self, fig_dict, sample_batch, prior_latent_params, anchor_latents):
         """The 12 worst state columns, drawn with the CRYSTAL latent-parameter panel code.
@@ -208,7 +209,8 @@ class ConformerModeller(Modeller):
         anchors = host(anchor_latents)
         periodic = np.asarray(host(self.energy_function.periodic_dims)).astype(bool)
         block = host(self.energy_function._free_block)
-        cls_name = {0: 'r', 1: 'theta', 2: 'phi', 3: 'transverse', 4: 'double_bond'}
+        cls_name = {0: 'r', 1: 'theta', 2: 'phi', 3: 'transverse', 4: 'double_bond',
+                    5: 'sibling_offset'}
         # on a CARRIER `_free_block` is the REGION code, which files a linear bend's u and v
         # under theta; the layout's per-member kinds say what the column holds for whom
         carrier = getattr(self.energy_function, 'carrier', None)
@@ -1086,7 +1088,8 @@ class ConformerModeller(Modeller):
         Nothing is parsed, embedded or read from disk. The SMILES it was built from (the
         conditions file's string, stereo marks included) names the molecule where the
         identifier does not. Its per-column block codes in state order (`_free_block`, a
-        transverse u or v as 3, a bounded double-bond dihedral as 4) fix, with the stamped
+        transverse u or v as 3, a bounded double-bond dihedral as 4, a sibling offset as 5)
+        fix, with the stamped
         `block_width`, the carrier columns it owns. Its placement-order atomic numbers (`spec.z`) are the atoms `_resolve_rows`
         compares against every stored row. Another molecule under the same identifier, or the
         same SMILES built into another chart, changes the digest.

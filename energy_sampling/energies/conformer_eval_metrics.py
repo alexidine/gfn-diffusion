@@ -330,6 +330,9 @@ def _dof_class_columns(en):
     # that has one, so every other chart's key set is unchanged
     if (block == 4).any():
         out['double_bond'] = np.flatnonzero(block == 4)
+    # a sibling offset (block 5) likewise; its group's leader column stays in 'phi'
+    if (block == 5).any():
+        out['sibling_offset'] = np.flatnonzero(block == 5)
     return out
 
 
@@ -502,9 +505,10 @@ def dof_element_stats(en, x, reference=None, prefix: str = 'dof_elem/') -> dict:
     out = {}
     # 'transverse' groups a linear bend's u and v by the element of its vertex; it appears
     # only on a molecule that has one, so every other molecule's key set is unchanged
-    # 'double_bond' likewise groups the bounded dihedrals of locked double bonds (block 4)
+    # 'double_bond' likewise groups the bounded dihedrals of locked double bonds (block 4),
+    # and 'sibling_offset' the bounded offsets of sibling groups (block 5)
     for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi'), (3, 'transverse'),
-                       (4, 'double_bond')):
+                       (4, 'double_bond'), (5, 'sibling_offset')):
         for zval in np.unique(owner):
             idx = np.flatnonzero((block == cls) & (owner == zval))
             if idx.size == 0:

@@ -17,7 +17,11 @@ first row of a ``torsion_groups`` group) is replaced by ``e_g``, the RIGID ROTAT
 whole group about its central bond (the same angle on every row of the group, i.e. 1 / scale
 on each of its columns). The rotation is the soft torsional coordinate; moving one sibling
 alone changes the angle between siblings and is stiff. This is the leader-plus-followers
-structure ``sample_prior_states`` draws with.
+structure ``sample_prior_states`` draws with. In a group the chart carries as one rotation
+plus offsets (``ConformerTorsions(sibling_offset_box_deg=W)``) the leader's column IS the
+rigid rotation, so ``e_g`` is that column alone (1 / pi on it, 0 on the followers' offset
+columns); the directions and their widths in radians are those of the default chart, and a
+follower's width in state units is over its own scale, W, like every width here.
 
 THE WIDTH of each basis direction is ``sqrt(kT / kappa)``, kappa the second derivative of the
 member's potential (``potential_energy`` at T = 1: every force-field term, the stereo lock,
@@ -140,10 +144,14 @@ def member_widths(member, temperature: float) -> Tuple[np.ndarray, np.ndarray]:
     s_sib = member.sibling_jitter_sigma(groups, T) if groups else []
     leaders = np.zeros(k, dtype=bool)
     directions = np.zeros((len(groups), k))
+    # a follower carried as an OFFSET (`sibling_offset_box_deg`) is turned by its leader's
+    # column already: the group's rotation is then that one column, and the follower's own
+    # axis moves it alone, as it did when its column was periodic
+    offset = np.asarray(getattr(member, 'sibling_offset_rows', np.zeros(0)), dtype=bool)
     for g, rows in enumerate(groups):
         for i, j in enumerate(rows):
             c = col_of_row[n_phi0 + j]
-            directions[g, c] = 1.0 / scale[c]
+            directions[g, c] = 0.0 if (offset.size and offset[j]) else 1.0 / scale[c]
             if i == 0:
                 leaders[c] = True
                 own[c], step[c] = 0.0, FD_STEP_ANGLE

@@ -694,8 +694,12 @@ def rebuilt_layout(batch) -> Tuple[int, Dict[str, np.ndarray]]:
                         for i, ident in enumerate(list(batch.identifier))}
 
 
-#: the per-atom fields that name a STATE COLUMN, the ones ``carrier_pad_condition`` remaps
+#: the per-atom fields that name a STATE COLUMN, the ones ``carrier_pad_condition`` remaps.
+#: ``ctree_ph_lead_col`` (a sibling offset row's second column, the leader's) is on a graph
+#: only when the set was built under ``sibling_offset_box_deg``; checked where the member's
+#: own graph carries it, and then required of the written file.
 _COLUMN_MAP_FIELDS = ('ctree_r_col', 'ctree_th_col', 'ctree_ph_col')
+_OPTIONAL_COLUMN_MAP_FIELDS = ('ctree_ph_lead_col',)
 
 
 def verify_conditions_file(path, layout, members: List[dict], own: Dict[str, object], *,
@@ -758,7 +762,18 @@ def verify_conditions_file(path, layout, members: List[dict], own: Dict[str, obj
             continue
         at = slice(int(ptr[row_of[ident]]), int(ptr[row_of[ident] + 1]))
         to_carrier = torch.as_tensor(layout.cols[ident], dtype=torch.long)
-        for name in _COLUMN_MAP_FIELDS:
+        for name in _COLUMN_MAP_FIELDS + _OPTIONAL_COLUMN_MAP_FIELDS:
+            if name in _OPTIONAL_COLUMN_MAP_FIELDS:
+                has_own = getattr(own[ident], name, None) is not None
+                has_file = getattr(batch, name, None) is not None
+                if has_own != has_file:
+                    on, off = (('the member', 'the file') if has_own
+                               else ('the file', 'the member'))
+                    problems.append(f'{ident}: {name} is on {on} and not on {off} '
+                                    f'(sibling_offset_box_deg differs between them)')
+                    break
+                if not has_own:
+                    continue
             mine = torch.as_tensor(getattr(own[ident], name)).reshape(-1).long()
             expect = torch.where(mine >= 0, to_carrier[mine.clamp_min(0)], mine)
             got = torch.as_tensor(getattr(batch, name)).reshape(-1)[at].long()

@@ -240,26 +240,30 @@ def header_differences(old: dict, new: dict) -> List[str]:
 #: consumer measures them into its own member (``states_of_rows``), re-scores every row and
 #: refuses one outside its box (``match_rows``: ``db_outside_box``, ``db_rescore``).
 #: ``double_bond_box_deg`` changes the box and periodicity of a locked double bond's dihedral
-#: column and nothing a record holds.
-CHART_ONLY_KWARGS = ('double_bond_box_deg',)
+#: column and nothing a record holds. ``sibling_offset_box_deg`` re-expresses a sibling
+#: group's dihedral columns as one rotation plus bounded offsets: the same rows, another
+#: linear combination of columns, and again nothing a record holds.
+CHART_ONLY_KWARGS = ('double_bond_box_deg', 'sibling_offset_box_deg')
 
 
 class _UnboxedCodes:
     """``member`` as `_member_signature` reads it, with a bounded double-bond dihedral (block
-    code 4) read as the phi column (2) it is without ``double_bond_box_deg``."""
+    code 4) and a sibling offset (block code 5) read as the phi column (2) each is without
+    ``double_bond_box_deg`` and ``sibling_offset_box_deg``. Neither option adds, drops or
+    reorders a column, so the codes are the default chart's."""
 
     def __init__(self, member):
         self.spec = member.spec
         fb = np.asarray(member._free_block).reshape(-1).copy()
-        fb[fb == 4] = 2
+        fb[(fb == 4) | (fb == 5)] = 2
         self._free_block = fb
 
 
 def member_signature(identifier: str, member) -> str:
     """``ConformerModeller._member_signature``: the run's condition-set digest of this member,
-    taken WITHOUT the double-bond box (``CHART_ONLY_KWARGS``), so a database's signature is
-    the same whether its builder, or the consumer matching against it, bounds those columns.
-    Equal to the run's digest for every member built without the box.
+    taken WITHOUT the double-bond box and the sibling offsets (``CHART_ONLY_KWARGS``), so a
+    database's signature is the same whether its builder, or the consumer matching against
+    it, bounds those columns. Equal to the run's digest for every member built without either.
 
     Imported, not restated. The import pulls in the trainer (about 13 s, once per process)."""
     from conformer_modeller import ConformerModeller

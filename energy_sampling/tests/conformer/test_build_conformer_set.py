@@ -415,7 +415,7 @@ def test_linear_group_refusals_are_classified_from_their_producers():
             build_member(smiles, smiles, {**ENERGY_KW, 'delta_theta_max': dtm}, carrier=True)
         assert exc.value.code == 'transverse_box' and text in exc.value.message
     with pytest.raises(ValueError, match='no carrier region') as exc:
-        CarrierLayout({'X': types.SimpleNamespace(_free_block=np.array([0, 1, 5]))})
+        CarrierLayout({'X': types.SimpleNamespace(_free_block=np.array([0, 1, 6]))})
     assert classify_failure(exc.value) == 'other'
     # and the linear groups themselves build, in the carrier form a set file carries
     for smiles in ('CC#N', 'CC#C'):

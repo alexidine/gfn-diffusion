@@ -163,6 +163,13 @@ CTREE_GRAPH_FIELDS = ('n_torsions', 'ctree_r_floor', 'ctree_theta_floor', 'ctree
                       # its baked energy and its per-coordinate features belong to
                       'ctree_stereo_coeff')
 CONFORMER_FIELDS = CTREE_ATOM_FIELDS + CTREE_GRAPH_FIELDS
+#: per TORSION-OWNING atom, OPTIONAL (not in CTREE_ATOM_FIELDS, so a file without them still
+#: loads): the SECOND state column driving this atom's dihedral and its scale, -1 / 0 where
+#: there is none. Written only under `ConformerTorsions(sibling_offset_box_deg=W)`, where a
+#: sibling group's leader column turns every row of the group: a follower's dihedral is then
+#: ``phi0 + ph_scale * x[ph_col] + ph_lead_scale * x[ph_lead_col]``, its own offset column
+#: plus its leader's. `state_to_dof` adds the second term when the fields are present.
+SIBLING_LEAD_FIELDS = ('ctree_ph_lead_col', 'ctree_ph_lead_scale')
 # additionally required of a prior / replay row, but not of a condition
 STATE_FIELDS = ('torsion_state', 'conformer_energy')
 
@@ -394,6 +401,17 @@ def condition_from_energy(energy, identifier: Optional[str] = None,
     mol.ctree_th_scale = _scatter(_scale[_nr:_nr + _nth], rank >= 2, n, dtype, fill=0.0)
     mol.ctree_ph_col = _scatter(_col[_nr + _nth:], rank >= 3, n, torch.long, fill=-1)
     mol.ctree_ph_scale = _scatter(_scale[_nr + _nth:], rank >= 3, n, dtype, fill=0.0)
+    # A SIBLING OFFSET ROW READS TWO COLUMNS: its own (the offset, above) and its group's
+    # leader's (the rotation). The second pair is written only by an energy built with
+    # `sibling_offset_box_deg`, on every graph of such a set whether or not the molecule has
+    # an offset row, so a set's graphs collate; a graph without the fields reads as having
+    # none, and the default chart's graphs carry exactly the fields they always did.
+    if getattr(energy, 'sibling_offset_box_deg', None) is not None:
+        _lcol, _lscale = _lead_state_map(energy)
+        for _name, _val in zip(SIBLING_LEAD_FIELDS, (
+                _scatter(_lcol, rank >= 3, n, torch.long, fill=-1),
+                _scatter(_lscale, rank >= 3, n, dtype, fill=0.0))):
+            setattr(mol, _name, _val)
     # the domain clamp, carried so the graph path reproduces `dof_from_state` exactly rather
     # than approximating it. `clamp` is off at torsion/dihedral where r and theta are the
     # frozen reference and cannot leave the domain.
@@ -453,6 +471,23 @@ def dummy_frame_atom_flags(energy) -> torch.Tensor:
     """
     rank = np.minimum(np.asarray(energy.spec.round_id), 3)
     rows = np.asarray(getattr(energy, 'dummy_frame_rows',
+                              np.zeros(int(energy.n_ph), dtype=bool)), dtype=bool)
+    return _scatter(torch.as_tensor(np.ascontiguousarray(rows), dtype=torch.bool),
+                    rank >= 3, int(energy.spec.n_atoms), torch.bool, fill=False)
+
+
+def sibling_offset_atom_flags(energy) -> torch.Tensor:
+    """``[n_atoms]`` bool in PLACEMENT order: this atom's dihedral is a sibling OFFSET row,
+    read as its own column plus its group's leader's.
+
+    The per-torsion-row `energy.sibling_offset_rows` scattered onto the atom each row places:
+    the atoms on which a graph built under `sibling_offset_box_deg` has ``ctree_ph_lead_col``
+    >= 0. The multi-molecule energy's library holds it and `_resolve_rows` compares it atom by
+    atom with the batch, as it does the transverse and dummy-frame flags: a graph built under
+    the other chart reconstructs another geometry from right-shaped tensors.
+    """
+    rank = np.minimum(np.asarray(energy.spec.round_id), 3)
+    rows = np.asarray(getattr(energy, 'sibling_offset_rows',
                               np.zeros(int(energy.n_ph), dtype=bool)), dtype=bool)
     return _scatter(torch.as_tensor(np.ascontiguousarray(rows), dtype=torch.bool),
                     rank >= 3, int(energy.spec.n_atoms), torch.bool, fill=False)
@@ -532,36 +567,77 @@ def _dof_state_map(energy):
 
     The authority is `energy._M` (which columns actually survive at this level) with
     `energy._free_scale` (0.3 A for r, 0.5 rad for theta, pi for phi, the box half-width for a
-    bounded double-bond dihedral) -- NOT `mask`, and NOT a
+    bounded double-bond dihedral or a sibling offset) -- NOT `mask`, and NOT a
     hardcoded pi. `_M` is a 0/1 selection with at most one column per row, already asserted
     below, so a per-row `(column, scale)` pair is a complete description at EVERY tier; no dense
     matrix is needed and nothing here is torsion-specific.
+
+    THE ONE EXCEPTION is a sibling OFFSET row (`sibling_offset_box_deg`,
+    `energy.sibling_offset_rows`): it has exactly two columns, its own (the offset) and its
+    group's leader's (the rotation). This returns its OWN pair and `_lead_state_map` the
+    leader's; a row with two columns that is not such a row, or any row with more, is refused.
     """
+    return _state_maps(energy)[:2]
+
+
+def _lead_state_map(energy):
+    """``(col [n_ph], scale [n_ph])`` per TORSION row: the leader column that also drives a
+    sibling offset row and its signed scale; -1 and 0 on every other row. See
+    `_dof_state_map`."""
+    n0 = int(energy.n_r) + int(energy.n_th)
+    _, _, col, scale = _state_maps(energy)
+    return col[n0:], scale[n0:]
+
+
+def _state_maps(energy):
+    """``(col, scale, lead_col, lead_scale)``, each ``[n_dof]``: `_dof_state_map`'s own pair
+    per DoF row and, on a sibling offset row, its leader's."""
     n_dof = int(energy.spec.n_dof)
     col = np.full(n_dof, -1, dtype=np.int64)
     scale = np.zeros(n_dof, dtype=np.float64)
+    lead_col = np.full(n_dof, -1, dtype=np.int64)
+    lead_scale = np.zeros(n_dof, dtype=np.float64)
 
     m = energy._M.detach().cpu().numpy()
     if m.shape[1] == 0:
-        return col, scale
+        return col, scale, lead_col, lead_scale
     driven = energy._driven_idx.detach().cpu().numpy()
     free_scale = np.asarray(energy._free_scale.detach().cpu()).reshape(-1)
+    n0 = int(energy.n_r) + int(energy.n_th)
+    offset = np.zeros(n_dof, dtype=bool)
+    offset[n0:] = np.asarray(getattr(energy, 'sibling_offset_rows',
+                                     np.zeros(n_dof - n0, dtype=bool)), dtype=bool)
 
     hits = (m != 0)
     per_row = hits.sum(1)
-    if int(per_row.max()) > 1:
-        bad = np.flatnonzero(per_row > 1).tolist()
+    bad = [int(driven[i]) for i in np.flatnonzero(per_row > 1)
+           if not (per_row[i] == 2 and offset[int(driven[i])])]
+    if bad:
         raise ValueError(
             f"driven rows {bad} are moved by more than one state column; the per-row "
-            f"(column, scale) form assumes a 0/1 selection matrix (see _dof_state_map)")
-    for i in np.flatnonzero(per_row == 1):
-        j = int(hits[i].argmax())
+            f"(column, scale) form assumes a 0/1 selection matrix, with a second column on "
+            f"a sibling offset row only (see _dof_state_map)")
+    own_row = None if int(per_row.max()) < 2 else energy._sel_rows.detach().cpu().numpy()
+    for i in np.flatnonzero(per_row >= 1):
         row = int(driven[i])
+        cols = np.flatnonzero(hits[i])
+        if len(cols) == 2:
+            # the row's own column is the one `state_from_dof` reads it into
+            mine = [int(c) for c in cols if int(own_row[c]) == row]
+            if len(mine) != 1:
+                raise ValueError(f'sibling offset row {row} has columns {cols.tolist()}, '
+                                 f'{len(mine)} of them its own')
+            j = mine[0]
+            lj = int(cols[cols != j][0])
+            lead_col[row] = lj
+            lead_scale[row] = float(m[i, lj]) * float(free_scale[lj])
+        else:
+            j = int(cols[0])
         col[row] = j
         # SIGNED, from M itself rather than assumed +1: a future chart that drives a row
         # negatively would otherwise be reconstructed with the wrong sense, silently.
         scale[row] = float(m[i, j]) * float(free_scale[j])
-    return col, scale
+    return col, scale, lead_col, lead_scale
 
 
 def _state_columns(energy) -> torch.Tensor:
@@ -906,6 +982,16 @@ def state_to_dof(batch, state: torch.Tensor):
                 rank >= 2)
     ph = _block(batch.ctree_phi0[rank >= 3], batch.ctree_ph_col, batch.ctree_ph_scale,
                 rank >= 3)
+    lead = getattr(batch, SIBLING_LEAD_FIELDS[0], None)
+    if lead is not None:
+        # a sibling OFFSET row is its own column plus its group's leader's (the block-5 note
+        # in ConformerTorsions); absent on every graph of a default chart
+        keep = rank >= 3
+        c, g = lead[keep], graph[keep]
+        hit = torch.nonzero(c >= 0, as_tuple=True)[0]
+        if int(hit.numel()):
+            sc = getattr(batch, SIBLING_LEAD_FIELDS[1])[keep]
+            ph = ph.index_add(0, hit, sc[hit] * state[g[hit], c[hit]])
     # THE SAME CLAMP `dof_from_state` APPLIES, and only where it applies there: at torsion and
     # dihedral r and theta are the frozen reference and cannot leave the domain, so clamping
     # would be a silent no-op that hides a future divergence rather than reproducing one.
