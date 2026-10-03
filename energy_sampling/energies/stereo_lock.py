@@ -19,8 +19,10 @@ WHAT IS LOCKED. Two kinds of element, both keyed on atoms of the condition graph
   * every double bond RDKit reports as POTENTIAL stereo (``DOUBLE_BOND``) on the input
     molecule, perceived on both the heavy-atom and the explicit-H graph (`tagged_elements`).
 
-A three-coordinate centre is NOT locked: RDKit's perception from 3D does not recover N stereo,
-so an N-tagged isomer could not be verified, and the two sides of a three-coordinate centre stay
+A three-coordinate centre is NOT locked by default: RDKit's perception from 3D does not recover
+N stereo (measured again 2026-10-03 on the stereo nitrogens below: no N tag on any of 603
+embedded QM9 isomers, under the legacy or the new perception), and the two sides of a
+three-coordinate centre stay
 together inside one condition (a working assumption, stated for N invertomers in
 build_conformer_conditions.py::stereo_mol; see the wiki page on the force field). It covers
 EVERY three-coordinate atom, not only an amine N: a sulfoxide S or a phosphine P is left free
@@ -33,6 +35,32 @@ N at its ring's closure included. That module names what it misses: a ring N at 
 root, and one the tree enters from its substituent; a caged N has no second side. The tags are
 stripped wherever isomers are compared (`_strip_invertible`). A four-coordinate N+ is an
 ordinary locked centre.
+
+STEREO NITROGENS (`ConformerTorsions(lock_stereo_nitrogen=True)`; off by default. Owner
+decision 2026-10-03: lock the slow-flipping nitrogens by the rules the rest of the stereo
+handling uses). A STEREO NITROGEN (`stereo_nitrogens`) is an N with three single bonds to three
+non-hydrogen neighbours and no hydrogen, which `Chem.FindPotentialStereo` reports as a
+tetrahedral element on the molecule AS PARSED from its SMILES (implicit hydrogens): RDKit's own
+rule, an N in a three-membered ring or a bridgehead N, less the ones symmetry removes. An N-H
+is never one: RDKit drops a tag on it at the parse, so no SMILES can name its configuration.
+With the option on, a stereo nitrogen the condition's SMILES TAGS is a third kind of locked
+atom: its tag stays in every isomer comparison (`_strip_invertible`'s ``keep``), a SMILES that
+leaves a stereogenic one untagged is `stereo_unspecified`, and its element is a ``TETRAHEDRAL``
+one whose quad is its three neighbours and itself -- the one triple product a three-coordinate
+centre has, the form of a four-coordinate centre's "three bond directions" candidates. An
+untagged stereo nitrogen that no enumeration distinguishes (a symmetric cage's) stays free, so
+a SMILES without an N tag builds, with the option on, the member it builds with it off.
+THE SIGN IS STILL READ OFF THE REFERENCE, and because 3D perception returns nothing for N the
+reference is VERIFIED against the tag by the element's own sign. RDKit's tag convention is the
+sign of the chiral volume of the centre's first three neighbours in its bond order
+(``CHI_TETRAHEDRAL_CCW`` positive: `nitrogen_tag_sign`, the rule RDKit's 3D perception applies
+to carbon, pinned by tests/conformer/test_stereo_nitrogen.py against that perception), carried
+to the quad's neighbour order by the parity of the permutation (`quad_sign_of_tag`). A reference
+whose element has the other sign is `stereo_verify_failed`; one below `MIN_MARGIN` is
+`stereo_lock_in_band`: refused, not left free, because the tag is in the condition's name and a
+near-planar reference cannot show which side it names. Measured on 611 tagged stereo nitrogens
+of 400 QM9 molecules (ETKDGv3 seed 0 + MMFF94): |v| from 0.655 to 0.982, median 0.779, none
+below 0.5; 610 on the tagged side, one inverted by the MMFF relaxation and so refused.
 
 THE INDICATOR. Per element a signed, normalised four-point quantity of the positions of four
 atoms ``p1..p4`` (the element's QUAD):
@@ -184,6 +212,98 @@ def _find_potential(mol) -> List[tuple]:
     return out
 
 
+def _is_stereo_nitrogen_atom(atom) -> bool:
+    """The structural half of the STEREO NITROGEN rule (module docstring), on one atom."""
+    from rdkit import Chem
+    return (atom.GetAtomicNum() == 7 and atom.GetDegree() == 3 and atom.GetTotalNumHs() == 0
+            and not atom.GetIsAromatic()
+            and all(n.GetAtomicNum() != 1 for n in atom.GetNeighbors())
+            and all(b.GetBondType() == Chem.BondType.SINGLE for b in atom.GetBonds()))
+
+
+def stereo_nitrogens(mol) -> List[int]:
+    """Atom indices of `mol`'s STEREO NITROGENS (module docstring), ascending.
+
+    `mol` is the molecule AS PARSED (implicit hydrogens; an =NH hydrogen may be explicit). The
+    explicit-H graph answers differently: there RDKit also reports an aziridine N-H, and does
+    not report the N of 99 of the 9,866 QM9 constitutions that have a stereo nitrogen (census
+    of all 133,641, 2026-10-03), so every caller passes the parsed view (`implicit_h_view`).
+    Whether one is TAGGED is the caller's question.
+    """
+    with pinned_perception():
+        return sorted(key[0] for kind, key, _, _ in _find_potential(mol)
+                      if kind == TETRAHEDRAL
+                      and _is_stereo_nitrogen_atom(mol.GetAtomWithIdx(key[0])))
+
+
+def implicit_h_view(mol):
+    """A copy of an explicit-H `mol` with its removable hydrogens removed, conformer kept, and
+    its heavy atoms on THE SAME INDICES -- checked, since whatever is read off the view is
+    carried back by index. True of ``AddHs(MolFromSmiles(s))``, which appends its hydrogens.
+    """
+    from rdkit import Chem
+    h = Chem.RemoveHs(Chem.Mol(mol))
+    for a in h.GetAtoms():
+        if a.GetAtomicNum() != mol.GetAtomWithIdx(a.GetIdx()).GetAtomicNum():
+            raise ValueError('removing hydrogens renumbered the heavy atoms; the molecule was '
+                             'not built as AddHs(MolFromSmiles(smiles))')
+    return h
+
+
+def nitrogen_tag_sign(atom) -> int:
+    """+1, -1 or 0: the sign RDKit's tetrahedral tag on a three-neighbour `atom` asks of the
+    chiral volume ``(p1 - p0) . [(p2 - p0) x (p3 - p0)]`` of its neighbours p1..p3, taken in
+    ITS BOND ORDER, about its own position p0. ``CHI_TETRAHEDRAL_CCW`` is positive: the rule
+    RDKit's 3D perception applies to the first three neighbours of any centre.
+    """
+    from rdkit import Chem
+    tag = atom.GetChiralTag()
+    return (1 if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CCW
+            else -1 if tag == Chem.ChiralType.CHI_TETRAHEDRAL_CW else 0)
+
+
+def bond_order_neighbours(atom) -> List[int]:
+    """`atom`'s neighbours in its bond order, the order a chiral tag is written against."""
+    return [int(b.GetOtherAtomIdx(atom.GetIdx())) for b in atom.GetBonds()]
+
+
+def quad_sign_of_tag(tag_sign: int, neighbours: Sequence[int]) -> int:
+    """The sign a tag asks of the lock's indicator on the quad ``sorted(neighbours) + [centre]``.
+
+    ``neighbours`` are the centre's three neighbours IN BOND ORDER, in the numbering the quad
+    is sorted in (placement slots, for a `StereoTable`). The triple product changes sign with
+    each exchange of two neighbours, so the answer is `tag_sign` times the parity of the
+    permutation that sorts them.
+    """
+    n = [int(a) for a in neighbours]
+    if len(n) != 3 or len(set(n)) != 3:
+        raise ValueError(f'need three distinct neighbours, got {n}')
+    inversions = sum(1 for i in range(3) for j in range(i + 1, 3) if n[i] > n[j])
+    return int(tag_sign) * (-1 if inversions % 2 else 1)
+
+
+def assign_nitrogen_tags_from_3d(mol, atoms: Sequence[int]):
+    """Tag each three-neighbour atom of `atoms` on `mol` (IN PLACE) from `mol`'s conformer.
+
+    What RDKit's 3D perception does not do for N: the tag whose `nitrogen_tag_sign` is the
+    sign of the chiral volume of the atom's three neighbours in its bond order. A volume of
+    exactly zero leaves the atom untagged. Returns `mol`.
+    """
+    from rdkit import Chem
+    pos = np.asarray(mol.GetConformer().GetPositions(), dtype=np.float64)
+    for i in atoms:
+        a = mol.GetAtomWithIdx(int(i))
+        nb = bond_order_neighbours(a)
+        if len(nb) != 3:
+            raise ValueError(f'atom {int(i)} has {len(nb)} neighbours; a stereo nitrogen has 3')
+        u, v, w = (pos[k] - pos[int(i)] for k in nb)
+        vol = float(np.dot(u, np.cross(v, w)))
+        a.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CCW if vol > 0.0
+                       else Chem.ChiralType.CHI_TETRAHEDRAL_CW if vol < 0.0
+                       else Chem.ChiralType.CHI_UNSPECIFIED)
+    return mol
+
+
 def tagged_elements(smiles: str) -> List[dict]:
     """The potential stereo elements of the INPUT molecule, and which ones its tags specify.
 
@@ -197,10 +317,13 @@ def tagged_elements(smiles: str) -> List[dict]:
     imine (CC=N comes back with no double bond). An element reported on either is an element;
     it counts as specified only if no report calls it unspecified.
 
-    ``[{'kind', 'atoms', 'specified', 'element', 'degree', 'type'}]``; ``degree`` is the key
-    atom's total degree (hydrogens included), so a tetrahedral element of degree 3 is an
-    invertible centre the lock leaves alone. ``kind`` 0 is a stereo type this module does not
-    lock (an allene, an atropisomer), carried so a caller can refuse it.
+    ``[{'kind', 'atoms', 'specified', 'element', 'degree', 'type', 'stereo_nitrogen'}]``;
+    ``degree`` is the key atom's total degree (hydrogens included), so a tetrahedral element
+    of degree 3 is an invertible centre the lock leaves alone -- unless it is a
+    ``stereo_nitrogen`` (module docstring: reported on the parsed graph, and passing
+    `_is_stereo_nitrogen_atom`) and the energy was asked to hold those. ``kind`` 0 is a stereo
+    type this module does not lock (an allene, an atropisomer), carried so a caller can refuse
+    it.
 
     'Potential' is RDKit's word and is wider than stereogenic: a bridgehead of a symmetric
     cage, or a centre that is stereogenic only for some assignments of the others, is
@@ -223,31 +346,41 @@ def tagged_elements(smiles: str) -> List[dict]:
                     at = molh.GetAtomWithIdx(key[0])
                     merged[k] = dict(kind=kind, atoms=key, specified=spec,
                                      element=at.GetSymbol(), degree=int(at.GetTotalDegree()),
-                                     type=tname)
+                                     type=tname, stereo_nitrogen=False)
+                if m is mol0 and kind == TETRAHEDRAL:
+                    merged[k]['stereo_nitrogen'] = _is_stereo_nitrogen_atom(
+                        mol0.GetAtomWithIdx(key[0]))
     return [merged[k] for k in sorted(merged)]
 
 
-def _strip_invertible(mol):
-    """`mol` (in place) with the chiral tag cleared on every three-coordinate atom.
+def _strip_invertible(mol, keep: Sequence[int] = ()):
+    """`mol` (in place) with the chiral tag cleared on every three-coordinate atom not in `keep`.
 
     The lock does not pin an invertible centre, so a tag there names nothing the target
-    distinguishes; every isomer comparison here is made without them.
+    distinguishes; every isomer comparison here is made without them. `keep` holds the atoms
+    the lock DOES pin: the stereo nitrogens, under `lock_stereo_nitrogen`.
     """
     from rdkit import Chem
+    keep = {int(i) for i in keep}
     for a in mol.GetAtoms():
-        if a.GetTotalDegree() == 3 and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+        if (a.GetTotalDegree() == 3 and a.GetIdx() not in keep
+                and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED):
             a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
     return mol
 
 
-def canonical_isomeric(smiles: str) -> str:
-    """Canonical isomeric SMILES of the input, invertible-centre tags stripped, pinned perception."""
+def canonical_isomeric(smiles: str, lock_nitrogen: bool = False) -> str:
+    """Canonical isomeric SMILES of the input, invertible-centre tags stripped, pinned
+    perception. With `lock_nitrogen` a stereo nitrogen's tag is kept."""
     from rdkit import Chem
     with pinned_perception():
-        return Chem.MolToSmiles(_strip_invertible(Chem.MolFromSmiles(smiles)))
+        m = Chem.MolFromSmiles(smiles)
+        return Chem.MolToSmiles(_strip_invertible(
+            m, stereo_nitrogens(m) if lock_nitrogen else ()))
 
 
-def consistent_isomers(smiles: str, max_isomers: int = 4096) -> List[str]:
+def consistent_isomers(smiles: str, max_isomers: int = 4096,
+                       lock_nitrogen: bool = False) -> List[str]:
     """Canonical isomeric SMILES of every stereoisomer the input's tags are consistent with.
 
     One entry means the tags pin a single isomer. RDKit's enumerator over the unassigned
@@ -256,6 +389,12 @@ def consistent_isomers(smiles: str, max_isomers: int = 4096) -> List[str]:
     tags stripped -- so an element that is 'potential' but not stereogenic given the others
     (a symmetric bridgehead, a centre whose two branches are made equivalent by the rest)
     collapses to one string instead of reading as unassigned.
+
+    With `lock_nitrogen` the stereo nitrogens are stereo elements like any other: a tag on one
+    is kept going in, so it is not re-enumerated, and kept coming out, so an input that leaves
+    a stereogenic one untagged comes back as two isomers. Which atoms those are is read off
+    each enumerated isomer's own hydrogen-free view, since symmetry can make it depend on the
+    other centres' assignment.
     """
     from rdkit import Chem
     from rdkit.Chem.EnumerateStereoisomers import (EnumerateStereoisomers,
@@ -264,13 +403,26 @@ def consistent_isomers(smiles: str, max_isomers: int = 4096) -> List[str]:
     out = set()
     with pinned_perception():
         mol0 = Chem.MolFromSmiles(smiles)
+        if not lock_nitrogen:
+            for m in (mol0, Chem.AddHs(mol0)):
+                for iso in EnumerateStereoisomers(_strip_invertible(Chem.Mol(m)),
+                                                  options=opts):
+                    out.add(Chem.MolToSmiles(Chem.RemoveHs(_strip_invertible(Chem.Mol(iso)))))
+            return sorted(out)
+        keep0 = stereo_nitrogens(mol0)             # heavy-atom indices, which AddHs keeps
         for m in (mol0, Chem.AddHs(mol0)):
-            for iso in EnumerateStereoisomers(_strip_invertible(Chem.Mol(m)), options=opts):
-                out.add(Chem.MolToSmiles(Chem.RemoveHs(_strip_invertible(Chem.Mol(iso)))))
+            for iso in EnumerateStereoisomers(_strip_invertible(Chem.Mol(m), keep0),
+                                              options=opts):
+                h = Chem.RemoveHs(Chem.Mol(iso))
+                keep = stereo_nitrogens(h)
+                if keep:
+                    out.add(Chem.MolToSmiles(_strip_invertible(h, keep)))
+                else:              # no nitrogen to keep: the string the option-off path writes
+                    out.add(Chem.MolToSmiles(Chem.RemoveHs(_strip_invertible(Chem.Mol(iso)))))
     return sorted(out)
 
 
-def realised_isomer(mol) -> str:
+def realised_isomer(mol, lock_nitrogen: bool = False) -> str:
     """Canonical isomeric SMILES of the stereoisomer a 3D conformer REALISES.
 
     Stereo re-perceived from the coordinates of `mol`'s conformer (on a copy; `mol` is not
@@ -278,12 +430,47 @@ def realised_isomer(mol) -> str:
     =NH imine). Comparing it with `canonical_isomeric` of the input is the verify step: the
     reference embedding is the object the lock's signs are read from, so an embedding that
     realised another isomer would lock that one.
+
+    With `lock_nitrogen`, a molecule that has a stereo nitrogen is perceived by
+    `perceive_with_nitrogens` instead, which tags the nitrogens from the geometry too; one
+    that has none returns the string the option-off path writes.
     """
     from rdkit import Chem
     with pinned_perception():
         m = Chem.Mol(mol)
         Chem.AssignStereochemistryFrom3D(m, replaceExistingTags=True)
-        return Chem.MolToSmiles(Chem.RemoveHs(_strip_invertible(m)))
+        if not (lock_nitrogen and any(_is_stereo_nitrogen_atom(a) for a in m.GetAtoms())):
+            return Chem.MolToSmiles(Chem.RemoveHs(_strip_invertible(m)))
+        h = implicit_h_view(_strip_invertible(m))
+        if not stereo_nitrogens(h):
+            return Chem.MolToSmiles(h)
+        h = perceive_with_nitrogens(mol)
+        return Chem.MolToSmiles(_strip_invertible(h, stereo_nitrogens(h)))
+
+
+def perceive_with_nitrogens(mol):
+    """The hydrogen-free view of an explicit-H 3D `mol`, its stereo perceived from the
+    geometry WITH the stereo nitrogens (a copy; `mol` is not touched).
+
+    RDKit's `AssignStereochemistryFrom3D` is three steps: bond stereo from 3D, a raw tag on
+    every centre from its chiral volume, then the legacy assignment, which drops the tags
+    that are no stereocentre. It writes no raw tag on a three-coordinate N, and the last step
+    then also drops a centre that is one only TOGETHER with that N (the bridgehead carbon
+    facing a bridgehead N). So here the same three steps run with the N tags written between
+    the second and the third (`assign_nitrogen_tags_from_3d`, on every N that passes
+    `_is_stereo_nitrogen_atom`; the assignment drops the ones that are no stereocentre), and
+    the third on the hydrogen-free view, the graph RDKit judges a stereo nitrogen on. Call it
+    under `pinned_perception`.
+    """
+    from rdkit import Chem
+    m = Chem.Mol(mol)
+    Chem.DetectBondStereochemistry(m)
+    Chem.AssignAtomChiralTagsFromStructure(m, replaceExistingTags=True)
+    h = implicit_h_view(m)
+    assign_nitrogen_tags_from_3d(
+        h, [a.GetIdx() for a in h.GetAtoms() if _is_stereo_nitrogen_atom(a)])
+    Chem.AssignStereochemistry(h, cleanIt=True, force=True)
+    return h
 
 
 # ----------------------------------------------------------------------------- indicator
@@ -349,6 +536,13 @@ class StereoTable:
         return {frozenset((int(q[1]), int(q[2]))) for q, k in zip(self.quad, self.kind)
                 if int(k) == DOUBLE_BOND}
 
+    def element_of(self, key: int, kind: int = TETRAHEDRAL) -> int:
+        """Index of the one element of `kind` keyed on slot `key`; KeyError otherwise."""
+        hit = np.flatnonzero((self.key == int(key)) & (self.kind == int(kind)))
+        if hit.size != 1:
+            raise KeyError(f'{hit.size} elements of kind {kind} keyed on slot {int(key)}')
+        return int(hit[0])
+
     def with_sign(self, sign) -> 'StereoTable':
         """A copy locking the given signs instead: another labelled configuration."""
         s = np.asarray(sign, dtype=np.int64).reshape(-1)
@@ -407,17 +601,21 @@ def _best_quad(pos: np.ndarray, cands: List[List[int]], kind: int) -> Tuple[List
 
 def build_table(ref_pos: np.ndarray, bond_index_slot: np.ndarray,
                 double_bonds: Sequence[Tuple[int, int]],
-                stereocentres: Sequence[int] = ()) -> StereoTable:
+                stereocentres: Sequence[int] = (),
+                nitrogens: Sequence[int] = ()) -> StereoTable:
     """The lock table of one molecule, everything in PLACEMENT-SLOT numbering.
 
     ``ref_pos [N, 3]`` the reference conformer; ``bond_index_slot [2, n_bonds]`` the full bond
     graph; ``double_bonds`` the potential-stereo double bonds; ``stereocentres`` the
-    tetrahedral atoms RDKit calls stereo elements of the input (recorded, not used to select).
+    tetrahedral atoms RDKit calls stereo elements of the input (recorded, not used to select);
+    ``nitrogens`` the three-neighbour stereo nitrogens to lock (module docstring, STEREO
+    NITROGENS), empty unless the energy was asked to hold them.
 
-    Tetrahedral elements are EVERY atom with four neighbours, in ascending slot order, then
-    the double bonds in ascending (b, c). A deterministic function of the graph, the
-    reference and the canonical placement order, so a condition graph built from the same
-    member carries the same table.
+    Tetrahedral elements are EVERY atom with four neighbours and each atom of ``nitrogens``,
+    in ascending slot order, then the double bonds in ascending (b, c). A nitrogen's quad is
+    its three neighbours, ascending, then itself: its one triple product. A deterministic
+    function of the graph, the reference and the canonical placement order, so a condition
+    graph built from the same member carries the same table.
     """
     pos = np.asarray(ref_pos, dtype=np.float64)
     n = len(pos)
@@ -427,6 +625,12 @@ def build_table(ref_pos: np.ndarray, bond_index_slot: np.ndarray,
         nbr[int(v)].add(int(u))
     kinds, keys, quads, signs, margins, los, sc = [], [], [], [], [], [], []
     sc_set = {int(a) for a in stereocentres}
+    n_set = {int(a) for a in nitrogens}
+    for c in sorted(n_set):
+        if not 0 <= c < n or len(nbr[c]) != 3:
+            raise ValueError(f'stereo nitrogen at slot {c}: its element needs exactly three '
+                             f'bonded neighbours in the chart\'s graph, it has '
+                             f'{len(nbr[c]) if 0 <= c < n else "no such slot"}')
 
     def add(kind, key, quad, val):
         kinds.append(kind)
@@ -439,6 +643,12 @@ def build_table(ref_pos: np.ndarray, bond_index_slot: np.ndarray,
 
     for c in range(n):
         ns = sorted(nbr[c])
+        if c in n_set:
+            quad = ns + [c]                        # its three bond directions: one candidate
+            add(TETRAHEDRAL, c, quad, float(_values_np(
+                pos, np.asarray([quad], dtype=np.int64),
+                np.full(1, TETRAHEDRAL, dtype=np.int64))[0]))
+            continue
         if len(ns) != 4:
             continue
         cands = []
@@ -533,8 +743,9 @@ def graph_fields(table: StereoTable, n_atoms: int, dtype) -> Dict[str, torch.Ten
 
     Deltas, like ``ctree_ref_*`` and ``ctree_closure``, because a buffer draw re-offsets atom
     indices by collation but never remaps their values. One element per key atom, which the
-    two kinds guarantee: a tetrahedral key has four neighbours and a double-bond end at most
-    three, and an atom is the begin atom of at most one double bond unless it is cumulated --
+    two kinds guarantee: a tetrahedral key has four neighbours, or is a stereo nitrogen, whose
+    three bonds are single, and a double-bond end has at most three with a double bond among
+    them; an atom is the begin atom of at most one double bond unless it is cumulated --
     asserted rather than assumed.
     """
     kind = torch.zeros(n_atoms, dtype=torch.long)

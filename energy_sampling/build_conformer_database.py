@@ -245,6 +245,25 @@ def header_differences(old: dict, new: dict) -> List[str]:
 #: linear combination of columns, and again nothing a record holds.
 CHART_ONLY_KWARGS = ('double_bond_box_deg', 'sibling_offset_box_deg')
 
+#: ConformerTorsions arguments that decide WHICH IDENTIFIERS a molecule has, and nothing about
+#: the member an identifier names. ``lock_stereo_nitrogen`` is NOT chart-only: it changes the
+#: conditions of every molecule with a stereogenic stereo nitrogen (energies/stereo_lock.py).
+#: A database is still read across the two values, because a record is found BY IDENTIFIER and
+#: an identifier that builds under both values names one member with one lock table:
+#:   * a SMILES with no N tag has no locked nitrogen under either value, so wherever it builds
+#:     its member, reference, lock table and rows are the same (the option's only effect on a
+#:     built member is the lock elements of the nitrogens its SMILES tags);
+#:   * a SMILES with an N tag builds only with the option on (off: ``stereo_n_tagged`` /
+#:     ``stereo_unsupported``), so only a database built with it on holds it;
+#:   * a SMILES that leaves a stereogenic stereo nitrogen untagged builds only with the option
+#:     off (on: ``stereo_unspecified``), and a walk with the option on never asks for it --
+#:     its stored rows, which may sit on both nitrogen sides, are never read.
+#: So a consumer under the other value finds exactly the records that are valid for it, and
+#: every other condition is ``db_absent``: embedded here, with no database rows. The
+#: consumers say so (``other_identity_kwargs``), and ``match_rows`` still re-scores each row
+#: it takes under the consumer's own lock.
+IDENTITY_KWARGS = ('lock_stereo_nitrogen',)
+
 
 class _UnboxedCodes:
     """``member`` as `_member_signature` reads it, with a bounded double-bond dihedral (block
@@ -1219,12 +1238,13 @@ def read_references(db_dir, *, log=print):
 def refuse_other_member_kwargs(info: dict, energy_kw: dict, what: str):
     """SystemExit when the database's members were built under other member-defining
     ConformerTorsions arguments than ``energy_kw`` (``build_conformer_references.
-    defining_energy``, resolved against the signature defaults)."""
+    defining_energy``, resolved against the signature defaults). ``CHART_ONLY_KWARGS`` and
+    ``IDENTITY_KWARGS`` are not compared; ``other_identity_kwargs`` reports the latter."""
     import build_conformer_references as bcr
 
     have = bcr.defining_energy(bcr.member_kwargs(info['energy_kwargs']))
     want = bcr.defining_energy(bcr.member_kwargs(energy_kw))
-    for name in CHART_ONLY_KWARGS:
+    for name in CHART_ONLY_KWARGS + IDENTITY_KWARGS:
         have.pop(name, None)
         want.pop(name, None)
     diff = [f'{k}: database {have.get(k, "<absent>")!r}, {what} {want.get(k, "<absent>")!r}'
@@ -1233,6 +1253,19 @@ def refuse_other_member_kwargs(info: dict, energy_kw: dict, what: str):
     if diff:
         raise SystemExit(f"{info['path']} was built under other member arguments than the "
                          f'{what}:\n  ' + '\n  '.join(diff))
+
+
+def other_identity_kwargs(info: dict, energy_kw: dict) -> Dict[str, dict]:
+    """``{name: {'database': value, 'consumer': value}}`` for each of ``IDENTITY_KWARGS`` the
+    database was built under another value of than ``energy_kw`` (both resolved against the
+    signature defaults). Non-empty means the database holds no record of the conditions that
+    exist only under the consumer's value: they are ``db_absent`` (see ``IDENTITY_KWARGS``)."""
+    import build_conformer_references as bcr
+
+    have = bcr.defining_energy(bcr.member_kwargs(info['energy_kwargs']))
+    want = bcr.defining_energy(bcr.member_kwargs(energy_kw))
+    return {n: {'database': have.get(n), 'consumer': want.get(n)} for n in IDENTITY_KWARGS
+            if have.get(n) != want.get(n)}
 
 
 #: why a consumer takes no rows from the database for a condition

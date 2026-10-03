@@ -369,8 +369,15 @@ class Built:
     mirror_of: Dict[str, str] = field(default_factory=dict)     # name -> its mirror's name
 
 
-def stereo_plan(key: str):
+def stereo_plan(key: str, lock_nitrogen: bool = False):
     """``(names, mirror_of, rejections-as-tuples)`` for one constitution.
+
+    ``lock_nitrogen`` (``energy_config.lock_stereo_nitrogen``) makes the two configurations
+    of a stereo nitrogen two names (``stereoisomer_classes``). The mirror of a name inverts
+    its N tags with the rest, so an invertomer's mirror image is its enantiomer, not its
+    other invertomer; the cap of ``--max-stereoisomers-per-molecule`` conditions is unchanged,
+    so at the default 2 a molecule keeps one pick and its mirror and its other invertomers
+    are not built.
 
     ``names`` are the enumerated stereoisomers (``stereoisomer_classes``), one per
     ``stereo_identity``. ``mirror_of[name]`` is the enumerated name whose identity is that of
@@ -382,12 +389,12 @@ def stereo_plan(key: str):
     """
     from models.encoder_probe import mirror_smiles
 
-    classes = stereoisomer_classes(key)
+    classes = stereoisomer_classes(key, lock_nitrogen=lock_nitrogen)
     names = [n for n, _, _ in classes]
     by_identity = {idt: n for n, idt, _ in classes}
     mirror_of = {}
     for n in names:
-        m = by_identity.get(smiles_identity(mirror_smiles(n)))
+        m = by_identity.get(smiles_identity(mirror_smiles(n), lock_nitrogen))
         if m is not None:
             mirror_of[n] = m
     rows = []
@@ -411,7 +418,8 @@ def build_molecule(entry: Entry, energy_kw: dict, *, bundle, cap: Optional[int],
     """
     rej = []
     try:
-        isos, mirror_of, extra = stereo_plan(entry.key)
+        isos, mirror_of, extra = stereo_plan(
+            entry.key, bool(energy_kw.get('lock_stereo_nitrogen', False)))
     except Exception as exc:                                   # noqa: BLE001 - recorded
         rej.append(_rej('molecule', entry.key, entry.index, entry.side, '',
                         'stereo_enumeration', f'{type(exc).__name__}: {exc}'))
@@ -1132,8 +1140,19 @@ def main(argv=None):
                              'prior_train.pt; pass one')
         if int(args.rows_per_condition_cap) < 1:
             raise SystemExit('--rows-per-condition-cap must be >= 1')
-        from build_conformer_database import first_header, refuse_other_member_kwargs
-        refuse_other_member_kwargs(first_header(args.database), energy_kw, 'set builder')
+        from build_conformer_database import (first_header, other_identity_kwargs,
+                                              refuse_other_member_kwargs)
+        _db_head = first_header(args.database)
+        refuse_other_member_kwargs(_db_head, energy_kw, 'set builder')
+        # an argument that decides which identifiers a molecule has (IDENTITY_KWARGS) may
+        # differ: the conditions that exist only under this build's value are then absent
+        # from the database, embedded here, and take no database rows (db_absent)
+        db_identity = other_identity_kwargs(_db_head, energy_kw)
+        for _name, _v in db_identity.items():
+            print(f"NOTE: the database was built under {_name}={_v['database']!r}, this set "
+                  f"under {_v['consumer']!r}. Conditions that exist only under this value "
+                  f"have no database record: they are embedded here and take no database "
+                  f"rows (prior_refusals.tsv, db_absent).")
     if int(args.workers) < 1:
         raise SystemExit('--workers must be >= 1')
 
@@ -1454,6 +1473,10 @@ def main(argv=None):
         'references': {
             'source': 'database' if references is not None else 'embedded',
             'database_run_hash': ref_info['run_hash'] if ref_info else None,
+            # build_conformer_database.IDENTITY_KWARGS the database was built under another
+            # value of ({} when none): conditions that exist only under this build's value
+            # have no database record
+            'database_identity_kwargs': db_identity if args.database is not None else {},
             'reference': _count(r['reference'] for s in mrows for r in mrows[s]),
             'thermal_check': _count(r['thermal_check'] for s in mrows for r in mrows[s]),
             'refusals_from_database': sum(
@@ -1469,7 +1492,12 @@ def main(argv=None):
                    'salt': args.stereo_salt, 'perception': 'legacy (pinned)',
                    'identity': 'build_conformer_conditions.py::stereo_identity (fixed-H '
                                'InChI and CIP labels), never canonical SMILES equality',
-                   'tetrahedral_N': 'not a stereo element (working assumption)',
+                   'tetrahedral_N': (
+                       'a stereo nitrogen (energies/stereo_lock.py::stereo_nitrogens) is a '
+                       'stereo element, tagged in the identifier and locked '
+                       '(energy_config.lock_stereo_nitrogen); every other N is not'
+                       if energy_kw.get('lock_stereo_nitrogen', False)
+                       else 'not a stereo element (working assumption)'),
                    'mirror_pairs': sorted({tuple(sorted((r['identifier'], r['mirror'])))
                                            for r in mrows['train'] + mrows['heldout']
                                            if r['mirror']}),

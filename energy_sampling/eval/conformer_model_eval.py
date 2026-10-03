@@ -549,7 +549,12 @@ def stereo_pairs(smiles_of: Mapping[str, str]) -> List[dict]:
     """Pairs of conditions of one constitution (`build_conformer_set.constitution_key`),
     classified by `build_conformer_conditions.smiles_identity`: 'mirror' when one is the
     other with every tetrahedral centre inverted (`encoder_probe.mirror_smiles`), 'same
-    isomer' when both name one stereoisomer, 'diastereomer' otherwise."""
+    isomer' when both name one stereoisomer, 'diastereomer' otherwise.
+
+    A stereo nitrogen's tag is read as part of the identity (`lock_nitrogen=True`): an
+    identifier carries one only when its set was built under `lock_stereo_nitrogen`, where
+    two invertomers are two isomers, and an identifier without one reads the same either way.
+    """
     from build_conformer_conditions import smiles_identity
     from build_conformer_set import constitution_key
     from models.encoder_probe import mirror_smiles
@@ -561,8 +566,8 @@ def stereo_pairs(smiles_of: Mapping[str, str]) -> List[dict]:
     for key, ids in sorted(groups.items()):
         if len(ids) < 2:
             continue
-        idt = {i: smiles_identity(smiles_of[i]) for i in ids}
-        mir = {i: smiles_identity(mirror_smiles(smiles_of[i])) for i in ids}
+        idt = {i: smiles_identity(smiles_of[i], True) for i in ids}
+        mir = {i: smiles_identity(mirror_smiles(smiles_of[i]), True) for i in ids}
         for a, b in itertools.combinations(sorted(ids), 2):
             if idt[a] == idt[b]:
                 kind = 'same isomer'

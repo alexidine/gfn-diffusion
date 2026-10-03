@@ -354,8 +354,11 @@ def atom_parity(en) -> np.ndarray:
     pseudo-asymmetric centres and runs under the pinned perception), so an untagged centre
     reads 0 -- the condition does not say which configuration it is. A three-coordinate
     centre (an amine N) is left at 0: its invertomers are one condition (stereo_lock's module
-    note). Read off the energy's own record; `en.mol` is not touched (this used to reassign
-    its stereo in place).
+    note). A stereo nitrogen the energy LOCKS (`ConformerTorsions.stereo_nitrogen_atoms`,
+    empty unless it was built under `lock_stereo_nitrogen`) is the exception: its two
+    configurations are two conditions over one graph, so it carries its parity like any
+    tagged centre, the sign of its three neighbours' triple product. Read off the energy's
+    own record; `en.mol` is not touched (this used to reassign its stereo in place).
 
     The sign is read off the reference conformer, which is legitimate here in a way it was
     NOT for the reference dihedral: the embedding respects the SMILES stereo tags, so parity
@@ -365,6 +368,7 @@ def atom_parity(en) -> np.ndarray:
     from energies.stereo_lock import TETRAHEDRAL
     centres = {int(e['atoms'][0]) for e in en.stereo_elements
                if e['kind'] == TETRAHEDRAL and e['specified'] and e['degree'] == 4}
+    centres |= {int(a) for a in getattr(en, 'stereo_nitrogen_atoms', ()) or ()}
     n = en.spec.n_atoms
     out = np.zeros(n)
     if not centres:

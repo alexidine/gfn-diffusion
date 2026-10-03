@@ -111,7 +111,8 @@ REASON_CODES = {
     'convention_check': 'the condition graph and the energy build different geometry',
     'stereo_unspecified': 'the SMILES leaves stereo open: it enumerates to more than one '
                           'stereoisomer (enumerate_stereoisomers)',
-    'stereo_n_tagged': 'the SMILES tags a tetrahedral N, which 3D perception cannot verify',
+    'stereo_n_tagged': 'the SMILES tags a tetrahedral N, which 3D perception cannot verify '
+                       '(not raised for a stereo nitrogen held under lock_stereo_nitrogen)',
     'stereo_verify_failed': 'the embedded reference, re-perceived from 3D, is a different '
                             'stereoisomer (stereo_identity) from the one requested',
     'encoder_alignment': 'the encoder atom order does not align with the tree',
@@ -271,6 +272,15 @@ def stereo_mol(smiles: str):
     Whether to keep the assumption, split hindered invertomers into separate conditions, or
     extend the prior's flip to a ring N at the root is an OPEN OWNER DECISION; until it is
     made the assumption stands as written.
+    OWNER DECISION 2026-10-03: split them, as an option. Under
+    ``energy_config.lock_stereo_nitrogen`` (off by default) a STEREO NITROGEN
+    (energies/stereo_lock.py: three single bonds to non-hydrogen atoms, and a tetrahedral
+    element by RDKit's own rule, an N in a three-membered ring or a bridgehead N) is a stereo
+    element: every function below that takes ``lock_nitrogen`` then keeps its tag, enumerates
+    it, and reads it off a 3D reference by the sign of its chiral volume
+    (``stereo_lock.perceive_with_nitrogens``), since RDKit's 3D perception returns none. With
+    the option off nothing here changes, and an aziridine N-H, which no SMILES can tag, stays
+    under the assumption either way.
     """
     from rdkit import Chem
 
@@ -283,11 +293,21 @@ def stereo_mol(smiles: str):
     return Chem.AddHs(m, onlyOnAtoms=on) if on else m
 
 
-def _strip_n_tags(m):
+def _strip_n_tags(m, lock_nitrogen: bool = False):
+    """``m`` (in place) with every N tag cleared -- with ``lock_nitrogen``, every N tag but a
+    stereo nitrogen's (``stereo_lock.stereo_nitrogens``, judged on ``m``, which must then be
+    a hydrogen-free view: a parse, ``stereo_mol`` or ``RemoveHs`` of a member's mol)."""
     from rdkit import Chem
 
+    keep = ()
+    if lock_nitrogen and any(a.GetAtomicNum() == 7
+                             and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+                             for a in m.GetAtoms()):
+        from energies.stereo_lock import stereo_nitrogens
+        keep = set(stereo_nitrogens(m))
     for a in m.GetAtoms():
-        if a.GetAtomicNum() == 7 and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED:
+        if (a.GetAtomicNum() == 7 and a.GetIdx() not in keep
+                and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED):
             a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
     return m
 
@@ -301,11 +321,16 @@ def _parse(smiles: str):
     return m
 
 
-def stereo_identity(mol) -> tuple:
+def stereo_identity(mol, lock_nitrogen: bool = False) -> tuple:
     """WHICH STEREOISOMER ``mol`` is, read off its atoms and bonds without the SMILES writer.
 
     ``(fixed-H InChI, CIP signature)``; two molecules are one stereoisomer only when BOTH
     agree. Call it under ``legacy_stereo`` (``mol``'s tags were assigned under it).
+
+    With ``lock_nitrogen`` a stereo nitrogen's tag is kept (``_strip_n_tags``), so the two
+    configurations of one are two identities: the CIP labeller labels such an N (all 397 of
+    397 QM9 molecules sampled 2026-10-03), while InChI separates only some of them (336 of
+    those 397), which is why the identity is the pair.
 
     RDKIT'S CANONICAL SMILES IS NOT A STEREO IDENTITY on some cages and spiro systems, so
     no identifier comparison goes through it. Measured over 3,000 random QM9 molecules at
@@ -343,7 +368,7 @@ def stereo_identity(mol) -> tuple:
     """
     from rdkit import Chem
 
-    m = _labelled(mol)
+    m = _labelled(mol, lock_nitrogen)
     inchi = Chem.MolToInchi(m, options='/FixedH')
     heavy = [a.GetIdx() for a in m.GetAtoms() if a.GetAtomicNum() != 1]
     pos = {old: j for j, old in enumerate(heavy)}
@@ -358,12 +383,13 @@ def stereo_identity(mol) -> tuple:
     return inchi, tuple(atoms), tuple(bonds)
 
 
-def _labelled(mol):
-    """A conformer-free copy of ``mol``, N tags off, CIP-labelled, unlabelled tags dropped."""
+def _labelled(mol, lock_nitrogen: bool = False):
+    """A conformer-free copy of ``mol``, N tags off (a stereo nitrogen's kept under
+    ``lock_nitrogen``), CIP-labelled, unlabelled tags dropped."""
     from rdkit import Chem
     from rdkit.Chem import rdCIPLabeler
 
-    m = _strip_n_tags(Chem.Mol(mol))
+    m = _strip_n_tags(Chem.Mol(mol), lock_nitrogen)
     m.RemoveAllConformers()
     for x in (*m.GetAtoms(), *m.GetBonds()):
         x.ClearProp('_CIPCode')
@@ -381,14 +407,19 @@ def _n_stereo_marks(smiles: str) -> int:
     return smiles.replace('@@', '@').count('@') + smiles.count('/') + smiles.count(chr(92))
 
 
-def smiles_identity(smiles: str) -> tuple:
+def smiles_identity(smiles: str, lock_nitrogen: bool = False) -> tuple:
     """``stereo_identity`` of a SMILES as parsed -- the isomer its tags name."""
     with legacy_stereo():
-        return stereo_identity(_parse(smiles))
+        return stereo_identity(_parse(smiles), lock_nitrogen)
 
 
-def stereoisomer_classes(smiles: str, max_isomers: int = 1024) -> list:
+def stereoisomer_classes(smiles: str, max_isomers: int = 1024,
+                         lock_nitrogen: bool = False) -> list:
     """``[(name, identity, other_names)]``: every stereoisomer of ``smiles``, sorted by name.
+
+    With ``lock_nitrogen`` the two configurations of a stereo nitrogen are two isomers, each
+    named with its N tag; the enumerator already assigns them (it counts every N it calls
+    potential, which is why the 2**n bound below does not move), and only the strip differs.
 
     Every assignment of the open elements (``onlyUnassigned``: an element the input already
     specifies is kept), N tags stripped, written as a canonical tagged SMILES and re-written
@@ -425,17 +456,17 @@ def stereoisomer_classes(smiles: str, max_isomers: int = 1024) -> list:
                              f'{max_isomers}; refusing a truncated enumeration')
         strings = set()
         for iso in EnumerateStereoisomers(m, options=opts):
-            iso = _strip_n_tags(Chem.Mol(iso))
+            iso = _strip_n_tags(Chem.Mol(iso), lock_nitrogen)
             strings.add(Chem.MolToSmiles(_parse(Chem.MolToSmiles(Chem.RemoveHs(iso)))))
         classes = {}
         for s in strings:
-            idt = stereo_identity(_parse(s))
+            idt = stereo_identity(_parse(s), lock_nitrogen)
             classes.setdefault(idt, set()).add(s)
             # the same SMILES with the tags no CIP label backs dropped, when it still parses
             # to this isomer: a 1,3-disubstituted bicyclo[1.1.1]pentane is then named without
             # the bridgehead tags legacy writes on it, which the encoder would read as parity
-            bare = Chem.MolToSmiles(_labelled(_parse(s)))
-            if bare != s and stereo_identity(_parse(bare)) == idt:
+            bare = Chem.MolToSmiles(_labelled(_parse(s), lock_nitrogen))
+            if bare != s and stereo_identity(_parse(bare), lock_nitrogen) == idt:
                 classes[idt].add(bare)
     out = []
     for k, v in classes.items():
@@ -445,17 +476,18 @@ def stereoisomer_classes(smiles: str, max_isomers: int = 1024) -> list:
     return sorted(out)
 
 
-def enumerate_stereoisomers(smiles: str, max_isomers: int = 1024) -> list:
+def enumerate_stereoisomers(smiles: str, max_isomers: int = 1024,
+                            lock_nitrogen: bool = False) -> list:
     """Every stereoisomer of ``smiles``, one tagged SMILES each, sorted.
 
     ``stereoisomer_classes``'s names: one string per stereoisomer by ``stereo_identity``, so
     the list is a function of the molecule rather than of RDKit's walk order, and a tagged
     input enumerates to one string.
     """
-    return [name for name, _, _ in stereoisomer_classes(smiles, max_isomers)]
+    return [name for name, _, _ in stereoisomer_classes(smiles, max_isomers, lock_nitrogen)]
 
 
-def unspecified_stereo(smiles: str) -> list:
+def unspecified_stereo(smiles: str, lock_nitrogen: bool = False) -> list:
     """``[]`` when ``smiles`` names ONE stereoisomer, else the isomers it leaves open.
 
     JUDGED BY THE ENUMERATOR ITSELF, so "fully specified" means exactly what enumeration
@@ -465,20 +497,32 @@ def unspecified_stereo(smiles: str) -> list:
     molecules with no open element at all (30 of 5,000 random QM9 molecules whole, 101 in
     part), none for the tetrahedral-N reason it was once blamed on.
     """
-    classes = stereoisomer_classes(smiles)
+    classes = stereoisomer_classes(smiles, lock_nitrogen=lock_nitrogen)
     return [] if len(classes) <= 1 else [c[0] for c in classes]
 
 
-def _tagged_from_3d(mol3d):
-    """A copy of ``mol3d`` with every tag replaced by what its geometry says, N tags off."""
+def _tagged_from_3d(mol3d, lock_nitrogen: bool = False):
+    """A copy of ``mol3d`` with every tag replaced by what its geometry says, N tags off.
+
+    With ``lock_nitrogen``, a molecule that has a stereo nitrogen comes back as its
+    hydrogen-free view perceived WITH those nitrogens
+    (``stereo_lock.perceive_with_nitrogens``), every other N tag off; ``RemoveHs`` of it is
+    itself, so the callers' ``RemoveHs`` is unchanged. One without a stereo nitrogen comes
+    back exactly as with the option off.
+    """
     from rdkit import Chem
 
     m = Chem.Mol(mol3d)
     Chem.AssignStereochemistryFrom3D(m)
+    if lock_nitrogen:
+        from energies import stereo_lock as sl
+        if (any(sl._is_stereo_nitrogen_atom(a) for a in m.GetAtoms())
+                and sl.stereo_nitrogens(sl.implicit_h_view(m))):
+            return _strip_n_tags(sl.perceive_with_nitrogens(mol3d), True)
     return _strip_n_tags(m)
 
 
-def realised_isomer(mol3d) -> str:
+def realised_isomer(mol3d, lock_nitrogen: bool = False) -> str:
     """The stereoisomer an embedded molecule IS, re-perceived from 3D, as a SMILES to READ.
 
     ``AssignStereochemistryFrom3D``, then the canonical isomeric SMILES of the H-stripped
@@ -489,7 +533,7 @@ def realised_isomer(mol3d) -> str:
     from rdkit import Chem
 
     with legacy_stereo():
-        m = _tagged_from_3d(mol3d)
+        m = _tagged_from_3d(mol3d, lock_nitrogen)
         return Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(Chem.RemoveHs(m))))
 
 
@@ -503,7 +547,8 @@ def constitution_smiles(smiles: str) -> str:
 
 
 @functools.lru_cache(maxsize=4096)
-def untagged_realisations(constitution: str, seed: int, n_seeds: int = 4) -> frozenset:
+def untagged_realisations(constitution: str, seed: int, n_seeds: int = 4,
+                          lock_nitrogen: bool = False) -> frozenset:
     """``stereo_identity`` of every isomer ETKDG realises for the UNTAGGED constitution.
 
     One ETKDGv3 embedding per seed in ``seed .. seed + n_seeds - 1`` (the member's own seed
@@ -532,7 +577,8 @@ def untagged_realisations(constitution: str, seed: int, n_seeds: int = 4) -> fro
         except Exception:                                    # noqa: BLE001 - probe only
             pass
         with legacy_stereo():
-            out.add(stereo_identity(Chem.RemoveHs(_tagged_from_3d(m))))
+            out.add(stereo_identity(Chem.RemoveHs(_tagged_from_3d(m, lock_nitrogen)),
+                                    lock_nitrogen))
     return frozenset(out)
 
 
@@ -640,11 +686,12 @@ def build_member(smiles: str, identifier: str, energy_kw: dict, *, bundle=None,
         raise MemberRefused(classify_failure(exc), f'{type(exc).__name__}: {exc}') from None
 
 
-def _embed_failure(smiles: str, seed: int, message: str):
+def _embed_failure(smiles: str, seed: int, message: str, lock_nitrogen: bool = False):
     """``(code, message)`` for a construction that failed to embed: realisable or not."""
     try:
-        want = smiles_identity(smiles)
-        seen = untagged_realisations(constitution_smiles(smiles), int(seed), PROBE_SEEDS)
+        want = smiles_identity(smiles, lock_nitrogen)
+        seen = untagged_realisations(constitution_smiles(smiles), int(seed), PROBE_SEEDS,
+                                     bool(lock_nitrogen))
     except Exception as exc:                                   # noqa: BLE001 - probe only
         return 'embed_failed', f'{message} (realisability probe raised {exc!r})'
     seeds = f'seeds {seed}..{int(seed) + PROBE_SEEDS - 1}'
@@ -697,7 +744,8 @@ def _build_member(smiles, identifier, energy_kw, *, bundle, carrier, check,
         if chart_code is not None:
             code = chart_code
         if code == 'embed_failed':
-            code, msg = _embed_failure(smiles, energy_kw.get('seed', 0), msg)
+            code, msg = _embed_failure(smiles, energy_kw.get('seed', 0), msg,
+                                       bool(energy_kw.get('lock_stereo_nitrogen', False)))
         raise MemberRefused(code, msg) from None
     if reference is not None:
         why = _stored_reference_problem(identifier, energy, reference, stored_perm)
@@ -811,16 +859,26 @@ def _check_stereo(smiles: str, energy):
     shown to hold it, and a tag nothing enforces is a label that lies. The reference is
     compared by ``stereo_identity`` against the SMILES AS PARSED -- no canonical rewrite on
     either side, since the rewrite can itself change the isomer.
+
+    A member built under ``lock_stereo_nitrogen`` holds its tagged stereo nitrogens
+    (``energy.stereo_nitrogen_atoms``): those tags are not refused, an untagged stereogenic
+    one leaves stereo open like any other element, and the reference's side of each is read
+    by the sign of its chiral volume (``_tagged_from_3d``).
     """
     from rdkit import Chem
 
+    lock_n = bool(getattr(energy, 'lock_stereo_nitrogen', False))
+    held = set(getattr(energy, 'stereo_nitrogen_atoms', ()) or ()) if lock_n else set()
     m = _parse(smiles)
     if any(a.GetAtomicNum() == 7 and a.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
-           for a in m.GetAtoms()):
+           and a.GetIdx() not in held for a in m.GetAtoms()):
         raise MemberRefused('stereo_n_tagged',
                             f'{smiles} tags a tetrahedral N; N configuration is not '
-                            f'perceivable from 3D, so it cannot be verified or pinned')
-    open_ = unspecified_stereo(smiles)
+                            f'perceivable from 3D, so it cannot be verified or pinned'
+                            + ('' if lock_n else ' (a stereo nitrogen -- three-ring or '
+                               'bridgehead N -- is held under energy_config.'
+                               'lock_stereo_nitrogen)'))
+    open_ = unspecified_stereo(smiles, lock_n)
     if open_:
         raise MemberRefused('stereo_unspecified',
                             f'{smiles} leaves stereo open: it enumerates to {len(open_)} '
@@ -828,15 +886,15 @@ def _check_stereo(smiles: str, energy):
                             f' ETKDG would choose by seed and the identifier would not say '
                             f'which. Pass a stereo-tagged SMILES, or build the set with '
                             f'build_conformer_set.py, which enumerates them')
-    want = smiles_identity(smiles)
+    want = smiles_identity(smiles, lock_n)
     with legacy_stereo():
         # H-stripped, so the labeller reads the same atoms in the same order as the parse
         # it is compared with (the member's mol is that parse with hydrogens appended)
-        got = stereo_identity(Chem.RemoveHs(_tagged_from_3d(energy.mol)))
+        got = stereo_identity(Chem.RemoveHs(_tagged_from_3d(energy.mol, lock_n)), lock_n)
     if got != want:
         part = 'InChI' if got[0] != want[0] else 'CIP labels'
         raise MemberRefused('stereo_verify_failed',
-                            f'reference re-perceives as {realised_isomer(energy.mol)}, '
+                            f'reference re-perceives as {realised_isomer(energy.mol, lock_n)}, '
                             f'requested {smiles} ({part} differ)')
 
 

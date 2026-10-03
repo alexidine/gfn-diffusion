@@ -126,9 +126,11 @@ class MultiConformerTorsions(ConformerTorsions):
         # `double_bond_box_deg` joins them: it decides which of a member's columns are walled
         # and their scale, and a member built under another box would sit in a layout, and
         # under a chart constant, that are not the set's. `sibling_offset_box_deg` likewise,
-        # and it also decides which rows read a second column.
+        # and it also decides which rows read a second column. `lock_stereo_nitrogen` decides
+        # which SMILES are members at all, so one member built under the other value means the
+        # set mixes two definitions of a condition.
         for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff',
-                     'double_bond_box_deg', 'sibling_offset_box_deg'):
+                     'double_bond_box_deg', 'sibling_offset_box_deg', 'lock_stereo_nitrogen'):
             want = getattr(self, name)
             off = [i for i, m in self._members.items() if getattr(m, name) != want]
             if off:

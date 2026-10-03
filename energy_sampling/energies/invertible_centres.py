@@ -4,7 +4,8 @@ WHAT THE TARGET HOLDS. At `dihedral` and above the chart reaches both sides of e
 centre: the two pyramids of a three-coordinate centre, and the two labelled parities of a
 four-coordinate centre (docs/wiki/conformer-chart-and-internal-coordinates.md, the chirality
 section). The stereo lock (energies/stereo_lock.py) pins every four-coordinate centre when
-`stereo_coeff` > 0 and leaves every three-coordinate centre free: an amine N, a near-planar
+`stereo_coeff` > 0 and leaves every three-coordinate centre free (but a stereo nitrogen locked
+under `lock_stereo_nitrogen`; LOCK AND SCOPE below): an amine N, a near-planar
 amide N (NON-PLANAR below), a planar sp2 C, whose two sides are one geometry, and also a
 sulfoxide S or a phosphine P, whose inversion is slow (QM9 has neither). The target holds both
 sides of a FREE centre wherever both are low-energy minima; the barrier between them does not
@@ -127,6 +128,12 @@ every sp3 centre when `stereo_coeff` is 0, the labelled parities of a CH2 or CH3
 stays one-sided as before although the unlocked target holds both of its sides: a KNOWN
 LIMITATION, which the eval's parity metric still reads and the log Z check's label names. The
 eval counts an UNKNOWN centre as free; the prior does not flip it.
+A LOCKED THREE-COORDINATE CENTRE exists under `ConformerTorsions(lock_stereo_nitrogen=True)`
+only: a stereo nitrogen the condition's SMILES tags (energies/stereo_lock.py, STEREO
+NITROGENS) has a TETRAHEDRAL element keyed on it, so it reads LOCKED here like any named
+centre -- not flipped by the prior, not required on both sides by the eval, not named by the
+log Z check's label -- while every other three-coordinate centre of the same molecule stays
+FREE (tests/conformer/test_stereo_nitrogen.py).
 
 BITWISE WHERE NOTHING IS FLIPPED. Given [] from `invertible_centres`, the prior draw, its density
 and the oracle make no call on the generator and move no row: a molecule with no FREE

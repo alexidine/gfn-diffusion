@@ -58,13 +58,15 @@ class ChartRefused(ValueError):
       * ``stereo_unspecified`` -- the SMILES leaves a lockable stereo element unassigned, so
         the isomer the lock would pin is whatever the embedding happened to realise;
       * ``stereo_unsupported`` -- a stereo element the lock does not enforce is tagged (a
-        tetrahedral N, an allene or atropisomer axis);
+        tetrahedral N, an allene or atropisomer axis; a stereo nitrogen is enforced, and so
+        not refused, under ``lock_stereo_nitrogen``);
       * ``stereo_verify_failed`` -- the reference embedding realised a different isomer
-        than the SMILES names;
+        than the SMILES names (for a locked stereo nitrogen: the other invertomer);
       * ``stereo_lock_in_band`` -- an element's best indicator is within ``MIN_MARGIN`` of
         zero at the reference, so the wrong configuration would pay too little to be locked
         out (build_conformer_conditions.py also records it when the lock fires on a thermal
-        sample of the correct isomer, `stereo_lock.thermal_check`);
+        sample of the correct isomer, `stereo_lock.thermal_check`); a locked stereo nitrogen
+        that is nearly planar at the reference is refused under this code;
       * ``stereo_torsion_double_bond`` -- at ``torsion`` a rotatable column turns a locked
         double bond, which the torsion prior draws into both E and Z.
     """
@@ -330,6 +332,19 @@ class ConformerTorsions(BaseSet):
                  # prices the configuration with the offsets negated; without the lock the
                  # target holds both and the box would cut one, so the pair is refused.
                  sibling_offset_box_deg: Optional[float] = None,
+                 # LOCK THE STEREO NITROGENS. False (the default) leaves every
+                 # three-coordinate centre free, as it was: a tag on one is stripped from the
+                 # condition's identity and refused when the lock is on. True makes a STEREO
+                 # NITROGEN (energies/stereo_lock.py: three single bonds to non-hydrogen
+                 # atoms, reported by RDKit as a tetrahedral element on the parsed SMILES --
+                 # an N in a three-membered ring or a bridgehead N) a stereo element: its tag
+                 # is part of the identity, an untagged stereogenic one is refused, a tagged
+                 # one gets a lock element whose sign is read off the reference and checked
+                 # against the tag, and the prior no longer reflects it. It CHANGES WHICH
+                 # CONDITIONS A MOLECULE HAS, so it is not a chart-only option: a member
+                 # whose SMILES has no N tag is the same under both values, every other one
+                 # exists under one value only. Needs the lock (stereo_coeff > 0).
+                 lock_stereo_nitrogen: bool = False,
                  # A STORED REFERENCE CONFORMER, [N, 3] Angstrom in the atom order of
                  # Chem.AddHs(Chem.MolFromSmiles(smiles)). None (the default) embeds one:
                  # seeded ETKDGv3, then MMFF94 relaxation when mmff_reference. Given, it IS the
@@ -565,6 +580,19 @@ class ConformerTorsions(BaseSet):
         # Off (stereo_coeff 0) it adds no term and refuses nothing; the table still exists so
         # a condition graph and the per-coordinate features are the same object either way.
         self.stereo_coeff = stereo_coeff             # validated by the property's setter
+        if not isinstance(lock_stereo_nitrogen, (bool, np.bool_)):
+            raise ValueError(f'lock_stereo_nitrogen must be true or false, got '
+                             f'{lock_stereo_nitrogen!r}')
+        if lock_stereo_nitrogen and self.stereo_coeff <= 0.0:
+            raise ValueError(
+                'lock_stereo_nitrogen with stereo_coeff 0: the option makes a stereo '
+                'nitrogen\'s configuration part of a condition\'s identity, and with the lock '
+                'off nothing holds it, so the condition would be named as one configuration '
+                'and hold both. Refused for every molecule, with or without such a nitrogen, '
+                'so a set fails on its first member. Set stereo_coeff > 0 or leave '
+                'lock_stereo_nitrogen false.')
+        #: whether a tagged stereo nitrogen is a locked stereo element (energies/stereo_lock.py)
+        self.lock_stereo_nitrogen = bool(lock_stereo_nitrogen)
         self._init_stereo(smiles, slot, pos_np, level)
         if double_bond_box_deg is not None:
             _w = float(double_bond_box_deg)
@@ -1261,26 +1289,62 @@ class ConformerTorsions(BaseSet):
         The signs are then read off the reference, not off the tags, so the reference must BE
         the tagged isomer: `realised_isomer` re-perceives it from 3D and it must equal the
         input's canonical isomeric SMILES.
+
+        STEREO NITROGENS (`lock_stereo_nitrogen`; energies/stereo_lock.py). With the option
+        on, each stereo nitrogen the SMILES tags is a locked element
+        (`stereo_nitrogen_atoms`); 3D perception returns nothing for it, so its element's sign
+        is checked against the sign its tag asks for (`stereo_lock.quad_sign_of_tag`), and a
+        near-planar one is refused before that comparison can read noise.
         """
         from energies import stereo_lock as sl
 
+        lock_n = bool(self.lock_stereo_nitrogen)
         #: the INPUT molecule's potential stereo elements (stereo_lock.tagged_elements), in
         #: `self.mol`'s atom indexing -- the condition side of the stereo contract
         self.stereo_elements = sl.tagged_elements(smiles)
+        #: the stereo nitrogens the lock holds, RDKit atom indices of `self.mol`, ascending:
+        #: the ones the SMILES tags, and none unless `lock_stereo_nitrogen`
+        self.stereo_nitrogen_atoms = tuple(sorted(
+            int(e['atoms'][0]) for e in self.stereo_elements
+            if lock_n and e['kind'] == sl.TETRAHEDRAL and e['stereo_nitrogen']
+            and e['specified']))
+        held_n = set(self.stereo_nitrogen_atoms)
+        if lock_n:
+            # A TAG ON A STEREO NITROGEN IS EITHER HELD OR THE BUILD STOPS. "Tagged" above is
+            # `tagged_elements`' `specified`, which unites two graphs' reports; the SMILES's
+            # own parse is the authority on whether the tag is there. A stereo nitrogen that
+            # carries a tag and is not held would be a condition named as one configuration
+            # with nothing holding it.
+            from rdkit import Chem
+            with sl.pinned_perception():
+                _parsed = Chem.MolFromSmiles(smiles)
+            _stray = sorted(
+                int(e['atoms'][0]) for e in self.stereo_elements
+                if e['kind'] == sl.TETRAHEDRAL and e['stereo_nitrogen']
+                and (sl.nitrogen_tag_sign(_parsed.GetAtomWithIdx(int(e['atoms'][0]))) != 0)
+                != (int(e['atoms'][0]) in held_n))
+            if _stray:
+                raise RuntimeError(
+                    f'{smiles}: stereo nitrogen(s) at atom(s) {_stray} are tagged in the '
+                    f'SMILES but not listed as specified stereo elements (or the reverse); '
+                    f'refusing to build a member whose nitrogen tag nothing holds')
         dbl = [tuple(int(slot[a]) for a in e['atoms']) for e in self.stereo_elements
                if e['kind'] == sl.DOUBLE_BOND]
         centres = [int(slot[e['atoms'][0]]) for e in self.stereo_elements
-                   if e['kind'] == sl.TETRAHEDRAL and e['specified'] and e['degree'] == 4]
-        self.stereo = sl.build_table(pos_slot, self.bond_index_slot, dbl, stereocentres=centres)
+                   if e['kind'] == sl.TETRAHEDRAL and e['specified']
+                   and (e['degree'] == 4 or int(e['atoms'][0]) in held_n)]
+        self.stereo = sl.build_table(pos_slot, self.bond_index_slot, dbl, stereocentres=centres,
+                                     nitrogens=[int(slot[a]) for a in self.stereo_nitrogen_atoms])
         #: the isomer the reference conformer REALISES (re-perceived from 3D), and the input's
-        self.stereo_isomer = sl.realised_isomer(self.mol)
-        self.stereo_input = sl.canonical_isomeric(smiles)
+        self.stereo_isomer = sl.realised_isomer(self.mol, lock_nitrogen=lock_n)
+        self.stereo_input = sl.canonical_isomeric(smiles, lock_nitrogen=lock_n)
         if self.stereo_coeff <= 0.0:
             return
 
         odd = [e for e in self.stereo_elements if e['kind'] == 0]
         inv = [e for e in self.stereo_elements
-               if e['kind'] == sl.TETRAHEDRAL and e['degree'] != 4 and e['specified']]
+               if e['kind'] == sl.TETRAHEDRAL and e['degree'] != 4 and e['specified']
+               and int(e['atoms'][0]) not in held_n]
         if odd or inv:
             what = ([f"{e['type']} at atom {e['atoms']}" for e in odd]
                     + [f"tetrahedral {e['element']}{e['atoms'][0]} (3-coordinate)" for e in inv])
@@ -1290,12 +1354,16 @@ class ConformerTorsions(BaseSet):
                 f"enforce them -- a three-coordinate centre (an amine N) is left to invert "
                 f"inside one condition (RDKit does not recover N stereo from 3D, so it could "
                 f"not be verified), and axial stereo has no indicator. Strip those tags, or run "
-                f"with stereo_coeff 0.")
-        isomers = sl.consistent_isomers(smiles)
+                f"with stereo_coeff 0."
+                + ("" if lock_n or not any(e['stereo_nitrogen'] for e in inv) else
+                   " A tagged stereo nitrogen (three-ring or bridgehead N) is locked under "
+                   "lock_stereo_nitrogen: true."))
+        isomers = sl.consistent_isomers(smiles, lock_nitrogen=lock_n)
         if len(isomers) != 1:
             loose = [(e['type'], e['atoms']) for e in self.stereo_elements
                      if not e['specified'] and not (e['kind'] == sl.TETRAHEDRAL
-                                                    and e['degree'] != 4)]
+                                                    and e['degree'] != 4
+                                                    and not (lock_n and e['stereo_nitrogen']))]
             raise ChartRefused(
                 'stereo_unspecified',
                 f"{smiles}: the tags are consistent with {len(isomers)} stereoisomers (e.g. "
@@ -1304,6 +1372,8 @@ class ConformerTorsions(BaseSet):
                 f"locked to whatever the ETKDG embedding realised ({self.stereo_isomer!r} "
                 f"this time), which the problem identity does not record. Pass a fully tagged "
                 f"stereoisomer.")
+        if held_n:
+            self._verify_stereo_nitrogens(smiles, slot)
         if self.stereo_isomer != self.stereo_input:
             raise ChartRefused(
                 'stereo_verify_failed',
@@ -1336,6 +1406,58 @@ class ConformerTorsions(BaseSet):
                     f"rotatable (no bond-order test) and its prior draws both E and Z, so the "
                     f"lock would reject a fixed share of every prior draw. Run it unlocked "
                     f"(stereo_coeff 0), or at dihedral/flex/full.")
+
+    def _verify_stereo_nitrogens(self, smiles: str, slot: np.ndarray):
+        """Refuse a reference that does not REALISE the tagged configuration of a locked
+        stereo nitrogen, or that is too flat there to say which it realises.
+
+        Per locked nitrogen, on a fresh parse of ``smiles`` (``self.mol``'s heavy atoms keep
+        its indices and its bond order about a hydrogen-free N): the tag's sign for the
+        neighbours in bond order (`stereo_lock.nitrogen_tag_sign`), carried to the lock
+        element's own neighbour order (`quad_sign_of_tag`), must be the sign the table read
+        off the reference. The margin is checked FIRST: below `MIN_MARGIN` the reference's
+        sign is not evidence of either configuration, and the condition is refused
+        (`stereo_lock_in_band`) rather than built with that nitrogen free, because its tag is
+        part of the condition's name.
+        """
+        from rdkit import Chem
+
+        from energies import stereo_lock as sl
+        with sl.pinned_perception():
+            parsed = Chem.MolFromSmiles(smiles)
+        flat, wrong = [], []
+        for a in self.stereo_nitrogen_atoms:
+            e = self.stereo.element_of(int(slot[a]))
+            atom = parsed.GetAtomWithIdx(int(a))
+            want = sl.quad_sign_of_tag(sl.nitrogen_tag_sign(atom),
+                                       [int(slot[k]) for k in sl.bond_order_neighbours(atom)])
+            if want == 0:
+                raise RuntimeError(f'{smiles}: stereo nitrogen at atom {a} is listed as tagged '
+                                   f'but its parse carries no tetrahedral tag')
+            if sorted(int(slot[k]) for k in sl.bond_order_neighbours(atom)) != [
+                    int(q) for q in self.stereo.quad[e][:3]]:
+                raise RuntimeError(f'{smiles}: the lock element of the stereo nitrogen at atom '
+                                   f'{a} is not on its three bonded neighbours')
+            if float(self.stereo.margin[e]) < sl.MIN_MARGIN:
+                flat.append((int(a), float(self.stereo.margin[e])))
+            elif int(self.stereo.sign[e]) != want:
+                wrong.append((int(a), float(self.stereo.margin[e])))
+        if flat:
+            raise ChartRefused(
+                'stereo_lock_in_band',
+                f"{smiles}: the tagged stereo nitrogen(s) at atom(s) {[a for a, _ in flat]} are "
+                f"nearly planar at the reference (|indicator| "
+                f"{[round(m, 4) for _, m in flat]}, below {sl.MIN_MARGIN}): the reference does "
+                f"not show which configuration it realises, and the mirror point would pay too "
+                f"little to be locked out (stereo_lock.MIN_MARGIN).")
+        if wrong:
+            raise ChartRefused(
+                'stereo_verify_failed',
+                f"{smiles}: the reference conformer realises the OTHER configuration of the "
+                f"tagged stereo nitrogen(s) at atom(s) {[a for a, _ in wrong]} (|indicator| "
+                f"{[round(m, 4) for _, m in wrong]}; 3D perception returns no N tag, so the "
+                f"lock element's sign is compared with the sign the tag asks for). The lock "
+                f"reads its signs off the reference, so it would pin the wrong invertomer.")
 
     def held_phi_rows(self):
         """phi rows the prior HOLDS at their reference: impropers, plus locked double bonds.
@@ -1484,6 +1606,12 @@ class ConformerTorsions(BaseSet):
                 f"   STEREO LOCK {state}: {n_t} tetrahedral centre(s) ({int(st.stereocentre.sum())} "
                 f"stereocentre(s), the rest labelled parity), {n_b} double bond(s); reference "
                 f"realises {self.stereo_isomer!r}")
+            if getattr(self, 'lock_stereo_nitrogen', False):
+                lines.append(
+                    f"   STEREO NITROGENS LOCKED (lock_stereo_nitrogen): "
+                    f"{len(self.stereo_nitrogen_atoms)} three-neighbour N among the "
+                    f"tetrahedral centres above, RDKit atom(s) "
+                    f"{list(self.stereo_nitrogen_atoms)}")
         if n_free[0] or n_free[1]:
             lines.append(f"   box: r +/-{self.delta_r_max} A, theta "
                          f"+/-{self.delta_theta_max} rad, wall {self.bounding_coeff}, "
@@ -1965,7 +2093,11 @@ class ConformerTorsions(BaseSet):
             target. At a three-coordinate centre the target holds both sides and
             energies/invertible_centres.py flips between them, an offset going from about
             +120 to -120 degrees, which a narrow box would cut: those groups keep periodic
-            followers, whether or not that module qualifies the centre;
+            followers, whether or not that module qualifies the centre. A LOCKED STEREO
+            NITROGEN (`lock_stereo_nitrogen`) is named by the lock and has three neighbours:
+            its group is NOT converted either. Every one RDKit reports is a ring atom, which
+            the rule above already excludes, and this rule does not count it as named, which
+            keeps it out should that ever change;
           * no row is a transverse v, uses a dummy frame or is held on a collinear frame
             (``linear_frame``).
 
@@ -1977,6 +2109,10 @@ class ConformerTorsions(BaseSet):
         if self.stereo_coeff > 0.0 and self.stereo.n:
             named = {int(k) for k, kd in zip(self.stereo.key, self.stereo.kind)
                      if int(kd) == TETRAHEDRAL}
+            if getattr(self, 'stereo_nitrogen_atoms', ()):
+                _slot = np.empty(int(self.spec.n_atoms), dtype=np.int64)
+                _slot[np.asarray(self.spec.perm)] = np.arange(int(self.spec.n_atoms))
+                named -= {int(_slot[a]) for a in self.stereo_nitrogen_atoms}
         ring = self._ring_atoms()
         tv = {int(j) for j in np.asarray(self.transverse_partner)[
             np.asarray(self.transverse_angles, dtype=bool)]}
