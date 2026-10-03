@@ -5,9 +5,9 @@ search (P-1, Z'=1, raw eLJ): every standardized QM9 molecule, near-exact duplica
 chunks 0-49 cut to their 10 most diverse crystals, a random 5% of molecules held out with all their crystals.
 
 PHASE 1 (`python configs/qm9full_sep30/make.py p1`): train_prior only, ONE training the phase-2 arms share (two legs,
-below) -- the Z fallback they differ in does not act in train_prior (tbc 0). Stopped by hand, as cl21_p1 was: the stage carries no
-exit, and archive_period 5000 writes the candidate seeds. Built from cond_lam_sep21/p1.yaml, the first phase of the
-chain the best conditional run (cond_tb_sep25 ctb25_extreme_l1) came from, with:
+below) -- the Z fallback they differ in does not act in train_prior (tbc 0). Stopped by hand, as cl21_p1 was: the
+stage carries no exit, and archive_period 5000 writes the candidate seeds. Built from cond_lam_sep21/p1.yaml, the
+first phase of the chain the best conditional run (cond_tb_sep25 ctb25_extreme_l1) came from, with:
   - every *_hidden_dim 1024 except the log Z head (flow_hidden_dim 64, flow_layers 2: small, so a learned Z(c) can
     be tested without the 1.6M-parameter head that memorized); model.condition_embedding_dim 128 (was 16)
   - integrator.T 50 and eval_T 50 (was 25)
@@ -34,10 +34,43 @@ TWO LEGS, one INDEX row each; the job script's array is the second.
                   prod_aug26 arms). And epochs 1,000,000: the step count restarts at 0 and the base's 100,000 would
                   end a stage that is stopped by hand.
 
-PHASE 2, once the owner picks the seed: the extreme TB recipe from the seed, weights only, as two arms --
-A untrusted_z global, B untrusted_z head (the small learned head). Not generated here yet.
+PHASE 2 (`python configs/qm9full_sep30/make.py arms`; owner 2026-10-03, phase 1 "visually converged"): the extreme TB
+recipe (cond_tb_sep25/ctb25_extreme_l1_cont3.yaml: lambda 1, tb 1 on every branch against the persistent per-condition
+Z, forward and backward at 0.5 / 0.5 with no replay share, the forward branch's reward gradient on its last step, P_B
+frozen at entry, the log Z head regressed onto the tracker's trusted estimates) seeded from phase-1 leg 1, weights only
+on a first launch, as two arms that differ in one key:
+  qf30_tbg  condition_log_z.untrusted_z global   a row below min_visits is scored against one all-condition level
+  qf30_tbh  condition_log_z.untrusted_z head     ... against the small learned head, which the TB residual then trains
+Held-out molecules are never visited, so their eval rows always take the fallback: eval_test/tb_err against
+eval_fwd/tb_err is the test of whether a learned Z(c) generalises. On top of the recipe:
+  - the model, integrator, data files and cluster keys are phase 1's (the seed's architecture and problem; the problem
+    identity is asserted equal to the seed leg's)
+  - the stub train_prior of final_sep19 (no skip_if, an exit that holds at the first metric write, on_exit
+    snapshot_prior) and no prior model
+  - energy_reference seed_min; half_life_visits 50; untrusted_z as the arm
+  - lr_control.fixed_scale 0.2 (2.5e-5). At width 512 the recipe's first leg ran 0.2 and its last ran 0.5 to step
+    28,590 with lr_ctrl/divergences 0 (their W&B summaries); 0.2 is that last rate halved for the doubled width, the
+    rule that gave phase 1 its 2.5e-4. THE RATE IS FIXED AT LAUNCH: a resume keeps the checkpointed scale (TWO LEGS
+    above), so a different rate is a new arm.
+  - fire_cut_factor 1.0 (the canonical value; the recipe carried 0.5 from its base). The loss-excursion bar stays out
+    of service (loss_excursion_k 1e6, cond_tb_sep25/make.py), so a fire is a gradient excursion or a non-finite step:
+    it rewinds at the same rate in both arms, and an arm that keeps firing ends on the reload budget with a .dead file.
+    A halving cut would leave the two arms at different rates.
+  - epochs 1,000,000 (the recipe's 200,000 is a local run length; the step count starts at 0 and the wall ends a leg)
+  - buffers.anchor_buffer.max_size 2,500,000, about twice the seed, which is every prior row (1,212,915). The
+    recipe's 200,000 sat above its 52,181-row seed and its anchor count never moved (anchor_buffer_length at steps 2,600
+    and 28,590); under that cap here the first admission would thin the seed down to it (the overflow thin in
+    top_up_prior_from_anchors and screen_and_admit_anchors). The other buffer keys are the recipe's, which are the
+    canonical config's "CONDITIONAL ARM:" values (anchor growth on, replay unprioritised).
+  - cluster budgets: final_sep19's eLJ eval budget, phase 1's held-out sample count, and an archive with buffers every
+    10,000 steps and not 5000: a buffers file holds the whole anchor buffer, 2.8 KB a row on the smoke run's sidecar,
+    so about 3.5 to 4 GB an arm here against phase 1's 1.19 GB
+THE SEED (final_sep19's job script, SEED_B): leg 1's newest 5000-step archive, or its _running.pt with SRC_RUNNING=1.
+Each arm resolves it at its own first launch, so the two arms share a seed only if leg 1 is not writing meanwhile:
+cancel it first. A resubmission resumes the arm's own _running.pt in full.
 
     python configs/qm9full_sep30/make.py p1
+    python configs/qm9full_sep30/make.py arms [--dry]
 """
 import copy
 import importlib.util
@@ -51,6 +84,9 @@ _spec = importlib.util.spec_from_file_location('nigmake', HERE.parent / 'mle_nig
 nig = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nig)
 w3 = nig.w3
+_spec = importlib.util.spec_from_file_location('finmake', HERE.parent / 'final_sep19' / 'make.py')
+fin = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(fin)
 
 TAG = 'qf30'
 BATTERY = 'qm9full_sep30'
@@ -73,6 +109,23 @@ LIVE = 1    # the INDEX row the job script's array launches
 # (hard_failure.loss_excursion_k, fire_cut_factor, epochs): the base's, and a promoting leg's
 BASE_GUARD = (10.0, 0.5, 100_000)
 HOT_GUARD = (40.0, 1.0, 1_000_000)
+
+# ---- phase 2
+RECIPE = HERE.parent / 'cond_tb_sep25' / 'ctb25_extreme_l1_cont3.yaml'
+SEED_LEG = LEGS[LIVE][0]
+ARMS = (('tbg', 'global'), ('tbh', 'head'))
+P2_SCALE = 0.2
+P2_FIRE_CUT = 1.0
+P2_EPOCHS = 1_000_000
+P2_ARCHIVE = 10_000
+ANCHOR_MAX = 2_500_000
+# (lr_control.fixed_scale, fire_cut_factor, hard_failure.loss_excursion_k, epochs, anchor_buffer.max_size) of the recipe
+RECIPE_IS = (0.5, 0.5, 1.0e6, 200_000, 200_000)
+WO_PLACEHOLDER = 'WEIGHTS_ONLY_PLACEHOLDER'
+FROM_P1 = ('prior_path', 'molecules_path', 'test_molecules_path', 'checkpoints_dir', 'model', 'integrator', 'eval_T',
+           'compile_policy', 'cuda_memory_fraction', 'test_eval_num_samples')
+STUB_EXIT = [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}]
+STAGES = ['train_prior', 'var_conditioning']
 
 
 def _guard(cfg):
@@ -150,9 +203,156 @@ def check_p1(cfg, name, scale, warm):
     w3._scan_local_paths(cfg, name)
 
 
+def build_arm(run, untrusted, p1):
+    cfg = yaml.safe_load(RECIPE.read_text(encoding='utf-8'))
+    lc, ab = cfg['lr_control'], cfg['buffers']['anchor_buffer']
+    recipe_is = (lc['fixed_scale'], lc['fire_cut_factor'], lc['hard_failure']['loss_excursion_k'], cfg['epochs'],
+                 ab['max_size'])
+    assert recipe_is == RECIPE_IS and lc['seed_lr'] == SEED_LR, recipe_is
+    for k in FROM_P1:
+        cfg[k] = copy.deepcopy(p1[k])
+    cfg['tag'], cfg['run_name'] = TAG, run
+    cfg['checkpoint_name'] = fin.PLACEHOLDER
+    cfg['load_weights_only'] = True     # the first launch; main_arms writes the placeholder the job script fills
+    cfg['continue_from_checkpoint'] = False
+    cfg['prior_model_name'] = fin.PRIOR_PLACEHOLDER
+    cfg['epochs'] = P2_EPOCHS
+    cfg['archive_period'] = P2_ARCHIVE
+    cfg['archive_buffers'] = True
+    cfg.update(fin.ELJ_EVAL)
+    lc['fixed_scale'] = P2_SCALE
+    lc['fire_cut_factor'] = P2_FIRE_CUT
+    cfg['energy_config']['energy_reference'] = 'seed_min'
+    cl = cfg['condition_log_z']
+    cl['untrusted_z'] = untrusted
+    cl['global_half_life_updates'] = 50.0
+    cl['half_life_visits'] = HALF_LIFE_VISITS
+    ab['max_size'] = ANCHOR_MAX
+    stages = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in stages] == STAGES, [s['name'] for s in stages]
+    stub = stages[0]
+    stub.pop('skip_if', None)
+    stub['exit'] = copy.deepcopy(STUB_EXIT)
+    stub['on_exit'] = ['snapshot_prior']
+    cfg['protocol'] = PROTOCOL
+    return cfg
+
+
+def check_arm(cfg, name, untrusted, p1, n_prior_rows):
+    assert cfg['model'] == p1['model'] and cfg['integrator'] == p1['integrator'], f'{name}: the seed\'s model moved'
+    assert cfg['integrator']['T'] == cfg['eval_T'] == p1['eval_T'] == T, f'{name}: the trajectory length moved'
+    mine, theirs = w3.problem_def(cfg), w3.problem_def(p1)
+    moved = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
+    assert not moved, f'{name}: problem identity differs from the seed leg on {moved}; the seed would be refused'
+    ec = cfg['energy_config']
+    assert ec['energy_reference'] == 'seed_min' and ec['lambda_mix'] == 1.0 and ec['prior_flow_path'] is None, name
+    cl = cfg['condition_log_z']
+    assert (cl['untrusted_z'], cl['half_life_visits'], cl['min_visits']) == (untrusted, HALF_LIFE_VISITS, 20), name
+    lc = cfg['lr_control']
+    assert lc['mode'] == 'fixed' and lc['seed_lr'] == SEED_LR and lc['fixed_scale'] == P2_SCALE, name
+    # the stage promotes above its burn-in scale: no cut on a fire, and the loss-excursion bar out of service
+    assert lc['fixed_scale'] > lc['burn_in_scale'] and lc['fire_cut_factor'] == P2_FIRE_CUT, name
+    assert lc['hard_failure']['loss_excursion_k'] == RECIPE_IS[2], name
+    # fixed_scale acts on the rate var_conditioning steps (lr_fused, managed when 'auto') and no rail holds it
+    assert cfg['lr_fused'] == 'auto' and cfg.get('max_lr') is None, name
+    assert (cfg['epochs'], cfg['archive_period'], cfg['archive_buffers']) == (P2_EPOCHS, P2_ARCHIVE, True), name
+    assert P2_ARCHIVE % cfg['eval_period'] == 0, f'{name}: an archive links the buffers file the last eval wrote'
+    # the canonical config's "CONDITIONAL ARM:" globals (mk_dev.yaml), which the recipe carries
+    assert (cfg['batch_size'], cfg['grow_batch_size'], cfg['max_batch_size'], cfg['batch_util_target']) == \
+        (1000, False, 1000, 0.0), name
+    assert cl['rollout_condition_draw'] == 'cycle' and cfg['z_calibration']['fill_from_eval'] == 'off', name
+    rb, ab = cfg['buffers']['replay_buffer'], cfg['buffers']['anchor_buffer']
+    assert (rb['churn_rate'], rb['mean_residence_steps'], rb['max_size']) == (0, 1200, 150000), name
+    assert rb['val_frac'] == 0.0 and rb['prioritise']['enabled'] is False, name
+    assert (ab['frozen'], ab['thin_every_n_evals'], ab['refresh_every_n_evals'], ab['topup_admit_record_breakers']) == \
+        (False, 0, 0, True), name
+    assert cfg['buffers']['prior_buffer']['source'] == 'anchors' and ab['seed_source'] == 'prior_dataset', name
+    assert ab['max_size'] == ANCHOR_MAX >= 2 * n_prior_rows, (name, n_prior_rows)
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert st[0]['exit'] == STUB_EXIT and 'skip_if' not in st[0] and st[0]['on_exit'] == ['snapshot_prior'], name
+    vc = st[1]
+    assert vc['train_mode'] == 'fused', name
+    assert vc['on_enter'] == ['rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb'], (name, vc['on_enter'])
+    assert vc['fracs'] == {'fwd': 0.5, 'bwd': 0.5, 'replay': 0.0} and vc['fwd_rollout_every'] == 0, name
+    for branch in ('fwd', 'bwd', 'replay'):
+        c = vc['loss_coeffs'][branch]
+        assert c['tb'] == 1.0 and c['tb_z_source'] == 'persistent', (name, branch)
+    fwd = vc['loss_coeffs']['fwd']
+    assert (fwd['emp_z_persistent'], fwd['freeze_z'], fwd['reward_grads']) == (1.0, 0.0, 1.0), \
+        f'{name}: the head must learn the trusted estimates, and the forward branch carries the terminal force'
+    assert cfg['checkpoint_name'] == fin.PLACEHOLDER and cfg['prior_model_name'] == fin.PRIOR_PLACEHOLDER, name
+    assert cfg['continue_from_checkpoint'] is False, name
+    w3._scan_local_paths(cfg, name)
+
+
+def main_arms(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    seed_arm = f'{TAG}_{SEED_LEG}'
+    seed_yaml = HERE / f'{seed_arm}.yaml'
+    p1 = yaml.safe_load(seed_yaml.read_text(encoding='utf-8'))
+    committed = w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{seed_arm}.yaml'], HERE)
+    assert yaml.safe_load(committed) == p1, f'{seed_yaml} is not the committed file the seed leg ran'
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+    import torch
+    n_prior_rows = int(torch.load(LOCAL_PRIORS / TEST, map_location='cpu', weights_only=False)['n_structures'])
+    arms = {}
+    for run, untrusted in ARMS:
+        name = f'{TAG}_{run}'
+        cfg = build_arm(run, untrusted, p1)
+        check_arm(cfg, name, untrusted, p1, n_prior_rows)
+        for weights_only in (True, False):  # the first launch and a resubmission, as the job script resolves them
+            probe = copy.deepcopy(cfg)
+            probe['load_weights_only'] = weights_only
+            fin.load_check(probe, name, STAGES)
+        cfg['load_weights_only'] = WO_PLACEHOLDER
+        arms[name] = cfg
+    # the job script finds an arm's files, and the seed leg's, by `*<arm>_*`: no name may match another's
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + list(arms)
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    a, b = arms.values()
+    b_as_a = copy.deepcopy(b)
+    b_as_a['condition_log_z']['untrusted_z'] = a['condition_log_z']['untrusted_z']
+    b_as_a['run_name'] = a['run_name']
+    assert a == b_as_a, 'the two arms must differ in condition_log_z.untrusted_z alone'
+    for i, (name, cfg) in enumerate(arms.items()):
+        lc = cfg['lr_control']
+        print(f"[{i}] {name}: untrusted_z {cfg['condition_log_z']['untrusted_z']}; lr_control.fixed_scale "
+              f"{lc['fixed_scale']:g} ({lc['fixed_scale'] * SEED_LR:g}), fire_cut_factor {lc['fire_cut_factor']:g}; "
+              f"anchor capacity {ANCHOR_MAX:,} for {n_prior_rows:,} prior rows; weights-only first launch from "
+              f"*{seed_arm}_*")
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in arms.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    fin._write_index(HERE / 'INDEX_b.tsv',
+                     [(name, 'qm9full', 'seeded', seed_arm, PRIOR, str(prior_bytes)) for name in arms])
+    with (HERE / f'submit_{BATTERY}_b.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(fin.SBATCH.format(
+            wall=fin.WALL, last=len(arms) - 1, tag=TAG + 'b', battery=BATTERY, leg='b', ckpts=w3.CLUSTER_CKPTS,
+            data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+            what=f'phase 2 of the conditional GFN on the full-QM9 prior, the extreme TB recipe: weights-only first '
+                 f'launch from {seed_arm} (its newest step archive, or its _running.pt with SRC_RUNNING=1), full '
+                 f'resume afterwards; the arms differ in condition_log_z.untrusted_z (global, head).'))
+    print(f'wrote {len(arms)} arms, INDEX_b.tsv and submit_{BATTERY}_b.sbatch')
+    print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
 def main(argv):
-    if argv[:1] != ['p1']:
-        sys.exit(__doc__)
+    if argv[:1] == ['p1']:
+        return main_p1(argv)
+    if argv[:1] == ['arms']:
+        return main_arms(argv)
+    sys.exit(__doc__)
+
+
+def main_p1(argv):
     dirty = w3.dirty_files()
     if dirty and '--allow-dirty' not in argv:
         sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))

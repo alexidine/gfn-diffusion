@@ -1,0 +1,3 @@
+arm	family	start	warm_src	prior	prior_bytes
+qf30_tbg	qm9full	seeded	qf30_p1lr2	qm9full_prior.pt	2433322986
+qf30_tbh	qm9full	seeded	qf30_p1lr2	qm9full_prior.pt	2433322986
