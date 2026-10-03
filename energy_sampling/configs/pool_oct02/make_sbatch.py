@@ -33,7 +33,7 @@ UMA=/scratch/mk8347/models/uma/esen_s.pt
 '''
 SYSROW = '''
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
-read -r NAME SG KEY TSF MOL PRE <<< "$(awk -F'\\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7}' ${ARMS}/SYSTEMS.tsv)"
+read -r NAME SG KEY TSF MOL PRE WINDOW <<< "$(awk -F'\\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7, $8}' ${ARMS}/SYSTEMS.tsv)"
 if [ -z "${NAME}" ]; then echo "no system at task ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 '''
 RUN = '''
@@ -76,6 +76,26 @@ echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} premerge ${NAME}: $(ls ${
         tail -25 ${POOL}/curate.log
         CUDA_VISIBLE_DEVICES=-1 python -u -m data_processing.pool_anchors starts ${POOL} ${DATA}/${NAME}/starts.pt \\
             --mol ${MOL} --sg ${SG} --key ${KEY} --window 10
+    '''))
+
+# ---------------------------------------------------------------- export
+w('submit_export.sbatch', HEAD.format(
+    time='03:00:00', gres=GPU, mem='64G', cpus=8, signal='', job='po_export', doc=
+    '''# pool_oct02 export: one task = one system of SYSTEMS.tsv: pool_anchors export of the POOLED registry (<system>/pool)
+# -> the lowest state of every basin within the system window (kT above the lowest basin), in the chart the trainer
+# reads, as <system>/anchors.pt (prior layout): the anchor rows of the prior and the starts of the flood. A system merged
+# on the dev box has its anchors.pt uploaded; the task then only checks that the file is there. The GPU is used only by
+# the re-scoring (UMA).''') + SYSROW + '''
+OUT=${DATA}/${NAME}/anchors.pt
+if [ "${PRE}" != "1" ]; then
+    if [ -f "${OUT}" ]; then echo "${NAME}: ${OUT} was uploaded ($(stat -c %s ${OUT}) bytes)"; exit 0; fi
+    echo "FATAL: ${OUT} missing (upload it from the dev box)" >&2; exit 1
+fi
+POOL=${DATA}/${NAME}/pool
+if [ ! -f "${POOL}/registry.pt" ]; then echo "FATAL: ${POOL}/registry.pt missing (the premerge stage writes it)" >&2; exit 1; fi
+echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} export ${NAME} (sg ${SG}, ${KEY}, window ${WINDOW} kT) start=$(date -Is)"
+''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        python -u -m data_processing.pool_anchors export ${POOL} ${OUT} \\
+            --mol ${MOL} --sg ${SG} --key ${KEY} --tsf ${TSF} --window ${WINDOW} --mlip_path ${UMA}
     '''))
 
 # ---------------------------------------------------------------- polish
@@ -137,7 +157,7 @@ echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} merge ${NAME} (sg ${SG}, 
 w('submit_flood.sbatch', HEAD.format(
     time='12:00:00', gres=GPU, mem='48G', cpus=8, signal='', job='po_flood', doc=
     '''# pool_oct02 flood: one task = one row of FLOOD.tsv (line 1 is the header) = one shard of one system's capped-MC flood
-# (data_processing/capped_mc.py) from <system>/anchors_polished.pt, with the row's arguments, into
+# (data_processing/capped_mc.py) from <system>/anchors.pt, with the row's arguments, into
 # <system>/flood/shard_<k>. Resubmitting continues every shard from its state.pt (--resume).''') + '''
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
 NAME=$(awk -F'\\t' -v n=${ROW} 'NR==n {print $2}' ${ARMS}/FLOOD.tsv)
@@ -147,9 +167,9 @@ KEY=$(awk -F'\\t' -v n=${ROW} 'NR==n {print $5}' ${ARMS}/FLOOD.tsv)
 CUT=$(awk -F'\\t' -v n=${ROW} 'NR==n {print $6}' ${ARMS}/FLOOD.tsv)
 ARGS=$(awk -F'\\t' -v n=${ROW} 'NR==n {print $7}' ${ARMS}/FLOOD.tsv)
 if [ -z "${NAME}" ]; then echo "no task at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
-SEEDS=${DATA}/${NAME}/anchors_polished.pt
+SEEDS=${DATA}/${NAME}/anchors.pt
 OUT=${DATA}/${NAME}/flood/shard_${SHARD}
-if [ ! -f "${SEEDS}" ]; then echo "FATAL: ${SEEDS} missing (the merge stage writes it)" >&2; exit 1; fi
+if [ ! -f "${SEEDS}" ]; then echo "FATAL: ${SEEDS} missing (the export stage writes it)" >&2; exit 1; fi
 mkdir -p ${OUT}
 echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} flood ${NAME} shard ${SHARD}/${NSH} (${KEY}) start=$(date -Is)"
 ''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        export GPU_MEM_FRACTION=0.9
@@ -160,14 +180,14 @@ echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} flood ${NAME} shard ${SHA
 # ---------------------------------------------------------------- assemble
 w('submit_assemble.sbatch', HEAD.format(
     time='04:00:00', gres=GPU, mem='96G', cpus=8, signal='', job='po_assemble', doc=
-    '''# pool_oct02 assemble: one task = one system of SYSTEMS.tsv: data_processing/pool_assemble.py on anchors_polished.pt
+    '''# pool_oct02 assemble: one task = one system of SYSTEMS.tsv: data_processing/pool_assemble.py on anchors.pt
 # and every flood shard -> <system>/<system>_pooled_oct02_prior.pt (anchors + flood, latent de-dupe, normaliser images;
 # 'prior' and 'equalized_prior' hold the same rows; a sample of rows re-scored). Environment: DEDUPE (default 0.01, the
 # latent radius), TARGET_ROWS (default 400000: the flood radius widens until the file holds at most that many rows).''') + SYSROW + '''
 if [ ! -d "${DATA}/${NAME}/flood" ]; then echo "${NAME}: no flood yet; nothing to assemble"; exit 0; fi
 echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} assemble ${NAME} start=$(date -Is)"
-''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors_polished.pt ${DATA}/${NAME}/flood \\
+''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors.pt ${DATA}/${NAME}/flood \\
             ${DATA}/${NAME}/${NAME}_pooled_oct02_prior.pt --sg ${SG} --key ${KEY} --mol ${MOL} --mlip_path ${UMA} \\
             --dedupe ${DEDUPE:-0.01} --target-rows ${TARGET_ROWS:-400000}
     '''))
-print('wrote 5 sbatch files')
+print('wrote 6 sbatch files')

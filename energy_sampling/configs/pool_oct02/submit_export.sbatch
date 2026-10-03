@@ -1,20 +1,21 @@
 #!/bin/bash
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=96G
+#SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
 #SBATCH --array=0-3
 #SBATCH --account=torch_pr_226_chemistry
-#SBATCH --job-name=po_assemble
+#SBATCH --job-name=po_export
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool_oct02/joblogs/%x_%A_%a.out
 
-# pool_oct02 assemble: one task = one system of SYSTEMS.tsv: data_processing/pool_assemble.py on anchors.pt
-# and every flood shard -> <system>/<system>_pooled_oct02_prior.pt (anchors + flood, latent de-dupe, normaliser images;
-# 'prior' and 'equalized_prior' hold the same rows; a sample of rows re-scored). Environment: DEDUPE (default 0.01, the
-# latent radius), TARGET_ROWS (default 400000: the flood radius widens until the file holds at most that many rows).
+# pool_oct02 export: one task = one system of SYSTEMS.tsv: pool_anchors export of the POOLED registry (<system>/pool)
+# -> the lowest state of every basin within the system window (kT above the lowest basin), in the chart the trainer
+# reads, as <system>/anchors.pt (prior layout): the anchor rows of the prior and the starts of the flood. A system merged
+# on the dev box has its anchors.pt uploaded; the task then only checks that the file is there. The GPU is used only by
+# the re-scoring (UMA).
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -31,8 +32,14 @@ ROW=$((SLURM_ARRAY_TASK_ID + 2))
 read -r NAME SG KEY TSF MOL PRE WINDOW <<< "$(awk -F'\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7, $8}' ${ARMS}/SYSTEMS.tsv)"
 if [ -z "${NAME}" ]; then echo "no system at task ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 
-if [ ! -d "${DATA}/${NAME}/flood" ]; then echo "${NAME}: no flood yet; nothing to assemble"; exit 0; fi
-echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} assemble ${NAME} start=$(date -Is)"
+OUT=${DATA}/${NAME}/anchors.pt
+if [ "${PRE}" != "1" ]; then
+    if [ -f "${OUT}" ]; then echo "${NAME}: ${OUT} was uploaded ($(stat -c %s ${OUT}) bytes)"; exit 0; fi
+    echo "FATAL: ${OUT} missing (upload it from the dev box)" >&2; exit 1
+fi
+POOL=${DATA}/${NAME}/pool
+if [ ! -f "${POOL}/registry.pt" ]; then echo "FATAL: ${POOL}/registry.pt missing (the premerge stage writes it)" >&2; exit 1; fi
+echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} export ${NAME} (sg ${SG}, ${KEY}, window ${WINDOW} kT) start=$(date -Is)"
 
 srun singularity exec --nv \
     --overlay ${OVERLAY}:ro \
@@ -44,9 +51,8 @@ srun singularity exec --nv \
     /bin/bash -c "
         source /ext3/env.sh
         export PYTHONPATH=${MXT_ROOT}:${PROJECT_ROOT}/gfn-diffusion:${PYLIBS}:\$PYTHONPATH
-        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors.pt ${DATA}/${NAME}/flood \
-            ${DATA}/${NAME}/${NAME}_pooled_oct02_prior.pt --sg ${SG} --key ${KEY} --mol ${MOL} --mlip_path ${UMA} \
-            --dedupe ${DEDUPE:-0.01} --target-rows ${TARGET_ROWS:-400000}
+        python -u -m data_processing.pool_anchors export ${POOL} ${OUT} \
+            --mol ${MOL} --sg ${SG} --key ${KEY} --tsf ${TSF} --window ${WINDOW} --mlip_path ${UMA}
     "
 RC=$?
 echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} status=${RC} end=$(date -Is)"

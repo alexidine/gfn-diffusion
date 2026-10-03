@@ -1,28 +1,29 @@
-"""pool_oct02: the pooled prior rebuild of the four zp1 systems on the cluster -- premerge, polish, merge, flood,
-assemble.
+"""pool_oct02: the pooled prior rebuild of the four zp1 systems on the cluster -- premerge, export, flood, assemble.
 
     python configs/pool_oct02/make.py      (locally: reads the zp1_sep28 stream configs and the pooled coord.yaml files)
 
 Source: for each system, D:/crystal_datasets/pooled_oct02/<name>/ holds the zp1_sep28 campaign's shards plus one stream
-per old prior / search file, every old row re-scored on the campaign molecule (session scripts make_pool.py). Stages,
-each an sbatch array here, chained by launch.sh:
+per old prior / search file, every old row re-scored on the campaign molecule (session scripts make_pool.py). The
+pooled registry's basins are the anchors. Their lowest states are unconverged search end states: a further relaxation
+drains them into far fewer minima (2026-10-03, MIPCAS UMA: 7,624 -> 394), but every such minimum within 5 kT already
+has an anchor within the identity cut at the same energy, so the anchors hold the floors and a spread up the walls,
+which is what a coverage prior wants. Stages, each an sbatch array here, chained by launch.sh
+(prep = premerge -> export; flood = flood -> assemble):
 
-  premerge  (systems whose pooled merge was not done locally: PREMERGE) one coordinator curate pass over the uploaded
-            pool (<name>/pool: RDF leader clustering of every row within 10 kT), then `pool_anchors starts`: the lowest
-            state of every basin, in the trainer's chart, as <name>/starts.pt.
-  polish    run_search, init_sample_method 'data', one stage (Rprop, lr 0.001 annealed, no compression, wrap, up to
-            POLISH_STEPS steps, convergence_eps 1e-6) into <name>/polish (a campaign directory, stream 'polish'); the
-            array tasks split starts.pt by mol_seed, the block size computed from the file at run time. Why: the zp1
-            end states are not converged (2026-10-02: 400 more Rprop steps lower 60 MIPCAS eLJ anchors a median 0.66 kT
-            and move 49 of them past the identity cut; a further 400 move none).
-  merge     a curate pass over <name>/polish, then `pool_anchors export`: basins within 12 kT, trainer's chart, as
-            <name>/anchors_polished.pt (prior layout).
-  flood     data_processing/capped_mc.py from anchors_polished.pt, FLOOD settings below, into <name>/flood/shard_<k>.
+  premerge  (systems whose pooled merge was not done on the dev box: PREMERGE) one coordinator curate pass over the
+            uploaded pool (<name>/pool: RDF leader clustering of every row within 10 kT).
+  export    `pool_anchors export` of the pooled registry: the lowest state of every basin within WINDOW kT, in the
+            chart the trainer reads, as <name>/anchors.pt (prior layout). For a system merged on the dev box the file
+            is uploaded and the task only checks that it is there.
+  flood     data_processing/capped_mc.py from anchors.pt, FLOOD settings below, into <name>/flood/shard_<k>.
   assemble  data_processing/pool_assemble.py: anchors + flood states, latent de-dupe at DEDUPE, normaliser images,
             written as <name>/<name>_pooled_oct02_prior.pt ('prior' and 'equalized_prior' hold the same rows).
+  polish, merge   not in the chain; kept for the converged-minima census (`launch.sh polish`): run_search in data mode
+            over starts.pt (Rprop, lr 0.001 annealed, up to POLISH_STEPS steps, convergence_eps 1e-6), then a curate
+            pass and an export of the polished basins (anchors_polished.pt).
 
 Writes <name>/coord.yaml, <name>/polish.yaml, <name>/pool_coord.yaml (PREMERGE systems), INDEX.tsv (polish tasks),
-FLOOD.tsv (flood tasks), SYSTEMS.tsv, and the --array lines of the five sbatch files.
+FLOOD.tsv (flood tasks), SYSTEMS.tsv, and the --array lines of the six sbatch files.
 """
 import math
 import os
@@ -37,11 +38,16 @@ DATA = '/scratch/mk8347/data/crystal_datasets'
 UMA = '/scratch/mk8347/models/uma/esen_s.pt'
 POLISH_STEPS = 500
 DEDUPE = 0.01
-# capped_mc: one global level 10 kT above the lowest seed, no per-seed cap, T = 1 x training, 400 steps, one walker per
-# distinct minimum (seeds thinned at the identity cut), no packing-coefficient filter, and proposals that leave the
-# reduced-cell domain rejected (--red_max 0)
-FLOOD = ('--steps 400 --adapt_end 120 --cov_updates 40,80 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 10 '
-         '--seed_window_kT 10 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise')
+# capped_mc (owner 2026-10-03): the walkers' own distribution is the data. From every start, walk at the training
+# temperature and keep every accepted move: no burn-in, no claim of equilibrium. Why T x1: in 12 dimensions a walker
+# settles about 6 T above its floor and does not come back down (measured, MIPCAS eLJ: +5.6 kT at x1 from starts near
+# the floor, reached in about 150 steps and held; at x3 96% of the covered cells sit in the top 4 kT under the ceiling),
+# so a hot walk only inflates into the ceiling. Starts: the anchors within WINDOW kT of the lowest (thinned at the
+# identity cut), one walker each, 300 steps. The ceiling is a safety rail (15 kT above the lowest start); proposals
+# that leave the reduced-cell domain are rejected (--red_max 0); no packing-coefficient filter.
+WINDOW = 5.0
+FLOOD = ('--steps 300 --adapt_end 90 --cov_updates 30,60 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 15 '
+         f'--seed_window_kT {WINDOW:g} --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise')
 # name, space group, energy key, molecule on the cluster, thermal_scaling_factor (eLJ: the current prior files'),
 # polish tasks, polish batch size, flood shards
 SYSTEMS = [
@@ -74,7 +80,7 @@ def write(name, text):
 # the ten columns are the layout the first launch's job scripts read (its merge is still queued): do not reorder
 pol = ['\t'.join(['task', 'name', 'sub', 'n_sub', 'num_samples', 'n_starts', 'sg', 'key', 'tsf', 'mol'])]
 fl = ['\t'.join(['task', 'name', 'shard', 'n_shards', 'key', 'cut', 'args'])]
-sy = ['\t'.join(['task', 'name', 'sg', 'key', 'tsf', 'mol', 'premerge'])]
+sy = ['\t'.join(['task', 'name', 'sg', 'key', 'tsf', 'mol', 'premerge', 'window'])]
 t = f = 0
 for k, (name, sg, key, mol, tsf, n_sub, bs, n_fl) in enumerate(SYSTEMS):
     d = os.path.join(HERE, name)
@@ -110,13 +116,14 @@ for k, (name, sg, key, mol, tsf, n_sub, bs, n_fl) in enumerate(SYSTEMS):
     for j in range(n_fl):
         fl.append('\t'.join(str(v) for v in (f, name, j, n_fl, key, pooled['identity_cut'], FLOOD)))
         f += 1
-    sy.append('\t'.join(str(v) for v in (k, name, sg, key, tsf, mol, int(name in PREMERGE))))
+    sy.append('\t'.join(str(v) for v in (k, name, sg, key, tsf, mol, int(name in PREMERGE), WINDOW)))
     print(f'{name}: {n_sub} polish tasks, {n_fl} flood shards' + (', premerge on the cluster' if name in PREMERGE else ''))
 write('INDEX.tsv', '\n'.join(pol) + '\n')
 write('FLOOD.tsv', '\n'.join(fl) + '\n')
 write('SYSTEMS.tsv', '\n'.join(sy) + '\n')
 for fn, last in (('submit_polish.sbatch', t - 1), ('submit_flood.sbatch', f - 1), ('submit_premerge.sbatch', len(SYSTEMS) - 1),
-                 ('submit_merge.sbatch', len(SYSTEMS) - 1), ('submit_assemble.sbatch', len(SYSTEMS) - 1)):
+                 ('submit_merge.sbatch', len(SYSTEMS) - 1), ('submit_export.sbatch', len(SYSTEMS) - 1),
+                 ('submit_assemble.sbatch', len(SYSTEMS) - 1)):
     p = os.path.join(HERE, fn)
     text = re.sub(r'#SBATCH --array=\S+', f'#SBATCH --array=0-{last}', open(p, encoding='utf8').read())
     assert_no_local_paths(text, fn)

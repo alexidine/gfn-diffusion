@@ -28,7 +28,7 @@ DATA=/scratch/mk8347/data/crystal_datasets/pooled_oct02
 UMA=/scratch/mk8347/models/uma/esen_s.pt
 
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
-read -r NAME SG KEY TSF MOL PRE <<< "$(awk -F'\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7}' ${ARMS}/SYSTEMS.tsv)"
+read -r NAME SG KEY TSF MOL PRE WINDOW <<< "$(awk -F'\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7, $8}' ${ARMS}/SYSTEMS.tsv)"
 if [ -z "${NAME}" ]; then echo "no system at task ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 
 CAMP=${DATA}/${NAME}/polish

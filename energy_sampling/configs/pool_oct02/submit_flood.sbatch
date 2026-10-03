@@ -12,7 +12,7 @@
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool_oct02/joblogs/%x_%A_%a.out
 
 # pool_oct02 flood: one task = one row of FLOOD.tsv (line 1 is the header) = one shard of one system's capped-MC flood
-# (data_processing/capped_mc.py) from <system>/anchors_polished.pt, with the row's arguments, into
+# (data_processing/capped_mc.py) from <system>/anchors.pt, with the row's arguments, into
 # <system>/flood/shard_<k>. Resubmitting continues every shard from its state.pt (--resume).
 module purge
 
@@ -34,9 +34,9 @@ KEY=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${ARMS}/FLOOD.tsv)
 CUT=$(awk -F'\t' -v n=${ROW} 'NR==n {print $6}' ${ARMS}/FLOOD.tsv)
 ARGS=$(awk -F'\t' -v n=${ROW} 'NR==n {print $7}' ${ARMS}/FLOOD.tsv)
 if [ -z "${NAME}" ]; then echo "no task at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
-SEEDS=${DATA}/${NAME}/anchors_polished.pt
+SEEDS=${DATA}/${NAME}/anchors.pt
 OUT=${DATA}/${NAME}/flood/shard_${SHARD}
-if [ ! -f "${SEEDS}" ]; then echo "FATAL: ${SEEDS} missing (the merge stage writes it)" >&2; exit 1; fi
+if [ ! -f "${SEEDS}" ]; then echo "FATAL: ${SEEDS} missing (the export stage writes it)" >&2; exit 1; fi
 mkdir -p ${OUT}
 echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} flood ${NAME} shard ${SHARD}/${NSH} (${KEY}) start=$(date -Is)"
 
