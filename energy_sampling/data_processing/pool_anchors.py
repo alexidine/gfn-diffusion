@@ -45,6 +45,7 @@ from mxtaltools.crystal_search import coordinator as co
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 EDGE = 0.9999  # mxtaltools crystal_opt_utils.CELL_EDGE: the builders clip a centre to [0, EDGE]
+FACE_EPS = 1e-5  # fractional: a recomputed centre this close below a cell face is on the face
 ANALYZE_KW = dict(cutoff=10, supercell_size=10, std_orientation=False)  # MolecularCrystal.analyze_crystal_batch
 RED_TOL = 1e-6  # a row with a larger reduction penalty is outside the reduced-cell domain the trainer penalises leaving
 
@@ -105,7 +106,9 @@ class Chart:
         out.box_analysis()
         X = torch.einsum('nij,naj->nai', out.T_fc.double(), frac_atoms)
         c = torch.einsum('nij,nj->ni', out.T_cf.double(), self.centre(X))
-        c = (c - torch.floor(c)).clamp(0.0, EDGE)
+        # a centre on a cell face recomputed from the atoms lands a float below it (-1e-7); the plain floor wrapped it
+        # to the far side (y = 0 -> 0.9999, which sg 14 reads as outside its box: 1,398 of 24,461 NEHZOR eLJ rows)
+        c = (c - torch.floor(c + FACE_EPS)).clamp(0.0, EDGE)
         R, rms = proper_fit(self.M[None].expand(n, -1, -1), self.cen(X))
         out.aunit_centroid = c.to(like.aunit_centroid.dtype)
         # scipy's conversion: rotmat2rotvec loses the axis for rotation angles near pi (2 of 3000 MIPCAS images read
@@ -218,7 +221,7 @@ def basin_rows(reg_dir, window):
 
 def _chart(a):
     dev, pred = 'cpu', None
-    if a.key == 'uma':
+    if a.key == 'uma' and a.mode == 'export':  # `starts` scores nothing (it loaded the model and failed without a path)
         from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
         dev = 'cuda'
         pred = init_uma_crystal_predictor(a.mlip_path, device=dev)
