@@ -56,6 +56,16 @@ mkdir -p ${OUT}
 if [ "$(sha256sum ${WORKDIR}/${SOURCE} | cut -d' ' -f1)" != "7c88ed2437c11efe03747d66ff5a97259ea0c2338cad9343b5825b687c9125c0" ]; then
     echo "FATAL: ${WORKDIR}/${SOURCE} is not the committed QM9 index (git pull)" >&2; exit 1
 fi
+# ONE JOB PER ARM. A second job on an arm resumes the same state file and both then overwrite it.
+# This job exits if another running job of this name holds the same array row.
+ME=${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}
+OTHER=$(squeue -h -u ${USER} --name=${SLURM_JOB_NAME} -t RUNNING -o "%K %i" 2>/dev/null \
+    | awk -v k=${SLURM_ARRAY_TASK_ID} -v me=${ME} '$1==k && $2!=me {print $2}' | head -1)
+if [ -n "${OTHER}" ]; then
+    echo "arm ${ARM} is already running as job ${OTHER}; this job exits without starting a second copy. Resubmit once that one has ended." >&2
+    exit 0
+fi
+
 if [ -f ${OUT}/mp+attn+spd_n110000_s0_state.pt ]; then
     echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM} (width ${HIDDEN}, ${LAYERS} layers)  RESUME"
 else

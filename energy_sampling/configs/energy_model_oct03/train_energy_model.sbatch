@@ -58,6 +58,16 @@ if [ ! -f ${CONFIG} ]; then echo "FATAL: missing ${CONFIG}" >&2; exit 1; fi
 RDKIT=$(grep -o '"rdkit": *"[^"]*"' ${RUNG}/manifest.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 if [ -z "${RDKIT}" ]; then echo "FATAL: ${RUNG}/manifest.json names no RDKit version" >&2; exit 1; fi
 
+# ONE JOB PER ARM. A second job on an arm resumes the same checkpoint, then both overwrite it and log
+# to one wandb run. This job exits if another running job of this name holds the same array row.
+ME=${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}
+OTHER=$(squeue -h -u ${USER} --name=${SLURM_JOB_NAME} -t RUNNING -o "%K %i" 2>/dev/null \
+    | awk -v k=${SLURM_ARRAY_TASK_ID} -v me=${ME} '$1==k && $2!=me {print $2}' | head -1)
+if [ -n "${OTHER}" ]; then
+    echo "arm ${ARM} is already running as job ${OTHER}; this job exits without starting a second copy. Resubmit once that one has ended." >&2
+    exit 0
+fi
+
 if [ -f ${OUT}/${ARM}_running.pt ]; then
     echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  RESUME: ${OUT}/${ARM}_running.pt"
 else
