@@ -65,6 +65,19 @@ def test_a_cut_run_continues_as_the_uncut_one(samples, tmp_path, monkeypatch):
                **{**KW, 'hidden': 24})
 
 
+def test_a_run_that_got_worse_after_its_best_point_says_so():
+    point = lambda step, test, train: {'step': step, 'test_total': test, 'total': train}
+    # enc03_w256l6 as it ran: best at the second curve point, far worse at the end
+    blown = {'steps': 400000, 'best_step': 6666, 'best_heldout': 0.0506,
+             'curve': [point(0, 240.0, 250.0), point(6666, 0.0506, 0.05), point(399999, 18.25, 1.65)]}
+    msg = ep.degraded(blown)
+    assert msg and 'step 6666 of 400000' in msg and '18.2' in msg
+    # a run whose best is late, or whose end is near its best, says nothing
+    late = dict(blown, best_step=390000)
+    flat = dict(blown, curve=blown['curve'][:2] + [point(399999, 0.09, 0.03)])
+    assert ep.degraded(late) is None and ep.degraded(flat) is None
+
+
 def test_source_table_replaces_the_local_dataset(tmp_path):
     path = tmp_path / 'index.tsv.gz'
     with gzip.open(path, 'wt') as f:

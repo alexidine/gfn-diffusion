@@ -1,4 +1,6 @@
-arm	hidden	layers
-enc03_w128	128	4
-enc03_w192	192	4
-enc03_w256l6	256	6
+arm	hidden	layers	lr	lr_final
+enc03_w128	128	4	3e-4	3e-6
+enc03_w192	192	4	3e-4	3e-6
+enc03_w256l6	256	6	3e-4	3e-6
+enc03_w256l6_lr1	256	6	1e-4	1e-6
+enc03_w256l6_lr03	256	6	3e-5	3e-7

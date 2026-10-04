@@ -918,6 +918,28 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
             'log_sigma': {p.name: float(model.log_sigma[p.name].detach()) for p in PROBES}}
 
 
+def degraded(result, factor: float = 5.0, early: float = 0.5) -> Optional[str]:
+    """A line saying the run got WORSE after its best point, or None.
+
+    `run` saves and scores the best held-out state, so a run that blows up at step 10,000 of
+    400,000 still prints a clean probe table -- of the step-10,000 model. Said when the best
+    state is from the first ``early`` of the run and the last held-out loss is more than
+    ``factor`` times the best (enc03_w256l6, 2026-10-03: best 0.05 at step 6,666 of 400,000,
+    last 18.2, with the train loss at 1.7).
+    """
+    curve = result.get('curve') or []
+    if not curve:
+        return None
+    last = curve[-1]
+    best, step, steps = result['best_heldout'], result['best_step'], result['steps']
+    if step < early * steps and last['test_total'] > factor * best:
+        return (f'TRAINING DEGRADED AFTER ITS BEST POINT. The saved and scored state is step '
+                f'{step} of {steps} (held-out loss {best:.4f}); at the last step the held-out '
+                f'loss is {last["test_total"]:.4f} and the train loss {last["total"]:.4f}. '
+                f'The table describes the step-{step} state, not a converged one.')
+    return None
+
+
 def report(agg, sizes, arms, baseline, tols, meta) -> str:
     w = max(len(pr.name) for pr in PROBES) + 2
     L = ['ENCODER PROBE BATTERY -- exact-match accuracy (%), train / test. TARGET IS 100.',
@@ -1160,6 +1182,9 @@ def main(argv=None):
                     f"{pr.name[:4]} {100*r['train'][pr.name]['exact']:.0f}"
                     f"/{100*r['test'][pr.name]['exact']:.0f}" for pr in PROBES[:3])
                 print(f'  {arm} n={n} s={seed}: {shown}')
+                warn = degraded(r)
+                if warn:
+                    print(f'  ** {arm} n={n} s={seed}: {warn}', flush=True)
             for pr in PROBES:
                 tr = np.array([x['train'][pr.name]['exact'] for x in per_seed])
                 te = np.array([x['test'][pr.name]['exact'] for x in per_seed])

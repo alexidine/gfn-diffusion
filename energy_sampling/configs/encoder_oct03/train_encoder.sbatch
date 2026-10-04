@@ -17,13 +17,17 @@
 # 110,000 training molecules and 5,000 held out by parent skeleton, read from the committed
 # configs/conformer_db_sep29/qm9_index.tsv.gz; stereo features 2 (r/s at pseudo-asymmetric
 # centres, an E/Z bond column, the two E/Z probes); message passing + attention + shortest-path
-# bias; 400,000 steps at 256 molecules, rate 3e-4 falling on a cosine to 3e-6 after 2,000 warm-up
-# steps; the best held-out state is the one saved and scored.
+# bias; 400,000 steps at 256 molecules, the arm's rate falling on a cosine to a hundredth of it
+# after 2,000 warm-up steps; the best held-out state is the one saved and scored.
 #
 # Arm = row of INDEX.tsv (line 1 is the header):
-#   0 enc03_w128     width 128, 4 layers: the shipped shape, so its embeddings fit the current policy input
-#   1 enc03_w192     width 192, 4 layers
-#   2 enc03_w256l6   width 256, 6 layers
+#   0 enc03_w128         width 128, 4 layers, rate 3e-4: the shipped shape, so its embeddings fit the current policy input
+#   1 enc03_w192         width 192, 4 layers, rate 3e-4
+#   2 enc03_w256l6       width 256, 6 layers, rate 3e-4. RAN 2026-10-03 AND DEGRADED: best held-out loss 0.05 at
+#                        step 6,666, 18.2 at step 400,000 with the train loss at 1.7; its saved encoder is the step-6,666 state
+#   3 enc03_w256l6_lr1   width 256, 6 layers, rate 1e-4
+#   4 enc03_w256l6_lr03  width 256, 6 layers, rate 3e-5
+# The array line covers rows 0-2; rows 3-4: sbatch --array=3,4 configs/encoder_oct03/train_encoder.sbatch
 #
 # Writes, per arm, under checkpoints/encoder_oct03/<arm>/:
 #   mp+attn+spd_n110000_s0.pt        the encoder (models/encoder_cache.load_encoder reads it)
@@ -48,7 +52,9 @@ INDEX=${ARMS}/INDEX.tsv
 ARM=$(awk -F'\t' -v n=${ROW} 'NR==n {print $1}' ${INDEX})
 HIDDEN=$(awk -F'\t' -v n=${ROW} 'NR==n {print $2}' ${INDEX})
 LAYERS=$(awk -F'\t' -v n=${ROW} 'NR==n {print $3}' ${INDEX})
-if [ -z "${ARM}" ]; then echo "no arm at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
+LR=$(awk -F'\t' -v n=${ROW} 'NR==n {print $4}' ${INDEX})
+LR_FINAL=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${INDEX})
+if [ -z "${ARM}" ] || [ -z "${LR_FINAL}" ]; then echo "no complete arm at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 OUT=${WORKDIR}/checkpoints/encoder_oct03/${ARM}
 J=${LOGS}/${ARM}_${SLURM_JOB_ID}
 mkdir -p ${OUT}
@@ -67,9 +73,9 @@ if [ -n "${OTHER}" ]; then
 fi
 
 if [ -f ${OUT}/mp+attn+spd_n110000_s0_state.pt ]; then
-    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM} (width ${HIDDEN}, ${LAYERS} layers)  RESUME"
+    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM} (width ${HIDDEN}, ${LAYERS} layers, rate ${LR})  RESUME"
 else
-    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM} (width ${HIDDEN}, ${LAYERS} layers)  FRESH"
+    echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM} (width ${HIDDEN}, ${LAYERS} layers, rate ${LR})  FRESH"
 fi
 
 { nvidia-smi -L
@@ -88,7 +94,7 @@ srun singularity exec --nv \
         export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
         python -u -m models.encoder_probe --device cuda --arms mp+attn+spd --sizes 110000 --n-test 5000 \
             --seeds 0 --stereo-features 2 --hidden ${HIDDEN} --layers ${LAYERS} --no-match-params \
-            --steps 400000 --batch-mols 256 --lr 3e-4 --lr-schedule cosine --lr-final 3e-6 --warmup-steps 2000 \
+            --steps 400000 --batch-mols 256 --lr ${LR} --lr-schedule cosine --lr-final ${LR_FINAL} --warmup-steps 2000 \
             --source ${SOURCE} --build-workers ${NCPU} --resume --save-every 5000 --verbose \
             --save-dir ${OUT} --out ${OUT}/${ARM}.json
     " 2>&1 | tee -a ${J}.log
