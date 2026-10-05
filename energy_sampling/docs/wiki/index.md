@@ -1,6 +1,6 @@
 # GFN knowledge base
 
-Forty-nine pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
+Fifty pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
 
 ## Theory of the objective
 
@@ -20,6 +20,7 @@ Forty-nine pages, each drafted from the code and the derivation notes, verified 
 - [prior-density-models](prior-density-models.md) — mixed page: the kNN and flow density models fitted to prior draws, their coordinates and geometry checks, the kNN dimensional bias, the ground truth available, the slope calibration gate, and how a fitted density enters the reward.
 - [molecule-conditions-and-anchors](molecule-conditions-and-anchors.md) — mixed page: the config keys naming the condition, prior and held-out files, what each file must hold, the identifier registry and condition ids, the QM9 and anchor build scripts with their frame and split rules, and the prior path's place in problem identity.
 - [molecule-encoder](molecule-encoder.md) — mixed page: the 2D-graph encoder behind the conformer condition, its inputs and structural encodings, the attention and broadcast global steps, the probe battery's targets, scoring and skeleton-grouped split, and the frozen cache with its atom-order and checkpoint stamps.
+- [per-condition-evaluation](per-condition-evaluation.md) — code-bound page: the offline suite that rebuilds a conditional crystal run from a checkpoint and draws per molecule, its gate against the run's logged eval, the matched training and held-out comparison, the per-molecule atlas and what reads it, the folded-latent distances, the pair, motif and other-geometry experiments, the relaxation of draws against random starts and stored minima, and the figure and report writers.
 
 ## Training dynamics and control
 
