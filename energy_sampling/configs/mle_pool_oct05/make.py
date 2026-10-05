@@ -15,7 +15,11 @@ burn-in, batch policy, eval, archives, terminal MLE stage, DPLR off, fresh weigh
 
 Not acridine: its pooled prior is the pool_acr_oct03 battery's.
 
-NOTE ON START-UP: train.py re-scores every prior row at init. The UMA files hold 263,060 (mipu) and 334,968 (nehu)
+  prior_scan_cache = true
+      The first launch scores every prior row and writes <prior>.scan-<hash>.pt beside the file; a requeue or relaunch
+      loads it after re-scoring 512 rows (prior_scan_cache.py).
+
+NOTE ON START-UP: train.py re-scores every prior row at the FIRST launch. The UMA files hold 263,060 (mipu) and 334,968 (nehu)
 rows, so those two arms spend their first minutes to an hour in that scan.
 
 OUT-OF-BOX STATES: kept states outside the trainer latent box were filtered from the files, all images (owner
@@ -65,6 +69,7 @@ def build_arm(base, fam):
     cfg['molecules_path'] = prior
     cfg['buffers']['prior_buffer']['max_size'] = rows
     cfg['buffers']['anchor_buffer']['max_size'] = rows
+    cfg['prior_scan_cache'] = True
     return name, cfg, dropped
 
 
@@ -79,6 +84,7 @@ def check(cfg, name, fam):
     assert cfg['buffers']['prior_buffer']['max_size'] == cfg['buffers']['anchor_buffer']['max_size'] == rows, name
     assert cfg['buffers']['prior_buffer']['seed_source'] == cfg['buffers']['anchor_buffer']['seed_source'] == \
         'prior_dataset', name
+    assert cfg['prior_scan_cache'] is True, name
     assert cfg['checkpoint_name'] is None and cfg['continue_from_checkpoint'] == w3.CONT_PLACEHOLDER, name
     assert cfg['load_weights_only'] is False and cfg['model']['dplr_rank'] == 0, name
     assert cfg['lr_control']['fixed_scale'] == w3.SCALE == 2.0, name

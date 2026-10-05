@@ -26,6 +26,7 @@ load_weights_only: false     # true = take only model weights from checkpoint_na
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # seeds the prior buffer, and the anchor buffer on molecule routes
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
 test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent
+prior_scan_cache: false      # true = reuse the init-time scoring of prior_path from <prior_path>.scan-<hash>.pt when its identity (file, row count, energy function, MLIP file, space groups, z_primes, eLJ coefficient, energy_config) matches and a re-score of 512 random rows agrees; otherwise score every row and write that file. false = score every row at every launch
 archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O  # todo on MLIP models set this to 1k
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
 override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR bracket re-stamps every rate on its next tick anyway

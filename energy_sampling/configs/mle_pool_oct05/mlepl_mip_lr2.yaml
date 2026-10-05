@@ -14,6 +14,7 @@ load_weights_only: false
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_elj_pooled_oct02_prior.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_elj_pooled_oct02_prior.pt
 test_molecules_path: null
+prior_scan_cache: true
 archive_period: 5000
 archive_buffers: true
 override_learning_rates: false

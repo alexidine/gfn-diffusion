@@ -55,6 +55,7 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
+from energy_sampling import prior_scan_cache
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
     ROLLOUT_CONDITION_DRAWS
@@ -3627,6 +3628,57 @@ class Modeller:
         # before the calibrator exists, so it cannot describe its own sensor there.
         self.lr_controller.announce()
 
+    def _score_prior_rows(self, prior, announce=True):
+        """(energy [n], analysed batch) of a prior batch through the run's energy function: the init-time pass
+        over prior_path, and (announce False) the row check of a cached pass (cfg:prior_scan_cache)."""
+        if announce:
+            print("Re-analyzing prior energies")
+        prior = prior.to(self.device)
+        # NO_GRAD, explicitly. keep_grads defaults False but that only DETACHES
+        # the output -- it does not stop the graph being built, and fairchem's
+        # _run_inference uses nullcontext (not no_grad) whenever direct_forces is
+        # False, which is what this predictor sets. So without this the whole
+        # ~176k-row scoring pass built an autograd graph nothing ever
+        # differentiates, holding activations for the entire scan. That is the
+        # pass whose MLIP chunk size collapsed to 144 on the uma arm.
+        with torch.no_grad():
+            energy, prior = self.energy_function.batched_analyze_crystal_batch(
+                self._batch_latents(prior),
+                prior,
+                self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
+                                                                 device=self.device),
+                return_batch=True,
+                internal_oom_recovery=True,
+                # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
+            )
+        return energy, prior
+
+    def _prior_scan_from_cache(self, prior):
+        """(energy, analysed batch) from the scan cache of prior_path, or None when there is none, its identity
+        differs, or a re-score of prior_scan_cache.CHECK_ROWS rows of `prior` disagrees with it (the caller then
+        scores every row and rewrites the cache). `prior` is the batch as loaded, before any scoring."""
+        identity = prior_scan_cache.scan_identity(self.args, prior.num_graphs,
+                                                  getattr(self.energy_function, 'lj_coeff', None))
+        path = prior_scan_cache.cache_path(self.args.prior_path, identity)
+        hit = prior_scan_cache.load(path, identity)
+        if hit is None:
+            return None
+        energy, batch = hit
+        if int(batch.num_graphs) != int(prior.num_graphs) or int(energy.numel()) != int(prior.num_graphs):
+            print(f"prior scan cache: {path} holds {int(batch.num_graphs)} rows, the prior {int(prior.num_graphs)}; "
+                  f"scoring the prior again")
+            return None
+        idx = prior_scan_cache.check_rows(prior.num_graphs)
+        fresh, _ = self._score_prior_rows(prior.subsample_new_batch(idx), announce=False)
+        ok, frac, med, mx = prior_scan_cache.agrees(energy.flatten()[idx], fresh)
+        print(f"prior scan cache: {path}: {len(idx)} rows re-scored, {100 * frac:.2f}% differ by more than "
+              f"{prior_scan_cache.ENERGY_TOL} (median |d| {med:.4g}, max {mx:.4g}) -> "
+              f"{'using the cache' if ok else 'STALE, scoring the prior again'}")
+        if not ok:
+            return None
+        strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
+        return energy.to(self.device), batch.to(self.device)
+
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
@@ -3681,25 +3733,21 @@ class Modeller:
                     f"this prior on the elj route.")
             self.energy_function.lj_coeff = _tsf
         if True:  # not hasattr(prior, self.args.energy_function):
-            print("Re-analyzing prior energies")
-            prior = prior.to(self.device)
-            # NO_GRAD, explicitly. keep_grads defaults False but that only DETACHES
-            # the output -- it does not stop the graph being built, and fairchem's
-            # _run_inference uses nullcontext (not no_grad) whenever direct_forces is
-            # False, which is what this predictor sets. So without this the whole
-            # ~176k-row scoring pass built an autograd graph nothing ever
-            # differentiates, holding activations for the entire scan. That is the
-            # pass whose MLIP chunk size collapsed to 144 on the uma arm.
-            with torch.no_grad():
-                energy, prior = self.energy_function.batched_analyze_crystal_batch(
-                    self._batch_latents(prior),
-                    prior,
-                    self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
-                                                                     device=self.device),
-                    return_batch=True,
-                    internal_oom_recovery=True,
-                    # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
-                )
+            # cfg:prior_scan_cache -- reuse an earlier launch's pass when its identity matches and a
+            # sample of rows re-scores to the cached energies (prior_scan_cache.py); otherwise score
+            # every row, as always, and write the cache for the next launch.
+            use_scan_cache = bool(getattr(self.args, 'prior_scan_cache', False))
+            cached_scan = self._prior_scan_from_cache(prior) if use_scan_cache else None
+            if cached_scan is not None:
+                energy, prior = cached_scan
+            else:
+                energy, prior = self._score_prior_rows(prior)
+                if use_scan_cache:
+                    identity = prior_scan_cache.scan_identity(self.args, prior.num_graphs,
+                                                              getattr(self.energy_function, 'lj_coeff', None))
+                    path = prior_scan_cache.cache_path(self.args.prior_path, identity)
+                    if prior_scan_cache.save(path, identity, energy, prior):
+                        print(f"prior scan cache: wrote {path}")
 
             # ARM THE SOFT ENERGY CLIP, from the distribution just measured.
             # `set_reward_clip` has had ZERO callers since it was written, so
