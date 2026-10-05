@@ -1,0 +1,21 @@
+tag	out	arm	step	sampler	n_train	n_test	collect_args
+p24_s100k_plain	csp24	qf30_fwdF_lr5	100000	s100k	12	12	--random --prior --starts 256 --batch-rows 1024
+p24_s100k_modes	csp24	qf30_fwdF_lr5	100000	s100k	12	12	--prior --cluster-from 32768 --starts 32 --batch-rows 256
+p24_s010k_plain	csp24	qf30_fwdF_lr5	10000	s010k	12	12	--starts 256 --batch-rows 1024
+p24_s010k_modes	csp24	qf30_fwdF_lr5	10000	s010k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_s020k_plain	csp24	qf30_fwdF_lr5	20000	s020k	12	12	--starts 256 --batch-rows 1024
+p24_s020k_modes	csp24	qf30_fwdF_lr5	20000	s020k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_s030k_plain	csp24	qf30_fwdF_lr5	30000	s030k	12	12	--starts 256 --batch-rows 1024
+p24_s030k_modes	csp24	qf30_fwdF_lr5	30000	s030k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_s040k_plain	csp24	qf30_fwdF_lr5	40000	s040k	12	12	--starts 256 --batch-rows 1024
+p24_s040k_modes	csp24	qf30_fwdF_lr5	40000	s040k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_s050k_plain	csp24	qf30_fwdF_lr5	50000	s050k	12	12	--starts 256 --batch-rows 1024
+p24_s050k_modes	csp24	qf30_fwdF_lr5	50000	s050k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_s070k_plain	csp24	qf30_fwdF_lr5	70000	s070k	12	12	--starts 256 --batch-rows 1024
+p24_s070k_modes	csp24	qf30_fwdF_lr5	70000	s070k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24_upb070k_plain	csp24	qf30_upb_lr5	70000	upb070k	12	12	--starts 256 --batch-rows 1024
+p24_upb070k_modes	csp24	qf30_upb_lr5	70000	upb070k	12	12	--cluster-from 32768 --starts 32 --batch-rows 256
+p24x_random	csp24x	qf30_fwdF_lr5	100000	s100k	12	12	--skip-models --random --starts 4096 --batch-rows 1024
+p24x_s100k	csp24x	qf30_fwdF_lr5	100000	s100k	12	12	--starts 4096 --batch-rows 1024
+p100_s100k_modes	csp100	qf30_fwdF_lr5	100000	s100k	50	50	--prior --cluster-from 32768 --starts 32 --batch-rows 256
+p100_s100k_plain	csp100	qf30_fwdF_lr5	100000	s100k	50	50	--random --prior --starts 64 --batch-rows 1024
