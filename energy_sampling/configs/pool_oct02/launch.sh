@@ -5,6 +5,7 @@
 #   bash launch.sh flood  <system> ...  flood -> assemble          (needs the system's anchors.pt)
 #   bash launch.sh all    <system> ...  prep, then flood -> assemble once the export has succeeded
 #   bash launch.sh finish <system> ...  export -> flood -> assemble (the premerge already ran: <system>/pool/registry.pt)
+#   bash launch.sh assemble <system> ... assemble alone, from the anchors.pt and flood shards already on disk
 #   bash launch.sh polish <system> ...  the converged-minima census: polish -> merge (not part of the prior build)
 #
 # Systems: the names in SYSTEMS.tsv (mipcas_elj mipcas_uma nehzor_elj nehzor_uma). POLISH_TASKS=<array spec> limits a
@@ -13,7 +14,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "${HERE}/joblogs"
-STAGE=${1:?usage: launch.sh prep|flood|all|finish|polish <system> ...}
+STAGE=${1:?usage: launch.sh prep|flood|all|finish|assemble|polish <system> ...}
 shift
 if [ $# -eq 0 ]; then echo "name at least one system" >&2; exit 1; fi
 
@@ -44,6 +45,9 @@ case "${STAGE}" in
         POL=$(sub --array="${POLISH_TASKS:-$(ids "${HERE}/INDEX.tsv" "$@")}" "${HERE}/submit_polish.sbatch")
         MERGE=$(sub --array="${SYS}" --dependency=afterany:${POL} "${HERE}/submit_merge.sbatch")
         echo "polish ${POL} -> merge ${MERGE}" ;;
+    assemble)
+        AS=$(sub --array="${SYS}" "${HERE}/submit_assemble.sbatch")
+        echo "assemble ${AS}" ;;
     flood) ;;
     *) echo "unknown stage ${STAGE}" >&2; exit 1 ;;
 esac

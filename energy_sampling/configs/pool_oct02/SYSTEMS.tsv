@@ -1,5 +1,5 @@
-task	name	sg	key	tsf	mol	premerge	window
-0	mipcas_elj	2	elj	0.3635836825309169	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt	0	5.0
-1	mipcas_uma	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt	0	5.0
-2	nehzor_elj	14	elj	0.15557874739170074	/scratch/mk8347/data/crystal_datasets/nehzor/NEHZOR0_std_conf.pt	1	5.0
-3	nehzor_uma	14	uma	1.0	/scratch/mk8347/data/crystal_datasets/nehzor/NEHZOR0_std_conf.pt	1	5.0
+task	name	sg	key	tsf	mol	premerge	window	radius	ceiling
+0	mipcas_elj	2	elj	0.3635836825309169	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt	0	5.0	0.0244	10.0
+1	mipcas_uma	2	uma	1.0	/scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized.pt	0	5.0	0.0232	10.0
+2	nehzor_elj	14	elj	0.15557874739170074	/scratch/mk8347/data/crystal_datasets/nehzor/NEHZOR0_std_conf.pt	1	5.0	0.0262	10.0
+3	nehzor_uma	14	uma	1.0	/scratch/mk8347/data/crystal_datasets/nehzor/NEHZOR0_std_conf.pt	1	5.0	0.0252	10.0

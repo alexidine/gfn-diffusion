@@ -24,6 +24,7 @@ WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
 ARMS=${WORKDIR}/configs/pool_oct02
 PYLIBS=/scratch/mk8347/pylibs
 DATA=/scratch/mk8347/data/crystal_datasets/pooled_oct02
+PRIORS=/scratch/mk8347/data/crystal_datasets/conditional/priors
 UMA=/scratch/mk8347/models/uma/esen_s.pt
 
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
