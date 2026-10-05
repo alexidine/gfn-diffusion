@@ -5,7 +5,8 @@
 #   bash launch.sh all     premerge -> export -> walk (4 shards)
 #   bash launch.sh prep    premerge -> export                   (writes <SYS>/anchors.pt)
 #   bash launch.sh flood   the walk only                        (needs anchors.pt; resubmitting resumes every shard)
-#   bash launch.sh assemble   anchors + walk -> the prior file  (TARGET_ROWS=400000 and DEDUPE=0.01 by default)
+#   bash launch.sh assemble   anchors + walk -> the prior file, copied into the priors directory
+#                             (TARGET_ROWS=400000 and DEDUPE=0.01 by default)
 #
 # SYS = /scratch/mk8347/data/crystal_datasets/pooled_oct02/acridine_mace. The assembly is submitted on its own, once
 # the walk has finished: `all` does not chain it.

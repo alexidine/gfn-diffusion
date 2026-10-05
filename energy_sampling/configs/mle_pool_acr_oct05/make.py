@@ -8,7 +8,9 @@ molecules_path = the pooled file, both buffer caps = its row count) with one cha
 
   mlip_path = /scratch/mk8347/data/acr_newmodel.model
       The MACE checkpoint the prior was searched, walked and scored under (acr_m2_sep26 made the same switch for the
-      sampler). mlip_path is not part of the problem identity, which stays that of the seed arm mle09_acr.
+      sampler). mlip_path is NOT part of the trainer's problem identity (utils.get_problem_definition), so nothing in a
+      checkpoint load tells this model from the older one: a generator that builds on family 'acr' must set mlip_path
+      itself, as this one does (the family default is the older, more strongly binding checkpoint).
 
 THE PRIOR, acridine_mace_pooled_oct03_pc055_prior.pt, is built by configs/pool_acr_oct03 (acridine P2_1/c Z'=1, the
 universal conformer = the gas-phase minimum under acr_newmodel): the basins of the acr_zp1_sep30 campaign within 5 kT
