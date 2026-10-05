@@ -10,7 +10,7 @@ Stages (`launch.sh`):
 4. **assemble** (GPU, `launch.sh assemble`, submitted separately once the walk is done). `data_processing/pool_assemble_mace.py`:
    - leaves out states outside the trainer's latent box (64 anchors);
    - leaves out anchors and walk states the trainer's density penalty touches, before the de-dupe. Under `acr_newmodel` the walk's 15 kT ceiling is above the whole binding energy (13.1 kT), so 55% of the walk states are expanded cells below a packing coefficient of 0.55;
-   - de-duplicates in latent space at 0.01, widening the walk states' radius until the file fits 400,000 rows;
+   - de-duplicates in latent space: anchors at 0.01 from one another, walk states at 0.031, the 1 kT latent kick under `acr_newmodel`. The radius is a physical scale, not a row budget (owner 2026-10-05), so the file is as large as that makes it. `E_MAX_KT=<x>` leaves out states more than x kT above the lowest; that, or another `WALK_RADIUS`, is how the size is controlled;
    - writes the 8 normaliser images of every kept state, and re-scores a sample with MACE;
    - does not apply the molecule's own C2 relabelling (owner 2026-10-05: the model conditions on one labelled conformer).
 
