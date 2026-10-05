@@ -41,3 +41,12 @@ The integrator applies the findings it accepts and records the ones it rejects w
 ## 6. Record
 
 Each installed page is listed in [index.md](index.md) with a one-line scope. The commit hash on the page is the one it was verified against, and is updated only by re-verification.
+
+## 7. What goes elsewhere
+
+Section 2 keeps run results out of a page. They have two homes outside this directory, and neither is read by `check_refs.py`.
+
+- **Battery records**, `docs/results/`: what a closed, designed battery measured, as datasets, trends and correlations. A record is frozen, is not a finding, and is not cited on a page as evidence. A trend that earns a mechanism is promoted by doing sections 1 to 6 for that mechanism; the record is not edited.
+- **Research notes**, `docs/research/`: system-specific analyses that bear on the research projects and not on the code.
+
+A result that fits neither and is not mechanism is not recorded. `docs/findings.md` is frozen and takes no new entries.

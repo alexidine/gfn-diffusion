@@ -78,6 +78,8 @@ Fifty pages, each drafted from the code and the derivation notes, verified again
 
 How a page is produced: [writing-protocol](writing-protocol.md).
 
+Not in this knowledge base: what a closed battery measured is a frozen record under `docs/results/`, and system-specific research analyses are notes under `docs/research/`. Neither is evidence for a page here.
+
 ## Conventions on every page
 
 - **A page describes mechanics and theory.** What the code does, verifiable against it; what the theory says, derivable. Where the two disagree the page says so and stops. No history, no morals, no verdicts on what was tried.
