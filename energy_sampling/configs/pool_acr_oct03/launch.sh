@@ -6,7 +6,7 @@
 #   bash launch.sh prep    premerge -> export                   (writes <SYS>/anchors.pt)
 #   bash launch.sh flood   the walk only                        (needs anchors.pt; resubmitting resumes every shard)
 #   bash launch.sh assemble   anchors + walk -> the prior file, copied into the priors directory
-#                             (WALK_RADIUS=0.031, the 1 kT kick; E_MAX_KT=<x> for an energy ceiling; DEDUPE=0.01)
+#                             (RADIUS=0.0312, the 1 kT kick, and CEILING=10 kT: pool_oct02's rule)
 #
 # SYS = /scratch/mk8347/data/crystal_datasets/pooled_oct02/acridine_mace. The assembly is submitted on its own, once
 # the walk has finished: `all` does not chain it.
@@ -29,7 +29,7 @@ case "${STAGE}" in
     flood) ;;
     assemble)
         AS=$(sub "${HERE}/submit_assemble.sbatch")
-        echo "assemble ${AS} (WALK_RADIUS=${WALK_RADIUS:-0.031}, E_MAX_KT=${E_MAX_KT:-none}, DEDUPE=${DEDUPE:-0.01})" ;;
+        echo "assemble ${AS} (RADIUS=${RADIUS:-0.0312}, CEILING=${CEILING:-10} kT)" ;;
     *) echo "unknown stage ${STAGE}" >&2; exit 1 ;;
 esac
 if [ "${STAGE}" = "flood" ] || [ "${STAGE}" = "all" ]; then

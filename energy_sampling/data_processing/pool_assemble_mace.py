@@ -1,39 +1,38 @@
 """Assemble a shipped prior file from pooled anchors and their capped-MC walk, MACE energy (acridine; pool_acr_oct03).
 
     python -m data_processing.pool_assemble_mace ANCHORS.pt FLOOD_DIR OUT.pt --sg 14 --mol MOL.pt --mlip_path MODEL
-        --walk-radius R [--e-max-kT X] [--dedupe 0.01] [--no-fold] [--check 2000] [--keep-penalised] [--device cuda]
+        --radius R [--ceiling_kT C] [--no-fold] [--check 2000] [--device cuda]
 
-The steps are those of data_processing.pool_assemble (whose helpers are used unchanged): candidates = the anchors, then
-every walk state; greedy de-dupe in the trainer's 12-D latent (anchors first, each group in ascending energy: anchors
-at --dedupe from one another, any pair with a walk state at --walk-radius); every kept state written
-with its normaliser images the +1 chart holds (sg 14: eight); a random --check rows re-scored the trainer's way against
-their stored energy; cached space-group lookup fields dropped from the rows (pool_assemble.LAZY_CACHES: a stored copy
-breaks key parity with the trainer's batches). What differs:
+This is data_processing.pool_assemble (GFN 54ea7e36: one physical radius per system under an energy ceiling, no row
+budget) for a MACE energy, with pool_assemble's helpers used unchanged and its steps in its order:
+
+  1. candidates = the anchors, then every walk state, as rows on the anchors' molecule at handedness +1.
+  2. ceiling (--ceiling_kT C): a candidate more than C kT (2.494 kJ/mol) above the lowest anchor is left out. Then thin
+     in the trainer's latent: greedy, anchors first in ascending energy, then walk states in ascending energy; a row
+     within --radius of a kept row is dropped. One radius for every pair, no row budget.
+  3. a kept state outside the trainer latent box (a cell parameter changes by more than 1e-3 on a pass through the
+     latent and back) is left out, and so is a state the trainer's density penalty touches.
+  4. fold: every kept state written with the 8 normaliser images the +1 chart holds, images carrying its energy.
+  5. cached space-group lookup fields dropped; --check rows re-scored the trainer's way against their stored energy;
+     OUT.summary.json written with pool_assemble's keys.
+
+What differs from pool_assemble, and why:
 
   * the energy is the MACE lattice energy under --mlip_path (key 'mace', kJ/mol per molecule, no scaling factor);
-  * LATENT BOX. A state the trainer's latent cannot represent (any of its 12 cell parameters changes by more than 1e-3
-    on a pass latent_params -> latent_to_cell_params, pool_assemble's test) is left out: anchors before the de-dupe,
-    and after the fold any state one of whose images fails, with all its images.
-  * DENSITY, BEFORE the de-dupe. Anchors and walk states the trainer's density penalty touches
-    (energies.molecular_crystal.density_penalty > 0) are left out (owner 2026-10-05). pool_assemble does this after
-    its de-dupe, which is equivalent when few states are affected. Here most are: under acr_newmodel the walk's 15 kT
-    ceiling is above the whole binding energy (13.1 kT), walkers drift into expanded cells, and 55% of the walk states
-    carry a penalty; thinning first spent the row budget on them (walk radius 0.284) and then would discard 90% of
-    what it had kept. --keep-penalised turns the filter off.
-  * THE WALK RADIUS IS PHYSICAL, NOT A ROW BUDGET (owner 2026-10-05). --walk-radius is a fixed latent distance, for
-    acridine the 1 kT kick (0.031: the latent step that raises a relaxed basin's energy by a median 1 kT under
-    acr_newmodel); the file is as large as that makes it. pool_assemble's --target-rows widened the radius until the
-    file fit 400,000 rows, which put acridine's at 0.146, five kicks, and deleted nearly every walk state near a low
-    anchor. The size is controlled by --e-max-kT (anchors and walk states more than X kT above the lowest are left
-    out) or by choosing another radius; --target-rows remains only as an explicit override.
-  * no relabelling of the molecule's own symmetry (owner 2026-10-05: the model conditions on one labelled conformer,
-    so the C2-relabelled copies are not added).
+  * DENSITY AND THE LATENT BOX ARE ALSO APPLIED BEFORE THE THINNING. pool_assemble filters only the kept states, which
+    is the same thing when few states are affected. Here most are: under acr_newmodel the walk's 15 kT ceiling is
+    above the whole binding energy (13.1 kT), walkers drift into expanded cells, and 55% of the walk states carry the
+    density penalty. A penalised state that is kept by the thinning deletes every unpenalised state within the radius
+    and is then removed itself, leaving a hole. Filtering the candidates first avoids that; step 3 still runs on the
+    kept states and should find nothing.
+  * the latent-box test is repeated on every image after the fold; a state one of whose images fails leaves with all
+    its images.
+  * no relabelling of the molecule's own symmetry (owner 2026-10-05: the model conditions on one labelled conformer).
 
-The file records what it was built from by name and size, never by path: the anchors and model file names and sizes,
-the molecule file name, the counts left out at each step, the re-scoring check, and the repository commit when git can
-report it.
+The file records its inputs by name and size, never by path.
 """
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -61,12 +60,15 @@ def representable(batch, chunk=200000):
     return torch.cat(out)
 
 
-def packing_of(template, cp, chunk=20000):
-    """[n] packing coefficient of rows with the given cell parameters on the template's molecule."""
-    out = []
+def rows_ok(template, cp, chunk=200000):
+    """([n] in the latent box, [n] free of the trainer's density penalty) for rows with the given cell parameters."""
+    from energies.molecular_crystal import density_penalty
+    box, dens = [], []
     for lo in range(0, len(cp), chunk):
-        out.append(rows_on(template, cp[lo:lo + chunk]).packing_coeff.double().flatten())
-    return torch.cat(out)
+        b = rows_on(template, cp[lo:lo + chunk])
+        dens.append(density_penalty(b.packing_coeff.double().flatten()) <= 0)
+        box.append(representable(b))
+    return torch.cat(box), torch.cat(dens)
 
 
 def _commit():
@@ -86,18 +88,12 @@ def main(argv=None):
     ap.add_argument('--sg', type=int, required=True)
     ap.add_argument('--mol', required=True)
     ap.add_argument('--mlip_path', required=True)
-    ap.add_argument('--dedupe', type=float, default=0.01)
+    ap.add_argument('--radius', type=float, required=True,
+                    help='thinning radius in the trainer latent (Euclidean), for anchors and walk states alike')
+    ap.add_argument('--ceiling_kT', type=float, default=None,
+                    help='leave out candidates more than this many kT above the lowest anchor (default: no ceiling)')
     ap.add_argument('--no-fold', action='store_true')
-    ap.add_argument('--walk-radius', type=float, required=True,
-                    help='latent distance below which a walk state duplicates a kept state: a physical scale (the '
-                         "system's 1 kT kick), not a row budget")
-    ap.add_argument('--e-max-kT', type=float, default=None,
-                    help='leave out anchors and walk states more than this many kT (2.494 kJ/mol) above the lowest')
-    ap.add_argument('--target-rows', type=int, default=0,
-                    help='override: widen the walk radius x1.25 at a time until the file holds at most this many rows')
     ap.add_argument('--check', type=int, default=2000)
-    ap.add_argument('--keep-penalised', action='store_true',
-                    help="keep anchors and walk states the trainer's density penalty touches")
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--vram', type=float, default=None)
     ap.add_argument('--chunk', type=int, default=32)
@@ -107,39 +103,26 @@ def main(argv=None):
     t0 = time.time()
     src = torch.load(a.anchors, weights_only=False)
     anchors = src['prior']
-    n_anchors_in = anchors.num_graphs
-    ok = representable(anchors)
-    n_box_anchors = int((~ok).sum())
-    print(f'anchors: {n_anchors_in}; outside the latent box (left out): {n_box_anchors}', flush=True)
-    if float((~ok).double().mean()) > 0.05:
-        raise SystemExit(f'refused: {n_box_anchors} of {len(ok)} anchors are outside the latent box')
-    anchors = anchors.subsample_new_batch(torch.nonzero(ok).flatten())
     eA = anchors[KEY].double().flatten()
     cpA = anchors.full_cell_parameters().float()
     cpF, eF, n_files = load_flood(a.flood_dir)
-    n_flood_in = len(cpF)
-    n_dens_anchors = n_dens_walk = 0
-    if not a.keep_penalised:
-        from energies.molecular_crystal import density_penalty
-        pa, pf = anchors.packing_coeff.double().flatten(), packing_of(anchors, cpF)
-        ka, kf = density_penalty(pa) <= 0, density_penalty(pf) <= 0
-        n_dens_anchors, n_dens_walk = int((~ka).sum()), int((~kf).sum())
-        print(f"density: {n_dens_anchors} of {len(ka)} anchors and {n_dens_walk} of {len(kf)} walk states carry the "
-              f"trainer's density penalty and are left out; packing coefficient kept {float(pa[ka].min()):.3f} .. "
-              f"{float(max(pa[ka].max(), pf[kf].max())):.3f}", flush=True)
-        anchors = anchors.subsample_new_batch(torch.nonzero(ka).flatten())
-        eA, cpA = eA[ka], cpA[ka]
-        cpF, eF = cpF[kf], eF[kf]
-    n_emax_anchors = n_emax_walk = 0
-    if a.e_max_kT is not None:
-        top = float(min(eA.min(), eF.min())) + a.e_max_kT * KT
-        ka, kf = eA <= top, eF <= top
-        n_emax_anchors, n_emax_walk = int((~ka).sum()), int((~kf).sum())
-        print(f'energy ceiling {a.e_max_kT} kT above the lowest ({top:.3f} kJ/mol): {n_emax_anchors} anchors and '
-              f'{n_emax_walk} of {len(kf)} walk states are above it and are left out', flush=True)
-        anchors = anchors.subsample_new_batch(torch.nonzero(ka).flatten())
-        eA, cpA = eA[ka], cpA[ka]
-        cpF, eF = cpF[kf], eF[kf]
+    n_anchor_in, n_flood_in = len(cpA), len(cpF)
+    if a.ceiling_kT is not None:
+        top = float(eA.min()) + a.ceiling_kT * KT
+        okA, okF = eA <= top, eF <= top
+        print(f'ceiling {a.ceiling_kT:g} kT above the lowest anchor ({float(eA.min()):.3f} -> {top:.3f}): '
+              f'{int(okA.sum())} of {len(eA)} anchors and {int(okF.sum())} of {len(eF)} walk states under it', flush=True)
+        cpA, eA, cpF, eF = cpA[okA], eA[okA], cpF[okF], eF[okF]
+    n_anchor_ceil, n_flood_ceil = len(cpA), len(cpF)
+    # before the thinning (see the docstring): candidates outside the latent box or under the density penalty
+    boxA, densA = rows_ok(anchors, cpA)
+    boxF, densF = rows_ok(anchors, cpF)
+    print(f'before thinning: outside the latent box {int((~boxA).sum())} anchors, {int((~boxF).sum())} walk states; '
+          f'density-penalised {int((~densA).sum())} anchors, {int((~densF).sum())} of {len(densF)} walk states; left out',
+          flush=True)
+    pre = dict(anchors_outside_box=int((~boxA).sum()), flood_outside_box=int((~boxF).sum()),
+               anchors_density=int((boxA & ~densA).sum()), flood_density=int((boxF & ~densF).sum()))
+    cpA, eA, cpF, eF = cpA[boxA & densA], eA[boxA & densA], cpF[boxF & densF], eF[boxF & densF]
     cp = torch.cat([cpA, cpF])
     E = torch.cat([eA, eF])
     is_anchor = torch.zeros(len(cp), dtype=torch.bool)
@@ -150,18 +133,19 @@ def main(argv=None):
     from scipy.spatial import cKDTree
     x, box = wrapped(lat, per)
     tree = cKDTree(x, boxsize=box)
-    n_img = 1 if a.no_fold else (4 if a.sg == 2 else 8)
-    r_flood = a.walk_radius
-    while True:
-        kept, n_pairs = greedy_dedupe(x, box, tree, order, len(cpA), a.dedupe, r_flood)
-        ka = is_anchor[kept]
-        print(f'latent de-dupe (periodic dims {per}): anchors at {a.dedupe}, walk states at {r_flood:.4f} ({n_pairs} '
-              f'close pairs): kept {int(ka.sum())} of {len(cpA)} anchors and {int((~ka).sum())} of {len(cpF)} walk '
-              f'states ({n_files} shard files) -> about {len(kept) * n_img} rows  ({time.time() - t0:.0f} s)', flush=True)
-        if not a.target_rows or len(kept) * n_img <= a.target_rows or int((~ka).sum()) == 0:
-            break
-        r_flood *= 1.25
+    kept, n_pairs = greedy_dedupe(x, box, tree, order, len(cpA), a.radius, a.radius)
+    ka = is_anchor[kept]
+    n_anchor_thin, n_flood_thin = int(ka.sum()), int((~ka).sum())
+    print(f'latent thinning at radius {a.radius:g} (periodic dims {per}; {n_pairs} close pairs): kept {n_anchor_thin} '
+          f'of {len(cpA)} anchors and {n_flood_thin} of {len(cpF)} walk states ({n_files} shard files)  '
+          f'({time.time() - t0:.0f} s)', flush=True)
     kept = torch.from_numpy(np.sort(kept))
+    # pool_assemble's filters on the kept states: nothing should be left for them here
+    kbox, kdens = rows_ok(anchors, cp[kept])
+    n_outside, n_density = int((~kbox).sum()), int((kbox & ~kdens).sum())
+    if n_outside or n_density:
+        print(f'kept states: {n_outside} outside the latent box, {n_density} density-penalised; left out', flush=True)
+        kept = kept[kbox & kdens]
     from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
     ch = Chart(a.mol, a.sg, KEY, a.device, load_mace_model(a.mlip_path, device=a.device, dtype=torch.float32))
 
@@ -183,19 +167,18 @@ def main(argv=None):
 
     out, source, image = fold(kept)
     rep = representable(out)
-    n_box_states = 0
+    n_box_fold = 0
     if not bool(rep.all()):  # an image at the edge of the box: its state goes, with every image
         bad_states = torch.unique(source[~rep])
-        n_box_states = len(bad_states)
-        print(f'latent box after the fold: {int((~rep).sum())} rows of {n_box_states} states fail; those states are '
-              f'left out with all their images ({int(is_anchor[kept][bad_states].sum())} of them anchors)', flush=True)
+        n_box_fold = len(bad_states)
+        print(f'latent box after the fold: {int((~rep).sum())} rows of {n_box_fold} states fail; those states are left '
+              f'out with all their images ({int(is_anchor[kept][bad_states].sum())} of them anchors)', flush=True)
         keep_state = torch.ones(len(kept), dtype=torch.bool)
         keep_state[bad_states] = False
         kept = kept[keep_state]
         out, source, image = fold(kept)
-        rep = representable(out)
-        if not bool(rep.all()):
-            raise SystemExit(f'refused: {int((~rep).sum())} rows are still outside the latent box')
+        if not bool(representable(out).all()):
+            raise SystemExit('refused: rows outside the latent box remain after the fold filter')
     e_out = E[kept][source].clone()
     setattr(out, KEY, e_out.float())
     hand = set(out.aunit_handedness.flatten().tolist())
@@ -225,28 +208,40 @@ def main(argv=None):
     print('Kept states (one per image set) by energy above the lowest row, kT = 2.494 kJ/mol: anchors, walk states.')
     first = image == image.min()
     e_min = float(e_out.min())
+    bands = {}
     for lo, hi in ((0, 1), (1, 2), (2, 5), (5, 10), (10, None)):
         m = first & (e_out >= e_min + lo * KT)
         if hi is not None:
             m = m & (e_out < e_min + hi * KT)
-        print(f'  {lo} kT to {"the ceiling" if hi is None else str(hi) + " kT"}: {int((m & anc).sum())} anchors, '
-              f'{int((m & ~anc).sum())} walk states')
+        label = f'{lo} kT to ' + ('the ceiling' if hi is None else f'{hi} kT')
+        bands[label] = (int((m & anc).sum()), int((m & ~anc).sum()))
+        print(f'  {label}: {bands[label][0]} anchors, {bands[label][1]} walk states')
     for k in LAZY_CACHES:  # last, since any analysis rebuilds them
         if k in out.keys():
             delattr(out, k)
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': 1, 'source_row': kept[source],
-            'image_id': image, 'is_anchor': anc, 'dedupe': a.dedupe, 'flood_radius': r_flood, 'walk_radius_asked': a.walk_radius,
-            'e_max_kT': a.e_max_kT, 'target_rows': a.target_rows, 'folded': not a.no_fold,
-            'n_anchors_in': n_anchors_in, 'n_flood_in': n_flood_in, 'n_shard_files': n_files,
-            'anchors_outside_box_dropped': n_box_anchors, 'states_outside_box_after_fold_dropped': n_box_states,
-            'anchors_density_dropped': n_dens_anchors, 'walk_states_density_dropped': n_dens_walk,
-            'anchors_above_ceiling_dropped': n_emax_anchors, 'walk_states_above_ceiling_dropped': n_emax_walk,
-            'density_filter': not a.keep_penalised, 'check': check,
+            'image_id': image, 'is_anchor': anc, 'n_anchors_in': n_anchor_in, 'n_flood_in': n_flood_in,
+            'radius': a.radius, 'ceiling_kT': a.ceiling_kT, 'folded': not a.no_fold,
+            'out_of_box_states_dropped': n_outside + n_box_fold, 'density_states_dropped': n_density,
+            'dropped_before_thinning': pre, 'check': check,
             'anchors_file': (os.path.basename(a.anchors), os.path.getsize(a.anchors)),
             'mlip_file': (os.path.basename(a.mlip_path), os.path.getsize(a.mlip_path)),
             'mol_file': os.path.basename(a.mol), 'commit': _commit()}
     torch.save(blob, a.out)
-    print(f'wrote {a.out} ({os.path.getsize(a.out)} bytes, {out.num_graphs} rows, {time.time() - t0:.0f} s)')
+    summary = {'file': os.path.basename(a.out), 'bytes': os.path.getsize(a.out), 'rows': int(out.num_graphs),
+               'radius': a.radius, 'ceiling_kT': a.ceiling_kT, 'folded': not a.no_fold,
+               'anchors_in': n_anchor_in, 'flood_states_in': n_flood_in,
+               'anchors_under_ceiling': n_anchor_ceil, 'flood_states_under_ceiling': n_flood_ceil,
+               'dropped_before_thinning': pre,
+               'anchors_after_thinning': n_anchor_thin, 'flood_states_after_thinning': n_flood_thin,
+               'states_outside_latent_box': n_outside, 'states_with_density_penalty': n_density,
+               'states_outside_latent_box_after_fold': n_box_fold,
+               'states_kept': len(kept), 'anchor_rows': int(anc.sum()),
+               'energy_min': float(e_out.min()), 'energy_max': float(e_out.max()), 'energy_key': KEY,
+               'kept_states_by_band_anchors_walk': bands, 'check': check, 'commit': blob['commit']}
+    with open(a.out + '.summary.json', 'w') as fh:
+        json.dump(summary, fh, indent=1)
+    print(f'wrote {a.out} ({summary["bytes"]} bytes, {summary["rows"]} rows, {time.time() - t0:.0f} s)')
 
 
 if __name__ == '__main__':

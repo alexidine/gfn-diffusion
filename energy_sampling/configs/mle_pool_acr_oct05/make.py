@@ -12,16 +12,20 @@ molecules_path = the pooled file, both buffer caps = its row count) with one cha
       checkpoint load tells this model from the older one: a generator that builds on family 'acr' must set mlip_path
       itself, as this one does (the family default is the older, more strongly binding checkpoint).
 
-THE PRIOR, acridine_mace_pooled_oct03_pc055_prior.pt, is built by configs/pool_acr_oct03 (acridine P2_1/c Z'=1, the
-universal conformer = the gas-phase minimum under acr_newmodel): the basins of the acr_zp1_sep30 campaign within 5 kT
-as anchors, a training-temperature capped-MC walk from each, every row in the trainer's chart at handedness +1
-(exact for planar acridine), states outside the trainer latent box left out (64 anchors), states outside the density
-penalty's free range 0.55-0.95 left out (374 anchors, 617,326 of 1,131,800 walk states: the walk's 15 kT ceiling is
-above this model's whole binding energy of 13.1 kT, so walkers went diffuse), walk states thinned in latent space to
-fit 400,000 rows (radius 0.146), every kept state written with its 8 normaliser images. 10,527 anchors + 26,200 walk
-states = 36,727 states x 8 = 293,816 rows. The molecule's own C2 relabelling is not applied (owner 2026-10-05).
+THE PRIOR, acridine_mace_pooled_oct05_prior.pt, is built by configs/pool_acr_oct03 (acridine P2_1/c Z'=1, the
+universal conformer = the gas-phase minimum under acr_newmodel) on pool_oct02's final rule: the basins of the
+acr_zp1_sep30 campaign within 5 kT as anchors, a training-temperature capped-MC walk from each, every row in the
+trainer's chart at handedness +1 (exact for planar acridine); candidates more than 10 kT above the lowest anchor, outside
+the trainer latent box, or under the trainer's density penalty left out; one thinning radius for every pair, 0.0312
+(the latent kick that raises a relaxed basin by a median 1 kT), no row budget; every kept state written with its 8
+normaliser images. The molecule's own C2 relabelling is not applied (owner 2026-10-05).
 
-NOTE ON START-UP: train.py re-scores every prior row at init: 293,816 MACE evaluations before the first step.
+ITS SIZE AND ROW COUNT are read from the assembly's own summary, acridine_mace_pooled_oct05_prior.pt.summary.json,
+copied beside this file from the priors directory once the assemble job has run. Without it the generator refuses:
+the arm's buffer caps and the job's size guard are the file's, not numbers typed here.
+
+START-UP: prior_scan_cache is true (mle_pool_oct05): the first launch scores every prior row with MACE and writes the
+cache beside the prior; later launches and requeues load it after re-scoring 512 rows.
 """
 import copy
 import importlib.util
@@ -48,12 +52,23 @@ BATTERY = 'mle_pool_acr_oct05'
 FAM = 'acr'
 MLIP_OLD = '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model'
 MLIP_NEW = '/scratch/mk8347/data/acr_newmodel.model'
-#: the prior file, its size in bytes, its row count
-PRIOR = ('acridine_mace_pooled_oct03_pc055_prior.pt', 314_402_033, 293_816)
+PRIOR_FILE = 'acridine_mace_pooled_oct05_prior.pt'
+SUMMARY = HERE / (PRIOR_FILE + '.summary.json')
+
+
+def prior():
+    """(file name, bytes, rows) from the assemble job's summary; exits when the summary has not been copied here."""
+    import json
+    if not SUMMARY.exists():
+        sys.exit(f'REFUSING: {SUMMARY.name} is not here. Run configs/pool_acr_oct03/launch.sh assemble on the cluster, '
+                 f'then copy the summary it writes into {HERE.name}/.')
+    d = json.loads(SUMMARY.read_text(encoding='utf-8'))
+    assert d['file'] == PRIOR_FILE and d['energy_key'] == 'mace' and d['folded'] is True, d
+    return PRIOR_FILE, int(d['bytes']), int(d['rows'])
 
 
 def build_arm(base):
-    pl.PRIORS[FAM] = PRIOR
+    pl.PRIORS[FAM] = prior()
     name, cfg, dropped = pl.build_arm(base, FAM)
     assert cfg['mlip_path'] == MLIP_OLD, cfg['mlip_path']
     cfg['mlip_path'] = MLIP_NEW
@@ -63,6 +78,7 @@ def build_arm(base):
 def check(cfg, name):
     pl.check(cfg, name, FAM)  # problem identity = the seed arm's; prior, caps, fresh start, rate, terminal MLE stage
     assert cfg['energy_function'] == 'mace' and cfg['mlip_path'] == MLIP_NEW, name
+    assert cfg['prior_scan_cache'] is True, name
     assert cfg['run_name'] == name == f'{TAG}_{FAM}_lr2', name
 
 
@@ -74,11 +90,7 @@ def main(argv):
     name, cfg, dropped = build_arm(copy.deepcopy(base))
     check(cfg, name)
     w3.load_check(cfg, name)
-    local = w3.LOCAL_DATA / PRIOR[0]
-    if local.exists():
-        assert local.stat().st_size == PRIOR[1], f'{local} is {local.stat().st_size} bytes, PRIOR says {PRIOR[1]}'
-    else:
-        print(f'NOTE: {local} not on this machine; its byte size is unchecked')
+    PRIOR = prior()
 
     (HERE / 'joblogs').mkdir(exist_ok=True)
     (HERE / 'joblogs' / '.gitkeep').write_text('ships this directory to the cluster; SLURM cannot create --output\n',
