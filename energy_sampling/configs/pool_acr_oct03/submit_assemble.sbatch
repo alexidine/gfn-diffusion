@@ -30,8 +30,10 @@ MOL=/scratch/mk8347/data/crystal_datasets/acridine/acr_newmodel_conformer.pt
 MODEL=/scratch/mk8347/data/acr_newmodel.model
 DEDUPE=${DEDUPE:-0.01}
 TARGET_ROWS=${TARGET_ROWS:-400000}
+PC_MIN=${PC_MIN:-0}   # packing-coefficient floor on anchors and walk states (0: none)
+OUTTAG=${OUTTAG:-}    # appended to the output name, e.g. _pc062
 
-OUT=${SYS}/${NAME}_pooled_oct03_prior.pt
+OUT=${SYS}/${NAME}_pooled_oct03${OUTTAG}_prior.pt
 if [ ! -f "${SYS}/anchors.pt" ]; then echo "FATAL: ${SYS}/anchors.pt missing (the export stage writes it)" >&2; exit 1; fi
 if [ -z "$(ls ${SYS}/flood/shard_*/shard_*.pt 2>/dev/null | head -1)" ]; then echo "FATAL: no walk shards under ${SYS}/flood" >&2; exit 1; fi
 echo "JOB ${SLURM_JOB_ID} assemble ${NAME} (dedupe ${DEDUPE}, target rows ${TARGET_ROWS}) start=$(date -Is)"
@@ -40,7 +42,7 @@ srun singularity exec --nv     --overlay ${OVERLAY}:ro     --bind ${PROJECT_ROOT
         source /ext3/env.sh
         export PYTHONPATH=${MXT_ROOT}:${PROJECT_ROOT}/gfn-diffusion:${PYLIBS}:\$PYTHONPATH
         python -u -m data_processing.pool_assemble_mace ${SYS}/anchors.pt ${SYS}/flood ${OUT} --sg 14 --mol ${MOL} \
-            --mlip_path ${MODEL} --dedupe ${DEDUPE} --target-rows ${TARGET_ROWS}
+            --mlip_path ${MODEL} --dedupe ${DEDUPE} --target-rows ${TARGET_ROWS} --pc-min ${PC_MIN}
     "
 RC=$?
 echo "JOB ${SLURM_JOB_ID} status=${RC} end=$(date -Is)"
