@@ -130,14 +130,31 @@ named keys and no others (asserted leaf by leaf):
     0.5, which keeps the pair consistent should the controller ever reopen.
   - the force's reach is the stage's forward path_grad_last_k and its scale channel the stage's forward
     path_grad_scale; loss coefficients are always read from the config.
-The first launch of a continued arm seeds from its source's NEWEST STEP ARCHIVE and that archive's frozen buffers
-(steps 100,000 and 70,000), never the source's _running.pt: rows 0 and 4 resume those runs and rewrite it. So do not
-pass SRC_RUNNING to this leg. A resubmission resumes the arm's own _running.pt. Rows 0 and 4 name no seed ('-'): a
-row whose own _running.pt is missing fails at the seed lookup instead of starting phase 2 again from phase 1.
+The first launch of a continued arm seeds from ONE NAMED STEP ARCHIVE of its source and that archive's frozen
+buffers (steps 100,000 and 70,000, INDEX column src_step), never the source's _running.pt and never "the newest
+archive": rows 0 and 4 resume those runs, rewrite the first and add to the second, and array tasks do not start
+together. So do not pass SRC_RUNNING to this leg. A resubmission resumes the arm's own _running.pt. Rows 0 and 4 name
+no seed ('-', no step): a row whose own _running.pt is missing stops at the seed lookup instead of starting phase 2
+again from phase 1.
+
+LEG E, CONDITIONAL MLE (`python configs/qm9full_sep30/make.py cmle`; owner 2026-10-05). Phase 1 trains with
+scramble_conditions, so the trunk learns to ignore the condition and the conditioner stays at its initial weights:
+its forward draws sat at a median 68 kT above their molecule's best from step 24,000 to the end (qf30_p1lr2), and
+everything conditional is learned inside the TB stage (qf30_fwdF_lr5: 25 kT at step 100,000, 3.2 kT a doubling of
+steps). Leg e is phase 1's leg-1 config with that flag false and nothing else moved (asserted): the same backward
+MLE on the stored search minima, the conditioner now in the graph. No TB, no rollouts in training; run until stopped.
+  [0] qf30_cmle_seed  weights from qf30_p1lr2's step-45,000 archive: phase 1 carried on, conditionally (P_B live)
+  [1] qf30_cmle_lead  weights from qf30_fwdF_lr5's step-100,000 archive: the TB-trained leader under MLE (P_B is the
+                      frozen snapshot that archive carries, which a weights-only load installs)
+Both are weights-only on a first launch (step count, optimizers and controller fresh: burn-in, then the ramp to
+fixed_scale 2 = 2.5e-4, phase 1's rate) and resume themselves in full afterwards. The reading is the forward draws'
+median excess against 68 (phase 1) and 25 (the leader). The rows are the stored minima as they are, at most 10 a
+molecule, so a training molecule can be memorised (owner 2026-10-05: "not worried about MLE overfit for now").
 
     python configs/qm9full_sep30/make.py p1
     python configs/qm9full_sep30/make.py arms [--dry]      # legs b and c
     python configs/qm9full_sep30/make.py cont [--dry]      # leg d
+    python configs/qm9full_sep30/make.py cmle [--dry]      # leg e
 """
 import copy
 import importlib.util
@@ -232,6 +249,28 @@ CONT = (('fwdF_lr5', None, 1, 1, True),
 CONT_SCALE = 0.5        # the controller scale both sources carry in their checkpoints (their fixed_scale)
 CONT_REACH_MAX = 0.3    # time units: the longest reach of the forward force a continued arm may take (k / T)
 NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run: matches no checkpoint file
+# the archive a seeded row of legs d and e loads, by source run: the last one each stopped run wrote (W&B last steps
+# 109,590, 72,150 and 47,940 at archive periods 10,000, 10,000 and 5,000)
+SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
+# leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
+CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
+# the job script's seed lookup (final_sep19's SEED_B) and the pinned one legs d and e run in its place
+SEED_NEWEST = """        CK=$(ls -t ${CKPTS}/*${SRC}_*_step[0-9]*.pt 2>/dev/null | grep -v '_buffers.pt$' | head -1)
+        if [ -z "${CK}" ]; then
+            echo "FATAL: leg A arm ${SRC} has no step archive yet in ${CKPTS} (needs archive_period steps)" >&2; exit 1
+        fi
+"""
+SEED_PINNED = """        # THE SEED STEP IS NAMED (INDEX column 7), not "the newest": a resumed source writes more.
+        SRC_STEP=$(awk -F'\\t' -v n=${ROW} 'NR==n {print $7}' ${INDEX})
+        if [ -z "${SRC_STEP}" ]; then
+            echo "FATAL: arm ${ARM} has no _running.pt of its own and INDEX names no seed step for it" >&2; exit 1
+        fi
+        NA=$(ls ${CKPTS}/*${SRC}_*_step${SRC_STEP}.pt 2>/dev/null | grep -v '_buffers.pt$' | wc -l)
+        if [ "${NA}" -ne 1 ]; then
+            echo "FATAL: ${NA} matches for *${SRC}_*_step${SRC_STEP}.pt in ${CKPTS} (need exactly 1)" >&2; exit 1
+        fi
+        CK=$(ls ${CKPTS}/*${SRC}_*_step${SRC_STEP}.pt | grep -v '_buffers.pt$')
+"""
 FROM_P1 = ('prior_path', 'molecules_path', 'test_molecules_path', 'checkpoints_dir', 'model', 'integrator', 'eval_T',
            'compile_policy', 'cuda_memory_fraction', 'test_eval_num_samples')
 STUB_EXIT = [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}]
@@ -522,6 +561,22 @@ def _vet(cfg, name, z):
     return cfg
 
 
+def _write_index_pinned(path, rows):
+    """INDEX with a seventh column: the step of the source archive a seeded row loads ('' on a resume row)."""
+    with path.open('w', encoding='utf-8', newline='\n') as f:
+        f.write('arm\tfamily\tstart\twarm_src\tprior\tprior_bytes\tsrc_step\n')
+        for r in rows:
+            assert len(r) == 7, r
+            f.write('\t'.join(r) + '\n')
+
+
+def _pinned_sbatch(**fields):
+    """final_sep19's job script with its newest-archive seed lookup replaced by the named step."""
+    sb = fin.SBATCH.format(**fields)
+    assert sb.count(SEED_NEWEST) == 1, "final_sep19's seed lookup moved"
+    return sb.replace(SEED_NEWEST, SEED_PINNED)
+
+
 def build_cont(run, source, rate, reach, scale_live=True):
     """A leg-b or leg-c arm continued under a new name, loaded in full from that arm (the module docstring, LEG D)."""
     cfg = copy.deepcopy(source)
@@ -597,7 +652,7 @@ def main_cont(argv):
             probe = copy.deepcopy(cfg)
             probe['load_weights_only'] = False      # what the job script resolves on a resubmission
             fin.load_check(probe, name, STAGES)
-            rows.append((name, 'qm9full', 'resume', NO_SEED, PRIOR, str(prior_bytes)))
+            rows.append((name, 'qm9full', 'resume', NO_SEED, PRIOR, str(prior_bytes), ''))
             continue
         source_name = f'{TAG}_{src}'
         assert source_name in ran and name not in ran, name
@@ -605,7 +660,7 @@ def main_cont(argv):
         cfg = build_cont(run, source, rate, reach, scale_live)
         check_cont(cfg, name, source, source_name, rate, reach, scale_live)
         new[name] = cfg
-        rows.append((name, 'qm9full', 'continued', source_name, PRIOR, str(prior_bytes)))
+        rows.append((name, 'qm9full', 'continued', source_name, PRIOR, str(prior_bytes), str(SEED_STEP[src])))
     # the job script finds an arm's files, and its source's, by `*<arm>_*`: no name may match another's
     names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
     assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
@@ -626,16 +681,103 @@ def main_cont(argv):
         with path.open('w', encoding='utf-8', newline='\n') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
         assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
-    fin._write_index(HERE / 'INDEX_d.tsv', rows)
+    _write_index_pinned(HERE / 'INDEX_d.tsv', rows)
     with (HERE / f'submit_{BATTERY}_d.sbatch').open('w', encoding='utf-8', newline='\n') as f:
-        f.write(fin.SBATCH.format(
+        f.write(_pinned_sbatch(
             wall=fin.WALL, last=len(rows) - 1, tag=TAG + 'd', battery=BATTERY, leg='d', ckpts=w3.CLUSTER_CKPTS,
             data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
             what=f'continuation of the stopped leg-b and leg-c arms. A "resume" row continues its own _running.pt; a '
-                 f'"continued" row is a new run name loaded IN FULL (weights, optimizers, Z table, buffers) from its '
-                 f"warm_src arm's newest step archive on a first launch, and resumes itself afterwards. DO NOT PASS "
+                 f'"continued" row is a new run name loaded IN FULL (weights, optimizers, Z table, buffers) from the '
+                 f"src_step archive of its warm_src arm on a first launch, and resumes itself afterwards. DO NOT PASS "
                  f'SRC_RUNNING: the resume rows rewrite those files (make.py, LEG D).'))
     print(f'wrote {len(new)} continued arms with INDEX_d.tsv ({len(rows)} rows) and submit_{BATTERY}_d.sbatch')
+    print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
+def build_cmle(run, p1):
+    """Phase 1's leg-1 config with the condition scramble off, under the phase-2 job script's seed placeholders
+    (the module docstring, LEG E)."""
+    cfg = copy.deepcopy(p1)
+    cfg['run_name'] = run
+    assert cfg['checkpoint_name'] == fin.PLACEHOLDER and cfg['prior_model_name'] is None, run
+    cfg['load_weights_only'] = True     # the first launch; main_cmle writes the placeholder the job script fills
+    cfg['continue_from_checkpoint'] = False
+    stages = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in stages] == ['train_prior'] and stages[0]['flags']['scramble_conditions'] is True
+    stages[0]['flags']['scramble_conditions'] = False
+    return cfg
+
+
+def check_cmle(cfg, name, p1, source, source_name):
+    check_p1(dict(cfg, continue_from_checkpoint=w3.CONT_PLACEHOLDER), name, 2.0, True)
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert st[0]['flags'] == dict(p1['protocols'][PROTOCOL]['stages'][0]['flags'], scramble_conditions=False), name
+    assert st[0]['bwd_sampling_mode'] == 'dataset' and st[0]['loss_coeffs']['bwd']['mle'] == 1.0, name
+    # an embedding condition is what the scramble acts on, and the conditioner is what leaving it off trains
+    assert cfg['embedding_conditioning'] is True and not cfg.get('freeze_backward_policy'), name
+    mine, theirs = w3.problem_def(cfg), w3.problem_def(source)
+    assert mine == theirs, f'{name}: problem identity differs from {source_name}; its weights would be refused'
+    assert cfg['model'] == source['model'], f'{name}: not the model of {source_name}'
+    assert cfg['integrator'] == source['integrator'], f'{name}: not the trajectory of {source_name}'
+    # phase 1's leg 1 with the scramble off; continue_from_checkpoint is that leg's job-script placeholder, which this
+    # leg's job script does not fill
+    moved = _moved(p1, cfg)
+    assert moved == ['continue_from_checkpoint',
+                     f'protocols.{PROTOCOL}.stages[train_prior].flags.scramble_conditions'], (name, moved)
+    for weights_only in (True, False):  # the first launch and a resubmission
+        fin.load_check(dict(copy.deepcopy(cfg), load_weights_only=weights_only), name, ['train_prior'])
+
+
+def main_cmle(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+
+    def committed(run):
+        name = f'{TAG}_{run}'
+        cfg = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{name}.yaml'], HERE))
+        on_disk = yaml.safe_load((HERE / f'{name}.yaml').read_text(encoding='utf-8'))
+        assert on_disk == cfg, f'{name}.yaml is not the committed file'
+        return cfg
+
+    p1 = committed(SEED_LEG)
+    rows, new = [], {}
+    for run, src in CMLE:
+        name, source_name = f'{TAG}_{run}', f'{TAG}_{src}'
+        cfg = build_cmle(run, p1)
+        check_cmle(cfg, name, p1, committed(src), source_name)
+        cfg['load_weights_only'] = WO_PLACEHOLDER
+        new[name] = cfg
+        rows.append((name, 'qm9full', 'weights', source_name, PRIOR, str(prior_bytes), str(SEED_STEP[src])))
+    ran = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + [f'{TAG}_{run}' for run, *_ in ARMS] + \
+          [f'{TAG}_{run}' for run, _ in LIVE_PB] + [f'{TAG}_{run}' for run, src, *_ in CONT if src is not None]
+    names = ran + list(new)
+    assert len(set(names)) == len(names), names
+    # the job script finds an arm's files, and its source's, by `*<arm>_*`: no name may match another's
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    print(f'leg e, conditional MLE (INDEX_e row = array index): {TAG}_{SEED_LEG} with scramble_conditions false, '
+          f'weights-only first launch from the named archive, rate {2.0 * SEED_LR:g} after burn-in and ramp:')
+    for i, (run, src) in enumerate(CMLE):
+        print(f'[{i}] {TAG}_{run:<10} weights of {TAG}_{src} at step {SEED_STEP[src]:,}')
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    _write_index_pinned(HERE / 'INDEX_e.tsv', rows)
+    with (HERE / f'submit_{BATTERY}_e.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(_pinned_sbatch(
+            wall=fin.WALL, last=len(rows) - 1, tag=TAG + 'e', battery=BATTERY, leg='e', ckpts=w3.CLUSTER_CKPTS,
+            data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+            what=f'conditional MLE: phase 1 ({TAG}_{SEED_LEG}) with scramble_conditions false, weights-only first '
+                 f'launch from the src_step archive of the warm_src arm, full resume afterwards; stopped by hand '
+                 f'(make.py, LEG E).'))
+    print(f'wrote {len(new)} arms with INDEX_e.tsv and submit_{BATTERY}_e.sbatch')
     print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
 
 
@@ -719,6 +861,8 @@ def main(argv):
         return main_arms(argv)
     if argv[:1] == ['cont']:
         return main_cont(argv)
+    if argv[:1] == ['cmle']:
+        return main_cmle(argv)
     sys.exit(__doc__)
 
 
