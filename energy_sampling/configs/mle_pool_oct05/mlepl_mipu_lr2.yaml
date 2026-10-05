@@ -11,8 +11,8 @@ checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling
 checkpoint_name: null
 prior_model_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_uma_pooled_oct02_prior.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_uma_pooled_oct02_prior.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_uma_pooled_oct05_prior.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_uma_pooled_oct05_prior.pt
 test_molecules_path: null
 prior_scan_cache: true
 archive_period: 5000
@@ -527,7 +527,7 @@ buffers:
     weighted_bwd_beta: 0.9
     churn_batch_ref: 1000
     min_size: 10000
-    max_size: 263060
+    max_size: 784916
     init_fraction: 0.25
     expire_max_frac: 0.1
     anchor_floor_frac: 0.1
@@ -555,7 +555,7 @@ buffers:
     thin_every_n_evals: 0
     refresh_every_n_evals: 0
     seed_source: prior_dataset
-    max_size: 263060
+    max_size: 784916
     dup_cutoff: 0.05
     screen_energy_window: 20
     thin_energy_window: 50

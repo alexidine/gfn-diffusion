@@ -5,11 +5,13 @@
 THE ARMS are mle_fresh_sep17's (its build_arm: mle_w3_sep16's arm shape on today's committed mk_dev -- rate scale 2.0,
 burn-in, batch policy, eval, archives, terminal MLE stage, DPLR off, fresh weights) with two changes:
 
-  prior_path = molecules_path = <family>_pooled_oct02_prior.pt
-      Built by configs/pool_oct02: the zp1_sep28 campaign pooled with every older prior and search file, the pooled
-      basins within 5 kT as anchors, a training-temperature capped-MC walk from each (every accepted move kept),
-      thinned in latent space and written with every normaliser image the +1 chart holds (x4 in P-1, x8 in P2_1/c).
-      `prior` and `equalized_prior` are the same rows (owner 2026-10-05: everything points at the full set).
+  prior_path = molecules_path = <system>_pooled_oct05_prior.pt
+      Built by configs/pool_oct02 (`launch.sh assemble`, job 19233778): the zp1_sep28 campaign pooled with every older
+      prior and search file, the pooled basins within 5 kT as anchors, a training-temperature capped-MC walk from each
+      (every accepted move kept), everything more than 10 kT above the lowest anchor left out, thinned in latent space
+      at the system's 1 kT kick (no row budget) and written with every normaliser image the +1 chart holds (x4 in
+      P-1, x8 in P2_1/c). `prior` and `equalized_prior` are the same rows (owner 2026-10-05: everything points at the
+      full set). Each file's <file>.summary.json beside it on the cluster holds the count at every step.
   buffers.prior_buffer.max_size = buffers.anchor_buffer.max_size = the file's row count
       mk_dev's 250,000 / 200,000 are below every file; a smaller cap subsamples at seeding and breaks up the image sets.
 
@@ -19,15 +21,16 @@ Not acridine: its pooled prior is the pool_acr_oct03 battery's.
       The first launch scores every prior row and writes <prior>.scan-<hash>.pt beside the file; a requeue or relaunch
       loads it after re-scoring 512 rows (prior_scan_cache.py).
 
-NOTE ON START-UP: train.py re-scores every prior row at the FIRST launch. The UMA files hold 263,060 (mipu) and 334,968 (nehu)
-rows, so those two arms spend their first minutes to an hour in that scan.
+NOTE ON START-UP: train.py re-scores every prior row at the FIRST launch. The files hold 799,060 (mip),
+784,916 (mipu), 4,520,416 (neh) and 1,199,288 (nehu) rows, so the two UMA arms spend a long
+first stretch in that scan, and neh loads a 5.4 GB file (a start-up on a file of that size has not been run).
 
 OUT-OF-BOX STATES: kept states outside the trainer latent box were filtered from the files, all images (owner
-2026-10-05): 176 states from neh, 13 from nehu, none from mip / mipu.
+2026-10-05): 164 states from neh, 10 from nehu, 0 from mip, 0 from mipu.
 
 DENSITY: states the trainer's density penalty touches (energies.molecular_crystal.density_penalty > 0, i.e. a packing
-coefficient below 0.55 or above 0.95) were filtered from the files, all images (owner 2026-10-05): 3 states from mipu,
-109 from neh, 27 from nehu, none from mip; every one was below 0.55.
+coefficient below 0.55 or above 0.95) were filtered from the files, all images (owner 2026-10-05): 83 states from
+neh, 0 from mip, 0 from mipu, 0 from nehu.
 """
 import copy
 import importlib.util
@@ -53,10 +56,10 @@ TAG = 'mlepl'
 BATTERY = 'mle_pool_oct05'
 #: family -> (prior file, its size in bytes on the cluster, its row count)
 PRIORS = {
-    'mip':  ('mipcas_elj_pooled_oct02_prior.pt', 200_815_040, 263_172),
-    'mipu': ('mipcas_uma_pooled_oct02_prior.pt', 200_729_472, 263_060),
-    'neh':  ('nehzor_elj_pooled_oct02_prior.pt', 346_122_055, 289_872),
-    'nehu': ('nehzor_uma_pooled_oct02_prior.pt', 399_966_599, 334_968),
+    'mip': ('mipcas_elj_pooled_oct05_prior.pt', 616_093_331, 799_060),
+    'mipu':('mipcas_uma_pooled_oct05_prior.pt', 605_188_243, 784_916),
+    'neh': ('nehzor_elj_pooled_oct05_prior.pt', 5_433_580_454, 4_520_416),
+    'nehu':('nehzor_uma_pooled_oct05_prior.pt', 1_441_564_186, 1_199_288),
 }
 
 
