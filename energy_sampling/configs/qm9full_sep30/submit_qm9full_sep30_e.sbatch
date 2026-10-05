@@ -6,13 +6,13 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-5
+#SBATCH --array=0-1
 #SBATCH --account=torch_pr_226_chemistry
-#SBATCH --job-name=qf30d
+#SBATCH --job-name=qf30e
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
 
-# qm9full_sep30 leg d: continuation of the stopped leg-b and leg-c arms. A "resume" row continues its own _running.pt; a "continued" row is a new run name loaded IN FULL (weights, optimizers, Z table, buffers) from the src_step archive of its warm_src arm on a first launch, and resumes itself afterwards. DO NOT PASS SRC_RUNNING: the resume rows rewrite those files (make.py, LEG D).
-# Arm = row of INDEX_d.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
+# qm9full_sep30 leg e: conditional MLE: phase 1 (qf30_p1lr2) with scramble_conditions false, weights-only first launch from the src_step archive of the warm_src arm, full resume afterwards; stopped by hand (make.py, LEG E).
+# Arm = row of INDEX_e.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
 
@@ -27,7 +27,7 @@ DATA=/scratch/mk8347/data/crystal_datasets/conditional/priors
 mkdir -p ${LOGS}
 
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
-INDEX=${ARMS}/INDEX_d.tsv
+INDEX=${ARMS}/INDEX_e.tsv
 ARM=$(awk -F'\t' -v n=${ROW} 'NR==n {print $1}' ${INDEX})
 SRC=$(awk -F'\t' -v n=${ROW} 'NR==n {print $4}' ${INDEX})
 PRIOR=$(awk -F'\t' -v n=${ROW} 'NR==n {print $5}' ${INDEX})

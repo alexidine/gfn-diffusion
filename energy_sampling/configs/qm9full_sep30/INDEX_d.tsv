@@ -1,7 +1,7 @@
-arm	family	start	warm_src	prior	prior_bytes
-qf30_fwdF_lr5	qm9full	resume	-	qm9full_prior.pt	2433322986
-qf30_fwdF_lr10	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986
-qf30_fwdF_k5m	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986
-qf30_fwdF_k5	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986
-qf30_upb_lr5	qm9full	resume	-	qm9full_prior.pt	2433322986
-qf30_upb_lr10	qm9full	continued	qf30_upb_lr5	qm9full_prior.pt	2433322986
+arm	family	start	warm_src	prior	prior_bytes	src_step
+qf30_fwdF_lr5	qm9full	resume	-	qm9full_prior.pt	2433322986	
+qf30_fwdF_lr10	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	100000
+qf30_fwdF_k5m	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	100000
+qf30_fwdF_k5	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	100000
+qf30_upb_lr5	qm9full	resume	-	qm9full_prior.pt	2433322986	
+qf30_upb_lr10	qm9full	continued	qf30_upb_lr5	qm9full_prior.pt	2433322986	70000
