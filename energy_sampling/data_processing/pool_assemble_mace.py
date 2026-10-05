@@ -14,8 +14,9 @@ their stored energy. What differs:
     change under latent_params -> latent_to_cell_params lies outside the latent box, and the trainer would read a
     different crystal from its row (acridine: 64 of 10,986 anchors were outside capped_mc's clamp box). Walk states
     are inside the box by construction; the written rows are checked the same way.
-  * --pc-min F: anchors and walk states with a packing coefficient below F are left out before the de-dupe (owner
-    2026-10-05: filter on density). Under acr_newmodel the walk's 15 kT ceiling lies above the whole binding energy
+  * --pc-min F / --pc-max G: anchors and walk states with a packing coefficient outside [F, G] are left out before
+    the de-dupe (owner 2026-10-05: filter on density, with the range the trainer's density penalty leaves unpenalised,
+    energies/molecular_crystal.py density_penalty: 0.55 to 0.95). Under acr_newmodel the walk's 15 kT ceiling lies above the whole binding energy
     (13.1 kT), so walkers drift into expanded, unbound cells: 55% of acridine's walk states have a packing coefficient
     below 0.55, where the MIPCAS and NEHZOR walks never go.
   * no relabelling of the molecule's own symmetry (owner 2026-10-05: the model conditions on one labelled conformer,
@@ -68,6 +69,8 @@ def main(argv=None):
     ap.add_argument('--check', type=int, default=2000)
     ap.add_argument('--pc-min', type=float, default=0.0,
                     help='leave out anchors and walk states with a packing coefficient below this (0: no floor)')
+    ap.add_argument('--pc-max', type=float, default=float('inf'),
+                    help='leave out anchors and walk states with a packing coefficient above this')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--vram', type=float, default=None)
     ap.add_argument('--chunk', type=int, default=32)
@@ -85,11 +88,13 @@ def main(argv=None):
     eA = anchors[KEY].double().flatten()
     cpA = anchors.full_cell_parameters().float()
     cpF, eF, n_files = load_flood(a.flood_dir)
-    if a.pc_min > 0:
+    if a.pc_min > 0 or a.pc_max < float('inf'):
         pa, pf = anchors.packing_coeff.double().flatten(), packing_of(anchors, cpF)
-        ka, kf = pa >= a.pc_min, pf >= a.pc_min
-        print(f'packing-coefficient floor {a.pc_min}: kept {int(ka.sum())} of {len(ka)} anchors and {int(kf.sum())} of '
-              f'{len(kf)} walk states', flush=True)
+        ka, kf = (pa >= a.pc_min) & (pa <= a.pc_max), (pf >= a.pc_min) & (pf <= a.pc_max)
+        print(f'packing coefficient in [{a.pc_min}, {a.pc_max}]: kept {int(ka.sum())} of {len(ka)} anchors and '
+              f'{int(kf.sum())} of {len(kf)} walk states (below: {int((pa < a.pc_min).sum())} anchors, '
+              f'{int((pf < a.pc_min).sum())} walk states; above: {int((pa > a.pc_max).sum())}, '
+              f'{int((pf > a.pc_max).sum())})', flush=True)
         anchors = anchors.subsample_new_batch(torch.nonzero(ka).flatten())
         eA, cpA = eA[ka], cpA[ka]
         cpF, eF = cpF[kf], eF[kf]
@@ -165,7 +170,7 @@ def main(argv=None):
         print(f'  rows within {w:g} kT: {int(m.sum())} (anchors {int((m & anc).sum())}, walk states {int((m & ~anc).sum())})')
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': 1, 'source_row': kept[source],
             'image_id': image, 'is_anchor': anc, 'n_anchors_in': len(cpA), 'n_anchors_outside_box': int((~ok).sum()),
-            'n_flood_in': len(cpF), 'pc_min': a.pc_min, 'dedupe': a.dedupe, 'flood_radius': r_flood, 'folded': not a.no_fold,
+            'n_flood_in': len(cpF), 'pc_min': a.pc_min, 'pc_max': a.pc_max, 'dedupe': a.dedupe, 'flood_radius': r_flood, 'folded': not a.no_fold,
             'anchors_file': os.path.abspath(a.anchors), 'flood_dir': os.path.abspath(a.flood_dir)}
     torch.save(blob, a.out)
     print(f'wrote {a.out} ({os.path.getsize(a.out) / 2 ** 20:.0f} MiB, {time.time() - t0:.0f} s)')

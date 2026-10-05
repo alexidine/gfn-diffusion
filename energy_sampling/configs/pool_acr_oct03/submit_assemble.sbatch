@@ -30,7 +30,8 @@ MOL=/scratch/mk8347/data/crystal_datasets/acridine/acr_newmodel_conformer.pt
 MODEL=/scratch/mk8347/data/acr_newmodel.model
 DEDUPE=${DEDUPE:-0.01}
 TARGET_ROWS=${TARGET_ROWS:-400000}
-PC_MIN=${PC_MIN:-0}   # packing-coefficient floor on anchors and walk states (0: none)
+PC_MIN=${PC_MIN:-0.55}   # packing coefficient kept: the range the trainer's density penalty leaves unpenalised
+PC_MAX=${PC_MAX:-0.95}
 OUTTAG=${OUTTAG:-}    # appended to the output name, e.g. _pc062
 
 OUT=${SYS}/${NAME}_pooled_oct03${OUTTAG}_prior.pt
@@ -42,7 +43,7 @@ srun singularity exec --nv     --overlay ${OVERLAY}:ro     --bind ${PROJECT_ROOT
         source /ext3/env.sh
         export PYTHONPATH=${MXT_ROOT}:${PROJECT_ROOT}/gfn-diffusion:${PYLIBS}:\$PYTHONPATH
         python -u -m data_processing.pool_assemble_mace ${SYS}/anchors.pt ${SYS}/flood ${OUT} --sg 14 --mol ${MOL} \
-            --mlip_path ${MODEL} --dedupe ${DEDUPE} --target-rows ${TARGET_ROWS} --pc-min ${PC_MIN}
+            --mlip_path ${MODEL} --dedupe ${DEDUPE} --target-rows ${TARGET_ROWS} --pc-min ${PC_MIN} --pc-max ${PC_MAX}
     "
 RC=$?
 echo "JOB ${SLURM_JOB_ID} status=${RC} end=$(date -Is)"
