@@ -19,8 +19,8 @@ Steps
   4. write {'prior': batch, 'equalized_prior': the same batch, 'thermal_scaling_factor', ['uma_energy_state']} plus
      provenance (source row, image id, anchor flag). Energies are stored in the file's raw currency under --key (eLJ:
      the flood's training-currency energy divided by the anchors file's thermal_scaling_factor).
-  5. every row is passed through the trainer latent and back, so a row outside the latent box is stored clipped (the
-     way the trainer reads it) and re-scored; cached space-group lookup fields are dropped from the rows.
+  5. a kept state outside the trainer latent box (its cell parameters change on a pass through the latent and back)
+     is left out before folding, with all its images; cached space-group lookup fields are dropped from the rows.
   6. check: --check rows drawn at random are re-scored the trainer's way against their stored energy (all asserted).
 """
 import argparse
@@ -164,6 +164,19 @@ def main(argv=None):
         from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
         ch.device, ch.predictor = 'cuda', init_uma_crystal_predictor(a.mlip_path, device='cuda')
     base = rows_on(anchors, cp[kept])
+    # The trainer scores a row from its 12 latents, so a state outside the latent box (a long reduced-cell axis) would
+    # be read clipped, as a different crystal. Such states are left out, before folding, so every image goes with them
+    # (owner 2026-10-05: filter, do not clip).
+    rt = base.clone()
+    rt.latent_to_cell_params(rt.latent_params())
+    outside = (rt.full_cell_parameters().double() - base.full_cell_parameters().double()).abs().amax(1) > 1e-3
+    del rt
+    n_outside = int(outside.sum())
+    if n_outside:
+        print(f'latent box: {n_outside} kept states lie outside it and are left out '
+              f'({int((outside & is_anchor[kept]).sum())} of them anchors)', flush=True)
+        kept = kept[~outside]
+        base = rows_on(anchors, cp[kept])
     ch.setup(base)
     if a.no_fold:
         out, source, image = base, torch.arange(len(kept)), torch.zeros(len(kept), dtype=torch.long)
@@ -177,17 +190,6 @@ def main(argv=None):
             out = out.append_batch(p)
         source, image = torch.cat(srcs), torch.cat(iids)
     e_out = E[kept][source].clone()
-    # The trainer scores a row from its 12 latents, so a row outside the latent box (a long reduced-cell axis) is read
-    # clipped, as a different crystal. Store every row the way it will be read, and re-score the rows that moved.
-    cp_before = out.full_cell_parameters().double()
-    out.latent_to_cell_params(out.latent_params())
-    out.box_analysis()
-    clipped = torch.nonzero((out.full_cell_parameters().double() - cp_before).abs().amax(1) > 1e-3).flatten()
-    if len(clipped):
-        e_c, _ = ch.read(out.subsample_new_batch(clipped))
-        print(f'latent box: {len(clipped)} rows stored clipped; energy change median '
-              f'{float((e_c - e_out[clipped]).median()):+.3f}, max {float((e_c - e_out[clipped]).max()):+.3f}', flush=True)
-        e_out[clipped] = e_c
     setattr(out, a.key, e_out.float())
     hand = set(out.aunit_handedness.flatten().tolist())
     assert hand == {1.0}, hand
@@ -213,7 +215,7 @@ def main(argv=None):
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': src.get('thermal_scaling_factor', 1),
             'source_row': kept[source], 'image_id': image, 'is_anchor': is_anchor[kept][source],
             'n_anchors_in': len(cpA), 'n_flood_in': len(cpF), 'dedupe': a.dedupe, 'flood_radius': r_flood,
-            'folded': not a.no_fold, 'clipped_rows': clipped,
+            'folded': not a.no_fold, 'out_of_box_states_dropped': n_outside,
             'anchors_file': os.path.abspath(a.anchors), 'flood_dir': os.path.abspath(a.flood_dir)}
     if 'uma_energy_state' in src:
         blob['uma_energy_state'] = src['uma_energy_state']

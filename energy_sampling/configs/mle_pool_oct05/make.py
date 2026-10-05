@@ -15,8 +15,11 @@ burn-in, batch policy, eval, archives, terminal MLE stage, DPLR off, fresh weigh
 
 Not acridine: its pooled prior is the pool_acr_oct03 battery's.
 
-NOTE ON START-UP: train.py re-scores every prior row at init. The UMA files hold 263,072 (mipu) and 335,288 (nehu)
+NOTE ON START-UP: train.py re-scores every prior row at init. The UMA files hold 263,072 (mipu) and 335,184 (nehu)
 rows, so those two arms spend their first minutes to an hour in that scan.
+
+OUT-OF-BOX STATES: kept states outside the trainer latent box were filtered from the files, all images (owner
+2026-10-05): 176 states from neh, 13 from nehu, none from mip / mipu.
 """
 import copy
 import importlib.util
@@ -44,8 +47,8 @@ BATTERY = 'mle_pool_oct05'
 PRIORS = {
     'mip':  ('mipcas_elj_pooled_oct02_prior.pt', 202_920_467, 263_172),
     'mipu': ('mipcas_uma_pooled_oct02_prior.pt', 202_843_795, 263_072),
-    'neh':  ('nehzor_elj_pooled_oct02_prior.pt', 351_192_365, 292_152),
-    'nehu': ('nehzor_uma_pooled_oct02_prior.pt', 403_032_045, 335_288),
+    'neh':  ('nehzor_elj_pooled_oct02_prior.pt', 347_162_695, 290_744),
+    'nehu': ('nehzor_uma_pooled_oct02_prior.pt', 400_224_711, 335_184),
 }
 
 
