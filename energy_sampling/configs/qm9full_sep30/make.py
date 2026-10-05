@@ -103,8 +103,41 @@ THE SEED (final_sep19's job script, SEED_B): leg 1's newest 5000-step archive, o
 Each arm resolves it at its own first launch, so the arms share a seed only if leg 1 is not writing meanwhile:
 cancel it first. A resubmission resumes the arm's own _running.pt in full.
 
+LEG D, CONTINUATION (`python configs/qm9full_sep30/make.py cont`; owner 2026-10-05, the leg-b and leg-c arms stopped
+by hand near steps 110,000 and 72,000: "we should no matter [what] submit a couple of continuation jobs ... Pb and
+forward forces and higher LR looked good"). INDEX_d rows, in the order to submit them in:
+  [0] qf30_fwdF_lr5    the leg-b arm itself, resumed from its own _running.pt (its committed file, untouched)
+  [1] qf30_fwdF_lr10   qf30_fwdF_lr5 continued at twice the rate (1.25e-4)
+  [2] qf30_fwdF_k5m    qf30_fwdF_lr5 continued with the forward force reaching the last 5 steps
+                       (path_grad_last_k 5 = 0.1 time units at T 50; 1 step is 0.02), through the steps' means only
+                       (path_grad_scale 0: the sampled log-variances are detached)
+  [3] qf30_fwdF_k5     the same reach with the scale channel live, as the 1-step force ran (path_grad_scale 1)
+  [4] qf30_upb_lr5     the leg-c arm itself (P_B trainable), resumed from its own _running.pt
+  [5] qf30_upb_lr10    qf30_upb_lr5 continued at twice the rate
+ROWS BUILT AND NOT SHIPPED (local runs 2026-10-05 on a 300-molecule prior at batch 200, each a full load from one
+step-900 archive of a qf30_fwdF_lr5-shaped run in cruise at scale 0.5, 150 steps): four times the rate ended
+UNRECOVERABLE after 4 rewinds in 56 steps, and twice the rate with the 5-step force took 3 rewinds in 150 steps;
+twice the rate alone, and the 5-step force alone in both forms, took none. Step time there: 1.20 s with the 1-step
+force, 1.37 s with 5 steps through the means, 1.80 s with 5 steps and the scale channel live.
+A CONTINUED ARM IS A NEW RUN NAME LOADED IN FULL from the arm it continues (load_weights_only false): weights, the
+P_B snapshot, optimizers, step count, the per-condition Z table, the buffers and the controller's state, so it opens
+inside var_conditioning at the source's step and no on_enter action runs again. It differs from its source in the
+named keys and no others (asserted leaf by leaf):
+  - THE RATE MOVES THROUGH lr_control.seed_lr, NOT fixed_scale. The controller's scale is restored from the checkpoint
+    (0.5 in both sources, in cruise) and fixed_scale is read once, when burn-in ends (TWO LEGS above), so a new
+    fixed_scale would be inert. The applied rate is base x scale (controller.py, _apply_lrs) and the base is this
+    config's seed_lr (lr_fused auto), so seed_lr 2.5e-4 under the restored 0.5 trains at 1.25e-4. fixed_scale stays
+    0.5, which keeps the pair consistent should the controller ever reopen.
+  - the force's reach is the stage's forward path_grad_last_k and its scale channel the stage's forward
+    path_grad_scale; loss coefficients are always read from the config.
+The first launch of a continued arm seeds from its source's NEWEST STEP ARCHIVE and that archive's frozen buffers
+(steps 100,000 and 70,000), never the source's _running.pt: rows 0 and 4 resume those runs and rewrite it. So do not
+pass SRC_RUNNING to this leg. A resubmission resumes the arm's own _running.pt. Rows 0 and 4 name no seed ('-'): a
+row whose own _running.pt is missing fails at the seed lookup instead of starting phase 2 again from phase 1.
+
     python configs/qm9full_sep30/make.py p1
     python configs/qm9full_sep30/make.py arms [--dry]      # legs b and c
+    python configs/qm9full_sep30/make.py cont [--dry]      # leg d
 """
 import copy
 import importlib.util
@@ -188,6 +221,17 @@ ANCHOR_MAX = 2_500_000
 # (lr_control.fixed_scale, fire_cut_factor, hard_failure.loss_excursion_k, epochs, anchor_buffer.max_size) of the recipe
 RECIPE_IS = (0.5, 0.5, 1.0e6, 200_000, 200_000)
 WO_PLACEHOLDER = 'WEIGHTS_ONLY_PLACEHOLDER'
+# leg d: (run_name, the run it continues or None for a run resumed as itself, multiple of the source's rate, the
+# forward force's reach in steps, whether the force's scale channel is live). ROW ORDER IS THE ARRAY INDEX: append only.
+CONT = (('fwdF_lr5', None, 1, 1, True),
+        ('fwdF_lr10', 'fwdF_lr5', 2, 1, True),
+        ('fwdF_k5m', 'fwdF_lr5', 1, 5, False),
+        ('fwdF_k5', 'fwdF_lr5', 1, 5, True),
+        ('upb_lr5', None, 1, 1, True),
+        ('upb_lr10', 'upb_lr5', 2, 1, True))
+CONT_SCALE = 0.5        # the controller scale both sources carry in their checkpoints (their fixed_scale)
+CONT_REACH_MAX = 0.3    # time units: the longest reach of the forward force a continued arm may take (k / T)
+NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run: matches no checkpoint file
 FROM_P1 = ('prior_path', 'molecules_path', 'test_molecules_path', 'checkpoints_dir', 'model', 'integrator', 'eval_T',
            'compile_policy', 'cuda_memory_fraction', 'test_eval_num_samples')
 STUB_EXIT = [{'metric': 'bwd/mle', 'above': -1e9, 'patience': 1}]
@@ -478,6 +522,123 @@ def _vet(cfg, name, z):
     return cfg
 
 
+def build_cont(run, source, rate, reach, scale_live=True):
+    """A leg-b or leg-c arm continued under a new name, loaded in full from that arm (the module docstring, LEG D)."""
+    cfg = copy.deepcopy(source)
+    cfg['run_name'] = run
+    cfg['load_weights_only'] = False    # a literal: the job script's weights-only substitution passes it by
+    cfg['lr_control']['seed_lr'] = SEED_LR * rate
+    fwd = cfg['protocols'][PROTOCOL]['stages'][1]['loss_coeffs']['fwd']
+    fwd['path_grad_last_k'] = reach
+    fwd['path_grad_scale'] = 1 if scale_live else 0
+    return cfg
+
+
+def check_cont(cfg, name, source, source_name, rate, reach, scale_live):
+    lc, src_lc = cfg['lr_control'], source['lr_control']
+    # the rate: base x the scale the checkpoint restores; nothing else in the controller's block moves
+    assert lc['mode'] == 'fixed' and cfg['lr_fused'] == 'auto' and cfg.get('max_lr') is None, name
+    assert src_lc['seed_lr'] == SEED_LR and src_lc['fixed_scale'] == CONT_SCALE == lc['fixed_scale'], name
+    assert lc['seed_lr'] == SEED_LR * rate and rate >= 1, (name, lc['seed_lr'])
+    assert lc['fire_cut_factor'] == P2_FIRE_CUT and lc['hard_failure']['loss_excursion_k'] == RECIPE_IS[2], name
+    # a full load into the source's own stage, with its buffers
+    assert cfg['checkpoint_name'] == fin.PLACEHOLDER and cfg['load_weights_only'] is False, name
+    assert cfg['continue_from_checkpoint'] is False and cfg['prior_model_name'] == fin.PRIOR_PLACEHOLDER, name
+    assert not cfg['buffers'].get('fresh_on_switch'), f'{name}: the source buffers must be restored'
+    mine, theirs = w3.problem_def(cfg), w3.problem_def(source)
+    assert mine == theirs, f'{name}: problem identity differs from {source_name}; its checkpoint would be refused'
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in st] == STAGES, name
+    assert st[1]['on_enter'] == source['protocols'][PROTOCOL]['stages'][1]['on_enter'], name
+    fwd = st[1]['loss_coeffs']['fwd']
+    assert fwd['reward_grads'] == 1.0 and fwd['path_grad_last_k'] == reach >= 1, (name, fwd)
+    assert source['protocols'][PROTOCOL]['stages'][1]['loss_coeffs']['fwd']['path_grad_scale'] == 1, source_name
+    assert fwd['path_grad_scale'] == (1 if scale_live else 0), (name, fwd)
+    # the two rows the 2026-10-05 smoke runs lost (the module docstring): no rate above twice the source's, and
+    # no longer reach at a raised rate
+    assert rate <= 2 and not (rate > 1 and reach > 1), f'{name}: rate x{rate} with reach {reach} diverged in the smoke'
+    assert reach / cfg['integrator']['T'] <= CONT_REACH_MAX, f'{name}: the force reaches past {CONT_REACH_MAX} time units'
+    assert (cfg['epochs'], cfg['archive_period'], cfg['archive_buffers']) == (P2_EPOCHS, P2_ARCHIVE, True), name
+    # the source with the named leaves moved: all of them, and no others
+    allowed = ['load_weights_only'] + (['lr_control.seed_lr'] if rate != 1 else []) + \
+              ([f'{VC}.loss_coeffs.fwd.path_grad_last_k'] if reach != 1 else []) + \
+              ([] if scale_live else [f'{VC}.loss_coeffs.fwd.path_grad_scale'])
+    assert _moved(source, cfg) == sorted(allowed), (name, _moved(source, cfg))
+    w3._scan_local_paths(cfg, name)
+    fin.load_check(copy.deepcopy(cfg), name, STAGES)
+    assert not _baseline_notices(cfg), (name, [str(v) for v in _baseline_notices(cfg)])
+
+
+def main_cont(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+
+    def committed(run):
+        """A leg-b or leg-c arm as it ran: the committed file, which must be the one on disk."""
+        name = f'{TAG}_{run}'
+        text = w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{name}.yaml'], HERE)
+        cfg = yaml.safe_load(text)
+        on_disk = yaml.safe_load((HERE / f'{name}.yaml').read_text(encoding='utf-8'))
+        assert on_disk == cfg, f'{name}.yaml is not the committed file'
+        return cfg
+
+    ran = {f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
+    rows, new = [], {}
+    for run, src, rate, reach, scale_live in CONT:
+        name = f'{TAG}_{run}'
+        if src is None:
+            # resumed as itself: its committed file is the config, and its own _running.pt the only start
+            assert name in ran and (rate, reach, scale_live) == (1, 1, True), name
+            cfg = committed(run)
+            assert cfg['load_weights_only'] == WO_PLACEHOLDER and cfg['lr_control']['fixed_scale'] == CONT_SCALE, name
+            probe = copy.deepcopy(cfg)
+            probe['load_weights_only'] = False      # what the job script resolves on a resubmission
+            fin.load_check(probe, name, STAGES)
+            rows.append((name, 'qm9full', 'resume', NO_SEED, PRIOR, str(prior_bytes)))
+            continue
+        source_name = f'{TAG}_{src}'
+        assert source_name in ran and name not in ran, name
+        source = committed(src)
+        cfg = build_cont(run, source, rate, reach, scale_live)
+        check_cont(cfg, name, source, source_name, rate, reach, scale_live)
+        new[name] = cfg
+        rows.append((name, 'qm9full', 'continued', source_name, PRIOR, str(prior_bytes)))
+    # the job script finds an arm's files, and its source's, by `*<arm>_*`: no name may match another's
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    print(f'leg d, continuation (INDEX_d row = array index). A continued arm loads its source in full and trains at '
+          f'seed_lr x the restored scale {CONT_SCALE:g}:')
+    for i, (run, src, rate, reach, scale_live) in enumerate(CONT):
+        if src is None:
+            print(f'[{i}] {TAG}_{run:<12} resumed from its own _running.pt, unchanged')
+        else:
+            print(f'[{i}] {TAG}_{run:<12} {TAG}_{src} continued | rate {SEED_LR * rate * CONT_SCALE:.3g} (seed_lr '
+                  f'{SEED_LR * rate:.3g}) | forward force over the last {reach} step{"s" if reach > 1 else ""} '
+                  f'({reach / T:g} time units), {"means and scales" if scale_live else "means only"}')
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    fin._write_index(HERE / 'INDEX_d.tsv', rows)
+    with (HERE / f'submit_{BATTERY}_d.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(fin.SBATCH.format(
+            wall=fin.WALL, last=len(rows) - 1, tag=TAG + 'd', battery=BATTERY, leg='d', ckpts=w3.CLUSTER_CKPTS,
+            data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+            what=f'continuation of the stopped leg-b and leg-c arms. A "resume" row continues its own _running.pt; a '
+                 f'"continued" row is a new run name loaded IN FULL (weights, optimizers, Z table, buffers) from its '
+                 f"warm_src arm's newest step archive on a first launch, and resumes itself afterwards. DO NOT PASS "
+                 f'SRC_RUNNING: the resume rows rewrite those files (make.py, LEG D).'))
+    print(f'wrote {len(new)} continued arms with INDEX_d.tsv ({len(rows)} rows) and submit_{BATTERY}_d.sbatch')
+    print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
 def main_arms(argv):
     dry = '--dry' in argv
     dirty = w3.dirty_files()
@@ -556,6 +717,8 @@ def main(argv):
         return main_p1(argv)
     if argv[:1] == ['arms']:
         return main_arms(argv)
+    if argv[:1] == ['cont']:
+        return main_cont(argv)
     sys.exit(__doc__)
 
 
