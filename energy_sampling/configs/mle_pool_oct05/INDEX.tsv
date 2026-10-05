@@ -1,0 +1,5 @@
+arm	family	start	warm_src	prior	prior_bytes
+mlepl_mip_lr2	mip	fresh	-	mipcas_elj_pooled_oct02_prior.pt	202920467
+mlepl_mipu_lr2	mipu	fresh	-	mipcas_uma_pooled_oct02_prior.pt	202843795
+mlepl_neh_lr2	neh	fresh	-	nehzor_elj_pooled_oct02_prior.pt	351192365
+mlepl_nehu_lr2	nehu	fresh	-	nehzor_uma_pooled_oct02_prior.pt	403032045

@@ -19,7 +19,9 @@ Steps
   4. write {'prior': batch, 'equalized_prior': the same batch, 'thermal_scaling_factor', ['uma_energy_state']} plus
      provenance (source row, image id, anchor flag). Energies are stored in the file's raw currency under --key (eLJ:
      the flood's training-currency energy divided by the anchors file's thermal_scaling_factor).
-  5. check: --check rows drawn at random are re-scored the trainer's way against their stored energy (all asserted).
+  5. every row is passed through the trainer latent and back, so a row outside the latent box is stored clipped (the
+     way the trainer reads it) and re-scored; cached space-group lookup fields are dropped from the rows.
+  6. check: --check rows drawn at random are re-scored the trainer's way against their stored energy (all asserted).
 """
 import argparse
 import glob
@@ -32,6 +34,8 @@ import torch
 from data_processing.pool_anchors import Chart
 
 PHI, RMAG = 10, 11
+#: buffer._LAZY_SG_CACHES plus free_axis_lut, which the trainer does not strip at load
+LAZY_CACHES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
 
 
 def periodic_dims(sg):
@@ -172,7 +176,18 @@ def main(argv=None):
         for p in parts[1:]:
             out = out.append_batch(p)
         source, image = torch.cat(srcs), torch.cat(iids)
-    e_out = E[kept][source]
+    e_out = E[kept][source].clone()
+    # The trainer scores a row from its 12 latents, so a row outside the latent box (a long reduced-cell axis) is read
+    # clipped, as a different crystal. Store every row the way it will be read, and re-score the rows that moved.
+    cp_before = out.full_cell_parameters().double()
+    out.latent_to_cell_params(out.latent_params())
+    out.box_analysis()
+    clipped = torch.nonzero((out.full_cell_parameters().double() - cp_before).abs().amax(1) > 1e-3).flatten()
+    if len(clipped):
+        e_c, _ = ch.read(out.subsample_new_batch(clipped))
+        print(f'latent box: {len(clipped)} rows stored clipped; energy change median '
+              f'{float((e_c - e_out[clipped]).median()):+.3f}, max {float((e_c - e_out[clipped]).max()):+.3f}', flush=True)
+        e_out[clipped] = e_c
     setattr(out, a.key, e_out.float())
     hand = set(out.aunit_handedness.flatten().tolist())
     assert hand == {1.0}, hand
@@ -198,10 +213,13 @@ def main(argv=None):
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': src.get('thermal_scaling_factor', 1),
             'source_row': kept[source], 'image_id': image, 'is_anchor': is_anchor[kept][source],
             'n_anchors_in': len(cpA), 'n_flood_in': len(cpF), 'dedupe': a.dedupe, 'flood_radius': r_flood,
-            'folded': not a.no_fold,
+            'folded': not a.no_fold, 'clipped_rows': clipped,
             'anchors_file': os.path.abspath(a.anchors), 'flood_dir': os.path.abspath(a.flood_dir)}
     if 'uma_energy_state' in src:
         blob['uma_energy_state'] = src['uma_energy_state']
+    for k in LAZY_CACHES:  # last, since any analysis rebuilds them; a stored copy breaks key parity with trainer batches
+        if k in out.keys():
+            delattr(out, k)
     torch.save(blob, a.out)
     print(f'wrote {a.out} ({os.path.getsize(a.out) / 2 ** 20:.0f} MiB, {time.time() - t0:.0f} s)')
 
