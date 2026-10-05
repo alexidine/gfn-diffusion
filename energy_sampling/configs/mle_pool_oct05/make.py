@@ -15,11 +15,15 @@ burn-in, batch policy, eval, archives, terminal MLE stage, DPLR off, fresh weigh
 
 Not acridine: its pooled prior is the pool_acr_oct03 battery's.
 
-NOTE ON START-UP: train.py re-scores every prior row at init. The UMA files hold 263,072 (mipu) and 335,184 (nehu)
+NOTE ON START-UP: train.py re-scores every prior row at init. The UMA files hold 263,060 (mipu) and 334,968 (nehu)
 rows, so those two arms spend their first minutes to an hour in that scan.
 
 OUT-OF-BOX STATES: kept states outside the trainer latent box were filtered from the files, all images (owner
 2026-10-05): 176 states from neh, 13 from nehu, none from mip / mipu.
+
+DENSITY: states the trainer's density penalty touches (energies.molecular_crystal.density_penalty > 0, i.e. a packing
+coefficient below 0.55 or above 0.95) were filtered from the files, all images (owner 2026-10-05): 3 states from mipu,
+109 from neh, 27 from nehu, none from mip; every one was below 0.55.
 """
 import copy
 import importlib.util
@@ -45,10 +49,10 @@ TAG = 'mlepl'
 BATTERY = 'mle_pool_oct05'
 #: family -> (prior file, its size in bytes on the cluster, its row count)
 PRIORS = {
-    'mip':  ('mipcas_elj_pooled_oct02_prior.pt', 202_920_467, 263_172),
-    'mipu': ('mipcas_uma_pooled_oct02_prior.pt', 202_843_795, 263_072),
-    'neh':  ('nehzor_elj_pooled_oct02_prior.pt', 347_162_695, 290_744),
-    'nehu': ('nehzor_uma_pooled_oct02_prior.pt', 400_224_711, 335_184),
+    'mip':  ('mipcas_elj_pooled_oct02_prior.pt', 200_815_040, 263_172),
+    'mipu': ('mipcas_uma_pooled_oct02_prior.pt', 200_729_472, 263_060),
+    'neh':  ('nehzor_elj_pooled_oct02_prior.pt', 346_122_055, 289_872),
+    'nehu': ('nehzor_uma_pooled_oct02_prior.pt', 399_966_599, 334_968),
 }
 
 

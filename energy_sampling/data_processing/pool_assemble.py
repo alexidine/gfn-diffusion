@@ -20,7 +20,8 @@ Steps
      provenance (source row, image id, anchor flag). Energies are stored in the file's raw currency under --key (eLJ:
      the flood's training-currency energy divided by the anchors file's thermal_scaling_factor).
   5. a kept state outside the trainer latent box (its cell parameters change on a pass through the latent and back)
-     is left out before folding, with all its images; cached space-group lookup fields are dropped from the rows.
+     is left out before folding, with all its images; so is a state the trainer's density penalty touches
+     (energies.molecular_crystal.density_penalty > 0); cached space-group lookup fields are dropped from the rows.
   6. check: --check rows drawn at random are re-scored the trainer's way against their stored energy (all asserted).
 """
 import argparse
@@ -177,6 +178,18 @@ def main(argv=None):
               f'({int((outside & is_anchor[kept]).sum())} of them anchors)', flush=True)
         kept = kept[~outside]
         base = rows_on(anchors, cp[kept])
+    # The density bounds are the trainer's own: a state its density penalty touches (packing coefficient outside the
+    # zero region of energies.molecular_crystal.density_penalty) is left out, with all its images (owner 2026-10-05).
+    from energies.molecular_crystal import density_penalty
+    pc = base.packing_coeff.double().flatten()
+    off_density = density_penalty(pc) > 0
+    n_density = int(off_density.sum())
+    if n_density:
+        print(f'density: {n_density} kept states carry a density penalty and are left out (packing coefficient '
+              f'{float(pc[off_density].min()):.3f} .. {float(pc[off_density].max()):.3f}; '
+              f'{int((off_density & is_anchor[kept]).sum())} of them anchors)', flush=True)
+        kept = kept[~off_density]
+        base = rows_on(anchors, cp[kept])
     ch.setup(base)
     if a.no_fold:
         out, source, image = base, torch.arange(len(kept)), torch.zeros(len(kept), dtype=torch.long)
@@ -215,7 +228,7 @@ def main(argv=None):
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': src.get('thermal_scaling_factor', 1),
             'source_row': kept[source], 'image_id': image, 'is_anchor': is_anchor[kept][source],
             'n_anchors_in': len(cpA), 'n_flood_in': len(cpF), 'dedupe': a.dedupe, 'flood_radius': r_flood,
-            'folded': not a.no_fold, 'out_of_box_states_dropped': n_outside,
+            'folded': not a.no_fold, 'out_of_box_states_dropped': n_outside, 'density_states_dropped': n_density,
             'anchors_file': os.path.abspath(a.anchors), 'flood_dir': os.path.abspath(a.flood_dir)}
     if 'uma_energy_state' in src:
         blob['uma_energy_state'] = src['uma_energy_state']
