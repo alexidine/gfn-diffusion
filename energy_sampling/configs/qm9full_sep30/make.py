@@ -173,6 +173,25 @@ against its own target on this run's rollout states); train_step_time.
     python configs/qm9full_sep30/make.py cont [--dry]      # leg d
     python configs/qm9full_sep30/make.py cmle [--dry]      # leg e
     python configs/qm9full_sep30/make.py force [--dry]     # leg f
+    python configs/qm9full_sep30/make.py mleb [--dry]      # leg g
+
+LEG G, CONDITIONAL MLE OVER BATCH AND RATE (`python configs/qm9full_sep30/make.py mleb`; owner 2026-10-06: "MLE is
+quite well-behaved and cheap. I wonder if we could get away with huge batches and larger LR, to accelerate
+convergence"). Leg e's qf30_cmle_seed crossed the TB leader's excess at step 20,000 and ran at 2.5e-4 and batch 1000
+with no rewind. Leg g is that arm with P_B frozen from the start, the batch pinned, and the two factors crossed:
+  [0] qf30_cmf_b1k_lr20  batch 1000, 2.5e-4: the control (leg e's arm with P_B frozen and the batch pinned)
+  [1] qf30_cmf_b1k_lr80  batch 1000, 1e-3
+  [2] qf30_cmf_b4k_lr20  batch 4000, 2.5e-4
+  [3] qf30_cmf_b4k_lr80  batch 4000, 1e-3: four times the rows a step at the same step size a row
+P_B FROZEN (freeze_backward_policy true: a snapshot of the seed's P_B, taken at start-up) because the batch is bound
+by memory: at batch 1000 the training step peaked at 32.5 GB with P_B live (qf30_cmle_seed) and 16.4 GB with it
+frozen (qf30_cmle_lead), which also ran 0.70 s a step against 0.98, and the two sat on one excess curve at equal
+steps. THE BATCH IS PINNED (grow_batch_size false, max_batch_size the batch, batch_util_target 0): leg e carries the
+occupancy sizer, which held its base rung. With growth off an out-of-memory cut is not regrown, so an arm that does
+not fit runs on at a smaller batch: Batch Size and batch/oom_events say so. The rate is lr_control.fixed_scale, read
+at the end of burn-in on these weights-only starts (2 and 8 on seed_lr 1.25e-4). Same seed as leg e: qf30_p1lr2's
+step-45,000 archive, weights only on a first launch, full resume afterwards; no exit, stopped by hand. Compare at
+equal steps, at equal rows seen and at equal wall clock.
 """
 import copy
 import importlib.util
@@ -272,6 +291,10 @@ NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run:
 SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
 # leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
 CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
+# leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
+MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr80', 1000, 8.0),
+        ('cmf_b4k_lr20', 4000, 2.0), ('cmf_b4k_lr80', 4000, 8.0))
+MLEB_BASE = 'cmle_seed'     # the leg-e arm leg g is built from
 # leg f: (run_name, the run it continues, the starting value of P_F's force gate or None for no force term). ROW
 # ORDER IS THE ARRAY INDEX: append only.
 FORCE = (('frc_ctl', 'fwdF_lr5', None), ('frc_g0', 'fwdF_lr5', 0.0), ('frc_g1', 'fwdF_lr5', 0.1))
@@ -926,6 +949,99 @@ def main_cmle(argv):
     print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
 
 
+def build_mleb(run, base, batch, scale):
+    """Leg e's conditional-MLE arm with P_B frozen from start-up, the batch pinned at `batch` and the rate at
+    `scale` x seed_lr (the module docstring, LEG G)."""
+    cfg = copy.deepcopy(base)
+    cfg['run_name'] = run
+    cfg['freeze_backward_policy'] = True
+    cfg.update(batch_size=batch, max_batch_size=batch, grow_batch_size=False, batch_util_target=0.0)
+    cfg['lr_control']['fixed_scale'] = scale
+    return cfg
+
+
+def check_mleb(cfg, name, base, p1, batch, scale):
+    lc = cfg['lr_control']
+    assert lc['mode'] == 'fixed' and lc['seed_lr'] == SEED_LR and lc['fixed_scale'] == scale, name
+    assert cfg['lr_back'] == 'auto' and cfg.get('max_lr') is None, name     # the rate train_prior steps, unrailed
+    assert _guard(cfg) == HOT_GUARD and scale > lc['burn_in_scale'], (name, _guard(cfg))
+    assert (cfg['batch_size'], cfg['max_batch_size'], cfg['grow_batch_size'], cfg['batch_util_target']) == \
+        (batch, batch, False, 0.0), name
+    # at or above the accumulation floor every step is one plain optimizer step (batch-size.md)
+    assert batch >= cfg['fused_grad_accum_min_samples'], name
+    assert cfg['freeze_backward_policy'] is True and cfg['model']['learn_pb'] is True, name
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in st] == ['train_prior'] and st[0]['flags']['scramble_conditions'] is False, name
+    assert st[0]['train_mode'] == 'bwd' and st[0]['bwd_sampling_mode'] == 'dataset', name
+    assert w3.problem_def(cfg) == w3.problem_def(p1), f'{name}: problem identity differs from the seed leg'
+    assert cfg['checkpoint_name'] == fin.PLACEHOLDER and cfg['load_weights_only'] == WO_PLACEHOLDER, name
+    moved = _moved(base, cfg)
+    want = sorted(['freeze_backward_policy', 'grow_batch_size', 'max_batch_size', 'batch_util_target']
+                  + (['batch_size'] if batch != base['batch_size'] else [])
+                  + (['lr_control.fixed_scale'] if scale != base['lr_control']['fixed_scale'] else []))
+    assert moved == want, (name, moved)
+    w3._scan_local_paths(cfg, name)
+    for weights_only in (True, False):  # the first launch and a resubmission
+        fin.load_check(dict(copy.deepcopy(cfg), load_weights_only=weights_only), name, ['train_prior'])
+
+
+def main_mleb(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+
+    def committed(run):
+        name = f'{TAG}_{run}'
+        cfg = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{name}.yaml'], HERE))
+        on_disk = yaml.safe_load((HERE / f'{name}.yaml').read_text(encoding='utf-8'))
+        assert on_disk == cfg, f'{name}.yaml is not the committed file'
+        return cfg
+
+    base, p1 = committed(MLEB_BASE), committed(SEED_LEG)
+    seed = dict(CMLE)[MLEB_BASE]
+    assert seed == SEED_LEG and base['batch_size'] == 1000 and base['lr_control']['fixed_scale'] == 2.0, MLEB_BASE
+    assert len({(b, s) for _, b, s in MLEB}) == len(MLEB) and MLEB[0][1:] == (1000, 2.0), 'row 0 is the control'
+    rows, new = [], {}
+    for run, batch, scale in MLEB:
+        name = f'{TAG}_{run}'
+        cfg = build_mleb(run, base, batch, scale)
+        check_mleb(cfg, name, base, p1, batch, scale)
+        new[name] = cfg
+        rows.append((name, 'qm9full', 'weights', f'{TAG}_{seed}', PRIOR, str(prior_bytes), str(SEED_STEP[seed])))
+    ran = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + [f'{TAG}_{run}' for run, *_ in ARMS] + \
+          [f'{TAG}_{run}' for run, _ in LIVE_PB] + [f'{TAG}_{run}' for run, src, *_ in CONT if src is not None] + \
+          [f'{TAG}_{run}' for run, _ in CMLE] + [f'{TAG}_{run}' for run, *_ in FORCE]
+    names = ran + list(new)
+    assert len(set(names)) == len(names), names
+    # the job script finds an arm's files, and its source's, by `*<arm>_*`: no name may match another's
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    print(f'leg g, conditional MLE over batch and rate (INDEX_g row = array index): {TAG}_{MLEB_BASE} with P_B frozen '
+          f'and the batch pinned, weights of {TAG}_{seed} at step {SEED_STEP[seed]:,}:')
+    for i, (run, batch, scale) in enumerate(MLEB):
+        print(f'[{i}] {TAG}_{run:<13} batch {batch:>5,} | rate {scale * SEED_LR:g} (fixed_scale {scale:g}) | '
+              f'{1_212_915 / batch:,.0f} steps a pass over the prior rows')
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    _write_index_pinned(HERE / 'INDEX_g.tsv', rows)
+    with (HERE / f'submit_{BATTERY}_g.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(_pinned_sbatch(
+            wall=fin.WALL, last=len(rows) - 1, tag=TAG + 'g', battery=BATTERY, leg='g', ckpts=w3.CLUSTER_CKPTS,
+            data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+            what=f'conditional MLE over batch size and rate, P_B frozen: {TAG}_{MLEB_BASE} with the batch pinned, '
+                 f'weights-only first launch from the src_step archive of the warm_src arm, full resume afterwards; '
+                 f'stopped by hand. With growth off an out-of-memory cut stands: read Batch Size (make.py, LEG G).'))
+    print(f'wrote {len(new)} arms with INDEX_g.tsv and submit_{BATTERY}_g.sbatch')
+    print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
 def main_arms(argv):
     dry = '--dry' in argv
     dirty = w3.dirty_files()
@@ -1008,6 +1124,8 @@ def main(argv):
         return main_cont(argv)
     if argv[:1] == ['cmle']:
         return main_cmle(argv)
+    if argv[:1] == ['mleb']:
+        return main_mleb(argv)
     if argv[:1] == ['force']:
         return main_force(argv)
     sys.exit(__doc__)
