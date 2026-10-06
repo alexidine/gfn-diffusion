@@ -80,6 +80,10 @@ def parse():
     ap.add_argument('--conditions', default=r'D:/crystal_datasets/conditional/priors/qm9full_conditions.pt')
     ap.add_argument('--test-conditions', default=r'D:/crystal_datasets/conditional/priors/qm9full_test_conditions.pt')
     ap.add_argument('--train-molecules', type=int, default=0, help='use only this many training molecules (0 = all)')
+    ap.add_argument('--holdout-rows', type=int, default=0,
+                    help='hold this many rows of --conditions out of training (a seeded draw) and score them as the '
+                         'held-out split, in place of --test-conditions: for a prior of ONE molecule, where the '
+                         'held-out set is crystals, not molecules')
     ap.add_argument('--eval-molecules', type=int, default=512, help='molecules per split scored at each evaluation')
     ap.add_argument('--steps', type=int, default=2000)
     ap.add_argument('--batch', type=int, default=128)
@@ -429,10 +433,24 @@ def main():
     vdw = torch.tensor(list(VDW_RADII.values()), device=dev)
 
     train = load_split(a.conditions, a.train_molecules, a.seed, a.split_key)
-    test = load_split(a.test_conditions, 0, a.seed)
     mults = torch.tensor([float(v) for v in a.noise_scales.split(',')])
-    train_eval = train.subsample_new_batch(torch.arange(min(a.eval_molecules, train.num_graphs)))
-    print(f"[pretrain] arm {a.arm} ({stem}): {train.num_graphs} training crystals, {test.num_graphs} held-out crystals, "
+    if a.holdout_rows > 0:
+        # rows of the one file: the held-out split is crystals the model never trained on, of molecules it did
+        if not a.eval_molecules <= a.holdout_rows < train.num_graphs:
+            raise SystemExit(f'--holdout-rows {a.holdout_rows} must cover --eval-molecules {a.eval_molecules} and '
+                             f'leave rows to train on ({train.num_graphs} in the file)')
+        perm = torch.randperm(train.num_graphs, generator=torch.Generator().manual_seed(a.seed + 1))
+        test = train.subsample_new_batch(perm[:a.eval_molecules])
+        train_rows = perm[a.holdout_rows:]
+        held_name, train_name = 'held-out crystals', 'training crystals'
+    else:
+        test = load_split(a.test_conditions, 0, a.seed)
+        train_rows = torch.arange(train.num_graphs)
+        held_name, train_name = 'held-out molecules', 'training molecules'
+    train_eval = train.subsample_new_batch(train_rows[:min(a.eval_molecules, len(train_rows))])
+    held_note = (f"{a.holdout_rows} rows of the same file held out ({test.num_graphs} scored)" if a.holdout_rows > 0
+                 else f"{test.num_graphs} held-out crystals")
+    print(f"[pretrain] arm {a.arm} ({stem}): {len(train_rows)} training crystals, {held_note}, "
           f"batch {a.batch}, {a.steps} steps, device {dev.type}; kT = {a.temperature:g} raw eLJ units, "
           f"lj_coeff {a.lj_coeff:g}; target '{a.target}', reference cutoff {a.label_cutoff:g} A, feature cutoff "
           f"{a.feature_cutoff:g} A, per-atom compression above {a.compress_at:g} kT; bridge variance multipliers "
@@ -481,7 +499,8 @@ def main():
     else:
         cal = []
         for _ in range(4):
-            sub = train.subsample_new_batch(torch.randint(0, train.num_graphs, (a.batch,), generator=gen)).to(dev)
+            sub = train.subsample_new_batch(
+                train_rows[torch.randint(0, len(train_rows), (a.batch,), generator=gen)]).to(dev)
             x_t = bridge_state(sub.latent_params(gauge_fix_free_axes=True),
                                0.8 + 0.2 * torch.rand(sub.num_graphs, generator=gen), a.t_scale, gen)
             f = build_example(sub, x_t, a, vdw, False, with_reference=True)['ref_force']
@@ -507,8 +526,8 @@ def main():
 
     def score(step, label):
         fitted.eval()
-        results = {'held-out molecules': evaluate(a.arm, models, test, a, vdw, scale, dev),
-                   'training molecules': evaluate(a.arm, models, train_eval, a, vdw, scale, dev)}
+        results = {held_name: evaluate(a.arm, models, test, a, vdw, scale, dev),
+                   train_name: evaluate(a.arm, models, train_eval, a, vdw, scale, dev)}
         fitted.train()
         print_eval(label, step, a.arm, a, results)
         history[step] = results
@@ -518,7 +537,8 @@ def main():
         save(0)
 
     for step in range(1, a.steps + 1):
-        sub = train.subsample_new_batch(torch.randint(0, train.num_graphs, (a.batch,), generator=gen)).to(dev)
+        sub = train.subsample_new_batch(
+            train_rows[torch.randint(0, len(train_rows), (a.batch,), generator=gen)]).to(dev)
         frac = torch.randint(0, a.T + 1, (sub.num_graphs,), generator=gen).float() / a.T
         if a.late_share > 0:
             late = torch.rand(sub.num_graphs, generator=gen) < a.late_share
@@ -553,7 +573,7 @@ def main():
             if step == a.steps and float(mults.max()) > 1.0:
                 # the widest states the model was trained on, scored once at the end
                 fitted.eval()
-                wide = {'held-out molecules': evaluate(a.arm, models, test, a, vdw, scale, dev, float(mults.max()))}
+                wide = {held_name: evaluate(a.arm, models, test, a, vdw, scale, dev, float(mults.max()))}
                 fitted.train()
                 print_eval('Evaluation on widened states', step, a.arm, a, wide, float(mults.max()))
                 history[f'{step}_wide'] = wide
