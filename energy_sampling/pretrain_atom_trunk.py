@@ -74,6 +74,9 @@ def parse():
     ap.add_argument('--out', required=True, help='directory for the checkpoint, the log and the evaluation json')
     ap.add_argument('--tag', default=None, help='file stem for this run inside --out (default: the arm)')
     ap.add_argument('--trunk', default=None, help='trunk checkpoint, required by --arm head')
+    ap.add_argument('--init', default=None,
+                    help='trunk checkpoint to continue from (--arm trunk): its weights and its row scales; it is '
+                         'scored once before any update')
     ap.add_argument('--conditions', default=r'D:/crystal_datasets/conditional/priors/qm9full_conditions.pt')
     ap.add_argument('--test-conditions', default=r'D:/crystal_datasets/conditional/priors/qm9full_test_conditions.pt')
     ap.add_argument('--train-molecules', type=int, default=0, help='use only this many training molecules (0 = all)')
@@ -92,6 +95,12 @@ def parse():
     ap.add_argument('--t-scale', type=float, default=0.05)
     ap.add_argument('--noise-scales', default='1',
                     help='comma-separated multipliers on the bridge variance, one drawn per training state')
+    ap.add_argument('--late-share', type=float, default=0.0,
+                    help='share of training states whose position is drawn uniformly on [--late-from, 1] '
+                         'instead of on the T + 1 grid positions')
+    ap.add_argument('--late-from', type=float, default=0.9)
+    ap.add_argument('--eval-positions', default=','.join(f'{v:g}' for v in EVAL_STEPS_OF_T),
+                    help='comma-separated trajectory positions (fractions of T) scored at each evaluation')
     ap.add_argument('--split-key', default='prior', help='key of the crystal batch inside --conditions')
     ap.add_argument('--label-cutoff', type=float, default=10.0)
     ap.add_argument('--feature-cutoff', type=float, default=5.0)
@@ -269,21 +278,29 @@ def _relative(u, v, rows=slice(None)):
 
 
 def evaluate(arm, models, split, a, vdw, scale, dev, noise_mult=1.0):
-    """Scoring of one split at fixed trajectory positions; one dict of medians over molecules per position.
+    """Scoring of one split at fixed trajectory positions; one dict of medians over crystals per position.
 
     Two comparisons: the model's force against its own target, and the model's force plus
-    the closed-form tail against the reference (the same thing under --target full).
+    the closed-form tail against the reference (the same thing under --target full). Beside
+    them, where a position sits: the target energy above the same crystal's stored state, and
+    the reference force and the model's error as the displacement of one full-strength force
+    step, sqrt(t_scale / T) * force, in units of that step's noise standard deviation.
     """
     rows = {}
     gen = torch.Generator().manual_seed(1234)
     n = min(a.eval_molecules, split.num_graphs)
-    for frac in EVAL_STEPS_OF_T:
-        acc = {k: [] for k in ('cos', 'pose', 'cell', 'rms', 'size', 'own_pose', 'own_cell', 'e')}
+    step_std = math.sqrt(a.t_scale / a.T)
+    e_end = {}
+    for frac in [float(v) for v in a.eval_positions.split(',')]:
+        acc = {k: [] for k in ('cos', 'pose', 'cell', 'rms', 'size', 'own_pose', 'own_cell', 'e',
+                               'excess', 'step_ref', 'step_err')}
         bad = 0
         for start in range(0, n, a.batch):
             sub = split.subsample_new_batch(torch.arange(start, min(start + a.batch, n))).to(dev)
-            x_t = bridge_state(sub.latent_params(gauge_fix_free_axes=True),
-                               torch.full((sub.num_graphs,), frac), a.t_scale * noise_mult, gen)
+            x_end = sub.latent_params(gauge_fix_free_axes=True)
+            if start not in e_end:
+                e_end[start] = build_example(sub, x_end, a, vdw, False)['energy']
+            x_t = bridge_state(x_end, torch.full((sub.num_graphs,), frac), a.t_scale * noise_mult, gen)
             ex = build_example(sub, x_t, a, vdw, need_geometry_grad=(arm == 'trunk'), with_reference=True)
             pred, _, energy = predict(arm, models, ex, scale, training=False)
             pred, energy = pred.detach(), energy.detach()
@@ -299,12 +316,18 @@ def evaluate(arm, models, split, a, vdw, scale, dev, noise_mult=1.0):
             acc['own_pose'].append(_relative(uo, vo, POSE_ROWS))
             acc['own_cell'].append(_relative(uo, vo, CELL_ROWS))
             acc['e'].append(((energy - ex['energy']).abs() / ex['nat'])[ok])
+            acc['excess'].append((ex['energy'] - e_end[start])[ok])
+            acc['step_ref'].append(step_std * ex['ref_force'][ok].square().mean(1).sqrt())
+            acc['step_err'].append(step_std * (pred + ex['tail_force'] - ex['ref_force'])[ok].square().mean(1).sqrt())
         acc = {k: torch.cat(v) for k, v in acc.items()}
         rows[frac] = dict(cos_median=float(acc['cos'].median()), cos_p10=float(acc['cos'].quantile(0.1)),
                           err_pose=float(acc['pose'].median()), err_cell=float(acc['cell'].median()),
                           rms_scaled=float(acc['rms'].median()), target_scaled=float(acc['size'].median()),
                           own_pose=float(acc['own_pose'].median()), own_cell=float(acc['own_cell'].median()),
-                          e_per_atom=float(acc['e'].median()), n=int(acc['cos'].numel()), nonfinite=bad)
+                          e_per_atom=float(acc['e'].median()), e_excess=float(acc['excess'].median()),
+                          step_ref_sigma=float(acc['step_ref'].median()),
+                          step_err_sigma=float(acc['step_err'].median()),
+                          n=int(acc['cos'].numel()), nonfinite=bad)
     return rows
 
 
@@ -312,21 +335,27 @@ def print_eval(tag, step, arm, a, results, noise_mult=1.0):
     print(f"\nTable. {tag} at step {step}: arm '{arm}', target '{a.target}', {a.feature_cutoff:g} A features. Force on "
           f"the 12 latent rows for QM9 conditions crystals walked back to a trajectory position by the reference "
           f"bridge at {noise_mult:g}x its variance (trained on multipliers {a.noise_scales}; position 1 is the stored "
-          f"crystal, 0 the latent origin); medians over molecules (count in the last "
+          f"crystal, 0 the latent origin); medians over crystals (count in the last "
           f"column), rows scaled by fixed per-row constants. 'vs reference' compares the model's force, plus the "
           f"closed-form tail under target 'short', with the {a.label_cutoff:g} A compressed-eLJ force; 'vs own target' "
           f"compares the model's force with what it was fitted to. Relative error is |prediction - target| / "
           f"|target| and is ill-conditioned where the target is near zero (position 1, the stored minimum), so the "
           f"RMS error over rows is given beside the RMS size of the reference. Energy error is |E - E_target| per atom"
-          + (", the frozen trunk's for the head arm." if arm == 'head' else "."))
+          + (", the frozen trunk's for the head arm." if arm == 'head' else ".")
+          + f" 'Energy above stored' is the target energy at the position minus the same crystal's at position 1. "
+          f"The two 'force step' columns are sqrt(t_scale / T) * force, RMS over rows, for the reference force and "
+          f"for the model's error: the displacement of one full-strength force step in units of that step's noise "
+          f"standard deviation (T {a.T}, t_scale {a.t_scale:g}).")
     print("split | position (t/T) | cosine vs reference, median | cosine vs reference, 10th pct | pose rows vs reference | "
           "cell rows vs reference | RMS error / RMS reference (row-scale units) | pose rows vs own target | "
-          "cell rows vs own target | energy error (kT per atom) | molecules")
+          "cell rows vs own target | energy error (kT per atom) | energy above stored (kT per crystal) | "
+          "reference force step (noise std) | force step error (noise std) | crystals")
     for split, rows in results.items():
         for frac, r in rows.items():
             print(f"{split} | {frac:g} | {r['cos_median']:.4f} | {r['cos_p10']:.4f} | {r['err_pose']:.3f} | "
                   f"{r['err_cell']:.3f} | {r['rms_scaled']:.3f} / {r['target_scaled']:.3f} | {r['own_pose']:.3f} | "
-                  f"{r['own_cell']:.3f} | {r['e_per_atom']:.3f} | {r['n']}")
+                  f"{r['own_cell']:.3f} | {r['e_per_atom']:.3f} | {r['e_excess']:.2f} | {r['step_ref_sigma']:.3f} | "
+                  f"{r['step_err_sigma']:.3f} | {r['n']}")
 
 
 def time_inference(model, split, a, vdw, dev, n=1000, chunk=250, reps=5):
@@ -408,11 +437,13 @@ def main():
     test = load_split(a.test_conditions, 0, a.seed)
     mults = torch.tensor([float(v) for v in a.noise_scales.split(',')])
     train_eval = train.subsample_new_batch(torch.arange(min(a.eval_molecules, train.num_graphs)))
-    print(f"[pretrain] arm {a.arm} ({stem}): {train.num_graphs} training molecules, {test.num_graphs} held-out molecules, "
+    print(f"[pretrain] arm {a.arm} ({stem}): {train.num_graphs} training crystals, {test.num_graphs} held-out crystals, "
           f"batch {a.batch}, {a.steps} steps, device {dev.type}; kT = {a.temperature:g} raw eLJ units, "
           f"lj_coeff {a.lj_coeff:g}; target '{a.target}', reference cutoff {a.label_cutoff:g} A, feature cutoff "
           f"{a.feature_cutoff:g} A, per-atom compression above {a.compress_at:g} kT; bridge variance multipliers "
-          f"{mults.tolist()}", flush=True)
+          f"{mults.tolist()}"
+          + (f"; {a.late_share:g} of training states drawn on t/T in [{a.late_from:g}, 1]" if a.late_share > 0 else ""),
+          flush=True)
 
     # models are built before any sampling: mxtaltools' scalarMLP reseeds torch at construction
     models = {}
@@ -429,6 +460,18 @@ def main():
     if a.arm == 'embedded':
         emb_dim = int(train.embedding.reshape(train.num_graphs, -1).shape[1])
         models['embedded'] = MLP(12 + emb_dim, 13, a.hidden).to(dev)
+    init = None
+    if a.init:
+        if a.arm != 'trunk':
+            raise SystemExit('--init continues a trunk; use it with --arm trunk')
+        init = torch.load(a.init, map_location=dev, weights_only=False)
+        # a continued run must describe the same model and the same target as the checkpoint
+        for key in ('node_dim', 'message_dim', 'num_convs', 'unfolded', 'feature_cutoff', 'label_cutoff', 'target',
+                    'compress_at', 'temperature', 'lj_coeff'):
+            if init['args'][key] != getattr(a, key):
+                raise SystemExit(f"--init {a.init} was fitted with {key} = {init['args'][key]!r}, this run asks for "
+                                 f"{getattr(a, key)!r}")
+        models['trunk'].load_state_dict(init['model'])
     fitted = models[a.arm]
     n_params = sum(p.numel() for p in fitted.parameters())
     torch.manual_seed(a.seed)
@@ -438,6 +481,8 @@ def main():
     # fixed. Taken from the reference under either target, so runs with different targets share one scale.
     if a.arm == 'head':
         scale = ck['row_scale'].to(dev)
+    elif init is not None:
+        scale = init['row_scale'].to(dev)      # the checkpoint's own, so its loss and tables stay comparable
     else:
         cal = []
         for _ in range(4):
@@ -448,7 +493,8 @@ def main():
             cal.append(f[torch.isfinite(f).all(1)])
         scale = torch.cat(cal).abs().median(0).values.clamp(min=1e-3)
     print(f"[pretrain] {n_params:,} fitted parameters; row scales (kT per latent unit): "
-          + ", ".join(f"{v:.1f}" for v in scale.tolist()), flush=True)
+          + ", ".join(f"{v:.1f}" for v in scale.tolist())
+          + (f"; continued from {a.init} (step {init['step']})" if init is not None else ""), flush=True)
 
     opt = torch.optim.Adam(fitted.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.steps, eta_min=a.lr * 0.05)
@@ -464,9 +510,24 @@ def main():
                        'evaluations': {str(k): {s: {str(p): v for p, v in r.items()} for s, r in res.items()}
                                        for k, res in history.items()}}, f, indent=1)
 
+    def score(step, label):
+        fitted.eval()
+        results = {'held-out molecules': evaluate(a.arm, models, test, a, vdw, scale, dev),
+                   'training molecules': evaluate(a.arm, models, train_eval, a, vdw, scale, dev)}
+        fitted.train()
+        print_eval(label, step, a.arm, a, results)
+        history[step] = results
+
+    if init is not None:
+        score(0, 'Evaluation of the checkpoint before any update')
+        save(0)
+
     for step in range(1, a.steps + 1):
         sub = train.subsample_new_batch(torch.randint(0, train.num_graphs, (a.batch,), generator=gen)).to(dev)
         frac = torch.randint(0, a.T + 1, (sub.num_graphs,), generator=gen).float() / a.T
+        if a.late_share > 0:
+            late = torch.rand(sub.num_graphs, generator=gen) < a.late_share
+            frac = torch.where(late, a.late_from + (1 - a.late_from) * torch.rand(sub.num_graphs, generator=gen), frac)
         mult = mults[torch.randint(0, len(mults), (sub.num_graphs,), generator=gen)]
         x_t = bridge_state(sub.latent_params(gauge_fix_free_axes=True), frac, a.t_scale * mult, gen)
         ex = build_example(sub, x_t, a, vdw, need_geometry_grad=(a.arm == 'trunk'))
@@ -483,7 +544,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(fitted.parameters(), 10.0)
         opt.step()
         sched.step()
-        log.append((float(f_loss), float(e_loss) if e_loss is not None else float('nan')))
+        log.append((float(f_loss.detach()), float(e_loss.detach()) if e_loss is not None else float('nan')))
         if step % 50 == 0 or step == 1:
             recent = torch.tensor(log[-50:])
             print(f"[pretrain] step {step:6d}  force loss {float(recent[:, 0].mean()):.4f}  energy loss "
@@ -493,12 +554,7 @@ def main():
                   + (f"  peak GPU {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB" if dev.type == 'cuda' else ""),
                   flush=True)
         if step % a.eval_every == 0 or step == a.steps:
-            fitted.eval()
-            results = {'held-out molecules': evaluate(a.arm, models, test, a, vdw, scale, dev),
-                       'training molecules': evaluate(a.arm, models, train_eval, a, vdw, scale, dev)}
-            fitted.train()
-            print_eval('Evaluation', step, a.arm, a, results)
-            history[step] = results
+            score(step, 'Evaluation')
             if step == a.steps and float(mults.max()) > 1.0:
                 # the widest states the model was trained on, scored once at the end
                 fitted.eval()
