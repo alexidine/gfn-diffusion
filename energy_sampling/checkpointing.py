@@ -248,6 +248,24 @@ class Checkpointer:
             print(f"batch_size: checkpoint restored {restored} -> using {m.batch_size} "
                   f"(config batch_size={args.batch_size}, max_batch_size={args.max_batch_size}, "
                   f"grow_batch_size={grow})")
+        # A PENDING S2 AUDIT DOES NOT SURVIVE A RESTART AS STORED. Its deadline
+        # (`audit_at`, train.select_batch_size) is a WALL-CLOCK time one policy
+        # window after the rung was selected, and what it judges is the occupancy
+        # LIVED over that window. A requeued leg starts hours past the deadline with
+        # an empty occupancy record, so the audit fired on its first step against
+        # start-up idle, failed, and stood the batch down to the base rung -- and
+        # `stood_down` is never re-probed, so the leg stayed there. mlepl_neh_lr2
+        # (2026-10-06) resumed holding 1600, read "a full policy window at 1600
+        # reads 0.7%", dropped to 1000 and ran 2.4 h at 51% occupancy until the
+        # cluster cancelled it for low usage. Give the audit a window this process
+        # has actually lived.
+        sizer = getattr(m, 'batch_sizer', None)
+        if isinstance(sizer, dict) and sizer.get('audit_at') is not None:
+            policy_s = float(getattr(args, 'gpu_util_policy_window_s', 7200) or 7200)
+            sizer['audit_at'] = float(m._now()) + policy_s
+            print(f"batch: resumed holding {m.batch_size} with an occupancy audit pending -- "
+                  f"re-armed for {policy_s:g} s from now (its stored deadline was a wall-clock "
+                  f"time in the previous process)")
 
     def path_for(self, tag: str) -> str:
         m = self.modeller
