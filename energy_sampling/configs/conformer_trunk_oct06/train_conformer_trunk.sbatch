@@ -33,7 +33,8 @@
 #
 # RESUBMIT THIS FILE to continue an arm past the wall: each arm resumes its own <arm>_running.pt.
 # One arm: sbatch --array=<row> configs/conformer_trunk_oct06/train_conformer_trunk.sbatch
-# Smoke: STEPS=400 EVAL_EVERY=200 sbatch --time=00:40:00 --array=2 <this file>   (writes <arm>_smoke_*)
+# Smoke: STEPS=400 EVAL_EVERY=200 sbatch --time=01:30:00 --array=2 <this file>   (writes <arm>_smoke_*; most of
+# it is start-up: the energy of 34,698 conditions is built first, 45 ms a condition on the development machine)
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
