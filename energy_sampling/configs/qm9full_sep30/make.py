@@ -151,10 +151,28 @@ fixed_scale 2 = 2.5e-4, phase 1's rate) and resume themselves in full afterwards
 median excess against 68 (phase 1) and 25 (the leader). The rows are the stored minima as they are, at most 10 a
 molecule, so a training molecule can be memorised (owner 2026-10-05: "not worried about MLE overfit for now").
 
+LEG F, FORCE TERM (`python configs/qm9full_sep30/make.py force`; owner 2026-10-06: "an actual test run with this
+whole new setup"). P_F's mean gains gate(t) * cap(step variance * force) (models/gfn.py GFN.init_force_drift), the
+force being minus the gradient of a pre-trained atom trunk's energy on the latent (models/crystal_force.py; the trunk
+is configs/atom_trunk_oct05's at_c2_ft_late). Each row is qf30_fwdF_lr5's step-FORCE_SEED_STEP archive loaded IN FULL
+under a new name, as a leg-d continued row is, with the eight force leaves added and nothing else moved (asserted):
+  [0] qf30_frc_ctl  no force term: the control, from the same archive under the same code
+  [1] qf30_frc_g0   gate learned from 0: the arm starts as the control and the term has to earn its way in
+  [2] qf30_frc_g1   gate learned from 0.1
+The force acts on states from t = FORCE_T_MIN on (the last fifth of the trajectory), and one step's force displacement
+is capped at FORCE_MAX_SIGMA of that step's noise standard deviations. The archive predates the gates: they start at
+their configured values and every other parameter keeps its optimizer state (checkpointing.py _load_state,
+_grown_optimizer_state). P_B is the frozen snapshot the archive carries and takes no force term. Every trajectory
+that is scored, rolled out or not, pays one trunk call per state inside the window, so a step is slower than the
+control's. Read against the control at equal steps: the eval_fwd quality numbers and the forward Jensen;
+force/gate_fwd_mean_* (does the gate grow); force/cosine_*, force/err_sigma_* and force/agreement_failed (the trunk
+against its own target on this run's rollout states); train_step_time.
+
     python configs/qm9full_sep30/make.py p1
     python configs/qm9full_sep30/make.py arms [--dry]      # legs b and c
     python configs/qm9full_sep30/make.py cont [--dry]      # leg d
     python configs/qm9full_sep30/make.py cmle [--dry]      # leg e
+    python configs/qm9full_sep30/make.py force [--dry]     # leg f
 """
 import copy
 import importlib.util
@@ -254,6 +272,40 @@ NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run:
 SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
 # leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
 CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
+# leg f: (run_name, the run it continues, the starting value of P_F's force gate or None for no force term). ROW
+# ORDER IS THE ARRAY INDEX: append only.
+FORCE = (('frc_ctl', 'fwdF_lr5', None), ('frc_g0', 'fwdF_lr5', 0.0), ('frc_g1', 'fwdF_lr5', 0.1))
+FORCE_SEED_STEP = 150_000   # the newest archive qf30_fwdF_lr5 had written when leg f was generated (2026-10-06)
+FORCE_T_MIN = 0.8           # trajectory time from which a state gets a force
+FORCE_MAX_SIGMA = 2.0       # cap on one step's force displacement, in that step's noise standard deviations
+FORCE_CHUNK = 1000          # crystal states per trunk call
+# the trunk: its path under the cluster checkpoints directory, its bytes, and the energy it was fitted at
+FORCE_TRUNK = ('atom_trunk_oct05/at_c2_ft_late.pt', 595_833)
+FORCE_TRUNK_ENERGY = {'temperature': 6.9, 'lj_coeff': 1.0}
+FORCE_LEAVES = ('drift_force.checkpoint', 'drift_force.chunk') + tuple(
+    f'model.force_drift_{k}' for k in ('fwd', 'bwd', 'learned', 'max_sigma', 't_min', 'differentiable'))
+PRIOR_GUARD = """if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
+    echo "FATAL: ${DATA}/${PRIOR} is ${HAVE} bytes, expected ${PRIOR_BYTES}" >&2; exit 1
+fi
+"""
+FORCE_GUARD = """
+# THE FORCE TERM (leg f): the trunk an arm with a gate reads, and the code on both sides that reads it.
+TRUNK=%(trunk)s
+HAVE=$(stat -c %%s ${TRUNK} 2>/dev/null || echo 0)
+if [ "${HAVE}" != "%(bytes)d" ]; then
+    echo "FATAL: ${TRUNK} is ${HAVE} bytes, expected %(bytes)d" >&2; exit 1
+fi
+for f in ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py ${WORKDIR}/models/crystal_force.py; do
+    if [ ! -s "${f}" ]; then echo "FATAL: ${f} is missing -- git pull BOTH repositories" >&2; exit 1; fi
+done
+if ! grep -q 'FORCE_DRIFT_GFN_KEYS' ${WORKDIR}/checkpointing.py; then
+    echo "FATAL: ${WORKDIR}/checkpointing.py does not read the force keys on a reload -- git pull gfn-diffusion" >&2; exit 1
+fi
+"""
+NIGGLI_CHECK = """'Niggli triclinic penalty is OFF'\\" || exit 1
+"""
+FORCE_IMPORT = """        python -c \\"from models.crystal_force import CrystalDriftForce, TrunkForce\\" || exit 1
+"""
 # the job script's seed lookup (final_sep19's SEED_B) and the pinned one legs d and e run in its place
 SEED_NEWEST = """        CK=$(ls -t ${CKPTS}/*${SRC}_*_step[0-9]*.pt 2>/dev/null | grep -v '_buffers.pt$' | head -1)
         if [ -z "${CK}" ]; then
@@ -589,7 +641,7 @@ def build_cont(run, source, rate, reach, scale_live=True):
     return cfg
 
 
-def check_cont(cfg, name, source, source_name, rate, reach, scale_live):
+def check_cont(cfg, name, source, source_name, rate, reach, scale_live, extra_allowed=()):
     lc, src_lc = cfg['lr_control'], source['lr_control']
     # the rate: base x the scale the checkpoint restores; nothing else in the controller's block moves
     assert lc['mode'] == 'fixed' and cfg['lr_fused'] == 'auto' and cfg.get('max_lr') is None, name
@@ -617,7 +669,7 @@ def check_cont(cfg, name, source, source_name, rate, reach, scale_live):
     # the source with the named leaves moved: all of them, and no others
     allowed = ['load_weights_only'] + (['lr_control.seed_lr'] if rate != 1 else []) + \
               ([f'{VC}.loss_coeffs.fwd.path_grad_last_k'] if reach != 1 else []) + \
-              ([] if scale_live else [f'{VC}.loss_coeffs.fwd.path_grad_scale'])
+              ([] if scale_live else [f'{VC}.loss_coeffs.fwd.path_grad_scale']) + list(extra_allowed)
     assert _moved(source, cfg) == sorted(allowed), (name, _moved(source, cfg))
     w3._scan_local_paths(cfg, name)
     fin.load_check(copy.deepcopy(cfg), name, STAGES)
@@ -692,6 +744,99 @@ def main_cont(argv):
                  f'SRC_RUNNING: the resume rows rewrite those files (make.py, LEG D).'))
     print(f'wrote {len(new)} continued arms with INDEX_d.tsv ({len(rows)} rows) and submit_{BATTERY}_d.sbatch')
     print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
+def build_force(run, source, gate, trunk):
+    """A leg-b arm continued under a new name with the force leaves added: a gate in P_F starting at `gate`, or,
+    for None, every leaf present and no force term (the module docstring, LEG F)."""
+    cfg = build_cont(run, source, 1, 1, True)
+    cfg['model'].update(force_drift_fwd=gate, force_drift_bwd=None, force_drift_learned=True,
+                        force_drift_max_sigma=FORCE_MAX_SIGMA, force_drift_t_min=FORCE_T_MIN,
+                        force_drift_differentiable=False)
+    cfg['drift_force'] = {'checkpoint': None if gate is None else trunk, 'chunk': FORCE_CHUNK}
+    return cfg
+
+
+def check_force(cfg, name, source, source_name, gate, trunk):
+    check_cont(cfg, name, source, source_name, 1, 1, True, extra_allowed=FORCE_LEAVES)
+    m = cfg['model']
+    assert m['force_drift_fwd'] == gate and (gate is None or 0 <= gate <= 1), (name, gate)
+    assert (m['force_drift_learned'], m['force_drift_max_sigma'], m['force_drift_t_min'],
+            m['force_drift_differentiable']) == (True, FORCE_MAX_SIGMA, FORCE_T_MIN, False), name
+    assert cfg['drift_force'] == {'checkpoint': None if gate is None else trunk, 'chunk': FORCE_CHUNK}, name
+    # P_B is frozen on entering the TB stage and the archive carries that snapshot, written without a gate: a
+    # backward gate would be refused when the snapshot loads
+    assert m['force_drift_bwd'] is None and 'freeze_pb' in cfg['protocols'][PROTOCOL]['stages'][1]['on_enter'], name
+    # what train.py _build_drift_force refuses a force term without, and the energy the trunk was fitted at
+    assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
+    assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
+    assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
+    # the window opens on a grid time, so the count of states that reach the trunk is the same for every row
+    assert 0 < FORCE_T_MIN < 1 and abs(FORCE_T_MIN * T - round(FORCE_T_MIN * T)) < 1e-9, FORCE_T_MIN
+
+
+def main_force(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+    trunk = f'{w3.CLUSTER_CKPTS}/{FORCE_TRUNK[0]}'
+
+    def committed(run):
+        """The source arm as it ran: the committed file, which must be the one on disk."""
+        name = f'{TAG}_{run}'
+        cfg = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{name}.yaml'], HERE))
+        on_disk = yaml.safe_load((HERE / f'{name}.yaml').read_text(encoding='utf-8'))
+        assert on_disk == cfg, f'{name}.yaml is not the committed file'
+        return cfg
+
+    ran = ({f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
+           | {f'{TAG}_{run}' for run, *_ in CONT} | {f'{TAG}_{run}' for run, _ in CMLE})
+    rows, new = [], {}
+    for run, src, gate in FORCE:
+        name, source_name = f'{TAG}_{run}', f'{TAG}_{src}'
+        assert source_name in ran and name not in ran, name
+        source = committed(src)
+        cfg = build_force(run, source, gate, trunk)
+        check_force(cfg, name, source, source_name, gate, trunk)
+        new[name] = cfg
+        rows.append((name, 'qm9full', 'continued', source_name, PRIOR, str(prior_bytes), str(FORCE_SEED_STEP)))
+    assert [g for _, _, g in FORCE].count(None) == 1 and FORCE[0][2] is None, 'row 0 is the one control'
+    # the job script finds an arm's files, and its source's, by `*<arm>_*`: no name may match another's
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    in_window = round(T * (1 - FORCE_T_MIN)) + 1
+    print(f'leg f, force term (INDEX_f row = array index). Every row loads {TAG}_{FORCE[0][1]} step {FORCE_SEED_STEP:,} '
+          f'in full; the force acts from t = {FORCE_T_MIN:g} ({in_window} of the {T + 1} states of a trajectory), '
+          f'capped at {FORCE_MAX_SIGMA:g} noise std per step; trunk {trunk}:')
+    for i, (run, src, gate) in enumerate(FORCE):
+        print(f'[{i}] {TAG}_{run:<8} ' + ('no force term (control)' if gate is None
+                                          else f'P_F gate learned from {gate:g}; no term in P_B (frozen)'))
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    _write_index_pinned(HERE / 'INDEX_f.tsv', rows)
+    sb = _pinned_sbatch(
+        wall=fin.WALL, last=len(rows) - 1, tag=TAG + 'f', battery=BATTERY, leg='f', ckpts=w3.CLUSTER_CKPTS,
+        data=w3.CLUSTER_DATA, seed_block=fin.SEED_B,
+        what=f'the force term in P_F. Every row is a new run name loaded IN FULL (weights, optimizers, Z table, '
+             f'buffers) from the src_step archive of its warm_src arm on a first launch, and resumes itself '
+             f'afterwards; row 0 is the control. DO NOT PASS SRC_RUNNING (make.py, LEG F).')
+    # the trunk and the code that reads it are checked before the seed is resolved, and imported before the run
+    assert sb.count(PRIOR_GUARD) == 1 and sb.count(NIGGLI_CHECK) == 1, "final_sep19's job script moved"
+    sb = sb.replace(PRIOR_GUARD, PRIOR_GUARD + FORCE_GUARD % {'trunk': trunk, 'bytes': FORCE_TRUNK[1]})
+    sb = sb.replace(NIGGLI_CHECK, NIGGLI_CHECK + FORCE_IMPORT)
+    with (HERE / f'submit_{BATTERY}_f.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(sb)
+    print(f'wrote {len(new)} arms with INDEX_f.tsv ({len(rows)} rows) and submit_{BATTERY}_f.sbatch')
+    print(f'the trunk must be at {trunk} with {FORCE_TRUNK[1]:,} bytes; the seed is {TAG}_{FORCE[0][1]} step '
+          f'{FORCE_SEED_STEP:,} with its _buffers.pt beside it')
 
 
 def build_cmle(run, p1):
@@ -863,6 +1008,8 @@ def main(argv):
         return main_cont(argv)
     if argv[:1] == ['cmle']:
         return main_cmle(argv)
+    if argv[:1] == ['force']:
+        return main_force(argv)
     sys.exit(__doc__)
 
 
