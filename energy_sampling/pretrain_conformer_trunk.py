@@ -32,7 +32,9 @@ coordinate scaled by its thermal width (so a coordinate counts by the energy it 
 its own thermal range, and a stiff bond does not outvote a torsion). --force-weight 0 fits
 the energy alone and skips the reference gradient.
 
-A run resumes from <out-dir>/<name>_running.pt when that file exists.
+A run resumes from <out-dir>/<name>_running.pt when that file exists, and only under the
+arguments that file was written with (RESUME_KEYS): the schedule is a function of --steps,
+so a resume under another length would jump the learning rate.
 """
 from __future__ import annotations
 
@@ -49,6 +51,10 @@ from torch import nn
 from models.conformer_trunk import MIN_DISTANCE, ConformerTrunk, MoleculeTopology
 from models.energy_probe import (BAND, LOSS_SCALE, TABLE_CAPTION, build_energy, load_rung, metrics,
                                  molecule_split, table_header, table_row, thermal_sigma)
+
+#: arguments a resumed run must share with the run that wrote the checkpoint
+RESUME_KEYS = ('rung', 'config', 'max_conditions', 'seed', 'batch', 'steps', 'lr', 'lr_final', 'warmup',
+               'force_weight', 'bridge_share', 'noise_scales', 'noise_range', 'heldout_frac', 'conformer_frac')
 
 FORCE_CAPTION = (
     'Gradient of the potential with respect to the state: the model (its energy differentiated '
@@ -341,6 +347,10 @@ def main(argv=None):
         ck = torch.load(run_path, map_location=dev, weights_only=False)
         if ck['trunk_args'] != model.args:
             raise SystemExit(f'{run_path} holds a model built with {ck["trunk_args"]}; this run asks for {model.args}')
+        moved = {k: (ck['args'].get(k), getattr(a, k)) for k in RESUME_KEYS if ck['args'].get(k) != getattr(a, k)}
+        if moved:
+            raise SystemExit(f'{run_path} was written under other arguments (stored, asked): {moved}. A resume '
+                             f'continues the same run; give a changed one another --name.')
         model.load_state_dict(ck['model'])
         opt.load_state_dict(ck['opt'])
         tg.set_state(ck['noise_generator'].cpu())

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=1-00:00:00
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
@@ -19,9 +19,10 @@
 # energy differentiated through the build. It is fitted to the force-field part of the potential the r20k
 # run samples from, under that run's clip, minus each molecule's potential at its reference conformer.
 # Condition set, held-out molecules, held-out stored conformers, the three thermal test sets and the energy
-# table are energy_model_oct03's (models/energy_probe.py), so an arm here reads against an em03 arm at the
-# same step: same data, same target on those test sets, same schedule (300,000 steps at batch 1024, cosine
-# 3e-4 -> 3e-6), a different model.
+# table are energy_model_oct03's (models/energy_probe.py): same data, same target on those test sets, a
+# different model. The schedule is a fifth of em03's: 60,000 steps at batch 1024, cosine 3e-4 -> 3e-6 (em03:
+# 300,000). Read an arm's LAST line against an em03 arm's last line, not step against step: at 60,000 steps
+# em03's rate is still near its peak and this run's is at its floor.
 #
 # Arm = row of INDEX.tsv (line 1 is the header):
 #   0 ct06_e      energy alone, thermal states alone: em03's protocol with this model
@@ -31,10 +32,11 @@
 # Contrasts: 0 v em03 = what seeing atoms buys; 0 v 1 = what fitting the gradient buys; 1 v 2 = what bridge
 # states cost on the thermal sets and buy on the bridge sets (lines F of the log). Every arm scores all sets.
 #
-# RESUBMIT THIS FILE to continue an arm past the wall: each arm resumes its own <arm>_running.pt.
+# RESUBMIT THIS FILE to continue an arm past the wall: each arm resumes its own <arm>_running.pt. A resume
+# under another schedule or arm setting is refused by the script, so a longer run is a new arm, not STEPS=.
 # One arm: sbatch --array=<row> configs/conformer_trunk_oct06/train_conformer_trunk.sbatch
-# Smoke: STEPS=400 EVAL_EVERY=200 sbatch --time=01:30:00 --array=2 <this file>   (writes <arm>_smoke_*; most of
-# it is start-up: the energy of 34,698 conditions is built first, 45 ms a condition on the development machine)
+# Smoke: SMOKE=1 sbatch --time=01:30:00 --array=2 <this file>   (400 steps, writes <arm>_smoke_*; most of it
+# is start-up: the energy of 34,698 conditions is built first, 45 ms a condition on the development machine)
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -53,10 +55,10 @@ INDEX=${ARMS}/INDEX.tsv
 ARM=$(awk -F'\t' -v n=${ROW} 'NR==n {print $1}' ${INDEX})
 FLAGS=$(awk -F'\t' -v n=${ROW} 'NR==n {print $2}' ${INDEX})
 if [ -z "${ARM}" ]; then echo "no arm at row ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
-STEPS=${STEPS:-300000}
-EVAL_EVERY=${EVAL_EVERY:-5000}
+STEPS=60000
+EVAL_EVERY=2500
 WANDB="--wandb-project 'GFN Energy'"
-if [ "${STEPS}" != "300000" ]; then ARM=${ARM}_smoke; WANDB=""; fi
+if [ -n "${SMOKE}" ]; then ARM=${ARM}_smoke; STEPS=400; EVAL_EVERY=200; WANDB=""; fi
 J=${LOGS}/${ARM}_${SLURM_JOB_ID}
 
 # RUNG GUARD: the set the r20k run trains on, built by configs/conformer_mle_sep30/build_r20k.sbatch
