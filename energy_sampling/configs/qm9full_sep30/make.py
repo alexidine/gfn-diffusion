@@ -180,16 +180,19 @@ quite well-behaved and cheap. I wonder if we could get away with huge batches an
 convergence"). Leg e's qf30_cmle_seed crossed the TB leader's excess at step 20,000 and ran at 2.5e-4 and batch 1000
 with no rewind. Leg g is that arm with P_B frozen from the start, the batch pinned, and the two factors crossed:
   [0] qf30_cmf_b1k_lr20  batch 1000, 2.5e-4: the control (leg e's arm with P_B frozen and the batch pinned)
-  [1] qf30_cmf_b1k_lr80  batch 1000, 1e-3
+  [1] qf30_cmf_b1k_lr40  batch 1000, 5e-4
   [2] qf30_cmf_b4k_lr20  batch 4000, 2.5e-4
-  [3] qf30_cmf_b4k_lr80  batch 4000, 1e-3: four times the rows a step at the same step size a row
+  [3] qf30_cmf_b4k_lr40  batch 4000, 5e-4
+NO ROW AT 1e-3: in the local smoke run of this arm shape (300-molecule prior, batch 200, burn-in 50 and ramp 200
+steps) the loss rose with the rate from 5e-5 on, and at 1e-3 the run took 4 rewinds in 31 steps and ended
+UNRECOVERABLE; at 5e-4 it held 6 nats above its floor with no rewind. The generator refuses a scale above 4.
 P_B FROZEN (freeze_backward_policy true: a snapshot of the seed's P_B, taken at start-up) because the batch is bound
 by memory: at batch 1000 the training step peaked at 32.5 GB with P_B live (qf30_cmle_seed) and 16.4 GB with it
 frozen (qf30_cmle_lead), which also ran 0.70 s a step against 0.98, and the two sat on one excess curve at equal
 steps. THE BATCH IS PINNED (grow_batch_size false, max_batch_size the batch, batch_util_target 0): leg e carries the
 occupancy sizer, which held its base rung. With growth off an out-of-memory cut is not regrown, so an arm that does
 not fit runs on at a smaller batch: Batch Size and batch/oom_events say so. The rate is lr_control.fixed_scale, read
-at the end of burn-in on these weights-only starts (2 and 8 on seed_lr 1.25e-4). Same seed as leg e: qf30_p1lr2's
+at the end of burn-in on these weights-only starts (2 and 4 on seed_lr 1.25e-4). Same seed as leg e: qf30_p1lr2's
 step-45,000 archive, weights only on a first launch, full resume afterwards; no exit, stopped by hand. Compare at
 equal steps, at equal rows seen and at equal wall clock.
 """
@@ -292,8 +295,9 @@ SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
 # leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
 CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
 # leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
-MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr80', 1000, 8.0),
-        ('cmf_b4k_lr20', 4000, 2.0), ('cmf_b4k_lr80', 4000, 8.0))
+MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr40', 1000, 4.0),
+        ('cmf_b4k_lr20', 4000, 2.0), ('cmf_b4k_lr40', 4000, 4.0))
+MLEB_SCALE_MAX = 4.0        # fixed_scale 8 (1e-3) diverged in the 2026-10-06 smoke run (the module docstring, LEG G)
 MLEB_BASE = 'cmle_seed'     # the leg-e arm leg g is built from
 # leg f: (run_name, the run it continues, the starting value of P_F's force gate or None for no force term). ROW
 # ORDER IS THE ARRAY INDEX: append only.
@@ -964,7 +968,7 @@ def check_mleb(cfg, name, base, p1, batch, scale):
     lc = cfg['lr_control']
     assert lc['mode'] == 'fixed' and lc['seed_lr'] == SEED_LR and lc['fixed_scale'] == scale, name
     assert cfg['lr_back'] == 'auto' and cfg.get('max_lr') is None, name     # the rate train_prior steps, unrailed
-    assert _guard(cfg) == HOT_GUARD and scale > lc['burn_in_scale'], (name, _guard(cfg))
+    assert _guard(cfg) == HOT_GUARD and lc['burn_in_scale'] < scale <= MLEB_SCALE_MAX, (name, _guard(cfg), scale)
     assert (cfg['batch_size'], cfg['max_batch_size'], cfg['grow_batch_size'], cfg['batch_util_target']) == \
         (batch, batch, False, 0.0), name
     # at or above the accumulation floor every step is one plain optimizer step (batch-size.md)
