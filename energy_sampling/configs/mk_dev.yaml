@@ -347,6 +347,21 @@ model:
   dplr_rho_max: 0.5            # cap on correlated variance fraction; also an exact cap on pairwise |corr_jk| <= rho_max. Keep < 1 strictly
   dplr_mask_angular: true      # zero the correlated fraction on wrapped dims (angular, plus any periodic_centroids ones); correlations then only couple non-wrapped dims. Required true when DPLR runs with periodic dims (asserted at construction)
   pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
+  # Force term in the kernel means (GFN.init_force_drift): mean += gate(t) * cap(step variance * force), the
+  # force from the trunk named by drift_force.checkpoint. eLJ, Z' = 1, fixed temperature. On a reload these six
+  # are read from THIS config, not the checkpoint's.
+  force_drift_fwd: null        # starting value of P_F's gate; null = no force term in P_F
+  force_drift_bwd: null        # starting value of P_B's gate (positive = the backward step moves to lower energy); null = no force term in P_B
+  force_drift_learned: true    # gates are learned functions of time, one per latent row; false = held at their starting values (no parameters)
+  force_drift_max_sigma: 2.0   # cap on one step's force displacement, in that step's noise standard deviations (RMS over live rows); null = no cap
+  force_drift_t_min: 0.0       # trajectory time in [0, 1) before which a state gets no force and the trunk is not called
+  force_drift_differentiable: false  # true = the force carries its graph to the state (second derivatives through the trunk); read only by path-gradient options
+
+# force model read by model.force_drift_fwd / force_drift_bwd; not loaded when both are null
+################################################################
+drift_force:
+  checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint; required when a force term is on
+  chunk: 1000                  # crystal states per trunk call
 
 # training params
 ################################################################

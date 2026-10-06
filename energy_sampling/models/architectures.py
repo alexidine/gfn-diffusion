@@ -295,6 +295,39 @@ class FlowModel(nn.Module):
         return self.model(z)
 
 
+class ForceGate(nn.Module):
+    """Per-coordinate multiplier on a force term in a kernel mean, as a function of time.
+
+        gate(t) = init + net(t_emb)            [B, out_dim]
+
+    `net`'s output layer is zero at construction, so the gate starts at `init` for every
+    time and coordinate and moves only by training. `learned=False` builds no parameters
+    and holds the gate at `init`.
+    """
+
+    def __init__(self, t_dim: int, out_dim: int, init: float = 0.0, hidden_dim: int = 64,
+                 learned: bool = True):
+        super(ForceGate, self).__init__()
+        self.out_dim = out_dim
+        self.init = float(init)
+        self.learned = learned
+        if learned:
+            self.net = nn.Sequential(nn.Linear(t_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
+            self.net[-1].weight.data.fill_(0.0)
+            self.net[-1].bias.data.fill_(0.0)
+
+    def forward(self, t_emb):
+        if not self.learned:
+            return t_emb.new_full((t_emb.shape[0], self.out_dim), self.init)
+        return self.init + self.net(t_emb)
+
+    def restart(self):
+        """Back to `init` at every time: the output layer is zeroed, as at construction."""
+        if self.learned:
+            self.net[-1].weight.data.fill_(0.0)
+            self.net[-1].bias.data.fill_(0.0)
+
+
 class LangevinScalingModel(nn.Module):
     def __init__(self, s_emb_dim: int,
                  t_dim: int,

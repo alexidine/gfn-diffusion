@@ -59,8 +59,8 @@ from torch import nn
 
 from buffer import strip_lazy_sg_caches
 from models.atom_trunk import AtomTrunk, crystal_density, intramolecular_edges, pooled_features
-from mxtaltools.analysis.vdw_analysis import exponential_edgewise_lj_energy, lj_cutoff_envelope
-from mxtaltools.common.utils import log_rescale_positive
+from models.crystal_force import compressed_elj_per_atom
+from mxtaltools.analysis.vdw_analysis import lj_cutoff_envelope
 from mxtaltools.constants.atom_properties import VDW_RADII
 from mxtaltools.crystal_building.image_pairs import build_image_tables, select_images, pair_distances
 
@@ -148,13 +148,8 @@ def bridge_state(x_end, frac, t_scale, gen):
 
 def atom_energies(pairs, vdw, a, n_nodes, switch_at=None):
     """Per-atom eLJ energy in kT over a pair list, optionally switched to zero at `switch_at`, then compressed."""
-    e_pair = exponential_edgewise_lj_energy(
-        vdw, {'intermolecular_dist': pairs['dist'],
-              'intermolecular_dist_atoms': [pairs['z_src'], pairs['z_tgt']]}, 2.5) * (a.lj_coeff / a.temperature)
-    if switch_at is not None:
-        e_pair = e_pair * lj_cutoff_envelope(pairs['dist'], switch_at, a.switch_width)
-    raw = torch.zeros(n_nodes, dtype=e_pair.dtype, device=e_pair.device).index_add_(0, pairs['node_ref'], e_pair)
-    return log_rescale_positive(raw, a.compress_at)
+    envelope = None if switch_at is None else lj_cutoff_envelope(pairs['dist'], switch_at, a.switch_width)
+    return compressed_elj_per_atom(pairs, vdw, a.lj_coeff, a.temperature, a.compress_at, n_nodes, envelope)
 
 
 def tail_energy(tables, T_fc, vdw, a):

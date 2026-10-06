@@ -654,6 +654,13 @@ class Checkpointer:
     # resumed run may take them from its own config. Everything else fixes the
     # weight layout and has to come from the file.
     RECONFIGURABLE_GFN_KEYS = ('t_scale_ratio', 't_scale_power', 't_scale_preserve_budget')
+    # The force terms in the kernel means (GFN.init_force_drift) are this run's to decide as well:
+    # an arm that adds one to a shared checkpoint would otherwise run as the control. Unlike the
+    # keys above they can ADD parameters, the gates, which a checkpoint written without them does
+    # not carry; _load_state and _grown_optimizer_state are what let such a checkpoint load.
+    FORCE_DRIFT_GFN_KEYS = ('force_drift_fwd', 'force_drift_bwd', 'force_drift_learned',
+                            'force_drift_max_sigma', 'force_drift_t_min', 'force_drift_differentiable')
+    FORCE_GATE_KEY = '.force_gate.'
 
     def _build_gfn(self, config):
         """The model a checkpoint's gfn_config describes, BEFORE any weights load.
@@ -680,7 +687,7 @@ class Checkpointer:
         """
         config = dict(checkpoint['gfn_config'])
         current = vars(self.modeller.args.model)
-        for key in self.RECONFIGURABLE_GFN_KEYS:
+        for key in self.RECONFIGURABLE_GFN_KEYS + self.FORCE_DRIFT_GFN_KEYS:
             if key not in current:
                 continue
             if current[key] != config.get(key):
@@ -688,6 +695,61 @@ class Checkpointer:
             config[key] = current[key]
         self._assert_dead_rows_match(config)
         return config
+
+    def _load_state(self, model, state, what, in_place: bool = False):
+        """load_state_dict, strict but for the force gates (FORCE_GATE_KEY) a checkpoint predates.
+
+        A model built with a force term has gate parameters; a checkpoint written without one
+        does not. They are left as constructed, at their starting values. `in_place` says the
+        model was not just built (a rewind): its gates may have trained, so they are put back
+        at their starting values, which is what the checkpoint's model had in effect. Any other
+        missing key, and any unexpected key, raises as a strict load would.
+        """
+        result = model.load_state_dict(state, strict=False)
+        gates = [k for k in result.missing_keys if self.FORCE_GATE_KEY in k]
+        missing = [k for k in result.missing_keys if self.FORCE_GATE_KEY not in k]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(f"{what}: the state dict does not fit the model. Missing keys: {missing}; "
+                               f"unexpected keys: {list(result.unexpected_keys)}")
+        if gates:
+            if in_place:
+                model.restart_force_gates()
+            print(f"{what}: written without this model's force gates ({len(gates)} tensors); they "
+                  f"{'go back to' if in_place else 'start at'} their configured starting values")
+
+    @staticmethod
+    def _grown_optimizer_state(opt, saved):
+        """`saved` re-indexed for `opt` when opt's parameter groups are the saved ones with
+        parameters ADDED AT THEIR ENDS: (state dict, number of added parameters), else None.
+
+        The case is a model that gained parameters inside existing groups, the force gates,
+        which sit after their policy's own parameters. `opt.load_state_dict(saved)` refuses a
+        group of another size, and the fallback starts the whole optimizer fresh: every
+        parameter loses its moments and its step count, and an arm that differs from its
+        control by one small module would also differ by a reset optimizer. Here each saved
+        parameter keeps its state under its new index and the added ones start without any,
+        which Adam initialises at their first step. Refused (None) unless the group count is
+        unchanged, no group shrank, and every carried parameter has the saved shape.
+        """
+        live, old = opt.param_groups, saved['param_groups']
+        if len(live) != len(old):
+            return None
+        sizes = [(len(g['params']), len(o['params'])) for g, o in zip(live, old)]
+        if all(n == o for n, o in sizes) or any(n < o for n, o in sizes):
+            return None
+        fresh = opt.state_dict()['param_groups']
+        state = {}
+        for g_live, g_new, g_old in zip(live, fresh, old):
+            for p, new_id, old_id in zip(g_live['params'], g_new['params'], g_old['params']):
+                entry = saved['state'].get(old_id)
+                if entry is None:
+                    continue
+                shaped = next((v for v in entry.values() if torch.is_tensor(v) and v.dim() > 0), None)
+                if shaped is not None and shaped.shape != p.shape:
+                    return None
+                state[new_id] = entry
+        groups = [dict(g_old, params=g_new['params']) for g_new, g_old in zip(fresh, old)]
+        return {'state': state, 'param_groups': groups}, sum(n - o for n, o in sizes)
 
     def _assert_dead_rows_match(self, config):
         """
@@ -728,9 +790,9 @@ class Checkpointer:
         self.assert_problem_match(checkpoint, path, 'checkpoint_name')
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
         m.ema_model = deepcopy(m.gfn_model)
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
@@ -856,9 +918,9 @@ class Checkpointer:
         self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
         m.ema_model = deepcopy(m.gfn_model)
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
@@ -898,8 +960,14 @@ class Checkpointer:
                         f"measures a rate that is not the one under test.")
                 print(f"No saved optimizer state for '{key}' - starting it fresh")
                 continue
+            saved = saved_optimizers[key]
+            grown = self._grown_optimizer_state(opt, saved)
+            if grown is not None:
+                saved, added = grown
+                print(f"optimizer '{key}': {added} parameters are new in this model and start without "
+                      f"optimizer state; every other parameter keeps its moments and step count")
             try:
-                opt.load_state_dict(saved_optimizers[key])
+                opt.load_state_dict(saved)
             except (ValueError, RuntimeError) as e:
                 # e.g. checkpoint predates flow params folding into the policy
                 # optimizers, so param group counts no longer line up
@@ -928,8 +996,8 @@ class Checkpointer:
     def load_model_only(self, path, load_optimizers: bool = False):
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)', in_place=True)
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)', in_place=True)
         self._restore_pb_snapshot(checkpoint)
         m.gfn_model.train()
         m.ema_model.eval()

@@ -69,6 +69,7 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
+from models.crystal_force import CrystalDriftForce, TrunkForce
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
     resolve_dead_rows, verify_dead_rows, describe as describe_dead_rows)
@@ -3265,6 +3266,94 @@ class Modeller:
                   f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
         self.ema_model.install_pb_snapshot(frozen)
 
+    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk')
+
+    def _build_drift_force(self):
+        """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd):
+        the trunk named by drift_force.checkpoint, with this run's energy function building the
+        crystals it reads. None when the model has no force term.
+
+        Refused: a force term without a checkpoint; a route the trunk does not cover (not eLJ,
+        Z' > 1, a conditioned temperature); and, in TrunkForce.check_energy, a run whose
+        temperature or lj_coeff is not the one the trunk was fitted at.
+        """
+        cfg = getattr(self.args, 'drift_force', None)
+        cfg = {} if cfg is None else dict(vars(cfg))
+        unknown = sorted(set(cfg) - set(self.DRIFT_FORCE_KEYS))
+        if unknown:
+            raise ValueError(f"drift_force: unknown keys {unknown}; it reads {list(self.DRIFT_FORCE_KEYS)}")
+        checkpoint = cfg.get('checkpoint')
+        if not self.gfn_model.force_on:
+            if checkpoint is not None:
+                print(f"drift_force.checkpoint is set ({checkpoint}) but the model has no force term "
+                      f"(model.force_drift_fwd and model.force_drift_bwd are null): the trunk is not loaded")
+            return None
+        if checkpoint is None:
+            raise ValueError("model.force_drift_fwd / model.force_drift_bwd ask for a force term, and "
+                             "drift_force.checkpoint names no trunk")
+        if self.args.energy_function != 'elj' or max(self.args.z_primes) != 1 or self.args.temperature_conditioning:
+            raise ValueError(
+                f"the force term reads a trunk fitted to the eLJ energy of Z' = 1 crystals at one temperature; "
+                f"this run has energy_function {self.args.energy_function!r}, z_primes {list(self.args.z_primes)}, "
+                f"temperature_conditioning {self.args.temperature_conditioning}")
+        trunk = TrunkForce(checkpoint, self.device, chunk=int(cfg.get('chunk', 1000)))
+        trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
+        m = self.gfn_model
+        print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "
+              f"{trunk.temperature:g}, lj_coeff {trunk.lj_coeff:g}); P_F gate starts at {m.force_drift_fwd}, "
+              f"P_B gate at {m.force_drift_bwd}, {'learned' if m.force_drift_learned else 'held fixed'}; cap "
+              f"{m.force_drift_max_sigma} noise std per step; acting from t = {m.force_drift_t_min:g}")
+        return CrystalDriftForce(trunk, self.energy_function)
+
+    @torch.no_grad()
+    def force_agreement_stats(self, model, states, mol_batch, discretizer, max_rows: int = 256):
+        """The force model against its own target on rollout states, for the eval log.
+
+        `states` [B, T + 1, dim] are one eval batch's forward trajectories and `mol_batch` the
+        molecules they were rolled out for. At three times inside the force window (its first
+        state, its middle one and the last state a step leaves from), on up to `max_rows` rows:
+        the cosine between the trunk's force and its exact target (TrunkForce.target_force), the
+        target and the trunk's error as the displacement of one full-strength force step in that
+        step's noise standard deviations (TrunkForce.agreement), and the mean gate at that time.
+        'force/agreement_failed' is 0 when this ran and 1 when it raised, so a missing
+        measurement is never read as a good one.
+        """
+        stats = {'force/agreement_failed': 1.0}
+        try:
+            trunk = self.drift_force.trunk_force
+            rows = min(int(max_rows), mol_batch.num_graphs)
+            sub = mol_batch.subsample_new_batch(torch.arange(rows, device=mol_batch.device))
+            ctx = self.drift_force.context(sub)
+            ts = discretizer(1).to(self.device)[0]
+            T = ts.numel() - 1
+            window = [j for j in range(T) if float(ts[j]) >= model.force_drift_t_min]
+            picks = sorted({window[0], window[len(window) // 2], T - 1})
+            gate_f, gate_b = model.force_gate_values(ts[picks])
+            for n, j in enumerate(picks):
+                step_variance = float(model.accum_var(ts[j + 1:j + 2]) - model.accum_var(ts[j:j + 1]))
+                res = trunk.agreement(states[:rows, j].to(self.device), ctx, step_variance)
+                tag = f't{float(ts[j]):.2f}'
+                for k, v in res.items():
+                    stats[f'force/{k}_{tag}'] = v
+                if gate_f is not None:
+                    stats[f'force/gate_fwd_mean_{tag}'] = float(model._mean_over_live(gate_f[n:n + 1]))
+                    stats[f'force/gate_fwd_absmax_{tag}'] = float(gate_f[n].abs().max())
+                if gate_b is not None:
+                    stats[f'force/gate_bwd_mean_{tag}'] = float(model._mean_over_live(gate_b[n:n + 1]))
+            stats['force/nonfinite_rows'] = float(model.force_nonfinite_rows())
+            stats['force/trunk_states'] = float(trunk.rows)
+            stats['force/agreement_failed'] = 0.0
+            tags = [f't{float(ts[j]):.2f}' for j in picks]
+            print(f"force model on {rows} rollout states per time (cosine with its target | error and target step, "
+                  f"noise std" + (" | mean P_F gate" if gate_f is not None else "") + "): " + "; ".join(
+                      f"{tag[1:]}: {stats[f'force/cosine_{tag}']:.4f} | {stats[f'force/err_sigma_{tag}']:.3f} of "
+                      f"{stats[f'force/target_sigma_{tag}']:.2f}"
+                      + (f" | {stats[f'force/gate_fwd_mean_{tag}']:+.5f}" if gate_f is not None else "")
+                      for tag in tags))
+        except Exception as e:  # a diagnostic must not end a run; the flag above says it did not report
+            print(f"force_agreement_stats failed ({type(e).__name__}: {e}); logged as force/agreement_failed = 1")
+        return stats
+
     def init_gfn(self):
         reload = False
 
@@ -3295,10 +3384,15 @@ class Modeller:
             self.ema_model = deepcopy(self.gfn_model)
             self.init_schedulers_optimizers()
 
+        # the force provider of the kernels' force terms (None without one): runtime state
+        # like the flags below, installed on both models on every build and reload path
+        self.drift_force = self._build_drift_force()
+
         # runtime flag like compile_policy, set on both fresh-build and reload
         # paths; deliberately not part of gfn_config (checkpoints/problem
         # hashing unaffected)
         for model in (self.gfn_model, self.ema_model):
+            model.install_drift_force(self.drift_force)
             model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
             # WHICH BRANCHES checkpoint. Absent/empty = all of them, unchanged.
             # Only fwd shares a step with the energy function's footprint, and it
@@ -8150,6 +8244,8 @@ class Modeller:
         # a mostly-absent one.
         metrics.update({'pooled/%s' % k: v
                         for k, v in getattr(self, '_pooled_stats', {}).items()})
+        # the force model on this eval's rollout states (force_agreement_stats); empty without a force term
+        metrics.update(getattr(self, '_force_stats', {}))
 
         """Forward TB Stats"""
         log_r = fwd_stats['log_r']
@@ -11318,6 +11414,11 @@ class Modeller:
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
+
+            if side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None:
+                # the first eval batch of the training conditions: read by log_metrics
+                self._force_stats = self.force_agreement_stats(
+                    model, out['flow_states'], mol_batch, eval_discretizer)
 
             sample_batch_i = out.pop('sample_batch')
             sample_batch_i = sample_batch_i.detach().cpu()

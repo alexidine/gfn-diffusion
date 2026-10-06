@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from energy_sampling.utils import gaussian_params
 from mxtaltools.models.graph_models.molecule_graph_model import VectorMoleculeGraphModel
 from mxtaltools.models.modules.components import scalarMLP
-from .architectures import NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
+from .architectures import NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel, ForceGate
 
 logtwopi = math.log(2 * math.pi)
 
@@ -53,9 +53,17 @@ class GFN(nn.Module):  # todo add seeding
                  dplr_rho_max: float = 0.9,
                  dplr_mask_angular: bool = True,
                  pb_exact_reversal: bool = True,
+                 force_drift_fwd: Optional[float] = None,
+                 force_drift_bwd: Optional[float] = None,
+                 force_drift_learned: bool = True,
+                 force_drift_max_sigma: Optional[float] = 2.0,
+                 force_drift_t_min: float = 0.0,
+                 force_drift_differentiable: bool = False,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
+        self.init_force_drift(force_drift_fwd, force_drift_bwd, force_drift_learned,
+                              force_drift_max_sigma, force_drift_t_min, force_drift_differentiable)
         self.harmonics_dim = harmonics_dim
         self.t_dim = t_dim
         self.s_emb_dim = s_emb_dim
@@ -177,6 +185,181 @@ class GFN(nn.Module):  # todo add seeding
                                            policy_hidden_dim, policy_layers, 2 * self.dim,
                                            zero_init=zero_init,
                                            norm=norm, dropout=dropout)
+        # Force-term gates (init_force_drift) are CHILDREN of the policy they act in, so
+        # each trains in that policy's optimizer group, and P_B's gate is frozen and
+        # snapshotted with backward_policy (PB_SNAPSHOT_MODULES). With both options None
+        # no module is built and the state dict is the one it always was.
+        if self.force_drift_fwd is not None:
+            self.forward_policy.force_gate = ForceGate(t_dim, self.dim, self.force_drift_fwd,
+                                                       learned=self.force_drift_learned)
+        if self.force_drift_bwd is not None:
+            self.backward_policy.force_gate = ForceGate(t_dim, self.dim, self.force_drift_bwd,
+                                                        learned=self.force_drift_learned)
+
+    def init_force_drift(self, fwd, bwd, learned, max_sigma, t_min, differentiable):
+        """
+        Optional force term in the kernel means. With F(x) = -dE~/dx the force on the
+        latent (in kT per latent unit) from the installed provider (install_drift_force),
+
+            P_F:  mean(x' | x)  +=  a_F(t)  * tame(dt C(x, t) F(x))
+            P_B:  mean(x  | x') +=  a_B(t') * tame(beta(x', t') F(x'))
+
+        C is the forward kernel's own covariance per unit time (diagonal plus low rank
+        when DPLR is on) and beta the backward kernel's own per-coordinate step variance,
+        both detached: each kernel's variance is the mobility of its force term and is
+        not trained through it. a_F, a_B are per-coordinate gates, functions of time
+        (ForceGate), starting at `fwd` / `bwd`; None leaves that kernel without the term.
+
+        SIGN. A positive gate moves the kernel's own step toward lower energy, in
+        whichever direction of time that kernel runs: a_B > 0 sends the BACKWARD step
+        downhill too, a_B < 0 uphill. Untamed, the term changes a step's log P_F by
+        a_F r_F.F(x) - a_F^2/2 F(x).(dt C) F(x), with r_F the step's residual under the
+        kernel without the term, and log P_B by the same expression in a_B, r_B, beta
+        and F(x') (tests/models/test_force_drift.py pins both). To first order in the
+        step r_F = -r_B = x' - x, so log P_F - log P_B gains (a_F + a_B)(x' - x).F:
+        over a stretch where a_F + a_B = 1 that sums to minus the energy change along
+        it. a_F = 1, a_B = 0 is the score term of a reverse diffusion, a_F = a_B = 1/2
+        the overdamped Langevin pair.
+
+        tame() bounds one step's force displacement at `max_sigma` times that step's
+        noise standard deviation, RMS over live coordinates, direction kept:
+        u / sqrt(1 + (rms / max_sigma)^2). None = unbounded.
+
+        `t_min`: a state earlier than this is given no force (and the provider is not
+        called for it); a state's time decides, so P_F leaving it and P_B conditioned
+        on it agree. `differentiable`: the provider is asked for a force that carries
+        its graph to the state; otherwise the force is a constant of the step.
+
+        Every scoring route reads the same two functions (_fwd_force_mean through
+        _forward_kernel, _bwd_force_shift through _eval_pb_logprob / _bwd_step), so a
+        trajectory scores the same however it was produced.
+        """
+        self.force_drift_fwd = None if fwd is None else float(fwd)
+        self.force_drift_bwd = None if bwd is None else float(bwd)
+        self.force_drift_learned = bool(learned)
+        self.force_drift_max_sigma = None if max_sigma is None else float(max_sigma)
+        self.force_drift_t_min = float(t_min)
+        self.force_drift_differentiable = bool(differentiable)
+        if self.force_drift_max_sigma is not None and self.force_drift_max_sigma <= 0:
+            raise ValueError(f"force_drift_max_sigma must be positive or None, got {max_sigma}")
+        if not 0.0 <= self.force_drift_t_min < 1.0:
+            raise ValueError(f"force_drift_t_min is a trajectory time in [0, 1), got {t_min}")
+        self.force_fwd_on = self.force_drift_fwd is not None
+        self.force_bwd_on = self.force_drift_bwd is not None
+        self.force_on = self.force_fwd_on or self.force_bwd_on
+        # the provider is runtime state, installed after construction and kept out of
+        # the module tree: it is not in the state dict and no optimizer group holds it
+        object.__setattr__(self, 'drift_force_fn', None)
+        self._force_nonfinite_rows = 0
+
+    def install_drift_force(self, fn):
+        """
+        Install the force provider the force terms read: fn(state [B, dim], context,
+        create_graph: bool) -> F [B, dim], F = -dE~/dx at `state`, for any state on a
+        trajectory. `context` says which system each row is. A caller of a trajectory
+        function may pass one as `drift_context`; otherwise, if the provider has a
+        `context(mol_batch)` method, it is called once per trajectory batch with the
+        `mol_batch` that function was given (row i of the states <-> graph i), and
+        its result is the context.
+
+        The provider must be a deterministic function of (state, context), periodic in
+        the wrapped coordinates, and must work when called with gradients disabled (an
+        autograd-based one enables them itself). None removes it.
+        """
+        object.__setattr__(self, 'drift_force_fn', fn)
+
+    def _drift_context(self, drift_context, mol_batch):
+        """The force provider's context for one trajectory batch: the caller's, or the
+        provider's own from `mol_batch` (see install_drift_force). None without a
+        force term."""
+        if not self.force_on or drift_context is not None:
+            return drift_context
+        build = getattr(self.drift_force_fn, 'context', None)
+        return None if build is None else build(mol_batch)
+
+    def _state_force(self, state, t, drift_ctx):
+        """Force on the latent at `state` (time `t` [B]), or None when no row is inside
+        the time window. The one place the provider is called."""
+        if self.drift_force_fn is None:
+            raise RuntimeError(
+                "a force term is configured (force_drift_fwd / force_drift_bwd) but no "
+                "provider is installed; call install_drift_force first")
+        if self.force_drift_t_min > 0 and not bool((t >= self.force_drift_t_min).any()):
+            return None
+        x = self._wrap_ang(state)
+        if self.force_drift_differentiable:
+            force = self.drift_force_fn(x, drift_ctx, True)
+        else:
+            force = self.drift_force_fn(x.detach(), drift_ctx, False).detach()
+        if force.shape != state.shape:
+            raise ValueError(f"the force provider returned shape {tuple(force.shape)} for "
+                             f"states of shape {tuple(state.shape)}")
+        return self._clean_force(force, t)
+
+    def _clean_force(self, force, t):
+        """What every force passes through before a kernel reads it, computed or stored:
+        a row with a non-finite entry gets no force (and is counted), dead coordinates
+        get none, and rows outside the time window get none."""
+        bad = ~torch.isfinite(force).all(dim=1, keepdim=True)
+        self._force_nonfinite_rows = self._force_nonfinite_rows + bad.sum().detach()
+        force = torch.where(bad, torch.zeros_like(force), force)
+        if self.dead_idx.numel() > 0:
+            force = force.index_fill(1, self.dead_idx, 0.0)
+        if self.force_drift_t_min > 0:
+            force = force * (t >= self.force_drift_t_min).to(force.dtype).unsqueeze(1)
+        return force
+
+    def force_nonfinite_rows(self) -> int:
+        """Rows whose force was dropped for a non-finite entry since construction."""
+        return int(self._force_nonfinite_rows)
+
+    def _tame_force_step(self, step, var):
+        """Bound `step` [B, dim] at force_drift_max_sigma noise standard deviations
+        (`var`: the step's per-coordinate variance), RMS over live coordinates."""
+        if self.force_drift_max_sigma is None:
+            return step
+        rms = self._live_only(step / var.sqrt()).pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return step / (1.0 + (rms / self.force_drift_max_sigma) ** 2).sqrt()
+
+    def _fwd_force_mean(self, force, t_emb, logvar, d, V, dts):
+        """The force term of P_F's mean, per unit time like the policy's own."""
+        dt = dts.unsqueeze(1)
+        cf = d.detach() * force
+        if V is not None:
+            Vd = V.detach()
+            cf = cf + torch.einsum('bnr,br->bn', Vd, torch.einsum('bnr,bn->br', Vd, force))
+        step = self._tame_force_step(dt * cf, dt * logvar.detach().exp())
+        return self.forward_policy.force_gate(t_emb) * step / dt
+
+    def _pb_force_gate(self, t):
+        """P_B's gate from the live modules, or from the snapshot when P_B is frozen."""
+        fr = getattr(self, '_pb_frozen', None)
+        if fr is not None:
+            with torch.no_grad():
+                return fr['backward_policy'].force_gate(fr['t_model'](t))
+        return self.backward_policy.force_gate(self.t_model(t))
+
+    def _bwd_force_shift(self, force, back_var, t_next):
+        """The force term of P_B's mean for the step arriving at t_next, as a
+        displacement. Wrapped on the periodic coordinates: the kernel there is
+        periodic in its mean, and a canonical shift keeps the mixture's image grid
+        (PB_IMAGE_LIFTS) complete."""
+        var = back_var.detach()
+        return self._wrap_ang(self._pb_force_gate(t_next) * self._tame_force_step(var * force, var))
+
+    def restart_force_gates(self):
+        """Put the learned gates back at their starting values (ForceGate.restart)."""
+        for policy in (self.forward_policy, self.backward_policy):
+            gate = getattr(policy, 'force_gate', None)
+            if gate is not None:
+                gate.restart()
+
+    def force_gate_values(self, t):
+        """(a_F, a_B) at times t [B], each [B, dim] or None: a read-out for logging."""
+        with torch.no_grad():
+            a_f = self.forward_policy.force_gate(self.t_model(t)) if self.force_fwd_on else None
+            a_b = self._pb_force_gate(t) if self.force_bwd_on else None
+        return a_f, a_b
 
     def init_conditioner(self, cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
                          dropout, norm):
@@ -677,7 +860,7 @@ class GFN(nn.Module):  # todo add seeding
 
         return s_new
 
-    def _forward_kernel(self, state, t, condition_embedding, t_next, dts):
+    def _forward_kernel(self, state, t, condition_embedding, t_next, dts, force=None):
         """
         Evaluate the forward policy at `state`/`t`: this is the one density
         (mean, d, V) shared by get_traj_fwd, get_traj_bwd's pf term, and
@@ -689,6 +872,10 @@ class GFN(nn.Module):  # todo add seeding
         noise on this step is what lands the sample at t_next, so that's the
         interval whose variance budget it should spend. It also makes P_F and
         P_B read the same baseline for the same interval.
+
+        `force`: the force on the latent at `state` (_state_force), or None. With
+        force_drift_fwd set it adds P_F's force term to the returned mean, so
+        every route that scores or samples through here carries it.
         """
         expanded_state = self.expand_state_for_policy(state)
         s_emb = self.s_model(expanded_state, condition_embedding)
@@ -696,6 +883,8 @@ class GFN(nn.Module):  # todo add seeding
         state_update = self.predict_next_state(s_emb, t_emb, state)
         pf_mean, logvar, d, V = self.eval_forward_head(
             state_update, self.var_log_rate(t, t_next, dts))
+        if force is not None and self.force_fwd_on:
+            pf_mean = pf_mean + self._fwd_force_mean(force, t_emb, logvar, d, V, dts)
         return pf_mean, logvar, d, V, s_emb, t_emb
 
     def _use_traj_checkpoint(self, mode=None):
@@ -882,15 +1071,21 @@ class GFN(nn.Module):  # todo add seeding
         return self.flow_model(condition_embedding.detach()).flatten()
 
     def _fwd_step(self, current_state, dts, t_cur, t_next, condition_embedding, eps, eps_r,
-                  exploration_std, is_first: bool, detach_traj: bool):
+                  exploration_std, is_first: bool, detach_traj: bool,
+                  force_cur=None, drift_ctx=None, need_force_next: bool = False):
         """
         One forward-rollout step: propagate current_state -> next_state and
         score the transition. Returns the (angular-wrapped) next state plus
         everything the loop needs downstream; the trailing Gaussian-parameter
         tensors are only consumed under return_gauss_params.
+
+        force_cur is the force at current_state, handed in by the loop; the last
+        return is the force at next_state (None unless need_force_next), which
+        P_B reads here and the loop hands to the next step, so each state's force
+        is computed once.
         """
         pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
-            current_state, t_cur, condition_embedding, t_next, dts)
+            current_state, t_cur, condition_embedding, t_next, dts, force_cur)
         pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, d.log())
         # fwd_loss_coeffs.path_grad_scale 0: the reparameterised path gradient
         # reaches the step's MEAN but not its noise SCALE. At small dt the scale
@@ -915,15 +1110,19 @@ class GFN(nn.Module):  # todo add seeding
         fwd_drift = dts.unsqueeze(1) * pf_mean
         logpf_i = self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V)
 
+        force_next = self._state_force(next_state, t_next, drift_ctx) if need_force_next else None
+
         # compute backward logprobs
         back_drift, back_var, logpb_i = self._eval_pb_logprob(
             condition_embedding, current_state, next_state, dts, t_cur, t_next,
-            is_first, logpf_i)
+            is_first, logpf_i, force_next)
 
-        return next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+        return (next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d,
+                force_next)
 
     def _bwd_step(self, current_state, dts, ts, condition_embedding, eps, u_lift,
-                  i: int, trajectory_length: int, detach_traj: bool):
+                  i: int, trajectory_length: int, detach_traj: bool,
+                  force_cur=None, drift_ctx=None, need_force_prev: bool = False):
         """
         One backward-rollout step: propagate current_state -> prev_state under
         P_B (deterministically to the source on the final step) and score both
@@ -935,6 +1134,10 @@ class GFN(nn.Module):  # todo add seeding
         component Gaussian -- and the score is the same mixture density
         _eval_pb_logprob computes, so bwd-generated trajectories replay
         bit-identically.
+
+        force_cur is the force at current_state (read by P_B's force term); the
+        last return is the force at prev_state (None unless need_force_prev),
+        read by P_F here and handed by the loop to the next step.
         """
         if i < trajectory_length - 1:
             # backward propagate
@@ -947,18 +1150,24 @@ class GFN(nn.Module):  # todo add seeding
             t_prev, t_next = ts[:, trajectory_length - i - 1], ts[:, trajectory_length - i]
             drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
 
-            # canonical (k=0) drift; under the mixture this is the diagnostic
-            # summary, and the sampled component replaces the mean below
-            back_drift = - current_state * drift_coeff * back_mean_correction
-            # directly x_t-u\Delta t
-            back_mean = current_state + back_drift
             var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
                 min=-self.var_clip, max=self.var_clip).exp()
             back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
 
+            # canonical (k=0) drift; under the mixture this is the diagnostic
+            # summary, and the sampled component replaces the mean below
+            back_drift = - current_state * drift_coeff * back_mean_correction
+            back_shift = None
+            if force_cur is not None and self.force_bwd_on:
+                back_shift = self._bwd_force_shift(force_cur, back_var, t_next)
+                back_drift = back_drift + back_shift
+            # directly x_t-u\Delta t
+            back_mean = current_state + back_drift
+
             if self.pb_exact_reversal and self.ang_dim > 0:
                 back_mean = self._pb_mixture_ang_mean(
-                    back_mean, current_state, drift_coeff, back_mean_correction, t_next, u_lift)
+                    back_mean, current_state, drift_coeff, back_mean_correction, t_next, u_lift,
+                    back_shift)
 
             prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj, eps=eps)
             # R3: wrap before any scoring -- no scorer ever sees a pre-wrap coordinate
@@ -966,8 +1175,8 @@ class GFN(nn.Module):  # todo add seeding
             prev_state = self._pin_dead(prev_state)  # dead dims never move (D33)
 
             # log Pb: the one kernel every scoring path evaluates
-            logpb_i = self._pb_logprob(prev_state, current_state, drift_coeff,
-                                       back_mean_correction, back_var, t_next)
+            logpb_i = self._score_pb(prev_state, current_state, drift_coeff,
+                                     back_mean_correction, back_var, t_next, back_shift)
         else:
             # send it identically to the source state (0)
             # pinned too: with a nonzero canonical value (hexagonal gamma) the source
@@ -980,26 +1189,30 @@ class GFN(nn.Module):  # todo add seeding
         """log pf calculation"""
         # forward kernel: same policy density as get_traj_fwd/get_traj_replay, so DPLR
         # applies here too when enabled. Only the backward policy (P_B, above) stays diagonal.
+        force_prev = (self._state_force(prev_state, ts[:, trajectory_length - i - 1], drift_ctx)
+                      if need_force_prev else None)
         pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
             prev_state, ts[:, trajectory_length - i - 1], condition_embedding,
-            ts[:, trajectory_length - i], dts)
+            ts[:, trajectory_length - i], dts, force_prev)
 
         flow_i = self._step_flow(s_emb, t_emb)
 
         fwd_drift = dts.unsqueeze(1) * pf_mean
         logpf_i = self.fwd_gauss_logprob(current_state - prev_state, fwd_drift, d, dts, V)
 
-        return prev_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+        return (prev_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d,
+                force_prev)
 
     def _pb_mixture_ang_mean(self, back_mean, current_state, drift_coeff, back_mean_correction,
-                             t_next, u_lift):
+                             t_next, u_lift, back_shift=None):
         """
         Replace the angular dims of back_mean with a sampled mixture
         component's mean: draw the arrival lift k ~ pi by inverse-CDF on the
         pre-drawn uniform u_lift, then mean = (1 - c*kappa) * (y + L*k).
         Lift-then-Gaussian is exactly the mixture _pb_mixture_ang_logprob
         scores (its inner image sum is the wrap pushforward), so sampler and
-        scorer agree by construction.
+        scorer agree by construction. back_shift (P_B's force term) moves every
+        component's mean alike.
         """
         ang = self.ang_idx
         y = current_state.index_select(1, ang)                                   # [B, ang]
@@ -1011,17 +1224,21 @@ class GFN(nn.Module):  # todo add seeding
         idx = (u_lift.unsqueeze(-1) > cdf).sum(-1).clamp(max=len(self.PB_LIFTS) - 1)  # [B, ang]
         picked_lift = y_lifts.gather(-1, idx.unsqueeze(-1)).squeeze(-1)          # [B, ang]
         contraction = 1.0 - drift_coeff * back_mean_correction.index_select(1, ang)
-        return back_mean.index_copy(1, ang, contraction * picked_lift)
+        mean_ang = contraction * picked_lift
+        if back_shift is not None:
+            mean_ang = mean_ang + back_shift.index_select(1, ang)
+        return back_mean.index_copy(1, ang, mean_ang)
 
     def _replay_step(self, current_state, next_state, dts, t_cur, t_next,
-                     condition_embedding, is_first: bool):
+                     condition_embedding, is_first: bool, force_cur=None, force_next=None):
         """
         Score one fixed transition (replayed trajectory): no propagation, no
-        wrap -- states are read as given.
+        wrap -- states are read as given. force_cur / force_next are the forces
+        at the two states, from the loop.
         """
         # PROPAGATION (evaluated against the given transition, not sampled)
         pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
-            current_state, t_cur, condition_embedding, t_next, dts)
+            current_state, t_cur, condition_embedding, t_next, dts, force_cur)
 
         flow_i = self._step_flow(s_emb, t_emb)
 
@@ -1032,11 +1249,11 @@ class GFN(nn.Module):  # todo add seeding
         # compute backward logprobs
         back_drift, back_var, logpb_i = self._eval_pb_logprob(
             condition_embedding, current_state, next_state, dts, t_cur, t_next,
-            is_first, logpf_i)
+            is_first, logpf_i, force_next)
         return logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
 
     def last_step_mean_shift(self, trajectory, discretizer, condition, mol_batch,
-                             freeze_policy: bool = False):
+                             freeze_policy: bool = False, drift_context=None):
         """dt * mu_theta(x_{T-1}) LIVE for a batch of stored trajectories: the
         MEAN channel of the last step's reparameterisation, dt * d mu / d theta.
         For the mean-only stored-force surrogate (replay_loss_coeffs
@@ -1058,12 +1275,16 @@ class GFN(nn.Module):  # todo add seeding
                 condition_embedding = condition_embedding.detach()
         else:
             condition_embedding = None
+        force = (self._state_force(trajectory[:, T - 1], ts[:, T - 1],
+                                   self._drift_context(drift_context, mol_batch))
+                 if self.force_fwd_on else None)
         pf_mean = self._forward_kernel(trajectory[:, T - 1], ts[:, T - 1], condition_embedding,
-                                       ts[:, T], dts)[0]
+                                       ts[:, T], dts, force)[0]
         return dts.unsqueeze(1) * pf_mean
 
     def _implied_step(self, current_state, next_state_stored, dts, t_cur, t_next,
-                      condition_embedding, is_first: bool):
+                      condition_embedding, is_first: bool,
+                      force_cur=None, drift_ctx=None, need_force_next: bool = False):
         """
         One STORED transition re-propagated LIVE through the noise the current
         kernel needs to reproduce it: eps* = (x_{t+1} - x_t - dt*mu_theta) /
@@ -1079,7 +1300,7 @@ class GFN(nn.Module):  # todo add seeding
         sigma-credit differs.
         """
         pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
-            current_state, t_cur, condition_embedding, t_next, dts)
+            current_state, t_cur, condition_embedding, t_next, dts, force_cur)
         fwd_drift = dts.unsqueeze(1) * pf_mean
         with torch.no_grad():
             resid = self._wrap_ang(next_state_stored - current_state - fwd_drift)
@@ -1131,16 +1352,22 @@ class GFN(nn.Module):  # todo add seeding
 
         flow_i = self._step_flow(s_emb, t_emb)
         logpf_i = self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V)
+        force_next = self._state_force(next_state, t_next, drift_ctx) if need_force_next else None
         back_drift, back_var, logpb_i = self._eval_pb_logprob(
             condition_embedding, current_state, next_state, dts, t_cur, t_next,
-            is_first, logpf_i)
-        return next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+            is_first, logpf_i, force_next)
+        return (next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d,
+                force_next)
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True,
                      freeze_policy: bool = False, path_grad_last_k: int = 0,
-                     state_grad_hook=None):
+                     state_grad_hook=None, drift_context=None):
         """
+        drift_context: handed untouched to the force provider (install_drift_force)
+        with every state; None lets the provider build it from mol_batch. Unused
+        without a force term.
+
         state_grad_hook(i, grad): optional callback registered on every LIVE
         (non-detached) next_state, receiving the step index and dL/dx_{i+1}
         during backward. A pure diagnostic for the path-gradient arms: it is
@@ -1199,6 +1426,12 @@ class GFN(nn.Module):  # todo add seeding
         if not self.full_flow:
             log_flow[:, 0] = self._condition_flow(condition_embedding)
 
+        # force at the state the next step leaves from; each step returns the force
+        # at the state it lands on, so a state's force is computed once
+        drift_context = self._drift_context(drift_context, mol_batch)
+        force_cur = (self._state_force(current_state, ts[:, 0], drift_context)
+                     if self.force_fwd_on else None)
+
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
             # pre-draw the step's noise at loop level (outside any checkpoint
@@ -1213,10 +1446,13 @@ class GFN(nn.Module):  # todo add seeding
             if path_grad_last_k > 0 and i >= trajectory_length - path_grad_last_k:
                 step_detach = False
 
+            # P_B reads the landing state's force on every step, P_F on all but the last
+            need_force_next = self.force_bwd_on or (self.force_fwd_on and i < trajectory_length - 1)
             (next_state, logpf_i, logpb_i, flow_i,
-             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+             back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                 use_ckpt, self._fwd_step, current_state, dts, ts[:, i], ts[:, i + 1],
-                condition_embedding, eps, eps_r, exploration_std, i == 0, step_detach)
+                condition_embedding, eps, eps_r, exploration_std, i == 0, step_detach,
+                force_cur, drift_context, need_force_next)
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)
@@ -1302,7 +1538,8 @@ class GFN(nn.Module):  # todo add seeding
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = False,
-                     freeze_policy: bool = False, scramble_condition_tiles: int = 0):
+                     freeze_policy: bool = False, scramble_condition_tiles: int = 0,
+                     drift_context=None):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -1337,6 +1574,11 @@ class GFN(nn.Module):  # todo add seeding
         if not self.full_flow and trajectory_length > 1:
             log_flow[:, 0] = self._condition_flow(condition_embedding)
 
+        # force at the state the next backward step is conditioned on (see get_traj_fwd)
+        drift_context = self._drift_context(drift_context, mol_batch)
+        force_cur = (self._state_force(current_state, ts[:, trajectory_length], drift_context)
+                     if (self.force_bwd_on and trajectory_length > 1) else None)
+
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
             # pre-draw the step's noise at loop level (outside any checkpoint
@@ -1348,10 +1590,14 @@ class GFN(nn.Module):  # todo add seeding
                       if (self.pb_exact_reversal and self.ang_dim > 0 and i < trajectory_length - 1)
                       else None)
 
+            # P_F reads the force at the state this step lands on; P_B reads it on the
+            # next step unless that step is the deterministic one into the source
+            need_force_prev = self.force_fwd_on or (self.force_bwd_on and i < trajectory_length - 2)
             (prev_state, logpf_i, logpb_i, flow_i,
-             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+             back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                 use_ckpt, self._bwd_step, current_state, dts, ts, condition_embedding,
-                eps, u_lift, i, trajectory_length, detach_traj)
+                eps, u_lift, i, trajectory_length, detach_traj,
+                force_cur, drift_context, need_force_prev)
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)
@@ -1373,7 +1619,8 @@ class GFN(nn.Module):  # todo add seeding
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
                         return_gauss_params: bool = False, freeze_policy: bool = False,
                         scramble_condition_tiles: int = 0, resample_last_k: int = 0,
-                        state_grad_hook=None, implied_noise_last_k: int = 0):
+                        state_grad_hook=None, implied_noise_last_k: int = 0,
+                        drift_context=None, state_forces=None):
         """
         Recompute log_flow, logpf and logpb for a fixed batch of trajectories
         (e.g., replayed from a buffer), instead of generating them. Mirrors
@@ -1397,6 +1644,11 @@ class GFN(nn.Module):  # todo add seeding
         returned states EQUAL the stored ones and carry d x / d theta. Pair
         with a stored terminal force (replay_loss_coeffs.stored_force_k).
         Mutually exclusive with resample_last_k.
+
+        state_forces: [batch_size, trajectory_length + 1, dim], the provider's force
+        at every stored state, if the caller kept them; the stored states are then
+        scored without calling the provider. They must come from the provider now
+        installed. A live tail computes its own.
 
         trajectory: [batch_size, trajectory_length + 1, dim]
         """
@@ -1446,13 +1698,31 @@ class GFN(nn.Module):  # todo add seeding
         # tail is collected here and the returned tensor is assembled by cat.
         live_tail = {}
 
+        if state_forces is not None and state_forces.shape != trajectory.shape:
+            raise ValueError(f"state_forces has shape {tuple(state_forces.shape)}, expected the "
+                             f"trajectory's {tuple(trajectory.shape)}")
+
+        # stored forces cover a fixed replay; only a live tail still needs the provider
+        if state_forces is None or resample_last_k > 0 or implied_noise_last_k > 0:
+            drift_context = self._drift_context(drift_context, mol_batch)
+
+        def stored_force(j):
+            if state_forces is not None:
+                return self._clean_force(state_forces[:, j].detach(), ts[:, j])
+            return self._state_force(trajectory[:, j], ts[:, j], drift_context)
+
+        force_cur = stored_force(0) if self.force_fwd_on else None
+
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
+            # as in get_traj_fwd: P_B reads the landing state's force, P_F all but the last
+            need_force_next = self.force_bwd_on or (self.force_fwd_on and i < trajectory_length - 1)
             if implied_noise_last_k > 0 and i >= trajectory_length - implied_noise_last_k:
                 (next_state, logpf_i, logpb_i, flow_i,
-                 back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                 back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                     use_ckpt, self._implied_step, current_state, trajectory[:, i + 1], dts,
-                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
+                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0,
+                    force_cur, drift_context, need_force_next)
                 if state_grad_hook is not None and next_state.requires_grad:
                     next_state.register_hook(functools.partial(state_grad_hook, i))
                 live_tail[i + 1] = next_state
@@ -1462,19 +1732,23 @@ class GFN(nn.Module):  # todo add seeding
                 eps_r = (torch.randn(batch_size, self.dplr_rank, device=self.device)
                          if self.dplr_rank > 0 else None)
                 (next_state, logpf_i, logpb_i, flow_i,
-                 back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                 back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                     use_ckpt, self._fwd_step, current_state, dts, ts[:, i], ts[:, i + 1],
-                    condition_embedding, eps, eps_r, None, i == 0, False)
+                    condition_embedding, eps, eps_r, None, i == 0, False,
+                    force_cur, drift_context, need_force_next)
                 if state_grad_hook is not None and next_state.requires_grad:
                     next_state.register_hook(functools.partial(state_grad_hook, i))
                 live_tail[i + 1] = next_state
             else:
                 next_state = states[:, i + 1]
+                force_next = stored_force(i + 1) if need_force_next else None
 
                 (logpf_i, logpb_i, flow_i,
                  back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
                     use_ckpt, self._replay_step, current_state, next_state, dts,
-                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0)
+                    ts[:, i], ts[:, i + 1], condition_embedding, i == 0,
+                    force_cur, force_next)
+                force_cur = force_next
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)
@@ -1499,7 +1773,7 @@ class GFN(nn.Module):  # todo add seeding
             return states, logpfs, logpbs, log_flow
 
     def _eval_pb_logprob(self, condition_embedding, current_state, next_state, dts,
-                         t_prev, t_next, is_first: bool, fallback_logpf):
+                         t_prev, t_next, is_first: bool, fallback_logpf, force_next=None):
         """
         P_B step log-prob for the forward-direction transition current_state
         -> next_state over the step [t_prev, t_next]. Shared by get_traj_fwd and
@@ -1511,6 +1785,9 @@ class GFN(nn.Module):  # todo add seeding
         The returned back_drift is the canonical (k=0) component's drift --
         under pb_exact_reversal it is a diagnostic summary of the mixture,
         not the full kernel (see _pb_logprob).
+
+        force_next: the force at next_state, or None; with force_drift_bwd set
+        it adds P_B's force term (_bwd_force_shift), the same one _bwd_step samples.
         """
         # R2: P_B is a kernel of the state on the circle; condition on the
         # canonical representative, never a rollout's pre-wrap coordinate
@@ -1524,8 +1801,12 @@ class GFN(nn.Module):  # todo add seeding
             var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
                 min=-self.var_clip, max=self.var_clip).exp()
             back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
-            logpb_i = self._pb_logprob(current_state, next_state, drift_coeff,
-                                       back_mean_correction, back_var, t_next)
+            back_shift = None
+            if force_next is not None and self.force_bwd_on:
+                back_shift = self._bwd_force_shift(force_next, back_var, t_next)
+                back_drift = back_drift + back_shift
+            logpb_i = self._score_pb(current_state, next_state, drift_coeff,
+                                     back_mean_correction, back_var, t_next, back_shift)
         else:  # instead set this as a constant the model will have to learn around
             back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
             logpb_i = torch.zeros_like(fallback_logpf)
@@ -1541,7 +1822,19 @@ class GFN(nn.Module):  # todo add seeding
     PB_LIFTS = (-2.0, -1.0, 0.0, 1.0, 2.0)
     PB_IMAGE_LIFTS = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
 
-    def _pb_logprob(self, prev_state, next_state, drift_coeff, back_mean_correction, back_var, t_next):
+    def _score_pb(self, prev_state, next_state, drift_coeff, back_mean_correction, back_var,
+                  t_next, back_shift):
+        """_pb_logprob, called with its historical signature when there is no force
+        term: a subclass that overrides _pb_logprob without the back_shift argument
+        keeps working, and fails only if a force term is actually configured."""
+        if back_shift is None:
+            return self._pb_logprob(prev_state, next_state, drift_coeff, back_mean_correction,
+                                    back_var, t_next)
+        return self._pb_logprob(prev_state, next_state, drift_coeff, back_mean_correction,
+                                back_var, t_next, back_shift=back_shift)
+
+    def _pb_logprob(self, prev_state, next_state, drift_coeff, back_mean_correction, back_var, t_next,
+                    back_shift=None):
         """
         One-step log P_B(prev | next), shared by all scoring paths (fwd,
         replay via _eval_pb_logprob; bwd via _bwd_step). next_state must
@@ -1549,10 +1842,13 @@ class GFN(nn.Module):  # todo add seeding
         Angular dims: pb_exact_reversal=False scores the single-image kernel
         (gauss_logprob's nearest-image residual, drift from the canonical
         representative); =True scores the exact reversal of the wrapped
-        reference bridge (docs/periodic_scoring_fix.html eq. 4).
+        reference bridge (docs/periodic_scoring_fix.html eq. 4). back_shift
+        (P_B's force term, _bwd_force_shift) adds to the mean on every dim.
         """
         if not (self.pb_exact_reversal and self.ang_dim > 0):
             back_drift = -next_state * drift_coeff * back_mean_correction
+            if back_shift is not None:
+                back_drift = back_drift + back_shift
             return self.gauss_logprob(prev_state - next_state, back_drift, back_var)
 
         # canonicalize both endpoints: the truncated image grids below are
@@ -1563,6 +1859,8 @@ class GFN(nn.Module):  # todo add seeding
         lin, ang = self.lin_idx, self.ang_idx
         next_lin = next_state.index_select(1, lin)
         back_drift_lin = -next_lin * drift_coeff * back_mean_correction.index_select(1, lin)
+        if back_shift is not None:
+            back_drift_lin = back_drift_lin + back_shift.index_select(1, lin)
         z_lin = (prev_state.index_select(1, lin) - next_lin) - back_drift_lin
         var_lin = back_var.index_select(1, lin)
         logpb_lin = -0.5 * (z_lin ** 2 / var_lin + logtwopi + var_lin.log()).sum(1)
@@ -1570,10 +1868,11 @@ class GFN(nn.Module):  # todo add seeding
         logpb_ang = self._pb_mixture_ang_logprob(
             prev_state.index_select(1, ang), next_state.index_select(1, ang),
             drift_coeff, back_mean_correction.index_select(1, ang),
-            back_var.index_select(1, ang), t_next)
+            back_var.index_select(1, ang), t_next,
+            None if back_shift is None else back_shift.index_select(1, ang))
         return logpb_lin + logpb_ang
 
-    def _pb_mixture_ang_logprob(self, x, y, drift_coeff, kappa, beta_sq, t_next):
+    def _pb_mixture_ang_logprob(self, x, y, drift_coeff, kappa, beta_sq, t_next, shift=None):
         """
         Exact reversal of the wrapped reference bridge on angular dims, in
         double-image form: an outer mixture over arrival lifts y + L*k of the
@@ -1594,6 +1893,8 @@ class GFN(nn.Module):  # todo add seeding
 
         contraction = 1.0 - drift_coeff * kappa                          # [B, ang]
         component_mean = contraction.unsqueeze(-1) * y_lifts             # [B, ang, K]
+        if shift is not None:
+            component_mean = component_mean + shift.unsqueeze(-1)
 
         image_lifts = torch.tensor(self.PB_IMAGE_LIFTS, device=x.device, dtype=x.dtype) * period
         x_lifts = x.unsqueeze(-1).unsqueeze(-1) + image_lifts.view(1, 1, 1, -1)  # [B, ang, 1, M]
@@ -1720,6 +2021,11 @@ class GFN(nn.Module):  # todo add seeding
                 "attributes and freeze_backward_policy deepcopies the trunk; the "
                 "two are mutually exclusive. Use compile_policy: auto with a "
                 "frozen P_B.")
+        if self.force_on:
+            raise ValueError(
+                "compile_policy: 'step' compiles the step bodies, and with a force term "
+                "(force_drift_fwd / force_drift_bwd) _fwd_step calls the force provider "
+                "inside that region. Use compile_policy: auto with a force term.")
         self._fwd_step = torch.compile(self._fwd_step)
         self._replay_step = torch.compile(self._replay_step)
         print('compile_policy step: _fwd_step + _replay_step compiled as whole-step '
