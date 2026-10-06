@@ -58,6 +58,7 @@ LOGS=${BATTERY}/joblogs
 CKPTS=${WORKDIR}/checkpoints
 RESULTS=${PROJECT_ROOT}/csp_oct05
 SEARCH=${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/qm9_full_sep29/tasks/0.yaml
+PYLIBS=/scratch/mk8347/pylibs
 mkdir -p ${LOGS} ${RESULTS}
 
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
@@ -73,6 +74,7 @@ if [ ! -f "${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_search/standardize.py" 
     echo "FATAL: MXtalTools lacks crystal_search/standardize.py -- git pull MXtalTools" >&2; exit 1
 fi
 if [ ! -f "${WORKDIR}/eval/cond_panel/csp.py" ]; then echo "FATAL: missing eval/cond_panel/csp.py -- git pull gfn-diffusion" >&2; exit 1; fi
+if [ ! -d "${PYLIBS}/spglib" ]; then echo "FATAL: ${PYLIBS} holds no spglib (the cell standardisation imports it)" >&2; exit 1; fi
 NA=$(ls ${CKPTS}/*${ARM}_*_step${STEP}.pt 2>/dev/null | grep -v '_buffers.pt$' | wc -l)
 if [ "${NA}" -ne 1 ]; then
     echo "FATAL: ${NA} matches for *${ARM}_*_step${STEP}.pt in ${CKPTS} (need exactly 1)" >&2; exit 1
@@ -93,7 +95,8 @@ srun singularity exec --nv \
     ${IMAGE} \
     /bin/bash -c "
         source /ext3/env.sh
-        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
+        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:${PYLIBS}:\$PYTHONPATH
+        python -c 'import spglib, yaml; from eval.cond_panel import csp, relax, sampler; from data_processing.pool_anchors import Chart; from mxtaltools.crystal_search.standardize import standardize_cells' || { echo 'FATAL: an import the evaluator needs failed in this environment' >&2; exit 1; }
         python -u -m eval.cond_panel.csp collect --model ${NAME}=${CK} --config ${CONFIG} --search-config ${SEARCH} \
             --out ${RESULTS}/${OUT} --n-train ${NTRAIN} --n-test ${NTEST} ${ARGS}
     " 2>&1 | tee ${J}.log
