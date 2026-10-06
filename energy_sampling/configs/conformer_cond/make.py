@@ -202,7 +202,8 @@ CRYSTAL_ONLY_KEYS = frozenset({
     # the crystal sampler's force term and its force model (image tables of a crystal)
     'model.force_drift_fwd', 'model.force_drift_bwd', 'model.force_drift_learned',
     'model.force_drift_max_sigma', 'model.force_drift_t_min', 'model.force_drift_differentiable',
-    'drift_force.checkpoint', 'drift_force.chunk',
+    'drift_force.checkpoint', 'drift_force.chunk', 'drift_force.max_images', 'drift_force.max_pairs',
+    'drift_force.max_pairs_per_call',
 })
 #: energy_config keys the route drops and still reads elsewhere (utils.problem_slug)
 TOLERATED_ENERGY_KEYS = frozenset({'temperature'})

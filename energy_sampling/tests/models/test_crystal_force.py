@@ -216,8 +216,9 @@ def test_target_force_is_the_pretraining_reference_and_agreement_reads_it(crysta
                         temperature=provider.temperature, compress_at=provider.compress_at, target='full',
                         switch_width=1.0)
     ref = build_example(batch, x, a, torch.tensor(list(VDW_RADII.values())), False, with_reference=True)['ref_force']
-    target = provider.target_force(x, ctx)
+    target, capped = provider.target_force(x, ctx)
     assert torch.allclose(target, -ref, atol=1e-3, rtol=1e-4) and target.abs().max() > 1e-2
+    assert not bool(capped.any()), 'a real crystal must sit under the default caps'
 
     stats = provider.agreement(x, ctx, step_variance=1e-3)
     assert stats['rows'] == len(crystals)
@@ -225,6 +226,49 @@ def test_target_force_is_the_pretraining_reference_and_agreement_reads_it(crysta
     want = (1e-3 ** 0.5 * (force - target).square().mean(1).sqrt()).median()
     assert abs(stats['err_sigma'] - float(want)) < 1e-6 * max(1.0, float(want))
     assert -1.0 <= stats['cosine'] <= 1.0 and stats['target_sigma'] > 0
+
+
+def _squeezed(batch):
+    """Stored crystals with their three cell-length rows pushed far down: cells no crystal has."""
+    x = batch.latent_params(gauge_fix_free_axes=True).clone()
+    x[:, :3] = -0.9
+    return x
+
+
+def test_memory_bound_caps_squeezed_cells_and_splits_calls_without_changing_values(crystals, checkpoint):
+    """On cells far below any physical density the pair list is capped per crystal and the trunk is
+    called on groups of crystals under the pair budget. The split changes no number; the caps are
+    counted; and a real crystal is under them, so its force is the uncapped one."""
+    batch = _batch(crystals)
+    x = _states(batch, 8)
+    free = TrunkForce(checkpoint, 'cpu', max_images=10 ** 6, max_pairs=10 ** 8, max_pairs_per_call=10 ** 9)
+    default = TrunkForce(checkpoint, 'cpu')
+    f_free = free(x, free.context(batch), False)
+    # the same pair lists (MXtalTools' tests/test_image_pairs.py holds them entry for entry); two evaluations differ only in rounding
+    assert torch.allclose(default(x, default.context(batch), False), f_free, atol=1e-5, rtol=1e-6)
+    assert default.capped_rows == 0 and free.capped_rows == 0
+
+    x = _squeezed(batch)
+    one = TrunkForce(checkpoint, 'cpu', max_images=60, max_pairs=500, max_pairs_per_call=10 ** 9)
+    e1, f1 = one.energy_and_force(x, one.context(batch))
+    assert one.capped_rows == len(crystals) and one.extra_calls == 0, (one.capped_rows, one.extra_calls)
+    assert torch.isfinite(f1).all() and torch.isfinite(e1).all() and f1.abs().max() > 0
+
+    split = TrunkForce(checkpoint, 'cpu', max_images=60, max_pairs=500, max_pairs_per_call=1200)
+    e2, f2 = split.energy_and_force(x, split.context(batch))
+    assert split.extra_calls >= 2, 'the pair budget was meant to force several trunk calls'
+    assert torch.allclose(e2, e1, atol=1e-4, rtol=1e-5) and torch.allclose(f2, f1, atol=1e-3, rtol=1e-4)
+    # chunks and the budget compose
+    both = TrunkForce(checkpoint, 'cpu', chunk=3, max_images=60, max_pairs=500, max_pairs_per_call=1200)
+    e3, f3 = both.energy_and_force(x, both.context(batch))
+    assert torch.allclose(e3, e1, atol=1e-4, rtol=1e-5) and torch.allclose(f3, f1, atol=1e-3, rtol=1e-4)
+
+    # the agreement check leaves capped rows out rather than comparing two truncated lists
+    stats = one.agreement(x, one.context(batch), step_variance=1e-3)
+    assert stats['rows'] + stats['capped'] == len(crystals) and stats['capped'] > 0
+
+    with pytest.raises(ValueError, match='must fit in a call'):
+        TrunkForce(checkpoint, 'cpu', max_pairs=500, max_pairs_per_call=100)
 
 
 def test_copying_a_sampler_shares_the_provider(crystals, checkpoint):

@@ -361,7 +361,10 @@ model:
 ################################################################
 drift_force:
   checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint; required when a force term is on
-  chunk: 1000                  # crystal states per trunk call
+  chunk: 1000                  # crystal states per geometry build
+  max_images: 2000             # image molecules one crystal may hold inside the trunk's reach; its nearest are kept
+  max_pairs: 40000             # atom pairs one crystal may hold inside the trunk's cutoff; its shortest are kept
+  max_pairs_per_call: 4000000  # atom pairs one trunk call may be handed; a batch over it is split across calls
 
 # training params
 ################################################################

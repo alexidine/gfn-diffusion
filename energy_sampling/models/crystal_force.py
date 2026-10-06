@@ -13,6 +13,14 @@ E~ is the trunk's energy: the per-atom-compressed eLJ energy in kT at ONE temper
 molecule-only parts of the geometry (image tables, intramolecular pairs) are built once
 per context; a state costs the latent map, the image selection, the pair distances inside
 the trunk's cutoff, and one forward and one backward pass of the trunk.
+
+MEMORY IS BOUNDED WHATEVER THE STATE. A cell squeezed far below any physical density (what
+an untrained policy produces) has thousands of times the pairs of a crystal: 2.2 million
+inside 5 A against at most 21 thousand on the trunk's training states (QM9, measured
+2026-10-06). `max_images` and `max_pairs` cap what one crystal may hold (its nearest images,
+its shortest pairs), and `max_pairs_per_call` splits a batch of rows across trunk calls, so
+no state can ask for more than a fixed amount. A capped crystal's force is the force of its
+truncated pair list; `capped_rows` counts them.
 """
 import math
 from dataclasses import dataclass, replace
@@ -72,11 +80,15 @@ class TrunkForce:
     ----------
     checkpoint : path of a `pretrain_atom_trunk.py` checkpoint (arm 'trunk', target 'full').
     device : where the trunk and every context live.
-    chunk : rows per trunk call; a context's rows are split into chunks of this size, which
-        bounds the memory of one force evaluation.
+    chunk : rows per geometry build; a context's rows are split into chunks of this size.
+    max_images, max_pairs : per-crystal caps on image molecules and on atom pairs inside the
+        trunk's cutoff (`image_pairs.select_images`, `pair_distances`). The defaults are about
+        twice the largest counts on the trunk's training states.
+    max_pairs_per_call : pairs one trunk call may be handed; rows over it go to further calls.
     """
 
-    def __init__(self, checkpoint: str, device, chunk: int = 1000):
+    def __init__(self, checkpoint: str, device, chunk: int = 1000, max_images: int = 2000,
+                 max_pairs: int = 40_000, max_pairs_per_call: int = 4_000_000):
         ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
         a = ck['args']
         if a.get('arm') != 'trunk' or a.get('target', 'full') != 'full':
@@ -85,6 +97,11 @@ class TrunkForce:
         self.checkpoint = str(checkpoint)
         self.device = torch.device(device)
         self.chunk = int(chunk)
+        self.max_images, self.max_pairs = int(max_images), int(max_pairs)
+        self.max_pairs_per_call = int(max_pairs_per_call)
+        if min(self.max_images, self.max_pairs, self.max_pairs_per_call) < 1 or self.max_pairs > self.max_pairs_per_call:
+            raise ValueError(f"max_images {max_images}, max_pairs {max_pairs} and max_pairs_per_call "
+                             f"{max_pairs_per_call} must be positive, and one crystal's pairs must fit in a call")
         self.cutoff = float(a['feature_cutoff'])
         self.label_cutoff = float(a['label_cutoff'])
         self.compress_at = float(a['compress_at'])
@@ -98,6 +115,8 @@ class TrunkForce:
         self.trunk.requires_grad_(False).eval()
         self.calls = 0          # force evaluations (one per state batch)
         self.rows = 0           # crystal states evaluated
+        self.capped_rows = 0    # of those, states whose image or pair list was capped
+        self.extra_calls = 0    # trunk calls beyond one per chunk, made to stay under max_pairs_per_call
 
     def check_energy(self, temperature: float, lj_coeff: float, rtol: float = 1e-6):
         """Refuse a run whose energy is not the one the trunk was fitted to. The target is
@@ -142,25 +161,59 @@ class TrunkForce:
             grad = torch.zeros_like(x)
             for c in ctx.chunks:
                 r = c.rows
-                sel = select_images(c.tables, T_fc[r], T_cf[r], centroid[r], orientation[r], self.cutoff)
-                pairs = pair_distances(c.tables, sel, self.cutoff)
-                out = self.trunk(c.z, c.node_graph, c.intra_index, c.intra_dist,
-                                 pairs['node_ref'], pairs['node_img'], pairs['dist'],
-                                 crystal_density(c.tables, T_fc[r]))
-                g, = torch.autograd.grad(out['energy'].sum(), x, retain_graph=True, create_graph=create_graph)
-                grad = grad + g
-                energy[r] = out['energy'].detach()
+                sel = select_images(c.tables, T_fc[r], T_cf[r], centroid[r], orientation[r], self.cutoff,
+                                    max_images=self.max_images)
+                pairs = pair_distances(c.tables, sel, self.cutoff, max_pairs=self.max_pairs)
+                self.capped_rows += int((sel['capped'] | sel['image_capped'] | pairs['pair_capped']).sum())
+                density = crystal_density(c.tables, T_fc[r])
+                for rows, inputs in self._calls(c, pairs, density):
+                    e = self.trunk(*inputs)['energy']
+                    g, = torch.autograd.grad(e.sum(), x, retain_graph=True, create_graph=create_graph)
+                    grad = grad + g
+                    energy[r][rows] = e.detach()
         self.calls += 1
         self.rows += ctx.num_rows
         return energy, -grad
+
+    def _calls(self, c: _Chunk, pairs, density):
+        """The trunk calls of one chunk: (rows of the chunk, trunk inputs) for the whole chunk when its
+        pairs fit `max_pairs_per_call`, else for consecutive groups of crystals that each do. Each
+        group's energy depends on its own crystals alone, so the caller may take its gradient and
+        let it go before the next."""
+        n_rows = c.rows.stop - c.rows.start
+        if int(pairs['dist'].numel()) <= self.max_pairs_per_call:
+            yield slice(0, n_rows), (c.z, c.node_graph, c.intra_index, c.intra_dist,
+                                     pairs['node_ref'], pairs['node_img'], pairs['dist'], density)
+            return
+        counts = torch.bincount(pairs['graph'], minlength=n_rows).tolist()
+        bounds, held = [0], 0
+        for g, k in enumerate(counts):
+            if held and held + k > self.max_pairs_per_call:
+                bounds.append(g)
+                held = 0
+            held += k
+        bounds.append(n_rows)
+        node_ptr = c.tables.ptr.tolist() + [int(c.z.numel())]
+        self.extra_calls += len(bounds) - 2
+        for g0, g1 in zip(bounds[:-1], bounds[1:]):
+            n0, n1 = node_ptr[g0], node_ptr[g1]
+            mine = (pairs['graph'] >= g0) & (pairs['graph'] < g1)
+            intra = (c.intra_index[1] >= n0) & (c.intra_index[1] < n1)     # an edge never leaves its molecule
+            yield slice(g0, g1), (c.z[n0:n1], c.node_graph[n0:n1] - g0, c.intra_index[:, intra] - n0,
+                                  c.intra_dist[intra], pairs['node_ref'][mine] - n0, pairs['node_img'][mine] - n0,
+                                  pairs['dist'][mine], density[g0:g1])
 
     def __call__(self, state, ctx: TrunkContext, create_graph: bool = False):
         return self.energy_and_force(state, ctx, create_graph)[1]
 
     def target_force(self, state, ctx: TrunkContext):
-        """-d(target)/dstate [B, dim]: the force of the energy the trunk was fitted to, the compressed
-        eLJ energy inside `label_cutoff`, computed exactly. What the trunk's force is an estimate of."""
+        """(-d(target)/dstate [B, dim], capped [B]): the force of the energy the trunk was fitted to, the
+        compressed eLJ energy inside `label_cutoff`, computed exactly; what the trunk's force is an
+        estimate of. The per-crystal caps apply here too, scaled by the volume ratio of the two cutoffs,
+        and `capped` marks the rows they cut: there this is the force of a truncated list, not the target."""
         vdw = torch.tensor(list(VDW_RADII.values()), device=self.device)
+        wider = math.ceil((self.label_cutoff / self.cutoff) ** 3)
+        capped = torch.zeros(ctx.num_rows, dtype=torch.bool, device=self.device)
         with torch.enable_grad():
             x = state.detach().to(self.device).requires_grad_(True)
             cb = ctx.crystals
@@ -169,31 +222,34 @@ class TrunkForce:
             grad = torch.zeros_like(x)
             for c in ctx.chunks:
                 r = c.rows
-                sel = select_images(c.tables, T_fc[r], T_cf[r], centroid[r], orientation[r], self.label_cutoff)
-                pairs = pair_distances(c.tables, sel, self.label_cutoff)
+                sel = select_images(c.tables, T_fc[r], T_cf[r], centroid[r], orientation[r], self.label_cutoff,
+                                    max_images=wider * self.max_images)
+                pairs = pair_distances(c.tables, sel, self.label_cutoff, max_pairs=wider * self.max_pairs)
+                capped[r] = sel['capped'] | sel['image_capped'] | pairs['pair_capped']
                 e_atom = compressed_elj_per_atom(pairs, vdw, self.lj_coeff, self.temperature, self.compress_at,
                                                  int(c.z.numel()))
                 grad = grad + torch.autograd.grad(e_atom.sum(), x, retain_graph=True)[0]
-        return -grad
+        return -grad, capped
 
     def agreement(self, state, ctx: TrunkContext, step_variance: float):
         """How well the trunk's force matches its target at `state`: medians over the rows where both
-        are finite. `step_variance` is one trajectory step's noise variance, so the two `*_sigma`
-        numbers are the displacement of a full-strength force step, target and error, in units of
-        that step's noise standard deviation (RMS over the latent's coordinates)."""
+        are finite and the target's pair list was not capped (`rows` of them; `capped` counts the rows
+        left out for a cap). `step_variance` is one trajectory step's noise variance, so the two
+        `*_sigma` numbers are the displacement of a full-strength force step, target and error, in
+        units of that step's noise standard deviation (RMS over the latent's coordinates)."""
         force = self(state, ctx, False)
-        target = self.target_force(state, ctx)
-        ok = torch.isfinite(force).all(1) & torch.isfinite(target).all(1)
+        target, capped = self.target_force(state, ctx)
+        ok = torch.isfinite(force).all(1) & torch.isfinite(target).all(1) & ~capped
         if not bool(ok.any()):
             return {'cosine': float('nan'), 'cosine_p10': float('nan'), 'err_sigma': float('nan'),
-                    'target_sigma': float('nan'), 'rows': 0}
+                    'target_sigma': float('nan'), 'rows': 0, 'capped': int(capped.sum())}
         f, t = force[ok], target[ok]
         cos = torch.nn.functional.cosine_similarity(f, t, dim=1)
         scale = math.sqrt(step_variance)
         return {'cosine': float(cos.median()), 'cosine_p10': float(cos.quantile(0.1)),
                 'err_sigma': float((scale * (f - t).square().mean(1).sqrt()).median()),
                 'target_sigma': float((scale * t.square().mean(1).sqrt()).median()),
-                'rows': int(ok.sum())}
+                'rows': int(ok.sum()), 'capped': int(capped.sum())}
 
 
 class CrystalDriftForce:

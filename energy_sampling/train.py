@@ -3266,7 +3266,7 @@ class Modeller:
                   f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
         self.ema_model.install_pb_snapshot(frozen)
 
-    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk')
+    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call')
 
     def _build_drift_force(self):
         """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd):
@@ -3296,13 +3296,17 @@ class Modeller:
                 f"the force term reads a trunk fitted to the eLJ energy of Z' = 1 crystals at one temperature; "
                 f"this run has energy_function {self.args.energy_function!r}, z_primes {list(self.args.z_primes)}, "
                 f"temperature_conditioning {self.args.temperature_conditioning}")
-        trunk = TrunkForce(checkpoint, self.device, chunk=int(cfg.get('chunk', 1000)))
+        # an absent key takes TrunkForce's own default: the bound is on whether or not a config names it
+        trunk = TrunkForce(checkpoint, self.device, **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:]
+                                                       if cfg.get(k) is not None})
         trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
         m = self.gfn_model
         print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "
               f"{trunk.temperature:g}, lj_coeff {trunk.lj_coeff:g}); P_F gate starts at {m.force_drift_fwd}, "
               f"P_B gate at {m.force_drift_bwd}, {'learned' if m.force_drift_learned else 'held fixed'}; cap "
-              f"{m.force_drift_max_sigma} noise std per step; acting from t = {m.force_drift_t_min:g}")
+              f"{m.force_drift_max_sigma} noise std per step; acting from t = {m.force_drift_t_min:g}; at most "
+              f"{trunk.max_images} images and {trunk.max_pairs} pairs a crystal, {trunk.max_pairs_per_call} pairs a "
+              f"trunk call")
         return CrystalDriftForce(trunk, self.energy_function)
 
     @torch.no_grad()
@@ -3342,6 +3346,9 @@ class Modeller:
                     stats[f'force/gate_bwd_mean_{tag}'] = float(model._mean_over_live(gate_b[n:n + 1]))
             stats['force/nonfinite_rows'] = float(model.force_nonfinite_rows())
             stats['force/trunk_states'] = float(trunk.rows)
+            # running totals since start-up: states whose pair list hit a cap, and trunk calls split for memory
+            stats['force/capped_states'] = float(trunk.capped_rows)
+            stats['force/extra_trunk_calls'] = float(trunk.extra_calls)
             stats['force/agreement_failed'] = 0.0
             tags = [f't{float(ts[j]):.2f}' for j in picks]
             print(f"force model on {rows} rollout states per time (cosine with its target | error and target step, "
@@ -3349,7 +3356,9 @@ class Modeller:
                       f"{tag[1:]}: {stats[f'force/cosine_{tag}']:.4f} | {stats[f'force/err_sigma_{tag}']:.3f} of "
                       f"{stats[f'force/target_sigma_{tag}']:.2f}"
                       + (f" | {stats[f'force/gate_fwd_mean_{tag}']:+.5f}" if gate_f is not None else "")
-                      for tag in tags))
+                      for tag in tags)
+                  + f". Capped so far: {trunk.capped_rows} of {trunk.rows} states; left out of this check for a cap: "
+                  + ", ".join(str(int(stats[f'force/capped_{tag}'])) for tag in tags))
         except Exception as e:  # a diagnostic must not end a run; the flag above says it did not report
             print(f"force_agreement_stats failed ({type(e).__name__}: {e}); logged as force/agreement_failed = 1")
         return stats
