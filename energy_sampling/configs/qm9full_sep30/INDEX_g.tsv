@@ -1,0 +1,5 @@
+arm	family	start	warm_src	prior	prior_bytes	src_step
+qf30_cmf_b1k_lr20	qm9full	weights	qf30_p1lr2	qm9full_prior.pt	2433322986	45000
+qf30_cmf_b1k_lr40	qm9full	weights	qf30_p1lr2	qm9full_prior.pt	2433322986	45000
+qf30_cmf_b4k_lr20	qm9full	weights	qf30_p1lr2	qm9full_prior.pt	2433322986	45000
+qf30_cmf_b4k_lr40	qm9full	weights	qf30_p1lr2	qm9full_prior.pt	2433322986	45000
