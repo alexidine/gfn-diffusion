@@ -174,6 +174,7 @@ against its own target on this run's rollout states); train_step_time.
     python configs/qm9full_sep30/make.py cmle [--dry]      # leg e
     python configs/qm9full_sep30/make.py force [--dry]     # leg f
     python configs/qm9full_sep30/make.py mleb [--dry]      # leg g
+    python configs/qm9full_sep30/make.py scratch [--dry]   # leg h
 
 LEG G, CONDITIONAL MLE OVER BATCH AND RATE (`python configs/qm9full_sep30/make.py mleb`; owner 2026-10-06: "MLE is
 quite well-behaved and cheap. I wonder if we could get away with huge batches and larger LR, to accelerate
@@ -195,6 +196,20 @@ not fit runs on at a smaller batch: Batch Size and batch/oom_events say so. The 
 at the end of burn-in on these weights-only starts (2 and 4 on seed_lr 1.25e-4). Same seed as leg e: qf30_p1lr2's
 step-45,000 archive, weights only on a first launch, full resume afterwards; no exit, stopped by hand. Compare at
 equal steps, at equal rows seen and at equal wall clock.
+
+LEG H, CONDITIONAL MLE FROM SCRATCH (`python configs/qm9full_sep30/make.py scratch`; owner 2026-10-06, the control
+of the comparison of the existing architecture with and without the force term, and later of the graph policy).
+Leg e's and leg g's arms start from other weights (phase 1's scrambled leg, or the TB leader); these start from nothing.
+Each row is phase 1's leg-1 recipe (build_p1 at fixed_scale 2: burn-in, the ramp to 2.5e-4, the hot guard, run
+until stopped) with no warm start, the condition scramble off and its own seed, and nothing else moved (asserted):
+  [0] qf30_ed_cmle_s1   seed 12345 (the recipe's)
+  [1] qf30_ed_cmle_s2   seed 23456
+  [2] qf30_ed_cmle_s3   seed 34567
+A fresh first launch and self-resume afterwards (phase 1's job script, reading INDEX_h.tsv). P_B is live and the
+batch sizer is leg e's, as in phase 1: leg g's frozen P_B is a snapshot of trained weights, which a fresh run lacks.
+The reading is the forward draws' median excess and the forward Jensen, on training and on held-out molecules, by
+step and by hour, against qf30_cmle_seed's curve at equal MLE steps (leg e). ROWS ARE APPENDED, never reordered:
+the rows that add the force term to this recipe take the next indices.
 """
 import copy
 import importlib.util
@@ -294,6 +309,9 @@ NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run:
 SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
 # leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
 CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
+# leg h: (run_name, seed) of the from-scratch conditional-MLE rows. ROW ORDER IS THE ARRAY INDEX: append only.
+SCRATCH = (('ed_cmle_s1', 12345), ('ed_cmle_s2', 23456), ('ed_cmle_s3', 34567))
+SCRATCH_SCALE = 2.0     # lr_control.fixed_scale of phase 1's leg 1 and of leg e: 2.5e-4 after burn-in and the ramp
 # leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
 MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr40', 1000, 4.0),
         ('cmf_b4k_lr20', 4000, 2.0), ('cmf_b4k_lr40', 4000, 4.0))
@@ -866,6 +884,91 @@ def main_force(argv):
           f'{FORCE_SEED_STEP:,} with its _buffers.pt beside it')
 
 
+def build_scratch(run, seed):
+    """Phase 1's leg-1 recipe from nothing, conditionally: no warm start, the scramble off, its own seed (the module
+    docstring, LEG H)."""
+    cfg = build_p1(run, SCRATCH_SCALE, None)
+    cfg['seed'] = seed
+    stages = cfg['protocols'][PROTOCOL]['stages']
+    assert stages[0]['flags']['scramble_conditions'] is True, run
+    stages[0]['flags']['scramble_conditions'] = False
+    return cfg
+
+
+def check_scratch(cfg, name, seed, p1lr2):
+    check_p1(cfg, name, SCRATCH_SCALE, None)
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert st[0]['bwd_sampling_mode'] == 'dataset' and st[0]['loss_coeffs']['bwd']['mle'] == 1.0, name
+    assert cfg['embedding_conditioning'] is True and not cfg.get('freeze_backward_policy'), name
+    assert cfg['seed'] == seed and isinstance(seed, int), (name, cfg['seed'])
+    # the committed phase-1 leg 1 (which leg e's arms are, scramble aside) with these leaves moved, and no others:
+    # a fresh start in place of the weights-only seed, the scramble, and the seed where it is not the recipe's
+    assert w3.problem_def(cfg) == w3.problem_def(p1lr2), f'{name}: not the problem of {TAG}_{LEGS[LIVE][0]}'
+    allowed = ['checkpoint_name', 'load_weights_only',
+               f'protocols.{PROTOCOL}.stages[train_prior].flags.scramble_conditions']
+    allowed += ['seed'] if seed != p1lr2['seed'] else []
+    assert _moved(p1lr2, cfg) == sorted(allowed), (name, _moved(p1lr2, cfg))
+    w3.load_check(cfg, name)
+
+
+def main_scratch(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+    leg1 = f'{TAG}_{LEGS[LIVE][0]}'
+    p1lr2 = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{leg1}.yaml'], HERE))
+    assert yaml.safe_load((HERE / f'{leg1}.yaml').read_text(encoding='utf-8')) == p1lr2, f'{leg1}.yaml is not committed'
+    ran = ({f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
+           | {f'{TAG}_{run}' for run, *_ in CONT} | {f'{TAG}_{run}' for run, _ in CMLE}
+           | {f'{TAG}_{run}' for run, *_ in FORCE} | {f'{TAG}_{run}' for run, *_ in MLEB})
+    assert len({seed for _, seed in SCRATCH}) == len(SCRATCH), 'two rows share a seed'
+    rows, new = [], {}
+    for run, seed in SCRATCH:
+        name = f'{TAG}_{run}'
+        assert name not in ran, name
+        cfg = build_scratch(run, seed)
+        check_scratch(cfg, name, seed, p1lr2)
+        new[name] = cfg
+        rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    rate = SCRATCH_SCALE * SEED_LR
+    print(f'leg h, conditional MLE from scratch (INDEX_h row = array index): phase 1\'s leg-1 recipe at {rate:g}, '
+          f'scramble off, no warm start:')
+    for i, (run, seed) in enumerate(SCRATCH):
+        print(f'[{i}] {TAG}_{run:<12} seed {seed}')
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    with (HERE / 'INDEX_h.tsv').open('w', encoding='utf-8', newline='\n') as f:
+        f.write('arm\tfamily\tstart\twarm_src\tprior\tprior_bytes\n')
+        f.writelines(rows)
+    array = '#SBATCH --array=0-__LAST__'
+    old = '# __BATTERY__: phase-1 MLE on the Niggli P-1 priors, warm (mle09 best, weights-only) and fresh.'
+    index, index_note = '${ARMS}/INDEX.tsv', '# Arm = row of INDEX.tsv'
+    assert all(nig.SBATCH.count(t) == 1 for t in (array, old, index_note)) and nig.SBATCH.count(index) == 4, \
+        'the mle_nig_sep17 job script moved'
+    sb = (nig.SBATCH.replace(array, f'#SBATCH --array=0-{len(rows) - 1}')
+          .replace(old, f'# __BATTERY__ leg h: conditional MLE from scratch (phase 1 with the condition scramble off), '
+                        f'one row per seed; the control of the force-term and graph-policy comparisons. Stopped by '
+                        f'hand; archives every 5000 steps.')
+          .replace(index, '${ARMS}/INDEX_h.tsv').replace(index_note, '# Arm = row of INDEX_h.tsv')
+          .replace('__TAG__', TAG + 'h').replace('__BATTERY__', BATTERY)
+          .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
+    assert 'INDEX.tsv' not in sb, 'a reference to phase 1\'s INDEX survived'
+    with (HERE / f'submit_{BATTERY}_h.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(sb)
+    print(f'wrote {len(new)} arms with INDEX_h.tsv ({len(rows)} rows) and submit_{BATTERY}_h.sbatch')
+    print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
 def build_cmle(run, p1):
     """Phase 1's leg-1 config with the condition scramble off, under the phase-2 job script's seed placeholders
     (the module docstring, LEG E)."""
@@ -1132,6 +1235,8 @@ def main(argv):
         return main_mleb(argv)
     if argv[:1] == ['force']:
         return main_force(argv)
+    if argv[:1] == ['scratch']:
+        return main_scratch(argv)
     sys.exit(__doc__)
 
 
