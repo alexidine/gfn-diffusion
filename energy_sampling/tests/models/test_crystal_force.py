@@ -235,6 +235,14 @@ def _squeezed(batch):
     return x
 
 
+def _same(a, b, rel=1e-4):
+    """Two evaluations of one quantity agree to `rel` of each row's own size. On squeezed cells a force
+    is of order 1e5 with components near zero, and two summation orders differ in those by more than
+    any per-element tolerance."""
+    a, b = a.reshape(a.shape[0], -1), b.reshape(b.shape[0], -1)
+    return bool(((a - b).norm(dim=1) <= rel * b.norm(dim=1) + 1e-6).all())
+
+
 def test_memory_bound_caps_squeezed_cells_and_splits_calls_without_changing_values(crystals, checkpoint):
     """On cells far below any physical density the pair list is capped per crystal and the trunk is
     called on groups of crystals under the pair budget. The split changes no number; the caps are
@@ -257,11 +265,11 @@ def test_memory_bound_caps_squeezed_cells_and_splits_calls_without_changing_valu
     split = TrunkForce(checkpoint, 'cpu', max_images=60, max_pairs=500, max_pairs_per_call=1200)
     e2, f2 = split.energy_and_force(x, split.context(batch))
     assert split.extra_calls >= 2, 'the pair budget was meant to force several trunk calls'
-    assert torch.allclose(e2, e1, atol=1e-4, rtol=1e-5) and torch.allclose(f2, f1, atol=1e-3, rtol=1e-4)
+    assert _same(e2, e1) and _same(f2, f1)
     # chunks and the budget compose
     both = TrunkForce(checkpoint, 'cpu', chunk=3, max_images=60, max_pairs=500, max_pairs_per_call=1200)
     e3, f3 = both.energy_and_force(x, both.context(batch))
-    assert torch.allclose(e3, e1, atol=1e-4, rtol=1e-5) and torch.allclose(f3, f1, atol=1e-3, rtol=1e-4)
+    assert _same(e3, e1) and _same(f3, f1)
 
     # the agreement check leaves capped rows out rather than comparing two truncated lists
     stats = one.agreement(x, one.context(batch), step_variance=1e-3)
