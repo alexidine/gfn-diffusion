@@ -13,20 +13,12 @@ What is pinned:
   * the builder's force is the energy's own gradient (RDKit present), and its check refuses one that is not.
 """
 import math
-import os
-import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-_here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-for _root in (_here, os.path.dirname(_here),
-              os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
-
-from energy_sampling.models.intra_trunk import MIN_DISTANCE, IntraTrunk, molecule_pairs  # noqa: E402
+from models.intra_trunk import MIN_DISTANCE, IntraTrunk, molecule_pairs
 
 pytestmark = pytest.mark.fast
 

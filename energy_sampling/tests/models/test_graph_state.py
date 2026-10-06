@@ -9,19 +9,10 @@ What is pinned:
     padded atom's (the gradient a trunk would be trained with through the stored embeddings);
   * a row with no atoms, and a missing or unexpected context or extra vector, raise.
 """
-import os
-import sys
-
 import pytest
 import torch
 
-_here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-for _root in (os.path.dirname(_here),
-              os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
-
-from energy_sampling.models.graph_state import AtomSetPool, AtomStateEncoding  # noqa: E402
+from models.graph_state import AtomSetPool, AtomStateEncoding
 
 pytestmark = pytest.mark.fast
 

@@ -59,6 +59,7 @@ from torch import nn
 
 from buffer import strip_lazy_sg_caches
 from models.atom_trunk import AtomTrunk, crystal_density, intramolecular_edges, pooled_features
+from models.stacked_trunk import StackedTrunk
 from models.crystal_force import compressed_elj_per_atom
 from mxtaltools.analysis.vdw_analysis import lj_cutoff_envelope
 from mxtaltools.constants.atom_properties import VDW_RADII
@@ -74,6 +75,10 @@ def parse():
     ap.add_argument('--out', required=True, help='directory for the checkpoint, the log and the evaluation json')
     ap.add_argument('--tag', default=None, help='file stem for this run inside --out (default: the arm)')
     ap.add_argument('--trunk', default=None, help='trunk checkpoint, required by --arm head')
+    ap.add_argument('--intra', default=None,
+                    help='pretrain_intra_trunk.py checkpoint: fit the trunk STACKED on that intra trunk, frozen '
+                         "(models/stacked_trunk.py): its per-atom states are each atom's input beside the element, "
+                         'and the trunk has no intramolecular edges of its own')
     ap.add_argument('--init', default=None,
                     help='trunk checkpoint to continue from (--arm trunk): its weights and its row scales; it is '
                          'scored once before any update')
@@ -235,7 +240,8 @@ def build_example(sub, x_t, a, vdw, need_geometry_grad, with_reference=False, la
             out['ref_force'] = out['force']
     density = crystal_density(tables, cb.T_fc)
     intra_index, intra_dist = intramolecular_edges(tables, a.feature_cutoff)
-    out.update({'intra_index': intra_index, 'intra_dist': intra_dist, 'inter_ref': inter_ref, 'inter_img': inter_img,
+    out.update({'mol_z': tables.z, 'mol_pos': tables.p, 'mol_mask': tables.amask,
+                'intra_index': intra_index, 'intra_dist': intra_dist, 'inter_ref': inter_ref, 'inter_img': inter_img,
                 'inter_dist': inter_dist if need_geometry_grad else inter_dist.detach(),
                 'density': density if need_geometry_grad else density.detach(),
                 'pairs_feature': inter_dist.numel() / n_graphs})
@@ -249,6 +255,10 @@ def force_loss(pred, target, scale):
 
 
 def trunk_energy(model, ex):
+    if isinstance(model, StackedTrunk):
+        # the frozen intra trunk's states of each molecule, then the intermolecular stages alone
+        e_m = model.molecule_states(ex['mol_z'], ex['mol_pos'], ex['mol_mask'])
+        return model(ex['z'], ex['node_graph'], ex['inter_ref'], ex['inter_img'], ex['inter_dist'], ex['density'], e_m)
     return model(ex['z'], ex['node_graph'], ex['intra_index'], ex['intra_dist'],
                  ex['inter_ref'], ex['inter_img'], ex['inter_dist'], ex['density'])
 
@@ -460,9 +470,19 @@ def main():
 
     # models are built before any sampling: mxtaltools' scalarMLP reseeds torch at construction
     models = {}
+    intra = None
+    if a.intra and a.arm != 'trunk':
+        raise SystemExit('--intra fits a stacked trunk; use it with --arm trunk')
     if a.arm in ('trunk', 'head'):
-        models['trunk'] = AtomTrunk(node_dim=a.node_dim, message_dim=a.message_dim, num_convs=a.num_convs,
-                                    cutoff=a.feature_cutoff, folded=not a.unfolded).to(dev)
+        if a.intra:
+            intra = torch.load(a.intra, map_location='cpu', weights_only=False)
+            models['trunk'] = StackedTrunk(intra['trunk_args'], node_dim=a.node_dim, message_dim=a.message_dim,
+                                           num_convs=a.num_convs, cutoff=a.feature_cutoff, folded=not a.unfolded)
+            models['trunk'].intra.load_state_dict(intra['model'])
+            models['trunk'].to(dev)
+        else:
+            models['trunk'] = AtomTrunk(node_dim=a.node_dim, message_dim=a.message_dim, num_convs=a.num_convs,
+                                        cutoff=a.feature_cutoff, folded=not a.unfolded).to(dev)
     if a.arm == 'head':
         if not a.trunk:
             raise SystemExit('--arm head needs --trunk')
@@ -484,11 +504,25 @@ def main():
             if init['args'][key] != getattr(a, key):
                 raise SystemExit(f"--init {a.init} was fitted with {key} = {init['args'][key]!r}, this run asks for "
                                  f"{getattr(a, key)!r}")
+        if bool(init['args'].get('intra')) != bool(a.intra):
+            raise SystemExit(f"--init {a.init} is {'a stacked' if init['args'].get('intra') else 'an unstacked'} "
+                             f"trunk; this run asks for the other kind")
         models['trunk'].load_state_dict(init['model'])
     fitted = models[a.arm]
-    n_params = sum(p.numel() for p in fitted.parameters())
+    n_params = sum(p.numel() for p in fitted.parameters() if p.requires_grad)
     torch.manual_seed(a.seed)
     gen = torch.Generator().manual_seed(a.seed)
+    if intra is not None:
+        if init is None:
+            # the intra states' size on this run's molecules, measured once and stored with the trunk
+            cal = train.subsample_new_batch(
+                train_rows[torch.randint(0, len(train_rows), (4 * a.batch,), generator=gen)]).to(dev)
+            tables = build_image_tables(cal)
+            fitted.calibrate(tables.z, tables.p, tables.amask)
+        print(f"[pretrain] stacked on the intra trunk {a.intra} (step {intra.get('step')}, "
+              f"{sum(p.numel() for p in fitted.intra.parameters()):,} frozen parameters, node width "
+              f"{fitted.intra.node_dim}); its per-atom states are read over {float(fitted.feature_scale):.4f}; "
+              f"no intramolecular edges in the fitted stages", flush=True)
 
     # per-row force scale: median |reference force| over crystals at late positions, measured once and then
     # fixed. Taken from the reference under either target, so runs with different targets share one scale.
@@ -510,13 +544,14 @@ def main():
           + ", ".join(f"{v:.1f}" for v in scale.tolist())
           + (f"; continued from {a.init} (step {init['step']})" if init is not None else ""), flush=True)
 
-    opt = torch.optim.Adam(fitted.parameters(), lr=a.lr)
+    opt = torch.optim.Adam([p for p in fitted.parameters() if p.requires_grad], lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.steps, eta_min=a.lr * 0.05)
     log, t0, skipped = [], time.perf_counter(), 0
     history, timing = {}, None
 
     def save(step):
-        torch.save({'model': fitted.state_dict(), 'row_scale': scale.cpu(), 'args': vars(a), 'step': step},
+        torch.save({'model': fitted.state_dict(), 'row_scale': scale.cpu(), 'args': vars(a), 'step': step,
+                    'intra_trunk_args': None if intra is None else intra['trunk_args']},
                    os.path.join(a.out, f'{stem}.pt'))
         with open(os.path.join(a.out, f'{stem}_eval.json'), 'w') as f:
             json.dump({'args': vars(a), 'parameters': n_params, 'timing': timing,
