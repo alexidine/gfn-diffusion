@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-2
+#SBATCH --array=0-6
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30h
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
 
-# qm9full_sep30 leg h: conditional MLE from scratch (phase 1 with the condition scramble off), one row per seed; the control of the force-term and graph-policy comparisons. Stopped by hand; archives every 5000 steps.
+# qm9full_sep30 leg h: conditional MLE from scratch (phase 1 with the condition scramble off). Rows 0-2 are the controls, one per seed; rows 3-6 add the force term in P_F. Stopped by hand; archives every 5000 steps.
 # Arm = row of INDEX_h.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
@@ -58,6 +58,21 @@ HAVE=$(stat -c %s ${DATA}/${PRIOR} 2>/dev/null || echo 0)
 if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
     echo "FATAL: ${DATA}/${PRIOR} is ${HAVE} bytes, expected ${PRIOR_BYTES} -- upload unfinished or a different file" >&2
     exit 1
+fi
+
+# THE FORCE TERM (rows with a gate): the trunk they read, and the memory-bounded code on both sides.
+if grep -q '^  force_drift_fwd: [0-9]' ${CONFIG}; then
+    TRUNK=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/atom_trunk_oct05/at_c2_ft_late.pt
+    HAVE=$(stat -c %s ${TRUNK} 2>/dev/null || echo 0)
+    if [ "${HAVE}" != "595833" ]; then
+        echo "FATAL: ${TRUNK} is ${HAVE} bytes, expected 595833" >&2; exit 1
+    fi
+    if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
+        echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+    fi
+    if ! grep -q 'max_pairs_per_call' ${WORKDIR}/models/crystal_force.py; then
+        echo "FATAL: models/crystal_force.py has no memory bound -- git pull gfn-diffusion" >&2; exit 1
+    fi
 fi
 
 # RESUME OR START. checkpoint_name always wins in train.py, so a requeue blanks it and auto-resumes
@@ -110,6 +125,7 @@ srun singularity exec --nv \
         export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         ${NIG_EXPORT}
         python -c \"import mxtaltools.common.sym_utils as s; assert getattr(s, 'NIGGLI_TRICLINIC', True), 'Niggli triclinic penalty is OFF'\" || exit 1
+        python -c \"from models.crystal_force import CrystalDriftForce, TrunkForce\" || exit 1
         python -u train.py --config ${RESOLVED}
     " 2>&1 | tee ${J}.trainlog
 
