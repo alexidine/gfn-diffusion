@@ -79,6 +79,8 @@ def parse():
                     help='pretrain_intra_trunk.py checkpoint: fit the trunk STACKED on that intra trunk, frozen '
                          "(models/stacked_trunk.py): its per-atom states are each atom's input beside the element, "
                          'and the trunk has no intramolecular edges of its own')
+    ap.add_argument('--partial-intra', action='store_true',
+                    help='accept an --intra checkpoint written before its run finished')
     ap.add_argument('--init', default=None,
                     help='trunk checkpoint to continue from (--arm trunk): its weights and its row scales; it is '
                          'scored once before any update')
@@ -476,6 +478,10 @@ def main():
     if a.arm in ('trunk', 'head'):
         if a.intra:
             intra = torch.load(a.intra, map_location='cpu', weights_only=False)
+            # the intra run writes its checkpoint at every evaluation: the file exists long before the run ends
+            if intra.get('step') != intra['args'].get('steps') and not a.partial_intra:
+                raise SystemExit(f"--intra {a.intra} is at step {intra.get('step')} of {intra['args'].get('steps')}: "
+                                 f"its run has not finished (--partial-intra stacks on it anyway)")
             models['trunk'] = StackedTrunk(intra['trunk_args'], node_dim=a.node_dim, message_dim=a.message_dim,
                                            num_convs=a.num_convs, cutoff=a.feature_cutoff, folded=not a.unfolded)
             models['trunk'].intra.load_state_dict(intra['model'])
