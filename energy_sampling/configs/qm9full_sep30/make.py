@@ -205,6 +205,19 @@ until stopped) with no warm start, the condition scramble off and its own seed, 
   [0] qf30_ed_cmle_s1   seed 12345 (the recipe's)
   [1] qf30_ed_cmle_s2   seed 23456
   [2] qf30_ed_cmle_s3   seed 34567
+and the same three with the force term in P_F (LEG F describes the term; here it is present from step 0, and its
+gate is trained by the likelihood), plus one row whose gate starts at zero:
+  [3] qf30_ld_cmle_s1   seed 12345, gate learned from 0.25
+  [4] qf30_ld_cmle_s2   seed 23456, gate learned from 0.25
+  [5] qf30_ld_cmle_s3   seed 34567, gate learned from 0.25
+  [6] qf30_ld_cmle_g0   seed 12345, gate learned from 0
+The force acts from t = 0.8, capped at 2 noise standard deviations a step, from the trunk at_c2_ft_late; no term in
+P_B. A force row equals its control apart from the force leaves (asserted). The provider's memory is bounded
+(drift_force.max_images, max_pairs, max_pairs_per_call): an untrained policy's rollouts reach cells with a hundred
+times a crystal's pairs, and the first local run without the bound ended in an out-of-memory loop in evaluation.
+Read against the controls at equal steps and at equal hours; force/gate_fwd_mean_* is what the likelihood asks of
+the force at each time, force/cosine_* and force/err_sigma_* the trunk on this run's rollouts, force/capped_states
+how many states hit the bound.
 A fresh first launch and self-resume afterwards (phase 1's job script, reading INDEX_h.tsv). P_B is live and the
 batch sizer is leg e's, as in phase 1: leg g's frozen P_B is a snapshot of trained weights, which a fresh run lacks.
 The reading is the forward draws' median excess and the forward Jensen, on training and on held-out molecules, by
@@ -309,8 +322,36 @@ NO_SEED = '-'           # INDEX warm_src of a row that only resumes its own run:
 SEED_STEP = {'fwdF_lr5': 100_000, 'upb_lr5': 70_000, 'p1lr2': 45_000}
 # leg e: (run_name, the run whose weights it starts from). ROW ORDER IS THE ARRAY INDEX: append only.
 CMLE = (('cmle_seed', 'p1lr2'), ('cmle_lead', 'fwdF_lr5'))
-# leg h: (run_name, seed) of the from-scratch conditional-MLE rows. ROW ORDER IS THE ARRAY INDEX: append only.
-SCRATCH = (('ed_cmle_s1', 12345), ('ed_cmle_s2', 23456), ('ed_cmle_s3', 34567))
+# leg h: (run_name, seed, starting value of P_F's force gate or None for no force term) of the from-scratch
+# conditional-MLE rows. ROW ORDER IS THE ARRAY INDEX: append only.
+SCRATCH = (('ed_cmle_s1', 12345, None), ('ed_cmle_s2', 23456, None), ('ed_cmle_s3', 34567, None),
+           ('ld_cmle_s1', 12345, 0.25), ('ld_cmle_s2', 23456, 0.25), ('ld_cmle_s3', 34567, 0.25),
+           ('ld_cmle_g0', 12345, 0.0))
+# the force rows' drift_force block beside the trunk path, and their model.force_drift_* values beside the gate
+SCRATCH_PROVIDER = {'chunk': 1000, 'max_images': 2000, 'max_pairs': 40_000, 'max_pairs_per_call': 4_000_000}
+SCRATCH_TERM = {'force_drift_bwd': None, 'force_drift_learned': True, 'force_drift_max_sigma': 2.0,
+                'force_drift_t_min': 0.8, 'force_drift_differentiable': False}
+NIG_PRIOR_GUARD = """if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
+    echo "FATAL: ${DATA}/${PRIOR} is ${HAVE} bytes, expected ${PRIOR_BYTES} -- upload unfinished or a different file" >&2
+    exit 1
+fi
+"""
+SCRATCH_GUARD = """
+# THE FORCE TERM (rows with a gate): the trunk they read, and the memory-bounded code on both sides.
+if grep -q '^  force_drift_fwd: [0-9]' ${CONFIG}; then
+    TRUNK=%(trunk)s
+    HAVE=$(stat -c %%s ${TRUNK} 2>/dev/null || echo 0)
+    if [ "${HAVE}" != "%(bytes)d" ]; then
+        echo "FATAL: ${TRUNK} is ${HAVE} bytes, expected %(bytes)d" >&2; exit 1
+    fi
+    if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
+        echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+    fi
+    if ! grep -q 'max_pairs_per_call' ${WORKDIR}/models/crystal_force.py; then
+        echo "FATAL: models/crystal_force.py has no memory bound -- git pull gfn-diffusion" >&2; exit 1
+    fi
+fi
+"""
 SCRATCH_SCALE = 2.0     # lr_control.fixed_scale of phase 1's leg 1 and of leg e: 2.5e-4 after burn-in and the ramp
 # leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
 MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr40', 1000, 4.0),
@@ -884,15 +925,37 @@ def main_force(argv):
           f'{FORCE_SEED_STEP:,} with its _buffers.pt beside it')
 
 
-def build_scratch(run, seed):
-    """Phase 1's leg-1 recipe from nothing, conditionally: no warm start, the scramble off, its own seed (the module
-    docstring, LEG H)."""
+def build_scratch(run, seed, gate=None, trunk=None):
+    """Phase 1's leg-1 recipe from nothing, conditionally: no warm start, the scramble off, its own seed; with a
+    `gate`, the force term in P_F as well (the module docstring, LEG H)."""
     cfg = build_p1(run, SCRATCH_SCALE, None)
     cfg['seed'] = seed
     stages = cfg['protocols'][PROTOCOL]['stages']
     assert stages[0]['flags']['scramble_conditions'] is True, run
     stages[0]['flags']['scramble_conditions'] = False
+    if gate is not None:
+        cfg['model'].update(force_drift_fwd=gate, **SCRATCH_TERM)
+        cfg['drift_force'] = dict(checkpoint=trunk, **SCRATCH_PROVIDER)
     return cfg
+
+
+def check_scratch_force(cfg, name, control, gate, trunk):
+    """A force row is its control with the force leaves added, and nothing else moved."""
+    m = cfg['model']
+    assert m['force_drift_fwd'] == gate and 0 <= gate <= 1, (name, gate)
+    assert {k: m[k] for k in SCRATCH_TERM} == SCRATCH_TERM, name
+    assert (SCRATCH_TERM['force_drift_t_min'], SCRATCH_TERM['force_drift_max_sigma']) == (FORCE_T_MIN, FORCE_MAX_SIGMA)
+    assert cfg['drift_force'] == dict(checkpoint=trunk, **SCRATCH_PROVIDER), name
+    assert SCRATCH_PROVIDER['max_pairs'] <= SCRATCH_PROVIDER['max_pairs_per_call'], SCRATCH_PROVIDER
+    # what train.py _build_drift_force refuses a force term without, and the energy the trunk was fitted at
+    assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
+    assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
+    assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
+    assert abs(FORCE_T_MIN * T - round(FORCE_T_MIN * T)) < 1e-9, FORCE_T_MIN
+    leaves = sorted([f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)]
+                    + [f'model.{k}' for k in ('force_drift_fwd', *SCRATCH_TERM)])
+    assert _moved(control, cfg) == leaves, (name, _moved(control, cfg))
+    w3.load_check(cfg, name)
 
 
 def check_scratch(cfg, name, seed, p1lr2):
@@ -923,13 +986,24 @@ def main_scratch(argv):
     ran = ({f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
            | {f'{TAG}_{run}' for run, *_ in CONT} | {f'{TAG}_{run}' for run, _ in CMLE}
            | {f'{TAG}_{run}' for run, *_ in FORCE} | {f'{TAG}_{run}' for run, *_ in MLEB})
-    assert len({seed for _, seed in SCRATCH}) == len(SCRATCH), 'two rows share a seed'
+    trunk = f'{w3.CLUSTER_CKPTS}/{FORCE_TRUNK[0]}'
+    controls = {seed: run for run, seed, gate in SCRATCH if gate is None}
+    assert len(controls) == sum(gate is None for *_, gate in SCRATCH), 'two controls share a seed'
     rows, new = [], {}
-    for run, seed in SCRATCH:
+    for run, seed, gate in SCRATCH:
         name = f'{TAG}_{run}'
         assert name not in ran, name
-        cfg = build_scratch(run, seed)
-        check_scratch(cfg, name, seed, p1lr2)
+        if gate is None:
+            cfg = build_scratch(run, seed)
+            check_scratch(cfg, name, seed, p1lr2)
+            path = HERE / f'{name}.yaml'
+            # a control already generated is not rewritten: it may be running
+            assert not path.exists() or yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, \
+                f'{name}.yaml on disk is not what this generator builds'
+        else:
+            assert seed in controls, f'{name}: no control row with seed {seed}'
+            cfg = build_scratch(run, seed, gate, trunk)
+            check_scratch_force(cfg, name, new[f'{TAG}_{controls[seed]}'], gate, trunk)
         new[name] = cfg
         rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
     names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
@@ -937,8 +1011,9 @@ def main_scratch(argv):
     rate = SCRATCH_SCALE * SEED_LR
     print(f'leg h, conditional MLE from scratch (INDEX_h row = array index): phase 1\'s leg-1 recipe at {rate:g}, '
           f'scramble off, no warm start:')
-    for i, (run, seed) in enumerate(SCRATCH):
-        print(f'[{i}] {TAG}_{run:<12} seed {seed}')
+    for i, (run, seed, gate) in enumerate(SCRATCH):
+        print(f'[{i}] {TAG}_{run:<12} seed {seed}' + ('' if gate is None else
+              f', force term in P_F: gate learned from {gate:g}, from t = {FORCE_T_MIN:g}, cap {FORCE_MAX_SIGMA:g}'))
     if dry:
         print('--dry: checks passed, nothing written')
         return
@@ -956,13 +1031,16 @@ def main_scratch(argv):
     assert all(nig.SBATCH.count(t) == 1 for t in (array, old, index_note)) and nig.SBATCH.count(index) == 4, \
         'the mle_nig_sep17 job script moved'
     sb = (nig.SBATCH.replace(array, f'#SBATCH --array=0-{len(rows) - 1}')
-          .replace(old, f'# __BATTERY__ leg h: conditional MLE from scratch (phase 1 with the condition scramble off), '
-                        f'one row per seed; the control of the force-term and graph-policy comparisons. Stopped by '
+          .replace(old, f'# __BATTERY__ leg h: conditional MLE from scratch (phase 1 with the condition scramble off). '
+                        f'Rows 0-2 are the controls, one per seed; rows 3-6 add the force term in P_F. Stopped by '
                         f'hand; archives every 5000 steps.')
           .replace(index, '${ARMS}/INDEX_h.tsv').replace(index_note, '# Arm = row of INDEX_h.tsv')
           .replace('__TAG__', TAG + 'h').replace('__BATTERY__', BATTERY)
           .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
     assert 'INDEX.tsv' not in sb, 'a reference to phase 1\'s INDEX survived'
+    assert sb.count(NIG_PRIOR_GUARD) == 1 and sb.count(NIGGLI_CHECK) == 1, 'the mle_nig_sep17 job script moved'
+    sb = sb.replace(NIG_PRIOR_GUARD, NIG_PRIOR_GUARD + SCRATCH_GUARD % {'trunk': trunk, 'bytes': FORCE_TRUNK[1]})
+    sb = sb.replace(NIGGLI_CHECK, NIGGLI_CHECK + FORCE_IMPORT)
     with (HERE / f'submit_{BATTERY}_h.sbatch').open('w', encoding='utf-8', newline='\n') as f:
         f.write(sb)
     print(f'wrote {len(new)} arms with INDEX_h.tsv ({len(rows)} rows) and submit_{BATTERY}_h.sbatch')
