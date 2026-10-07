@@ -12,7 +12,8 @@
 
 # intra_trunk_oct06, third stage: the molecule condition read off the intra trunk (build_trunk_conditions.py).
 #
-# Writes copies of the full-QM9 prior and condition files whose `embedding` is the pooled per-atom states of the
+# Writes copies of the full-QM9 prior and condition files whose `embedding` (of every crystal batch in a file:
+# a prior file holds its rows under `prior` and `equalized_prior`) is the pooled per-atom states of the
 # intra trunk inside the stacked trunk ([mean, sum / 16], width 256) instead of the Mo3ENet vector, into
 # ${DATA}/trunkcond_st06/ under the same file names. A run takes the trunk's condition by pointing prior_path,
 # molecules_path and test_molecules_path there and setting embedding_conditioning_dim: 256.

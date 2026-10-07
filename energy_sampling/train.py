@@ -3284,13 +3284,16 @@ class Modeller:
     DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call', 'partial')
 
     def _build_drift_force(self):
-        """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd):
-        the trunk named by drift_force.checkpoint, with this run's energy function building the
-        crystals it reads. None when the model has no force term.
+        """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd)
+        and its state features (model.state_atoms): the trunk named by drift_force.checkpoint,
+        with this run's energy function building the crystals it reads. None when the model has
+        neither.
 
-        Refused: a force term without a checkpoint; a route the trunk does not cover (not eLJ,
-        Z' > 1, a conditioned temperature); and, in TrunkForce.check_energy, a run whose
-        temperature or lj_coeff is not the one the trunk was fitted at.
+        Refused: a force term or state features without a checkpoint; a route the trunk does not
+        cover (not eLJ, Z' > 1, a conditioned temperature); in TrunkForce.check_energy, a run whose
+        temperature or lj_coeff is not the one the trunk was fitted at; a trunk whose fitting run
+        has not finished, unless drift_force.partial; and state features of another width than
+        the model was built for.
         """
         cfg = getattr(self.args, 'drift_force', None)
         cfg = {} if cfg is None else dict(vars(cfg))

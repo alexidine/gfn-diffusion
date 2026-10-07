@@ -193,6 +193,9 @@ def load_run(checkpoint_path: str, config_path: str, device: str = 'cpu',
                               if provider_cfg.get(k) is not None})
         # after the prior has had its say on lj_coeff: the trunk is checked against the energy the run scored
         trunk.check_energy(ef.temperature, ef.lj_coeff)
+        if not trunk.finished and not provider_cfg.get('partial'):
+            raise ValueError(f"the trunk {trunk_file} is at step {trunk.step} of {trunk.planned_steps}: its fitting "
+                             f"run has not finished, and the run's config does not set drift_force.partial")
         if gfn.features_on and trunk.features_dim != gfn.state_features_dim:
             raise ValueError(f"the archive's sampler reads state features of width {gfn.state_features_dim}; "
                              f"{trunk_file} hands out {trunk.features_dim}")

@@ -11,6 +11,9 @@ row's molecule:
     per-atom states of the isolated molecule, as the stacked trunk reads them (IntraTrunk, over
     its stored scale)  ->  [mean over atoms, sum over atoms / 16]          width 2 * node_dim
 
+EVERY crystal batch in a file is re-embedded, under whatever key it sits: a prior file holds
+its rows under `prior` and under `equalized_prior`, and the trainer reads the second.
+
 Nothing else in a file changes, so a run takes the new condition by pointing `prior_path`,
 `molecules_path` and `test_molecules_path` at the copies and setting
 `embedding_conditioning_dim` to the printed width. The trunk is frozen, so embedding once is
@@ -65,29 +68,40 @@ def main(argv=None):
     ap.add_argument('files', nargs='+', help='prior / condition files to re-embed')
     ap.add_argument('--trunk', required=True, help='stacked trunk checkpoint (pretrain_atom_trunk.py --intra)')
     ap.add_argument('--out-dir', required=True)
-    ap.add_argument('--key', default='prior', help='key of the crystal batch inside each file')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     a = ap.parse_args(argv)
     os.makedirs(a.out_dir, exist_ok=True)
     trunk = load_trunk(a.trunk, a.device)
     for path in a.files:
         blob = torch.load(path, map_location='cpu', weights_only=False)
-        batch = blob[a.key]
-        emb = molecule_conditions(trunk, batch, a.device)
-        if not bool(torch.isfinite(emb).all()):
-            raise SystemExit(f'{path}: non-finite conditions')
-        old = tuple(batch.embedding.shape) if hasattr(batch, 'embedding') else None
-        batch.embedding = emb
-        blob['embedding_dim'] = int(emb.shape[1])
+        batches = {key: value for key, value in blob.items()
+                   if hasattr(value, 'num_graphs') and hasattr(value, 'embedding')}
+        if not batches:
+            raise SystemExit(f'{path}: no crystal batch with an `embedding` under any of {list(blob)}')
+        done = {}       # id(batch) -> its new embedding: two keys may name one batch
+        for key, batch in batches.items():
+            if id(batch) in done:
+                continue
+            emb = molecule_conditions(trunk, batch, a.device)
+            if not bool(torch.isfinite(emb).all()):
+                raise SystemExit(f'{path}[{key}]: non-finite conditions')
+            old = tuple(batch.embedding.shape)
+            batch.embedding = emb
+            done[id(batch)] = emb
+            check = batch.subsample_new_batch(torch.tensor([0, batch.num_graphs - 1]))
+            assert torch.equal(check.embedding.reshape(2, -1), emb[[0, batch.num_graphs - 1]]), 'a row lost its condition'
+            distinct = torch.unique(emb.round(decimals=4), dim=0).shape[0]
+            same = [k for k, b in batches.items() if b is batch]
+            print(f"[trunk-conditions] {path} {same}: {batch.num_graphs} rows, embedding {old} -> {tuple(emb.shape)} "
+                  f"(embedding_conditioning_dim: {emb.shape[1]}); {distinct} distinct conditions; root mean square "
+                  f"{float(emb.square().mean().sqrt()):.3f}", flush=True)
+        width = {int(batch.embedding.reshape(batch.num_graphs, -1).shape[1]) for batch in batches.values()}
+        assert len(width) == 1, f'{path}: batches of widths {sorted(width)} after re-embedding'
+        blob['embedding_dim'] = width.pop()
         blob['encoder'] = f'intra trunk of {os.path.basename(a.trunk)}: [mean, sum / {SUM_SCALE:g}] of its per-atom states'
         out = os.path.join(a.out_dir, os.path.basename(path))
         torch.save(blob, out)
-        check = batch.subsample_new_batch(torch.tensor([0, batch.num_graphs - 1]))
-        assert torch.equal(check.embedding.reshape(2, -1), emb[[0, batch.num_graphs - 1]]), 'a row lost its condition'
-        distinct = torch.unique(emb.round(decimals=4), dim=0).shape[0]
-        print(f"[trunk-conditions] {path}: {batch.num_graphs} rows, embedding {old} -> {tuple(emb.shape)} "
-              f"(embedding_conditioning_dim: {emb.shape[1]}); {distinct} distinct conditions; root mean square "
-              f"{float(emb.square().mean().sqrt()):.3f} -> {out}", flush=True)
+        print(f"[trunk-conditions] wrote {out}", flush=True)
 
 
 if __name__ == '__main__':
