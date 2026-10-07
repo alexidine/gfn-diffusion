@@ -223,6 +223,25 @@ batch sizer is leg e's, as in phase 1: leg g's frozen P_B is a snapshot of train
 The reading is the forward draws' median excess and the forward Jensen, on training and on held-out molecules, by
 step and by hour, against qf30_cmle_seed's curve at equal MLE steps (leg e). ROWS ARE APPENDED, never reordered:
 the rows that add the force term to this recipe take the next indices.
+
+LEG I, THE STATE ENCODER THAT READS ATOMS (`python configs/qm9full_sep30/make.py graph`; owner 2026-10-06/07). Leg h's
+recipe (conditional MLE from scratch, P_B live) at HALF its rate and with a fire that lowers the rate: five of leg
+h's seven runs ended inside 3,300 steps with their rewind budget spent, at fixed_scale 2 and fire_cut_factor 1
+(a fire rewound and re-entered at the rate that had just detonated). Here fixed_scale is 1 (1.25e-4) and
+fire_cut_factor 0.5, in every row, the controls included, so a row is read against this leg's controls and not
+against leg h's. Kinds, three seeds each (two for the last):
+  ed   the embedded state encoder: the control                                   qf30_edr_cmle_s1 .. s3
+  gp   the state encoder reads the atoms of the asymmetric unit at every state  qf30_gp_cmle_s1 .. s3
+       (model.state_atoms; per atom the stacked trunk's node state, the intra trunk's state, its position in the
+       cell and its energy), the trunk frozen; the Mo3ENet condition unchanged
+  gpl  gp with the force term in P_F (gate learned from 0.25, from t = 0.8)      qf30_gpl_cmle_s1 .. s3
+  gpt  gp with the molecule condition read off the intra trunk instead           qf30_gpt_cmle_s1 .. s2
+       (the re-embedded files of configs/intra_trunk_oct06/submit_conditions.sbatch, width 256)
+A gp row is its control plus the state-encoder and trunk leaves; gpl and gpt are their gp row plus theirs
+(asserted). The trunk is intra_trunk_oct06/st06_c2_ft_late.pt; the job script refuses a graph row without it and a
+gpt row without the re-embedded files. COST: a graph row calls the trunk at every state of every trajectory, 51
+states where leg h's force rows called it at 11; at batch 1000 expect several times the control's step time, most
+of it the geometry build. Read by step AND by hour.
 """
 import copy
 import importlib.util
@@ -353,6 +372,41 @@ if grep -q '^  force_drift_fwd: [0-9]' ${CONFIG}; then
 fi
 """
 SCRATCH_SCALE = 2.0     # lr_control.fixed_scale of phase 1's leg 1 and of leg e: 2.5e-4 after burn-in and the ramp
+# leg i: (run_name, seed, kind) of the graph-policy comparison; kinds in the module docstring, LEG I.
+# ROW ORDER IS THE ARRAY INDEX: append only.
+GRAPH = (('edr_cmle_s1', 12345, 'ed'), ('edr_cmle_s2', 23456, 'ed'), ('edr_cmle_s3', 34567, 'ed'),
+         ('gp_cmle_s1', 12345, 'gp'), ('gp_cmle_s2', 23456, 'gp'), ('gp_cmle_s3', 34567, 'gp'),
+         ('gpl_cmle_s1', 12345, 'gpl'), ('gpl_cmle_s2', 23456, 'gpl'), ('gpl_cmle_s3', 34567, 'gpl'),
+         ('gpt_cmle_s1', 12345, 'gpt'), ('gpt_cmle_s2', 23456, 'gpt'))
+GRAPH_SCALE = 1.0           # lr_control.fixed_scale: 1.25e-4 after burn-in and the ramp
+GRAPH_FIRE_CUT = 0.5        # lr_control.fire_cut_factor: a fire halves the rate
+GRAPH_MODEL = {'state_atoms': 29, 'state_atom_hidden_dim': 128, 'state_atom_blocks': 2, 'state_atom_heads': 4}
+GRAPH_GATE = 0.25           # gpl rows: starting value of P_F's force gate
+GRAPH_TRUNK = 'intra_trunk_oct06/st06_c2_ft_late.pt'
+GRAPH_COND_DIR, GRAPH_COND_DIM = 'trunkcond_st06', 256
+GRAPH_GUARD = """
+# THE TRUNK (rows whose state encoder reads atoms, or with a force term) and the code that reads it.
+if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
+    TRUNK=%(trunk)s
+    if [ ! -s "${TRUNK}" ]; then
+        echo "FATAL: ${TRUNK} is missing -- the stacked trunk (configs/intra_trunk_oct06/submit_inter.sbatch)" >&2; exit 1
+    fi
+    if ! grep -q 'def state_info' ${WORKDIR}/models/crystal_force.py; then
+        echo "FATAL: models/crystal_force.py has no state features -- git pull gfn-diffusion" >&2; exit 1
+    fi
+    if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
+        echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+    fi
+fi
+# THE TRUNK'S CONDITION (gpt rows): the re-embedded files.
+if grep -q '/%(cond)s/' ${CONFIG}; then
+    for F in %(files)s; do
+        if [ ! -s "${DATA}/%(cond)s/${F}" ]; then
+            echo "FATAL: ${DATA}/%(cond)s/${F} is missing -- configs/intra_trunk_oct06/submit_conditions.sbatch" >&2; exit 1
+        fi
+    done
+fi
+"""
 # leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
 MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr40', 1000, 4.0),
         ('cmf_b4k_lr20', 4000, 2.0), ('cmf_b4k_lr40', 4000, 4.0))
@@ -1047,6 +1101,155 @@ def main_scratch(argv):
     print(f'the prior must be at {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
 
 
+def build_graph(run, seed, kind, trunk):
+    """Leg h's control recipe at GRAPH_SCALE with a fire that lowers the rate; a graph kind adds the state
+    encoder that reads atoms and the trunk, 'gpl' the force term, 'gpt' the trunk's condition (LEG I)."""
+    cfg = build_p1(run, GRAPH_SCALE, None)
+    cfg['seed'] = seed
+    stages = cfg['protocols'][PROTOCOL]['stages']
+    assert stages[0]['flags']['scramble_conditions'] is True, run
+    stages[0]['flags']['scramble_conditions'] = False
+    cfg['lr_control']['fire_cut_factor'] = GRAPH_FIRE_CUT
+    if kind != 'ed':
+        cfg['model'].update(GRAPH_MODEL)
+        cfg['drift_force'] = dict(checkpoint=trunk, **SCRATCH_PROVIDER)
+    if kind == 'gpl':
+        cfg['model'].update(force_drift_fwd=GRAPH_GATE, **SCRATCH_TERM)
+    if kind == 'gpt':
+        for key in ('prior_path', 'molecules_path', 'test_molecules_path'):
+            cfg[key] = cfg[key].replace(f'{w3.CLUSTER_DATA}/', f'{w3.CLUSTER_DATA}/{GRAPH_COND_DIR}/')
+        cfg['embedding_conditioning_dim'] = GRAPH_COND_DIM
+    return cfg
+
+
+GRAPH_LEAVES = {
+    'ed': [],
+    'gp': [f'model.{k}' for k in GRAPH_MODEL] + [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
+    'gpl': ['model.force_drift_fwd'] + [f'model.{k}' for k in SCRATCH_TERM],
+    'gpt': ['prior_path', 'molecules_path', 'test_molecules_path', 'embedding_conditioning_dim'],
+}
+
+
+def check_graph(cfg, name, seed, kind, p1lr2, parent, trunk):
+    """`parent`: the row this one is read against (a control for 'gp', the same seed's gp row for 'gpl' and
+    'gpt'), None for a control, which is checked against the committed phase-1 leg 1."""
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in st] == ['train_prior'] and 'exit' not in st[0] and st[0]['train_mode'] == 'bwd', name
+    assert st[0]['bwd_sampling_mode'] == 'dataset' and st[0]['loss_coeffs']['bwd']['mle'] == 1.0, name
+    assert st[0]['flags']['scramble_conditions'] is False, name
+    assert cfg['embedding_conditioning'] is True and not cfg.get('freeze_backward_policy'), name
+    assert cfg['seed'] == seed and isinstance(seed, int), (name, cfg['seed'])
+    assert cfg['checkpoint_name'] is None and cfg['load_weights_only'] is False, name
+    assert cfg['continue_from_checkpoint'] == w3.CONT_PLACEHOLDER, name
+    lc = cfg['lr_control']
+    assert (lc['mode'], lc['seed_lr'], lc['fixed_scale'], lc['fire_cut_factor']) == \
+        ('fixed', SEED_LR, GRAPH_SCALE, GRAPH_FIRE_CUT), name
+    assert cfg['lr_back'] == 'auto' and cfg.get('max_lr') is None, name
+    if kind == 'ed':
+        assert parent is None, name
+        assert w3.problem_def(cfg) == w3.problem_def(p1lr2), f'{name}: not the problem of {TAG}_{LEGS[LIVE][0]}'
+        allowed = ['checkpoint_name', 'load_weights_only', 'lr_control.fixed_scale', 'lr_control.fire_cut_factor',
+                   f'protocols.{PROTOCOL}.stages[train_prior].flags.scramble_conditions']
+        allowed += ['seed'] if seed != p1lr2['seed'] else []
+        assert _moved(p1lr2, cfg) == sorted(allowed), (name, _moved(p1lr2, cfg))
+        assert 'drift_force' not in cfg and 'state_atoms' not in cfg['model'], name
+    else:
+        assert _moved(parent, cfg) == sorted(GRAPH_LEAVES[kind]), (name, kind, _moved(parent, cfg))
+        m = cfg['model']
+        assert {k: m[k] for k in GRAPH_MODEL} == GRAPH_MODEL and m['state_atom_hidden_dim'] % m['state_atom_heads'] == 0
+        assert cfg['drift_force'] == dict(checkpoint=trunk, **SCRATCH_PROVIDER), name
+        # what train.py _build_drift_force refuses a trunk without, and the energy the trunk was fitted at
+        assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
+        assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
+        assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
+        if kind == 'gpl':
+            assert m['force_drift_fwd'] == GRAPH_GATE and {k: m[k] for k in SCRATCH_TERM} == SCRATCH_TERM, name
+        else:
+            assert m.get('force_drift_fwd') is None, name
+        if kind == 'gpt':
+            for key, file in (('prior_path', PRIOR), ('molecules_path', CONDITIONS), ('test_molecules_path', TEST)):
+                assert cfg[key] == f'{w3.CLUSTER_DATA}/{GRAPH_COND_DIR}/{file}', (name, key, cfg[key])
+            assert cfg['embedding_conditioning_dim'] == GRAPH_COND_DIM, name
+        else:
+            assert cfg['embedding_conditioning_dim'] == 192, name
+    w3._scan_local_paths(cfg, name)
+    w3.load_check(cfg, name)
+
+
+def main_graph(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+    leg1 = f'{TAG}_{LEGS[LIVE][0]}'
+    p1lr2 = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{leg1}.yaml'], HERE))
+    assert yaml.safe_load((HERE / f'{leg1}.yaml').read_text(encoding='utf-8')) == p1lr2, f'{leg1}.yaml is not committed'
+    ran = ({f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
+           | {f'{TAG}_{run}' for run, *_ in CONT} | {f'{TAG}_{run}' for run, _ in CMLE}
+           | {f'{TAG}_{run}' for run, *_ in FORCE} | {f'{TAG}_{run}' for run, *_ in MLEB}
+           | {f'{TAG}_{run}' for run, *_ in SCRATCH})
+    trunk = f'{w3.CLUSTER_CKPTS}/{GRAPH_TRUNK}'
+    by_kind = {(kind, seed): f'{TAG}_{run}' for run, seed, kind in GRAPH}
+    assert len(by_kind) == len(GRAPH), 'two rows share a kind and a seed'
+    rows, new = [], {}
+    for run, seed, kind in GRAPH:
+        name = f'{TAG}_{run}'
+        assert name not in ran and kind in GRAPH_LEAVES, name
+        cfg = build_graph(run, seed, kind, trunk)
+        if kind == 'ed':
+            parent = None
+        else:
+            key = ('ed' if kind == 'gp' else 'gp', seed)
+            assert key in by_kind and by_kind[key] in new, f'{name}: its {key[0]} row of seed {seed} must come first'
+            parent = new[by_kind[key]]
+        check_graph(cfg, name, seed, kind, p1lr2, parent, trunk)
+        new[name] = cfg
+        rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    print(f'leg i, the state encoder that reads atoms (INDEX_i row = array index): conditional MLE from scratch at '
+          f'{GRAPH_SCALE * SEED_LR:g}, a fire cutting the rate by {GRAPH_FIRE_CUT:g}; trunk {trunk}:')
+    what = {'ed': 'control', 'gp': f"state encoder reads {GRAPH_MODEL['state_atoms']} atoms",
+            'gpl': f'reads atoms, and the force term in P_F (gate from {GRAPH_GATE:g}, t >= {FORCE_T_MIN:g})',
+            'gpt': f'reads atoms, and the condition is the intra trunk\'s ({GRAPH_COND_DIR}, width {GRAPH_COND_DIM})'}
+    for i, (run, seed, kind) in enumerate(GRAPH):
+        print(f'[{i:2d}] {TAG}_{run:<12} seed {seed}  {what[kind]}')
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    with (HERE / 'INDEX_i.tsv').open('w', encoding='utf-8', newline='\n') as f:
+        f.write('arm\tfamily\tstart\twarm_src\tprior\tprior_bytes\n')
+        f.writelines(rows)
+    array = '#SBATCH --array=0-__LAST__'
+    old = '# __BATTERY__: phase-1 MLE on the Niggli P-1 priors, warm (mle09 best, weights-only) and fresh.'
+    index, index_note = '${ARMS}/INDEX.tsv', '# Arm = row of INDEX.tsv'
+    assert all(nig.SBATCH.count(t) == 1 for t in (array, old, index_note)) and nig.SBATCH.count(index) == 4, \
+        'the mle_nig_sep17 job script moved'
+    sb = (nig.SBATCH.replace(array, f'#SBATCH --array=0-{len(rows) - 1}')
+          .replace(old, f'# __BATTERY__ leg i: conditional MLE from scratch, the state encoder that reads atoms '
+                        f'against the embedded one. Rows 0-2 are the controls; 3-5 read atoms; 6-8 add the force '
+                        f'term; 9-10 take the condition from the intra trunk. Stopped by hand; archives every 5000 '
+                        f'steps (make.py, LEG I).')
+          .replace(index, '${ARMS}/INDEX_i.tsv').replace(index_note, '# Arm = row of INDEX_i.tsv')
+          .replace('__TAG__', TAG + 'i').replace('__BATTERY__', BATTERY)
+          .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
+    assert 'INDEX.tsv' not in sb, 'a reference to phase 1\'s INDEX survived'
+    assert sb.count(NIG_PRIOR_GUARD) == 1 and sb.count(NIGGLI_CHECK) == 1, 'the mle_nig_sep17 job script moved'
+    sb = sb.replace(NIG_PRIOR_GUARD, NIG_PRIOR_GUARD + GRAPH_GUARD % {
+        'trunk': trunk, 'cond': GRAPH_COND_DIR, 'files': ' '.join((PRIOR, CONDITIONS, TEST))})
+    sb = sb.replace(NIGGLI_CHECK, NIGGLI_CHECK + FORCE_IMPORT)
+    with (HERE / f'submit_{BATTERY}_i.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(sb)
+    print(f'wrote {len(new)} arms with INDEX_i.tsv ({len(rows)} rows) and submit_{BATTERY}_i.sbatch')
+    print(f'needs {trunk}, and for the gpt rows {w3.CLUSTER_DATA}/{GRAPH_COND_DIR}/ with {PRIOR}, {CONDITIONS}, {TEST}')
+
+
 def build_cmle(run, p1):
     """Phase 1's leg-1 config with the condition scramble off, under the phase-2 job script's seed placeholders
     (the module docstring, LEG E)."""
@@ -1315,6 +1518,8 @@ def main(argv):
         return main_force(argv)
     if argv[:1] == ['scratch']:
         return main_scratch(argv)
+    if argv[:1] == ['graph']:
+        return main_graph(argv)
     sys.exit(__doc__)
 
 
