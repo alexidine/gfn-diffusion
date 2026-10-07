@@ -3331,7 +3331,10 @@ class Modeller:
                                  f"({m.state_atoms} atoms of {trunk.atom_dim} + 2)")
             print(f"state features: {m.state_atoms} atoms of {trunk.atom_dim} features from the "
                   f"{'stacked ' if trunk.stacked else ''}trunk {checkpoint}, read by the state encoder at every "
-                  f"state of every trajectory; the trunk is frozen")
+                  f"state of every trajectory; the trunk is frozen"
+                  + (f"; a state before t = {m.state_crystal_t_min:g} is described by its molecule alone "
+                     f"({trunk.crystal_dim} trunk-state columns and the energy zero, no crystal built)"
+                     if m.state_crystal_t_min > 0 else ""))
         if not m.force_on:
             return CrystalDriftForce(trunk, self.energy_function)
         print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "
@@ -3345,11 +3348,13 @@ class Modeller:
     @torch.no_grad()
     def provider_counts(self, model):
         """The trunk provider's running totals since start-up, for the eval log: states it was called
-        on, states whose image or pair list hit a cap, trunk calls split for memory, and rows whose
-        force or features came back non-finite. Logged for a force term and for state features alike."""
+        on, of those the states described by the molecule alone (model.state_crystal_t_min), states
+        whose image or pair list hit a cap, trunk calls split for memory, and rows whose force or
+        features came back non-finite. Logged for a force term and for state features alike."""
         trunk = self.drift_force.trunk_force
         return {'force/nonfinite_rows': float(model.force_nonfinite_rows()),
                 'force/trunk_states': float(trunk.rows),
+                'force/molecule_only_states': float(trunk.molecule_rows),
                 'force/capped_states': float(trunk.capped_rows),
                 'force/extra_trunk_calls': float(trunk.extra_calls)}
 

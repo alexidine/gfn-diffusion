@@ -65,6 +65,7 @@ class GFN(nn.Module):  # todo add seeding
                  state_atom_hidden_dim: int = 128,
                  state_atom_blocks: int = 2,
                  state_atom_heads: int = 4,
+                 state_crystal_t_min: float = 0.0,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -81,6 +82,15 @@ class GFN(nn.Module):  # todo add seeding
         # through the shared s_model. 0 = none, and the model is the one it always was.
         self.state_features_dim = int(state_features_dim)
         self.features_on = self.state_features_dim > 0
+        # A state earlier than this is described by its molecule alone: the provider is told so
+        # (state_info's crystal_rows) and builds no crystal for a batch of such states. A state's
+        # time decides, so P_F leaving it and P_B conditioned on it read the same features.
+        self.state_crystal_t_min = float(state_crystal_t_min)
+        if not 0.0 <= self.state_crystal_t_min < 1.0:
+            raise ValueError(f"state_crystal_t_min is a trajectory time in [0, 1), got {state_crystal_t_min}")
+        if self.state_crystal_t_min > 0 and not self.features_on:
+            raise ValueError(f"state_crystal_t_min = {state_crystal_t_min} is set and the model reads no state "
+                             f"features (state_atoms / state_features_dim): the key would do nothing")
         self.init_force_drift(force_drift_fwd, force_drift_bwd, force_drift_learned,
                               force_drift_max_sigma, force_drift_t_min, force_drift_differentiable)
         self.harmonics_dim = harmonics_dim
@@ -288,6 +298,8 @@ class GFN(nn.Module):  # todo add seeding
         state_info(state, context, need_force, create_graph) -> (F or None, features
         [B, state_features_dim]), which is then the only call made: one evaluation gives
         a state's features and, when a force term reads that state, its force.
+        With state_crystal_t_min > 0 it is called with a fifth argument, crystal_rows
+        [B] bool: the rows whose time is inside the window.
         `context` says which system each row is. A caller of a trajectory
         function may pass one as `drift_context`; otherwise, if the provider has a
         `context(mol_batch)` method, it is called once per trajectory batch with the
@@ -326,7 +338,10 @@ class GFN(nn.Module):  # todo add seeding
         x = self._wrap_ang(state)
         live = self.force_drift_differentiable
         if self.features_on:
-            force, features = self.drift_force_fn.state_info(x if live else x.detach(), drift_ctx, need_force, live)
+            asked = (x if live else x.detach(), drift_ctx, need_force, live)
+            if self.state_crystal_t_min > 0:
+                asked += (t >= self.state_crystal_t_min,)
+            force, features = self.drift_force_fn.state_info(*asked)
             if features.shape != (state.shape[0], self.state_features_dim):
                 raise ValueError(f"the provider returned state features of shape {tuple(features.shape)}; "
                                  f"the model was built for [{state.shape[0]}, {self.state_features_dim}]")

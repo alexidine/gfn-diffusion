@@ -132,6 +132,50 @@ def test_stacked_checkpoint_is_a_force_provider_and_describes_a_state(crystals, 
         TrunkForce(checkpoint, 'cpu').state_info(x, ctx, need_force=False)
 
 
+def test_a_state_can_be_described_by_its_molecule_alone(crystals, checkpoint):
+    from energy_sampling.models.crystal_force import TrunkForce
+
+    batch = _batch(crystals)
+    B = len(crystals)
+    x = _states(batch, 3)
+    A = max(int(c.num_atoms) for c in crystals)
+    trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A, chunk=3)
+    ctx = trunk.context(batch)
+    assert trunk.crystal_dim == 32
+
+    def atoms(feats):
+        return feats.reshape(B, A, ATOM_DIM + 2)
+
+    force, full = trunk.state_info(x, ctx, need_force=True)
+    assert (trunk.calls, trunk.crystal_calls, trunk.molecule_rows) == (1, 1, 0)
+
+    # no row in its crystal, no force: nothing above the latent map is built
+    none, alone = trunk.state_info(x, ctx, need_force=False, crystal_rows=torch.zeros(B, dtype=torch.bool))
+    assert none is None and (trunk.calls, trunk.crystal_calls, trunk.molecule_rows) == (2, 1, B)
+    a, w = atoms(alone), atoms(full)
+    assert bool((a[..., :32] == 0).all()) and bool((a[..., ATOM_DIM - 1] == 0).all())
+    assert float(w[..., :32].abs().sum()) > 0 and float(w[..., ATOM_DIM - 1].abs().sum()) > 0
+    # everything that is the molecule's own is the same either way: intra state, positions, element, flag
+    assert torch.allclose(a[..., 32:ATOM_DIM - 1], w[..., 32:ATOM_DIM - 1], atol=1e-5)
+    assert torch.equal(a[..., ATOM_DIM:], w[..., ATOM_DIM:])
+
+    # some rows: each row is what the call for all, or for none, gives it
+    some = torch.zeros(B, dtype=torch.bool)
+    some[::2] = True
+    _, mixed = trunk.state_info(x, ctx, need_force=False, crystal_rows=some)
+    assert trunk.crystal_calls == 2 and trunk.molecule_rows == B + int((~some).sum())
+    m = atoms(mixed)
+    assert torch.allclose(m[some], w[some], atol=1e-5) and torch.allclose(m[~some], a[~some], atol=1e-6)
+
+    # a force is the crystal's whatever the rows' description
+    f2, alone2 = trunk.state_info(x, ctx, need_force=True, crystal_rows=torch.zeros(B, dtype=torch.bool))
+    assert trunk.crystal_calls == 3
+    assert torch.allclose(f2, force, atol=1e-5) and torch.allclose(alone2, alone, atol=1e-6)
+
+    with pytest.raises(ValueError, match='crystal_rows'):
+        trunk.state_info(x, ctx, need_force=False, crystal_rows=torch.zeros(B + 1, dtype=torch.bool))
+
+
 def _sampler(features_dim, atoms, seed=0, **over):
     from energy_sampling.models.gfn import GFN
 
@@ -146,8 +190,8 @@ def _sampler(features_dim, atoms, seed=0, **over):
     return GFN(**kwargs).eval()
 
 
-@pytest.mark.parametrize('force', [False, True])
-def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tmp_path, force):
+@pytest.mark.parametrize('force,window', [(False, 0.0), (True, 0.0), (False, 0.45), (True, 0.45), (True, 0.8)])
+def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tmp_path, force, window):
     from energy_sampling.models.crystal_force import CrystalDriftForce, TrunkForce
     from energy_sampling.models.graph_state import FlatAtomStateEncoding
     from energy_sampling.utils import uniform_discretizer
@@ -155,9 +199,9 @@ def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tm
     T, B = 6, len(crystals)
     mol_batch = _batch(crystals)
     A = max(int(c.num_atoms) for c in crystals)
-    over = dict(force_drift_fwd=0.5, force_drift_t_min=0.5) if force else {}
+    over = dict(force_drift_fwd=0.5, force_drift_t_min=0.45) if force else {}
     trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A)
-    g = _sampler(trunk.features_dim, A, **over)
+    g = _sampler(trunk.features_dim, A, state_crystal_t_min=window, **over)
     assert isinstance(g.s_model, FlatAtomStateEncoding) and g.features_on
     g.install_drift_force(CrystalDriftForce(trunk, _Builder()))
     disc = lambda b: uniform_discretizer(b, T)
@@ -165,7 +209,12 @@ def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tm
     with torch.no_grad():
         torch.manual_seed(1)
         s, pf, pb, _ = g.get_traj_fwd(torch.zeros(B, 12), disc, None, None, mol_batch)
-        assert trunk.calls == T + 1, 'one trunk pass per state of the trajectory'
+        assert trunk.calls == T + 1, 'one provider call per state of the trajectory'
+        # times 0, 1/6, .. 1: four are at or past 0.45, two at or past 0.8. A state is described in its
+        # crystal inside the window; the crystal is also built wherever a force term reads the state
+        described = {0.0: T + 1, 0.45: 4, 0.8: 2}[window]
+        assert trunk.molecule_rows == B * (T + 1 - described)
+        assert trunk.crystal_calls == (max(described, 4) if force else described)
         _, rpf, rpb, _ = g.get_traj_replay(s, disc, None, mol_batch)
         assert torch.allclose(rpf, pf, atol=1e-4) and torch.allclose(rpb, pb, atol=1e-4)
         torch.manual_seed(2)
@@ -203,6 +252,15 @@ def test_state_atoms_needs_a_matching_feature_width():
         _sampler(100, 7)
     with pytest.raises(ValueError, match='state_atoms'):
         _sampler(0, 7)
+
+
+def test_crystal_window_needs_state_features_and_a_time():
+    with pytest.raises(ValueError, match='state_crystal_t_min'):
+        _sampler(0, 0, state_crystal_t_min=0.5)                 # nothing would read it
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError, match='state_crystal_t_min'):
+            _sampler(7 * 10, 7, state_crystal_t_min=bad)
+    assert _sampler(7 * 10, 7, state_crystal_t_min=0.5).state_crystal_t_min == 0.5
 
 
 def test_nonfinite_features_are_zeroed_in_place_and_the_scramble_is_refused(crystals, checkpoint):
@@ -243,11 +301,14 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
 
     from energy_sampling.checkpointing import Checkpointer
 
-    def config_for(asked, held):
-        fake = SimpleNamespace(modeller=SimpleNamespace(args=SimpleNamespace(model=SimpleNamespace(state_atoms=asked))),
+    def config_for(asked, held, **window):
+        model = SimpleNamespace(state_atoms=asked, **{k: v for k, v in window.items() if k == 'state_crystal_t_min'})
+        fake = SimpleNamespace(modeller=SimpleNamespace(args=SimpleNamespace(model=model)),
                                RECONFIGURABLE_GFN_KEYS=(), FORCE_DRIFT_GFN_KEYS=(),
                                _assert_dead_rows_match=lambda config: None)
         stored = {'dim': 12} if held is None else {'dim': 12, 'state_atoms': held}
+        if 'held_window' in window:
+            stored['state_crystal_t_min'] = window['held_window']
         return Checkpointer._gfn_config_from(fake, {'gfn_config': stored})
 
     assert config_for(0, None) == {'dim': 12}                   # a checkpoint from before the key
@@ -255,3 +316,11 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
     for asked, held in ((29, None), (29, 0), (0, 29), (20, 29)):
         with pytest.raises(ValueError, match='state_atoms'):
             config_for(asked, held)
+    # the window the state encoder was trained on is the checkpoint's: a run asking for another is refused
+    assert config_for(29, 29, state_crystal_t_min=0.8, held_window=0.8)['state_crystal_t_min'] == 0.8
+    assert 'state_crystal_t_min' not in config_for(29, 29, state_crystal_t_min=0.0)    # from before the key
+    for asked, held in ((0.8, 0.0), (0.0, 0.8), (0.5, 0.8)):
+        with pytest.raises(ValueError, match='state_crystal_t_min'):
+            config_for(29, 29, state_crystal_t_min=asked, held_window=held)
+    with pytest.raises(ValueError, match='state_crystal_t_min'):
+        config_for(29, 29, state_crystal_t_min=0.8)                                    # a checkpoint without it

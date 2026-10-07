@@ -711,6 +711,12 @@ class Checkpointer:
         if asked != held:
             raise ValueError(f"model.state_atoms is {asked} in this run's config and {held} in the checkpoint: "
                              f"the state encoder that reads atoms cannot be added to or taken from saved weights")
+        # no parameters, but it decides what the state encoder is shown before that time: weights trained
+        # on one window read another's inputs as a different arm, so a change is refused rather than taken
+        asked, held = (float(c.get('state_crystal_t_min', 0.0) or 0.0) for c in (current, config))
+        if asked != held:
+            raise ValueError(f"model.state_crystal_t_min is {asked:g} in this run's config and {held:g} in the "
+                             f"checkpoint: the saved state encoder was trained on the checkpoint's window")
         for key in self.RECONFIGURABLE_GFN_KEYS + self.FORCE_DRIFT_GFN_KEYS:
             if key not in current:
                 continue

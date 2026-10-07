@@ -360,6 +360,7 @@ model:
   state_atom_hidden_dim: 128   # token width of the atom layers of the state encoder (read with state_atoms > 0)
   state_atom_blocks: 2         # rounds of self-attention over a row's atoms
   state_atom_heads: 4          # attention heads per round; must divide state_atom_hidden_dim
+  state_crystal_t_min: 0.0     # trajectory time in [0, 1) before which a state's atoms are described by the molecule alone (trunk state and energy columns zero; no pair list, no trunk call unless a force term reads the state); 0 = every state in its crystal. Read with state_atoms > 0
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
