@@ -237,11 +237,16 @@ against leg h's. Kinds, three seeds each (two for the last):
   gpl  gp with the force term in P_F (gate learned from 0.25, from t = 0.8)      qf30_gpl_cmle_s1 .. s3
   gpt  gp with the molecule condition read off the intra trunk instead           qf30_gpt_cmle_s1 .. s2
        (the re-embedded files of configs/intra_trunk_oct06/submit_conditions.sbatch, width 256)
-A gp row is its control plus the state-encoder and trunk leaves; gpl and gpt are their gp row plus theirs
-(asserted). The trunk is intra_trunk_oct06/st06_c2_ft_late.pt; the job script refuses a graph row without it and a
-gpt row without the re-embedded files. COST: a graph row calls the trunk at every state of every trajectory, 51
-states where leg h's force rows called it at 11; at batch 1000 expect several times the control's step time, most
-of it the geometry build. Read by step AND by hour.
+  gpw  gp with a state before t = 0.8 described by its molecule alone            qf30_gpw_cmle_s1 .. s3
+       (model.state_crystal_t_min: the trunk's node state and the energy are zero there and no crystal is built;
+       the intra state, the positions in the cell and the element are read at every state)
+  gpwl gpw with the force term in P_F, as gpl                                    qf30_gpwl_cmle_s1 .. s2
+A gp row is its control plus the state-encoder and trunk leaves; gpl, gpt and gpw are their gp row plus theirs,
+gpwl its gpw row plus gpl's (asserted). The trunk is intra_trunk_oct06/st06_c2_ft_late.pt; the job script refuses
+a graph row without it and a gpt row without the re-embedded files. COST: a gp, gpl or gpt row calls the trunk
+at every state of every trajectory, 51 states where leg h's force rows called it at 11; at batch 1000 expect
+several times the control's step time, most of it the geometry build. A gpw or gpwl row calls it at the 11 states
+from t = 0.8, which are also the cheapest to build. Read by step AND by hour.
 """
 import copy
 import importlib.util
@@ -377,11 +382,16 @@ SCRATCH_SCALE = 2.0     # lr_control.fixed_scale of phase 1's leg 1 and of leg e
 GRAPH = (('edr_cmle_s1', 12345, 'ed'), ('edr_cmle_s2', 23456, 'ed'), ('edr_cmle_s3', 34567, 'ed'),
          ('gp_cmle_s1', 12345, 'gp'), ('gp_cmle_s2', 23456, 'gp'), ('gp_cmle_s3', 34567, 'gp'),
          ('gpl_cmle_s1', 12345, 'gpl'), ('gpl_cmle_s2', 23456, 'gpl'), ('gpl_cmle_s3', 34567, 'gpl'),
-         ('gpt_cmle_s1', 12345, 'gpt'), ('gpt_cmle_s2', 23456, 'gpt'))
+         ('gpt_cmle_s1', 12345, 'gpt'), ('gpt_cmle_s2', 23456, 'gpt'),
+         ('gpw_cmle_s1', 12345, 'gpw'), ('gpw_cmle_s2', 23456, 'gpw'), ('gpw_cmle_s3', 34567, 'gpw'),
+         ('gpwl_cmle_s1', 12345, 'gpwl'), ('gpwl_cmle_s2', 23456, 'gpwl'))
+# the row a kind is read against: it must come earlier in GRAPH with the same seed
+GRAPH_PARENT = {'gp': 'ed', 'gpl': 'gp', 'gpt': 'gp', 'gpw': 'gp', 'gpwl': 'gpw'}
 GRAPH_SCALE = 1.0           # lr_control.fixed_scale: 1.25e-4 after burn-in and the ramp
 GRAPH_FIRE_CUT = 0.5        # lr_control.fire_cut_factor: a fire halves the rate
 GRAPH_MODEL = {'state_atoms': 29, 'state_atom_hidden_dim': 128, 'state_atom_blocks': 2, 'state_atom_heads': 4}
-GRAPH_GATE = 0.25           # gpl rows: starting value of P_F's force gate
+GRAPH_GATE = 0.25           # gpl and gpwl rows: starting value of P_F's force gate
+GRAPH_WINDOW = 0.8          # gpw and gpwl rows: model.state_crystal_t_min
 GRAPH_TRUNK = 'intra_trunk_oct06/st06_c2_ft_late.pt'
 GRAPH_COND_DIR, GRAPH_COND_DIM = 'trunkcond_st06', 256
 GRAPH_GUARD = """
@@ -396,6 +406,11 @@ if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
     fi
     if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
         echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+    fi
+fi
+if grep -q -E '^  state_crystal_t_min: 0\.[0-9]*[1-9]' ${CONFIG}; then
+    if ! grep -q 'state_crystal_t_min' ${WORKDIR}/models/gfn.py; then
+        echo "FATAL: models/gfn.py does not read state_crystal_t_min -- git pull gfn-diffusion" >&2; exit 1
     fi
 fi
 # THE TRUNK'S CONDITION (gpt rows): the re-embedded files.
@@ -1103,7 +1118,8 @@ def main_scratch(argv):
 
 def build_graph(run, seed, kind, trunk):
     """Leg h's control recipe at GRAPH_SCALE with a fire that lowers the rate; a graph kind adds the state
-    encoder that reads atoms and the trunk, 'gpl' the force term, 'gpt' the trunk's condition (LEG I)."""
+    encoder that reads atoms and the trunk, 'gpl' the force term, 'gpt' the trunk's condition, 'gpw' the time
+    from which a state is described in its crystal, 'gpwl' that and the force term (LEG I)."""
     cfg = build_p1(run, GRAPH_SCALE, None)
     cfg['seed'] = seed
     stages = cfg['protocols'][PROTOCOL]['stages']
@@ -1113,7 +1129,9 @@ def build_graph(run, seed, kind, trunk):
     if kind != 'ed':
         cfg['model'].update(GRAPH_MODEL)
         cfg['drift_force'] = dict(checkpoint=trunk, **SCRATCH_PROVIDER)
-    if kind == 'gpl':
+    if kind in ('gpw', 'gpwl'):
+        cfg['model']['state_crystal_t_min'] = GRAPH_WINDOW
+    if kind in ('gpl', 'gpwl'):
         cfg['model'].update(force_drift_fwd=GRAPH_GATE, **SCRATCH_TERM)
     if kind == 'gpt':
         for key in ('prior_path', 'molecules_path', 'test_molecules_path'):
@@ -1127,12 +1145,15 @@ GRAPH_LEAVES = {
     'gp': [f'model.{k}' for k in GRAPH_MODEL] + [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
     'gpl': ['model.force_drift_fwd'] + [f'model.{k}' for k in SCRATCH_TERM],
     'gpt': ['prior_path', 'molecules_path', 'test_molecules_path', 'embedding_conditioning_dim'],
+    'gpw': ['model.state_crystal_t_min'],
 }
+GRAPH_LEAVES['gpwl'] = GRAPH_LEAVES['gpl']
 
 
 def check_graph(cfg, name, seed, kind, p1lr2, parent, trunk):
-    """`parent`: the row this one is read against (a control for 'gp', the same seed's gp row for 'gpl' and
-    'gpt'), None for a control, which is checked against the committed phase-1 leg 1."""
+    """`parent`: the row this one is read against (GRAPH_PARENT: a control for 'gp', the same seed's gp row for
+    'gpl', 'gpt' and 'gpw', its gpw row for 'gpwl'), None for a control, which is checked against the committed
+    phase-1 leg 1."""
     st = cfg['protocols'][PROTOCOL]['stages']
     assert [s['name'] for s in st] == ['train_prior'] and 'exit' not in st[0] and st[0]['train_mode'] == 'bwd', name
     assert st[0]['bwd_sampling_mode'] == 'dataset' and st[0]['loss_coeffs']['bwd']['mle'] == 1.0, name
@@ -1162,10 +1183,16 @@ def check_graph(cfg, name, seed, kind, p1lr2, parent, trunk):
         assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
         assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
         assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
-        if kind == 'gpl':
+        if kind in ('gpl', 'gpwl'):
             assert m['force_drift_fwd'] == GRAPH_GATE and {k: m[k] for k in SCRATCH_TERM} == SCRATCH_TERM, name
         else:
             assert m.get('force_drift_fwd') is None, name
+        if kind in ('gpw', 'gpwl'):
+            # a whole number of steps, and the force window's own start: no state gets a force without its crystal
+            assert m['state_crystal_t_min'] == GRAPH_WINDOW == FORCE_T_MIN, name
+            assert cfg['integrator']['T'] == T and abs(GRAPH_WINDOW * T - round(GRAPH_WINDOW * T)) < 1e-9, name
+        else:
+            assert 'state_crystal_t_min' not in m, name
         if kind == 'gpt':
             for key, file in (('prior_path', PRIOR), ('molecules_path', CONDITIONS), ('test_molecules_path', TEST)):
                 assert cfg[key] == f'{w3.CLUSTER_DATA}/{GRAPH_COND_DIR}/{file}', (name, key, cfg[key])
@@ -1200,7 +1227,7 @@ def main_graph(argv):
         if kind == 'ed':
             parent = None
         else:
-            key = ('ed' if kind == 'gp' else 'gp', seed)
+            key = (GRAPH_PARENT[kind], seed)
             assert key in by_kind and by_kind[key] in new, f'{name}: its {key[0]} row of seed {seed} must come first'
             parent = new[by_kind[key]]
         check_graph(cfg, name, seed, kind, p1lr2, parent, trunk)
@@ -1212,7 +1239,9 @@ def main_graph(argv):
           f'{GRAPH_SCALE * SEED_LR:g}, a fire cutting the rate by {GRAPH_FIRE_CUT:g}; trunk {trunk}:')
     what = {'ed': 'control', 'gp': f"state encoder reads {GRAPH_MODEL['state_atoms']} atoms",
             'gpl': f'reads atoms, and the force term in P_F (gate from {GRAPH_GATE:g}, t >= {FORCE_T_MIN:g})',
-            'gpt': f'reads atoms, and the condition is the intra trunk\'s ({GRAPH_COND_DIR}, width {GRAPH_COND_DIM})'}
+            'gpt': f'reads atoms, and the condition is the intra trunk\'s ({GRAPH_COND_DIR}, width {GRAPH_COND_DIM})',
+            'gpw': f'reads atoms; the crystal only from t = {GRAPH_WINDOW:g}',
+            'gpwl': f'reads atoms; the crystal only from t = {GRAPH_WINDOW:g}; and the force term in P_F'}
     for i, (run, seed, kind) in enumerate(GRAPH):
         print(f'[{i:2d}] {TAG}_{run:<12} seed {seed}  {what[kind]}')
     if dry:
@@ -1234,8 +1263,9 @@ def main_graph(argv):
     sb = (nig.SBATCH.replace(array, f'#SBATCH --array=0-{len(rows) - 1}')
           .replace(old, f'# __BATTERY__ leg i: conditional MLE from scratch, the state encoder that reads atoms '
                         f'against the embedded one. Rows 0-2 are the controls; 3-5 read atoms; 6-8 add the force '
-                        f'term; 9-10 take the condition from the intra trunk. Stopped by hand; archives every 5000 '
-                        f'steps (make.py, LEG I).')
+                        f'term; 9-10 take the condition from the intra trunk; 11-13 read the crystal only from '
+                        f't = {GRAPH_WINDOW:g}; 14-15 add the force term to that. Stopped by hand; archives every '
+                        f'5000 steps (make.py, LEG I).')
           .replace(index, '${ARMS}/INDEX_i.tsv').replace(index_note, '# Arm = row of INDEX_i.tsv')
           .replace('__TAG__', TAG + 'i').replace('__BATTERY__', BATTERY)
           .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
