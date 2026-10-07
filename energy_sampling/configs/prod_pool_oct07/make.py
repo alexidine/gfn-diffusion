@@ -3,8 +3,9 @@
     python configs/prod_pool_oct07/make.py       # base = the COMMITTED mk_dev (git show HEAD:), warns on a dirty tree
 
 THE ARMS are prod_sep20's production arm (its build_arm and check, unchanged: a rollout every 5th step, P_B frozen
-at the phase-2 entry, replay 0.3 / bwd 0.7 pinned, tau 600, no forces, batch 1600 pinned, rate 0.5) for mip / neh /
-mipu / nehu, with three things taken from the seed run instead of mk_dev:
+at the phase-2 entry, replay 0.3 / bwd 0.7 pinned, tau 600, no forces, batch 1600 pinned (acr 1000, and no per-branch
+trajectory checkpointing there, both prod_sep20's), rate 0.5) for mip / neh / mipu / nehu / acr, with three things
+taken from the seed run instead of mk_dev:
 
   seed  *mlepl_<fam>_lr2_*_best.pt (mle_pool_oct05), resolved by the job at launch; identity, model and
         energy_config verbatim from that arm's yaml, so prior_path = molecules_path = <system>_pooled_oct05_prior.pt.
@@ -26,8 +27,13 @@ production arm would have resumed whichever of them was written last. main() ass
 The force is the replay-row one because this recipe gives the forward branch no loss weight (fracs fwd 0): rollouts
 only feed the replay buffer, so a forward-seat force would have nothing to act on.
 
-Not here: prod_sep20's every-10th arms (settled there), and acridine (its pooled prior and MLE arm are
-mle_pool_acr_oct05's). ROW ORDER IS THE ARRAY INDEX: the four production arms are 0-3, the exploration arms 4-6.
+ACRIDINE (owner 2026-10-07: "do acridine for me too in the same battery") seeds from mle_pool_acr_oct05's arm, so its
+prior is acridine_mace_pooled_oct05_prior.pt and its MACE checkpoint is that arm's mlip_path (acr_newmodel.model, the
+model the prior was searched and scored under; the family default is an older one, and mlip_path is not part of the
+trainer's problem identity, so the generator asserts it).
+
+Not here: prod_sep20's every-10th arms (settled there). ROW ORDER IS THE ARRAY INDEX: mip / neh / mipu / nehu
+production are 0-3, the mip exploration arms 4-6, acr production 7.
 """
 import copy
 import importlib.util
@@ -47,16 +53,20 @@ from prior_scan_cache import CHUNKING_KEYS  # noqa: E402
 
 TAG = 'ppl'
 BATTERY = 'prod_pool_oct07'
-SEED_BATTERY = 'mle_pool_oct05'
+#: family -> the battery whose mlepl_<fam>_lr2 arm is the seed
+SEED_BATTERY = {'mip': 'mle_pool_oct05', 'neh': 'mle_pool_oct05', 'mipu': 'mle_pool_oct05', 'nehu': 'mle_pool_oct05',
+                'acr': 'mle_pool_acr_oct05'}
 FAMS = ['mip', 'neh', 'mipu', 'nehu']
+ACR_MLIP = '/scratch/mk8347/data/acr_newmodel.model'
 N = 5
 FREEZE = 'freeze_pb:full'
 #: (family, stored force on replay rows, P_B frozen at entry). ROW ORDER IS THE ARRAY INDEX: append only.
-ARMS = [(fam, False, True) for fam in FAMS] + [('mip', True, True), ('mip', False, False), ('mip', True, False)]
+ARMS = ([(fam, False, True) for fam in FAMS] + [('mip', True, True), ('mip', False, False), ('mip', True, False)]
+        + [('acr', False, True)])
 p20.TAG = TAG
 fin.TAG = TAG
-fin.SEED_ARM.update({fam: f'{SEED_BATTERY}/mlepl_{fam}_lr2.yaml' for fam in FAMS})
-fin.SRC.update({fam: f'mlepl_{fam}_lr2' for fam in FAMS})
+fin.SEED_ARM.update({fam: f'{bat}/mlepl_{fam}_lr2.yaml' for fam, bat in SEED_BATTERY.items()})
+fin.SRC.update({fam: f'mlepl_{fam}_lr2' for fam in SEED_BATTERY})
 
 
 def build_arm(base, fam, force=False, frozen=True):
@@ -110,6 +120,9 @@ def check(cfg, name, fam, force=False, frozen=True, production=None):
     assert seed['buffers']['prior_buffer']['max_size'] == rows and rows > 500_000, name
     assert cfg['prior_path'].endswith('_pooled_oct05_prior.pt') and cfg['prior_scan_cache'] is True, name
     assert cfg['buffers']['anchor_buffer']['seed_source'] == 'prior_dataset', name
+    assert cfg.get('mlip_path') == seed.get('mlip_path'), name + ': the MLIP checkpoint moved from the seed arm'
+    if fam == 'acr':
+        assert cfg['mlip_path'] == ACR_MLIP and cfg['prior_path'].endswith('/acridine_mace_pooled_oct05_prior.pt'), name
     same = lambda ec: {k: v for k, v in ec.items() if k not in CHUNKING_KEYS}
     assert same(cfg['energy_config']) == same(seed['energy_config']), name + ': a moved energy_config would miss the scan cache'
 
@@ -129,8 +142,8 @@ def main(argv):
     for a in arms:   # the job's glob for an arm's own checkpoints is *<arm>_*: it must match no other arm's files
         clash = [b for b in arms if b != a and f'{a}_' in f'{TAG}_{b}_']
         assert not clash, f'the checkpoint glob of {a} also matches {clash}'
-    prior_index ={l.split('\t')[1]: l.split('\t')
-                   for l in (ROOT / SEED_BATTERY / 'INDEX.tsv').read_text(encoding='utf-8').splitlines()[1:]}
+    prior_index = {l.split('\t')[1]: l.split('\t') for bat in sorted(set(SEED_BATTERY.values()))
+                   for l in (ROOT / bat / 'INDEX.tsv').read_text(encoding='utf-8').splitlines()[1:]}
     for stale in HERE.glob(f'{TAG}_*.yaml'):
         stale.unlink()
     (HERE / 'joblogs').mkdir(exist_ok=True)
@@ -149,7 +162,7 @@ def main(argv):
             wall=fin.WALL, last=len(arms) - 1, tag=TAG, battery=BATTERY, leg='a', ckpts=fin.w3.CLUSTER_CKPTS,
             data=fin.w3.CLUSTER_DATA, seed_block=fin.SEED_A,
             what='PRODUCTION phase 2 on the pooled priors from the mlepl best-MLE checkpoints: a rollout every 5th '
-                 'step, P_B frozen at entry, replay pinned 0.3; plus mip exploration arms with the stored replay '
+                 'step, P_B frozen at entry, replay pinned 0.3 (mip, neh, mipu, nehu, acr); plus mip exploration arms with the stored replay '
                  'force, with P_B left trainable, and with both.'))
     for i, (name, (cfg, fam)) in enumerate(arms.items()):
         lc = cfg['lr_control']
