@@ -13,6 +13,7 @@ from energy_sampling.utils import gaussian_params
 from mxtaltools.models.graph_models.molecule_graph_model import VectorMoleculeGraphModel
 from mxtaltools.models.modules.components import scalarMLP
 from .architectures import NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel, ForceGate
+from .graph_state import FlatAtomStateEncoding
 
 logtwopi = math.log(2 * math.pi)
 
@@ -59,9 +60,27 @@ class GFN(nn.Module):  # todo add seeding
                  force_drift_max_sigma: Optional[float] = 2.0,
                  force_drift_t_min: float = 0.0,
                  force_drift_differentiable: bool = False,
+                 state_features_dim: int = 0,
+                 state_atoms: int = 0,
+                 state_atom_hidden_dim: int = 128,
+                 state_atom_blocks: int = 2,
+                 state_atom_heads: int = 4,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
+        # state_atoms > 0: the state features are per-atom (state_atoms atoms, padded), and the
+        # state encoder reads them as a set (graph_state.FlatAtomStateEncoding) instead of as one
+        # flat vector. state_features_dim must then be state_atoms * (features per atom + 2).
+        self.state_atoms = int(state_atoms)
+        if self.state_atoms > 0 and (int(state_features_dim) <= 0 or int(state_features_dim) % self.state_atoms
+                                     or int(state_features_dim) // self.state_atoms < 3):
+            raise ValueError(f"state_atoms = {state_atoms} needs state_features_dim = state_atoms * (features per "
+                             f"atom + 2); got {state_features_dim}")
+        # Features of a state that the installed provider computes (install_drift_force) and the
+        # state encoder reads beside the latent and the condition: P_F and P_B both see them,
+        # through the shared s_model. 0 = none, and the model is the one it always was.
+        self.state_features_dim = int(state_features_dim)
+        self.features_on = self.state_features_dim > 0
         self.init_force_drift(force_drift_fwd, force_drift_bwd, force_drift_learned,
                               force_drift_max_sigma, force_drift_t_min, force_drift_differentiable)
         self.harmonics_dim = harmonics_dim
@@ -141,12 +160,21 @@ class GFN(nn.Module):  # todo add seeding
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, t_hidden_dim,
                                     norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(self.expanded_dim,
-                                     s_layers,
-                                     s_hidden_dim,
-                                     condition_embedding_dim if self.conditional else 0,
-                                     s_emb_dim,
-                                     norm=norm, dropout=dropout)
+        if self.state_atoms > 0:
+            self.s_model = FlatAtomStateEncoding(self.expanded_dim, s_layers, s_hidden_dim,
+                                                 condition_embedding_dim if self.conditional else 0, s_emb_dim,
+                                                 atoms=self.state_atoms,
+                                                 atom_dim=self.state_features_dim // self.state_atoms - 2,
+                                                 atom_hidden_dim=state_atom_hidden_dim, blocks=state_atom_blocks,
+                                                 heads=state_atom_heads, norm=norm, dropout=dropout)
+        else:
+            self.s_model = StateEncoding(self.expanded_dim,
+                                         s_layers,
+                                         s_hidden_dim,
+                                         condition_embedding_dim if self.conditional else 0,
+                                         s_emb_dim,
+                                         norm=norm, dropout=dropout,
+                                         extra_dim=self.state_features_dim)
         self.init_policies(s_emb_dim, t_dim, policy_hidden_dim, policy_layers, zero_init, norm, dropout)
 
         self.pb_drift_range = pb_drift_range
@@ -256,7 +284,11 @@ class GFN(nn.Module):  # todo add seeding
         """
         Install the force provider the force terms read: fn(state [B, dim], context,
         create_graph: bool) -> F [B, dim], F = -dE~/dx at `state`, for any state on a
-        trajectory. `context` says which system each row is. A caller of a trajectory
+        trajectory. With state_features_dim > 0 the provider must also have
+        state_info(state, context, need_force, create_graph) -> (F or None, features
+        [B, state_features_dim]), which is then the only call made: one evaluation gives
+        a state's features and, when a force term reads that state, its force.
+        `context` says which system each row is. A caller of a trajectory
         function may pass one as `drift_context`; otherwise, if the provider has a
         `context(mol_batch)` method, it is called once per trajectory batch with the
         `mol_batch` that function was given (row i of the states <-> graph i), and
@@ -272,29 +304,59 @@ class GFN(nn.Module):  # todo add seeding
         """The force provider's context for one trajectory batch: the caller's, or the
         provider's own from `mol_batch` (see install_drift_force). None without a
         force term."""
-        if not self.force_on or drift_context is not None:
+        if not (self.force_on or self.features_on) or drift_context is not None:
             return drift_context
         build = getattr(self.drift_force_fn, 'context', None)
         return None if build is None else build(mol_batch)
 
     def _state_force(self, state, t, drift_ctx):
-        """Force on the latent at `state` (time `t` [B]), or None when no row is inside
-        the time window. The one place the provider is called."""
+        """The provider's record of `state` (time `t` [B]): the force on the latent,
+        [B, dim], and with state features on the features after it, [B, dim +
+        state_features_dim] (the force columns are zero where no force term reads the
+        state). None when nothing would read it. The one place the provider is called."""
         if self.drift_force_fn is None:
             raise RuntimeError(
-                "a force term is configured (force_drift_fwd / force_drift_bwd) but no "
-                "provider is installed; call install_drift_force first")
-        if self.force_drift_t_min > 0 and not bool((t >= self.force_drift_t_min).any()):
+                "a force term (force_drift_fwd / force_drift_bwd) or state features "
+                "(state_features_dim) are configured but no provider is installed; call "
+                "install_drift_force first")
+        need_force = self.force_on and not (
+            self.force_drift_t_min > 0 and not bool((t >= self.force_drift_t_min).any()))
+        if not need_force and not self.features_on:
             return None
         x = self._wrap_ang(state)
-        if self.force_drift_differentiable:
-            force = self.drift_force_fn(x, drift_ctx, True)
+        live = self.force_drift_differentiable
+        if self.features_on:
+            force, features = self.drift_force_fn.state_info(x if live else x.detach(), drift_ctx, need_force, live)
+            if features.shape != (state.shape[0], self.state_features_dim):
+                raise ValueError(f"the provider returned state features of shape {tuple(features.shape)}; "
+                                 f"the model was built for [{state.shape[0]}, {self.state_features_dim}]")
+            bad = ~torch.isfinite(features).all(dim=1, keepdim=True)
+            self._force_nonfinite_rows = self._force_nonfinite_rows + bad.sum().detach()
+            features = torch.where(bad, torch.zeros_like(features), features).detach()
         else:
-            force = self.drift_force_fn(x.detach(), drift_ctx, False).detach()
-        if force.shape != state.shape:
-            raise ValueError(f"the force provider returned shape {tuple(force.shape)} for "
-                             f"states of shape {tuple(state.shape)}")
-        return self._clean_force(force, t)
+            force = self.drift_force_fn(x if live else x.detach(), drift_ctx, live)
+        if force is None:
+            force = torch.zeros_like(state)
+        else:
+            if not live:
+                force = force.detach()
+            if force.shape != state.shape:
+                raise ValueError(f"the force provider returned shape {tuple(force.shape)} for "
+                                 f"states of shape {tuple(state.shape)}")
+            force = self._clean_force(force, t)
+        return torch.cat((force, features), dim=1) if self.features_on else force
+
+    def _record_force(self, record):
+        """The force columns of a state's record (_state_force)."""
+        return record[:, :self.dim] if (self.features_on and record is not None) else record
+
+    def _record_features(self, record):
+        """The feature columns of a state's record, or None when the model reads none."""
+        if not self.features_on:
+            return None
+        if record is None:
+            raise RuntimeError("state features are on and this state came without a provider record")
+        return record[:, self.dim:]
 
     def _clean_force(self, force, t):
         """What every force passes through before a kernel reads it, computed or stored:
@@ -878,7 +940,11 @@ class GFN(nn.Module):  # todo add seeding
         every route that scores or samples through here carries it.
         """
         expanded_state = self.expand_state_for_policy(state)
-        s_emb = self.s_model(expanded_state, condition_embedding)
+        if self.features_on:
+            s_emb = self.s_model(expanded_state, condition_embedding, self._record_features(force))
+            force = self._record_force(force)
+        else:
+            s_emb = self.s_model(expanded_state, condition_embedding)
         t_emb = self.t_model(t)
         state_update = self.predict_next_state(s_emb, t_emb, state)
         pf_mean, logvar, d, V = self.eval_forward_head(
@@ -1145,7 +1211,8 @@ class GFN(nn.Module):  # todo add seeding
 
             back_mean_correction, back_var_correction \
                 = self.get_bwd_correction(
-                condition_embedding, expanded_current_state, i, trajectory_length, ts)
+                condition_embedding, expanded_current_state, i, trajectory_length, ts,
+                self._record_features(force_cur))
 
             t_prev, t_next = ts[:, trajectory_length - i - 1], ts[:, trajectory_length - i]
             drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
@@ -1159,7 +1226,7 @@ class GFN(nn.Module):  # todo add seeding
             back_drift = - current_state * drift_coeff * back_mean_correction
             back_shift = None
             if force_cur is not None and self.force_bwd_on:
-                back_shift = self._bwd_force_shift(force_cur, back_var, t_next)
+                back_shift = self._bwd_force_shift(self._record_force(force_cur), back_var, t_next)
                 back_drift = back_drift + back_shift
             # directly x_t-u\Delta t
             back_mean = current_state + back_drift
@@ -1277,7 +1344,7 @@ class GFN(nn.Module):  # todo add seeding
             condition_embedding = None
         force = (self._state_force(trajectory[:, T - 1], ts[:, T - 1],
                                    self._drift_context(drift_context, mol_batch))
-                 if self.force_fwd_on else None)
+                 if (self.force_fwd_on or self.features_on) else None)
         pf_mean = self._forward_kernel(trajectory[:, T - 1], ts[:, T - 1], condition_embedding,
                                        ts[:, T], dts, force)[0]
         return dts.unsqueeze(1) * pf_mean
@@ -1430,7 +1497,7 @@ class GFN(nn.Module):  # todo add seeding
         # at the state it lands on, so a state's force is computed once
         drift_context = self._drift_context(drift_context, mol_batch)
         force_cur = (self._state_force(current_state, ts[:, 0], drift_context)
-                     if self.force_fwd_on else None)
+                     if (self.force_fwd_on or self.features_on) else None)
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
@@ -1447,7 +1514,8 @@ class GFN(nn.Module):  # todo add seeding
                 step_detach = False
 
             # P_B reads the landing state's force on every step, P_F on all but the last
-            need_force_next = self.force_bwd_on or (self.force_fwd_on and i < trajectory_length - 1)
+            need_force_next = (self.features_on or self.force_bwd_on
+                               or (self.force_fwd_on and i < trajectory_length - 1))
             (next_state, logpf_i, logpb_i, flow_i,
              back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                 use_ckpt, self._fwd_step, current_state, dts, ts[:, i], ts[:, i + 1],
@@ -1577,7 +1645,7 @@ class GFN(nn.Module):  # todo add seeding
         # force at the state the next backward step is conditioned on (see get_traj_fwd)
         drift_context = self._drift_context(drift_context, mol_batch)
         force_cur = (self._state_force(current_state, ts[:, trajectory_length], drift_context)
-                     if (self.force_bwd_on and trajectory_length > 1) else None)
+                     if ((self.force_bwd_on or self.features_on) and trajectory_length > 1) else None)
 
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
@@ -1592,7 +1660,8 @@ class GFN(nn.Module):  # todo add seeding
 
             # P_F reads the force at the state this step lands on; P_B reads it on the
             # next step unless that step is the deterministic one into the source
-            need_force_prev = self.force_fwd_on or (self.force_bwd_on and i < trajectory_length - 2)
+            need_force_prev = (self.features_on or self.force_fwd_on
+                               or (self.force_bwd_on and i < trajectory_length - 2))
             (prev_state, logpf_i, logpb_i, flow_i,
              back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
                 use_ckpt, self._bwd_step, current_state, dts, ts, condition_embedding,
@@ -1698,6 +1767,9 @@ class GFN(nn.Module):  # todo add seeding
         # tail is collected here and the returned tensor is assembled by cat.
         live_tail = {}
 
+        if state_forces is not None and self.features_on:
+            raise ValueError("state_forces holds forces only; with state features on every stored state "
+                             "goes back to the provider")
         if state_forces is not None and state_forces.shape != trajectory.shape:
             raise ValueError(f"state_forces has shape {tuple(state_forces.shape)}, expected the "
                              f"trajectory's {tuple(trajectory.shape)}")
@@ -1711,12 +1783,13 @@ class GFN(nn.Module):  # todo add seeding
                 return self._clean_force(state_forces[:, j].detach(), ts[:, j])
             return self._state_force(trajectory[:, j], ts[:, j], drift_context)
 
-        force_cur = stored_force(0) if self.force_fwd_on else None
+        force_cur = stored_force(0) if (self.force_fwd_on or self.features_on) else None
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
             # as in get_traj_fwd: P_B reads the landing state's force, P_F all but the last
-            need_force_next = self.force_bwd_on or (self.force_fwd_on and i < trajectory_length - 1)
+            need_force_next = (self.features_on or self.force_bwd_on
+                               or (self.force_fwd_on and i < trajectory_length - 1))
             if implied_noise_last_k > 0 and i >= trajectory_length - implied_noise_last_k:
                 (next_state, logpf_i, logpb_i, flow_i,
                  back_drift, back_var, fwd_drift, pflogvars, d, force_cur) = self._run_step(
@@ -1794,7 +1867,7 @@ class GFN(nn.Module):  # todo add seeding
         next_state = self._wrap_ang(next_state)
         expanded_next_state = self.expand_state_for_policy(next_state)
         back_mean_correction, back_var_correction = self.fwd_get_back_correction(
-            condition_embedding, expanded_next_state, t_next)
+            condition_embedding, expanded_next_state, t_next, self._record_features(force_next))
         drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
         back_drift = -next_state * drift_coeff * back_mean_correction
         if not is_first:  # variance is exactly zero for the first step, so we can't use it
@@ -1803,7 +1876,7 @@ class GFN(nn.Module):  # todo add seeding
             back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
             back_shift = None
             if force_next is not None and self.force_bwd_on:
-                back_shift = self._bwd_force_shift(force_next, back_var, t_next)
+                back_shift = self._bwd_force_shift(self._record_force(force_next), back_var, t_next)
                 back_drift = back_drift + back_shift
             logpb_i = self._score_pb(current_state, next_state, drift_coeff,
                                      back_mean_correction, back_var, t_next, back_shift)
@@ -2021,31 +2094,43 @@ class GFN(nn.Module):  # todo add seeding
                 "attributes and freeze_backward_policy deepcopies the trunk; the "
                 "two are mutually exclusive. Use compile_policy: auto with a "
                 "frozen P_B.")
-        if self.force_on:
+        if self.force_on or self.features_on:
             raise ValueError(
                 "compile_policy: 'step' compiles the step bodies, and with a force term "
-                "(force_drift_fwd / force_drift_bwd) _fwd_step calls the force provider "
-                "inside that region. Use compile_policy: auto with a force term.")
+                "(force_drift_fwd / force_drift_bwd) or state features (state_features_dim) "
+                "_fwd_step calls the provider inside that region. Use compile_policy: auto.")
         self._fwd_step = torch.compile(self._fwd_step)
         self._replay_step = torch.compile(self._replay_step)
         print('compile_policy step: _fwd_step + _replay_step compiled as whole-step '
               'units (_bwd_step remains eager -- it still takes int indices)')
 
-    def _pb_net(self, expanded_state, condition_embedding, t):
+    def _pb_net(self, expanded_state, condition_embedding, t, features=None):
         """(dmean, dvar) from the P_B network -- the live trunk+head, or the
-        frozen snapshot when freeze_backward_policy has been called."""
+        frozen snapshot when freeze_backward_policy has been called. `features`: the
+        state's features (_record_features), read by the state encoder when the model
+        was built with them."""
         fr = getattr(self, '_pb_frozen', None)
         if fr is not None:
             with torch.no_grad():
                 ce = condition_embedding.detach() if condition_embedding is not None else None
-                pbs = fr['backward_policy'](fr['s_model'](expanded_state.detach(), ce), fr['t_model'](t))
+                if features is None:
+                    s_emb = fr['s_model'](expanded_state.detach(), ce)
+                else:
+                    s_emb = fr['s_model'](expanded_state.detach(), ce, features.detach())
+                pbs = fr['backward_policy'](s_emb, fr['t_model'](t))
             return gaussian_params(pbs)
-        return gaussian_params(self.backward_policy(
-            self.s_model(expanded_state, condition_embedding), self.t_model(t)))
+        if features is None:
+            s_emb = self.s_model(expanded_state, condition_embedding)
+        else:
+            s_emb = self.s_model(expanded_state, condition_embedding, features)
+        return gaussian_params(self.backward_policy(s_emb, self.t_model(t)))
 
-    def fwd_get_back_correction(self, condition_embedding, expanded_next_state, t_next):
+    def fwd_get_back_correction(self, condition_embedding, expanded_next_state, t_next, features=None):
         if self.learn_pb:
-            dmean, dvar = self._pb_net(expanded_next_state, condition_embedding, t_next)
+            # without state features the call keeps its historical arguments: ConformerGFN overrides
+            # _pb_net with exactly those
+            dmean, dvar = (self._pb_net(expanded_next_state, condition_embedding, t_next) if features is None
+                           else self._pb_net(expanded_next_state, condition_embedding, t_next, features))
             back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
 
             if self.learned_variance:
@@ -2108,10 +2193,12 @@ class GFN(nn.Module):  # todo add seeding
             s_ = back_mean + back_var.sqrt() * eps
         return s_
 
-    def get_bwd_correction(self, condition_embedding, expanded_current_state, i, trajectory_length, ts):
+    def get_bwd_correction(self, condition_embedding, expanded_current_state, i, trajectory_length, ts,
+                           features=None):
         if self.learn_pb:
-            dmean, dvar = self._pb_net(expanded_current_state, condition_embedding,
-                                       ts[:, trajectory_length - i])
+            t_at = ts[:, trajectory_length - i]
+            dmean, dvar = (self._pb_net(expanded_current_state, condition_embedding, t_at) if features is None
+                           else self._pb_net(expanded_current_state, condition_embedding, t_at, features))
             back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
 
             if self.learned_variance:

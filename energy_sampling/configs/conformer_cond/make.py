@@ -202,6 +202,7 @@ CRYSTAL_ONLY_KEYS = frozenset({
     # the crystal sampler's force term and its force model (image tables of a crystal)
     'model.force_drift_fwd', 'model.force_drift_bwd', 'model.force_drift_learned',
     'model.force_drift_max_sigma', 'model.force_drift_t_min', 'model.force_drift_differentiable',
+    'model.state_atoms', 'model.state_atom_hidden_dim', 'model.state_atom_blocks', 'model.state_atom_heads',
     'drift_force.checkpoint', 'drift_force.chunk', 'drift_force.max_images', 'drift_force.max_pairs',
     'drift_force.max_pairs_per_call',
 })

@@ -132,13 +132,21 @@ class StateEncoding(nn.Module):
                  s_emb_dim: int = 64,
                  dropout: Optional[float] = 0,
                  norm: Optional[str] = None,
-                 bias: Optional[bool] = True
+                 bias: Optional[bool] = True,
+                 extra_dim: int = 0,
                  ):
         super(StateEncoding, self).__init__()
 
+        # A second input block: features of the state computed outside the latent (GFN's
+        # state_features_dim). Projected and normalised per row before it joins the state and
+        # the condition, so its scale is its own business and no row depends on another.
+        self.extra_dim = extra_dim
+        if extra_dim > 0:
+            self.extra_in = nn.Sequential(nn.Linear(extra_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
+
         self.x_model = scalarMLP(
             layers=layers,
-            input_dim=s_dim + conditioning_dim,
+            input_dim=s_dim + conditioning_dim + (hidden_dim if extra_dim > 0 else 0),
             filters=hidden_dim,
             output_dim=s_emb_dim,
             dropout=dropout,
@@ -146,11 +154,15 @@ class StateEncoding(nn.Module):
             bias=bias,
         )
 
-    def forward(self, s, conditioning=None):
+    def forward(self, s, conditioning=None, extra=None):
         if conditioning is not None:
             model_inputs = torch.cat([s, conditioning], dim=-1)
         else:
             model_inputs = s
+        if self.extra_dim > 0:
+            if extra is None:
+                raise ValueError('this state encoder was built with extra_dim > 0 and was given no extra input')
+            model_inputs = torch.cat([model_inputs, self.extra_in(extra)], dim=-1)
         return self.x_model(model_inputs)
 
 

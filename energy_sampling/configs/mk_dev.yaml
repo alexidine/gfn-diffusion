@@ -356,11 +356,15 @@ model:
   force_drift_max_sigma: 2.0   # cap on one step's force displacement, in that step's noise standard deviations (RMS over live rows); null = no cap
   force_drift_t_min: 0.0       # trajectory time in [0, 1) before which a state gets no force and the trunk is not called
   force_drift_differentiable: false  # true = the force carries its graph to the state (second derivatives through the trunk); read only by path-gradient options
+  state_atoms: 0               # > 0: the state encoder reads this many atoms (padded) of per-atom features from the drift_force trunk at every state; 0 = the latent and the condition only
+  state_atom_hidden_dim: 128   # token width of the atom layers of the state encoder (read with state_atoms > 0)
+  state_atom_blocks: 2         # rounds of self-attention over a row's atoms
+  state_atom_heads: 4          # attention heads per round; must divide state_atom_hidden_dim
 
-# force model read by model.force_drift_fwd / force_drift_bwd; not loaded when both are null
+# trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
 drift_force:
-  checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint; required when a force term is on
+  checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint (plain or stacked); required when a force term or state_atoms is on
   chunk: 1000                  # crystal states per geometry build
   max_images: 2000             # image molecules one crystal may hold inside the trunk's reach; its nearest are kept
   max_pairs: 40000             # atom pairs one crystal may hold inside the trunk's cutoff; its shortest are kept

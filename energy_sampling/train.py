@@ -3188,8 +3188,23 @@ class Modeller:
             print(f"WARNING: dead-row probe could not run ({type(e).__name__}: {e}); "
                   f"the tabulated rows for SG{sg} are UNVERIFIED this run")
 
+    def _state_features_dim(self):
+        """Width of the per-state features the sampler reads (GFN's state_features_dim): with
+        model.state_atoms > 0, that many atoms of what the drift_force.checkpoint trunk describes
+        an atom by, plus its element and a flag. 0 without."""
+        atoms = int(getattr(self.args.model, 'state_atoms', 0) or 0)
+        if atoms <= 0:
+            return 0
+        cfg = getattr(self.args, 'drift_force', None)
+        checkpoint = None if cfg is None else vars(cfg).get('checkpoint')
+        if checkpoint is None:
+            raise ValueError("model.state_atoms asks for per-atom state features, and drift_force.checkpoint "
+                             "names no trunk to compute them")
+        return atoms * (TrunkForce.atom_feature_dim(checkpoint) + 2)
+
     def _build_gfn_config(self):
         return dict(
+            state_features_dim=self._state_features_dim(),
             dim=self.energy_function.data_ndim,
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
@@ -3283,24 +3298,35 @@ class Modeller:
         if unknown:
             raise ValueError(f"drift_force: unknown keys {unknown}; it reads {list(self.DRIFT_FORCE_KEYS)}")
         checkpoint = cfg.get('checkpoint')
-        if not self.gfn_model.force_on:
+        if not (self.gfn_model.force_on or self.gfn_model.features_on):
             if checkpoint is not None:
                 print(f"drift_force.checkpoint is set ({checkpoint}) but the model has no force term "
-                      f"(model.force_drift_fwd and model.force_drift_bwd are null): the trunk is not loaded")
+                      f"(model.force_drift_fwd and model.force_drift_bwd are null) and reads no state "
+                      f"features (model.state_atoms): the trunk is not loaded")
             return None
         if checkpoint is None:
-            raise ValueError("model.force_drift_fwd / model.force_drift_bwd ask for a force term, and "
-                             "drift_force.checkpoint names no trunk")
+            raise ValueError("model.force_drift_fwd / model.force_drift_bwd / model.state_atoms ask for a trunk, "
+                             "and drift_force.checkpoint names none")
         if self.args.energy_function != 'elj' or max(self.args.z_primes) != 1 or self.args.temperature_conditioning:
             raise ValueError(
                 f"the force term reads a trunk fitted to the eLJ energy of Z' = 1 crystals at one temperature; "
                 f"this run has energy_function {self.args.energy_function!r}, z_primes {list(self.args.z_primes)}, "
                 f"temperature_conditioning {self.args.temperature_conditioning}")
         # an absent key takes TrunkForce's own default: the bound is on whether or not a config names it
-        trunk = TrunkForce(checkpoint, self.device, **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:]
-                                                       if cfg.get(k) is not None})
-        trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
         m = self.gfn_model
+        trunk = TrunkForce(checkpoint, self.device, max_atoms=m.state_atoms,
+                           **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:] if cfg.get(k) is not None})
+        trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
+        if m.features_on:
+            if trunk.features_dim != m.state_features_dim:
+                raise ValueError(f"the model was built for state features of width {m.state_features_dim}; the "
+                                 f"trunk {checkpoint} hands out {trunk.features_dim} "
+                                 f"({m.state_atoms} atoms of {trunk.atom_dim} + 2)")
+            print(f"state features: {m.state_atoms} atoms of {trunk.atom_dim} features from the "
+                  f"{'stacked ' if trunk.stacked else ''}trunk {checkpoint}, read by the state encoder at every "
+                  f"state of every trajectory; the trunk is frozen")
+        if not m.force_on:
+            return CrystalDriftForce(trunk, self.energy_function)
         print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "
               f"{trunk.temperature:g}, lj_coeff {trunk.lj_coeff:g}); P_F gate starts at {m.force_drift_fwd}, "
               f"P_B gate at {m.force_drift_bwd}, {'learned' if m.force_drift_learned else 'held fixed'}; cap "

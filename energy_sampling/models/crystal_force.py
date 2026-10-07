@@ -21,18 +21,37 @@ inside 5 A against at most 21 thousand on the trunk's training states (QM9, meas
 its shortest pairs), and `max_pairs_per_call` splits a batch of rows across trunk calls, so
 no state can ask for more than a fixed amount. A capped crystal's force is the force of its
 truncated pair list; `capped_rows` counts them.
+
+A STACKED CHECKPOINT (pretrain_atom_trunk.py --intra) is read the same way: the provider is
+then a `StackedTrunk`, and the intra trunk's states of each molecule are computed once per
+context.
+
+STATE FEATURES. With `max_atoms` set the provider also describes a state to a policy
+(`state_info`, read by GFN when it is built with state features): per atom of the
+asymmetric unit, the trunk's node state in the crystal, the intra trunk's state of that atom
+(stacked trunk), its fractional position in the cell, its offset from the molecule's centre
+and its energy, then its element and a flag, padded to `max_atoms` atoms and flattened. They
+come from the pass that gives the force, carry no gradient, and are the layout
+`models.graph_state.FlatAtomStateEncoding` unpacks.
 """
 import math
 from dataclasses import dataclass, replace
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from .atom_trunk import AtomTrunk, crystal_density, intramolecular_edges
+from .stacked_trunk import StackedTrunk
 from mxtaltools.analysis.vdw_analysis import exponential_edgewise_lj_energy
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.constants.atom_properties import VDW_RADII
 from mxtaltools.crystal_building.image_pairs import ImageTables, build_image_tables, select_images, pair_distances
+
+#: a state's per-atom features: offsets from the molecule's centre are divided by this (Angstrom),
+#: per-atom energies by ENERGY_SCALE (kT) and then held to +-ENERGY_CLAMP
+COORD_SCALE = 5.0
+ENERGY_SCALE = 5.0
+ENERGY_CLAMP = 10.0
 
 
 def compressed_elj_per_atom(pairs, vdw, lj_coeff: float, temperature: float, compress_at: float, n_nodes: int,
@@ -57,6 +76,7 @@ class _Chunk:
     node_graph: torch.Tensor    # [n] crystal index within the chunk
     intra_index: torch.Tensor   # [2, Ei]
     intra_dist: torch.Tensor    # [Ei]
+    e_m: Optional[torch.Tensor] = None   # [n, D] the intra trunk's states of its atoms (stacked trunk)
 
 
 @dataclass
@@ -85,10 +105,11 @@ class TrunkForce:
         trunk's cutoff (`image_pairs.select_images`, `pair_distances`). The defaults are about
         twice the largest counts on the trunk's training states.
     max_pairs_per_call : pairs one trunk call may be handed; rows over it go to further calls.
+    max_atoms : atoms per molecule the state features are padded to (0: no state features).
     """
 
     def __init__(self, checkpoint: str, device, chunk: int = 1000, max_images: int = 2000,
-                 max_pairs: int = 40_000, max_pairs_per_call: int = 4_000_000):
+                 max_pairs: int = 40_000, max_pairs_per_call: int = 4_000_000, max_atoms: int = 0):
         ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
         a = ck['args']
         if a.get('arm') != 'trunk' or a.get('target', 'full') != 'full':
@@ -109,14 +130,32 @@ class TrunkForce:
         self.lj_coeff = float(a['lj_coeff'])
         self.step = int(ck.get('step', -1))
         self.row_scale = ck['row_scale'].to(self.device)
-        self.trunk = AtomTrunk(node_dim=a['node_dim'], message_dim=a['message_dim'], num_convs=a['num_convs'],
-                               cutoff=self.cutoff, folded=not a['unfolded']).to(self.device)
+        self.stacked = ck.get('intra_trunk_args') is not None
+        if self.stacked:
+            self.trunk = StackedTrunk(ck['intra_trunk_args'], node_dim=a['node_dim'], message_dim=a['message_dim'],
+                                      num_convs=a['num_convs'], cutoff=self.cutoff, folded=not a['unfolded'])
+        else:
+            self.trunk = AtomTrunk(node_dim=a['node_dim'], message_dim=a['message_dim'], num_convs=a['num_convs'],
+                                   cutoff=self.cutoff, folded=not a['unfolded'])
         self.trunk.load_state_dict(ck['model'])
-        self.trunk.requires_grad_(False).eval()
+        self.trunk.to(self.device).requires_grad_(False).eval()
+        self.max_atoms = int(max_atoms)
+        #: per atom: trunk state, intra state (stacked), fractional position, offset from the centre, energy
+        self.atom_dim = int(a['node_dim']) + (self.trunk.intra.node_dim if self.stacked else 0) + 7
+        #: width of a state's flattened features: max_atoms * (atom_dim + element + flag)
+        self.features_dim = self.max_atoms * (self.atom_dim + 2)
         self.calls = 0          # force evaluations (one per state batch)
         self.rows = 0           # crystal states evaluated
         self.capped_rows = 0    # of those, states whose image or pair list was capped
         self.extra_calls = 0    # trunk calls beyond one per chunk, made to stay under max_pairs_per_call
+
+    @staticmethod
+    def atom_feature_dim(checkpoint: str) -> int:
+        """Features per atom a provider built on `checkpoint` hands out (`atom_dim`), read off the
+        checkpoint's arguments without building the trunk."""
+        ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
+        intra = ck.get('intra_trunk_args')
+        return int(ck['args']['node_dim']) + (int(intra.get('node_dim', 128)) if intra is not None else 0) + 7
 
     def check_energy(self, temperature: float, lj_coeff: float, rtol: float = 1e-6):
         """Refuse a run whose energy is not the one the trunk was fitted to. The target is
@@ -133,6 +172,9 @@ class TrunkForce:
         The batch is cloned: the caller's object is not touched afterwards."""
         cb = crystal_batch.clone().to(self.device)
         tables = build_image_tables(cb)
+        if self.max_atoms and int(tables.nat.max()) > self.max_atoms:
+            raise ValueError(f"a molecule of {int(tables.nat.max())} atoms; the state features were sized for "
+                             f"{self.max_atoms} (drift_force.max_atoms)")
         node_ptr = cb.ptr.to(self.device)
         chunks = []
         for lo in range(0, cb.num_graphs, self.chunk):
@@ -140,9 +182,10 @@ class TrunkForce:
             n_lo, n_hi = int(node_ptr[lo]), int(node_ptr[hi])
             sub = _slice_tables(tables, lo, hi, n_lo)
             intra_index, intra_dist = intramolecular_edges(sub, self.cutoff)
+            e_m = self.trunk.molecule_states(sub.z, sub.p, sub.amask) if self.stacked else None
             chunks.append(_Chunk(rows=slice(lo, hi), tables=sub, z=cb.z[n_lo:n_hi].long(),
                                  node_graph=cb.batch[n_lo:n_hi] - lo,
-                                 intra_index=intra_index, intra_dist=intra_dist))
+                                 intra_index=intra_index, intra_dist=intra_dist, e_m=e_m))
         return TrunkContext(crystals=cb, chunks=chunks, num_rows=cb.num_graphs)
 
     def energy_and_force(self, state, ctx: TrunkContext, create_graph: bool = False):
@@ -166,7 +209,7 @@ class TrunkForce:
                 pairs = pair_distances(c.tables, sel, self.cutoff, max_pairs=self.max_pairs)
                 self.capped_rows += int((sel['capped'] | sel['image_capped'] | pairs['pair_capped']).sum())
                 density = crystal_density(c.tables, T_fc[r])
-                for rows, inputs in self._calls(c, pairs, density):
+                for rows, _, inputs in self._calls(c, pairs, density):
                     e = self.trunk(*inputs)['energy']
                     g, = torch.autograd.grad(e.sum(), x, retain_graph=True, create_graph=create_graph)
                     grad = grad + g
@@ -175,15 +218,77 @@ class TrunkForce:
         self.rows += ctx.num_rows
         return energy, -grad
 
+    def state_info(self, state, ctx: TrunkContext, need_force: bool, create_graph: bool = False):
+        """(force [B, dim] or None, features [B, features_dim]) of `state`, from one pass of the trunk.
+
+        The force is `__call__`'s, taken only under `need_force`. The features are the module
+        docstring's: per atom [trunk state, intra state (stacked), fractional position, offset
+        from the molecule's centre / COORD_SCALE, energy / ENERGY_SCALE, element, 1], zero on
+        padding, flattened to [B, max_atoms * (atom_dim + 2)]. They carry no gradient."""
+        if self.max_atoms < 1:
+            raise ValueError("this provider was built without state features (max_atoms = 0)")
+        if ctx is None:
+            raise ValueError("TrunkForce needs a context (TrunkForce.context of the rows' crystal batch) passed "
+                             "to the trajectory function as drift_context")
+        if state.shape[0] != ctx.num_rows:
+            raise ValueError(f"{state.shape[0]} states for a context of {ctx.num_rows} rows")
+        width = self.atom_dim + 2
+        with torch.set_grad_enabled(need_force):
+            x = state.detach()
+            if need_force:
+                x = state if state.requires_grad else x.requires_grad_(True)
+            cb = ctx.crystals
+            cb.latent_to_cell_params(x.to(self.device))
+            T_fc, T_cf, centroid, orientation = cb.T_fc, cb.T_cf, cb.aunit_centroid, cb.aunit_orientation
+            feats = torch.zeros(ctx.num_rows, self.max_atoms, width, dtype=T_fc.dtype, device=self.device)
+            grad = torch.zeros_like(x) if need_force else None
+            for c in ctx.chunks:
+                r = c.rows
+                sel = select_images(c.tables, T_fc[r], T_cf[r], centroid[r], orientation[r], self.cutoff,
+                                    max_images=self.max_images)
+                pairs = pair_distances(c.tables, sel, self.cutoff, max_pairs=self.max_pairs)
+                self.capped_rows += int((sel['capped'] | sel['image_capped'] | pairs['pair_capped']).sum())
+                density = crystal_density(c.tables, T_fc[r])
+                node = torch.zeros(int(c.z.numel()), width, dtype=T_fc.dtype, device=self.device)
+                for _, (n0, n1), inputs in self._calls(c, pairs, density):
+                    out = self.trunk(*inputs)
+                    if need_force:
+                        g, = torch.autograd.grad(out['energy'].sum(), x, retain_graph=True, create_graph=create_graph)
+                        grad = grad + g
+                    k = out['h'].shape[1]
+                    node[n0:n1, :k] = out['h'].detach()
+                    node[n0:n1, self.atom_dim - 1] = (out['e_atom'].detach() / ENERGY_SCALE).clamp(-ENERGY_CLAMP,
+                                                                                                   ENERGY_CLAMP)
+                am = c.tables.amask
+                k = self.atom_dim - 7
+                if self.stacked:
+                    node[:, k - c.e_m.shape[1]:k] = c.e_m
+                # the asymmetric unit's atoms where the state puts them: operator 0 is the identity, so its
+                # copy is the molecule itself, offsets about the centre the fractional centroid names
+                offset = sel['skel'][:, 0].detach()
+                centre = torch.einsum('bij,bj->bi', T_fc[r], centroid[r][:, :3]).detach()
+                frac = torch.einsum('bij,baj->bai', T_cf[r].detach(), centre[:, None, :] + offset)
+                node[:, k:k + 3] = frac[am]
+                node[:, k + 3:k + 6] = offset[am] / COORD_SCALE
+                node[:, self.atom_dim] = c.z.to(node.dtype)
+                node[:, self.atom_dim + 1] = 1.0
+                block = torch.zeros(am.shape[0], am.shape[1], width, dtype=node.dtype, device=self.device)
+                block[am] = node
+                feats[r, :am.shape[1]] = block
+        self.calls += 1
+        self.rows += ctx.num_rows
+        return (-grad if need_force else None), feats.reshape(ctx.num_rows, self.features_dim)
+
     def _calls(self, c: _Chunk, pairs, density):
-        """The trunk calls of one chunk: (rows of the chunk, trunk inputs) for the whole chunk when its
-        pairs fit `max_pairs_per_call`, else for consecutive groups of crystals that each do. Each
+        """The trunk calls of one chunk: (rows of the chunk, its (first, last + 1) atoms, trunk inputs) for
+        the whole chunk when its pairs fit `max_pairs_per_call`, else for consecutive groups of crystals that each do. Each
         group's energy depends on its own crystals alone, so the caller may take its gradient and
         let it go before the next."""
         n_rows = c.rows.stop - c.rows.start
         if int(pairs['dist'].numel()) <= self.max_pairs_per_call:
-            yield slice(0, n_rows), (c.z, c.node_graph, c.intra_index, c.intra_dist,
-                                     pairs['node_ref'], pairs['node_img'], pairs['dist'], density)
+            yield slice(0, n_rows), (0, int(c.z.numel())), self._inputs(
+                c.z, c.node_graph, c.intra_index, c.intra_dist, pairs['node_ref'], pairs['node_img'],
+                pairs['dist'], density, c.e_m)
             return
         counts = torch.bincount(pairs['graph'], minlength=n_rows).tolist()
         bounds, held = [0], 0
@@ -199,9 +304,16 @@ class TrunkForce:
             n0, n1 = node_ptr[g0], node_ptr[g1]
             mine = (pairs['graph'] >= g0) & (pairs['graph'] < g1)
             intra = (c.intra_index[1] >= n0) & (c.intra_index[1] < n1)     # an edge never leaves its molecule
-            yield slice(g0, g1), (c.z[n0:n1], c.node_graph[n0:n1] - g0, c.intra_index[:, intra] - n0,
-                                  c.intra_dist[intra], pairs['node_ref'][mine] - n0, pairs['node_img'][mine] - n0,
-                                  pairs['dist'][mine], density[g0:g1])
+            yield slice(g0, g1), (n0, n1), self._inputs(
+                c.z[n0:n1], c.node_graph[n0:n1] - g0, c.intra_index[:, intra] - n0, c.intra_dist[intra],
+                pairs['node_ref'][mine] - n0, pairs['node_img'][mine] - n0, pairs['dist'][mine], density[g0:g1],
+                None if c.e_m is None else c.e_m[n0:n1])
+
+    def _inputs(self, z, node_graph, intra_index, intra_dist, ref, img, dist, density, e_m):
+        """The trunk's arguments: a stacked trunk reads the intra states and no intramolecular edge."""
+        if self.stacked:
+            return (z, node_graph, ref, img, dist, density, e_m)
+        return (z, node_graph, intra_index, intra_dist, ref, img, dist, density)
 
     def __call__(self, state, ctx: TrunkContext, create_graph: bool = False):
         return self.energy_and_force(state, ctx, create_graph)[1]
@@ -279,3 +391,10 @@ class CrystalDriftForce:
 
     def __call__(self, state, ctx: TrunkContext, create_graph: bool = False):
         return self.trunk_force(state, ctx, create_graph)
+
+    @property
+    def features_dim(self) -> int:
+        return self.trunk_force.features_dim
+
+    def state_info(self, state, ctx: TrunkContext, need_force: bool, create_graph: bool = False):
+        return self.trunk_force.state_info(state, ctx, need_force, create_graph)

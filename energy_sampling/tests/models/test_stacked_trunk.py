@@ -125,3 +125,22 @@ def test_force_matching_trains_the_stages_and_leaves_the_intra_trunk_alone(cryst
     assert all(torch.equal(before[k], after[k]) for k in before)
     assert not model.intra.training
     assert model.train().inter.training and not model.intra.training     # held in evaluation mode under .train()
+
+
+def test_trunk_conditions_are_the_pooled_intra_states_of_each_rows_molecule(crystals):
+    from build_trunk_conditions import SUM_SCALE, molecule_conditions
+
+    model = _model()
+    batch = collate_data_list([c.clone() for c in crystals])
+    width = INTRA_ARGS['node_dim']
+    emb = molecule_conditions(model, batch, 'cpu', chunk=3)
+    assert emb.shape == (len(crystals), 2 * width) and bool(torch.isfinite(emb).all())
+    # the image tables hold each molecule in another frame: the states, and so the conditions, do not care
+    tables = build_image_tables(batch)
+    states = model.molecule_states(tables.z, tables.p, tables.amask)
+    graph = tables.amask.nonzero(as_tuple=True)[0]
+    total = torch.zeros(len(crystals), width).index_add_(0, graph, states)
+    assert torch.allclose(emb[:, :width], total / tables.nat[:, None], atol=1e-4)
+    assert torch.allclose(emb[:, width:], total / SUM_SCALE, atol=1e-4)
+    alone = molecule_conditions(model, collate_data_list([crystals[2].clone()]), 'cpu')
+    assert torch.allclose(alone, emb[2:3], atol=1e-5)

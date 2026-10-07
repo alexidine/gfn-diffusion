@@ -124,3 +124,37 @@ class AtomStateEncoding(nn.Module):
         if extra is not None:
             parts.append(extra)
         return self.x_model(torch.cat(parts, dim=-1))
+
+
+class FlatAtomStateEncoding(nn.Module):
+    """`AtomStateEncoding` behind `StateEncoding`'s call: forward(s, conditioning, extra) -> s_emb.
+
+    `extra` is a state's flattened atom features as a provider hands them to GFN (the layout of
+    `models.crystal_force.TrunkForce.state_info`): [B, atoms * (atom_dim + 2)], per atom its
+    `atom_dim` features, then its atomic number, then 1 on a real atom and 0 on padding. The
+    condition vector, when there is one, joins the state after the pool.
+    """
+
+    def __init__(self, s_dim: int, layers: int, hidden_dim: int = 64, conditioning_dim: int = 0,
+                 s_emb_dim: int = 64, atoms: int = 1, atom_dim: int = 1, atom_hidden_dim: int = 128,
+                 blocks: int = 2, heads: int = 4, dropout: Optional[float] = 0, norm: Optional[str] = None,
+                 bias: Optional[bool] = True):
+        super().__init__()
+        self.atoms, self.atom_dim = int(atoms), int(atom_dim)
+        self.conditioning_dim = int(conditioning_dim)
+        self.extra_dim = self.atoms * (self.atom_dim + 2)
+        self.encoding = AtomStateEncoding(s_dim, self.atom_dim, layers, hidden_dim=hidden_dim, s_emb_dim=s_emb_dim,
+                                          extra_dim=self.conditioning_dim, atom_hidden_dim=atom_hidden_dim,
+                                          blocks=blocks, heads=heads, dropout=dropout, norm=norm, bias=bias)
+
+    def forward(self, s, conditioning=None, extra=None):
+        if extra is None:
+            raise ValueError('this state encoder reads atom features and was given none')
+        if extra.shape[-1] != self.extra_dim:
+            raise ValueError(f'atom features of width {extra.shape[-1]}; this encoder was built for '
+                             f'{self.atoms} atoms of {self.atom_dim} features ({self.extra_dim})')
+        per_atom = extra.reshape(extra.shape[0], self.atoms, self.atom_dim + 2)
+        mask = per_atom[..., -1] > 0.5
+        z = per_atom[..., -2].round().long()
+        return self.encoding(s, per_atom[..., :self.atom_dim], z, mask,
+                             extra=conditioning if self.conditioning_dim > 0 else None)
