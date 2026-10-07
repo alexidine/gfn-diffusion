@@ -3343,6 +3343,16 @@ class Modeller:
         return CrystalDriftForce(trunk, self.energy_function)
 
     @torch.no_grad()
+    def provider_counts(self, model):
+        """The trunk provider's running totals since start-up, for the eval log: states it was called
+        on, states whose image or pair list hit a cap, trunk calls split for memory, and rows whose
+        force or features came back non-finite. Logged for a force term and for state features alike."""
+        trunk = self.drift_force.trunk_force
+        return {'force/nonfinite_rows': float(model.force_nonfinite_rows()),
+                'force/trunk_states': float(trunk.rows),
+                'force/capped_states': float(trunk.capped_rows),
+                'force/extra_trunk_calls': float(trunk.extra_calls)}
+
     def force_agreement_stats(self, model, states, mol_batch, discretizer, max_rows: int = 256):
         """The force model against its own target on rollout states, for the eval log.
 
@@ -3377,11 +3387,7 @@ class Modeller:
                     stats[f'force/gate_fwd_absmax_{tag}'] = float(gate_f[n].abs().max())
                 if gate_b is not None:
                     stats[f'force/gate_bwd_mean_{tag}'] = float(model._mean_over_live(gate_b[n:n + 1]))
-            stats['force/nonfinite_rows'] = float(model.force_nonfinite_rows())
-            stats['force/trunk_states'] = float(trunk.rows)
-            # running totals since start-up: states whose pair list hit a cap, and trunk calls split for memory
-            stats['force/capped_states'] = float(trunk.capped_rows)
-            stats['force/extra_trunk_calls'] = float(trunk.extra_calls)
+            stats.update(self.provider_counts(model))
             stats['force/agreement_failed'] = 0.0
             tags = [f't{float(ts[j]):.2f}' for j in picks]
             print(f"force model on {rows} rollout states per time (cosine with its target | error and target step, "
@@ -11457,11 +11463,14 @@ class Modeller:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
 
-            if (side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None
-                    and self.gfn_model.force_on):
-                # the first eval batch of the training conditions: read by log_metrics
-                self._force_stats = self.force_agreement_stats(
-                    model, out['flow_states'], mol_batch, eval_discretizer)
+            if side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None:
+                # the first eval batch of the training conditions: read by log_metrics. The agreement
+                # check belongs to a force term; state features alone log the provider's counters
+                if self.gfn_model.force_on:
+                    self._force_stats = self.force_agreement_stats(
+                        model, out['flow_states'], mol_batch, eval_discretizer)
+                else:
+                    self._force_stats = self.provider_counts(model)
 
             sample_batch_i = out.pop('sample_batch')
             sample_batch_i = sample_batch_i.detach().cpu()
