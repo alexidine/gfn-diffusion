@@ -34,6 +34,7 @@ Constructing a GFN resets torch's global RNG (scalarMLP init), so seeds are set 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Optional
@@ -111,8 +112,12 @@ def _attach_mol_id(batch, registry):
 
 
 def load_run(checkpoint_path: str, config_path: str, device: str = 'cpu',
-             prior_path: Optional[str] = None) -> Run:
+             prior_path: Optional[str] = None, trunk_path: Optional[str] = None) -> Run:
     """Rebuild policy, reward, conditions and registry for one archive.
+
+    A sampler with a force term or with state features reads a trunk, as in training
+    (train.py::Modeller._build_drift_force): the config's `drift_force.checkpoint`, or
+    `trunk_path` where the archive is scored on a machine that holds the trunk elsewhere.
 
     config_path is the run's yaml: the energy coefficients are not in problem_def (only
     its identity keys are), so they are read from the config and the identity keys are
@@ -175,6 +180,23 @@ def load_run(checkpoint_path: str, config_path: str, device: str = 'cpu',
         identifiers |= set(test.identifier)
     registry = {ident: i for i, ident in enumerate(sorted(identifiers))}
     del prior, prior_batch
+
+    if gfn.force_on or gfn.features_on:
+        from models.crystal_force import CrystalDriftForce, TrunkForce
+        provider_cfg = dict(cfg.get('drift_force') or {})
+        trunk_file = trunk_path or provider_cfg.get('checkpoint')
+        if not trunk_file or not os.path.exists(trunk_file):
+            raise ValueError(f"this archive's sampler reads a trunk (force term {gfn.force_on}, state features "
+                             f"{gfn.features_on}) and {trunk_file!r} is not a file here: pass trunk_path")
+        trunk = TrunkForce(trunk_file, device, max_atoms=gfn.state_atoms,
+                           **{k: int(provider_cfg[k]) for k in ('chunk', 'max_images', 'max_pairs', 'max_pairs_per_call')
+                              if provider_cfg.get(k) is not None})
+        # after the prior has had its say on lj_coeff: the trunk is checked against the energy the run scored
+        trunk.check_energy(ef.temperature, ef.lj_coeff)
+        if gfn.features_on and trunk.features_dim != gfn.state_features_dim:
+            raise ValueError(f"the archive's sampler reads state features of width {gfn.state_features_dim}; "
+                             f"{trunk_file} hands out {trunk.features_dim}")
+        gfn.install_drift_force(CrystalDriftForce(trunk, ef))
 
     tracker = ck.get('condition_log_z') or {}
     if 'ema_logw' in tracker and tracker['ema_logw'].numel() != len(registry):
