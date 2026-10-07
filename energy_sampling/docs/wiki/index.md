@@ -1,6 +1,6 @@
 # GFN knowledge base
 
-Forty-nine pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
+Fifty pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
 
 ## Theory of the objective
 
@@ -19,6 +19,7 @@ Forty-nine pages, each drafted from the code and the derivation notes, verified 
 - [conditional-route](conditional-route.md) — mixed page: the condition channel into policy and flow head, the scramble seam, condition identity and which conditions each draw visits, the per-condition normaliser and its three Z settings, the held-out stream and the per-condition metric families.
 - [prior-density-models](prior-density-models.md) — mixed page: the kNN and flow density models fitted to prior draws, their coordinates and geometry checks, the kNN dimensional bias, the ground truth available, the slope calibration gate, and how a fitted density enters the reward.
 - [molecule-conditions-and-anchors](molecule-conditions-and-anchors.md) — mixed page: the config keys naming the condition, prior and held-out files, what each file must hold, the identifier registry and condition ids, the QM9 and anchor build scripts with their frame and split rules, and the prior path's place in problem identity.
+- [state-features-and-atom-encoder](state-features-and-atom-encoder.md) — code-bound page: the per-state record a trunk provider hands the sampler and the features it may carry, the per-atom layout `TrunkForce.state_info` writes from one trunk pass, the state encoder that reads atoms and where the condition vector joins it, which state's record each kernel reads on the forward, backward and replay routes and in the frozen P_B snapshot, how the trainer sizes the features and builds the provider, the load-time refusals, the molecule condition re-embedded from the intra trunk as a data step, and the evaluation loader.
 - [molecule-encoder](molecule-encoder.md) — mixed page: the 2D-graph encoder behind the conformer condition, its inputs and structural encodings, the attention and broadcast global steps, the probe battery's targets, scoring and skeleton-grouped split, and the frozen cache with its atom-order and checkpoint stamps.
 
 ## Training dynamics and control
