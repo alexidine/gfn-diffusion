@@ -330,9 +330,11 @@ class GFN(nn.Module):  # todo add seeding
             if features.shape != (state.shape[0], self.state_features_dim):
                 raise ValueError(f"the provider returned state features of shape {tuple(features.shape)}; "
                                  f"the model was built for [{state.shape[0]}, {self.state_features_dim}]")
-            bad = ~torch.isfinite(features).all(dim=1, keepdim=True)
-            self._force_nonfinite_rows = self._force_nonfinite_rows + bad.sum().detach()
-            features = torch.where(bad, torch.zeros_like(features), features).detach()
+            # a non-finite entry is zeroed where it stands and its row counted. Zeroing the whole row would
+            # also clear an atom layout's element and flag columns, and a row with no atoms cannot be encoded
+            finite = torch.isfinite(features)
+            self._force_nonfinite_rows = self._force_nonfinite_rows + (~finite.all(dim=1)).sum().detach()
+            features = torch.where(finite, features, torch.zeros_like(features)).detach()
         else:
             force = self.drift_force_fn(x if live else x.detach(), drift_ctx, live)
         if force is None:
@@ -1579,6 +1581,9 @@ class GFN(nn.Module):  # todo add seeding
         """
         if scramble_condition_tiles <= 0:
             return condition_embedding
+        if self.features_on:
+            raise ValueError("scramble_conditions with state features on: the features are built from the row's "
+                             "own molecule, so permuting the condition vector does not hide it")
         k = scramble_condition_tiles
         assert batch_size % k == 0, \
             f"batch size {batch_size} not divisible by scramble tile size {k}"

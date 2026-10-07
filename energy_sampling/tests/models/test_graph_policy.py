@@ -203,3 +203,55 @@ def test_state_atoms_needs_a_matching_feature_width():
         _sampler(100, 7)
     with pytest.raises(ValueError, match='state_atoms'):
         _sampler(0, 7)
+
+
+def test_nonfinite_features_are_zeroed_in_place_and_the_scramble_is_refused(crystals, checkpoint):
+    from energy_sampling.models.crystal_force import CrystalDriftForce, TrunkForce
+    from energy_sampling.utils import uniform_discretizer
+
+    T, B = 4, len(crystals)
+    mol_batch = _batch(crystals)
+    A = max(int(c.num_atoms) for c in crystals)
+    trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A)
+
+    class Poisoned(CrystalDriftForce):
+        """The provider with one row's first atom features not finite, as a collapsed cell gives them."""
+
+        def state_info(self, state, ctx, need_force, create_graph=False):
+            force, feats = super().state_info(state, ctx, need_force, create_graph)
+            feats = feats.clone()
+            feats[1, :4] = float('nan')
+            feats[1, 4] = float('inf')
+            return force, feats
+
+    g = _sampler(trunk.features_dim, A)
+    g.install_drift_force(Poisoned(trunk, _Builder()))
+    disc = lambda b: uniform_discretizer(b, T)
+    with torch.no_grad():
+        torch.manual_seed(1)
+        s, pf, pb, _ = g.get_traj_fwd(torch.zeros(B, 12), disc, None, None, mol_batch)
+    assert torch.isfinite(s).all() and torch.isfinite(pf).all() and torch.isfinite(pb).all()
+    assert g.force_nonfinite_rows() == T + 1                    # the one row, at every state
+    # the scramble (a conditional model's stage flag) cannot hide a molecule the features carry
+    assert g._maybe_scramble_condition_embedding(None, B, 0) is None
+    with pytest.raises(ValueError, match='scramble_conditions'):
+        g._maybe_scramble_condition_embedding(torch.zeros(B, 4), B, 2)
+
+
+def test_a_checkpoint_of_another_state_encoder_is_refused():
+    from types import SimpleNamespace
+
+    from energy_sampling.checkpointing import Checkpointer
+
+    def config_for(asked, held):
+        fake = SimpleNamespace(modeller=SimpleNamespace(args=SimpleNamespace(model=SimpleNamespace(state_atoms=asked))),
+                               RECONFIGURABLE_GFN_KEYS=(), FORCE_DRIFT_GFN_KEYS=(),
+                               _assert_dead_rows_match=lambda config: None)
+        stored = {'dim': 12} if held is None else {'dim': 12, 'state_atoms': held}
+        return Checkpointer._gfn_config_from(fake, {'gfn_config': stored})
+
+    assert config_for(0, None) == {'dim': 12}                   # a checkpoint from before the key
+    assert config_for(29, 29)['state_atoms'] == 29
+    for asked, held in ((29, None), (29, 0), (0, 29), (20, 29)):
+        with pytest.raises(ValueError, match='state_atoms'):
+            config_for(asked, held)

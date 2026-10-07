@@ -174,7 +174,7 @@ class TrunkForce:
         tables = build_image_tables(cb)
         if self.max_atoms and int(tables.nat.max()) > self.max_atoms:
             raise ValueError(f"a molecule of {int(tables.nat.max())} atoms; the state features were sized for "
-                             f"{self.max_atoms} (drift_force.max_atoms)")
+                             f"{self.max_atoms} (model.state_atoms)")
         node_ptr = cb.ptr.to(self.device)
         chunks = []
         for lo in range(0, cb.num_graphs, self.chunk):

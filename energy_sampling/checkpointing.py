@@ -705,6 +705,12 @@ class Checkpointer:
         """
         config = dict(checkpoint['gfn_config'])
         current = vars(self.modeller.args.model)
+        # the state encoder is architecture: the checkpoint's is the one that loads, so a run asking for
+        # another would silently train as the checkpoint's arm
+        asked, held = int(current.get('state_atoms', 0) or 0), int(config.get('state_atoms', 0) or 0)
+        if asked != held:
+            raise ValueError(f"model.state_atoms is {asked} in this run's config and {held} in the checkpoint: "
+                             f"the state encoder that reads atoms cannot be added to or taken from saved weights")
         for key in self.RECONFIGURABLE_GFN_KEYS + self.FORCE_DRIFT_GFN_KEYS:
             if key not in current:
                 continue

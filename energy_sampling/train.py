@@ -11450,7 +11450,8 @@ class Modeller:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
 
-            if side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None:
+            if (side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None
+                    and self.gfn_model.force_on):
                 # the first eval batch of the training conditions: read by log_metrics
                 self._force_stats = self.force_agreement_stats(
                     model, out['flow_states'], mol_batch, eval_discretizer)
