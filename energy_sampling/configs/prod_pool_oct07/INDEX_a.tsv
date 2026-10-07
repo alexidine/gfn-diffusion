@@ -1,0 +1,8 @@
+arm	family	start	warm_src	prior	prior_bytes
+ppl_mip_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
+ppl_neh_n5	neh	seed	mlepl_neh_lr2	nehzor_elj_pooled_oct05_prior.pt	5433580454
+ppl_mipu_n5	mipu	seed	mlepl_mipu_lr2	mipcas_uma_pooled_oct05_prior.pt	605188243
+ppl_nehu_n5	nehu	seed	mlepl_nehu_lr2	nehzor_uma_pooled_oct05_prior.pt	1441564186
+ppl_mip_force_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
+ppl_mip_unpb_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
+ppl_mip_unpb_force_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
