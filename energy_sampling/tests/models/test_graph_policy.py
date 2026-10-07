@@ -190,8 +190,10 @@ def _sampler(features_dim, atoms, seed=0, **over):
     return GFN(**kwargs).eval()
 
 
-@pytest.mark.parametrize('force,window', [(False, 0.0), (True, 0.0), (False, 0.45), (True, 0.45), (True, 0.8)])
-def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tmp_path, force, window):
+@pytest.mark.parametrize('force,window,atoms_from', [
+    (False, 0.0, 0.0), (True, 0.0, 0.0), (False, 0.45, 0.0), (True, 0.45, 0.0), (True, 0.8, 0.0),
+    (False, 0.0, 0.45), (False, 0.8, 0.45), (True, 0.0, 0.8), (False, 0.8, 0.8)])
+def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tmp_path, force, window, atoms_from):
     from energy_sampling.models.crystal_force import CrystalDriftForce, TrunkForce
     from energy_sampling.models.graph_state import FlatAtomStateEncoding
     from energy_sampling.utils import uniform_discretizer
@@ -201,7 +203,7 @@ def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tm
     A = max(int(c.num_atoms) for c in crystals)
     over = dict(force_drift_fwd=0.5, force_drift_t_min=0.45) if force else {}
     trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A)
-    g = _sampler(trunk.features_dim, A, state_crystal_t_min=window, **over)
+    g = _sampler(trunk.features_dim, A, state_crystal_t_min=window, state_atoms_t_min=atoms_from, **over)
     assert isinstance(g.s_model, FlatAtomStateEncoding) and g.features_on
     g.install_drift_force(CrystalDriftForce(trunk, _Builder()))
     disc = lambda b: uniform_discretizer(b, T)
@@ -209,12 +211,17 @@ def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tm
     with torch.no_grad():
         torch.manual_seed(1)
         s, pf, pb, _ = g.get_traj_fwd(torch.zeros(B, 12), disc, None, None, mol_batch)
-        assert trunk.calls == T + 1, 'one provider call per state of the trajectory'
-        # times 0, 1/6, .. 1: four are at or past 0.45, two at or past 0.8. A state is described in its
-        # crystal inside the window; the crystal is also built wherever a force term reads the state
-        described = {0.0: T + 1, 0.45: 4, 0.8: 2}[window]
-        assert trunk.molecule_rows == B * (T + 1 - described)
-        assert trunk.crystal_calls == (max(described, 4) if force else described)
+        # times 0, 1/6, .. 1: four are at or past 0.45, two at or past 0.8
+        inside = {0.0: T + 1, 0.45: 4, 0.8: 2}
+        # the provider is called for a state that reads atoms and for a state a force term reads
+        forced = 4 if force else 0
+        called = max(inside[atoms_from], forced)
+        assert trunk.calls == called, 'one provider call per state that reads atoms or is given a force'
+        # of the states the provider is called for: a state is described in its crystal inside the
+        # crystal window, and the crystal is also built wherever a force term reads the state
+        described = inside[window]
+        assert trunk.molecule_rows == B * max(called - described, 0)
+        assert trunk.crystal_calls == min(called, max(described, forced))
         _, rpf, rpb, _ = g.get_traj_replay(s, disc, None, mol_batch)
         assert torch.allclose(rpf, pf, atol=1e-4) and torch.allclose(rpb, pb, atol=1e-4)
         torch.manual_seed(2)
@@ -254,6 +261,35 @@ def test_state_atoms_needs_a_matching_feature_width():
         _sampler(0, 7)
 
 
+def test_a_state_before_the_atoms_window_is_given_no_atoms(crystals, checkpoint):
+    from energy_sampling.models.crystal_force import CrystalDriftForce, TrunkForce
+
+    B = len(crystals)
+    mol_batch = _batch(crystals)
+    A = max(int(c.num_atoms) for c in crystals)
+    trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A)
+    g = _sampler(trunk.features_dim, A, state_atoms_t_min=0.5)
+    g.install_drift_force(CrystalDriftForce(trunk, _Builder()))
+    ctx = g._drift_context(None, mol_batch)
+    x = _states(mol_batch, 4)
+    with torch.no_grad():
+        early = g._state_force(x, torch.full((B,), 0.25), ctx)
+        assert trunk.calls == 0 and early.shape == (B, 12 + trunk.features_dim) and bool((early == 0).all())
+        late = g._state_force(x, torch.full((B,), 0.75), ctx)
+        assert trunk.calls == 1 and float(g._record_features(late).abs().sum()) > 0
+        # rows of one batch on both sides of the time: each gets what its own time gives it
+        t = torch.full((B,), 0.75)
+        t[::2] = 0.25
+        mixed = g._state_force(x, t, ctx)
+        assert torch.equal(mixed[1::2], late[1::2]) and bool((mixed[::2] == 0).all())
+        # the state encoder takes a row without atoms; one built without the window refuses it
+        emb = g.s_model(g.expand_state_for_policy(x), None, g._record_features(mixed))
+        assert bool(torch.isfinite(emb).all())
+        strict = _sampler(trunk.features_dim, A)
+        with pytest.raises(ValueError, match='no atoms'):
+            strict.s_model(strict.expand_state_for_policy(x), None, g._record_features(mixed))
+
+
 def test_crystal_window_needs_state_features_and_a_time():
     with pytest.raises(ValueError, match='state_crystal_t_min'):
         _sampler(0, 0, state_crystal_t_min=0.5)                 # nothing would read it
@@ -261,6 +297,17 @@ def test_crystal_window_needs_state_features_and_a_time():
         with pytest.raises(ValueError, match='state_crystal_t_min'):
             _sampler(7 * 10, 7, state_crystal_t_min=bad)
     assert _sampler(7 * 10, 7, state_crystal_t_min=0.5).state_crystal_t_min == 0.5
+    # the atoms window: a time, on a model whose state encoder reads atoms, not past the crystal window
+    with pytest.raises(ValueError, match='state_atoms_t_min'):
+        _sampler(0, 0, state_atoms_t_min=0.5)
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError, match='state_atoms_t_min'):
+            _sampler(7 * 10, 7, state_atoms_t_min=bad)
+    with pytest.raises(ValueError, match='below state_atoms_t_min'):
+        _sampler(7 * 10, 7, state_crystal_t_min=0.5, state_atoms_t_min=0.8)
+    both = _sampler(7 * 10, 7, state_crystal_t_min=0.8, state_atoms_t_min=0.8)
+    assert both.state_atoms_t_min == 0.8 and both.s_model.encoding.empty_rows
+    assert not _sampler(7 * 10, 7).s_model.encoding.empty_rows
 
 
 def test_nonfinite_features_are_zeroed_in_place_and_the_scramble_is_refused(crystals, checkpoint):
@@ -302,13 +349,16 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
     from energy_sampling.checkpointing import Checkpointer
 
     def config_for(asked, held, **window):
-        model = SimpleNamespace(state_atoms=asked, **{k: v for k, v in window.items() if k == 'state_crystal_t_min'})
+        model = SimpleNamespace(state_atoms=asked, **{k: v for k, v in window.items()
+                                                      if k in ('state_crystal_t_min', 'state_atoms_t_min')})
         fake = SimpleNamespace(modeller=SimpleNamespace(args=SimpleNamespace(model=model)),
                                RECONFIGURABLE_GFN_KEYS=(), FORCE_DRIFT_GFN_KEYS=(),
                                _assert_dead_rows_match=lambda config: None)
         stored = {'dim': 12} if held is None else {'dim': 12, 'state_atoms': held}
         if 'held_window' in window:
             stored['state_crystal_t_min'] = window['held_window']
+        if 'held_atoms' in window:
+            stored['state_atoms_t_min'] = window['held_atoms']
         return Checkpointer._gfn_config_from(fake, {'gfn_config': stored})
 
     assert config_for(0, None) == {'dim': 12}                   # a checkpoint from before the key
@@ -324,3 +374,7 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
             config_for(29, 29, state_crystal_t_min=asked, held_window=held)
     with pytest.raises(ValueError, match='state_crystal_t_min'):
         config_for(29, 29, state_crystal_t_min=0.8)                                    # a checkpoint without it
+    assert config_for(29, 29, state_atoms_t_min=0.8, held_atoms=0.8)['state_atoms_t_min'] == 0.8
+    for asked, held in ((0.8, 0.0), (0.0, 0.8), (0.5, 0.8)):
+        with pytest.raises(ValueError, match='state_atoms_t_min'):
+            config_for(29, 29, state_atoms_t_min=asked, held_atoms=held)

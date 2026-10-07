@@ -66,6 +66,7 @@ class GFN(nn.Module):  # todo add seeding
                  state_atom_blocks: int = 2,
                  state_atom_heads: int = 4,
                  state_crystal_t_min: float = 0.0,
+                 state_atoms_t_min: float = 0.0,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -91,6 +92,19 @@ class GFN(nn.Module):  # todo add seeding
         if self.state_crystal_t_min > 0 and not self.features_on:
             raise ValueError(f"state_crystal_t_min = {state_crystal_t_min} is set and the model reads no state "
                              f"features (state_atoms / state_features_dim): the key would do nothing")
+        # A state earlier than this is given no atoms at all: the provider is not called for a batch of
+        # such states (unless a force term reads them) and the state encoder reads the state and the
+        # condition alone, as the encoder without atoms does. Again a state's time decides.
+        self.state_atoms_t_min = float(state_atoms_t_min)
+        if not 0.0 <= self.state_atoms_t_min < 1.0:
+            raise ValueError(f"state_atoms_t_min is a trajectory time in [0, 1), got {state_atoms_t_min}")
+        if self.state_atoms_t_min > 0 and self.state_atoms <= 0:
+            raise ValueError(f"state_atoms_t_min = {state_atoms_t_min} is set and the state encoder reads no atoms "
+                             f"(state_atoms): the key would do nothing")
+        if 0 < self.state_crystal_t_min < self.state_atoms_t_min:
+            raise ValueError(f"state_crystal_t_min = {state_crystal_t_min} is below state_atoms_t_min = "
+                             f"{state_atoms_t_min}: no state between them reads atoms, so the first would do "
+                             f"nothing there")
         self.init_force_drift(force_drift_fwd, force_drift_bwd, force_drift_learned,
                               force_drift_max_sigma, force_drift_t_min, force_drift_differentiable)
         self.harmonics_dim = harmonics_dim
@@ -176,7 +190,8 @@ class GFN(nn.Module):  # todo add seeding
                                                  atoms=self.state_atoms,
                                                  atom_dim=self.state_features_dim // self.state_atoms - 2,
                                                  atom_hidden_dim=state_atom_hidden_dim, blocks=state_atom_blocks,
-                                                 heads=state_atom_heads, norm=norm, dropout=dropout)
+                                                 heads=state_atom_heads, norm=norm, dropout=dropout,
+                                                 empty_rows=self.state_atoms_t_min > 0)
         else:
             self.s_model = StateEncoding(self.expanded_dim,
                                          s_layers,
@@ -301,7 +316,9 @@ class GFN(nn.Module):  # todo add seeding
         [B, state_features_dim]), which is then the only call made: one evaluation gives
         a state's features and, when a force term reads that state, its force.
         With state_crystal_t_min > 0 it is called with a fifth argument, crystal_rows
-        [B] bool: the rows whose time is inside the window.
+        [B] bool: the rows whose time is inside the window. With state_atoms_t_min > 0
+        it is not called for a batch of states that are all earlier than that time and
+        that no force term reads.
         `context` says which system each row is. A caller of a trajectory
         function may pass one as `drift_context`; otherwise, if the provider has a
         `context(mol_batch)` method, it is called once per trajectory batch with the
@@ -340,6 +357,13 @@ class GFN(nn.Module):  # todo add seeding
         x = self._wrap_ang(state)
         live = self.force_drift_differentiable
         if self.features_on:
+            reads = None
+            if self.state_atoms_t_min > 0:
+                reads = t >= self.state_atoms_t_min
+                if not need_force and not bool(reads.any()):
+                    # no row reads atoms and no force term reads the state: the provider is not called,
+                    # and the record is that of a state without atoms (every flag zero)
+                    return state.new_zeros(state.shape[0], self.dim + self.state_features_dim)
             asked = (x if live else x.detach(), drift_ctx, need_force, live)
             if self.state_crystal_t_min > 0:
                 asked += (t >= self.state_crystal_t_min,)
@@ -352,6 +376,8 @@ class GFN(nn.Module):  # todo add seeding
             finite = torch.isfinite(features)
             self._force_nonfinite_rows = self._force_nonfinite_rows + (~finite.all(dim=1)).sum().detach()
             features = torch.where(finite, features, torch.zeros_like(features)).detach()
+            if reads is not None:
+                features = features * reads.to(features.dtype).unsqueeze(1)
         else:
             force = self.drift_force_fn(x if live else x.detach(), drift_ctx, live)
         if force is None:

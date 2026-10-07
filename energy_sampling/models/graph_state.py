@@ -96,13 +96,19 @@ class AtomStateEncoding(nn.Module):
     The state goes in twice: to every token, so an atom is read knowing the cell and pose it
     sits in, and to the MLP after the pool, beside `extra` (a per-row vector of width
     `extra_dim`, e.g. a force on the state; 0: none).
+
+    `empty_rows`: a row with no atoms is encoded from the state and `extra` alone, its pooled
+    vector zero, and the pool runs on the other rows only (on none, it is not run). False: such
+    a row raises, as the pool does.
     """
 
     def __init__(self, s_dim: int, atom_dim: int, layers: int, hidden_dim: int = 64, s_emb_dim: int = 64,
                  extra_dim: int = 0, atom_hidden_dim: int = 128, blocks: int = 2, heads: int = 4,
-                 dropout: Optional[float] = 0, norm: Optional[str] = None, bias: Optional[bool] = True):
+                 dropout: Optional[float] = 0, norm: Optional[str] = None, bias: Optional[bool] = True,
+                 empty_rows: bool = False):
         super().__init__()
         self.extra_dim = int(extra_dim)
+        self.empty_rows = bool(empty_rows)
         self.pool = AtomSetPool(atom_dim, context_dim=s_dim, hidden_dim=atom_hidden_dim, blocks=blocks,
                                 heads=heads, dropout=dropout)
         self.x_model = scalarMLP(
@@ -120,10 +126,20 @@ class AtomStateEncoding(nn.Module):
         if (extra is None) != (self.extra_dim == 0):
             raise ValueError(f'this encoding reads an extra vector of width {self.extra_dim}; `extra` is '
                              f'{"absent" if extra is None else "given"}')
-        parts = [s, self.pool(atoms, z, mask, context=s)]
+        parts = [s, self._pooled(s, atoms, z, mask)]
         if extra is not None:
             parts.append(extra)
         return self.x_model(torch.cat(parts, dim=-1))
+
+    def _pooled(self, s, atoms, z, mask):
+        has = mask.any(dim=1)
+        if not self.empty_rows or bool(has.all()):
+            return self.pool(atoms, z, mask, context=s)          # the pool raises on a row with no atoms
+        pooled = s.new_zeros(s.shape[0], self.pool.out_dim)
+        if bool(has.any()):
+            mine = self.pool(atoms[has], z[has], mask[has], context=s[has])
+            pooled = pooled.to(mine.dtype).index_copy(0, has.nonzero(as_tuple=True)[0], mine)
+        return pooled
 
 
 class FlatAtomStateEncoding(nn.Module):
@@ -132,20 +148,22 @@ class FlatAtomStateEncoding(nn.Module):
     `extra` is a state's flattened atom features as a provider hands them to GFN (the layout of
     `models.crystal_force.TrunkForce.state_info`): [B, atoms * (atom_dim + 2)], per atom its
     `atom_dim` features, then its atomic number, then 1 on a real atom and 0 on padding. The
-    condition vector, when there is one, joins the state after the pool.
+    condition vector, when there is one, joins the state after the pool. `empty_rows` is
+    `AtomStateEncoding`'s: a row whose every flag is 0 is then encoded without atoms.
     """
 
     def __init__(self, s_dim: int, layers: int, hidden_dim: int = 64, conditioning_dim: int = 0,
                  s_emb_dim: int = 64, atoms: int = 1, atom_dim: int = 1, atom_hidden_dim: int = 128,
                  blocks: int = 2, heads: int = 4, dropout: Optional[float] = 0, norm: Optional[str] = None,
-                 bias: Optional[bool] = True):
+                 bias: Optional[bool] = True, empty_rows: bool = False):
         super().__init__()
         self.atoms, self.atom_dim = int(atoms), int(atom_dim)
         self.conditioning_dim = int(conditioning_dim)
         self.extra_dim = self.atoms * (self.atom_dim + 2)
         self.encoding = AtomStateEncoding(s_dim, self.atom_dim, layers, hidden_dim=hidden_dim, s_emb_dim=s_emb_dim,
                                           extra_dim=self.conditioning_dim, atom_hidden_dim=atom_hidden_dim,
-                                          blocks=blocks, heads=heads, dropout=dropout, norm=norm, bias=bias)
+                                          blocks=blocks, heads=heads, dropout=dropout, norm=norm, bias=bias,
+                                          empty_rows=empty_rows)
 
     def forward(self, s, conditioning=None, extra=None):
         if extra is None:

@@ -3334,7 +3334,9 @@ class Modeller:
                   f"state of every trajectory; the trunk is frozen"
                   + (f"; a state before t = {m.state_crystal_t_min:g} is described by its molecule alone "
                      f"({trunk.crystal_dim} trunk-state columns and the energy zero, no crystal built)"
-                     if m.state_crystal_t_min > 0 else ""))
+                     if m.state_crystal_t_min > 0 else "")
+                  + (f"; a state before t = {m.state_atoms_t_min:g} is given no atoms and the trunk is not "
+                     f"called for it" if m.state_atoms_t_min > 0 else ""))
         if not m.force_on:
             return CrystalDriftForce(trunk, self.energy_function)
         print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "

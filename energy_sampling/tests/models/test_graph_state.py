@@ -7,7 +7,10 @@ What is pinned:
   * every input is read: the state, each real atom's features and element, and the extra vector;
   * a loss on the encoding reaches every parameter and every real atom's features, and no
     padded atom's (the gradient a trunk would be trained with through the stored embeddings);
-  * a row with no atoms, and a missing or unexpected context or extra vector, raise.
+  * a row with no atoms, and a missing or unexpected context or extra vector, raise;
+  * an encoder built with `empty_rows` encodes a row with no atoms from the state and the extra
+    vector alone, leaves every other row as it was, and does not run the pool on a batch with
+    no atoms at all.
 """
 import pytest
 import torch
@@ -20,10 +23,10 @@ S_DIM, ATOM_DIM, EXTRA_DIM = 18, 11, 12
 SIZES = (5, 9, 3, 12, 7, 1)
 
 
-def _encoder(extra_dim=0, norm='layer'):
+def _encoder(extra_dim=0, norm='layer', **over):
     torch.manual_seed(0)
     return AtomStateEncoding(S_DIM, ATOM_DIM, layers=2, hidden_dim=64, s_emb_dim=32, extra_dim=extra_dim,
-                             atom_hidden_dim=48, blocks=2, heads=4, norm=norm).double()
+                             atom_hidden_dim=48, blocks=2, heads=4, norm=norm, **over).double()
 
 
 def _rows(width=None, fill=0.0, seed=1):
@@ -109,6 +112,42 @@ def test_a_loss_reaches_every_parameter_and_every_real_atom_only():
     per_atom = atoms.grad.abs().sum(-1)
     assert bool(torch.isfinite(atoms.grad).all())
     assert bool((per_atom[mask] > 0).all()) and bool((per_atom[~mask] == 0).all())
+
+
+def test_rows_without_atoms_are_encoded_from_the_state_alone_when_allowed():
+    strict, enc = _encoder(extra_dim=EXTRA_DIM), _encoder(extra_dim=EXTRA_DIM, empty_rows=True)
+    enc.load_state_dict(strict.state_dict())                     # the flag adds no parameter
+    s, atoms, z, mask = _rows()
+    extra = torch.randn(len(SIZES), EXTRA_DIM, generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+    whole = strict(s, atoms, z, mask, extra)
+    assert torch.allclose(enc(s, atoms, z, mask, extra), whole, atol=1e-12)     # nothing changes on full rows
+
+    gone = torch.tensor([False, True, False, False, True, False])
+    mask2 = mask & ~gone[:, None]
+    with pytest.raises(ValueError, match='no atoms'):
+        strict(s, atoms, z, mask2, extra)
+    mixed = enc(s, atoms, z, mask2, extra)
+    assert torch.allclose(mixed[~gone], whole[~gone], atol=1e-10)               # the other rows are untouched
+    # a row without atoms is the MLP on [state, zeros, extra], whatever its atom slots hold
+    bare = enc.x_model(torch.cat([s, torch.zeros(len(SIZES), enc.pool.out_dim, dtype=torch.float64), extra], dim=-1))
+    assert torch.allclose(mixed[gone], bare[gone], atol=1e-10)
+    assert float((mixed[gone] - whole[gone]).abs().max()) > 1e-4
+
+    # no row has atoms: the pool is not run
+    def boom(*args, **kwargs):
+        raise AssertionError('the pool ran on a batch without atoms')
+
+    handle = enc.pool.register_forward_pre_hook(boom)
+    none = enc(s, torch.full_like(atoms, float('nan')), z, torch.zeros_like(mask), extra)
+    handle.remove()
+    assert torch.allclose(none, bare, atol=1e-10)
+
+    # a loss on a mixed batch reaches the pool through the rows that have atoms, and the state of every row
+    s_live = s.clone().requires_grad_(True)
+    enc.zero_grad()
+    enc(s_live, atoms, z, mask2, extra).sum().backward()
+    assert float(enc.pool.token.weight.grad.abs().sum()) > 0
+    assert bool((s_live.grad.abs().sum(dim=1) > 0).all())
 
 
 def test_bad_calls_raise():
