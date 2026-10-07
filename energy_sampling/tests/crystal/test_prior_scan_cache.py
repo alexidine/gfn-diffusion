@@ -70,6 +70,14 @@ def test_identity_moves_with_the_file_and_the_scoring_config(tmp_path):
     assert psc.cache_path('p.pt', base) == f'p.pt.scan-{psc.identity_hash(base)}.pt'
 
 
+def test_a_chunking_key_does_not_move_the_identity(tmp_path):
+    off = psc.scan_identity(_args(tmp_path, internal_oom_recovery=False), 10, 0.36)
+    on = psc.scan_identity(_args(tmp_path, internal_oom_recovery=True), 10, 0.36)
+    assert off == on and psc.identity_hash(off) == psc.identity_hash(on)
+    assert off['energy_config']['internal_oom_recovery'] is False, 'the value caches written before the rule carry'
+    assert 'internal_oom_recovery' not in psc.scan_identity(_args(tmp_path), 10, 0.36)['energy_config'],         'a config without the key is not given one'
+
+
 def test_the_mlip_file_is_part_of_the_identity(tmp_path):
     a = _args(tmp_path)
     m = tmp_path / 'model.pt'
