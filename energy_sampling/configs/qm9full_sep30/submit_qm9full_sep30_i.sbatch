@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-10
+#SBATCH --array=0-15
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30i
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
 
-# qm9full_sep30 leg i: conditional MLE from scratch, the state encoder that reads atoms against the embedded one. Rows 0-2 are the controls; 3-5 read atoms; 6-8 add the force term; 9-10 take the condition from the intra trunk. Stopped by hand; archives every 5000 steps (make.py, LEG I).
+# qm9full_sep30 leg i: conditional MLE from scratch, the state encoder that reads atoms against the embedded one. Rows 0-2 are the controls; 3-5 read atoms; 6-8 add the force term; 9-10 take the condition from the intra trunk; 11-13 read the crystal only from t = 0.8; 14-15 add the force term to that. Stopped by hand; archives every 5000 steps (make.py, LEG I).
 # Arm = row of INDEX_i.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge
@@ -71,6 +71,11 @@ if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
     fi
     if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
         echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+    fi
+fi
+if grep -q -E '^  state_crystal_t_min: 0\.[0-9]*[1-9]' ${CONFIG}; then
+    if ! grep -q 'state_crystal_t_min' ${WORKDIR}/models/gfn.py; then
+        echo "FATAL: models/gfn.py does not read state_crystal_t_min -- git pull gfn-diffusion" >&2; exit 1
     fi
 fi
 # THE TRUNK'S CONDITION (gpt rows): the re-embedded files.
