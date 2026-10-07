@@ -431,5 +431,11 @@ class CrystalDriftForce:
     def features_dim(self) -> int:
         return self.trunk_force.features_dim
 
+    @property
+    def row_scale(self):
+        """[dim] the trunk's per-row force scale (its checkpoint's `row_scale`): what GFN divides the
+        force by before the state encoder reads it (state_force_input)."""
+        return self.trunk_force.row_scale
+
     def state_info(self, state, ctx: TrunkContext, need_force: bool, create_graph: bool = False, crystal_rows=None):
         return self.trunk_force.state_info(state, ctx, need_force, create_graph, crystal_rows)

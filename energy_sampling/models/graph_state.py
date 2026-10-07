@@ -150,18 +150,23 @@ class FlatAtomStateEncoding(nn.Module):
     `atom_dim` features, then its atomic number, then 1 on a real atom and 0 on padding. The
     condition vector, when there is one, joins the state after the pool. `empty_rows` is
     `AtomStateEncoding`'s: a row whose every flag is 0 is then encoded without atoms.
+
+    `tail_dim` > 0: `extra` carries that many further columns after the atoms, a per-row vector
+    (GFN's force input) that joins the state after the pool, beside the condition.
     """
 
     def __init__(self, s_dim: int, layers: int, hidden_dim: int = 64, conditioning_dim: int = 0,
                  s_emb_dim: int = 64, atoms: int = 1, atom_dim: int = 1, atom_hidden_dim: int = 128,
                  blocks: int = 2, heads: int = 4, dropout: Optional[float] = 0, norm: Optional[str] = None,
-                 bias: Optional[bool] = True, empty_rows: bool = False):
+                 bias: Optional[bool] = True, empty_rows: bool = False, tail_dim: int = 0):
         super().__init__()
         self.atoms, self.atom_dim = int(atoms), int(atom_dim)
         self.conditioning_dim = int(conditioning_dim)
-        self.extra_dim = self.atoms * (self.atom_dim + 2)
+        self.tail_dim = int(tail_dim)
+        self.extra_dim = self.atoms * (self.atom_dim + 2) + self.tail_dim
         self.encoding = AtomStateEncoding(s_dim, self.atom_dim, layers, hidden_dim=hidden_dim, s_emb_dim=s_emb_dim,
-                                          extra_dim=self.conditioning_dim, atom_hidden_dim=atom_hidden_dim,
+                                          extra_dim=self.conditioning_dim + self.tail_dim,
+                                          atom_hidden_dim=atom_hidden_dim,
                                           blocks=blocks, heads=heads, dropout=dropout, norm=norm, bias=bias,
                                           empty_rows=empty_rows)
 
@@ -170,9 +175,15 @@ class FlatAtomStateEncoding(nn.Module):
             raise ValueError('this state encoder reads atom features and was given none')
         if extra.shape[-1] != self.extra_dim:
             raise ValueError(f'atom features of width {extra.shape[-1]}; this encoder was built for '
-                             f'{self.atoms} atoms of {self.atom_dim} features ({self.extra_dim})')
+                             f'{self.atoms} atoms of {self.atom_dim} features'
+                             + (f' and {self.tail_dim} further columns' if self.tail_dim else '')
+                             + f' ({self.extra_dim})')
+        beside = [conditioning] if self.conditioning_dim > 0 else []
+        if self.tail_dim:
+            beside.append(extra[:, -self.tail_dim:])
+            extra = extra[:, :-self.tail_dim]
         per_atom = extra.reshape(extra.shape[0], self.atoms, self.atom_dim + 2)
         mask = per_atom[..., -1] > 0.5
         z = per_atom[..., -2].round().long()
         return self.encoding(s, per_atom[..., :self.atom_dim], z, mask,
-                             extra=conditioning if self.conditioning_dim > 0 else None)
+                             extra=torch.cat(beside, dim=-1) if beside else None)

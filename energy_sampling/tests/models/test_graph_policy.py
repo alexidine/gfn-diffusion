@@ -254,6 +254,108 @@ def test_sampler_reading_atoms_scores_every_route_alike(crystals, checkpoint, tm
     assert all(p.grad is None for p in trunk.trunk.parameters())
 
 
+class _Flipped:
+    """A provider handing out minus the force of the one it wraps, and the same features."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.row_scale = inner.row_scale
+
+    def context(self, mol_batch):
+        return self.inner.context(mol_batch)
+
+    def __call__(self, state, ctx, create_graph=False):
+        return -self.inner(state, ctx, create_graph)
+
+    def state_info(self, state, ctx, need_force, create_graph=False, crystal_rows=None):
+        force, feats = self.inner.state_info(state, ctx, need_force, create_graph, crystal_rows)
+        return (None if force is None else -force), feats
+
+
+@pytest.mark.parametrize('atoms', [True, False])
+def test_sampler_given_the_force_as_an_input_scores_every_route_alike(crystals, checkpoint, atoms):
+    from energy_sampling.models.architectures import StateEncoding
+    from energy_sampling.models.crystal_force import CrystalDriftForce, TrunkForce
+    from energy_sampling.models.graph_state import FlatAtomStateEncoding
+    from energy_sampling.utils import uniform_discretizer
+
+    T, B = 6, len(crystals)
+    mol_batch = _batch(crystals)
+    A = max(int(c.num_atoms) for c in crystals) if atoms else 0
+    trunk = TrunkForce(checkpoint, 'cpu', max_atoms=A)
+    g = _sampler(trunk.features_dim, A, state_force_input=True, force_drift_t_min=0.45)
+    # the force is an input and no kernel's mean has a force term: no gate, nothing added to a mean
+    assert g.force_input_on and g.features_on and not g.force_on and g.force_input_dim == 13
+    assert isinstance(g.s_model, FlatAtomStateEncoding if atoms else StateEncoding)
+    assert not any('force_gate' in n for n, _ in g.named_parameters())
+    provider = CrystalDriftForce(trunk, _Builder())
+    g.install_drift_force(provider)
+    disc = lambda b: uniform_discretizer(b, T)
+
+    with torch.no_grad():
+        torch.manual_seed(1)
+        s, pf, pb, _ = g.get_traj_fwd(torch.zeros(B, 12), disc, None, None, mol_batch)
+        # times 0, 1/6, .. 1: four are at or past 0.45. With atoms every state is described and a force is
+        # taken at those four; without atoms the provider is called for those four alone
+        assert trunk.calls == (T + 1 if atoms else 4)
+        _, rpf, rpb, _ = g.get_traj_replay(s, disc, None, mol_batch)
+        assert torch.allclose(rpf, pf, atol=1e-4) and torch.allclose(rpb, pb, atol=1e-4)
+        torch.manual_seed(2)
+        bs, bpf, bpb, _ = g.get_traj_bwd(s[:, -1], disc, None, mol_batch)
+        _, rpf2, rpb2, _ = g.get_traj_replay(bs, disc, None, mol_batch)
+        assert torch.allclose(rpf2, bpf.flip(1), atol=1e-4) and torch.allclose(rpb2, bpb.flip(1), atol=1e-4)
+        assert torch.isfinite(pf).all() and torch.isfinite(pb).all() and g.force_nonfinite_rows() == 0
+
+        # P_B frozen: the snapshot reads the same input
+        g.freeze_backward_policy()
+        _, fpf, fpb, _ = g.get_traj_replay(s, disc, None, mol_batch)
+        assert torch.allclose(fpf, pf, atol=1e-4) and torch.allclose(fpb, pb, atol=1e-4)
+        g.unfreeze_backward_policy()
+
+        # both policies read the force: with its sign turned the trajectory scores differently, at the
+        # steps whose conditioning state is inside the force's window and at no earlier step
+        g.install_drift_force(_Flipped(provider))
+        _, opf, opb, _ = g.get_traj_replay(s, disc, None, mol_batch)
+        g.install_drift_force(provider)
+    # P_F at step i reads state i (times 3/6 .. 5/6 inside the window); P_B at step i reads state i + 1
+    assert float((opf[:, 3:] - pf[:, 3:]).abs().max()) > 1e-4 and torch.allclose(opf[:, :3], pf[:, :3], atol=1e-5)
+    assert float((opb[:, 2:] - pb[:, 2:]).abs().max()) > 1e-4 and torch.allclose(opb[:, :2], pb[:, :2], atol=1e-5)
+
+    # a loss trains the state encoder and leaves the trunk alone
+    g.train()
+    _, tpf, tpb, _ = g.get_traj_replay(s, disc, None, mol_batch)
+    (tpf.sum() + tpb.sum()).backward()
+    assert sum(float(p.grad.abs().sum()) for p in g.s_model.parameters() if p.grad is not None) > 0
+    assert all(p.grad is None for p in trunk.trunk.parameters())
+
+
+def test_the_force_input_is_bounded_scaled_and_zero_without_a_force():
+    g = _sampler(0, 0, state_force_input=True)
+
+    class Scaled:
+        row_scale = torch.tensor([2.0] * 12)
+
+    g.install_drift_force(Scaled())
+    assert bool((g._force_input(torch.zeros(3, 12)) == 0).all())
+    small = 0.02 * torch.randn(4, 12, generator=torch.Generator().manual_seed(0))
+    out = g._force_input(small.clone().requires_grad_(True))
+    assert out.shape == (4, 13) and not out.requires_grad
+    rms = (small / 2.0).square().mean(1).sqrt()
+    assert torch.allclose(out[:, :12], small / 2.0, rtol=1e-3) and torch.allclose(out[:, 12], torch.log1p(rms))
+    huge = 1e9 * torch.randn(4, 12, generator=torch.Generator().manual_seed(1))
+    out = g._force_input(huge)
+    from energy_sampling.models.gfn import FORCE_INPUT_CAP
+    assert float(out[:, :12].square().mean(1).sqrt().max()) <= FORCE_INPUT_CAP + 1e-4
+    cos = torch.nn.functional.cosine_similarity(out[:, :12], huge, dim=1)
+    assert torch.allclose(cos, torch.ones(4), atol=1e-5) and bool((out[:, 12] > 15).all())
+    # a provider without a scale: the force as it comes
+    g.install_drift_force(object())
+    assert torch.allclose(g._force_input(small)[:, :12], small, rtol=1e-3)
+    # a state's record before the force's window is the record of no force
+    with pytest.raises(ValueError, match='state_crystal_t_min'):
+        _sampler(0, 0, state_force_input=True, state_crystal_t_min=0.5)     # that key needs the provider's features
+
+
 def test_state_atoms_needs_a_matching_feature_width():
     with pytest.raises(ValueError, match='state_atoms'):
         _sampler(100, 7)
@@ -349,8 +451,8 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
     from energy_sampling.checkpointing import Checkpointer
 
     def config_for(asked, held, **window):
-        model = SimpleNamespace(state_atoms=asked, **{k: v for k, v in window.items()
-                                                      if k in ('state_crystal_t_min', 'state_atoms_t_min')})
+        model = SimpleNamespace(state_atoms=asked, **{
+            k: v for k, v in window.items() if k in ('state_crystal_t_min', 'state_atoms_t_min', 'state_force_input')})
         fake = SimpleNamespace(modeller=SimpleNamespace(args=SimpleNamespace(model=model)),
                                RECONFIGURABLE_GFN_KEYS=(), FORCE_DRIFT_GFN_KEYS=(),
                                _assert_dead_rows_match=lambda config: None)
@@ -359,6 +461,8 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
             stored['state_crystal_t_min'] = window['held_window']
         if 'held_atoms' in window:
             stored['state_atoms_t_min'] = window['held_atoms']
+        if 'held_force' in window:
+            stored['state_force_input'] = window['held_force']
         return Checkpointer._gfn_config_from(fake, {'gfn_config': stored})
 
     assert config_for(0, None) == {'dim': 12}                   # a checkpoint from before the key
@@ -378,3 +482,10 @@ def test_a_checkpoint_of_another_state_encoder_is_refused():
     for asked, held in ((0.8, 0.0), (0.0, 0.8), (0.5, 0.8)):
         with pytest.raises(ValueError, match='state_atoms_t_min'):
             config_for(29, 29, state_atoms_t_min=asked, held_atoms=held)
+    # the force input widens the state encoder: the checkpoint's is the one that loads
+    assert config_for(29, 29, state_force_input=True, held_force=True)['state_force_input'] is True
+    for asked, held in ((True, False), (False, True)):
+        with pytest.raises(ValueError, match='state_force_input'):
+            config_for(29, 29, state_force_input=asked, held_force=held)
+    with pytest.raises(ValueError, match='state_force_input'):
+        config_for(29, 29, state_force_input=True)                                     # a checkpoint without it

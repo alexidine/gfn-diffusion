@@ -362,6 +362,7 @@ model:
   state_atom_heads: 4          # attention heads per round; must divide state_atom_hidden_dim
   state_crystal_t_min: 0.0     # trajectory time in [0, 1) before which a state's atoms are described by the molecule alone (trunk state and energy columns zero; no pair list, no trunk call unless a force term reads the state); 0 = every state in its crystal. Read with state_atoms > 0
   state_atoms_t_min: 0.0       # trajectory time in [0, 1) before which the state encoder is given no atoms (it reads the state and the condition alone) and the trunk is not called for the state unless a force term reads it; 0 = atoms at every state. Read with state_atoms > 0; state_crystal_t_min, when set, must not be below it
+  state_force_input: false     # true: the state encoder is also given the force on the state from the drift_force trunk (over the trunk's per-row scale, bounded in RMS, then its log magnitude; dim + 1 numbers), for states from force_drift_t_min on and zeros before. Independent of force_drift_fwd / force_drift_bwd and of state_atoms
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################

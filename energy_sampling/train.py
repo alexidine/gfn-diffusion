@@ -3324,11 +3324,15 @@ class Modeller:
             # the fitting script writes its checkpoint at every evaluation: the file exists from the first one
             raise ValueError(f"the trunk {checkpoint} is at step {trunk.step} of {trunk.planned_steps}: its fitting "
                              f"run has not finished (drift_force.partial: true reads it anyway)")
-        if m.features_on:
-            if trunk.features_dim != m.state_features_dim:
-                raise ValueError(f"the model was built for state features of width {m.state_features_dim}; the "
-                                 f"trunk {checkpoint} hands out {trunk.features_dim} "
-                                 f"({m.state_atoms} atoms of {trunk.atom_dim} + 2)")
+        if m.force_input_on:
+            print(f"force input: the state encoder is given the force on the state from the trunk {checkpoint} "
+                  f"(over the trunk's per-row scale, bounded, with its log magnitude: {m.force_input_dim} numbers), "
+                  f"for states from t = {m.force_drift_t_min:g} on; the trunk is frozen")
+        if m.features_on and trunk.features_dim != m.state_features_dim:
+            raise ValueError(f"the model was built for state features of width {m.state_features_dim}; the "
+                             f"trunk {checkpoint} hands out {trunk.features_dim} "
+                             f"({m.state_atoms} atoms of {trunk.atom_dim} + 2)")
+        if m.state_features_dim > 0:
             print(f"state features: {m.state_atoms} atoms of {trunk.atom_dim} features from the "
                   f"{'stacked ' if trunk.stacked else ''}trunk {checkpoint}, read by the state encoder at every "
                   f"state of every trajectory; the trunk is frozen"

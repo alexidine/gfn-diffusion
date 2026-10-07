@@ -18,6 +18,11 @@ from .graph_state import FlatAtomStateEncoding
 logtwopi = math.log(2 * math.pi)
 
 
+#: RMS over live coordinates at which the force shown to the state encoder saturates, in units of the
+#: provider's per-row force scale (GFN._force_input)
+FORCE_INPUT_CAP = 3.0
+
+
 class GFN(nn.Module):  # todo add seeding
     def __init__(self, dim: int, s_emb_dim: int, conditions_dim: int,
                  harmonics_dim: int, t_dim: int,
@@ -67,6 +72,7 @@ class GFN(nn.Module):  # todo add seeding
                  state_atom_heads: int = 4,
                  state_crystal_t_min: float = 0.0,
                  state_atoms_t_min: float = 0.0,
+                 state_force_input: bool = False,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -82,14 +88,20 @@ class GFN(nn.Module):  # todo add seeding
         # state encoder reads beside the latent and the condition: P_F and P_B both see them,
         # through the shared s_model. 0 = none, and the model is the one it always was.
         self.state_features_dim = int(state_features_dim)
-        self.features_on = self.state_features_dim > 0
+        # The state encoder is also given the force on the state (_force_input), whether or not a
+        # force term adds it to a kernel's mean: P_F and P_B both read it, each at the state it is
+        # conditioned on, from the state's record. A state before force_drift_t_min gets zeros.
+        self.force_input_on = bool(state_force_input)
+        self.force_input_dim = self.dim + 1 if self.force_input_on else 0
+        # everything below that asks "does a state encoder input come from the provider" reads this
+        self.features_on = self.state_features_dim > 0 or self.force_input_on
         # A state earlier than this is described by its molecule alone: the provider is told so
         # (state_info's crystal_rows) and builds no crystal for a batch of such states. A state's
         # time decides, so P_F leaving it and P_B conditioned on it read the same features.
         self.state_crystal_t_min = float(state_crystal_t_min)
         if not 0.0 <= self.state_crystal_t_min < 1.0:
             raise ValueError(f"state_crystal_t_min is a trajectory time in [0, 1), got {state_crystal_t_min}")
-        if self.state_crystal_t_min > 0 and not self.features_on:
+        if self.state_crystal_t_min > 0 and self.state_features_dim <= 0:
             raise ValueError(f"state_crystal_t_min = {state_crystal_t_min} is set and the model reads no state "
                              f"features (state_atoms / state_features_dim): the key would do nothing")
         # A state earlier than this is given no atoms at all: the provider is not called for a batch of
@@ -191,7 +203,8 @@ class GFN(nn.Module):  # todo add seeding
                                                  atom_dim=self.state_features_dim // self.state_atoms - 2,
                                                  atom_hidden_dim=state_atom_hidden_dim, blocks=state_atom_blocks,
                                                  heads=state_atom_heads, norm=norm, dropout=dropout,
-                                                 empty_rows=self.state_atoms_t_min > 0)
+                                                 empty_rows=self.state_atoms_t_min > 0,
+                                                 tail_dim=self.force_input_dim)
         else:
             self.s_model = StateEncoding(self.expanded_dim,
                                          s_layers,
@@ -199,7 +212,7 @@ class GFN(nn.Module):  # todo add seeding
                                          condition_embedding_dim if self.conditional else 0,
                                          s_emb_dim,
                                          norm=norm, dropout=dropout,
-                                         extra_dim=self.state_features_dim)
+                                         extra_dim=self.state_features_dim + self.force_input_dim)
         self.init_policies(s_emb_dim, t_dim, policy_hidden_dim, policy_layers, zero_init, norm, dropout)
 
         self.pb_drift_range = pb_drift_range
@@ -318,7 +331,8 @@ class GFN(nn.Module):  # todo add seeding
         With state_crystal_t_min > 0 it is called with a fifth argument, crystal_rows
         [B] bool: the rows whose time is inside the window. With state_atoms_t_min > 0
         it is not called for a batch of states that are all earlier than that time and
-        that no force term reads.
+        that no force term reads. With state_force_input the provider's `row_scale`
+        [dim], when it has one, divides the force the state encoder is shown.
         `context` says which system each row is. A caller of a trajectory
         function may pass one as `drift_context`; otherwise, if the provider has a
         `context(mol_batch)` method, it is called once per trajectory batch with the
@@ -343,20 +357,22 @@ class GFN(nn.Module):  # todo add seeding
     def _state_force(self, state, t, drift_ctx):
         """The provider's record of `state` (time `t` [B]): the force on the latent,
         [B, dim], and with state features on the features after it, [B, dim +
-        state_features_dim] (the force columns are zero where no force term reads the
-        state). None when nothing would read it. The one place the provider is called."""
+        state_features_dim] (the force columns are zero where neither a force term nor
+        the force input reads the state). None when nothing would read it. The one
+        place the provider is called."""
         if self.drift_force_fn is None:
             raise RuntimeError(
                 "a force term (force_drift_fwd / force_drift_bwd) or state features "
                 "(state_features_dim) are configured but no provider is installed; call "
                 "install_drift_force first")
-        need_force = self.force_on and not (
+        need_force = (self.force_on or self.force_input_on) and not (
             self.force_drift_t_min > 0 and not bool((t >= self.force_drift_t_min).any()))
         if not need_force and not self.features_on:
             return None
         x = self._wrap_ang(state)
         live = self.force_drift_differentiable
-        if self.features_on:
+        features = None
+        if self.state_features_dim > 0:
             reads = None
             if self.state_atoms_t_min > 0:
                 reads = t >= self.state_atoms_t_min
@@ -378,8 +394,10 @@ class GFN(nn.Module):  # todo add seeding
             features = torch.where(finite, features, torch.zeros_like(features)).detach()
             if reads is not None:
                 features = features * reads.to(features.dtype).unsqueeze(1)
-        else:
+        elif need_force:
             force = self.drift_force_fn(x if live else x.detach(), drift_ctx, live)
+        else:
+            force = None                # the force input alone, on states before the force's window
         if force is None:
             force = torch.zeros_like(state)
         else:
@@ -389,19 +407,36 @@ class GFN(nn.Module):  # todo add seeding
                 raise ValueError(f"the force provider returned shape {tuple(force.shape)} for "
                                  f"states of shape {tuple(state.shape)}")
             force = self._clean_force(force, t)
-        return torch.cat((force, features), dim=1) if self.features_on else force
+        return force if features is None else torch.cat((force, features), dim=1)
 
     def _record_force(self, record):
         """The force columns of a state's record (_state_force)."""
         return record[:, :self.dim] if (self.features_on and record is not None) else record
 
     def _record_features(self, record):
-        """The feature columns of a state's record, or None when the model reads none."""
+        """What the state encoder reads of a state's record beside the state and the condition: the
+        feature columns, then with state_force_input the force input. None when the model reads none."""
         if not self.features_on:
             return None
         if record is None:
             raise RuntimeError("state features are on and this state came without a provider record")
-        return record[:, self.dim:]
+        features = record[:, self.dim:]
+        if self.force_input_on:
+            features = torch.cat((features, self._force_input(record[:, :self.dim])), dim=1)
+        return features
+
+    def _force_input(self, force):
+        """What the state encoder is shown of the force on a state, [B, dim + 1]: the force over the
+        provider's per-row scale (`row_scale`, when it has one), bounded at FORCE_INPUT_CAP in RMS
+        over live coordinates with its direction kept, then log(1 + that RMS before the bound). It
+        is a function of the state alone (no kernel's variance enters), zero where the state got no
+        force, and carries no gradient."""
+        g = force.detach()
+        scale = getattr(self.drift_force_fn, 'row_scale', None)
+        if scale is not None:
+            g = g / scale.to(device=g.device, dtype=g.dtype)
+        rms = self._live_only(g).pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return torch.cat((g / (1.0 + (rms / FORCE_INPUT_CAP) ** 2).sqrt(), torch.log1p(rms)), dim=1)
 
     def _clean_force(self, force, t):
         """What every force passes through before a kernel reads it, computed or stored:

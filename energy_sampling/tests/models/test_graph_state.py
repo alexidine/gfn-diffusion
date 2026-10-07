@@ -15,7 +15,7 @@ What is pinned:
 import pytest
 import torch
 
-from models.graph_state import AtomSetPool, AtomStateEncoding
+from models.graph_state import AtomSetPool, AtomStateEncoding, FlatAtomStateEncoding
 
 pytestmark = pytest.mark.fast
 
@@ -148,6 +148,31 @@ def test_rows_without_atoms_are_encoded_from_the_state_alone_when_allowed():
     enc(s_live, atoms, z, mask2, extra).sum().backward()
     assert float(enc.pool.token.weight.grad.abs().sum()) > 0
     assert bool((s_live.grad.abs().sum(dim=1) > 0).all())
+
+
+def test_the_flat_form_reads_a_tail_vector_beside_the_condition():
+    """`FlatAtomStateEncoding` with `tail_dim`: the last columns of `extra` are a per-row vector that joins
+    the state after the pool, exactly as the inner encoder's `extra` does."""
+    torch.manual_seed(0)
+    cond_dim, tail_dim, width = 6, 5, max(SIZES)
+    flat = FlatAtomStateEncoding(S_DIM, layers=2, hidden_dim=64, conditioning_dim=cond_dim, s_emb_dim=32,
+                                 atoms=width, atom_dim=ATOM_DIM, atom_hidden_dim=48, blocks=1, heads=4, norm='layer',
+                                 tail_dim=tail_dim).double()
+    assert flat.extra_dim == width * (ATOM_DIM + 2) + tail_dim
+    s, atoms, z, mask = _rows()
+    g = torch.Generator().manual_seed(7)
+    cond = torch.randn(len(SIZES), cond_dim, generator=g, dtype=torch.float64)
+    tail = torch.randn(len(SIZES), tail_dim, generator=g, dtype=torch.float64)
+    per_atom = torch.cat([torch.where(mask[..., None], atoms, 0.0), (z * mask)[..., None].double(),
+                          mask[..., None].double()], dim=-1)
+    extra = torch.cat([per_atom.reshape(len(SIZES), -1), tail], dim=-1)
+    out = flat(s, cond, extra)
+    assert torch.allclose(out, flat.encoding(s, atoms, z, mask, extra=torch.cat([cond, tail], dim=-1)), atol=1e-12)
+    moved = extra.clone()
+    moved[:, -tail_dim:] += 1.0
+    assert float((flat(s, cond, moved) - out).abs().max()) > 1e-4
+    with pytest.raises(ValueError, match='further columns'):
+        flat(s, cond, extra[:, :-1])
 
 
 def test_bad_calls_raise():

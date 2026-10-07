@@ -760,6 +760,11 @@ class Checkpointer:
         if asked != held:
             raise ValueError(f"model.state_atoms is {asked} in this run's config and {held} in the checkpoint: "
                              f"the state encoder that reads atoms cannot be added to or taken from saved weights")
+        asked, held = bool(current.get('state_force_input', False)), bool(config.get('state_force_input', False))
+        if asked != held:
+            raise ValueError(f"model.state_force_input is {asked} in this run's config and {held} in the checkpoint: "
+                             f"the force input widens the state encoder's first layer, so it cannot be added to "
+                             f"or taken from saved weights")
         # no parameters, but they decide what the state encoder is shown before those times: weights trained
         # on one window read another's inputs as a different arm, so a change is refused rather than taken
         for key in ('state_crystal_t_min', 'state_atoms_t_min'):
