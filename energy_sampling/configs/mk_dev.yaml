@@ -369,6 +369,7 @@ drift_force:
   max_images: 2000             # image molecules one crystal may hold inside the trunk's reach; its nearest are kept
   max_pairs: 40000             # atom pairs one crystal may hold inside the trunk's cutoff; its shortest are kept
   max_pairs_per_call: 4000000  # atom pairs one trunk call may be handed; a batch over it is split across calls
+  partial: false               # true = read a trunk checkpoint written before its fitting run reached its last step
 
 # training params
 ################################################################

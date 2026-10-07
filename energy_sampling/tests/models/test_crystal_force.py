@@ -280,6 +280,18 @@ def test_memory_bound_caps_squeezed_cells_and_splits_calls_without_changing_valu
         TrunkForce(checkpoint, 'cpu', max_pairs=500, max_pairs_per_call=100)
 
 
+def test_a_checkpoint_from_before_the_last_step_is_marked_unfinished(checkpoint, tmp_path):
+    """The fitting script writes its file at every evaluation; the trainer refuses one that is not the last."""
+    assert TrunkForce(checkpoint, 'cpu').finished                # the fixture names no planned step count
+    ck = torch.load(checkpoint, weights_only=False)
+    for step, steps, finished in ((7, 7, True), (7, 60000, False)):
+        ck['step'], ck['args'] = step, dict(ck['args'], steps=steps)
+        path = tmp_path / f'trunk_{steps}.pt'
+        torch.save(ck, path)
+        trunk = TrunkForce(path, 'cpu')
+        assert (trunk.step, trunk.planned_steps, trunk.finished) == (step, steps, finished)
+
+
 def test_copying_a_sampler_shares_the_provider(crystals, checkpoint):
     import copy
     from energy_sampling.models.crystal_force import CrystalDriftForce

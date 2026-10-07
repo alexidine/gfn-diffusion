@@ -3281,7 +3281,7 @@ class Modeller:
                   f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
         self.ema_model.install_pb_snapshot(frozen)
 
-    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call')
+    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call', 'partial')
 
     def _build_drift_force(self):
         """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd):
@@ -3315,8 +3315,12 @@ class Modeller:
         # an absent key takes TrunkForce's own default: the bound is on whether or not a config names it
         m = self.gfn_model
         trunk = TrunkForce(checkpoint, self.device, max_atoms=m.state_atoms,
-                           **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:] if cfg.get(k) is not None})
+                           **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:-1] if cfg.get(k) is not None})
         trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
+        if not trunk.finished and not cfg.get('partial'):
+            # the fitting script writes its checkpoint at every evaluation: the file exists from the first one
+            raise ValueError(f"the trunk {checkpoint} is at step {trunk.step} of {trunk.planned_steps}: its fitting "
+                             f"run has not finished (drift_force.partial: true reads it anyway)")
         if m.features_on:
             if trunk.features_dim != m.state_features_dim:
                 raise ValueError(f"the model was built for state features of width {m.state_features_dim}; the "

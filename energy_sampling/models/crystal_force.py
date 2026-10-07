@@ -129,6 +129,10 @@ class TrunkForce:
         self.temperature = float(a['temperature'])
         self.lj_coeff = float(a['lj_coeff'])
         self.step = int(ck.get('step', -1))
+        #: the step the trunk's fitting run was to reach; `finished` is False on a checkpoint written at an
+        #: earlier evaluation (the script writes its file at every one)
+        self.planned_steps = int(a.get('steps', self.step))
+        self.finished = self.step == self.planned_steps
         self.row_scale = ck['row_scale'].to(self.device)
         self.stacked = ck.get('intra_trunk_args') is not None
         if self.stacked:
