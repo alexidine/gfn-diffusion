@@ -181,7 +181,7 @@ A run takes the rewritten condition through four keys: `cfg:prior_path`, `cfg:mo
 - `models/atom_trunk.py::AtomTrunk` is the per-atom energy model on a Z' = 1 crystal whose node states and per-atom energies the features carry, fitted by `pretrain_atom_trunk.py`.
 - `models/intra_trunk.py::IntraTrunk` is the same module over every atom pair of one isolated molecule, fitted by `pretrain_intra_trunk.py`.
 - `models/stacked_trunk.py::StackedTrunk` is an `AtomTrunk` over intermolecular pairs that reads a frozen `IntraTrunk`'s per-atom states as extra inputs per atom, fitted by `pretrain_atom_trunk.py` with `--intra`.
-- The force term in the kernels, `models/gfn.py::GFN.init_force_drift`, adds to each kernel's mean a gate times that kernel's step variance times the provider's force, under `cfg:model.force_drift_fwd` and `cfg:model.force_drift_bwd`, and reads the force columns of the record described here.
+- The force term in the kernels, `models/gfn.py::GFN.init_force_drift`, adds to each kernel's mean a gate times that kernel's step variance times the provider's force, that product bounded by `::GFN._tame_force_step` at `cfg:model.force_drift_max_sigma` noise standard deviations of the step whatever the gate, under `cfg:model.force_drift_fwd` and `cfg:model.force_drift_bwd`, and reads the force columns of the record described here.
 
 ## Owner choices
 

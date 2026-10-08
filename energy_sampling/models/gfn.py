@@ -239,8 +239,8 @@ class GFN(nn.Module):  # todo add seeding
         Optional force term in the kernel means. With F(x) = -dE~/dx the force on the
         latent (in kT per latent unit) from the installed provider (install_drift_force),
 
-            P_F:  mean(x' | x)  +=  a_F(t)  * tame(dt C(x, t) F(x))
-            P_B:  mean(x  | x') +=  a_B(t') * tame(beta(x', t') F(x'))
+            P_F:  mean(x' | x)  +=  tame(a_F(t)  * dt C(x, t) F(x))
+            P_B:  mean(x  | x') +=  tame(a_B(t') * beta(x', t') F(x'))
 
         C is the forward kernel's own covariance per unit time (diagonal plus low rank
         when DPLR is on) and beta the backward kernel's own per-coordinate step variance,
@@ -261,7 +261,9 @@ class GFN(nn.Module):  # todo add seeding
 
         tame() bounds one step's force displacement at `max_sigma` times that step's
         noise standard deviation, RMS over live coordinates, direction kept:
-        u / sqrt(1 + (rms / max_sigma)^2). None = unbounded.
+        u / sqrt(1 + (rms / max_sigma)^2). None = unbounded. The gate is inside it: the
+        bound holds for the displacement the kernel takes, whatever the gate, and a gate
+        that grows on a step already at the bound changes nothing but its direction.
 
         `t_min`: a state earlier than this is given no force (and the provider is not
         called for it); a state's time decides, so P_F leaving it and P_B conditioned
@@ -394,11 +396,13 @@ class GFN(nn.Module):  # todo add seeding
 
     def _tame_force_step(self, step, var):
         """Bound `step` [B, dim] at force_drift_max_sigma noise standard deviations
-        (`var`: the step's per-coordinate variance), RMS over live coordinates."""
+        (`var`: the step's per-coordinate variance), RMS over live coordinates. Written
+        on the mean square, not its root: a step of exactly zero (a gate at zero) then
+        has a finite gradient."""
         if self.force_drift_max_sigma is None:
             return step
-        rms = self._live_only(step / var.sqrt()).pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return step / (1.0 + (rms / self.force_drift_max_sigma) ** 2).sqrt()
+        mean_sq = self._live_only(step / var.sqrt()).pow(2).mean(dim=-1, keepdim=True)
+        return step / (1.0 + mean_sq / self.force_drift_max_sigma ** 2).sqrt()
 
     def _fwd_force_mean(self, force, t_emb, logvar, d, V, dts):
         """The force term of P_F's mean, per unit time like the policy's own."""
@@ -407,8 +411,8 @@ class GFN(nn.Module):  # todo add seeding
         if V is not None:
             Vd = V.detach()
             cf = cf + torch.einsum('bnr,br->bn', Vd, torch.einsum('bnr,bn->br', Vd, force))
-        step = self._tame_force_step(dt * cf, dt * logvar.detach().exp())
-        return self.forward_policy.force_gate(t_emb) * step / dt
+        step = self.forward_policy.force_gate(t_emb) * (dt * cf)
+        return self._tame_force_step(step, dt * logvar.detach().exp()) / dt
 
     def _pb_force_gate(self, t):
         """P_B's gate from the live modules, or from the snapshot when P_B is frozen."""
@@ -424,7 +428,7 @@ class GFN(nn.Module):  # todo add seeding
         periodic in its mean, and a canonical shift keeps the mixture's image grid
         (PB_IMAGE_LIFTS) complete."""
         var = back_var.detach()
-        return self._wrap_ang(self._pb_force_gate(t_next) * self._tame_force_step(var * force, var))
+        return self._wrap_ang(self._tame_force_step(self._pb_force_gate(t_next) * (var * force), var))
 
     def restart_force_gates(self):
         """Put the learned gates back at their starting values (ForceGate.restart)."""

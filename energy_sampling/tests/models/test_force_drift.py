@@ -1,5 +1,5 @@
 """Force terms in the kernel means (GFN.init_force_drift): P_F and P_B each take an optional
-term gate(t) * tame(variance * force), the force coming from an installed provider.
+term tame(gate(t) * variance * force), the force coming from an installed provider.
 
 What is pinned here, all on toy energies on CPU:
   * with both options None nothing is built and nothing is called;
@@ -335,6 +335,55 @@ def test_tame_bounds_the_step_and_keeps_its_direction():
     assert (rms <= 1.5 + 1e-4).all() and (rms > 1.49).all()
     cos = torch.nn.functional.cosine_similarity(step, d * f, dim=1)
     assert (cos > 1 - 1e-5).all()
+
+
+@pytest.mark.parametrize('gate', [1.0, 8.0, -30.0])
+def test_the_gated_step_is_bounded_whatever_the_gate(gate):
+    """The gate is inside the bound: no gate moves either kernel's mean further than
+    force_drift_max_sigma noise standard deviations. (Outside it, as the bound stood until
+    2026-10-08, a gate of 6 moved the mean 6 times the bound: qf30_frc_g1.)"""
+    g = build(force_drift_fwd=gate, force_drift_bwd=gate, force_drift_learned=False, force_drift_max_sigma=1.5)
+    big = lambda state, ctx, create_graph: torch.full_like(state, 1e4) * torch.arange(1, state.shape[1] + 1)
+    g.install_drift_force(big)
+    B, T = 5, 4
+    ts = uniform_discretizer(B, T)
+    dts = ts[:, 2] - ts[:, 1]
+    x = torch.randn(B, g.dim) * 0.1
+    sign = 1.0 if gate > 0 else -1.0
+    with torch.no_grad():
+        mu0, logvar, d, _, _, _ = g._forward_kernel(x, ts[:, 1], None, ts[:, 2], dts)
+        f = g._state_force(x, ts[:, 1], None)
+        mu1 = g._forward_kernel(x, ts[:, 1], None, ts[:, 2], dts, f)[0]
+        back_var = 0.01 + torch.rand(B, g.dim)
+        shift = g._bwd_force_shift(f, back_var, ts[:, 2])
+    step = dts[:, None] * (mu1 - mu0)
+    for moved, var, mobility in ((step, dts[:, None] * d, d), (shift, back_var, back_var)):
+        rms = (moved / var.sqrt()).pow(2).mean(1).sqrt()
+        assert (rms <= 1.5 + 1e-4).all() and (rms > 1.49).all(), (gate, rms)
+        cos = torch.nn.functional.cosine_similarity(moved, sign * mobility * f, dim=1)
+        assert (cos > 1 - 1e-5).all(), (gate, cos)
+
+
+def test_a_gate_on_a_bounded_step_has_no_pull_on_its_size():
+    """At the bound the displacement does not grow with the gate, so its gradient to a
+    uniform gate is zero to rounding: the loss cannot buy a larger step by raising it."""
+    g = build(force_drift_fwd=3.0, force_drift_learned=True, force_drift_max_sigma=1.5)
+    big = lambda state, ctx, create_graph: torch.full_like(state, 1e4) * torch.arange(1, state.shape[1] + 1)
+    g.install_drift_force(big)
+    B, T = 5, 4
+    ts = uniform_discretizer(B, T)
+    dts = ts[:, 2] - ts[:, 1]
+    x = torch.randn(B, g.dim) * 0.1
+    with torch.no_grad():
+        f = g._state_force(x, ts[:, 1], None)
+    mu = g._forward_kernel(x, ts[:, 1], None, ts[:, 2], dts, f)[0]
+    bias = g.forward_policy.force_gate.net[-1].bias
+    grad = torch.autograd.grad((dts[:, None] * mu).pow(2).sum(), bias, retain_graph=True)[0]
+    # the same sum with the bound off grows as gate^2: its gradient is the scale to read `grad` against
+    g.force_drift_max_sigma = None
+    free = torch.autograd.grad(
+        (dts[:, None] * g._forward_kernel(x, ts[:, 1], None, ts[:, 2], dts, f)[0]).pow(2).sum(), bias)[0]
+    assert grad.abs().sum() < 1e-6 * free.abs().sum(), (grad, free)
 
 
 def test_nonfinite_force_rows_are_dropped_and_counted():
