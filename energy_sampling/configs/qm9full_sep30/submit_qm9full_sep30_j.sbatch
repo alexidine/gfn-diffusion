@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=2-00:00:00
+#SBATCH --time=03:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=16
@@ -15,6 +15,7 @@
 # encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
 # array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
+# The wall is sized for the groups this file lists (make.py LADDER_TIME); `sbatch --time=...` overrides it.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
