@@ -247,6 +247,38 @@ a graph row without it and a gpt row without the re-embedded files. COST: a gp, 
 at every state of every trajectory, 51 states where leg h's force rows called it at 11; at batch 1000 expect
 several times the control's step time, most of it the geometry build. A gpw or gpwl row calls it at the 11 states
 from t = 0.8, which are also the cheapest to build. Read by step AND by hour.
+
+LEG J, FORCE TERM x ATOMS, BATCH PINNED (`python configs/qm9full_sep30/make.py ladder`; owner 2026-10-08: "plan a more
+rigorous ladder on cluster", arms "Core 2x2", the force term "at every state", "pin batch, pack seeds" with NVIDIA
+MPS). Leg i's recipe (conditional MLE from scratch, P_B live, fixed_scale 1, a fire halving the rate) with the batch
+PINNED in every row (grow_batch_size false), so two rows differ in what the row is and not in how far its batch
+grew. The pinned batch is 500 and the accumulation floor stays 1000: an update is 1000 trajectories, taken over two
+iterations (batch-size.md), in every row alike, so iteration counts mean the same thing across rows. 500 because of
+the rows that read atoms: on the laptop the af kind's training peak was 11.3 GB at batch 128 (cf: 6.3 GB at 256, c:
+4.7 GB at 256; 2026-10-08, 300 iterations each), which is about 44 GB at 500 and about 88 GB at 1000 on a card whose
+cap is 72. Four kinds, three seeds each, all reading the trunk intra_trunk_oct06/st06_c2_ft_late.pt where they read
+one:
+  c    the embedded state encoder, no force term: the control                    qf30_lad_c_s1 .. s3
+  cf   c with the force term in P_F                                              qf30_lad_cf_s1 .. s3
+  a    the state encoder reads the atoms of the asymmetric unit at every state  qf30_lad_a_s1 .. s3
+       (leg i's gp)
+  af   a with the force term in P_F                                              qf30_lad_af_s1 .. s3
+The force term acts at EVERY state (force_drift_t_min 0), its gate learned from 0 (at step 0 a force row's kernel
+is its control's) and inside the cap of 2 noise standard deviations a step (GFN._tame_force_step bounds gate x step
+since 2026-10-08: with the gate outside it, qf30_frc_g1's gate reached 6 and the run fired 45 times); no term in
+P_B. A row is its control plus its leaves, and af is a plus cf's force leaves and cf plus a's atom leaves (asserted).
+A control is leg i's committed control of the same seed plus the four batch leaves (asserted).
+TIMING ROWS qf30_ladt_*: a production row of its kind ended at 400 iterations (one evaluation, at 250), under its
+own name, for iteration time, peak memory and GPU utilisation before any production row is launched.
+ONE JOB, ONE GPU, ONE OR MORE ARMS: line n of GROUPS_j.tsv (array index n) names the arms that job runs. With more
+than one, run_group.sh starts NVIDIA MPS for them and gives each an equal share of 0.94 of the card's memory; if the
+daemon does not come up or a probe process cannot reach the card through it, the arms share the card by plain time
+slicing, and which of the two happened is the first line of the job's .share file. A pinned control leaves the
+card idle between its iterations, which is what the cluster cancels on; several on one card is the remedy.
+GROUPS ARE APPENDED, never reordered: lines 0-6 are the timing groups (c alone, two c, three c, cf alone, two cf,
+a alone, af alone); the production groups are appended once those have been read.
+Read at equal steps and at equal GPU-hours, as curves: held-out median and 90th-percentile excess energy and the
+likelihood of stored crystals of held-out molecules. bwd/mle is NOT a verdict: P_B reads the same features.
 """
 import copy
 import importlib.util
@@ -421,6 +453,265 @@ if grep -q '/%(cond)s/' ${CONFIG}; then
         fi
     done
 fi
+"""
+# leg j: the 2x2 of the force term and the state encoder that reads atoms, batch pinned (the module docstring,
+# LEG J). (run_name, seed, kind); kinds c, cf, a, af.
+LADDER_SEEDS = (('s1', 12345), ('s2', 23456), ('s3', 34567))
+LADDER = tuple((f'lad_{kind}_{tag}', seed, kind) for kind in ('c', 'cf', 'a', 'af') for tag, seed in LADDER_SEEDS)
+# timing rows: a production row of that kind and seed, ended at LADDER_TIMING_STEPS
+LADDER_TIMING = (('ladt_c_solo', 12345, 'c'), ('ladt_c_pa', 12345, 'c'), ('ladt_c_pb', 23456, 'c'),
+                 ('ladt_c_ta', 12345, 'c'), ('ladt_c_tb', 23456, 'c'), ('ladt_c_tc', 34567, 'c'),
+                 ('ladt_cf_solo', 12345, 'cf'), ('ladt_cf_pa', 12345, 'cf'), ('ladt_cf_pb', 23456, 'cf'),
+                 ('ladt_a_solo', 12345, 'a'), ('ladt_af_solo', 12345, 'af'))
+LADDER_TIMING_STEPS = 400
+# the arms one job runs on its one GPU; line n is array index n. APPEND ONLY.
+LADDER_GROUPS = (('ladt_c_solo',), ('ladt_c_pa', 'ladt_c_pb'), ('ladt_c_ta', 'ladt_c_tb', 'ladt_c_tc'),
+                 ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',))
+LADDER_BATCH = 500          # trajectories an iteration
+LADDER_UPDATE = 1000        # trajectories an optimizer step: fused_grad_accum_min_samples, as leg i has it
+LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATCH, 'grow_batch_size': False,
+                       'batch_util_target': 0.0}
+LADDER_GATE = 0.0           # starting value of P_F's force gate
+LADDER_TERM = dict(SCRATCH_TERM, force_drift_t_min=0.0)
+LADDER_SHARE = 0.94         # of the card's memory, split equally among the arms of a job with more than one
+LADDER_LEAVES = {
+    'trunk': [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
+    'force': ['model.force_drift_fwd'] + [f'model.{k}' for k in LADDER_TERM],
+    'atoms': [f'model.{k}' for k in GRAPH_MODEL],
+}
+LADDER_GUARD = """
+    # THE TRUNK (rows whose state encoder reads atoms, or with a force term) and the code that reads it.
+    if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
+        TRUNK=%(trunk)s
+        if [ ! -s "${TRUNK}" ]; then
+            echo "FATAL: ${TRUNK} is missing -- the stacked trunk (configs/intra_trunk_oct06/submit_inter.sbatch)" >&2; exit 1
+        fi
+        if ! grep -q 'def state_info' ${WORKDIR}/models/crystal_force.py; then
+            echo "FATAL: models/crystal_force.py has no state features -- git pull gfn-diffusion" >&2; exit 1
+        fi
+        if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
+            echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+        fi
+    fi
+    # THE FORCE TERM: the gate inside the cap (a gate that starts at zero has no gradient without it).
+    if grep -q '^  force_drift_fwd: [0-9]' ${CONFIG}; then
+        if ! grep -q 'mean_sq = self._live_only' ${WORKDIR}/models/gfn.py; then
+            echo "FATAL: models/gfn.py caps the force step before its gate -- git pull gfn-diffusion" >&2; exit 1
+        fi
+    fi
+"""
+LADDER_SBATCH = r"""#!/bin/bash
+#SBATCH --time=2-00:00:00
+#SBATCH --gres=gpu:a100:1
+#SBATCH --mem=128G
+#SBATCH --cpus-per-task=16
+#SBATCH --tasks-per-node=1
+#SBATCH --mail-user=mjakilgour@gmail.com
+#SBATCH --mail-type=END,FAIL
+#SBATCH --array=0-__LAST__
+#SBATCH --account=torch_pr_226_chemistry
+#SBATCH --job-name=__TAG__
+#SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/__BATTERY__/joblogs/%x_%A_%a.out
+
+# __BATTERY__ leg j: conditional MLE from scratch at a pinned batch, the force term in P_F crossed with the state
+# encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
+# array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
+# Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
+module purge
+
+IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
+OVERLAY=/scratch/mk8347/venvs/mxt_container/overlay-50G-10M-copy.ext3
+PROJECT_ROOT=/scratch/mk8347/projects/gfn_cond
+WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
+ARMS=${WORKDIR}/configs/__BATTERY__
+LOGS=${ARMS}/joblogs
+CKPTS=__CKPTS__
+DATA=__DATA__
+mkdir -p ${LOGS}
+
+GROUP=$(awk -v n=$((SLURM_ARRAY_TASK_ID + 1)) 'NR==n' ${ARMS}/GROUPS_j.tsv)
+if [ -z "${GROUP}" ]; then echo "no group at line ${SLURM_ARRAY_TASK_ID} of GROUPS_j.tsv" >&2; exit 1; fi
+
+# THE NIGGLI PENALTY. Older MXtalTools reads MXT_NIGGLI_TRICLINIC; newer makes Niggli the only rule
+# and refuses the variable. Anything else cannot score these priors.
+SYM=${PROJECT_ROOT}/MXtalTools/mxtaltools/common/sym_utils.py
+if grep -q 'MXT_NIGGLI_TRICLINIC is retired' ${SYM}; then
+    NIG_EXPORT=""
+elif grep -q "os.environ.get('MXT_NIGGLI_TRICLINIC'" ${SYM}; then
+    NIG_EXPORT="export MXT_NIGGLI_TRICLINIC=1;"
+else
+    echo "FATAL: ${SYM} has no triclinic Niggli penalty -- git pull MXtalTools" >&2; exit 1
+fi
+if [ ! -f ${ARMS}/run_group.sh ]; then echo "FATAL: ${ARMS}/run_group.sh is missing -- git pull gfn-diffusion" >&2; exit 1; fi
+
+# EACH ARM: its checks, and its config with the start resolved. A fresh first launch; a resubmission resumes
+# the arm's own _running.pt (checkpoint_name is null in every row).
+LIVE=""
+for ARM in ${GROUP}; do
+    LINE=$(awk -F'\t' -v a=${ARM} '$1==a' ${ARMS}/INDEX_j.tsv)
+    if [ -z "${LINE}" ]; then echo "FATAL: ${ARM} is not a row of INDEX_j.tsv" >&2; exit 1; fi
+    PRIOR=$(echo "${LINE}" | cut -f5)
+    PRIOR_BYTES=$(echo "${LINE}" | cut -f6)
+    CONFIG=${ARMS}/${ARM}.yaml
+    if [ ! -f "${CONFIG}" ]; then echo "missing config ${CONFIG}" >&2; exit 1; fi
+    if [ -f ${CKPTS}/${ARM}.dead ]; then
+        echo "arm ${ARM} aborted UNRECOVERABLE on an earlier launch -- skipping"
+        continue
+    fi
+    HAVE=$(stat -c %s ${DATA}/${PRIOR} 2>/dev/null || echo 0)
+    if [ "${HAVE}" != "${PRIOR_BYTES}" ]; then
+        echo "FATAL: ${DATA}/${PRIOR} is ${HAVE} bytes, expected ${PRIOR_BYTES} -- upload unfinished or a different file" >&2
+        exit 1
+    fi
+__GUARD__
+    RESOLVED=${LOGS}/${ARM}_${SLURM_JOB_ID}.yaml
+    OWN=$(ls -t ${CKPTS}/*${ARM}_*_running.pt 2>/dev/null | head -1)
+    if [ -n "${OWN}" ]; then
+        echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  RESUME: $(basename ${OWN})"
+        sed -e "s|CONTINUE_PLACEHOLDER|true|" ${CONFIG} > ${RESOLVED}
+    else
+        echo "array ${SLURM_ARRAY_TASK_ID} -> arm ${ARM}  FRESH"
+        sed -e "s|CONTINUE_PLACEHOLDER|false|" ${CONFIG} > ${RESOLVED}
+    fi
+    if grep -q 'CONTINUE_PLACEHOLDER' ${RESOLVED}; then
+        echo "FATAL: placeholder left in ${RESOLVED}" >&2; exit 1
+    fi
+    LIVE="${LIVE} ${ARM}"
+done
+N_LIVE=$(echo ${LIVE} | wc -w)
+if [ "${N_LIVE}" -eq 0 ]; then echo "every arm of this group is marked dead -- nothing to run"; exit 0; fi
+
+# MEMORY: an arm alone keeps its config's cuda_memory_fraction; arms sharing the card split __SHARE__ of it.
+if [ "${N_LIVE}" -gt 1 ]; then
+    FRAC=$(awk -v n=${N_LIVE} 'BEGIN {printf "%.3f", __SHARE__ / n}')
+    for ARM in ${LIVE}; do
+        RESOLVED=${LOGS}/${ARM}_${SLURM_JOB_ID}.yaml
+        if [ "$(grep -c '^cuda_memory_fraction: ' ${RESOLVED})" != "1" ]; then
+            echo "FATAL: ${RESOLVED} does not have exactly one cuda_memory_fraction line" >&2; exit 1
+        fi
+        sed -i "s|^cuda_memory_fraction: .*|cuda_memory_fraction: ${FRAC}|" ${RESOLVED}
+        echo "arm ${ARM}: cuda_memory_fraction ${FRAC} (${N_LIVE} arms on this card)"
+    done
+fi
+
+J=${LOGS}/__TAG___${SLURM_JOB_ID}
+{ nvidia-smi -L
+  scontrol show job ${SLURM_JOB_ID}
+  echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"
+  echo "arms:${LIVE}"
+} > ${J}.info 2>&1
+
+stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,clocks_throttle_reasons.active,power.draw,temperature.gpu \
+    --format=csv,nounits -l 10 > ${J}_smi.csv &
+SMI_PID=$!
+smi_epilogue() {
+    kill ${SMI_PID} 2>/dev/null
+    sacct -j ${SLURM_JOB_ID} --format=JobID,State,ExitCode,Elapsed,NodeList,Reason,Comment%64 \
+        > ${J}_sacct.txt 2>&1
+}
+trap smi_epilogue EXIT TERM
+
+srun singularity exec --nv \
+    --overlay ${OVERLAY}:ro \
+    --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
+    --bind /scratch/mk8347/data:/scratch/mk8347/data \
+    --pwd ${WORKDIR} \
+    ${IMAGE} \
+    /bin/bash -c "
+        source /ext3/env.sh
+        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
+        ${NIG_EXPORT}
+        python -c \"import mxtaltools.common.sym_utils as s; assert getattr(s, 'NIGGLI_TRICLINIC', True), 'Niggli triclinic penalty is OFF'\" || exit 1
+        python -c \"from models.crystal_force import CrystalDriftForce, TrunkForce\" || exit 1
+        bash ${ARMS}/run_group.sh ${LOGS} ${SLURM_JOB_ID} ${J}.share ${LIVE}
+    "
+
+for ARM in ${LIVE}; do
+    LOG=${LOGS}/${ARM}_${SLURM_JOB_ID}.trainlog
+    echo "===== ${ARM}: last lines of ${LOG}"
+    tail -n 25 ${LOG} 2>/dev/null
+    if grep -q 'UNRECOVERABLE' ${LOG} 2>/dev/null; then
+        echo "arm ${ARM} exhausted its rewind budget -- sentinel set, resubmissions will skip"
+        touch ${CKPTS}/${ARM}.dead
+    fi
+done
+"""
+LADDER_RUN_GROUP = r"""#!/bin/bash
+# Run the arms of one job on its one GPU, each as its own trainer (qm9full_sep30 leg j; written by make.py).
+# usage, inside the container and from energy_sampling/:
+#     run_group.sh <logs dir> <job id> <share file> <arm> [<arm> ...]
+# An arm's config is <logs dir>/<arm>_<job id>.yaml and its output <logs dir>/<arm>_<job id>.trainlog.
+# One arm runs as it would alone. More than one share the card through NVIDIA MPS when the daemon comes up
+# and a probe process reaches the card through it; otherwise by plain time slicing. The first line of
+# <share file> says which.
+LOGS=$1; JOB=$2; SHARE=$3; shift 3
+ARMS=("$@")
+N=${#ARMS[@]}
+if [ ${N} -lt 1 ]; then echo "run_group.sh: no arm given" >&2; exit 1; fi
+
+probe() {
+    python -c "import torch; torch.zeros(8, device='cuda').sum().item(); print('probe: cuda ok')"
+}
+
+MODE=solo
+if [ ${N} -gt 1 ]; then
+    MODE=timeslice
+    if command -v nvidia-cuda-mps-control > /dev/null 2>&1; then
+        export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_${JOB}/pipe
+        export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_${JOB}/log
+        mkdir -p ${CUDA_MPS_PIPE_DIRECTORY} ${CUDA_MPS_LOG_DIRECTORY}
+        nvidia-cuda-mps-control -d
+        # the daemon is up when its control pipe exists: ten seconds, then the arms run without it
+        for i in $(seq 1 20); do
+            [ -e ${CUDA_MPS_PIPE_DIRECTORY}/control ] && break
+            sleep 0.5
+        done
+        if [ -e ${CUDA_MPS_PIPE_DIRECTORY}/control ] && probe; then
+            MODE=mps
+        else
+            echo "MPS did not come up or the probe could not reach the card through it: time slicing instead"
+            echo quit | nvidia-cuda-mps-control 2> /dev/null
+            unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
+        fi
+    else
+        echo "nvidia-cuda-mps-control is not in this container: time slicing instead"
+    fi
+fi
+echo "GPU sharing for ${N} arm(s): ${MODE}" | tee ${SHARE}
+if [ "${MODE}" = timeslice ] && ! probe; then
+    echo "FATAL: the card cannot be reached without MPS either" | tee -a ${SHARE} >&2; exit 1
+fi
+
+# A signal from the scheduler reaches every process of the job: the trainers handle their own, and this shell
+# must outlive them or the container closes under their last checkpoint write.
+trap ':' TERM INT
+
+PIDS=()
+for ARM in "${ARMS[@]}"; do
+    python -u train.py --config ${LOGS}/${ARM}_${JOB}.yaml > ${LOGS}/${ARM}_${JOB}.trainlog 2>&1 &
+    PIDS+=($!)
+    echo "started ${ARM} (pid ${PIDS[-1]})"
+done
+# what holds the card once every trainer is up: under MPS the server is listed beside its clients
+# (slept in short pieces: killed below when the trainers end first, it leaves nothing waiting behind it)
+( for i in $(seq 1 60); do sleep 5; done
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv >> ${SHARE} 2>&1 ) &
+NOTE_PID=$!
+
+STATUS=0
+for i in "${!PIDS[@]}"; do
+    # `wait` returns early, above 128, when a trapped signal arrives: go round until the trainer has gone.
+    # It ends when the trainer does, and the scheduler's kill after its grace period bounds that.
+    while :; do
+        wait ${PIDS[$i]}; RC=$?
+        kill -0 ${PIDS[$i]} 2> /dev/null || break
+    done
+    echo "arm ${ARMS[$i]} ended with status ${RC}" | tee -a ${SHARE}
+    [ ${RC} -ne 0 ] && STATUS=${RC}
+done
+kill ${NOTE_PID} 2> /dev/null
+[ "${MODE}" = mps ] && echo quit | nvidia-cuda-mps-control
+exit ${STATUS}
 """
 # leg g: (run_name, batch_size, lr_control.fixed_scale). ROW ORDER IS THE ARRAY INDEX: append only.
 MLEB = (('cmf_b1k_lr20', 1000, 2.0), ('cmf_b1k_lr40', 1000, 4.0),
@@ -1280,6 +1571,166 @@ def main_graph(argv):
     print(f'needs {trunk}, and for the gpt rows {w3.CLUSTER_DATA}/{GRAPH_COND_DIR}/ with {PRIOR}, {CONDITIONS}, {TEST}')
 
 
+def build_ladder(run, seed, kind, trunk, steps=None):
+    """Leg i's control recipe with the batch pinned; 'cf' adds the force term at every state, 'a' the state encoder
+    that reads atoms, 'af' both. `steps` ends the run there (a timing row). The module docstring, LEG J."""
+    cfg = build_p1(run, GRAPH_SCALE, None)
+    cfg['seed'] = seed
+    stages = cfg['protocols'][PROTOCOL]['stages']
+    assert stages[0]['flags']['scramble_conditions'] is True, run
+    stages[0]['flags']['scramble_conditions'] = False
+    cfg['lr_control']['fire_cut_factor'] = GRAPH_FIRE_CUT
+    cfg.update(LADDER_BATCH_LEAVES)
+    if kind != 'c':
+        cfg['drift_force'] = dict(checkpoint=trunk, **SCRATCH_PROVIDER)
+    if kind in ('a', 'af'):
+        cfg['model'].update(GRAPH_MODEL)
+    if kind in ('cf', 'af'):
+        cfg['model'].update(force_drift_fwd=LADDER_GATE, **LADDER_TERM)
+    if steps is not None:
+        cfg['epochs'] = steps
+    return cfg
+
+
+def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
+    """`control_i`: leg i's committed control of this seed. `rows`: {kind: this seed's production row of that
+    kind}, holding every kind this one is read against."""
+    st = cfg['protocols'][PROTOCOL]['stages']
+    assert [s['name'] for s in st] == ['train_prior'] and 'exit' not in st[0] and st[0]['train_mode'] == 'bwd', name
+    assert st[0]['bwd_sampling_mode'] == 'dataset' and st[0]['loss_coeffs']['bwd']['mle'] == 1.0, name
+    assert st[0]['flags']['scramble_conditions'] is False, name
+    assert cfg['embedding_conditioning'] is True and cfg['embedding_conditioning_dim'] == 192, name
+    assert not cfg.get('freeze_backward_policy') and cfg['model']['learn_pb'] is True, name
+    assert cfg['seed'] == seed and isinstance(seed, int), (name, cfg['seed'])
+    assert cfg['checkpoint_name'] is None and cfg['load_weights_only'] is False, name
+    assert cfg['continue_from_checkpoint'] == w3.CONT_PLACEHOLDER, name
+    lc = cfg['lr_control']
+    assert (lc['mode'], lc['seed_lr'], lc['fixed_scale'], lc['fire_cut_factor']) == \
+        ('fixed', SEED_LR, GRAPH_SCALE, GRAPH_FIRE_CUT), name
+    assert cfg['lr_back'] == 'auto' and cfg.get('max_lr') is None, name
+    # the batch is pinned, and an update is a whole number of iterations: LADDER_UPDATE trajectories in every row
+    assert {k: cfg[k] for k in LADDER_BATCH_LEAVES} == LADDER_BATCH_LEAVES, name
+    assert cfg['fused_grad_accum_min_samples'] == LADDER_UPDATE and LADDER_UPDATE % LADDER_BATCH == 0, name
+    # run_group.sh rewrites this line for arms that share a card
+    assert isinstance(cfg['cuda_memory_fraction'], float) and LADDER_SHARE < 1.0, name
+    m = cfg['model']
+    if steps is not None:
+        # a timing row is its production row ended early, with one evaluation inside and no archive
+        assert _moved(rows[kind], cfg) == ['epochs'] and cfg['epochs'] == steps, (name, _moved(rows[kind], cfg))
+        assert cfg['eval_period'] < steps < cfg['archive_period'], (name, steps)
+    elif kind == 'c':
+        assert _moved(control_i, cfg) == sorted(k for k, v in LADDER_BATCH_LEAVES.items() if control_i[k] != v), \
+            (name, _moved(control_i, cfg))
+        assert control_i['grow_batch_size'] is True and control_i['seed'] == seed, name
+        assert 'drift_force' not in cfg and 'state_atoms' not in m and m.get('force_drift_fwd') is None, name
+    else:
+        L = LADDER_LEAVES
+        want = {'cf': {'c': L['trunk'] + L['force']}, 'a': {'c': L['trunk'] + L['atoms']},
+                'af': {'a': L['force'], 'cf': L['atoms'], 'c': L['trunk'] + L['force'] + L['atoms']}}[kind]
+        for against, leaves in want.items():
+            assert _moved(rows[against], cfg) == sorted(leaves), (name, against, _moved(rows[against], cfg))
+    if kind != 'c':
+        assert cfg['drift_force'] == dict(checkpoint=trunk, **SCRATCH_PROVIDER), name
+        assert SCRATCH_PROVIDER['max_pairs'] <= SCRATCH_PROVIDER['max_pairs_per_call'], SCRATCH_PROVIDER
+        # what train.py _build_drift_force refuses a trunk without, and the energy the trunk was fitted at
+        assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
+        assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
+        assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
+    if kind in ('a', 'af'):
+        assert {k: m[k] for k in GRAPH_MODEL} == GRAPH_MODEL and m['state_atom_hidden_dim'] % m['state_atom_heads'] == 0
+        assert 'state_crystal_t_min' not in m and 'state_atoms_t_min' not in m, name     # the crystal at every state
+    if kind in ('cf', 'af'):
+        assert m['force_drift_fwd'] == LADDER_GATE == 0.0 and {k: m[k] for k in LADDER_TERM} == LADDER_TERM, name
+        assert (m['force_drift_t_min'], m['force_drift_max_sigma'], m['force_drift_bwd']) == (0.0, FORCE_MAX_SIGMA, None)
+        assert m['force_drift_learned'] is True, name       # a gate held at 0 would be no force term at all
+    w3._scan_local_paths(cfg, name)
+    w3.load_check(cfg, name)
+
+
+def main_ladder(argv):
+    dry = '--dry' in argv
+    dirty = w3.dirty_files()
+    if dirty and '--allow-dirty' not in argv:
+        sys.exit('REFUSING: uncommitted:\n  ' + '\n  '.join(dirty))
+    prior_bytes = (LOCAL_PRIORS / PRIOR).stat().st_size
+    ran = ({f'{TAG}_{run}' for run, *_ in ARMS} | {f'{TAG}_{run}' for run, _ in LIVE_PB}
+           | {f'{TAG}_{run}' for run, *_ in CONT} | {f'{TAG}_{run}' for run, _ in CMLE}
+           | {f'{TAG}_{run}' for run, *_ in FORCE} | {f'{TAG}_{run}' for run, *_ in MLEB}
+           | {f'{TAG}_{run}' for run, *_ in SCRATCH} | {f'{TAG}_{run}' for run, *_ in GRAPH})
+    trunk = f'{w3.CLUSTER_CKPTS}/{GRAPH_TRUNK}'
+    # leg i's committed controls, by seed: what this leg's controls are read against
+    control_i = {}
+    for run, seed, kind in GRAPH:
+        if kind == 'ed':
+            committed = yaml.safe_load(w3._git(['show', f'HEAD:energy_sampling/configs/{BATTERY}/{TAG}_{run}.yaml'], HERE))
+            assert yaml.safe_load((HERE / f'{TAG}_{run}.yaml').read_text(encoding='utf-8')) == committed, run
+            control_i[seed] = committed
+    assert sorted(control_i) == sorted(seed for _, seed in LADDER_SEEDS), sorted(control_i)
+    rows, new, by_seed = [], {}, {}
+    for run, seed, kind in LADDER:
+        name = f'{TAG}_{run}'
+        assert name not in ran and name not in new, name
+        cfg = build_ladder(run, seed, kind, trunk)
+        check_ladder(cfg, name, seed, kind, control_i[seed], by_seed.setdefault(seed, {}), trunk)
+        by_seed[seed][kind] = cfg
+        new[name] = cfg
+        rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
+    for run, seed, kind in LADDER_TIMING:
+        name = f'{TAG}_{run}'
+        assert name not in ran and name not in new, name
+        cfg = build_ladder(run, seed, kind, trunk, LADDER_TIMING_STEPS)
+        check_ladder(cfg, name, seed, kind, control_i[seed], by_seed[seed], trunk, LADDER_TIMING_STEPS)
+        new[name] = cfg
+        rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
+    names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
+    assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
+    # every arm of a group is a row, and no arm is in two groups: two jobs would write one arm's checkpoints
+    grouped = [f'{TAG}_{run}' for group in LADDER_GROUPS for run in group]
+    assert all(g in new for g in grouped) and len(set(grouped)) == len(grouped), grouped
+    kind_of = {f'{TAG}_{run}': kind for run, _, kind in LADDER + LADDER_TIMING}
+    print(f'leg j, the force term crossed with the state encoder that reads atoms: conditional MLE from scratch at '
+          f'{GRAPH_SCALE * SEED_LR:g}, batch pinned at {LADDER_BATCH}, {LADDER_UPDATE} trajectories an update; '
+          f'trunk {trunk}:')
+    what = {'c': 'control', 'cf': f'force term in P_F at every state (gate from {LADDER_GATE:g}, cap {FORCE_MAX_SIGMA:g})',
+            'a': f"state encoder reads {GRAPH_MODEL['state_atoms']} atoms at every state",
+            'af': 'reads atoms, and the force term in P_F at every state'}
+    for run, seed, kind in LADDER + LADDER_TIMING:
+        ends = f', ends at iteration {LADDER_TIMING_STEPS}' if run.startswith('ladt_') else ''
+        print(f'    {TAG}_{run:<14} seed {seed}  {what[kind]}{ends}')
+    print('groups (GROUPS_j.tsv line = array index): one job, one GPU')
+    for i, group in enumerate(LADDER_GROUPS):
+        print(f'[{i:2d}] ' + '  +  '.join(f'{TAG}_{run} ({kind_of[TAG + "_" + run]})' for run in group))
+    if dry:
+        print('--dry: checks passed, nothing written')
+        return
+    for name, cfg in new.items():
+        path = HERE / f'{name}.yaml'
+        # a row already generated is not rewritten: it may be running
+        assert not path.exists() or yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, \
+            f'{name}.yaml on disk is not what this generator builds'
+        with path.open('w', encoding='utf-8', newline='\n') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        assert yaml.safe_load(path.read_text(encoding='utf-8')) == cfg, f'{path} does not read back as written'
+    with (HERE / 'INDEX_j.tsv').open('w', encoding='utf-8', newline='\n') as f:
+        f.write('arm\tfamily\tstart\twarm_src\tprior\tprior_bytes\n')
+        f.writelines(rows)
+    with (HERE / 'GROUPS_j.tsv').open('w', encoding='utf-8', newline='\n') as f:
+        f.writelines(' '.join(f'{TAG}_{run}' for run in group) + '\n' for group in LADDER_GROUPS)
+    guard = LADDER_GUARD.strip('\n') % {'trunk': trunk}
+    assert LADDER_SBATCH.count('__GUARD__') == 1 and LADDER_SBATCH.count('__SHARE__') == 2, 'the leg-j job script moved'
+    sb = (LADDER_SBATCH.replace('__LAST__', str(len(LADDER_GROUPS) - 1)).replace('__GUARD__', guard)
+          .replace('__SHARE__', f'{LADDER_SHARE:g}').replace('__TAG__', TAG + 'j').replace('__BATTERY__', BATTERY)
+          .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
+    assert '__' not in sb.replace('__pycache__', ''), 'a placeholder survived in the leg-j job script'
+    with (HERE / f'submit_{BATTERY}_j.sbatch').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(sb)
+    with (HERE / 'run_group.sh').open('w', encoding='utf-8', newline='\n') as f:
+        f.write(LADDER_RUN_GROUP)
+    print(f'wrote {len(new)} arms with INDEX_j.tsv ({len(rows)} rows), GROUPS_j.tsv ({len(LADDER_GROUPS)} groups), '
+          f'run_group.sh and submit_{BATTERY}_j.sbatch')
+    print(f'needs {trunk} and {w3.CLUSTER_DATA}/{PRIOR} with {prior_bytes:,} bytes, beside {CONDITIONS} and {TEST}')
+
+
 def build_cmle(run, p1):
     """Phase 1's leg-1 config with the condition scramble off, under the phase-2 job script's seed placeholders
     (the module docstring, LEG E)."""
@@ -1550,6 +2001,8 @@ def main(argv):
         return main_scratch(argv)
     if argv[:1] == ['graph']:
         return main_graph(argv)
+    if argv[:1] == ['ladder']:
+        return main_ladder(argv)
     sys.exit(__doc__)
 
 
