@@ -474,6 +474,10 @@ LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATC
 LADDER_GATE = 0.0           # starting value of P_F's force gate
 LADDER_TERM = dict(SCRATCH_TERM, force_drift_t_min=0.0)
 LADDER_SHARE = 0.94         # of the card's memory, split equally among the arms of a job with more than one
+# the job script's wall. Every group it lists now is a timing group: the slowest (af alone) is about 1.7 h at the
+# laptop's speed, and a group cut at the wall has already logged what it is for. A two-day request waits behind
+# the whole queue (owner 2026-10-08). Production groups get their own wall when they are appended.
+LADDER_TIME = '03:00:00'
 LADDER_LEAVES = {
     'trunk': [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
     'force': ['model.force_drift_fwd'] + [f'model.{k}' for k in LADDER_TERM],
@@ -501,7 +505,7 @@ LADDER_GUARD = """
     fi
 """
 LADDER_SBATCH = r"""#!/bin/bash
-#SBATCH --time=2-00:00:00
+#SBATCH --time=__TIME__
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=16
@@ -517,6 +521,7 @@ LADDER_SBATCH = r"""#!/bin/bash
 # encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
 # array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
+# The wall is sized for the groups this file lists (make.py LADDER_TIME); `sbatch --time=...` overrides it.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -1718,7 +1723,10 @@ def main_ladder(argv):
         f.writelines(' '.join(f'{TAG}_{run}' for run in group) + '\n' for group in LADDER_GROUPS)
     guard = LADDER_GUARD.strip('\n') % {'trunk': trunk}
     assert LADDER_SBATCH.count('__GUARD__') == 1 and LADDER_SBATCH.count('__SHARE__') == 2, 'the leg-j job script moved'
+    # LADDER_TIME is sized for timing groups: a production group needs a wall of its own
+    assert all(run.startswith('ladt_') for group in LADDER_GROUPS for run in group), 'a production group has no wall'
     sb = (LADDER_SBATCH.replace('__LAST__', str(len(LADDER_GROUPS) - 1)).replace('__GUARD__', guard)
+          .replace('__TIME__', LADDER_TIME)
           .replace('__SHARE__', f'{LADDER_SHARE:g}').replace('__TAG__', TAG + 'j').replace('__BATTERY__', BATTERY)
           .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
     assert '__' not in sb.replace('__pycache__', ''), 'a placeholder survived in the leg-j job script'
