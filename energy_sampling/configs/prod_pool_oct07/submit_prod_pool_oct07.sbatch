@@ -6,12 +6,12 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-7
+#SBATCH --array=0-8
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=ppl
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/prod_pool_oct07/joblogs/%x_%A_%a.out
 
-# prod_pool_oct07 leg a: PRODUCTION phase 2 on the pooled priors from the mlepl best-MLE checkpoints: a rollout every 5th step, P_B frozen at entry, replay pinned 0.3 (mip, neh, mipu, nehu, acr); plus mip exploration arms with the stored replay force, with P_B left trainable, and with both.
+# prod_pool_oct07 leg a: PRODUCTION phase 2 on the pooled priors from the mlepl best-MLE checkpoints: a rollout every 5th step, P_B frozen at entry, replay pinned 0.3 (mip, neh, mipu, nehu, acr); plus mip exploration arms with the stored replay force, with P_B left trainable, with both, and with the box and reduction penalties ramped 10 -> 1000 over the first 20k steps.
 # Arm = row of INDEX_a.tsv (line 1 is the header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue an arm past the wall.
 module purge

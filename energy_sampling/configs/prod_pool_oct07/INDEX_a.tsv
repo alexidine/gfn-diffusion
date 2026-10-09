@@ -7,3 +7,4 @@ ppl_mip_force_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	6160933
 ppl_mip_unpb_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
 ppl_mip_unpb_force_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
 ppl_acr_n5	acr	seed	mlepl_acr_lr2	acridine_mace_pooled_oct05_prior.pt	3427422543
+ppl_mip_ramp_n5	mip	seed	mlepl_mip_lr2	mipcas_elj_pooled_oct05_prior.pt	616093331
