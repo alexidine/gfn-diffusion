@@ -8,7 +8,8 @@ from ase.io import write
 from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
-    pes_cartoon, plot_dual_density_contour, combo_fig, fused_duo_embedding_fig, render_molecule_image
+    pes_cartoon, plot_dual_density_contour, combo_fig, fused_duo_embedding_fig, render_molecule_image, \
+    scale_embedding_fig
 from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat2, clustering, clustering3, \
     dmat_row_indices
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
@@ -52,6 +53,15 @@ def require_log_r(results, tag):
         f"{tag} results have no 'log_r' (the exact training reward). Rerun new_analysis.py with "
         f"`train_config` set for that run; the old generator_reward was not the training reward.")
     return results['log_r']
+
+
+# d_cut at the N/20 scale: the RDF distance below which 95% of sampled structure pairs match at least N of the 20
+# molecules of a COMPACK shell at CCDC defaults (logistic fits to 291 MIPCAS and 333 NEHZOR p23 sample pairs,
+# 2026-10-02; 20 of 20 gives 0.116 / 0.118, too tight for 100k draws to resolve). The kernel is sigma = d_cut / 3,
+# as everywhere else in the analysis. KERNEL_SCALES=1 draws one diagnostic landscape per scale.
+SCALE_RADII = {'mipcas': {'match15of20': 0.169, 'match10of20': 0.242},
+               'nehzor': {'match15of20': 0.177, 'match10of20': 0.319}}
+KERNEL_REACH = 3.0   # sigma = d_cut / 3, i.e. the kernel's d_cut IS the COMPACK distance above
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, out_dir=PAPER_FIG_DIR,
@@ -148,82 +158,84 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         return d['energy'][keep].flatten(), d['packing_coeff'][keep].flatten(), batch
 
     bundled = uma_bundle is not None and elj_bundle is not None
-    if bundled:
-        uma_en, uma_cp, uma_batch = bundle_draws(uma_bundle, uma_results)
-        elj_en, elj_cp, elj_batch = bundle_draws(elj_bundle, elj_results)   # the bundle stores the scaled eLJ
-    else:
-        uma_batch = reduced_only(uma_results)
-        elj_batch = reduced_only(elj_results)
-        uma_en = uma_batch.uma
-        elj_en = elj_batch.elj * en_scaling_factor
-        uma_cp = uma_batch.packing_coeff
-        elj_cp = elj_batch.packing_coeff
-    '''Density funnel overlay'''
-    combo_en = torch.cat([elj_en, uma_en])
-    fig_dict['density_contours'] = plot_dual_density_contour(elj_cp, elj_en.clip(max=0), uma_cp, uma_en.clip(max=0),
-                                                             label_a="LJ",
-                                                             label_b="UMA",
-                                                             ncontours=8,
-                                                             max_y_quantile=0.99,
-                                                             x_min=0.55, x_max=0.9,
-                                                             y_min=combo_en.amin() - 5, y_max=combo_en.quantile(0.95),
-                                                             bw=0.1,
-                                                             show=False,
-                                                             return_fig=True,
-                                                             yaxis_title="Lattice Energy (kJ/mol)",
-                                                             xaxis_title="Packing Coefficient"
-                                                             )
+    # the per-draw figures below are skipped when ONLY_FIG asks for none of them (they rebuild 100k-draw batches)
+    if want('density_contours', 'energy_marginal', 'marginals_fig', 'elj_staircase', 'uma_staircase'):
+        if bundled:
+            uma_en, uma_cp, uma_batch = bundle_draws(uma_bundle, uma_results)
+            elj_en, elj_cp, elj_batch = bundle_draws(elj_bundle, elj_results)   # the bundle stores the scaled eLJ
+        else:
+            uma_batch = reduced_only(uma_results)
+            elj_batch = reduced_only(elj_results)
+            uma_en = uma_batch.uma
+            elj_en = elj_batch.elj * en_scaling_factor
+            uma_cp = uma_batch.packing_coeff
+            elj_cp = elj_batch.packing_coeff
+        '''Density funnel overlay'''
+        combo_en = torch.cat([elj_en, uma_en])
+        fig_dict['density_contours'] = plot_dual_density_contour(elj_cp, elj_en.clip(max=0), uma_cp, uma_en.clip(max=0),
+                                                                 label_a="LJ",
+                                                                 label_b="UMA",
+                                                                 ncontours=8,
+                                                                 max_y_quantile=0.99,
+                                                                 x_min=0.55, x_max=0.9,
+                                                                 y_min=combo_en.amin() - 5, y_max=combo_en.quantile(0.95),
+                                                                 bw=0.1,
+                                                                 show=False,
+                                                                 return_fig=True,
+                                                                 yaxis_title="Lattice Energy (kJ/mol)",
+                                                                 xaxis_title="Packing Coefficient"
+                                                                 )
 
-    '''Energy marginals'''
-    fig_dict['energy_marginal'] = dual_energy_marginal_fig(elj_en, uma_en,
-                                                           "LJ"
-                                                           "UMA"
-                                                           )
+        '''Energy marginals'''
+        fig_dict['energy_marginal'] = dual_energy_marginal_fig(elj_en, uma_en,
+                                                               "LJ"
+                                                               "UMA"
+                                                               )
 
-    '''12 marginals'''
-    marginals_fig = uma_batch.plot_batch_cell_params(
-        space='latent',
-        ref_dist=elj_batch.latent_params(),
-        aux_dists=[eparams],
-        return_fig=True,
-        show=False
-    )
-    marginals_fig.data[1].name = "UMA Model"
-    marginals_fig.data[0].name = "LJ Model"
-    marginals_fig.data[2].name = "Experimental"
-    subplot_labels = [
-        '(a) Normed a',
-        '(b) Normed b',
-        '(c) Normed c',
-        '(d) α',
-        '(e) β',
-        '(f) γ',
-        '(g) u',
-        '(h) v',
-        '(i) w',
-        '(j) θ',
-        '(k) φ',
-        '(l) r',
-    ]
-    for ii, annotation in enumerate(marginals_fig.layout.annotations):
-        annotation.text = subplot_labels[ii]
-    fig_dict['marginals_fig'] = marginals_fig
+        '''12 marginals'''
+        marginals_fig = uma_batch.plot_batch_cell_params(
+            space='latent',
+            ref_dist=elj_batch.latent_params(),
+            aux_dists=[eparams],
+            return_fig=True,
+            show=False
+        )
+        marginals_fig.data[1].name = "UMA Model"
+        marginals_fig.data[0].name = "LJ Model"
+        marginals_fig.data[2].name = "Experimental"
+        subplot_labels = [
+            '(a) Normed a',
+            '(b) Normed b',
+            '(c) Normed c',
+            '(d) α',
+            '(e) β',
+            '(f) γ',
+            '(g) u',
+            '(h) v',
+            '(i) w',
+            '(j) θ',
+            '(k) φ',
+            '(l) r',
+        ]
+        for ii, annotation in enumerate(marginals_fig.layout.annotations):
+            annotation.text = subplot_labels[ii]
+        fig_dict['marginals_fig'] = marginals_fig
 
-    '''staircase plots'''
-    # axis_range=(-1, 1): the latent domain. Without it each panel bins over its OWN data range, so a
-    # near-delta dimension is binned across float noise and draws as stripes instead of a narrow peak.
-    elj_staircase = elj_batch.plot_batch_staircase(space='latent',
-                                                   ref_dist=ebatch.latent_params(),
-                                                   axis_range=(-1, 1),
-                                                   return_fig=True,
-                                                   show=False)
-    uma_staircase = uma_batch.plot_batch_staircase(space='latent',
-                                                   ref_dist=ebatch.latent_params(),
-                                                   axis_range=(-1, 1),
-                                                   return_fig=True,
-                                                   show=False)
-    fig_dict['elj_staircase'] = elj_staircase
-    fig_dict['uma_staircase'] = uma_staircase
+        '''staircase plots'''
+        # axis_range=(-1, 1): the latent domain. Without it each panel bins over its OWN data range, so a
+        # near-delta dimension is binned across float noise and draws as stripes instead of a narrow peak.
+        elj_staircase = elj_batch.plot_batch_staircase(space='latent',
+                                                       ref_dist=ebatch.latent_params(),
+                                                       axis_range=(-1, 1),
+                                                       return_fig=True,
+                                                       show=False)
+        uma_staircase = uma_batch.plot_batch_staircase(space='latent',
+                                                       ref_dist=ebatch.latent_params(),
+                                                       axis_range=(-1, 1),
+                                                       return_fig=True,
+                                                       show=False)
+        fig_dict['elj_staircase'] = elj_staircase
+        fig_dict['uma_staircase'] = uma_staircase
 
     # the embedding and clustering index by dmat_row_indices, i.e. rows of the FULL sample batch
     # (the dmat itself already carries the energy window and any reduction filter)
@@ -253,20 +265,68 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
     if bundled:
         # the whole landscape over the bundle's draws: the 10k basins extended to every draw (landscape_100k)
         from energy_sampling.eval.paper1_results.landscape_100k import bundle_landscape
-        landscape, fig_thermos = bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, 'uma',
-                                                  max_n_clusters=4, min_basin_size=100)
-        (basin_colorscale, basin_min_batch, indexed_cluster_labels,
-         n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
-         polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
-         sample_energy, sample_inds, stats) = landscape
-        fig_dict['cluster_analysis'] = combo_fig(
-            num_polymorphs, n_basins, packing_coeffs, stats, fig_thermos, sample_inds, sample_embedding, p_maxima,
-            polymorph_inds, new_min_inds, sample_energy, polymorph_colorscale, sample_colors,
-            indexed_cluster_labels, basin_colorscale, basin_min_batch, polymorph_basin_index,
-            energy_function='uma', marker_scale=(10000 / len(sample_inds)) ** 0.5)
+        # The paper figure: basins, shading and the first percentile rows at the 10/20 scale (95% of pairs at that
+        # RDF distance match at least 10 of 20 molecules); the same points' percentiles at the 15/20 scale as extra
+        # table rows. KERNEL_SCALES=1 instead draws one diagnostic landscape per scale, each with its own mean shift.
+        kernel = {name: 3 * r / KERNEL_REACH for name, r in SCALE_RADII[mol_name].items()}
+        scales = {'': kernel['match10of20']}
+        diagnostic = bool(os.environ.get('KERNEL_SCALES'))
+        if diagnostic:
+            scales = {f'_{name}': dc for name, dc in kernel.items()}
+        for suffix, d_cut in scales.items():
+            print(f"  landscape{suffix}: kernel d_cut {d_cut:.4f} (sigma {d_cut / 3:.4f})")
+            landscape, fig_thermos = bundle_landscape(
+                uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, 'uma', max_n_clusters=4,
+                min_basin_size=100, d_cut=d_cut, max_basins=6 if diagnostic else 4,
+                scale_label=None if diagnostic else '10/20',
+                extra_scales=None if diagnostic else {'15/20': kernel['match15of20']})
+            (basin_colorscale, basin_min_batch, indexed_cluster_labels,
+             n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
+             polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
+             sample_energy, sample_inds, stats) = landscape
+            fig_dict['cluster_analysis' + suffix] = combo_fig(
+                num_polymorphs, n_basins, packing_coeffs, stats, fig_thermos, sample_inds, sample_embedding, p_maxima,
+                polymorph_inds, new_min_inds, sample_energy, polymorph_colorscale, sample_colors,
+                indexed_cluster_labels, basin_colorscale, basin_min_batch, polymorph_basin_index,
+                energy_function='uma', marker_scale=(10000 / len(sample_inds)) ** 0.5)
+            if diagnostic:
+                fig_dict = {'cluster_analysis' + suffix: fig_dict['cluster_analysis' + suffix]}
+                export_figs(fig_dict, mol_name, out_dir)
+        if diagnostic:
+            return
         print("  basin-maximum crystal export skipped: the maxima are bundle draws, which are not stored as crystals")
         fig_dict['pes_cartoon'] = pes_cartoon()
         export_figs(fig_dict, mol_name, out_dir)
+        return
+    if os.environ.get('KERNEL_SCALES'):
+        # the 10k analysis set at each COMPACK-anchored scale: density, mean shift and table at that kernel width
+        for name, r in SCALE_RADII[mol_name].items():
+            d_cut = 3 * r / KERNEL_REACH
+            res_s = dict(uma_results, d_cuts=[d_cut])
+            dm = uma_results['dmat'].double()
+            th = {'density': (torch.exp(-dm ** 2 / (2 * (d_cut / 3) ** 2)).sum(-1) - 1).numpy()}
+            cl, icl, pm, nb = clustering(res_s, th, max_n_clusters=4, min_basin_size=100)
+            print(f"  scale {name} (10k): d_cut {d_cut:.4f}; {nb} basins of 100+; sizes "
+                  f"{[int((icl == k).sum()) for k in range(nb)]}; unassigned {100 * float((icl < 0).float().mean()):.1f}%")
+            if nb == 0:
+                print("    no basin of 100+ samples at this width: no figure")
+                continue
+            if nb > 6:   # the figure grid holds six: keep the six largest, in density order
+                sizes = torch.tensor([int((icl == k).sum()) for k in range(nb)])
+                keep = torch.sort(torch.argsort(-sizes)[:6]).values
+                remap = torch.full((nb,), -1, dtype=torch.long)
+                remap[keep] = torch.arange(6)
+                cl = torch.where(torch.isin(icl, keep), cl, torch.full_like(cl, -1))
+                icl = torch.where(icl >= 0, remap[icl.clamp(min=0)], icl)
+                pm, nb = pm[keep.numpy()], 6
+            (basin_colorscale, basin_min_batch, icl, nb, new_min_inds, pm, packing_coeffs, polymorph_basin_index,
+             polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding, sample_energy, sample_inds,
+             stats) = combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, res_s, 'uma', cl,
+                                         pm, nb, icl)
+            export_figs({f'cluster_analysis_{name}_10k': combo_fig(
+                num_polymorphs, nb, packing_coeffs, stats, th, sample_inds, sample_embedding, pm, polymorph_inds,
+                new_min_inds, sample_energy, polymorph_colorscale, sample_colors, icl, basin_colorscale,
+                basin_min_batch, polymorph_basin_index, energy_function='uma')}, mol_name, out_dir)
         return
     cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters=4, min_basin_size=100)
     #cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering3(uma_results, uma_thermos, max_n_clusters=6,min_basin_size=100)
@@ -352,7 +412,7 @@ def export_figs(fig_dict, mol_name, out_dir):
         if key == 'pes_cartoon':
             dd = {
                 'width': 900,
-                'height': 900,
+                'height': 540,  # 60% of the square version
                 'font_size': 22,
             }
         if key == 'summary_table' or key == 'polymorph_table':
@@ -407,12 +467,15 @@ def export_figs(fig_dict, mol_name, out_dir):
             }
         if key == 'duo_embedding':
             dd = {'width': 1000, 'height': 1000, 'margin': dict(l=20, r=20, t=20, b=20)}
+        if key == 'embedding_scales':
+            dd = {'width': 2100, 'height': 700, 'margin': dict(l=20, r=30, t=60, b=20), 'font_size': 22,
+                  'annotations_font_size': 28}
         if key == 'duo_embedding_fused':
             dd = {'width': 2000, 'height': 1000, 'margin': dict(l=20, r=20, t=20, b=20), 'annotations_font_size': 38}
-        if key == 'cluster_analysis':
+        if key.startswith('cluster_analysis'):
             dd = {
                 'width': 1500,
-                'height': 800,  # the summary table carries four data rows
+                'height': 900,  # the summary table carries up to six data rows
                 'annotations_font_size': 24,
                 'font_size': 24,
                 'legend_font_size': 16,
@@ -584,6 +647,29 @@ def fused_duo_embedding(mol_names, out_dir):
     export_figs({'duo_embedding_fused': fig}, '_'.join(mol_names), out_dir)
 
 
+def scale_embeddings(mol_name, uma_bundle, out_dir):
+    """The UMA model's 100k embedding (window & reduced draws) coloured three ways: lattice energy, and the P(x)
+    percentile at the 10/20 and 15/20 kernel scales (sigma = d_cut / 3, sums from the bundle's histograms)."""
+    from scipy.stats import rankdata
+    from energy_sampling.eval.paper1_results.dens_engine import kernel_sums_from_hist
+    from energy_sampling.eval.paper1_results.landscape_100k import embed_bundles
+    draws = torch.load(os.path.join(uma_bundle, 'draws.pt'), weights_only=False)
+    keep = draws['window_reduced'].numpy()
+    n = len(keep)
+    emb = embed_bundles([uma_bundle])
+    energy = draws['energy'].numpy()[keep]
+    panels = [dict(values=energy, title='Lattice energy', colorbar='E (kJ/mol)', colorscale='Turbo_r',
+                   # colour scale capped 10 kT above the lowest draw; draws above it (up to the 15 kT window) take the end colour
+                   range=(float(energy.min()), float(energy.min()) + 10 * float(draws['kT'])), top='low')]
+    for name, label in (('match10of20', '10/20'), ('match15of20', '15/20')):
+        s = kernel_sums_from_hist(uma_bundle, 3 * SCALE_RADII[mol_name][name] / KERNEL_REACH)[:n][keep]
+        panels.append(dict(values=100 * (rankdata(s) - 0.5) / len(s), title=f'P<sup>{label}</sup>(x) percentile',
+                           colorbar='percentile', colorscale='Turbo', range=(0, 100), top='high'))
+        print(f"  {mol_name} {label}: {100 * float(np.mean(s < 1)):.1f}% of draws below one draw's weight")
+    fig = scale_embedding_fig(emb['draws'][0][keep], panels, emb['refs'])
+    export_figs({'embedding_scales': fig}, mol_name, out_dir)
+
+
 def fused_energies(mol_names, out_dir, row_height=1500):
     """One figure from the exported `<mol>_energy_marginal.png` and `<mol>_density_contours.png`: a row per
     molecule (marginals, then contours), lettered panels, a row label, a dashed rule between rows, and the
@@ -703,5 +789,9 @@ if __name__ == '__main__':
     only_fig = {k.strip() for k in os.environ.get('ONLY_FIG', '').split(',') if k.strip()}
     if not only_fig or only_fig.intersection(('duo_embedding', 'duo_embedding_fused')):
         fused_duo_embedding([m for m in PAIRS if not only or m in only], out_dir)
+    if not only_fig or 'embedding_scales' in only_fig:
+        for m, paths in PAIRS.items():
+            if paths.get('uma_bundle') and (not only or m in only):
+                scale_embeddings(m, paths['uma_bundle'], out_dir)
     if not only_fig or only_fig.intersection(('energy_marginal', 'density_contours', 'energies_fused')):
         fused_energies([m for m in PAIRS if not only or m in only], out_dir)

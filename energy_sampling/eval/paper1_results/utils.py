@@ -2919,7 +2919,9 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     "assign samples to basins"
     sig = d_cuts[0] / 3
     weights = np.exp(-dmat[anchors] ** 2 / (2 * sig ** 2))
-    weights = weights / weights.sum(0)
+    # a sample too far from every anchor for any kernel weight (possible at a narrow kernel) has a zero total; it
+    # must come out unassigned, not NaN (which the 0.8 test below lets through to the first anchor)
+    weights = weights / weights.sum(0).clamp(min=1e-30)
     assignments = weights.argmax(dim=0)
     assignments[weights.amax(dim=0) < 0.8] = -1
     cluster_labels = torch.tensor([i[ass] if ass > -1 else -1 for ass in assignments])

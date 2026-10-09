@@ -1476,7 +1476,8 @@ def combo_fig(num_polymorphs,
 
     embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
               sample_embedding, sample_inds, poly_labels=poly_labels, extra_refs=stats.get('extra_refs'),
-              shade=(rankdata(uma_thermos['density']) / len(uma_thermos['density'])) if marker_scale < 1 else None)
+              shade=(rankdata(uma_thermos['density']) / len(uma_thermos['density'])) if marker_scale < 1 else None,
+              scale_label=stats.get('scale_label'))
 
     fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
              polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function,
@@ -1578,7 +1579,8 @@ def combo_fig(num_polymorphs,
     x_pad = 0.075 * (all_cp.max() - all_cp.min())
     y_pad = 0.075 * (all_en.max() - all_en.min())
     x_range = [all_cp.min() - x_pad, all_cp.max() + x_pad]
-    y_range = [all_en.min() - y_pad, all_en.max() + y_pad]
+    # extra room below only: the polymorph and energy-minimum markers sit at the bottom edge
+    y_range = [all_en.min() - y_pad - 0.10 * (all_en.max() - all_en.min()), all_en.max() + y_pad]
 
     # after all add_trace calls, before fig.show()
     for (row, col) in basin_positions:
@@ -1628,7 +1630,7 @@ def make_specs_fig(n_basins):
 
         fig = make_subplots(
             rows=total_rows, cols=total_cols,
-            row_heights=[0.33, 0.33, 0.34],  # the table row holds four data rows
+            row_heights=[0.30, 0.30, 0.40],  # the table row holds up to six data rows
             column_widths=[0.3, 0.3, 0.4 / 3, 0.4 / 3, 0.4 / 3],
             specs=specs,
             subplot_titles=subplot_titles,
@@ -1662,7 +1664,7 @@ def make_specs_fig(n_basins):
 
         fig = make_subplots(
             rows=total_rows, cols=total_cols,
-            row_heights=[0.33, 0.33, 0.34],  # the table row holds four data rows
+            row_heights=[0.30, 0.30, 0.40],  # the table row holds up to six data rows
             column_widths=[0.3, 0.3, 0.4 / 2, 0.4 / 2],
             specs=specs,
             subplot_titles=subplot_titles,
@@ -1732,7 +1734,7 @@ def embedding_references(fig, sample_embedding, extra_refs, marker_font_size, al
 
 
 def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
-              sample_embedding, sample_inds, poly_labels=None, extra_refs=None, shade=None):
+              sample_embedding, sample_inds, poly_labels=None, extra_refs=None, shade=None, scale_label=None):
     """shade: [n] in [0, 1] (the density percentile / 100). When given, density is drawn as colour strength instead
     of marker size -- markers are one small size, pale where sparse and saturated where dense, densest on top --
     because at ~100k points a size difference cannot be seen."""
@@ -1816,7 +1818,8 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     for name, color, size, symbol, width in (("Probability maximum", "rgb(150,150,150)", 16, "circle", 4),
                                              ("Energy minimum", "white", 16, "circle", 4),
                                              ("Experimental polymorph", "black", 14, "x-thin", 3),
-                                             ("Shade ∝ P(x)" if shade is not None else "Size ∝ P(x)",
+                                             (("Shade" if shade is not None else "Size") + " ∝ P"
+                                              + (f"<sup>{scale_label}</sup>" if scale_label else "") + "(x)",
                                               "rgb(170,170,170)", 10, "circle", 0)):
         fig.add_scatter(x=[None], y=[None], mode='markers', name=name, showlegend=True,
                         marker=dict(size=size, color=color, symbol=symbol, line=dict(color='black', width=width)),
@@ -1892,7 +1895,8 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
                 cmax=100,
                 opacity=0.6,
                 showscale=(i == 0),  # only once
-                colorbar_title="P(x)<br>percentile",
+                colorbar_title=("P" + (f"<sup>{stats['scale_label']}</sup>" if stats.get('scale_label') else "")
+                                + "(x)<br>percentile"),
             ),
             showlegend=False
         ), row=row, col=col)
@@ -1981,13 +1985,19 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     raw_values = [e_min]
     formatters = [fmt1]
     if has_pct:
-        # pre-formatted because a below-resolution point prints a bound
+        # pre-formatted: a point with under one draw's kernel weight around it is below what the sample resolves and
+        # prints '<LOD' (limit of detection)
         below = stats['below_resolution']
         f_pct = stats['density_pct_floor']
-        row_labels.append(f"{'UMA' if paired else primary} P(x) percentile")
-        raw_values.append([f"< {np.ceil(f_pct):.0f}" if b else pct_text(v)
+        psym = lambda s: "P" + (f"<sup>{s}</sup>" if s else "") + "(x*) percentile"   # P^{10/20}(x*) percentile
+        row_labels.append(f"{'UMA' if paired else primary} {psym(stats.get('scale_label'))}")
+        raw_values.append(["<LOD" if b else pct_text(v)
                            for v, b in zip(stats['density_pct'], below)])
         formatters.append(str)
+        for ex in stats.get('extra_scales') or []:   # the same points at another kernel width
+            row_labels.append(f"{'UMA' if paired else primary} {psym(ex['label'])}")
+            raw_values.append(["<LOD" if b else pct_text(v) for v, b in zip(ex['uma_pct'], ex['uma_below'])])
+            formatters.append(str)
     else:
         row_labels.append(f"Normed {'UMA' if paired else primary} P(x*)")
         raw_values.append(p)
@@ -1999,19 +2009,23 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
             formatters.append(fmt2)
         if 'elj_density_pct' in stats:
             eb, ef_ = stats['elj_below_resolution'], stats['elj_density_pct_floor']
-            row_labels.append("LJ P(x) percentile")
-            raw_values.append([f"< {np.ceil(ef_):.0f}" if b else pct_text(v)
+            row_labels.append(f"LJ {psym(stats.get('scale_label'))}")
+            raw_values.append(["<LOD" if b else pct_text(v)
                                for v, b in zip(stats['elj_density_pct'], eb)])
             formatters.append(str)
+            for ex in stats.get('extra_scales') or []:
+                row_labels.append(f"LJ {psym(ex['label'])}")
+                raw_values.append(["<LOD" if b else pct_text(v) for v, b in zip(ex['elj_pct'], ex['elj_below'])])
+                formatters.append(str)
     # c_p of the table's point x*: a basin's density maximum, or the polymorph itself (not the basin's
     # lowest-energy sample, whatever the old E_min label said)
-    row_labels.append("c<sub>p</sub>(x*)")
-    raw_values.append(cp)
-    formatters.append(fmt2)
+    row_labels.insert(1, "c<sub>p</sub>(x*)")   # second, after the energy
+    raw_values.insert(1, cp)
+    formatters.insert(1, fmt2)
     # Which rows should have the *minimum* bolded vs the *maximum*?
     # For most quantities lower is "best"; for TΔS higher (less negative) is notable.
     bold_min_rows = {0}  # E
-    bold_max_rows = set() if has_pct else {1}  # normed P; the percentile rows are pre-formatted strings
+    bold_max_rows = set() if has_pct else {2}  # normed P (row 1 is c_p); the percentile rows are pre-formatted strings
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
     heads = polymorph_labels(num_polymorphs, poly_labels)
     for ind in range(num_polymorphs):
@@ -2464,4 +2478,55 @@ def fused_duo_embedding_fig(panels, callout='EXP'):
     fig.update_layout(plot_bgcolor='white', paper_bgcolor='white',
                       legend=dict(font=dict(size=32), itemsizing='constant', x=0.995, y=0.995, xanchor='right',
                                   yanchor='top', bgcolor='rgba(255,255,255,0.7)'))
+    return fig
+
+
+def scale_embedding_fig(xy, panels, poly_xy, poly_labels=None):
+    """One embedding drawn once per quantity, side by side.
+
+    xy: [n, 2] embedding coordinates. panels: list of dicts with 'values' [n], 'title', 'colorbar' (its title),
+    'range' (cmin, cmax), 'colorscale', and 'top' ('high' or 'low': which end of the values is drawn last, i.e. on
+    top). poly_xy: [k, 2] experimental structures, marked X and named by a callout."""
+    n_p = len(panels)
+    fig = make_subplots(rows=1, cols=n_p, horizontal_spacing=0.075,
+                        subplot_titles=[f"({chr(97 + k)}) {p['title']}" for k, p in enumerate(panels)])
+    xy, poly_xy = np.asarray(xy), np.atleast_2d(poly_xy)
+    heads = polymorph_labels(len(poly_xy), poly_labels)
+    span = float(np.ptp(xy, axis=0).max())
+    for k, p in enumerate(panels):
+        v = np.asarray(p['values'], dtype=float)
+        order = np.argsort(v if p.get('top', 'high') == 'high' else -v)
+        ax = '' if k == 0 else str(k + 1)
+        dom = fig.layout[f'xaxis{ax}'].domain
+        fig.add_scatter(x=xy[order, 0], y=xy[order, 1], mode='markers', showlegend=False, row=1, col=k + 1,
+                        marker=dict(size=2.6, color=v[order], colorscale=p['colorscale'], cmin=p['range'][0],
+                                    cmax=p['range'][1], line_width=0,
+                                    colorbar=dict(title=dict(text=p['colorbar'], side='right'), x=dom[1] + 0.004,
+                                                  xanchor='left', len=0.86, thickness=16)))
+        fig.add_scatter(x=poly_xy[:, 0], y=poly_xy[:, 1], mode='markers', marker_symbol='x-thin',
+                        marker_line_color='black', marker_line_width=4, marker_size=16, showlegend=False,
+                        row=1, col=k + 1)
+        # callout tail: the direction around each X with the fewest points under the label
+        tails = []
+        for head, label in zip(poly_xy, heads):
+            best, best_score = None, None
+            for r_frac in (0.14, 0.20):
+                for ang in np.linspace(0, 2 * np.pi, 24, endpoint=False):
+                    tail = head + r_frac * span * np.array([np.cos(ang), np.sin(ang)])
+                    if np.any(tail < xy.min(0)) or np.any(tail > xy.max(0)):
+                        continue
+                    score = int((np.linalg.norm(xy - tail, axis=1) < 0.06 * span).sum())
+                    score += sum(10 ** 7 for other in tails if np.linalg.norm(other - tail) < 0.10 * span)
+                    if best_score is None or score < best_score:
+                        best, best_score = tail, score
+            tails.append(best)
+            fig.add_annotation(x=head[0], y=head[1], ax=best[0], ay=best[1], xref=f'x{ax}', yref=f'y{ax}',
+                               axref=f'x{ax}', ayref=f'y{ax}', text=label, name='callout', showarrow=True,
+                               arrowhead=2, arrowsize=1.2, arrowwidth=3, arrowcolor='black', standoff=9,
+                               font=dict(size=34, color='black', family='Times New Roman'))
+        fig.update_xaxes(title_text='CV1', row=1, col=k + 1)
+    fig.update_yaxes(title_text='CV2', row=1, col=1)
+    fig.update_xaxes(showgrid=False, showticklabels=False, zeroline=False)
+    fig.update_yaxes(showgrid=False, showticklabels=False, zeroline=False)
+    fig.update_layout(plot_bgcolor='white', paper_bgcolor='white')
     return fig

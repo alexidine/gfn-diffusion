@@ -20,7 +20,7 @@ import plotly.express as px
 import torch
 
 from energy_sampling.eval.paper1_results.dens_engine import (
-    PairDistance, load_bundle, rdf_to_cdf, point_sums, SETS, SIGMA_MULTS, _log)
+    PairDistance, load_bundle, rdf_to_cdf, point_sums, kernel_sums_from_hist, SETS, SIGMA_MULTS, _log)
 
 
 def _dist_to_draws(bundle, cdf, empty, device='cuda', col_chunk=8192, cols=None):
@@ -178,7 +178,7 @@ def embed_bundles(outs, n_neighbors=300, min_dist=0.75, n_landmarks=10000, seed=
     return res
 
 
-def mean_shift_pointers(out, cutoffs, device='cuda', row_block=1024, col_chunk=8192):
+def mean_shift_pointers(out, cutoffs, device='cuda', row_block=1024, col_chunk=8192, dens=None, tag=''):
     """utils.mean_shift_density's pointer table over a bundle's window & reduced draws, for every cutoff at once.
 
     A draw points at the DENSEST draw closer than the cutoff (itself included). With the draws ordered by density,
@@ -193,10 +193,10 @@ def mean_shift_pointers(out, cutoffs, device='cuda', row_block=1024, col_chunk=8
     N = len(draws['energy'])
     si, ci = SIGMA_MULTS.index(1.0), SETS.index('window_reduced')
     rows = torch.nonzero(draws['window_reduced']).flatten().numpy()
-    dens = np.asarray(b['sums'][:N, si, ci])[rows]
+    dens = np.asarray(b['sums'][:N, si, ci])[rows] if dens is None else np.asarray(dens)   # dens: over `rows`
     perm = np.argsort(-dens, kind='stable')
     cutoffs = np.asarray(cutoffs, dtype=np.float32)
-    cache = os.path.join(out, 'meanshift_ptr.npz')
+    cache = os.path.join(out, f'meanshift_ptr{tag}.npz')
     if os.path.exists(cache):
         z = np.load(cache)
         if len(z['cutoffs']) == len(cutoffs) and np.allclose(z['cutoffs'], cutoffs) and len(z['perm']) == len(perm):
@@ -235,12 +235,15 @@ def mean_shift_pointers(out, cutoffs, device='cuda', row_block=1024, col_chunk=8
     return rows, perm, ptr
 
 
-def mean_shift_anchors(out, d_cut, max_n_clusters, device='cuda'):
+def mean_shift_anchors(out, d_cut, max_n_clusters, device='cuda', dens=None, tag=''):
     """The mean-shift scan of utils.clustering over a bundle's window & reduced draws: the smallest cutoff in
     linspace(0.33, 2, 200) x d_cut that leaves at most max_n_clusters modes. Returns (rows, anchors, cutoff factor),
     anchors as positions within rows."""
+    # utils.clustering scans to 2 x d_cut; the same step carried to 3 x, because a COMPACK-anchored d_cut can be
+    # small against the distance between a molecule's packing families
     ccs = np.linspace(0.33, 2, 200)
-    rows, perm, ptr = mean_shift_pointers(out, ccs * d_cut, device)
+    ccs = np.concatenate([ccs, ccs[-1] + (ccs[1] - ccs[0]) * np.arange(1, 120)])
+    rows, perm, ptr = mean_shift_pointers(out, ccs * d_cut, device, dens=dens, tag=tag)
     for cc, p in zip(ccs, ptr):
         state = np.arange(len(p))
         for _ in range(100):
@@ -252,6 +255,10 @@ def mean_shift_anchors(out, d_cut, max_n_clusters, device='cuda'):
         if len(modes) <= max_n_clusters:
             break
     _log(f"mean shift over {len(rows)} draws: {len(modes)} modes at cutoff {cc:.3f} x d_cut")
+    if len(modes) > 64:   # the scan ran out: keep the 64 modes that the most draws flow to
+        ids, counts = np.unique(state, return_counts=True)
+        modes = np.sort(ids[np.argsort(-counts)[:64]])
+        _log(f"   scan exhausted; keeping the 64 largest modes ({int(np.sort(counts)[-64:].sum())} of {len(state)} draws)")
     return rows, perm[modes], float(cc)
 
 
@@ -277,7 +284,8 @@ def _rank(raw_draws, raw_pts):
 
 
 def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, energy_function, max_n_clusters,
-                     min_basin_size, device='cuda', basins_from='bundle'):
+                     min_basin_size, device='cuda', basins_from='bundle', d_cut=None, max_basins=None,
+                     scale_label=None, extra_scales=None):
     """figures.combo_fig's inputs over the bundle's window & reduced draws.
 
     Basins are the 10k analysis's: its mean-shift anchors are reused and every bundle draw is assigned by the same
@@ -295,19 +303,28 @@ def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, e
     b = load_bundle(uma_bundle)
     draws, refs = b['draws'], b['refs']
     N, R = len(draws['energy']), len(refs['labels'])
-    assert abs(b['sigma']['d_cut'] / float(uma_results['d_cuts'][0]) - 1) < 1e-6, "bundle is not on this figure's kernel"
+    # d_cut: another kernel width than the analysis's (basins_from='bundle' only). Every kernel sum then comes from
+    # the stored distance histograms, and the mean shift, the assignment and the percentiles all use that width.
+    rescaled = d_cut is not None
+    assert not rescaled or basins_from == 'bundle', "a d_cut override needs the bundle's own mean shift"
+    if not rescaled:
+        assert abs(b['sigma']['d_cut'] / float(uma_results['d_cuts'][0]) - 1) < 1e-6, "bundle is not on this figure's kernel"
+    d_cut = b['sigma']['d_cut'] if d_cut is None else float(d_cut)
     assert b['meta']['step_ind'] == uma_results['provenance']['step_ind'], "bundle and results differ in checkpoint"
     assert refs['labels'] == [str(i) for i in ebatch.identifier], "bundle references differ from the figure's"
-    sigma0 = b['sigma']['sigma0']
+    sigma0 = d_cut / 3
     si, ci = SIGMA_MULTS.index(1.0), SETS.index('window_reduced')
     rows = torch.nonzero(draws['window_reduced']).flatten()
     M = len(rows)
-    dens = torch.from_numpy(np.asarray(b['sums'][:N, si, ci]))[rows]
-    ref_sums = torch.from_numpy(np.asarray(b['sums'][N:, si, ci]))
+    all_sums = kernel_sums_from_hist(uma_bundle, d_cut) if rescaled else np.asarray(b['sums'][:, si, ci])
+    dens = torch.from_numpy(np.asarray(all_sums[:N]))[rows]
+    ref_sums = torch.from_numpy(np.asarray(all_sums[N:]))
 
     own = basins_from == 'bundle'
     if own:   # mean shift over the bundle's own draws
-        ms_rows, anchors, _ = mean_shift_anchors(uma_bundle, b['sigma']['d_cut'], max_n_clusters, device)
+        ms_rows, anchors, _ = mean_shift_anchors(uma_bundle, d_cut, max_n_clusters, device,
+                                                 dens=dens.numpy() if rescaled else None,
+                                                 tag=f'_dcut{d_cut:.4f}' if rescaled else '')
         assert np.array_equal(ms_rows, rows.numpy())
         kept_10k = anchors
         a_rows = rows[torch.as_tensor(anchors)].numpy()
@@ -326,10 +343,18 @@ def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, e
     kept = torch.as_tensor([int(a) in set(int(k) for k in kept_10k) for a in anchors])
     lab = torch.where((best_share >= 0.8) & kept[best], best, torch.full_like(best, -1))
     if own:   # the same share of the set that min_basin_size is of a 10k analysis
-        for v in torch.unique(lab):
-            if v >= 0 and int((lab == v).sum()) < min_basin_size * M / 10000:
+        small = [v for v in torch.unique(lab) if v >= 0 and int((lab == v).sum()) < min_basin_size * M / 10000]
+        if len(small) == len([v for v in torch.unique(lab) if v >= 0]):
+            print(f"  no basin holds {min_basin_size} per 10,000 draws at this kernel width; keeping the largest instead")
+        else:
+            for v in small:
                 lab[lab == v] = -1
     basin_ids = [int(v) for v in torch.unique(lab) if v >= 0]
+    if max_basins is not None and len(basin_ids) > max_basins:   # the figure grid holds this many: keep the largest
+        basin_ids.sort(key=lambda v: -int((lab == v).sum()))
+        for v in basin_ids[max_basins:]:
+            lab[lab == v] = -1
+        basin_ids = basin_ids[:max_basins]
     # a basin's probability maximum is its MODE: the densest member within one kernel width of the 10k anchor (the
     # mean-shift mode). The densest member anywhere would sit on the basin's border with a denser neighbour.
     p_max = {}
@@ -372,12 +397,27 @@ def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, e
     order = np.argsort(np.argsort(rows[p_maxima].numpy()))   # cdf rows were read sorted; restore basin order
     pt_cdf = torch.cat([pt_cdf[:n_basins][order], pt_cdf[n_basins:]])
     pt_empty = torch.cat([draws['empty'][rows[p_maxima]], refs['empty']])
-    ps = point_sums(elj_bundle, cdf=pt_cdf, empty=pt_empty, device=device)
-    assert abs(ps['d_cut'] / b['sigma']['d_cut'] - 1) < 1e-6, "the eLJ bundle is on a different kernel"
+    ps = point_sums(elj_bundle, cdf=pt_cdf, empty=pt_empty, device=device, d_cut=d_cut if rescaled else None)
+    assert abs(ps['d_cut'] / d_cut - 1) < 1e-6, "the eLJ bundle is on a different kernel"
     (stats['elj_density_pct'], stats['elj_density_pct_floor'],
      stats['elj_below_resolution']) = _rank(ps['draw_sums'], ps['point_sums'])
     stats['elj_density'] = (ps['point_sums'] / ps['draw_sums'].max()).numpy()
     stats['uma_bundle_n_draws'], stats['elj_bundle_n_draws'] = M, ps['n_draws']
+    # scale_label names the kernel the basins, shading and first percentile rows use; extra_scales {label: d_cut}
+    # adds the SAME points' percentiles at other kernel widths (basins and points unchanged), for the table only
+    stats['scale_label'] = scale_label
+    stats['extra_scales'] = []
+    for label, dc in (extra_scales or {}).items():
+        s2 = kernel_sums_from_hist(uma_bundle, dc)
+        d2 = torch.from_numpy(s2[:N])[rows]
+        u = _rank(d2, torch.cat([d2[p_maxima], torch.from_numpy(s2[N:])]))
+        p2 = point_sums(elj_bundle, cdf=pt_cdf, empty=pt_empty, device=device, d_cut=dc)
+        e = _rank(p2['draw_sums'], p2['point_sums'])
+        stats['extra_scales'].append({'label': label, 'uma_pct': u[0], 'uma_below': u[2], 'elj_pct': e[0],
+                                      'elj_below': e[2]})
+        print(f"  scale {label} (d_cut {dc:.4f}): UMA percentiles {np.round(u[0], 1).tolist()} "
+              f"(<LOD {u[2].astype(int).tolist()}), LJ {np.round(e[0], 1).tolist()} (<LOD {e[2].astype(int).tolist()}); "
+              f"draws below one draw's weight: UMA {u[1]:.1f}%, LJ {e[1]:.1f}%")
 
     ref_d = torch.from_numpy(np.asarray(b['ref_dist']))[:, rows]
     polymorph_basin_index = torch.stack([torch.stack([ref_d[r][indexed == k].min() for k in range(n_basins)])

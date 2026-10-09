@@ -544,7 +544,8 @@ def load_neighbours(out, r0, r1):
     return z['counts'], z['idx'], z['dist']
 
 
-def point_sums(out, rdf=None, set_name='window_reduced', device='cuda', col_chunk=8192, cdf=None, empty=None):
+def point_sums(out, rdf=None, set_name='window_reduced', device='cuda', col_chunk=8192, cdf=None, empty=None,
+               d_cut=None):
     """Kernel sums of arbitrary structures against a bundle's draws, at the bundle's own sigma0.
 
     rdf: [P, channels, bins], scored in the bundle's rdf_mode. Returns the points' sums over the draws of
@@ -563,6 +564,10 @@ def point_sums(out, rdf=None, set_name='window_reduced', device='cuda', col_chun
     dist = PairDistance(C, B, bool(draws['empty'].any() or p_empty.any()))
     empty, mask = draws['empty'].to(device), member.to(device).double()
     sigma0 = b['sigma']['sigma0']
+    draw_sums = torch.from_numpy(np.asarray(b['sums'][:N, si, ci]))[member]
+    if d_cut is not None:   # another kernel width: the draws' sums come from the stored histograms
+        sigma0 = d_cut / 3
+        draw_sums = torch.from_numpy(kernel_sums_from_hist(out, d_cut, set_name)[:N])[member]
     acc = torch.zeros(len(p_cdf), device=device, dtype=torch.float64)
     nearest = torch.full((len(p_cdf),), float('inf'), device=device)
     for c0 in range(0, N, col_chunk):
@@ -572,8 +577,8 @@ def point_sums(out, rdf=None, set_name='window_reduced', device='cuda', col_chun
         w[Dm < 1e-7] = 0.0
         acc += w @ mask[c0:c1]
         nearest = torch.minimum(nearest, torch.where(mask[c0:c1].bool()[None, :], Dm, torch.inf).amin(1))
-    return {'point_sums': acc.cpu(), 'draw_sums': torch.from_numpy(np.asarray(b['sums'][:N, si, ci]))[member],
-            'nearest': nearest.cpu(), 'd_cut': b['sigma']['d_cut'], 'sigma0': sigma0, 'n_draws': int(member.sum()),
+    return {'point_sums': acc.cpu(), 'draw_sums': draw_sums,
+            'nearest': nearest.cpu(), 'd_cut': 3 * sigma0, 'sigma0': sigma0, 'n_draws': int(member.sum()),
             'rdf_mode': b['meta']['rdf_mode'], 'step_ind': b['meta']['step_ind']}
 
 
