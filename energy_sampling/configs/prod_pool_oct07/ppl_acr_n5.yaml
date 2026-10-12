@@ -259,6 +259,7 @@ condition_log_z:
   discovery_half_life_steps: 200.0
   untrusted_z: head
   global_half_life_updates: 50.0
+  best_energy_from_anchors_on_switch: false
   weighted_condition_sampling: true
   weighted_condition_sampling_clip_quantile: 0.99
   weighted_condition_sampling_temperature: 0.3

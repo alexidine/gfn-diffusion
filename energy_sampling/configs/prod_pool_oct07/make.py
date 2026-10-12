@@ -41,8 +41,22 @@ coefficient x (overshoot)^2 nats, so at 10 a density flat up to a wall keeps a s
 walls) and theta (5.8%, upper wall), up from 2% at 5,000 steps: the model is still finding the shelf the soft wall
 grants, and log Z rises with it.
 
+ACRIDINE AGAIN, ppl_acr_dens_n5 (2026-10-12): the acr production arm with two things added, for a phase 2 whose
+buffers are the recipe's. ppl_acr_n5 ran its whole phase 2 on a tracker record it inherited from the MLE run: a best
+energy of -1,327,550, set at that run's step-500 eval by a draw of the then untrained model (the prior's 3,203,168
+rows scan to a best of -45.3; the same eval's draws averaged +1e5 and 0.07% of them were reasonable). Against that
+record the entry rebuild of the prior buffer admitted no noised anchor and kept the raw dataset rows, no top-up was
+ever admitted, and the rows expired: 2.88M at entry, 766k at step 100,000, 43k at 124,000. Then the draws went
+diffuse (mean packing coefficient 0.608 at 100,000, 0.376 at 124,000, learned log Z up 4 nats with it).
+  floor  condition_log_z.best_energy_from_anchors_on_switch true: on the seed load the record becomes the anchor
+         minimum, so the entry rebuild and the top-ups work as in every other arm.
+  wall   density_coeff ramped 10 -> 1000 over the first 2,000 phase-2 steps (the penalty is coefficient x
+         ln(0.55 / packing coefficient)^2 nats: 1.4 nats at packing 0.38 under 10, 140 under 1000). The box and
+         reduction coefficients stay at 10, as in every production arm; their ramp is the fine-tune's.
+
 Not here: prod_sep20's every-10th arms (settled there). ROW ORDER IS THE ARRAY INDEX: mip / neh / mipu / nehu
-production are 0-3, the mip exploration arms 4-6, acr production 7, the mip early-ramp arm 8.
+production are 0-3, the mip exploration arms 4-6, acr production 7, the mip early-ramp arm 8, acr with the floor reset
+and the density wall 9.
 """
 import copy
 import importlib.util
@@ -71,25 +85,32 @@ N = 5
 FREEZE = 'freeze_pb:full'
 #: prod_sep23_ft's ramp of both penalty coefficients (geometric, anchored at the stage's entry)
 SCHEDULE = {'bounding_coeff': {'target': 1000, 'steps': 20000}, 'reduction_coeff': {'target': 1000, 'steps': 20000}}
-#: (family, stored force on replay rows, P_B frozen at entry, penalty ramp from entry). ROW ORDER IS THE ARRAY INDEX:
-#: append only.
-ARMS = ([(fam, False, True, False) for fam in FAMS]
-        + [('mip', True, True, False), ('mip', False, False, False), ('mip', True, False, False)]
-        + [('acr', False, True, False)] + [('mip', False, True, True)])
+#: the density wall of ppl_acr_dens_n5, from the stage's entry
+DENSITY_SCHEDULE = {'density_coeff': {'target': 1000.0, 'steps': 2000, 'kind': 'geometric'}}
+FLOOR_KEY = 'best_energy_from_anchors_on_switch'
+#: (family, stored force on replay rows, P_B frozen at entry, penalty ramp from entry, floor reset + density wall).
+#: ROW ORDER IS THE ARRAY INDEX: append only.
+ARMS = ([(fam, False, True, False, False) for fam in FAMS]
+        + [('mip', True, True, False, False), ('mip', False, False, False, False), ('mip', True, False, False, False)]
+        + [('acr', False, True, False, False)] + [('mip', False, True, True, False)]
+        + [('acr', False, True, False, True)])
 p20.TAG = TAG
 fin.TAG = TAG
 fin.SEED_ARM.update({fam: f'{bat}/mlepl_{fam}_lr2.yaml' for fam, bat in SEED_BATTERY.items()})
 fin.SRC.update({fam: f'mlepl_{fam}_lr2' for fam in SEED_BATTERY})
 
 
-def build_arm(base, fam, force=False, frozen=True, ramp=False):
+def build_arm(base, fam, force=False, frozen=True, ramp=False, dens=False):
     name, cfg = p20.build_arm(base, fam, N, force)
-    if force or ramp or not frozen:
+    if force or ramp or dens or not frozen:
         name = (f'{TAG}_{fam}' + ('' if frozen else '_unpb') + ('_force' if force else '') + ('_ramp' if ramp else '')
-                + f'_n{N}')
+                + ('_dens' if dens else '') + f'_n{N}')
         cfg['run_name'] = name
     if ramp:
         fin._stage(cfg, 'equilibration')['coeff_schedule'] = copy.deepcopy(SCHEDULE)
+    if dens:
+        fin._stage(cfg, 'equilibration')['coeff_schedule'] = copy.deepcopy(DENSITY_SCHEDULE)
+        cfg['condition_log_z'][FLOOR_KEY] = True
     if not frozen:
         eq = fin._stage(cfg, 'equilibration')
         assert eq['on_enter'][-1] == FREEZE and eq['on_enter'].count(FREEZE) == 1, name
@@ -115,11 +136,13 @@ def moved(a, b):
     return sorted(k for k in set(la) | set(lb) if la.get(k) != lb.get(k))
 
 
-def check(cfg, name, fam, force=False, frozen=True, ramp=False, production=None):
+def check(cfg, name, fam, force=False, frozen=True, ramp=False, dens=False, production=None):
     probe = copy.deepcopy(cfg)
     eq = fin._stage(cfg, 'equilibration')
-    assert (eq.get('coeff_schedule') or {}) == (SCHEDULE if ramp else {}), name
+    assert (eq.get('coeff_schedule') or {}) == (SCHEDULE if ramp else DENSITY_SCHEDULE if dens else {}), name
     assert cfg['energy_config']['bounding_coeff'] == 10.0 == cfg['energy_config']['reduction_coeff'], name
+    assert cfg['energy_config']['density_coeff'] == 10.0 and bool(cfg['condition_log_z'].get(FLOOR_KEY)) is dens, name
+    assert not dens or cfg['buffers'].get('fresh_on_switch') in (False, None), name
     if not frozen:   # prod_sep20's check is the frozen arm's: judge this arm as that one plus the freeze
         assert not any(str(a).startswith('freeze_pb') for a in eq['on_enter']), name
         assert cfg.get('freeze_backward_policy') in (False, None), name
@@ -129,8 +152,10 @@ def check(cfg, name, fam, force=False, frozen=True, ramp=False, production=None)
         want = {'run_name'}
         if force:
             want.add('replay_loss_coeffs.stored_force_k')
-        if ramp or not frozen:
+        if ramp or dens or not frozen:
             want.add('protocols.unconditional_tb.stages')
+        if dens:
+            want.add(f'condition_log_z.{FLOOR_KEY}')
         assert set(moved(cfg, production)) == want, (name, moved(cfg, production))
     seed = fin.load(fin.SEED_ARM[fam])
     rows = seed['buffers']['anchor_buffer']['max_size']
@@ -151,10 +176,11 @@ def main(argv):
         print('WARNING: the working tree is dirty (base read from git HEAD; the cluster runs HEAD):\n  ' + '\n  '.join(dirty))
     base = fin.committed_mk_dev()
     arms = {}
-    for fam, force, frozen, ramp in ARMS:
-        name, cfg = build_arm(base, fam, force, frozen, ramp)
-        plain = force is False and frozen is True and ramp is False
-        check(cfg, name, fam, force, frozen, ramp, production=None if plain else arms[f'{TAG}_{fam}_n{N}'][0])
+    assert base['condition_log_z'].get(FLOOR_KEY) is False, f'mk_dev at HEAD does not carry condition_log_z.{FLOOR_KEY}'
+    for fam, force, frozen, ramp, dens in ARMS:
+        name, cfg = build_arm(base, fam, force, frozen, ramp, dens)
+        plain = force is False and frozen is True and ramp is False and dens is False
+        check(cfg, name, fam, force, frozen, ramp, dens, production=None if plain else arms[f'{TAG}_{fam}_n{N}'][0])
         fin.load_check(cfg, name, ['train_prior', 'equilibration'])
         arms[name] = (cfg, fam)
     for a in arms:   # the job's glob for an arm's own checkpoints is *<arm>_*: it must match no other arm's files
@@ -189,7 +215,8 @@ def main(argv):
               f"batch={cfg['batch_size']} tau={p20.TAU} {'MLIP' if fin.MLIP[fam] else 'ELJ '} "
               f"P_B {'frozen at entry' if FREEZE in fin._stage(cfg, 'equilibration')['on_enter'] else 'TRAINABLE'} "
               f"{'STORED FORCE k=1 ' if cfg['replay_loss_coeffs']['stored_force_k'] else ''}"
-              f"{'PENALTY RAMP 10->1000/20k ' if fin._stage(cfg, 'equilibration').get('coeff_schedule') else ''}"
+              f"{'PENALTY RAMP 10->1000/20k ' if fin._stage(cfg, 'equilibration').get('coeff_schedule') == SCHEDULE else ''}"
+              f"{'DENSITY 10->1000/2k + FLOOR RESET ' if cfg['condition_log_z'].get(FLOOR_KEY) else ''}"
               f"anchors={cfg['buffers']['anchor_buffer']['max_size']:,} noise={cfg['buffers']['anchor_buffer']['noise_log_range']} "
               f"seed=*{fin.SRC[fam]}_*_best.pt prior={cfg['prior_path'].rsplit('/', 1)[1]}")
 
