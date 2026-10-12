@@ -276,7 +276,15 @@ daemon does not come up or a probe process cannot reach the card through it, the
 slicing, and which of the two happened is the first line of the job's .share file. A pinned control leaves the
 card idle between its iterations, which is what the cluster cancels on; several on one card is the remedy.
 GROUPS ARE APPENDED, never reordered: lines 0-6 are the timing groups (c alone, two c, three c, cf alone, two cf,
-a alone, af alone); the production groups are appended once those have been read.
+a alone, af alone). They ran on an A100 with a 3-hour wall (W&B runs qf30_ladt_*, read 2026-10-12): every arm kept
+batch 500 with no out-of-memory event and no fire, MPS or time slicing undetermined from here (the .share files).
+Seconds an iteration, alone / two on a card / three on a card: c 0.77 / 0.92 / 1.15; cf 3.36 / 4.75 / -;
+a 2.86 alone; af 3.89 alone. GPU utilisation over the last third of each run (W&B's system stream): c 61 / 73 / 78
+percent; cf 74 / 88; a 74; af 77. Three controls fit a card at a 0.313 memory share each and two cf arms at 0.47;
+the arms that read atoms were run only with the whole card. The same seed gave the same numbers alone and packed.
+THE PRODUCTION GROUPS, from those: 7 = the three controls on one card; 8 = cf seeds 1 and 2 on one card, 9 = cf
+seed 3; 10-12 = a, one seed a card; 13-15 = af, one seed a card. The job script's array is 7-15; `--array` on the
+sbatch line picks a subset (7-9 is the force term against the control, 10-15 the arms that read atoms).
 Read at equal steps and at equal GPU-hours, as curves: held-out median and 90th-percentile excess energy and the
 likelihood of stored crystals of held-out molecules. bwd/mle is NOT a verdict: P_B reads the same features.
 """
@@ -466,7 +474,10 @@ LADDER_TIMING = (('ladt_c_solo', 12345, 'c'), ('ladt_c_pa', 12345, 'c'), ('ladt_
 LADDER_TIMING_STEPS = 400
 # the arms one job runs on its one GPU; line n is array index n. APPEND ONLY.
 LADDER_GROUPS = (('ladt_c_solo',), ('ladt_c_pa', 'ladt_c_pb'), ('ladt_c_ta', 'ladt_c_tb', 'ladt_c_tc'),
-                 ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',))
+                 ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',),
+                 ('lad_c_s1', 'lad_c_s2', 'lad_c_s3'), ('lad_cf_s1', 'lad_cf_s2'), ('lad_cf_s3',),
+                 ('lad_a_s1',), ('lad_a_s2',), ('lad_a_s3',), ('lad_af_s1',), ('lad_af_s2',), ('lad_af_s3',))
+LADDER_FIRST_LIVE = 7       # the first production group: the job script's array starts here
 LADDER_BATCH = 500          # trajectories an iteration
 LADDER_UPDATE = 1000        # trajectories an optimizer step: fused_grad_accum_min_samples, as leg i has it
 LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATCH, 'grow_batch_size': False,
@@ -474,10 +485,9 @@ LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATC
 LADDER_GATE = 0.0           # starting value of P_F's force gate
 LADDER_TERM = dict(SCRATCH_TERM, force_drift_t_min=0.0)
 LADDER_SHARE = 0.94         # of the card's memory, split equally among the arms of a job with more than one
-# the job script's wall. Every group it lists now is a timing group: the slowest (af alone) is about 1.7 h at the
-# laptop's speed, and a group cut at the wall has already logged what it is for. A two-day request waits behind
-# the whole queue (owner 2026-10-08). Production groups get their own wall when they are appended.
-LADDER_TIME = '03:00:00'
+# the job script's wall, for the production groups its array lists (the timing groups ran with 3 hours). An arm
+# resumes its own _running.pt on a resubmission, so a shorter `sbatch --time=...` only means more legs.
+LADDER_TIME = '2-00:00:00'
 LADDER_LEAVES = {
     'trunk': [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
     'force': ['model.force_drift_fwd'] + [f'model.{k}' for k in LADDER_TERM],
@@ -512,7 +522,7 @@ LADDER_SBATCH = r"""#!/bin/bash
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-__LAST__
+#SBATCH --array=__FIRST__-__LAST__
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=__TAG__
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/__BATTERY__/joblogs/%x_%A_%a.out
@@ -521,7 +531,8 @@ LADDER_SBATCH = r"""#!/bin/bash
 # encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
 # array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
-# The wall is sized for the groups this file lists (make.py LADDER_TIME); `sbatch --time=...` overrides it.
+# The array lists the production groups; lines below it in GROUPS_j.tsv are the timing groups, already run.
+# `sbatch --time=...` gives a shorter leg: every arm resumes its own _running.pt on the next submission.
 module purge
 
 IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
@@ -1723,9 +1734,13 @@ def main_ladder(argv):
         f.writelines(' '.join(f'{TAG}_{run}' for run in group) + '\n' for group in LADDER_GROUPS)
     guard = LADDER_GUARD.strip('\n') % {'trunk': trunk}
     assert LADDER_SBATCH.count('__GUARD__') == 1 and LADDER_SBATCH.count('__SHARE__') == 2, 'the leg-j job script moved'
-    # LADDER_TIME is sized for timing groups: a production group needs a wall of its own
-    assert all(run.startswith('ladt_') for group in LADDER_GROUPS for run in group), 'a production group has no wall'
-    sb = (LADDER_SBATCH.replace('__LAST__', str(len(LADDER_GROUPS) - 1)).replace('__GUARD__', guard)
+    # the array runs the production groups only, and those are exactly the groups from LADDER_FIRST_LIVE on
+    assert all(run.startswith('ladt_') == (i < LADDER_FIRST_LIVE) for i, group in enumerate(LADDER_GROUPS)
+               for run in group), 'LADDER_FIRST_LIVE does not separate the timing groups from the production groups'
+    assert sorted(f'{TAG}_{run}' for group in LADDER_GROUPS[LADDER_FIRST_LIVE:] for run in group) == \
+        sorted(f'{TAG}_{run}' for run, _, _ in LADDER), 'a production row is in no group, or in two'
+    sb = (LADDER_SBATCH.replace('__FIRST__', str(LADDER_FIRST_LIVE))
+          .replace('__LAST__', str(len(LADDER_GROUPS) - 1)).replace('__GUARD__', guard)
           .replace('__TIME__', LADDER_TIME)
           .replace('__SHARE__', f'{LADDER_SHARE:g}').replace('__TAG__', TAG + 'j').replace('__BATTERY__', BATTERY)
           .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
