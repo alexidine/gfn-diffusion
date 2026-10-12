@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, \
+from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     BufferCurrencyError
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, normalize_problem_def
@@ -154,6 +154,55 @@ def fresh_buffers_on_switch(modeller, checkpoint: dict, path: str) -> bool:
     print(f"buffers.fresh_on_switch: {path} belongs to run {src!r}, this run is {modeller.run_name!r} -- the buffer "
           f"sidecar is NOT restored; prior/anchor buffers seed from the re-analysed prior dataset and the replay "
           f"buffer refills from live rollouts, so every stored row is scored by this run's energy function", flush=True)
+    return True
+
+
+def best_energy_from_anchors_on_switch(modeller, checkpoint: dict, path: str) -> bool:
+    """cfg:condition_log_z.best_energy_from_anchors_on_switch -- when THIS run loads ANOTHER run's checkpoint,
+    replace the restored tracker's per-condition best energy with the restored anchor buffer's per-condition minimum
+    (+inf, "never visited", for a condition that holds no anchor). A resume of the run's OWN checkpoint is untouched.
+    Off by default; prints when it fires.
+
+    Why it exists. The record is a running minimum over every energy the run has scored, forward-eval draws
+    included, and nothing stores the row that set it. One absurd evaluation therefore stays for good, and everything
+    measured as an excess above it breaks at once: the prior buffer's admission gate (energy < floor + ramp_floor)
+    admits no noised anchor, its staleness rule (excess >= ramp_floor) expires every row it holds, and the
+    excess-energy and nonthermal metrics read the offset. ppl_acr_n5 (2026-10-12) inherited -1.33e6 from its MLE
+    seed against an anchor minimum of -45.3: zero top-ups from step 86,660 on, and the prior buffer fell from 2.9M
+    rows to 43k in 37k steps.
+
+    The anchor buffer's energies are the anchor currency (best_energy_phys). On a run that never supplied a separate
+    physical energy the tracker's two minima are one stream and both are set; a run that has (lambda mixing) is
+    refused, since its mixture minimum cannot be read off the anchors. An absent or empty anchor buffer is refused
+    too (buffers.fresh_on_switch leaves none restored at this point): the key would otherwise do nothing, silently."""
+    cfg = getattr(modeller.args, 'condition_log_z', None)
+    if not bool(getattr(cfg, 'best_energy_from_anchors_on_switch', False)):
+        return False
+    src = checkpoint.get('run_name')
+    if src == modeller.run_name:
+        return False
+    tracker = modeller.condition_log_z
+    anchors = getattr(modeller, 'anchor_buffer', None)
+    if anchors is None or len(anchors) == 0:
+        raise ValueError(f"condition_log_z.best_energy_from_anchors_on_switch: {path} restored no anchor buffer to "
+                         f"read the minima from (is buffers.fresh_on_switch also set?)")
+    if not tracker.phys_is_alias:
+        raise ValueError("condition_log_z.best_energy_from_anchors_on_switch: the restored tracker carries a physical "
+                         "minimum separate from its mixture minimum; the anchors give only the physical one")
+    ids = torch.arange(tracker.best_energy.numel(), dtype=torch.long)
+    mins = _per_condition_min(anchors.condition_id.detach().cpu().long().flatten(),
+                              anchors.energy.detach().cpu().float().flatten(), ids)
+    old = tracker.best_energy.clone()
+    tracker.best_energy = mins.clone()
+    tracker.best_energy_phys = mins.clone()
+    seen = torch.isfinite(old) & torch.isfinite(mins)
+    moved = (old[seen] - mins[seen]).abs()
+    print(f"condition_log_z.best_energy_from_anchors_on_switch: {path} belongs to run {src!r}, this run is "
+          f"{modeller.run_name!r} -- best energy of {int(torch.isfinite(mins).sum())} condition(s) set to the anchor "
+          f"buffer's minimum ({len(anchors)} anchors); "
+          + (f"restored record {float(old[seen].min()):.6g} .. {float(old[seen].max()):.6g}, now "
+             f"{float(mins[seen].min()):.6g} .. {float(mins[seen].max()):.6g}, largest move {float(moved.max()):.6g}"
+             if bool(seen.any()) else "no condition had both a restored record and an anchor"), flush=True)
     return True
 
 
@@ -851,6 +900,7 @@ class Checkpointer:
         if checkpoint.get('condition_log_z') is not None:
             m.condition_log_z = ConditionLogZTracker.from_state_dict(
                 checkpoint['condition_log_z'], current_step=m.step_ind)
+            best_energy_from_anchors_on_switch(m, checkpoint, path)
         # judged against the live config by Modeller.init_energy_reference once the
         # identifier registry exists; absent (older checkpoints) = trained unreferenced
         m._resumed_energy_reference = checkpoint.get('energy_reference') or {'mode': None, 'table': None}

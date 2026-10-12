@@ -603,6 +603,7 @@ condition_log_z:
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
   untrusted_z: head  # the Z a TB residual uses for a condition below min_visits: head = the learned flow head; global = the all-condition EMA of the log w that feeds ema_logw (requires energy_config.energy_reference)
   global_half_life_updates: 50.0  # half-life, in update() calls, of that all-condition EMA
+  best_energy_from_anchors_on_switch: false  # true = when checkpoint_name belongs to ANOTHER run (its stored run_name differs from this run's), each condition's restored best energy is replaced by the restored anchor buffer's minimum for that condition (+inf where it holds no anchor); a resume of the run's own checkpoint is untouched. Raises when no anchor buffer was restored or the tracker carries a separate physical minimum. Prints when it fires (checkpointing.best_energy_from_anchors_on_switch)
   # {fwd,bwd,replay}_tb_z_source MOVED -> {fwd,bwd,replay}_loss_coeffs.tb_z_source.
   # It is a property of what a branch's loss does, and loss_coeffs is the one place
   # a protocol stage can override per branch -- so the conditional route now adopts
