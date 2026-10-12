@@ -600,3 +600,4 @@ energy_config:
   mlip_activation_checkpointing: true
   prior_flow_path: null
   lambda_mix: 1.0
+  implausible_energy_below: -1000.0

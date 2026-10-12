@@ -53,6 +53,9 @@ diffuse (mean packing coefficient 0.608 at 100,000, 0.376 at 124,000, learned lo
   wall   density_coeff ramped 10 -> 1000 over the first 2,000 phase-2 steps (the penalty is coefficient x
          ln(0.55 / packing coefficient)^2 nats: 1.4 nats at packing 0.38 under 10, 140 under 1000). The box and
          reduction coefficients stay at 10, as in every production arm; their ramp is the fine-tune's.
+  screen energy_config.implausible_energy_below = -1000 (owner 2026-10-12: "an absolute reasonable magnitude over
+         which samples are excluded as obviously wrong"): a draw MACE scores under -1000 kJ/mol is scored at +1000, so
+         it cannot become the record again. The prior's rows lie between about -45 and -9 in the tracker's currency.
 
 Not here: prod_sep20's every-10th arms (settled there). ROW ORDER IS THE ARRAY INDEX: mip / neh / mipu / nehu
 production are 0-3, the mip exploration arms 4-6, acr production 7, the mip early-ramp arm 8, acr with the floor reset
@@ -72,7 +75,7 @@ p20 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(p20)
 fin = p20.fin
 sys.path.insert(0, str(ROOT.parent))
-from prior_scan_cache import CHUNKING_KEYS  # noqa: E402
+from prior_scan_cache import CHUNKING_KEYS, SCREEN_KEYS  # noqa: E402
 
 TAG = 'ppl'
 BATTERY = 'prod_pool_oct07'
@@ -88,6 +91,8 @@ SCHEDULE = {'bounding_coeff': {'target': 1000, 'steps': 20000}, 'reduction_coeff
 #: the density wall of ppl_acr_dens_n5, from the stage's entry
 DENSITY_SCHEDULE = {'density_coeff': {'target': 1000.0, 'steps': 2000, 'kind': 'geometric'}}
 FLOOR_KEY = 'best_energy_from_anchors_on_switch'
+SCREEN_KEY = 'implausible_energy_below'
+SCREEN_BELOW = -1000.0                  # the run's energy units: kJ/mol per molecule on the MLIP routes
 #: (family, stored force on replay rows, P_B frozen at entry, penalty ramp from entry, floor reset + density wall).
 #: ROW ORDER IS THE ARRAY INDEX: append only.
 ARMS = ([(fam, False, True, False, False) for fam in FAMS]
@@ -111,6 +116,7 @@ def build_arm(base, fam, force=False, frozen=True, ramp=False, dens=False):
     if dens:
         fin._stage(cfg, 'equilibration')['coeff_schedule'] = copy.deepcopy(DENSITY_SCHEDULE)
         cfg['condition_log_z'][FLOOR_KEY] = True
+        cfg['energy_config'][SCREEN_KEY] = SCREEN_BELOW
     if not frozen:
         eq = fin._stage(cfg, 'equilibration')
         assert eq['on_enter'][-1] == FREEZE and eq['on_enter'].count(FREEZE) == 1, name
@@ -143,6 +149,8 @@ def check(cfg, name, fam, force=False, frozen=True, ramp=False, dens=False, prod
     assert cfg['energy_config']['bounding_coeff'] == 10.0 == cfg['energy_config']['reduction_coeff'], name
     assert cfg['energy_config']['density_coeff'] == 10.0 and bool(cfg['condition_log_z'].get(FLOOR_KEY)) is dens, name
     assert not dens or cfg['buffers'].get('fresh_on_switch') in (False, None), name
+    # energy_config is the seed arm's block verbatim, absences included: an absent key is the code default, no screen
+    assert cfg['energy_config'].get(SCREEN_KEY) == (SCREEN_BELOW if dens else None), name
     if not frozen:   # prod_sep20's check is the frozen arm's: judge this arm as that one plus the freeze
         assert not any(str(a).startswith('freeze_pb') for a in eq['on_enter']), name
         assert cfg.get('freeze_backward_policy') in (False, None), name
@@ -155,7 +163,7 @@ def check(cfg, name, fam, force=False, frozen=True, ramp=False, dens=False, prod
         if ramp or dens or not frozen:
             want.add('protocols.unconditional_tb.stages')
         if dens:
-            want.add(f'condition_log_z.{FLOOR_KEY}')
+            want |= {f'condition_log_z.{FLOOR_KEY}', f'energy_config.{SCREEN_KEY}'}
         assert set(moved(cfg, production)) == want, (name, moved(cfg, production))
     seed = fin.load(fin.SEED_ARM[fam])
     rows = seed['buffers']['anchor_buffer']['max_size']
@@ -166,7 +174,7 @@ def check(cfg, name, fam, force=False, frozen=True, ramp=False, dens=False, prod
     assert cfg.get('mlip_path') == seed.get('mlip_path'), name + ': the MLIP checkpoint moved from the seed arm'
     if fam == 'acr':
         assert cfg['mlip_path'] == ACR_MLIP and cfg['prior_path'].endswith('/acridine_mace_pooled_oct05_prior.pt'), name
-    same = lambda ec: {k: v for k, v in ec.items() if k not in CHUNKING_KEYS}
+    same = lambda ec: {k: v for k, v in ec.items() if k not in CHUNKING_KEYS and k not in SCREEN_KEYS}
     assert same(cfg['energy_config']) == same(seed['energy_config']), name + ': a moved energy_config would miss the scan cache'
 
 
@@ -177,6 +185,9 @@ def main(argv):
     base = fin.committed_mk_dev()
     arms = {}
     assert base['condition_log_z'].get(FLOOR_KEY) is False, f'mk_dev at HEAD does not carry condition_log_z.{FLOOR_KEY}'
+    assert SCREEN_KEY in base['energy_config'] and base['energy_config'][SCREEN_KEY] is None, \
+        f'mk_dev at HEAD does not carry energy_config.{SCREEN_KEY}'
+    assert SCREEN_KEY in SCREEN_KEYS
     for fam, force, frozen, ramp, dens in ARMS:
         name, cfg = build_arm(base, fam, force, frozen, ramp, dens)
         plain = force is False and frozen is True and ramp is False and dens is False
@@ -217,6 +228,7 @@ def main(argv):
               f"{'STORED FORCE k=1 ' if cfg['replay_loss_coeffs']['stored_force_k'] else ''}"
               f"{'PENALTY RAMP 10->1000/20k ' if fin._stage(cfg, 'equilibration').get('coeff_schedule') == SCHEDULE else ''}"
               f"{'DENSITY 10->1000/2k + FLOOR RESET ' if cfg['condition_log_z'].get(FLOOR_KEY) else ''}"
+              f"{f'SCREEN below {SCREEN_BELOW:g} ' if cfg['energy_config'].get(SCREEN_KEY) is not None else ''}"
               f"anchors={cfg['buffers']['anchor_buffer']['max_size']:,} noise={cfg['buffers']['anchor_buffer']['noise_log_range']} "
               f"seed=*{fin.SRC[fam]}_*_best.pt prior={cfg['prior_path'].rsplit('/', 1)[1]}")
 
