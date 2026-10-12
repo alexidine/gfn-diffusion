@@ -1310,6 +1310,7 @@ energy_config:
   log_temperature_range: [ 0, 0.693147 ]
   # loss coefficients
   density_coeff: 10.0  # how much to weight the density penalty term in the energy function
+  implausible_energy_below: null  # a negative number, in the run's energy units = a sample whose physical energy (the mol_energy term, before penalties and the Jacobian) is under it is scored at the number's magnitude instead (energies.molecular_crystal.screen_implausible_energy) and counted in energy/implausible_rows. null = no screen. Not part of the problem identity; a prior scan cache holding a row under it is not used
   bounding_coeff: 10.0  # static (the old soft-start + terminal anneal was removed with the terminal-stage redesign)
   reduction_coeff: 10.0
   lj_coeff: 1.0  # loss coefficient

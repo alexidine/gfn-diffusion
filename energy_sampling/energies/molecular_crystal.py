@@ -37,6 +37,20 @@ def density_penalty(packing_coeff, turnover = 1):
                         turnover ** 2 + 2 * turnover * (u - turnover))
     return loose + F.relu(cp - 0.95) ** 2
 
+def screen_implausible_energy(mol_energy, below: float):
+    """(energy, flagged) for cfg:energy_config.implausible_energy_below. A row whose energy is under `below` is
+    flagged and carries |below| instead: finite and far above any real structure, so the row is read everywhere as
+    a clash is (a reward at the clip, never a record, never admitted to a buffer). A non-finite energy is left as
+    it is; the MLIP routes have their own handling of those.
+
+    Why a screen and not trust in the function: an MLIP is fitted on sensible geometries and can return anything
+    on a senseless one. The acridine MLE run's step-500 eval scored one draw of the untrained model at -1,327,550
+    (the prior's best row is -45); the tracker kept it as the condition's best energy, and every gate measured from
+    that record failed for the rest of the run and the run seeded from it."""
+    flagged = mol_energy < below
+    return torch.where(flagged, torch.full_like(mol_energy, abs(float(below))), mol_energy), flagged
+
+
 def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
     # soften the repulsion
     softened_energy = energy.clone()
@@ -142,6 +156,7 @@ class MolecularCrystal(BaseSet):
                  mlip_compile: bool = False,
                  mlip_edge_chunk_size: Optional[int] = None,
                  mlip_activation_checkpointing: bool = True,
+                 implausible_energy_below: Optional[float] = None,  # a physical energy under this (run energy units, negative) is replaced by its magnitude: see screen_implausible_energy. None = no screen
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
                  prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
@@ -174,6 +189,12 @@ class MolecularCrystal(BaseSet):
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
 
         self.density_coeff = density_coeff
+        if implausible_energy_below is not None and not float(implausible_energy_below) < 0:
+            raise ValueError(f'energy_config.implausible_energy_below must be negative (an energy no real structure '
+                             f'reaches), got {implausible_energy_below!r}')
+        self.implausible_energy_below = (None if implausible_energy_below is None
+                                         else float(implausible_energy_below))
+        self.implausible_rows = 0          # rows the screen has replaced since the last drain_energy_timing
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
         self.temperature_conditioning = temperature_conditioning
@@ -872,6 +893,10 @@ class MolecularCrystal(BaseSet):
             if self.energy_function in ['lj', 'qlj', 'elj'] and self.lj_rescale is not None:
                 # rescale functions with LJ-type minima to uma statistics
                 mol_energy = self.lj_rescale * mol_energy
+
+            if self.implausible_energy_below is not None:
+                mol_energy, flagged = screen_implausible_energy(mol_energy, self.implausible_energy_below)
+                self.implausible_rows += int(flagged.sum())
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
             # same temperature compensation as bounding_energy above -- this is a validity

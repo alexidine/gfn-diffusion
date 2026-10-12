@@ -830,6 +830,9 @@ def _to_plain(obj):
 # molecule set.
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
                                     'reward_range', 'internal_oom_recovery',
+                                    # a screen for evaluations no real structure reaches: it moves no
+                                    # energy a sampler of the problem should ever see
+                                    'implausible_energy_below',
                                     'host_gas_phase_reference',
                                     # lambda_mix is SCHEDULABLE -- balance.anneal_coeffs moves it
                                     # during a run -- so it cannot be part of a static problem hash

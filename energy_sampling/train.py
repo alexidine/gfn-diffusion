@@ -3823,6 +3823,19 @@ class Modeller:
               f"{'using the cache' if ok else 'STALE, scoring the prior again'}")
         if not ok:
             return None
+        # energy_config.implausible_energy_below is not in the cache identity (prior_scan_cache.SCREEN_KEYS): the
+        # cached pass and a screened one give the same rows unless a row's physical energy is under the floor, which
+        # the cached batch itself answers. A cache that cannot answer (no mol_energy on its rows) is not used.
+        floor = getattr(self.energy_function, 'implausible_energy_below', None)
+        if floor is not None:
+            mol_energy = getattr(batch, 'mol_energy', None)
+            n_under = None if mol_energy is None else int((torch.as_tensor(mol_energy).flatten() < floor).sum())
+            if n_under is None or n_under > 0:
+                print(f"prior scan cache: {path}: "
+                      + ("its rows carry no mol_energy" if n_under is None else
+                         f"{n_under} cached row(s) lie under energy_config.implausible_energy_below {floor:g}")
+                      + " -> scoring the prior again under the screen")
+                return None
         strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
         return energy.to(self.device), batch.to(self.device)
 

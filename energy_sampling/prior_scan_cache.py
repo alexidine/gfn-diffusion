@@ -12,7 +12,8 @@ differ by more than ENERGY_TOL the cache is treated as stale, the whole prior is
 IDENTITY is everything the config can say about the scoring: the prior file (name, size, a hash of its first and last
 MiB), the row count, the energy function, the MLIP checkpoint (name and size), the space groups and Z' values, the
 coefficient the run applies to eLJ, the temperature, and every key of energy_config except those that only choose
-how the pass is chunked (CHUNKING_KEYS). It cannot see a CODE change in the scoring; the row check is what catches
+how the pass is chunked (CHUNKING_KEYS) and the implausible-energy screen (SCREEN_KEYS, judged by the trainer
+against the loaded rows). It cannot see a CODE change in the scoring; the row check is what catches
 that.
 """
 import hashlib
@@ -29,6 +30,10 @@ CHECK_ROWS = 512
 ENERGY_TOL = 0.5
 #: a cache is stale when more than this share of the checked rows disagree
 MAX_BAD_FRACTION = 0.01
+#: energy_config keys left out of the identity because the trainer judges them against the loaded cache itself:
+#: implausible_energy_below changes a scanned row only if that row's energy is under it, and
+#: Modeller._prior_scan_from_cache refuses a cache holding such a row.
+SCREEN_KEYS = ('implausible_energy_below',)
 #: energy_config keys that choose how the pass is CHUNKED, not what it returns, entered into the identity at this
 #: fixed value. A phase-2 arm turns internal_oom_recovery on over the same prior and energy settings its MLE seed
 #: scored with it off; without this the two would hash apart and the phase-2 launch would score every row again.
@@ -73,8 +78,8 @@ def scan_identity(args, n_rows, lj_coeff):
         'space_groups': _plain(getattr(args, 'space_groups', None)),
         'z_primes': _plain(getattr(args, 'z_primes', None)),
         'lj_coeff': None if lj_coeff is None else float(lj_coeff),
-        'energy_config': {**_plain(args.energy_config), **{k: v for k, v in CHUNKING_KEYS.items()
-                                                           if k in _plain(args.energy_config)}},
+        'energy_config': {k: CHUNKING_KEYS.get(k, v) for k, v in _plain(args.energy_config).items()
+                          if k not in SCREEN_KEYS},
     }
 
 
