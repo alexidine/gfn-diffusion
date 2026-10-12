@@ -6,7 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=7-15
+#SBATCH --array=10,13,16,17
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30j
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
@@ -15,7 +15,8 @@
 # encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
 # array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
-# The array lists the production groups; lines below it in GROUPS_j.tsv are the timing groups, already run.
+# The array is one seed of each kind (make.py LADDER_ARRAY); `sbatch --array=...` picks other production groups.
+# An arm may be in more than one group: a job refuses an arm that another job still in the queue holds.
 # `sbatch --time=...` gives a shorter leg: every arm resumes its own _running.pt on the next submission.
 module purge
 
@@ -94,6 +95,15 @@ for ARM in ${GROUP}; do
     if grep -q 'CONTINUE_PLACEHOLDER' ${RESOLVED}; then
         echo "FATAL: placeholder left in ${RESOLVED}" >&2; exit 1
     fi
+    # ONE JOB PER ARM. The lock names the job that holds the arm; a holder no longer in the queue has ended.
+    LOCK=${CKPTS}/${ARM}.lock
+    if [ -f ${LOCK} ]; then
+        HOLDER=$(cat ${LOCK})
+        if [ "${HOLDER}" != "${SLURM_JOB_ID}" ] && squeue -h -j "${HOLDER}" 2>/dev/null | grep -q .; then
+            echo "FATAL: arm ${ARM} is held by job ${HOLDER}, which is still in the queue (${LOCK})" >&2; exit 1
+        fi
+    fi
+    echo ${SLURM_JOB_ID} > ${LOCK}
     LIVE="${LIVE} ${ARM}"
 done
 N_LIVE=$(echo ${LIVE} | wc -w)
@@ -152,4 +162,5 @@ for ARM in ${LIVE}; do
         echo "arm ${ARM} exhausted its rewind budget -- sentinel set, resubmissions will skip"
         touch ${CKPTS}/${ARM}.dead
     fi
+    if [ "$(cat ${CKPTS}/${ARM}.lock 2>/dev/null)" = "${SLURM_JOB_ID}" ]; then rm -f ${CKPTS}/${ARM}.lock; fi
 done
