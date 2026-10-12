@@ -1,0 +1,6 @@
+arm	family	start	warm_src	prior	prior_bytes	seed_step
+pft_mip_ft	mip	switch	ppl_mip_n5	mipcas_elj_pooled_oct05_prior.pt	616093331	-
+pft_neh_ft	neh	switch	ppl_neh_n5	nehzor_elj_pooled_oct05_prior.pt	5433580454	-
+pft_mipu_ft	mipu	switch	ppl_mipu_n5	mipcas_uma_pooled_oct05_prior.pt	605188243	-
+pft_nehu_ft	nehu	switch	ppl_nehu_n5	nehzor_uma_pooled_oct05_prior.pt	1441564186	-
+pft_acr_ft	acr	switch	ppl_acr_n5	acridine_mace_pooled_oct05_prior.pt	3427422543	100000
