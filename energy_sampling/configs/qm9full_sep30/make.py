@@ -283,8 +283,12 @@ a 2.86 alone; af 3.89 alone. GPU utilisation over the last third of each run (W&
 percent; cf 74 / 88; a 74; af 77. Three controls fit a card at a 0.313 memory share each and two cf arms at 0.47;
 the arms that read atoms were run only with the whole card. The same seed gave the same numbers alone and packed.
 THE PRODUCTION GROUPS, from those: 7 = the three controls on one card; 8 = cf seeds 1 and 2 on one card, 9 = cf
-seed 3; 10-12 = a, one seed a card; 13-15 = af, one seed a card. The job script's array is 7-15; `--array` on the
-sbatch line picks a subset (7-9 is the force term against the control, 10-15 the arms that read atoms).
+seed 3; 10-12 = a, one seed a card; 13-15 = af, one seed a card. `--array` on the sbatch line picks a subset
+(7-9 is the force term against the control, 10-15 the arms that read atoms).
+ONE SEED OF EACH KIND (owner 2026-10-12: "skip seed repeats"): 16 = the control's seed 1 alone, 17 = cf's seed 1
+alone; with 10 and 13 that is seed 12345 of all four kinds, and it is the job script's array. Seed 1 of c and of cf
+is therefore in two groups (alone, and packed in 7 and 8): the job script takes a lock per arm and refuses an arm
+that a job still in the queue holds, so two groups sharing an arm cannot both run it.
 Read at equal steps and at equal GPU-hours, as curves: held-out median and 90th-percentile excess energy and the
 likelihood of stored crystals of held-out molecules. bwd/mle is NOT a verdict: P_B reads the same features.
 """
@@ -476,8 +480,10 @@ LADDER_TIMING_STEPS = 400
 LADDER_GROUPS = (('ladt_c_solo',), ('ladt_c_pa', 'ladt_c_pb'), ('ladt_c_ta', 'ladt_c_tb', 'ladt_c_tc'),
                  ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',),
                  ('lad_c_s1', 'lad_c_s2', 'lad_c_s3'), ('lad_cf_s1', 'lad_cf_s2'), ('lad_cf_s3',),
-                 ('lad_a_s1',), ('lad_a_s2',), ('lad_a_s3',), ('lad_af_s1',), ('lad_af_s2',), ('lad_af_s3',))
-LADDER_FIRST_LIVE = 7       # the first production group: the job script's array starts here
+                 ('lad_a_s1',), ('lad_a_s2',), ('lad_a_s3',), ('lad_af_s1',), ('lad_af_s2',), ('lad_af_s3',),
+                 ('lad_c_s1',), ('lad_cf_s1',))
+LADDER_FIRST_LIVE = 7       # the first production group; groups before it are the timing groups
+LADDER_ARRAY = '10,13,16,17'    # the job script's array: seed 1 of each kind, each alone on a card
 LADDER_BATCH = 500          # trajectories an iteration
 LADDER_UPDATE = 1000        # trajectories an optimizer step: fused_grad_accum_min_samples, as leg i has it
 LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATCH, 'grow_batch_size': False,
@@ -522,7 +528,7 @@ LADDER_SBATCH = r"""#!/bin/bash
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=__FIRST__-__LAST__
+#SBATCH --array=__ARRAY__
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=__TAG__
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/__BATTERY__/joblogs/%x_%A_%a.out
@@ -531,7 +537,8 @@ LADDER_SBATCH = r"""#!/bin/bash
 # encoder that reads atoms (make.py, LEG J). ONE JOB RUNS THE ARMS OF ONE LINE OF GROUPS_j.tsv ON ONE GPU:
 # array index n = line n + 1 of that file (no header). DO NOT EDIT --array BY HAND: make.py rewrites it.
 # Resubmit this same file to continue a group past the wall: each arm resumes its own _running.pt.
-# The array lists the production groups; lines below it in GROUPS_j.tsv are the timing groups, already run.
+# The array is one seed of each kind (make.py LADDER_ARRAY); `sbatch --array=...` picks other production groups.
+# An arm may be in more than one group: a job refuses an arm that another job still in the queue holds.
 # `sbatch --time=...` gives a shorter leg: every arm resumes its own _running.pt on the next submission.
 module purge
 
@@ -592,6 +599,15 @@ __GUARD__
     if grep -q 'CONTINUE_PLACEHOLDER' ${RESOLVED}; then
         echo "FATAL: placeholder left in ${RESOLVED}" >&2; exit 1
     fi
+    # ONE JOB PER ARM. The lock names the job that holds the arm; a holder no longer in the queue has ended.
+    LOCK=${CKPTS}/${ARM}.lock
+    if [ -f ${LOCK} ]; then
+        HOLDER=$(cat ${LOCK})
+        if [ "${HOLDER}" != "${SLURM_JOB_ID}" ] && squeue -h -j "${HOLDER}" 2>/dev/null | grep -q .; then
+            echo "FATAL: arm ${ARM} is held by job ${HOLDER}, which is still in the queue (${LOCK})" >&2; exit 1
+        fi
+    fi
+    echo ${SLURM_JOB_ID} > ${LOCK}
     LIVE="${LIVE} ${ARM}"
 done
 N_LIVE=$(echo ${LIVE} | wc -w)
@@ -650,6 +666,7 @@ for ARM in ${LIVE}; do
         echo "arm ${ARM} exhausted its rewind budget -- sentinel set, resubmissions will skip"
         touch ${CKPTS}/${ARM}.dead
     fi
+    if [ "$(cat ${CKPTS}/${ARM}.lock 2>/dev/null)" = "${SLURM_JOB_ID}" ]; then rm -f ${CKPTS}/${ARM}.lock; fi
 done
 """
 LADDER_RUN_GROUP = r"""#!/bin/bash
@@ -1700,9 +1717,10 @@ def main_ladder(argv):
         rows.append(f'{name}\tqm9full\tfresh\t-\t{PRIOR}\t{prior_bytes}\n')
     names = [f'{TAG}_{run_name}' for run_name, _, _ in LEGS] + sorted(ran | set(new))
     assert not any(a != b and f'{a}_' in f'{b}_' for a in names for b in names), names
-    # every arm of a group is a row, and no arm is in two groups: two jobs would write one arm's checkpoints
+    # every arm of a group is a row. An arm may be in more than one group (alone, and packed with its other
+    # seeds); the job script's lock keeps two jobs from running it at once
     grouped = [f'{TAG}_{run}' for group in LADDER_GROUPS for run in group]
-    assert all(g in new for g in grouped) and len(set(grouped)) == len(grouped), grouped
+    assert all(g in new for g in grouped), grouped
     kind_of = {f'{TAG}_{run}': kind for run, _, kind in LADDER + LADDER_TIMING}
     print(f'leg j, the force term crossed with the state encoder that reads atoms: conditional MLE from scratch at '
           f'{GRAPH_SCALE * SEED_LR:g}, batch pinned at {LADDER_BATCH}, {LADDER_UPDATE} trajectories an update; '
@@ -1737,10 +1755,14 @@ def main_ladder(argv):
     # the array runs the production groups only, and those are exactly the groups from LADDER_FIRST_LIVE on
     assert all(run.startswith('ladt_') == (i < LADDER_FIRST_LIVE) for i, group in enumerate(LADDER_GROUPS)
                for run in group), 'LADDER_FIRST_LIVE does not separate the timing groups from the production groups'
-    assert sorted(f'{TAG}_{run}' for group in LADDER_GROUPS[LADDER_FIRST_LIVE:] for run in group) == \
-        sorted(f'{TAG}_{run}' for run, _, _ in LADDER), 'a production row is in no group, or in two'
-    sb = (LADDER_SBATCH.replace('__FIRST__', str(LADDER_FIRST_LIVE))
-          .replace('__LAST__', str(len(LADDER_GROUPS) - 1)).replace('__GUARD__', guard)
+    assert {f'{TAG}_{run}' for group in LADDER_GROUPS[LADDER_FIRST_LIVE:] for run in group} == \
+        {f'{TAG}_{run}' for run, _, _ in LADDER}, 'a production row is in no group'
+    # the array's groups are production groups and share no arm: one submission never asks for an arm twice
+    live = [int(i) for i in LADDER_ARRAY.split(',')]
+    assert all(LADDER_FIRST_LIVE <= i < len(LADDER_GROUPS) for i in live), LADDER_ARRAY
+    in_array = [run for i in live for run in LADDER_GROUPS[i]]
+    assert len(set(in_array)) == len(in_array), ('the array asks for an arm twice', in_array)
+    sb = (LADDER_SBATCH.replace('__ARRAY__', LADDER_ARRAY).replace('__GUARD__', guard)
           .replace('__TIME__', LADDER_TIME)
           .replace('__SHARE__', f'{LADDER_SHARE:g}').replace('__TAG__', TAG + 'j').replace('__BATTERY__', BATTERY)
           .replace('__CKPTS__', w3.CLUSTER_CKPTS).replace('__DATA__', w3.CLUSTER_DATA))
