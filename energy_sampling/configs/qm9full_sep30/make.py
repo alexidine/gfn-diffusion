@@ -289,6 +289,31 @@ ONE SEED OF EACH KIND (owner 2026-10-12: "skip seed repeats"): 16 = the control'
 alone; with 10 and 13 that is seed 12345 of all four kinds, and it is the job script's array. Seed 1 of c and of cf
 is therefore in two groups (alone, and packed in 7 and 8): the job script takes a lock per arm and refuses an arm
 that a job still in the queue holds, so two groups sharing an arm cannot both run it.
+RESULT OF THOSE FOUR at about 21 hours (W&B, read 2026-10-13, one seed each): median excess energy at iterations
+2,000 / 5,000 / 10,000 was 79 / 59 / 49 kT for c, 91 / 62 / 49 for a, 167 / 179 / 207 for cf (three fires, rate at
+one eighth) and 163 / 153 / 134 for af (one fire). The learned gate stayed near zero early and under 0.1 late; cf's
+draws improved only after its rate was cut, and then fell back whenever its late gate dipped.
+ONE MORE KIND ON THE CONTROL (owner 2026-10-13: "an arm without LD but with force as an input"), seed 1, alone
+on a card:
+  ci   the state encoder is given the force on the state at every state (model.state_force_input: the force over
+       the trunk's per-row scale, bounded in RMS, and its log magnitude); no force term in either kernel
+Group 18 = ci; it is the job script's array.
+THE KERNELS WIDEN UNDER THE FORCE TERM. bwd/step_var of the four arms above (W&B, read 2026-10-13), at iterations
+500 / 1,000 / 5,000 / 10,000: c 0.0060 / 0.0040 / 0.0030 / 0.0030; a 0.0063 / 0.0054 / 0.0018 / 0.0011;
+cf 0.0054 / 0.0289 / 0.0058 / 0.0375; af 0.0055 / 0.0250 / 0.0136 / 0.0138.
+A FORCE TERM WITH THE GATE HELD FIXED WAS TRIED ON THE LAPTOP AND IS NOT A ROW (owner 2026-10-13: "a gentler LD").
+The control row with force_drift_learned false, the term on the last five steps only, cap 2; 300 iterations at
+batch 256, one run each, 2026-10-13, against the control row run the same way. Training loss at iteration 290,
+kernel step variance at 290, median excess energy of 500 draws at 250:
+    control             0.9 nats   0.006   199 kT
+    gate held at 0.25  67.4 nats   0.166   234 kT   (mean packing coefficient of the draws 356; control 0.77)
+    gate held at 0.05  10.6 nats   0.114   203 kT
+The variance was still rising at the end of both. A full-strength force step there is 3.6 to 3.9 noise standard
+deviations (the run's own diagnostic). My reading, not tested: the term is P_F's own covariance times the force
+and its cap is in P_F's own noise standard deviations, so a wider kernel does not make the step smaller in those
+units, and the likelihood answers a step the data do not support by widening the kernel.
+A window bound on a grid time is decided by a float comparison: the sampler's tensor comparison puts t = 0.90
+inside a window from 0.9, the eval diagnostic's Python comparison (force_agreement_stats in train.py) puts it outside.
 Read at equal steps and at equal GPU-hours, as curves: held-out median and 90th-percentile excess energy and the
 likelihood of stored crystals of held-out molecules. bwd/mle is NOT a verdict: P_B reads the same features.
 """
@@ -470,6 +495,8 @@ fi
 # LEG J). (run_name, seed, kind); kinds c, cf, a, af.
 LADDER_SEEDS = (('s1', 12345), ('s2', 23456), ('s3', 34567))
 LADDER = tuple((f'lad_{kind}_{tag}', seed, kind) for kind in ('c', 'cf', 'a', 'af') for tag, seed in LADDER_SEEDS)
+# a kind added after the first read (the module docstring): the force as an input
+LADDER += (('lad_ci_s1', 12345, 'ci'),)
 # timing rows: a production row of that kind and seed, ended at LADDER_TIMING_STEPS
 LADDER_TIMING = (('ladt_c_solo', 12345, 'c'), ('ladt_c_pa', 12345, 'c'), ('ladt_c_pb', 23456, 'c'),
                  ('ladt_c_ta', 12345, 'c'), ('ladt_c_tb', 23456, 'c'), ('ladt_c_tc', 34567, 'c'),
@@ -481,15 +508,16 @@ LADDER_GROUPS = (('ladt_c_solo',), ('ladt_c_pa', 'ladt_c_pb'), ('ladt_c_ta', 'la
                  ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',),
                  ('lad_c_s1', 'lad_c_s2', 'lad_c_s3'), ('lad_cf_s1', 'lad_cf_s2'), ('lad_cf_s3',),
                  ('lad_a_s1',), ('lad_a_s2',), ('lad_a_s3',), ('lad_af_s1',), ('lad_af_s2',), ('lad_af_s3',),
-                 ('lad_c_s1',), ('lad_cf_s1',))
+                 ('lad_c_s1',), ('lad_cf_s1',), ('lad_ci_s1',))
 LADDER_FIRST_LIVE = 7       # the first production group; groups before it are the timing groups
-LADDER_ARRAY = '10,13,16,17'    # the job script's array: seed 1 of each kind, each alone on a card
+LADDER_ARRAY = '18'         # the job script's array: the force as an input
 LADDER_BATCH = 500          # trajectories an iteration
 LADDER_UPDATE = 1000        # trajectories an optimizer step: fused_grad_accum_min_samples, as leg i has it
 LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATCH, 'grow_batch_size': False,
                        'batch_util_target': 0.0}
 LADDER_GATE = 0.0           # starting value of P_F's force gate
 LADDER_TERM = dict(SCRATCH_TERM, force_drift_t_min=0.0)
+LADDER_INPUT = {'state_force_input': True, 'force_drift_t_min': 0.0}      # ci: the force shown at every state
 LADDER_SHARE = 0.94         # of the card's memory, split equally among the arms of a job with more than one
 # the job script's wall, for the production groups its array lists (the timing groups ran with 3 hours). An arm
 # resumes its own _running.pt on a resubmission, so a shorter `sbatch --time=...` only means more legs.
@@ -498,10 +526,11 @@ LADDER_LEAVES = {
     'trunk': [f'drift_force.{k}' for k in ('checkpoint', *SCRATCH_PROVIDER)],
     'force': ['model.force_drift_fwd'] + [f'model.{k}' for k in LADDER_TERM],
     'atoms': [f'model.{k}' for k in GRAPH_MODEL],
+    'input': [f'model.{k}' for k in LADDER_INPUT],
 }
 LADDER_GUARD = """
     # THE TRUNK (rows whose state encoder reads atoms, or with a force term) and the code that reads it.
-    if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
+    if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9]|state_force_input: true)' ${CONFIG}; then
         TRUNK=%(trunk)s
         if [ ! -s "${TRUNK}" ]; then
             echo "FATAL: ${TRUNK} is missing -- the stacked trunk (configs/intra_trunk_oct06/submit_inter.sbatch)" >&2; exit 1
@@ -511,6 +540,12 @@ LADDER_GUARD = """
         fi
         if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
             echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+        fi
+    fi
+    # THE FORCE AS AN INPUT: the code that reads the key.
+    if grep -q '^  state_force_input: true' ${CONFIG}; then
+        if ! grep -q 'state_force_input' ${WORKDIR}/models/gfn.py; then
+            echo "FATAL: models/gfn.py does not read state_force_input -- git pull gfn-diffusion" >&2; exit 1
         fi
     fi
     # THE FORCE TERM: the gate inside the cap (a gate that starts at zero has no gradient without it).
@@ -1620,6 +1655,8 @@ def build_ladder(run, seed, kind, trunk, steps=None):
         cfg['model'].update(GRAPH_MODEL)
     if kind in ('cf', 'af'):
         cfg['model'].update(force_drift_fwd=LADDER_GATE, **LADDER_TERM)
+    if kind == 'ci':
+        cfg['model'].update(LADDER_INPUT)
     if steps is not None:
         cfg['epochs'] = steps
     return cfg
@@ -1659,7 +1696,8 @@ def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
     else:
         L = LADDER_LEAVES
         want = {'cf': {'c': L['trunk'] + L['force']}, 'a': {'c': L['trunk'] + L['atoms']},
-                'af': {'a': L['force'], 'cf': L['atoms'], 'c': L['trunk'] + L['force'] + L['atoms']}}[kind]
+                'af': {'a': L['force'], 'cf': L['atoms'], 'c': L['trunk'] + L['force'] + L['atoms']},
+                'ci': {'c': L['trunk'] + L['input']}}[kind]
         for against, leaves in want.items():
             assert _moved(rows[against], cfg) == sorted(leaves), (name, against, _moved(rows[against], cfg))
     if kind != 'c':
@@ -1676,6 +1714,10 @@ def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
         assert m['force_drift_fwd'] == LADDER_GATE == 0.0 and {k: m[k] for k in LADDER_TERM} == LADDER_TERM, name
         assert (m['force_drift_t_min'], m['force_drift_max_sigma'], m['force_drift_bwd']) == (0.0, FORCE_MAX_SIGMA, None)
         assert m['force_drift_learned'] is True, name       # a gate held at 0 would be no force term at all
+    if kind == 'ci':
+        # the encoder is shown the force; neither kernel takes a force term, and the atoms are not read
+        assert m['state_force_input'] is True and m['force_drift_t_min'] == 0.0, name
+        assert m.get('force_drift_fwd') is None and m.get('force_drift_bwd') is None and 'state_atoms' not in m, name
     w3._scan_local_paths(cfg, name)
     w3.load_check(cfg, name)
 
@@ -1727,7 +1769,8 @@ def main_ladder(argv):
           f'trunk {trunk}:')
     what = {'c': 'control', 'cf': f'force term in P_F at every state (gate from {LADDER_GATE:g}, cap {FORCE_MAX_SIGMA:g})',
             'a': f"state encoder reads {GRAPH_MODEL['state_atoms']} atoms at every state",
-            'af': 'reads atoms, and the force term in P_F at every state'}
+            'af': 'reads atoms, and the force term in P_F at every state',
+            'ci': 'state encoder is given the force at every state; no force term'}
     for run, seed, kind in LADDER + LADDER_TIMING:
         ends = f', ends at iteration {LADDER_TIMING_STEPS}' if run.startswith('ladt_') else ''
         print(f'    {TAG}_{run:<14} seed {seed}  {what[kind]}{ends}')
