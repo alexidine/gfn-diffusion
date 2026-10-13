@@ -6,7 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=10,13,16,17
+#SBATCH --array=18
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qf30j
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/qm9full_sep30/joblogs/%x_%A_%a.out
@@ -65,7 +65,7 @@ for ARM in ${GROUP}; do
         exit 1
     fi
     # THE TRUNK (rows whose state encoder reads atoms, or with a force term) and the code that reads it.
-    if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9])' ${CONFIG}; then
+    if grep -q -E '^  (state_atoms: [1-9]|force_drift_fwd: [0-9]|state_force_input: true)' ${CONFIG}; then
         TRUNK=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/intra_trunk_oct06/st06_c2_ft_late.pt
         if [ ! -s "${TRUNK}" ]; then
             echo "FATAL: ${TRUNK} is missing -- the stacked trunk (configs/intra_trunk_oct06/submit_inter.sbatch)" >&2; exit 1
@@ -75,6 +75,12 @@ for ARM in ${GROUP}; do
         fi
         if ! grep -q 'max_pairs' ${PROJECT_ROOT}/MXtalTools/mxtaltools/crystal_building/image_pairs.py; then
             echo "FATAL: MXtalTools' image_pairs.py has no pair cap -- git pull MXtalTools" >&2; exit 1
+        fi
+    fi
+    # THE FORCE AS AN INPUT: the code that reads the key.
+    if grep -q '^  state_force_input: true' ${CONFIG}; then
+        if ! grep -q 'state_force_input' ${WORKDIR}/models/gfn.py; then
+            echo "FATAL: models/gfn.py does not read state_force_input -- git pull gfn-diffusion" >&2; exit 1
         fi
     fi
     # THE FORCE TERM: the gate inside the cap (a gate that starts at zero has no gradient without it).
