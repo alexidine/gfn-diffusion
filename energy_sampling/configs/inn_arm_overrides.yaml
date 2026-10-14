@@ -1,0 +1,15 @@
+# Changes to flow-sampler arms that are already queued (inn_modeller.py, apply_arm_overrides). A job script is fixed
+# at submission; this file and the code are read when the job starts. Key: <tag>_<run_name> as submitted. Value: the
+# flags that replace the submitted ones. An arm already running is not affected.
+#
+# inn_oct12, 2026-10-14. The queued QM9 arms drop the pathwise term (arm 1, qm9_path, lost reasonable fraction from
+# 0.856 to 0.633 in its first 3,000 energy-stage steps) and take the names of what they now run. Every queued arm
+# reuses each scored batch for several updates: arm 0's energy stage held the GPU at about 52%, under the cluster's
+# cancellation line of about 54-55% (docs/wiki/cluster-operations.md). The QM9 arms take 4, not 3, because their
+# scored batch carries a second energy call (the re-scored noised rows).
+inn12_qm9_path_noise: {run_name: qm9_noise, w_path: 0.0, updates_per_batch: 4}
+inn12_qm9_path_noise_temp: {run_name: qm9_noise_temp, w_path: 0.0, updates_per_batch: 4}
+inn12_qm9_path_noise_iw: {run_name: qm9_noise_iw, w_path: 0.0, updates_per_batch: 4}
+inn12_mip_base: {updates_per_batch: 3}
+inn12_mip_path: {updates_per_batch: 3}
+inn12_mip_temp: {updates_per_batch: 3}

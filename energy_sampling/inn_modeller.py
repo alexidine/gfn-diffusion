@@ -32,6 +32,9 @@ Two stages:
 
 Writes nothing under checkpoints_dir. Metrics go to wandb and to
 artifacts/inn_proto/<tag>_<run_name>/metrics.jsonl; the weights sit beside it.
+A metric carries the crystal trainer's name wherever that trainer logs the same
+quantity (fwd/ and bwd/ per branch, eval_*, lr_fwd, grad_norm_pre_clip, energy/,
+...); readings it has no counterpart for are under inn/.
 """
 import argparse
 import copy
@@ -628,7 +631,7 @@ class InnModeller(Modeller):
             if self.t_conditional:
                 self.check_temperature_form()
             if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()  # gpu_peak_mb reports the loop, not the prior scan
+                torch.cuda.reset_peak_memory_stats()  # vram/peak_train_mb reports the loop, not the prior scan
 
             self.log_path = os.path.join(self.out_dir, 'metrics.jsonl')
             open(self.log_path, 'w').close()
@@ -636,7 +639,8 @@ class InnModeller(Modeller):
             total = inn.mle_steps + (10 ** 9 if inn.budget_minutes is not None else inn.energy_steps)
             opt = sched = None
             log_z = self.log_z_level = None
-            self.rows = None
+            self.rows = self.scored = self.scored_d = None
+            self.reset_window()
             t0 = self.t_loop0 = time.time()
             bad_streak = n_evals = 0
             for step in range(total + 1):
@@ -666,11 +670,11 @@ class InnModeller(Modeller):
                     figs = inn.figs_every > 0 and (n_evals % inn.figs_every == 0 or done)
                     n_evals += 1
                     m = self.yielding(lambda: self.evaluate(figs), f'eval at step {step}')
-                    m.update(step=step, stage=stage, minutes=(time.time() - t0) / 60,
-                             energy_samples_scored=self.energy_samples_scored,
-                             log_z_level=log_z, oom_waits=self.oom_waits,
-                             gpu_peak_mb=torch.cuda.max_memory_allocated() / 2 ** 20
-                             if torch.cuda.is_available() else 0.0)
+                    m.update({'step': step, 'stage': stage, 'minutes': (time.time() - t0) / 60,
+                              'inn/energy_samples_total': float(self.energy_samples_scored),
+                              'batch/oom_events': float(self.oom_waits),
+                              'vram/peak_train_mb': torch.cuda.max_memory_allocated() / 2 ** 20
+                              if torch.cuda.is_available() else 0.0})
                     self.write(m, step)
                     self.sampler.train()
                 if done:
@@ -685,9 +689,9 @@ class InnModeller(Modeller):
                         return stats, False, level
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
-                    stats['grad_norm'] = float(
+                    stats['grad_norm_pre_clip'] = float(
                         torch.nn.utils.clip_grad_norm_(self.sampler.parameters(), inn.grad_clip))
-                    if not math.isfinite(stats['grad_norm']):  # a finite loss with a non-finite gradient
+                    if not math.isfinite(stats['grad_norm_pre_clip']):  # a finite loss with a non-finite gradient
                         opt.zero_grad(set_to_none=True)
                         return stats, False, level
                     opt.step()
@@ -695,7 +699,9 @@ class InnModeller(Modeller):
 
                 stats, stepped, log_z = self.yielding(update, f'step {step}')
                 self.log_z_level = log_z
+                self.win['seconds'] += time.perf_counter() - t_step
                 if not stepped:
+                    self.win['nonfinite_steps'] += 1
                     bad_streak += 1
                     if bad_streak >= 50:
                         raise RuntimeError(f"50 consecutive steps without a finite loss at step {step}")
@@ -705,9 +711,10 @@ class InnModeller(Modeller):
                 if step % inn.log_every == 0:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    stats.update(step=step, stage=stage, lr=opt.param_groups[0]['lr'],
-                                 seconds_step=time.perf_counter() - t_step)
-                    row = {f'train/{k}' if k not in ('step', 'stage') else k: v for k, v in stats.items()}
+                    row = {'step': step, 'stage': stage, 'lr_fwd': opt.param_groups[0]['lr'],
+                           'Batch Size': inn.mle_batch if stage == 'mle' else inn.batch,
+                           'train_step_time': time.perf_counter() - t_step}
+                    row.update(self.window_metrics())
                     row.update(self.rolling_stats(stats, step))
                     self.write(row, step)
 
@@ -769,55 +776,74 @@ class InnModeller(Modeller):
             if inn.mle_noise_log_range is not None:
                 x_d = self.jitter(x_d, inn.mle_noise_log_range)
             mle = -self.sampler.log_prob(x_d, c_d).mean()
-            stats['mle'] = float(mle.detach())
+            stats['bwd/mle'] = stats['bwd/loss'] = float(mle.detach())
+            self.win['samples'] += idx.numel()
             return stats, mle, log_z
 
-        # stored rows: as stored, or displaced and scored again where they land
+        # A SCORED BATCH -- the fresh draws, and with noise the displaced stored rows -- costs the
+        # step's energy calls and serves updates_per_batch updates. TB on detached rows needs no
+        # particular sampling distribution, so a row drawn one update earlier is still a valid row.
+        fresh = self.scored is None or self.scored['uses'] >= inn.updates_per_batch
+
+        # stored rows: as stored (new rows every update: no energy call), or displaced and scored
+        # again where they land (once per scored batch)
         noised = inn.data_noise_log_range is not None
         with torch.set_grad_enabled(inn.w_mle > 0 or not noised):
             log_q_stored = self.sampler.log_prob(x_d, c_d)
         mle = -log_q_stored.mean()  # always of the rows as stored
-        stats['mle'] = float(mle.detach())
+        stats['bwd/mle'] = float(mle.detach())
         if noised:
-            with torch.no_grad():
-                t = time.perf_counter()
-                x_d = self.jitter(x_d, inn.data_noise_log_range)
-                mol_d, log_T_rows, _, _ = self.mol_batch_for(cid_d, log_T_d)
-                lr_d = self.energy_function.log_reward(x_d, mol_d, log_T_rows, False,
-                                                        internal_oom_recovery=True).flatten().to(self.device)
-                stats['seconds_rescore'] = time.perf_counter() - t
-            self.energy_samples_scored += idx.numel()
+            if fresh:
+                with torch.no_grad():
+                    x_n = self.jitter(x_d, inn.data_noise_log_range)
+                    mol_d, log_T_rows, _, _ = self.mol_batch_for(cid_d, log_T_d)
+                    t = time.perf_counter()
+                    lr_n = self.energy_function.log_reward(x_n, mol_d, log_T_rows, False,
+                                                            internal_oom_recovery=True).flatten().to(self.device)
+                    self.win['energy_seconds'] += time.perf_counter() - t
+                self.energy_samples_scored += idx.numel()
+                self.scored_d = dict(x=x_n, cid=cid_d, log_T=log_T_d, c=c_d, log_r=lr_n)
+            x_d, cid_d, log_T_d, c_d, lr_d = (self.scored_d[k] for k in ('x', 'cid', 'log_T', 'c', 'log_r'))
             log_q_d = self.sampler.log_prob(x_d, c_d)
         else:
             lr_d, log_q_d = self.stored_log_r(idx, log_T_d), log_q_stored
         ok_d = torch.isfinite(lr_d) & torch.isfinite(log_q_d.detach())
-        stats['data_nonfinite_frac'] = 1.0 - float(ok_d.float().mean())
+        stats['inn/bwd_nonfinite_frac'] = 1.0 - float(ok_d.float().mean())
 
         # fresh draws: iw_k per molecule when the importance-weighted term is on
-        K = int(inn.iw_k) if inn.w_iw > 0 else 1
-        n = (inn.batch // K) * K
-        with torch.no_grad():
-            t = time.perf_counter()
-            mol_batch, log_T, c, cid = self.fresh_mol_batch(n, hot=True, repeats=K)
-            x, z0 = self.sampler.sample(n, c, return_base=True)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            stats['seconds_sample'] = time.perf_counter() - t
-            t = time.perf_counter()
-            log_r = self.energy_function.log_reward(x, mol_batch, log_T, False,
-                                                     internal_oom_recovery=True).flatten().to(self.device)
-            stats['seconds_reward'] = time.perf_counter() - t
-        self.energy_samples_scored += n
+        if fresh:
+            K = int(inn.iw_k) if inn.w_iw > 0 else 1
+            n = (inn.batch // K) * K
+            with torch.no_grad():
+                t = time.perf_counter()
+                mol_batch, log_T, c, cid = self.fresh_mol_batch(n, hot=True, repeats=K)
+                x, z0 = self.sampler.sample(n, c, return_base=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                stats['inn/seconds_sample'] = time.perf_counter() - t
+                t = time.perf_counter()
+                log_r = self.energy_function.log_reward(x, mol_batch, log_T, False,
+                                                         internal_oom_recovery=True).flatten().to(self.device)
+                self.win['energy_seconds'] += time.perf_counter() - t
+            self.energy_samples_scored += n
+            self.win['samples'] += n
+            self.scored = dict(uses=0, K=K, n=n, mol_batch=mol_batch, log_T=log_T, c=c, cid=cid, x=x, z0=z0,
+                               log_r=log_r)
+        sc = self.scored
+        sc['uses'] += 1
+        first = sc['uses'] == 1  # the draws are the current flow's own only on their first update
+        K, n, mol_batch, log_T, c, cid, x, z0, log_r = (sc[k] for k in ('K', 'n', 'mol_batch', 'log_T', 'c', 'cid',
+                                                                         'x', 'z0', 'log_r'))
         log_q = self.sampler.log_prob(x, c)
         ok = torch.isfinite(log_r) & torch.isfinite(log_q.detach())
-        stats['fwd_nonfinite_frac'] = 1.0 - float(ok.float().mean())
+        stats['inn/fwd_nonfinite_frac'] = 1.0 - float(ok.float().mean())
         if not bool(ok.any()) or not bool(ok_d.any()):
             return stats, None, log_z
         # level of a row = the head's log Z(c) (0 on an unconditional run) + the batch's own Huber root
         h = self.level_of(c)
         h_fixed = h.detach() if self.conditional else 0.0
         logw = (log_r - log_q.detach() - h_fixed)[ok]
-        root, _, frac_in = winsorized_z_root(logw, inn.beta)
+        root = winsorized_z_root(logw, inn.beta)[0]
         fwd = tb_loss((log_q - log_r + h_fixed + root)[ok], inn.beta).mean()
         # the level the stored rows are scored against: a lagged copy of the draws' own
         log_z = root if log_z is None else log_z + (root - log_z) * (1 - 0.5 ** (1 / inn.z_half_life))
@@ -827,23 +853,27 @@ class InnModeller(Modeller):
         loss = inn.w_fwd * fwd + inn.w_data * data + inn.w_mle * mle
         level = (h_fixed + log_z) if self.conditional else torch.full_like(log_r, log_z)
         level_d = (h_d.detach() + log_z) if self.conditional else torch.full_like(log_q_d.detach(), log_z)
-        # the trainer's tracker and train-cadence series take rows at the run's own temperature,
-        # and stored rows only as stored, so each series means what it means on a GFN run
+        # the trainer's tracker and train-cadence series take rows at the run's own temperature;
+        # stored rows go in as the branch trained on them, noised or not, as a GFN's backward
+        # branch takes its noised anchors
         cold = ok & (log_T.flatten() <= self.log_T0 + 1e-6)
-        cold_d = torch.zeros_like(ok_d) if noised else ok_d & (log_T_d <= self.log_T0 + 1e-6)
+        cold_d = ok_d & (log_T_d <= self.log_T0 + 1e-6)
         self.note_step(cid[cold], log_r[cold], log_q.detach()[cold], level[cold], log_T.flatten()[cold],
-                       cid_d[cold_d], lr_d[cold_d], log_q_d.detach()[cold_d], level_d[cold_d])
+                       cid_d[cold_d], lr_d[cold_d], log_q_d.detach()[cold_d], level_d[cold_d],
+                       x[cold], x_d[cold_d], feed_tracker=first)
 
-        stats.update(fwd_tb=float(fwd.detach()), data_tb=float(data.detach()), fwd_root=root,
-                     fwd_frac_in_knee=frac_in, log_z_level=log_z,
-                     data_resid_mean=float(resid_d.detach().mean()), fwd_logw_std=float(logw.std()))
+        # per-branch values under the trainer's names; rolling_stats smooths them with its own
+        fwd_loss, bwd_loss = inn.w_fwd * fwd, inn.w_data * data + inn.w_mle * mle
+        stats.update({'fwd/tb': float(fwd.detach()), 'bwd/tb': float(data.detach()),
+                      'fwd/log_z_global': float(root), 'bwd/log_z_global': float(log_z)})
         if self.conditional:
             # the head regresses onto each row's log weight less the shared root, so it carries the
             # differences between conditions and the root carries the level they share
             head = tb_loss((h - (log_r - log_q.detach() - root))[ok], inn.beta).mean()
             loss = loss + inn.w_head * head
-            stats.update(head_tb=float(head.detach()), head_std=float(h.detach().std()))
-        if inn.w_iw > 0:
+            fwd_loss = fwd_loss + inn.w_head * head
+            stats['inn/head_std'] = float(h.detach().std())
+        if inn.w_iw > 0 and first:
             # likelihood of the flow's own draws, each weighted by its self-normalised importance
             # weight among the draws that share its condition: one group per molecule (its K
             # draws share molecule and temperature), or the whole batch when every row shares one
@@ -857,35 +887,40 @@ class InnModeller(Modeller):
             n_groups = int(torch.isfinite(top).sum())
             iw = -(w[ok] * log_q[ok]).sum() / n_groups
             loss = loss + inn.w_iw * iw
+            fwd_loss = fwd_loss + inn.w_iw * iw
             ess = 1.0 / torch.zeros_like(top).index_add(0, group, w * w)[torch.isfinite(top)]
-            stats.update(iw=float(iw.detach()), iw_ess_mean=float(ess.mean()), iw_group_size=n / (int(group.max()) + 1))
-        if inn.w_path > 0:
+            stats.update({'inn/iw': float(iw.detach()), 'inn/iw_ess_mean': float(ess.mean())})
+        # the pathwise term's surrogate has no meaningful value, so the branch losses leave it out
+        stats.update({'fwd/loss': float(fwd_loss.detach()), 'bwd/loss': float(bwd_loss.detach())})
+        if inn.w_path > 0 and first:
             k = min(int(inn.path_batch), n)
             t = time.perf_counter()
             path = self.path_term(stats, z0[:k], None if c is None else c[:k],
                                   mol_batch.subsample_new_batch(np.arange(k)), log_T[:k])
-            stats['seconds_path'] = time.perf_counter() - t
+            stats['inn/seconds_path'] = time.perf_counter() - t
             loss = loss + inn.w_path * path
         return stats, loss, log_z
 
-    def note_step(self, cid, log_r, log_q, level, log_T, cid_d, log_r_d, log_q_d, level_d):
+    def note_step(self, cid, log_r, log_q, level, log_T, cid_d, log_r_d, log_q_d, level_d, x, x_d,
+                  feed_tracker: bool = True):
         """This step's rows to the trainer's per-condition tracker, the way its losses feed it:
         the draws' log weights (level and level streams) and energies (the running minimum), and
-        the stored rows' log weights (the backward level stream). Kept for rolling_stats too.
-        Either set may be empty (step_loss passes only rows at the run's own temperature, and
-        stored rows only when they were scored as stored)."""
+        the stored rows' log weights (the backward level stream). Kept for rolling_stats too,
+        with their latents. Either set may be empty (step_loss passes only rows at the run's own
+        temperature). A reused scored batch (feed_tracker False) refreshes the kept rows only, so
+        the tracker counts each draw once."""
         cpu = lambda t: t.detach().cpu()
-        cid, log_r, log_q, level, log_T = map(cpu, (cid, log_r, log_q, level, log_T))
-        cid_d, log_r_d, log_q_d, level_d = map(cpu, (cid_d, log_r_d, log_q_d, level_d))
+        cid, log_r, log_q, level, log_T, x = map(cpu, (cid, log_r, log_q, level, log_T, x))
+        cid_d, log_r_d, log_q_d, level_d, x_d = map(cpu, (cid_d, log_r_d, log_q_d, level_d, x_d))
         tracker, step = self.condition_log_z, int(self.step_ind)
-        if cid.numel():
+        if cid.numel() and feed_tracker:
             update_and_lookup_condition_log_z(tracker, cid, log_r, torch.zeros_like(log_q), log_q, 'cpu', step,
                                               log_Z_learned=level, mode_level_stream='fwd')
             update_condition_best_energy(tracker, cid, log_r, log_T)
-        if cid_d.numel():
+        if cid_d.numel() and feed_tracker:
             tracker.update_mode_level('bwd', cid_d, log_r_d - log_q_d, step=step)
-        self.rows = dict(step=step, cid=cid, log_r=log_r, log_q=log_q, level=level,
-                         cid_d=cid_d, log_r_d=log_r_d, log_q_d=log_q_d, level_d=level_d)
+        self.rows = dict(step=step, cid=cid, log_r=log_r, log_q=log_q, level=level, x=x,
+                         cid_d=cid_d, log_r_d=log_r_d, log_q_d=log_q_d, level_d=level_d, x_d=x_d)
 
     def path_term(self, stats, z0, c, mol_batch, log_T):
         """The pathwise gradient of KL(q || R/Z) through the sampler: the draws x = f(z0) are
@@ -897,7 +932,9 @@ class InnModeller(Modeller):
         s = self.sampler
         x = s.rsample(z0, c)
         leaf = x.detach().clone().requires_grad_(True)
+        t = time.perf_counter()
         log_r = self.energy_function.log_reward(leaf, mol_batch, log_T, False, keep_grads=True).flatten()
+        self.win['energy_seconds'] += time.perf_counter() - t
         force = torch.autograd.grad(log_r.sum(), leaf, allow_unused=True)[0]
         force = torch.zeros_like(leaf) if force is None else force
         score = torch.autograd.grad(s.log_prob(leaf, c).sum(), leaf)[0]
@@ -907,10 +944,15 @@ class InnModeller(Modeller):
         norm = g.norm(dim=-1)
         bar = float(self.inn.path_clip) * float(norm[ok].median()) if bool(ok.any()) else 0.0
         scale = (bar / norm.clamp_min(1e-12)).clamp(max=1.0)
-        stats.update(path_nonfinite_frac=1.0 - float(ok.float().mean()), path_norm_median=float(norm[ok].median())
-                     if bool(ok.any()) else 0.0, path_clipped_frac=float((scale < 1.0).float().mean()),
-                     path_force_norm_median=float(force.detach().norm(dim=-1).nan_to_num(0.0).median()),
-                     path_score_norm_median=float(score.detach().norm(dim=-1).median()))
+        f_ok = torch.isfinite(force).all(-1)
+        f_norm = torch.nan_to_num(force.detach(), nan=0.0, posinf=0.0, neginf=0.0).norm(dim=-1)
+        stats.update({'rewardgrad/force_nonfinite_frac': 1.0 - float(f_ok.float().mean()),
+                      'rewardgrad/force_norm_mean': float(f_norm.mean()),
+                      'rewardgrad/force_norm_max': float(f_norm.max()),
+                      'rewardgrad/push_norm_mean': float((norm * scale).mean()),
+                      'inn/path_nonfinite_frac': 1.0 - float(ok.float().mean()),
+                      'inn/path_clipped_frac': float((scale < 1.0).float().mean()),
+                      'inn/path_score_norm_mean': float(score.detach().norm(dim=-1).mean())})
         return ((g * scale.unsqueeze(-1)) * x).sum(-1).mean()
 
     # -- evaluation: the crystal trainer's own eval and figure code, fed a flow's numbers ----
@@ -928,7 +970,6 @@ class InnModeller(Modeller):
         dropped for a non-finite reward or density."""
         inn, ef, s = self.inn, self.energy_function, self.sampler
         acc = defaultdict(list)
-        lin = s.live_idx[~s.flow.is_wrap]
         sample_batch = None
         for start in range(0, n, inn.batch):
             k = min(inn.batch, n - start)
@@ -942,7 +983,6 @@ class InnModeller(Modeller):
             acc['head'].append((self.level_of(c) if self.conditional else torch.zeros(k)).cpu())
             acc['log_T_tensor'].append(log_T.flatten().cpu())
             acc['condition_id'].append(cid.cpu())
-            acc['outside'].append((x[:, lin].abs() > 1).any(-1).float().cpu())
         a = {k: torch.cat(v) for k, v in acc.items()}
         ok = torch.isfinite(a['log_r']) & torch.isfinite(a['log_q'])
         nonfinite = 1.0 - float(ok.float().mean())
@@ -952,11 +992,12 @@ class InnModeller(Modeller):
             sample_batch = sample_batch.subsample_new_batch(keep)
         return self.as_stats(a), sample_batch, nonfinite
 
-    def as_stats(self, a):
+    def as_stats(self, a, shared=None):
         """log q, log R and the head's level as the trainer's stats dict. The level every row is
-        scored against is the head's log Z(c) plus the shared level: the training loop's lagged
-        Huber root once the energy stage has one, else this batch's own."""
-        shared = self.log_z_level
+        scored against is the head's log Z(c) plus the shared level: `shared` when given, else the
+        training loop's lagged Huber root once the energy stage has one, else this batch's own."""
+        if shared is None:
+            shared = self.log_z_level
         if shared is None:
             shared = winsorized_z_root(a['log_r'] - a['log_q'] - a['head'], self.inn.beta)[0]
         out = dict(a)
@@ -966,31 +1007,73 @@ class InnModeller(Modeller):
         return out
 
     @torch.no_grad()
-    def stored_rows(self, n):
-        """The same stats dict for n stored prior rows: the trainer's backward stream."""
+    def stored_rows(self, n, shared=None):
+        """The same stats dict for n stored prior rows: the trainer's backward stream, scored against
+        the shared level given (see as_stats)."""
         idx = torch.randint(0, self.x_train.shape[0], (min(n, self.x_train.shape[0]),), device=self.device)
         c = self.context_of(self.cid_train[idx])
         return self.as_stats({
             'log_r': self.lr_train[idx].cpu(), 'log_q': self.sampler.log_prob(self.x_train[idx], c).cpu(),
             'head': (self.level_of(c) if self.conditional else torch.zeros(idx.numel())).cpu(),
-            'condition_id': self.cid_train[idx].cpu()})
+            'condition_id': self.cid_train[idx].cpu()}, shared)
 
     def rolling_stats(self, stats, step):
-        """The trainer's train-cadence series (fwd/..., bwd/...) for the step just taken, through its
-        own quick_tb_stats and metric tracker, so they are smoothed and named as its runs' are."""
-        rows = self.rows
-        self.metric_tracker.update('bwd', {'mle': stats['mle']}, step)
+        """The trainer's train-cadence series for the step just taken. The step's per-branch values
+        (fwd/..., bwd/...: losses, levels) join the trainer's own statistics of the step's rows --
+        quick_tb_stats, the mean log-probabilities and log R, the level, and the terminal box and
+        spread readings of Modeller's per-branch stats -- in its metric tracker, so they are
+        smoothed and named as its runs' are. The other values pass through unsmoothed."""
+        rows, wq = self.rows, self.args.conditional_worst_quantile
+        branch, out = {'fwd': {}, 'bwd': {}}, {}
+        for k, v in stats.items():
+            head, _, name = k.partition('/')
+            if head in branch and name:
+                branch[head][name] = v
+            else:
+                out[k] = v
         if rows is not None and rows['step'] == step:
-            wq = self.args.conditional_worst_quantile
-            if rows['cid'].numel() > 1:
-                self.metric_tracker.update('fwd', quick_tb_stats(
-                    rows['log_q'], torch.zeros_like(rows['log_q']), rows['level'], rows['log_r'],
-                    clip_beta=self.inn.beta, condition_id=rows['cid'], worst_quantile=wq), step)
-            if rows['cid_d'].numel() > 1:
-                self.metric_tracker.update('bwd', quick_tb_stats(
-                    rows['log_q_d'], torch.zeros_like(rows['log_q_d']), rows['level_d'], rows['log_r_d'],
-                    clip_beta=self.inn.beta_data, condition_id=rows['cid_d'], worst_quantile=wq), step)
-        return self.metric_tracker.snapshot(changed_only=True)
+            for b, sfx, beta in (('fwd', '', self.inn.beta), ('bwd', '_d', self.inn.beta_data)):
+                log_q, log_r, level, x = (rows[k + sfx] for k in ('log_q', 'log_r', 'level', 'x'))
+                if log_q.numel() < 2:
+                    continue
+                branch[b].update(quick_tb_stats(log_q, torch.zeros_like(log_q), level, log_r, clip_beta=beta,
+                                                condition_id=rows['cid' + sfx], worst_quantile=wq))
+                viol = (x.abs() - 1.0).clamp(min=0.0)
+                branch[b].update(logpf_mean=float(log_q.mean()), logpb_mean=0.0, logr_mean=float(log_r.mean()),
+                                 log_Z_learned=float(level.mean()),
+                                 box_violation=float((viol ** 2).sum(-1).mean()),
+                                 box_contact_frac=float((viol > 0).any(-1).float().mean()),
+                                 terminal_var=float(x[:, self.sampler.live_idx.cpu()].var(0).mean()))
+        for b, d in branch.items():
+            if d:
+                self.metric_tracker.update(b, d, step)
+        out.update(self.metric_tracker.snapshot(changed_only=True))
+        return out
+
+    def reset_window(self):
+        self.win = dict(seconds=0.0, energy_seconds=0.0, samples=0, nonfinite_steps=0)
+
+    def window_metrics(self):
+        """The trainer's throughput and energy-cost readings over the steps since the last report:
+        samples_per_sec, the energy function's own call counters (energy/seconds, calls,
+        ms_per_sample: every call, eval included), the share of step time spent in training
+        energy calls (the reward calls alone), and the skipped non-finite steps.
+        inn/energy_samples_total counts every training draw and re-scored row scored so far."""
+        w = self.win
+        out = {'gradnorm/nonfinite_steps': float(w['nonfinite_steps']),
+               'inn/energy_samples_total': float(self.energy_samples_scored)}
+        if w['seconds'] > 0:
+            out['samples_per_sec'] = w['samples'] / w['seconds']
+        timing = self.energy_function.drain_energy_timing()
+        if timing:
+            timing['energy/seconds_in_step'] = w['energy_seconds']
+            if w['seconds'] > 0:
+                timing['energy/frac_of_step'] = w['energy_seconds'] / w['seconds']
+                timing['energy/frac_outside_step'] = max(
+                    0.0, timing['energy/seconds'] - w['energy_seconds']) / w['seconds']
+        out.update(timing)
+        self.reset_window()
+        return out
 
     @torch.no_grad()
     def evaluate(self, figs: bool = False):
@@ -1000,8 +1083,12 @@ class InnModeller(Modeller):
         val = lambda t: t.cpu().detach().item()
         m = {}
 
-        fwd, sample_batch, m['eval_fwd/nonfinite_frac'] = self.draw(inn.eval_samples)
-        bwd = self.stored_rows(inn.eval_samples)
+        fwd, sample_batch, m['inn/eval_fwd_nonfinite_frac'] = self.draw(inn.eval_samples)
+        # one level for draws and stored rows, as the crystal trainer's learned log Z is one. Before
+        # the energy stage has a level that is the draws' own; scoring the stored rows against theirs
+        # centred eval_bwd/* on the rows themselves, so it jumped at the stage switch for no change
+        # in the sampler (inn12, 2026-10-14: eval_bwd/under_coverage 2.8 -> 33)
+        bwd = self.stored_rows(inn.eval_samples, shared=float((fwd['log_Z_learned'] - fwd['head']).mean()))
         # Emin(c) takes this batch first, as the trainer's fwd_eval_sampling does, so no draw sits below its floor
         energy = -fwd['log_r'] * 10 ** fwd['log_T_tensor']
         self.condition_log_z.update_best_energy(fwd['condition_id'], energy)
@@ -1016,30 +1103,28 @@ class InnModeller(Modeller):
         self.progress_metrics(m, sample_batch)
         m.update(self.log_condition_log_z_stats())
 
-        # this trainer's own readings, beside the trainer's
+        # this trainer's own readings, which the crystal trainer has no counterpart for: under inn/
         logw = fwd['log_r'] - fwd['log_q']
-        m['eval_fwd/huber_root'] = winsorized_z_root(logw, inn.beta)[0]
-        m['eval_fwd/outside_box_frac'] = float(fwd['outside'].mean())
-        m['Sample Energy Min'] = float(energy.min())
-        m['Sample Energy P10'], m['Sample Energy P50'], m['Sample Energy P90'] = quantiles(energy)
-        m['eval_fwd/frac_below_data_p90'] = float((energy <= self.data_energy['p90']).float().mean())
+        m['inn/sample_energy_min'] = float(energy.min())
+        m['inn/sample_energy_p10'], m['inn/sample_energy_p50'], m['inn/sample_energy_p90'] = quantiles(energy)
+        m['inn/frac_below_data_p90'] = float((energy <= self.data_energy['p90']).float().mean())
         if self.mol_conditional:  # the spread left once the head's per-condition level is taken out
-            m['eval_fwd/logw_std_head_centred'] = float((logw - fwd['head']).std())
+            m['inn/logw_std_head_centred'] = float((logw - fwd['head']).std())
             m.update(self.cross_condition_metrics())
         # working-precision conditioning of the sampler (see check_sampler_round_trip)
         c = self.context_of(self.cid_val[:2048])
         x, z0 = s.sample(c.shape[0] if self.conditional else 2048, c, return_base=True)
         z1, _ = s.to_base(x, c)
         err = torch.where(s.flow.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values
-        m['eval_fwd/round_trip_p99'] = quantiles(err, (0.99,))[0]
+        m['inn/round_trip_p99'] = quantiles(err, (0.99,))[0]
 
         lq_val = s.log_prob(self.x_val, self.context_of(self.cid_val))
         sub = torch.arange(min(self.x_val.shape[0], self.x_train.shape[0]), device=self.device)
-        m['data/val_nll'] = float(-lq_val.mean())
-        m['data/train_nll'] = float(-s.log_prob(self.x_train[sub], self.context_of(self.cid_train[sub])).mean())
+        m['inn/val_nll'] = float(-lq_val.mean())
+        m['inn/train_nll'] = float(-s.log_prob(self.x_train[sub], self.context_of(self.cid_train[sub])).mean())
         head_val = self.level_of(self.context_of(self.cid_val)) if self.conditional else 0.0
-        m['data/val_logw_mean'] = float((self.lr_val - lq_val - head_val).mean())
-        m['data/val_logw_std'] = float((self.lr_val - lq_val - head_val).std())
+        m['inn/val_logw_mean'] = float((self.lr_val - lq_val - head_val).mean())
+        m['inn/val_logw_std'] = float((self.lr_val - lq_val - head_val).std())
 
         if getattr(self, 'test_mol_dataset', None) is not None:
             m.update(self.held_out_metrics(arr))
@@ -1057,7 +1142,7 @@ class InnModeller(Modeller):
         test, test_batch, nonfinite = self.draw(n, self.test_mol_dataset)
         m = {f'eval_test/{k}': v for k, v in
              self._eval_conditional_stats(test, self.args.fwd_loss_coeffs).items()}
-        m['eval_test/nonfinite_frac'] = nonfinite
+        m['inn/eval_test_nonfinite_frac'] = nonfinite
         is_good = self._reasonable_sample_mask(test_batch)
         m['eval_test/Reasonable Sample Fraction'] = is_good.float().mean().item()
         self.log_condition_fraction(m, arr, 'Reasonable', is_good, test['condition_id'],
@@ -1139,11 +1224,13 @@ class InnModeller(Modeller):
 
     def write(self, metrics, step):
         """Scalars to metrics.jsonl; scalars, histograms and figures to wandb, cleaned up as
-        Modeller.evaluation cleans them and published through its failure-tolerant logger."""
+        Modeller.evaluation cleans them and published through its failure-tolerant logger. The
+        names are the crystal trainer's wherever it logs the same quantity; this trainer's own
+        readings sit under inn/. step, stage and minutes go to the file only (wandb has its own)."""
         row, out = {}, {}
         for k, v in metrics.items():
-            if isinstance(v, (str, type(None))):
-                row[k] = v
+            if isinstance(v, (str, type(None))) or k in ('step', 'minutes'):  # the file's own bookkeeping
+                row[k] = v if isinstance(v, (str, type(None))) else float(v)
                 continue
             if torch.is_tensor(v):
                 v = v.detach().cpu().numpy()
@@ -1165,10 +1252,10 @@ class InnModeller(Modeller):
                     f"{g('eval_test/Reasonable Sample Fraction'):.3f}" if 'eval_test/emp_z' in row else '')
             print(f"[{row.get('stage')} {step}] emp_z {g('eval_fwd/emp_z'):.2f}  jensen_z "
                   f"{g('eval_fwd/jensen_z'):.2f}  ess {g('eval_fwd/ess_frac'):.4f}  E mean "
-                  f"{g('Mean Sample Energy'):.1f} P50 {g('Sample Energy P50'):.1f}  excess kT P50 "
+                  f"{g('Mean Sample Energy'):.1f} P50 {g('inn/sample_energy_p50'):.1f}  excess kT P50 "
                   f"{g('Excess Energy Nats P50'):.1f} P90 {g('Excess Energy Nats P90'):.1f}  reasonable "
-                  f"{g('Reasonable Sample Fraction'):.3f}{test}  val nll {g('data/val_nll'):.3f}  "
-                  f"train nll {g('data/train_nll'):.3f}  {g('minutes'):.1f} min", flush=True)
+                  f"{g('Reasonable Sample Fraction'):.3f}{test}  val nll {g('inn/val_nll'):.3f}  "
+                  f"train nll {g('inn/train_nll'):.3f}  {g('minutes'):.1f} min", flush=True)
 
 
 def build_parser():
@@ -1230,6 +1317,9 @@ def build_parser():
                         'log T as a flow input, evaluate at the run\'s own; 1 = off')
     p.add_argument('--t_target_frac', type=float, default=0.25,
                    help='temperature conditioning: share of training rows kept at the run\'s own temperature')
+    p.add_argument('--updates_per_batch', type=int, default=1,
+                   help='energy stage: updates each scored batch serves (fresh draws and re-scored rows are scored '
+                        'once per batch; the importance-weighted and pathwise terms apply on its first update only)')
     p.add_argument('--w_iw', type=float, default=0.0,
                    help='weight of the importance-weighted likelihood of the flow\'s own draws; 0 = off')
     p.add_argument('--iw_k', type=int, default=8,
@@ -1266,6 +1356,36 @@ def apply_overrides(args, overrides):
         print(f"config override: {key} = {getattr(node, path[-1])!r}", flush=True)
 
 
+ARM_OVERRIDES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', 'inn_arm_overrides.yaml')
+
+
+def apply_arm_overrides(inn, path=ARM_OVERRIDES):
+    """Changes to an arm that is already queued. A job script is fixed at submission, but the code
+    and this file are read when the job starts, so the entry keyed `<tag>_<run_name>` -- the names
+    the arm was submitted under -- replaces those flags of its command line. Every replacement is
+    printed, and the run's wandb config holds the flags as finally applied (arm_overrides names the
+    entry). A flag this trainer does not have is refused; an arm with no entry is untouched."""
+    inn.arm_overrides = None
+    if not os.path.exists(path):
+        return
+    key = f'{inn.tag}_{inn.run_name}'
+    entry = (yaml.safe_load(open(path)) or {}).get(key)
+    if not entry:
+        return
+    unknown = sorted(set(entry) - set(vars(inn)))
+    if unknown:
+        raise SystemExit(f"{path}: entry {key} names flags this trainer does not have: {unknown}")
+    for k, v in entry.items():
+        old = getattr(inn, k)
+        new = float(v) if isinstance(old, float) and isinstance(v, int) else v
+        if old is not None and new is not None and type(new) is not type(old):
+            raise SystemExit(f"{path}: entry {key}: {k} = {v!r} is a {type(v).__name__}, the flag a "
+                             f"{type(old).__name__}")
+        setattr(inn, k, new)
+        print(f"arm override ({key} in {os.path.basename(path)}): {k} = {new!r} (submitted as {old!r})", flush=True)
+    inn.arm_overrides = key
+
+
 def refuse_foreign_paths(args, windows: bool = os.name == 'nt'):
     """Off Windows, a config value that is still a Windows drive path is one of the canonical
     config's local settings that the launch did not replace. Raise before anything reads it or
@@ -1281,6 +1401,7 @@ def refuse_foreign_paths(args, windows: bool = os.name == 'nt'):
 
 if __name__ == '__main__':
     _inn = build_parser().parse_args()
+    apply_arm_overrides(_inn)  # before anything reads the flags, run_name included
     _args = get_train_args(['--config', _inn.config])
     _args.tag, _args.run_name = _inn.tag, _inn.run_name
     # this trainer loads no checkpoint and writes none
