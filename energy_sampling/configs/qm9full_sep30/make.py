@@ -314,6 +314,14 @@ and its cap is in P_F's own noise standard deviations, so a wider kernel does no
 units, and the likelihood answers a step the data do not support by widening the kernel.
 A window bound on a grid time is decided by a float comparison: the sampler's tensor comparison puts t = 0.90
 inside a window from 0.9, the eval diagnostic's Python comparison (force_agreement_stats in train.py) puts it outside.
+RESULT OF ci (W&B, read 2026-10-16, one seed; it stopped at its 16-hour wall at iteration 10,240): median excess
+energy at iterations 1,000 / 5,000 / 10,000 was 65 / 42 / 33 kT against the control's 141 / 59 / 49 and a's
+130 / 62 / 49; held-out bound at 10,000 -53.2 nats against -60.8 (c) and -65.7 (a). The control reaches ci's 10,000
+only near 50,000. Seconds an iteration over each run, evals included: c 1.0, a 4.7, ci 5.5.
+ONE MORE KIND (owner 2026-10-16: "I like it", of the atoms arm with the force input added), seed 1, alone on a card:
+  ai   a with the force as an input as well (model.state_force_input): the atoms and the force on the state at every
+       state, no force term. Read against ci at matched iterations.
+Group 19 = ai; it is the job script's array.
 Read at equal steps and at equal GPU-hours, as curves: held-out median and 90th-percentile excess energy and the
 likelihood of stored crystals of held-out molecules. bwd/mle is NOT a verdict: P_B reads the same features.
 """
@@ -497,6 +505,8 @@ LADDER_SEEDS = (('s1', 12345), ('s2', 23456), ('s3', 34567))
 LADDER = tuple((f'lad_{kind}_{tag}', seed, kind) for kind in ('c', 'cf', 'a', 'af') for tag, seed in LADDER_SEEDS)
 # a kind added after the first read (the module docstring): the force as an input
 LADDER += (('lad_ci_s1', 12345, 'ci'),)
+# and after ci was read: the atoms with the force as an input (the module docstring)
+LADDER += (('lad_ai_s1', 12345, 'ai'),)
 # timing rows: a production row of that kind and seed, ended at LADDER_TIMING_STEPS
 LADDER_TIMING = (('ladt_c_solo', 12345, 'c'), ('ladt_c_pa', 12345, 'c'), ('ladt_c_pb', 23456, 'c'),
                  ('ladt_c_ta', 12345, 'c'), ('ladt_c_tb', 23456, 'c'), ('ladt_c_tc', 34567, 'c'),
@@ -508,9 +518,9 @@ LADDER_GROUPS = (('ladt_c_solo',), ('ladt_c_pa', 'ladt_c_pb'), ('ladt_c_ta', 'la
                  ('ladt_cf_solo',), ('ladt_cf_pa', 'ladt_cf_pb'), ('ladt_a_solo',), ('ladt_af_solo',),
                  ('lad_c_s1', 'lad_c_s2', 'lad_c_s3'), ('lad_cf_s1', 'lad_cf_s2'), ('lad_cf_s3',),
                  ('lad_a_s1',), ('lad_a_s2',), ('lad_a_s3',), ('lad_af_s1',), ('lad_af_s2',), ('lad_af_s3',),
-                 ('lad_c_s1',), ('lad_cf_s1',), ('lad_ci_s1',))
+                 ('lad_c_s1',), ('lad_cf_s1',), ('lad_ci_s1',), ('lad_ai_s1',))
 LADDER_FIRST_LIVE = 7       # the first production group; groups before it are the timing groups
-LADDER_ARRAY = '18'         # the job script's array: the force as an input
+LADDER_ARRAY = '19'         # the job script's array: the atoms with the force as an input
 LADDER_BATCH = 500          # trajectories an iteration
 LADDER_UPDATE = 1000        # trajectories an optimizer step: fused_grad_accum_min_samples, as leg i has it
 LADDER_BATCH_LEAVES = {'batch_size': LADDER_BATCH, 'max_batch_size': LADDER_BATCH, 'grow_batch_size': False,
@@ -1651,11 +1661,11 @@ def build_ladder(run, seed, kind, trunk, steps=None):
     cfg.update(LADDER_BATCH_LEAVES)
     if kind != 'c':
         cfg['drift_force'] = dict(checkpoint=trunk, **SCRATCH_PROVIDER)
-    if kind in ('a', 'af'):
+    if kind in ('a', 'af', 'ai'):
         cfg['model'].update(GRAPH_MODEL)
     if kind in ('cf', 'af'):
         cfg['model'].update(force_drift_fwd=LADDER_GATE, **LADDER_TERM)
-    if kind == 'ci':
+    if kind in ('ci', 'ai'):
         cfg['model'].update(LADDER_INPUT)
     if steps is not None:
         cfg['epochs'] = steps
@@ -1697,7 +1707,8 @@ def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
         L = LADDER_LEAVES
         want = {'cf': {'c': L['trunk'] + L['force']}, 'a': {'c': L['trunk'] + L['atoms']},
                 'af': {'a': L['force'], 'cf': L['atoms'], 'c': L['trunk'] + L['force'] + L['atoms']},
-                'ci': {'c': L['trunk'] + L['input']}}[kind]
+                'ci': {'c': L['trunk'] + L['input']},
+                'ai': {'a': L['input'], 'ci': L['atoms'], 'c': L['trunk'] + L['atoms'] + L['input']}}[kind]
         for against, leaves in want.items():
             assert _moved(rows[against], cfg) == sorted(leaves), (name, against, _moved(rows[against], cfg))
     if kind != 'c':
@@ -1707,7 +1718,7 @@ def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
         assert cfg['energy_function'] == 'elj' and list(cfg['z_primes']) == [1], name
         assert cfg['temperature_conditioning'] is False and cfg['compile_policy'] is False, name
         assert {k: cfg['energy_config'][k] for k in FORCE_TRUNK_ENERGY} == FORCE_TRUNK_ENERGY, name
-    if kind in ('a', 'af'):
+    if kind in ('a', 'af', 'ai'):
         assert {k: m[k] for k in GRAPH_MODEL} == GRAPH_MODEL and m['state_atom_hidden_dim'] % m['state_atom_heads'] == 0
         assert 'state_crystal_t_min' not in m and 'state_atoms_t_min' not in m, name     # the crystal at every state
     if kind in ('cf', 'af'):
@@ -1718,6 +1729,10 @@ def check_ladder(cfg, name, seed, kind, control_i, rows, trunk, steps=None):
         # the encoder is shown the force; neither kernel takes a force term, and the atoms are not read
         assert m['state_force_input'] is True and m['force_drift_t_min'] == 0.0, name
         assert m.get('force_drift_fwd') is None and m.get('force_drift_bwd') is None and 'state_atoms' not in m, name
+    if kind == 'ai':
+        # the encoder reads the atoms and is shown the force; neither kernel takes a force term
+        assert m['state_force_input'] is True and m['force_drift_t_min'] == 0.0, name
+        assert m.get('force_drift_fwd') is None and m.get('force_drift_bwd') is None, name
     w3._scan_local_paths(cfg, name)
     w3.load_check(cfg, name)
 
@@ -1770,7 +1785,8 @@ def main_ladder(argv):
     what = {'c': 'control', 'cf': f'force term in P_F at every state (gate from {LADDER_GATE:g}, cap {FORCE_MAX_SIGMA:g})',
             'a': f"state encoder reads {GRAPH_MODEL['state_atoms']} atoms at every state",
             'af': 'reads atoms, and the force term in P_F at every state',
-            'ci': 'state encoder is given the force at every state; no force term'}
+            'ci': 'state encoder is given the force at every state; no force term',
+            'ai': 'reads atoms, and the state encoder is given the force at every state; no force term'}
     for run, seed, kind in LADDER + LADDER_TIMING:
         ends = f', ends at iteration {LADDER_TIMING_STEPS}' if run.startswith('ladt_') else ''
         print(f'    {TAG}_{run:<14} seed {seed}  {what[kind]}{ends}')
