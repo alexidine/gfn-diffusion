@@ -326,6 +326,16 @@ protocols:
           target: 1000.0
           steps: 2000
           kind: geometric
+        bounding_coeff:
+          target: 1000.0
+          steps: 20000
+          kind: geometric
+          from_step: 130000
+        reduction_coeff:
+          target: 1000.0
+          steps: 20000
+          kind: geometric
+          from_step: 130000
       hot_lr_sensor:
         channel: fwd/scatter_err
         rows: 11

@@ -53,6 +53,10 @@ diffuse (mean packing coefficient 0.608 at 100,000, 0.376 at 124,000, learned lo
   wall   density_coeff ramped 10 -> 1000 over the first 2,000 phase-2 steps (the penalty is coefficient x
          ln(0.55 / packing coefficient)^2 nats: 1.4 nats at packing 0.38 under 10, 140 under 1000). The box and
          reduction coefficients stay at 10, as in every production arm; their ramp is the fine-tune's.
+  ramp   added 2026-10-16 for the arm's second leg (owner: go to the box and reduction fine-tune now, on the live
+         run): bounding_coeff and reduction_coeff 10 -> 1000 geometrically over 20,000 steps from step 130,000
+         (coeff_schedule from_step; the first leg ended at 129,950, and the stage's own anchor, stamped near 86,500,
+         would have read the new ramps as finished). The density ramp keeps the stage anchor and stays at 1000.
   screen energy_config.implausible_energy_below = -1000 (owner 2026-10-12: "an absolute reasonable magnitude over
          which samples are excluded as obviously wrong"): a draw MACE scores under -1000 kJ/mol is scored at +1000, so
          it cannot become the record again. The prior's rows lie between about -45 and -9 in the tracker's currency.
@@ -89,7 +93,10 @@ FREEZE = 'freeze_pb:full'
 #: prod_sep23_ft's ramp of both penalty coefficients (geometric, anchored at the stage's entry)
 SCHEDULE = {'bounding_coeff': {'target': 1000, 'steps': 20000}, 'reduction_coeff': {'target': 1000, 'steps': 20000}}
 #: the density wall of ppl_acr_dens_n5, from the stage's entry
-DENSITY_SCHEDULE = {'density_coeff': {'target': 1000.0, 'steps': 2000, 'kind': 'geometric'}}
+DENSITY_SCHEDULE = {'density_coeff': {'target': 1000.0, 'steps': 2000, 'kind': 'geometric'},
+                    # leg 2 (2026-10-16): the box and reduction fine-tune on the same run, from its own start step
+                    'bounding_coeff': {'target': 1000.0, 'steps': 20000, 'kind': 'geometric', 'from_step': 130000},
+                    'reduction_coeff': {'target': 1000.0, 'steps': 20000, 'kind': 'geometric', 'from_step': 130000}}
 FLOOR_KEY = 'best_energy_from_anchors_on_switch'
 SCREEN_KEY = 'implausible_energy_below'
 SCREEN_BELOW = -1000.0                  # the run's energy units: kJ/mol per molecule on the MLIP routes
@@ -227,7 +234,7 @@ def main(argv):
               f"P_B {'frozen at entry' if FREEZE in fin._stage(cfg, 'equilibration')['on_enter'] else 'TRAINABLE'} "
               f"{'STORED FORCE k=1 ' if cfg['replay_loss_coeffs']['stored_force_k'] else ''}"
               f"{'PENALTY RAMP 10->1000/20k ' if fin._stage(cfg, 'equilibration').get('coeff_schedule') == SCHEDULE else ''}"
-              f"{'DENSITY 10->1000/2k + FLOOR RESET ' if cfg['condition_log_z'].get(FLOOR_KEY) else ''}"
+              f"{'DENSITY 10->1000/2k + BOX/REDUCTION 10->1000/20k FROM 130000 + FLOOR RESET ' if cfg['condition_log_z'].get(FLOOR_KEY) else ''}"
               f"{f'SCREEN below {SCREEN_BELOW:g} ' if cfg['energy_config'].get(SCREEN_KEY) is not None else ''}"
               f"anchors={cfg['buffers']['anchor_buffer']['max_size']:,} noise={cfg['buffers']['anchor_buffer']['noise_log_range']} "
               f"seed=*{fin.SRC[fam]}_*_best.pt prior={cfg['prior_path'].rsplit('/', 1)[1]}")
