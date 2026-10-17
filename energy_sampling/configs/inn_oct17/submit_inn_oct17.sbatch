@@ -22,13 +22,16 @@
 # 75% busy (the likelihood batch; in the energy stage the stored-row batch, which costs no energy call). The fresh-draw
 # batch, and so the energy-call count, is fixed at 2000.
 #
-#   index  arm              what it is
-#   0      sharp1_s0        one block in the sharpness-rule order, one update per energy call
-#   1      sharp1_s1        arm 0 with seed 1 (its held-out split is drawn with that seed too)
-#   2      sharp2_s0        two blocks: the sharpness-rule order, then its reverse; 20,000 likelihood steps (about
-#                           arm 0's compute). Its phase-1 eval_fwd/* readings are bf16 draws of a stacked flow: read them
-#                           with eval_fwd/round_trip_p99 (best.pt and phase 2, in fp32, are unaffected)
-#   3      sharp1_upb4_s0   arm 0 with each scored batch reused for 4 updates
+#   index  arm            what it is
+#   0      sharp1_s0      one block in the sharpness-rule order, one update per energy call
+#   1      sharp1_s1      arm 0 with seed 1 (its held-out split is drawn with that seed too)
+#   2      sharp2_nz_s0   two blocks: the sharpness-rule order, then its reverse; 20,000 likelihood steps (about arm 0's
+#                         compute), with arm 3's noise. Its phase-1 eval_fwd/* readings are bf16 draws of a stacked flow:
+#                         read them with eval_fwd/round_trip_p99 (best.pt and phase 2, in fp32, are unaffected)
+#   3      sharp1_nz_s0   arm 0 with likelihood-phase noise: each row displaced every step by norm 0.0244 latent units
+#                         (the prior's de-dupe radius) in a random direction
+# Arms 2 and 3 were changed in arms.tsv on 2026-10-17 while queued; they were sharp2_s0 (no noise) and sharp1_upb4_s0
+# (arm 0 with each scored batch reused for 4 updates).
 #
 # EVERY ARM'S FLAGS ARE READ WHEN ITS TASK STARTS, from configs/inn_oct17/arms.tsv (per arm) and common.args (shared):
 # edit those files on the cluster to change a queued arm in place. Outputs: artifacts/inn_proto/inn17_<arm>_mle/ and
