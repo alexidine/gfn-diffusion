@@ -251,6 +251,7 @@ class _Flow(nn.Module):
                 orders.append(list(range(d))[::-1])
             else:
                 orders.append(torch.randperm(d, generator=g).tolist())
+        self.orders = orders  # read by callers that swap a block's conditioner (inn_modeller --conditioner)
         self.blocks = nn.ModuleList(
             _Block(o, wrap_mask, n_bins, hidden, bound) for o in orders)
 
