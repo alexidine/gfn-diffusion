@@ -1,0 +1,5 @@
+# inn_oct18f flags shared by every arm, read when each array task STARTS. Three lines: both stages, the likelihood
+# stage, the energy stage. Identical to inn_oct18's (and inn_oct17's) common.args except the tag.
+BOTH	--config configs/mk_dev.yaml --tag inn18f --prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_elj_pooled_oct05_prior.pt --conditioner transformer --tf_width 256 --tf_layers 4 --tf_heads 8 --n_bins 32 --val_group_ignore_rows 6,7,8 --set energy_config.bounding_coeff=1000 --set energy_config.reduction_coeff=1000 --set checkpoints_dir=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints --set gpu_util_sample_period_s=10 --cuda_memory_fraction 0.97 --oom_retries 3 --eval_samples 10000 --log_every 50 --util_target 0.75 --grow_dwell_s 300
+MLE	--energy_steps 0 --lr_mle 1e-3 --mle_batch 8192 --eval_every 2500
+ENERGY	--mle_steps 0 --tf_fp32 --batch 2000 --lr_energy 3e-4 --lr_energy_final 1e-5 --energy_warmup 200 --beta_data 80 --eval_every 500 --budget_minutes 360 --max_minutes 400

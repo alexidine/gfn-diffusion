@@ -74,13 +74,14 @@ def invert_differentiable(blk, y, ctx=None):
     preimage for any parameter value, so the graph through the passes carries its exact
     derivative."""
     x = torch.zeros_like(y)
+    mh = getattr(blk, 'min_height', None)
     for _ in range(blk.d):
         if ctx is None:
             p = blk.made(blk._feats(x)).view(y.shape[0], blk.d, blk.n_params)
             shift, sp = p[..., -1], p[..., :3 * blk.n_bins].view(y.shape[0], blk.d, 3, blk.n_bins)
         else:
             shift, sp = blk.spline_params(x, ctx)
-        z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap)
+        z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh)
         x = torch.where(blk.is_wrap, _wrap(z - shift), z - shift)
     return x
 
@@ -414,6 +415,28 @@ class InnModeller(Modeller):
             self.sampler = LatentFlow(dim, wrap_mask, dead_rows, *shape, seed=int(self.args.seed),
                                       transformer=transformer, block_orders=block_orders, half_rows=half_rows)
         self.sampler = self.sampler.to(self.device)
+        if inn.min_bin_height is not None:
+            # a lower floor on the spline's bin heights on the chosen rows: with a uniform base (wrapped and bounded
+            # rows) each bin holds at least its height floor of the row's mass whatever the weights, so the default
+            # 1e-3 x n_bins is mass no training can remove
+            if not isinstance(self.sampler, LatentFlow):
+                raise NotImplementedError("--min_bin_height is built for unconditional runs only")
+            h0 = float(inn.min_bin_height)  # an arm-override file may hand a YAML '1e-6' over as a string
+            if not 0.0 < h0 < 1.0 / inn.n_bins:
+                raise ValueError(f"--min_bin_height {h0:g} must lie in (0, 1/n_bins = {1.0 / inn.n_bins:g}): at or "
+                                 f"above 1/n_bins the heights cannot move or go negative")
+            if inn.min_bin_height_rows not in ('uniform', 'all'):
+                raise ValueError(f"--min_bin_height_rows {inn.min_bin_height_rows!r}: 'uniform' or 'all'")
+            if inn.w_path > 0:
+                # a draw inside a floored bin has |dx/dparams| up to ~1/floor, and the path term does not clip it
+                raise NotImplementedError("--min_bin_height with --w_path > 0: the reparameterised path gradient "
+                                          "is unbounded inside floored bins")
+            inn.min_bin_height = h0
+            for blk in self.sampler.flow.blocks:
+                rows = (blk.unit_base_rows() if inn.min_bin_height_rows == 'uniform'
+                        else torch.ones_like(blk.is_wrap))
+                blk.min_height = torch.where(rows, torch.full_like(blk.bound, h0), torch.full_like(blk.bound, 1e-3))
+            print(f"bin-height floor {h0:g} on {inn.min_bin_height_rows} rows (else 1e-3)")
         if inn.tf_fp32:
             if not (isinstance(self.sampler, LatentFlow) and inn.conditioner == 'transformer'):
                 raise NotImplementedError("--tf_fp32 needs an unconditional run with --conditioner transformer")
@@ -759,7 +782,16 @@ class InnModeller(Modeller):
             self.init_data_rows()
             if inn.init_from is not None:
                 # after init_data_rows: the saved standardisation replaces the one just fitted
-                self.sampler.load_state_dict(torch.load(inn.init_from, map_location='cpu')['state_dict'])
+                ck = torch.load(inn.init_from, map_location='cpu')
+                self.sampler.load_state_dict(ck['state_dict'])
+                # the bin-height floor is a run setting, not a weight: a different floor on the same weights is a
+                # different density, so say so when they differ
+                ck_floor = (ck.get('inn') or {}).get('min_bin_height')
+                ck_rows = (ck.get('inn') or {}).get('min_bin_height_rows')
+                if (ck_floor, ck_rows if ck_floor is not None else None) !=                         (inn.min_bin_height, inn.min_bin_height_rows if inn.min_bin_height is not None else None):
+                    print(f"WARNING --init_from: the checkpoint was trained with bin-height floor {ck_floor} on "
+                          f"{ck_rows} rows; this run uses {inn.min_bin_height} on {inn.min_bin_height_rows} rows "
+                          f"(None = 1e-3 everywhere)", flush=True)
                 for i, blk in enumerate(self.sampler.flow.blocks):
                     if isinstance(blk.made, CausalTransformerConditioner) and \
                             blk.made.order.tolist() != list(self.sampler.flow.orders[i]):
@@ -1638,6 +1670,11 @@ def build_parser():
     # the flow
     p.add_argument('--n_blocks', type=int, default=6)
     p.add_argument('--n_bins', type=int, default=16)
+    p.add_argument('--min_bin_height', type=float, default=None,
+                   help='floor on the spline bin heights (fraction of the interval) on --min_bin_height_rows; '
+                        'unset = 1e-3 everywhere')
+    p.add_argument('--min_bin_height_rows', choices=['uniform', 'all'], default='all',
+                   help='rows --min_bin_height applies to: the uniform-base (wrapped and bounded) rows, or every row')
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--hidden_layers', type=int, default=2)
     p.add_argument('--bound', type=float, default=5.0)

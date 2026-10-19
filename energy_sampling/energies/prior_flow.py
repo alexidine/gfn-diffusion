@@ -72,7 +72,34 @@ def _cumsum_last(t):
     return t @ u
 
 
-def _rq_spline(inputs, params, bound, circular):
+def _knot_derivatives(params, circular, bounded=None, end_raw=None):
+    """The K + 1 knot derivatives of a spline: a circular dim ties the ends (d_K = d_0); a
+    linear dim pins both ends to 1 (C1 identity tails); a BOUNDED dim (a closed interval,
+    no tails) leaves both ends free, its last derivative read from `end_raw` (the slot a
+    linear dim spends on its shift), offset so that a zero parameter gives slope 1."""
+    n_bins = params.shape[-1]
+    circ = circular.view(1, -1, 1)
+    d = _MIN_DERIV + F.softplus(params[..., 2, :])
+    out = torch.where(circ,
+                      torch.cat([d, d[..., :1]], dim=-1),                  # d_K == d_0
+                      F.pad(d[..., :n_bins - 1], (1, 1), value=1.0))       # C1 identity tails
+    if bounded is not None:
+        d_end = (_MIN_DERIV + F.softplus(end_raw + _SOFTPLUS_ONE)).unsqueeze(-1)
+        out = torch.where(bounded.view(1, -1, 1), torch.cat([d, d_end], dim=-1), out)
+    return out
+
+
+def _bin_fractions(params, n_bins, min_height=None):
+    """Bin widths and heights as fractions of the interval, each at least _MIN_BIN; `min_height` (optional [D]
+    tensor) replaces the heights' floor per dim."""
+    wh = F.softmax(params[..., :2, :], dim=-1)
+    if min_height is None:
+        return _MIN_BIN + (1.0 - _MIN_BIN * n_bins) * wh
+    lo = torch.stack((torch.full_like(min_height, _MIN_BIN), min_height), -1).view(1, -1, 2, 1)
+    return lo + (1.0 - lo * n_bins) * wh
+
+
+def _rq_spline(inputs, params, bound, circular, bounded=None, end_raw=None, min_height=None):
     """Monotone rational-quadratic spline; returns (outputs, log|dy/dx|).
 
     `inputs` [B, D]; `params` [B, D, 3, K] -> unnormalised widths, heights,
@@ -81,14 +108,15 @@ def _rq_spline(inputs, params, bound, circular):
     this flow is launch-bound, and two calls cost twice the kernels for the same
     arithmetic. A circular dim ties the end derivatives (d_K = d_0), giving a
     diffeomorphism of the circle [-bound, bound]; a linear dim pins them to 1 and
-    is the identity outside the box, a diffeomorphism of the line.
+    is the identity outside the box, a diffeomorphism of the line. A `bounded` dim
+    (optional per-dim mask, with `end_raw` [B, D] its last-derivative parameter) is a
+    diffeomorphism of the closed interval [-bound, bound] with no tails: an input
+    outside it has zero density (log-derivative -inf).
     """
     n_bins = params.shape[-1]
     b = bound.view(1, -1, 1)
-    circ = circular.view(1, -1, 1)
 
-    wh = F.softmax(params[..., :2, :], dim=-1)
-    wh = _MIN_BIN + (1.0 - _MIN_BIN * n_bins) * wh
+    wh = _bin_fractions(params, n_bins, min_height)
     cum = _cumsum_last(wh)
     cum = cum / cum[..., -1:]                       # pin the far knot exactly at 1
     cum = F.pad(cum, (1, 0))
@@ -97,10 +125,7 @@ def _rq_spline(inputs, params, bound, circular):
     cumw, cumh = cum[..., 0, :], cum[..., 1, :]
     w, h = lens[..., 0, :], lens[..., 1, :]
 
-    d = _MIN_DERIV + F.softplus(params[..., 2, :])
-    d = torch.where(circ,
-                    torch.cat([d, d[..., :1]], dim=-1),                  # d_K == d_0
-                    F.pad(d[..., :n_bins - 1], (1, 1), value=1.0))       # C1 identity tails
+    d = _knot_derivatives(params, circular, bounded, end_raw)
 
     x = torch.maximum(torch.minimum(inputs, b.squeeze(-1)), -b.squeeze(-1))
     idx = torch.searchsorted(cumw.detach().contiguous(),
@@ -122,10 +147,18 @@ def _rq_spline(inputs, params, bound, circular):
     logdet = torch.log(dnum.clamp_min(1e-30)) - 2.0 * torch.log(den.clamp_min(1e-30))
 
     # linear dims are the identity outside their box; circular dims have no
-    # outside (their input is folded onto [-bound, bound] before the call)
+    # outside (their input is folded onto [-bound, bound] before the call);
+    # bounded dims have no mass outside
     outside = (~circular).view(1, -1) & (inputs != x)
-    y = torch.where(outside, inputs, y)
-    logdet = torch.where(outside, torch.zeros_like(logdet), logdet)
+    if bounded is None:
+        y = torch.where(outside, inputs, y)
+        logdet = torch.where(outside, torch.zeros_like(logdet), logdet)
+    else:
+        bnd = bounded.view(1, -1)
+        tails = outside & ~bnd
+        y = torch.where(tails, inputs, y)
+        logdet = torch.where(tails, torch.zeros_like(logdet), logdet)
+        logdet = torch.where(outside & bnd, torch.full_like(logdet, -float('inf')), logdet)
     return y, logdet
 
 
@@ -190,14 +223,22 @@ class _MADE(nn.Module):
 class _Block(nn.Module):
     """One autoregressive layer over all d dims, in the given `order`."""
 
-    def __init__(self, order, wrap_mask, n_bins, hidden, bound):
+    def __init__(self, order, wrap_mask, n_bins, hidden, bound, bounded_mask=None):
         super().__init__()
         d = len(order)
         self.d, self.n_bins = d, n_bins
         self.n_params = 3 * n_bins + 1
         self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
+        # bounded dims: an interval [-1, 1] with no tails and no shift (its slot carries the last
+        # knot derivative). Not persistent, so existing state dicts load unchanged.
+        bmask = [False] * d if bounded_mask is None else [bool(b) for b in bounded_mask]
+        self.has_bounded = any(bmask)
+        self.register_buffer('is_bounded', torch.tensor(bmask, dtype=torch.bool), persistent=False)
         self.register_buffer('bound',
-                             torch.tensor([1.0 if w else bound for w in wrap_mask]))
+                             torch.tensor([1.0 if (w or bb) else bound for w, bb in zip(wrap_mask, bmask)]))
+        # per-dim floor on the bin heights ([d] tensor on the block's device), None = _MIN_BIN; set by the caller,
+        # not part of the state dict
+        self.min_height = None
         self.made = _MADE(order, wrap_mask, hidden, n_bins)
 
         # gather plan for the conditioner features: column f reads channel
@@ -213,6 +254,10 @@ class _Block(nn.Module):
         self.register_buffer('feat_dim', torch.tensor(fd, dtype=torch.long))
         self.register_buffer('feat_kind', torch.tensor(fk, dtype=torch.long))
 
+    def unit_base_rows(self):
+        """[d] mask of the rows whose base is uniform on [-1, 1] (wrapped and bounded)."""
+        return self.is_wrap | self.is_bounded
+
     def _feats(self, x):
         ang = math.pi * x
         trip = torch.stack((x, torch.sin(ang), torch.cos(ang)), dim=-1)   # [B, d, 3]
@@ -225,22 +270,33 @@ class _Block(nn.Module):
         sp = p[..., :3 * self.n_bins].view(b, self.d, 3, self.n_bins)
 
         # conditional rotation on the wrapped dims (|detJ| = 1, breaks the seam's
-        # fixed point); plain translation on the linear dims
+        # fixed point); plain translation on the linear dims; none on bounded dims
+        if self.has_bounded:
+            z = x + torch.where(self.is_bounded, torch.zeros_like(shift), shift)
+            z = torch.where(self.is_wrap, _wrap(z), z)
+            y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height)
+            return y, ld.sum(-1)
         z = x + shift
         z = torch.where(self.is_wrap, _wrap(z), z)
-        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap)
+        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height)
         return y, ld.sum(-1)
 
 
 class _Flow(nn.Module):
     def __init__(self, wrap_mask, n_blocks=6, n_bins=10, hidden=(384, 384),
-                 bound=5.0, seed=0):
+                 bound=5.0, seed=0, bounded_mask=None):
         super().__init__()
         d = len(wrap_mask)
         self.d, self.bound = d, bound
         self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
         self.register_buffer('mu', torch.zeros(d))
         self.register_buffer('sd', torch.ones(d))
+        # bounded dims (see _Block) are not standardised and take a uniform base, as wrapped dims do
+        bmask = [False] * d if bounded_mask is None else [bool(b) for b in bounded_mask]
+        self.bounded_mask = bmask
+        self.register_buffer('is_bounded', torch.tensor(bmask, dtype=torch.bool), persistent=False)
+        self.register_buffer('unit_base', torch.tensor([bool(w) or b for w, b in zip(wrap_mask, bmask)],
+                                                       dtype=torch.bool), persistent=False)
 
         g = torch.Generator().manual_seed(seed)
         orders = []
@@ -253,14 +309,15 @@ class _Flow(nn.Module):
                 orders.append(torch.randperm(d, generator=g).tolist())
         self.orders = orders  # read by callers that swap a block's conditioner (inn_modeller --conditioner)
         self.blocks = nn.ModuleList(
-            _Block(o, wrap_mask, n_bins, hidden, bound) for o in orders)
+            _Block(o, wrap_mask, n_bins, hidden, bound, bmask) for o in orders)
 
     def set_scaler(self, x):
-        """Standardise the LINEAR dims only; wrapped dims must stay on the circle."""
+        """Standardise the LINEAR dims only; wrapped dims must stay on the circle, and
+        bounded dims on their interval."""
         mu = x.mean(0)
         sd = x.std(0).clamp_min(1e-4)
-        mu = torch.where(self.is_wrap, torch.zeros_like(mu), mu)
-        sd = torch.where(self.is_wrap, torch.ones_like(sd), sd)
+        mu = torch.where(self.unit_base, torch.zeros_like(mu), mu)
+        sd = torch.where(self.unit_base, torch.ones_like(sd), sd)
         self.mu.copy_(mu)
         self.sd.copy_(sd)
 
@@ -274,10 +331,10 @@ class _Flow(nn.Module):
             z, l = blk(z)
             ld = ld + l
         base = x.new_zeros(x.shape[0])
-        if self.is_wrap.any():
-            base = base - math.log(2.0) * int(self.is_wrap.sum())
-        if (~self.is_wrap).any():
-            zl = z[:, ~self.is_wrap]
+        if self.unit_base.any():
+            base = base - math.log(2.0) * int(self.unit_base.sum())
+        if (~self.unit_base).any():
+            zl = z[:, ~self.unit_base]
             base = base - 0.5 * (zl * zl).sum(-1) \
                 - 0.5 * math.log(2 * math.pi) * zl.shape[1]
         return base + ld
@@ -287,25 +344,21 @@ class _Flow(nn.Module):
 
 # ---------------------------------------------------------------- inverse
 
-def _spline_knots(params, bound, circular):
+def _spline_knots(params, bound, circular, bounded=None, end_raw=None, min_height=None):
     n_bins = params.shape[-1]
     b = bound.view(1, -1, 1)
-    circ = circular.view(1, -1, 1)
-    wh = F.softmax(params[..., :2, :], dim=-1)
-    wh = _MIN_BIN + (1.0 - _MIN_BIN * n_bins) * wh
+    wh = _bin_fractions(params, n_bins, min_height)
     cum = _cumsum_last(wh); cum = cum / cum[..., -1:]
     cum = F.pad(cum, (1, 0))
     cum = (2.0 * b.unsqueeze(-1)) * cum - b.unsqueeze(-1)
     lens = cum[..., 1:] - cum[..., :-1]
     cumw, cumh = cum[..., 0, :], cum[..., 1, :]
     w, h = lens[..., 0, :], lens[..., 1, :]
-    d = _MIN_DERIV + F.softplus(params[..., 2, :])
-    d = torch.where(circ, torch.cat([d, d[..., :1]], -1),
-                    F.pad(d[..., :n_bins - 1], (1, 1), value=1.0))
+    d = _knot_derivatives(params, circular, bounded, end_raw)
     return cumw, cumh, w, h, d, n_bins
 
-def rq_spline_inverse(y, params, bound, circular):
-    cumw, cumh, w, h, d, n_bins = _spline_knots(params, bound, circular)
+def rq_spline_inverse(y, params, bound, circular, bounded=None, end_raw=None, min_height=None):
+    cumw, cumh, w, h, d, n_bins = _spline_knots(params, bound, circular, bounded, end_raw, min_height)
     bb = bound.view(1, -1)
     yc = torch.maximum(torch.minimum(y, bb), -bb)
     idx = torch.searchsorted(cumh.detach().contiguous(),
@@ -325,6 +378,8 @@ def rq_spline_inverse(y, params, bound, circular):
     xi = (2.0 * c / (-b_ - torch.sqrt(disc))).clamp(0.0, 1.0)
     x = xk + xi * wk
     outside = (~circular).view(1, -1) & (y != yc)
+    if bounded is not None:  # a bounded dim's base point is inside its interval by construction
+        outside = outside & ~bounded.view(1, -1)
     return torch.where(outside, y, x)
 
 @torch.no_grad()
@@ -336,11 +391,17 @@ def invert_block(blk, y, d):
     per pass whatever the ordering, so after d passes every dim is exact.
     """
     x = torch.zeros_like(y)
+    bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
+    mh = getattr(blk, 'min_height', None)
     for _ in range(d):
         p = blk.made(blk._feats(x)).view(y.shape[0], d, blk.n_params)
         shift = p[..., -1]
         sp = p[..., :3 * blk.n_bins].view(y.shape[0], d, 3, blk.n_bins)
-        z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap)
+        if bnd is None:
+            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh)
+        else:
+            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, bnd, shift, mh)
+            shift = torch.where(bnd, torch.zeros_like(shift), shift)
         x = torch.where(blk.is_wrap, _wrap(z - shift), z - shift)
     return x
 
@@ -351,7 +412,8 @@ def sample(flow, n, device, seed=0):
     g = torch.Generator(device='cpu').manual_seed(seed)
     zn = torch.randn(n, d, generator=g)
     zu = 2.0 * torch.rand(n, d, generator=g) - 1.0
-    z = torch.where(flow.is_wrap.cpu(), zu, zn).to(device)
+    unit = getattr(flow, 'unit_base', flow.is_wrap)
+    z = torch.where(unit.cpu(), zu, zn).to(device)
     for blk in reversed(list(flow.blocks)):
         z = invert_block(blk, z, d)
     return torch.where(flow.is_wrap, _wrap(z), z * flow.sd + flow.mu)
