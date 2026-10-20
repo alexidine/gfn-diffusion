@@ -89,6 +89,29 @@ def _knot_derivatives(params, circular, bounded=None, end_raw=None):
     return out
 
 
+def _tied_derivatives(params, slopes, circular, bounded=None, end_raw=None, max_factor=2.0):
+    """The K + 1 knot derivatives DERIVED from the bins' mean slopes `slopes` [B, D, K] (height / width): at an
+    interior knot the harmonic mean of its two bins' slopes (the Fritsch-Butland choice of monotone interpolation; it
+    lies between the smaller slope and twice it), times a learned factor in [1/max_factor, max_factor] from the
+    derivative slot (1 at a zero-initialised head; max_factor 1 is the pure harmonic mean). No knot is then far steeper
+    than both bins it joins, so a near-empty bin cannot carry a density spike at its edge: inside any bin with no
+    pinned end the density stays below 8 x max_factor x its mean slope. Ends as _knot_derivatives: a linear dim pins
+    both to 1, a circular dim joins bin K - 1 to bin 0 across the seam, a bounded dim gives each end its own bin's
+    slope times a factor (the last read from `end_raw`)."""
+    lf = math.log(float(max_factor))
+    f = torch.exp(lf * torch.tanh(params[..., 2, :] - _SOFTPLUS_ONE))
+    prev = torch.roll(slopes, 1, dims=-1)                    # knot k joins bin k - 1 (bin K - 1 at k = 0) and bin k
+    d = 2.0 * prev * slopes / (prev + slopes) * f
+    out = torch.where(circular.view(1, -1, 1),
+                      torch.cat([d, d[..., :1]], dim=-1),               # d_K == d_0
+                      F.pad(d[..., 1:], (1, 1), value=1.0))             # C1 identity tails
+    if bounded is not None:
+        f_end = torch.exp(lf * torch.tanh(end_raw)).unsqueeze(-1)
+        ends = torch.cat([slopes[..., :1] * f[..., :1], d[..., 1:], slopes[..., -1:] * f_end], dim=-1)
+        out = torch.where(bounded.view(1, -1, 1), ends, out)
+    return out
+
+
 def _bin_fractions(params, n_bins, min_height=None):
     """Bin widths and heights as fractions of the interval, each at least _MIN_BIN; `min_height` (optional [D]
     tensor) replaces the heights' floor per dim."""
@@ -99,7 +122,7 @@ def _bin_fractions(params, n_bins, min_height=None):
     return lo + (1.0 - lo * n_bins) * wh
 
 
-def _rq_spline(inputs, params, bound, circular, bounded=None, end_raw=None, min_height=None):
+def _rq_spline(inputs, params, bound, circular, bounded=None, end_raw=None, min_height=None, tied=False):
     """Monotone rational-quadratic spline; returns (outputs, log|dy/dx|).
 
     `inputs` [B, D]; `params` [B, D, 3, K] -> unnormalised widths, heights,
@@ -111,7 +134,9 @@ def _rq_spline(inputs, params, bound, circular, bounded=None, end_raw=None, min_
     is the identity outside the box, a diffeomorphism of the line. A `bounded` dim
     (optional per-dim mask, with `end_raw` [B, D] its last-derivative parameter) is a
     diffeomorphism of the closed interval [-bound, bound] with no tails: an input
-    outside it has zero density (log-derivative -inf).
+    outside it has zero density (log-derivative -inf). `tied` derives the knot
+    derivatives from the bin slopes (_tied_derivatives) instead of reading them free:
+    True for a learned factor in [1/2, 2], or a number F >= 1 for [1/F, F].
     """
     n_bins = params.shape[-1]
     b = bound.view(1, -1, 1)
@@ -125,7 +150,8 @@ def _rq_spline(inputs, params, bound, circular, bounded=None, end_raw=None, min_
     cumw, cumh = cum[..., 0, :], cum[..., 1, :]
     w, h = lens[..., 0, :], lens[..., 1, :]
 
-    d = _knot_derivatives(params, circular, bounded, end_raw)
+    d = (_tied_derivatives(params, h / w, circular, bounded, end_raw, 2.0 if tied is True else float(tied)) if tied
+         else _knot_derivatives(params, circular, bounded, end_raw))
 
     x = torch.maximum(torch.minimum(inputs, b.squeeze(-1)), -b.squeeze(-1))
     idx = torch.searchsorted(cumw.detach().contiguous(),
@@ -239,6 +265,9 @@ class _Block(nn.Module):
         # per-dim floor on the bin heights ([d] tensor on the block's device), None = _MIN_BIN; set by the caller,
         # not part of the state dict
         self.min_height = None
+        # knot derivatives derived from the bin slopes (_tied_derivatives) instead of free; set by the caller, not
+        # part of the state dict
+        self.tied = False
         self.made = _MADE(order, wrap_mask, hidden, n_bins)
 
         # gather plan for the conditioner features: column f reads channel
@@ -274,11 +303,12 @@ class _Block(nn.Module):
         if self.has_bounded:
             z = x + torch.where(self.is_bounded, torch.zeros_like(shift), shift)
             z = torch.where(self.is_wrap, _wrap(z), z)
-            y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height)
+            y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height,
+                               getattr(self, 'tied', False))
             return y, ld.sum(-1)
         z = x + shift
         z = torch.where(self.is_wrap, _wrap(z), z)
-        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height)
+        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=getattr(self, 'tied', False))
         return y, ld.sum(-1)
 
 
@@ -344,7 +374,7 @@ class _Flow(nn.Module):
 
 # ---------------------------------------------------------------- inverse
 
-def _spline_knots(params, bound, circular, bounded=None, end_raw=None, min_height=None):
+def _spline_knots(params, bound, circular, bounded=None, end_raw=None, min_height=None, tied=False):
     n_bins = params.shape[-1]
     b = bound.view(1, -1, 1)
     wh = _bin_fractions(params, n_bins, min_height)
@@ -354,11 +384,12 @@ def _spline_knots(params, bound, circular, bounded=None, end_raw=None, min_heigh
     lens = cum[..., 1:] - cum[..., :-1]
     cumw, cumh = cum[..., 0, :], cum[..., 1, :]
     w, h = lens[..., 0, :], lens[..., 1, :]
-    d = _knot_derivatives(params, circular, bounded, end_raw)
+    d = (_tied_derivatives(params, h / w, circular, bounded, end_raw, 2.0 if tied is True else float(tied)) if tied
+         else _knot_derivatives(params, circular, bounded, end_raw))
     return cumw, cumh, w, h, d, n_bins
 
-def rq_spline_inverse(y, params, bound, circular, bounded=None, end_raw=None, min_height=None):
-    cumw, cumh, w, h, d, n_bins = _spline_knots(params, bound, circular, bounded, end_raw, min_height)
+def rq_spline_inverse(y, params, bound, circular, bounded=None, end_raw=None, min_height=None, tied=False):
+    cumw, cumh, w, h, d, n_bins = _spline_knots(params, bound, circular, bounded, end_raw, min_height, tied)
     bb = bound.view(1, -1)
     yc = torch.maximum(torch.minimum(y, bb), -bb)
     idx = torch.searchsorted(cumh.detach().contiguous(),
@@ -393,14 +424,15 @@ def invert_block(blk, y, d):
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
     mh = getattr(blk, 'min_height', None)
+    td = getattr(blk, 'tied', False)
     for _ in range(d):
         p = blk.made(blk._feats(x)).view(y.shape[0], d, blk.n_params)
         shift = p[..., -1]
         sp = p[..., :3 * blk.n_bins].view(y.shape[0], d, 3, blk.n_bins)
         if bnd is None:
-            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh)
+            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh, tied=td)
         else:
-            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, bnd, shift, mh)
+            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, bnd, shift, mh, td)
             shift = torch.where(bnd, torch.zeros_like(shift), shift)
         x = torch.where(blk.is_wrap, _wrap(z - shift), z - shift)
     return x
