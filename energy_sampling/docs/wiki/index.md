@@ -1,6 +1,6 @@
 # GFN knowledge base
 
-Fifty pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
+Fifty-one pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
 
 ## Theory of the objective
 
@@ -37,6 +37,10 @@ Fifty pages, each drafted from the code and the derivation notes, verified again
 - [anchor-buffer](anchor-buffer.md) — mixed page: the permanent archive of low-energy states, its anchor-energy currency, the six membership sites and the two frozen-guarded primitives, the restore policy hook, and the jitter seam out to the prior buffer.
 - [replay-buffer](replay-buffer.md) — mixed page: the store of forward trajectories, uniform admission, the hazard and backstop eviction arms, the prioritised draw and its importance weights, the held-out split and the intake baseline.
 - [rollout-cadence-and-dose](rollout-cadence-and-dose.md) — mixed page: what a forward rollout buys, Little's-law identities, the dose variable, the Z-pinning invariants.
+
+## Exact-density sampler
+
+- [ar-spline-flow](ar-spline-flow.md) — mixed page: the masked autoregressive rational-quadratic spline flow behind `inn_modeller.py`, its wrapped, linear and bounded rows and their bases, the half-period fold and mixture layer, block orders and the MADE and causal-transformer conditioners, the exact log-density and the d-pass inverse, the in-bin map and its derivative, the bin-height floor and when a height is a mass, free and tied knot derivatives with their bounds, and which settings live in the weights.
 
 ## Compute and energy
 
