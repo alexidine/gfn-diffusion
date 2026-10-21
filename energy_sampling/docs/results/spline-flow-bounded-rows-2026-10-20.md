@@ -1,6 +1,6 @@
 # Spline flow: bounded rows, knot derivatives, height floor and replay (MIPCAS eLJ)
 
-*Battery record. Closed 2026-10-20. Code at commit `06950ee0`. Not a finding.*
+*Battery record. Closed 2026-10-20. Code at commit `08a399fa`. Not a finding.*
 
 ## Design
 
@@ -37,7 +37,7 @@ Arms (run names, prefixed `inn_` on disk and in wandb):
 Two 6M unbounded free arms from the night before (`mip_s2ctrl6m_oct19`, `mip_ctrl6m_s1b_oct19`, from the
 `mip_floor_s1_oct18c` stage 1) are included for the 6M comparison.
 
-Arms that ran before 18:35 on 20 Oct ran on the working tree that became `06950ee0`; the default (factor 2) tied path of
+Arms that ran before 18:35 on 20 Oct ran on the working tree that became `08a399fa`; the default (factor 2) tied path of
 that commit is bit-identical to the one they ran.
 
 ## Data
@@ -48,7 +48,7 @@ All under `energy_sampling/artifacts/inn_proto/` on the local machine (git-ignor
 `bounded6m_oct20.sh`, `tied_oct20.sh`, `floor7_oct20.sh`, `hour_oct20b.sh`, `gpu_oct20c.sh` and their logs; gradient-split
 logs `grad_mip_*.log` (`diag_oct20.sh`). Eval-only dumps with the floor changed on trained weights:
 `inn_dump_mip_tbnd_s2_f7eval_oct20`, `inn_dump_mip_tctrl_s2_f7eval_oct20`. The dump of `mip_bnd_s2_oct20` failed (a
-per-row split error in the dump code, fixed before `06950ee0`), so that arm has 40k eval draws only. The pinned
+per-row split error in the dump code, fixed before `08a399fa`), so that arm has 40k eval draws only. The pinned
 MXtalTools copy lived in a session scratch directory and is not kept.
 
 ## Measurements
