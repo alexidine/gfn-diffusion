@@ -39,6 +39,7 @@ rewardgrad/). log P_B is zero for a one-step map, so every TB statistic reads
 log R - log q exactly; "bwd"/"Backward" means the stored prior rows.
 """
 import argparse
+import contextlib
 import copy
 import gc
 import json
@@ -69,10 +70,13 @@ from utils import get_train_args, is_cuda_oom
 
 
 @torch.no_grad()
-def invert_block_cached(blk, y):
+def invert_block_cached(blk, y, ctx=None):
     """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
     per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
-    each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding."""
+    each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding; with
+    the layers in bf16 the decode's one-token path and forward's full pass round differently, and a trained map's
+    conditioning amplifies that (--tf_fp32 runs them in the input's precision).
+    ctx: a _ContextBlock's context, as its forward takes it (_ContextFlow.context_input's first output)."""
     b = y.shape[0]
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
@@ -91,7 +95,7 @@ def invert_block_cached(blk, y):
             shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
         x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
 
-    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype)
+    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx)
     return x
 
 
@@ -491,6 +495,7 @@ class _ContextFlow(nn.Module):
         self.level = _ResMLP(n_in, 256, 1)
         nn.init.zeros_(self.level.out[-1].weight)
         nn.init.zeros_(self.level.out[-1].bias)
+        self._shared = None   # context_input's results by condition tensor while ConditionalLatentFlow.shared_context is open
 
     def set_atom_table(self, z, pos, n):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
@@ -499,7 +504,18 @@ class _ContextFlow(nn.Module):
 
     def context_input(self, c):
         """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's
-        input in atom mode, else the embedded standardised condition and the standardised condition."""
+        input in atom mode, else the embedded standardised condition and the standardised condition. While
+        ConditionalLatentFlow.shared_context is open, a repeat call on the same tensor with gradients enabled returns
+        the first such call's result (no-grad calls, the draws', are not kept)."""
+        memo = self._shared
+        if memo is None or not torch.is_grad_enabled():
+            return self._context_input(c)
+        hit = memo.get(id(c))
+        if hit is None or hit[0] is not c:
+            hit = memo[id(c)] = (c, self._context_input(c))   # c is held, so its id is not reused inside the block
+        return hit[1]
+
+    def _context_input(self, c):
         if not self.atoms:
             s = self.standardise(c)
             return self.context(s), s
@@ -567,10 +583,30 @@ class ConditionalLatentFlow(nn.Module):
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
         for blk in reversed(list(f.blocks)):
-            z = blk.invert(z, ctx)
+            if isinstance(blk.made, CausalTransformerConditioner):
+                z = invert_block_cached(blk, z, ctx)       # one decode step per row, not d full passes
+            else:
+                z = blk.invert(z, ctx)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
         x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
         return (x, z0) if return_base else x
+
+    def set_bf16(self, on: bool):
+        """The transformer conditioners' layers in bf16 (the default) or in the input's precision, as LatentFlow."""
+        for blk in self.flow.blocks:
+            if isinstance(blk.made, CausalTransformerConditioner):
+                blk.made.bf16 = bool(on)
+
+    @contextlib.contextmanager
+    def shared_context(self):
+        """Within the block each condition tensor's context (_ContextFlow.context_input: the atom encoder and the
+        context network) is computed once with gradients and reused, so an energy step that reads the same conditions
+        for log q and for the level head encodes them once. The parameters must not change inside the block."""
+        self.flow._shared = {}
+        try:
+            yield
+        finally:
+            self.flow._shared = None
 
     def rsample(self, z0, c):
         """The draw sample() makes from base points z0, differentiable in the parameters."""
@@ -709,8 +745,8 @@ class InnModeller(Modeller):
                 blk.tied = tf
             print(f"knot derivatives tied to the neighbouring bin slopes (harmonic mean x a factor in [1/{tf:g}, {tf:g}])")
         if inn.tf_fp32:
-            if not (isinstance(self.sampler, LatentFlow) and inn.conditioner == 'transformer'):
-                raise NotImplementedError("--tf_fp32 needs an unconditional run with --conditioner transformer")
+            if inn.conditioner != 'transformer':
+                raise NotImplementedError("--tf_fp32 needs --conditioner transformer")
             self.sampler.set_bf16(False)
         n_par = sum(p.numel() for p in self.sampler.parameters())
         print(f"flow sampler: dim {dim}, wrapped rows {[i for i, w in enumerate(wrap_mask) if w]}, "
@@ -1279,7 +1315,9 @@ class InnModeller(Modeller):
                 t_step = time.perf_counter()
 
                 def update(log_z=log_z):
-                    stats, loss, level = self.step_loss(stage, log_z)
+                    # each condition tensor is encoded once with gradients for the step (log q, level head)
+                    with (self.sampler.shared_context() if self.conditional else contextlib.nullcontext()):
+                        stats, loss, level = self.step_loss(stage, log_z)
                     if loss is None or not bool(torch.isfinite(loss)):
                         return stats, False, level
                     opt.zero_grad(set_to_none=True)
@@ -1749,8 +1787,8 @@ class InnModeller(Modeller):
     def step_loss(self, stage, log_z):
         inn = self.inn
         stats = {}
-        if stage == 'mle' and inn.rows_per_molecule > 1:
-            idx = self.molecule_grouped_rows(self.batch_now['mle'], inn.rows_per_molecule)
+        if inn.rows_per_molecule > 1:
+            idx = self.molecule_grouped_rows(self.batch_now[stage], inn.rows_per_molecule)
         else:
             idx = torch.randint(0, self.x_train.shape[0],
                                 (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
@@ -1801,7 +1839,7 @@ class InnModeller(Modeller):
 
         # fresh draws: iw_k per molecule when the importance-weighted term is on
         if fresh:
-            K = int(inn.iw_k) if inn.w_iw > 0 else 1
+            K = int(inn.iw_k) if inn.w_iw > 0 else int(inn.rows_per_molecule)
             n = (inn.batch // K) * K
             with torch.no_grad():
                 t = time.perf_counter()
@@ -2474,9 +2512,10 @@ def build_parser():
                    help='--atom_tokens: radius-graph cutoff within a molecule (angstrom)')
     p.add_argument('--atom_radial', type=int, default=32, help='--atom_tokens: radial basis functions per edge')
     p.add_argument('--rows_per_molecule', type=int, default=1,
-                   help='likelihood stage: draw each batch as batch / k molecules with k stored rows each (molecules in '
-                        'proportion to their rows, so each row is as likely as in a uniform draw); with --atom_tokens '
-                        'the encoder runs on k times fewer molecules')
+                   help='draw each batch of stored rows as batch / k molecules with k rows each (molecules in '
+                        'proportion to their rows, so each row is as likely as in a uniform draw), and in the energy '
+                        'stage the fresh draws as batch / k molecules with k draws each (unless --w_iw sets the groups '
+                        'by --iw_k); with --atom_tokens the encoder runs on k times fewer molecules')
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--hidden_layers', type=int, default=2)
     p.add_argument('--bound', type=float, default=5.0)

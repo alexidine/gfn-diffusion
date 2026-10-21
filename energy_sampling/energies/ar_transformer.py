@@ -130,7 +130,7 @@ class CausalTransformerConditioner(nn.Module):
         return out[:, self.slot_of_dim].reshape(b, self.d * self.n_params)
 
     @torch.no_grad()
-    def decode(self, feats_of, solve_row, b, dtype):
+    def decode(self, feats_of, solve_row, b, dtype, ctx=None):
         """Autoregressive decoding with a key/value cache, one slot per step, for sampling.
 
         At step j the cache holds every layer's keys and values for slots 0..j-1. Slot j's token -- the start token at
@@ -139,10 +139,21 @@ class CausalTransformerConditioner(nn.Module):
         fixes that row. `feats_of()` returns the block's conditioner features [b, n_feat] of the rows fixed so far
         (`_Block._feats`); only the columns of the row just fixed are read. Each token's computation is the one
         forward() does for its slot on the completed rows, so the result matches the d-pass inverse (invert_block)
-        to rounding, at about one forward pass of conditioner work instead of d. Unconditional conditioners only."""
-        if self.ctx is not None:
-            raise NotImplementedError("decode: a conditional conditioner's context is not carried; use the d-pass inverse")
+        to rounding, at about one forward pass of conditioner work instead of d. A conditional conditioner takes the
+        same ctx as forward(): the context vector's projection is added to every token, and a cross-attending one's
+        memory is projected to keys and values once per layer for the whole decode."""
+        if (ctx is None) != (self.ctx is None):
+            raise ValueError("a conditional transformer conditioner needs ctx, an unconditional one takes none")
+        vec, mem, mem_mask = ctx if isinstance(ctx, tuple) else (ctx, None, None)
+        if mem is not None and not self.cross:
+            raise ValueError("a memory of tokens was passed to a conditioner built without cross-attention")
+        if self.cross and vec is not None and mem is None:
+            raise ValueError("a cross-attending conditioner needs ctx = (vector, memory, mask)")
         width = self.feat_w.shape[1]
+        add = self.ctx(vec).unsqueeze(1) if vec is not None else None
+        on_cuda = self.start.is_cuda
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=on_cuda and self.bf16):
+            mem_kv = [layer.kv_x(mem) if mem is not None else None for layer in self.layers]
         cache = [None] * len(self.layers)
         prev = None
         for j in range(self.d):
@@ -153,21 +164,26 @@ class CausalTransformerConditioner(nn.Module):
                 f = feats_of()[:, cols]                                           # [b, columns of row prev]
                 tok = ((f.unsqueeze(-1) * self.feat_w[cols]).sum(1) + self.dim_emb[prev]).unsqueeze(1)
             tok = tok + self.slot_emb[j]
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=tok.is_cuda and self.bf16):
+            if add is not None:
+                tok = tok + add
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=on_cuda and self.bf16):
                 for li, layer in enumerate(self.layers):
-                    tok, cache[li] = _layer_step(layer, tok, cache[li])
+                    tok, cache[li] = _layer_step(layer, tok, cache[li], mem_kv[li], mem_mask)
             params = self.head(self.ln(tok.to(dtype)))[:, 0]                      # [b, n_params]
             prev = int(self.order[j])
             solve_row(prev, params)
 
 
-def _layer_step(layer, h, kv):
-    """One token through a _CausalLayer, attending to the cached keys and values `kv` of the earlier slots; returns
-    the token's output and the cache extended by its own keys and values."""
+def _layer_step(layer, h, kv, mem_kv=None, mem_mask=None):
+    """One token through a _CausalLayer, attending to the cached keys and values `kv` of the earlier slots and, in a
+    cross-attending layer, to the memory's keys and values `mem_kv` [b, m, 2w]; returns the token's output and the
+    cache extended by its own keys and values."""
     b, n, w = h.shape
     q, k, v = layer.qkv(layer.ln1(h)).view(b, n, 3, layer.heads, w // layer.heads).permute(2, 0, 3, 1, 4)
     if kv is not None:
         k, v = torch.cat((kv[0], k), dim=2), torch.cat((kv[1], v), dim=2)
     a = F.scaled_dot_product_attention(q, k, v)      # one query, every cached key and its own: the causal row
     h = h + layer.proj(a.transpose(1, 2).reshape(b, n, w))
+    if layer.cross and mem_kv is not None:
+        h = h + layer.proj_x(_cross_attend(layer.q_x(layer.ln_x(h)), mem_kv, mem_mask, layer.heads))
     return h + layer.mlp(layer.ln2(h)), (k, v)
