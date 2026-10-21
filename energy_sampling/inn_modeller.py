@@ -562,7 +562,8 @@ class InnModeller(Modeller):
         ck_inn = None
         if inn.init_from is not None:
             ck_inn = torch.load(inn.init_from, map_location='cpu', weights_only=False).get('inn') or {}
-        account = resolve_auto_options(inn, self.conditional, ck_inn)
+        account = resolve_auto_options(inn, self.conditional, ck_inn,
+                                       live_rows=[i for i in range(dim) if i not in set(dead_rows)])
         if account:
             print(f"options left unset, resolved: {account}", flush=True)
         cond_dim = mol_dim + int(self.t_conditional)
@@ -2280,8 +2281,8 @@ def build_parser():
     p.add_argument('--init_from', default=None,
                    help='a mle_exit.pt / best.pt / latest.pt / final.pt of this trainer: start from its weights')
     # the flow
-    p.add_argument('--n_blocks', type=int, default=6)
-    p.add_argument('--n_bins', type=int, default=16)
+    p.add_argument('--n_blocks', type=int, default=1)
+    p.add_argument('--n_bins', type=int, default=32)
     p.add_argument('--mix_k', type=int, default=0,
                    help='unconditional transformer runs: a mixture-CDF layer of this many wrapped-logistic components on '
                         'each wrapped row before its spline (empty gaps by construction); 0 = off')
@@ -2301,7 +2302,7 @@ def build_parser():
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--hidden_layers', type=int, default=2)
     p.add_argument('--bound', type=float, default=5.0)
-    p.add_argument('--conditioner', choices=('made', 'transformer'), default='made',
+    p.add_argument('--conditioner', choices=('made', 'transformer'), default='transformer',
                    help='per-block autoregressive conditioner; transformer = causal self-attention over the order')
     p.add_argument('--tf_width', type=int, default=256)
     p.add_argument('--tf_layers', type=int, default=4)
@@ -2309,10 +2310,11 @@ def build_parser():
     p.add_argument('--tf_fp32', action='store_true',
                    help="transformer layers in fp32 instead of bf16 (a trained stack of blocks can fail the "
                         "working-precision round trip in bf16)")
-    p.add_argument('--block_orders', default=None,
+    p.add_argument('--block_orders', default='auto',
                    help="unconditional runs: comma-separated order per block, 'id' (stored rows), 'rev', or "
-                        "'.'-separated latent row indices (e.g. 6.7.8.9.10.11.3.4.5.0.1.2); "
-                        "unset = alternate stored, reversed, random")
+                        "'.'-separated latent row indices (e.g. 6.7.8.9.10.11.3.4.5.0.1.2); 'none' = alternate "
+                        "stored, reversed, random; 'auto' = Z1_ORDER on an unconditional one-block run over the "
+                        "12-row Z'=1 latent, the --init_from checkpoint's own orders, else 'none'")
     p.add_argument('--fold_half_rows', default=None,
                    help="unconditional runs: comma-separated wrapped latent rows whose distribution repeats every "
                         "half period (the prior's exact image copies, e.g. 7,8 for centroid y, z in sg 2); the flow "
@@ -2480,9 +2482,12 @@ ARM_OVERRIDES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config
 # tied knot derivatives, the bin-height floor and error-filtered replay. The conditional route refuses all four.
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0,
                               bank_frac=0.1)
+# the default row order of a one-block flow over the 12-row crystal latent at Z' = 1 (rows 0-11 all live): centroid z,
+# the orientation rows, centroid y and x, then the cell angles and lengths
+Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
 
 
-def resolve_auto_options(inn, conditional, ck_inn=None):
+def resolve_auto_options(inn, conditional, ck_inn=None, live_rows=None):
     """Fill the options left unset with a value and return a one-line account of where each came from.
 
     Unset = 'auto' (`--bounded_rows`, `--min_bin_height`) or None (`--tied_derivatives`, `--tied_factor`,
@@ -2490,7 +2495,9 @@ def resolve_auto_options(inn, conditional, ck_inn=None):
     checkpoint's own setting when `ck_inn` (its saved `inn` entry) is given, a key absent there meaning the setting it
     was trained under before the key existed (off, 1e-3 everywhere, free); otherwise the unconditional route's default
     (UNCONDITIONAL_DEFAULTS), or off on a conditional run. Replay (`--bank_frac`) is a training setting and takes the
-    route's default either way. 'none' turns `--bounded_rows` or `--min_bin_height` off explicitly."""
+    route's default either way. 'none' turns `--bounded_rows` or `--min_bin_height` off explicitly. `--block_orders`
+    'auto' is Z1_ORDER on an unconditional one-block run whose live rows `live_rows` are exactly 0-11, the
+    checkpoint's own orders under `--init_from`, else none (the alternating orders); 'none' sets the alternation."""
     src = []
 
     def pick(key, from_ck, route, off):
@@ -2520,6 +2527,11 @@ def resolve_auto_options(inn, conditional, ck_inn=None):
                                 if inn.tied_derivatives else 2.0)
     if inn.bank_frac is None:
         inn.bank_frac = float(pick('bank_frac', False, UNCONDITIONAL_DEFAULTS['bank_frac'], 0.0))
+    if inn.block_orders == 'auto':
+        z1 = int(inn.n_blocks) == 1 and live_rows is not None and list(live_rows) == list(range(12))
+        inn.block_orders = pick('block_orders', True, Z1_ORDER if z1 else None, None)
+    elif inn.block_orders == 'none':
+        inn.block_orders = None
     return ', '.join(src)
 
 
