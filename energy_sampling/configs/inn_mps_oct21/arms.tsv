@@ -1,0 +1,10 @@
+# inn_mps_oct21 arms, read by submit_inn_mps_oct21.sbatch when the job STARTS (edit here, in place, before it starts).
+# Columns (tab-separated, 4): index, arm, stage-1 seed (s0 or s1: which stage-1 run the arm starts from, and its seed
+# flags from common.args), stage-2 flags beyond common.args ('-' = none). Later flags win, so an arm's flags override the
+# shared ones. All six stage-2 arms run at once on one GPU, after both stage-1 runs.
+0	base	s0	-
+1	seed1	s1	-
+2	lr_half	s0	--lr_energy 1.5e-4
+3	lr_double	s0	--lr_energy 6e-4
+4	b1000	s0	--batch 1000
+5	rep02	s0	--bank_frac 0.2
