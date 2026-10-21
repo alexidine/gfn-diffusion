@@ -93,3 +93,46 @@ class CausalTransformerConditioner(nn.Module):
                 h = checkpoint(layer, h, use_reentrant=False) if torch.is_grad_enabled() else layer(h)
         out = self.head(self.ln(h.to(feats.dtype)))       # [b, d, n_params], slot order
         return out[:, self.slot_of_dim].reshape(b, self.d * self.n_params)
+
+    @torch.no_grad()
+    def decode(self, feats_of, solve_row, b, dtype):
+        """Autoregressive decoding with a key/value cache, one slot per step, for sampling.
+
+        At step j the cache holds every layer's keys and values for slots 0..j-1. Slot j's token -- the start token at
+        j = 0, else the value embedding of row order[j-1], fixed at the step before -- runs through each layer
+        attending to the cache and to itself, the head gives row order[j]'s parameters, and `solve_row(row, params)`
+        fixes that row. `feats_of()` returns the block's conditioner features [b, n_feat] of the rows fixed so far
+        (`_Block._feats`); only the columns of the row just fixed are read. Each token's computation is the one
+        forward() does for its slot on the completed rows, so the result matches the d-pass inverse (invert_block)
+        to rounding, at about one forward pass of conditioner work instead of d. Unconditional conditioners only."""
+        if self.ctx is not None:
+            raise NotImplementedError("decode: a conditional conditioner's context is not carried; use the d-pass inverse")
+        width = self.feat_w.shape[1]
+        cache = [None] * len(self.layers)
+        prev = None
+        for j in range(self.d):
+            if j == 0:
+                tok = self.start.to(dtype).expand(b, 1, width)
+            else:
+                cols = self.feat_dim == prev
+                f = feats_of()[:, cols]                                           # [b, columns of row prev]
+                tok = ((f.unsqueeze(-1) * self.feat_w[cols]).sum(1) + self.dim_emb[prev]).unsqueeze(1)
+            tok = tok + self.slot_emb[j]
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=tok.is_cuda and self.bf16):
+                for li, layer in enumerate(self.layers):
+                    tok, cache[li] = _layer_step(layer, tok, cache[li])
+            params = self.head(self.ln(tok.to(dtype)))[:, 0]                      # [b, n_params]
+            prev = int(self.order[j])
+            solve_row(prev, params)
+
+
+def _layer_step(layer, h, kv):
+    """One token through a _CausalLayer, attending to the cached keys and values `kv` of the earlier slots; returns
+    the token's output and the cache extended by its own keys and values."""
+    b, n, w = h.shape
+    q, k, v = layer.qkv(layer.ln1(h)).view(b, n, 3, layer.heads, w // layer.heads).permute(2, 0, 3, 1, 4)
+    if kv is not None:
+        k, v = torch.cat((kv[0], k), dim=2), torch.cat((kv[1], v), dim=2)
+    a = F.scaled_dot_product_attention(q, k, v)      # one query, every cached key and its own: the causal row
+    h = h + layer.proj(a.transpose(1, 2).reshape(b, n, w))
+    return h + layer.mlp(layer.ln2(h)), (k, v)

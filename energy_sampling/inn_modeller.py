@@ -68,6 +68,33 @@ from train import (Modeller, adjust_fig_filesize, condition_tracker_figs, equipa
 from utils import get_train_args, is_cuda_oom
 
 
+@torch.no_grad()
+def invert_block_cached(blk, y):
+    """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
+    per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
+    each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding."""
+    b = y.shape[0]
+    x = torch.zeros_like(y)
+    bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
+    mh = getattr(blk, 'min_height', None)
+    td = getattr(blk, 'tied', False)
+    nb = blk.n_bins
+
+    def solve_row(i, p):
+        shift, sp = p[:, -1:], p[:, :3 * nb].view(b, 1, 3, nb)
+        sl = slice(i, i + 1)
+        mhi = mh[sl] if mh is not None else None
+        if bnd is None:
+            z = rq_spline_inverse(y[:, sl], sp, blk.bound[sl], blk.is_wrap[sl], min_height=mhi, tied=td)
+        else:
+            z = rq_spline_inverse(y[:, sl], sp, blk.bound[sl], blk.is_wrap[sl], bnd[sl], shift, mhi, td)
+            shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
+        x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
+
+    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype)
+    return x
+
+
 def invert_differentiable(blk, y, ctx=None):
     """A block's inverse at y with the autograd graph kept (prior_flow.invert_block and
     _ContextBlock.invert run without one). After blk.d passes the result is the exact
@@ -289,7 +316,12 @@ class LatentFlow(nn.Module):
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
         for blk in reversed(list(f.blocks)):
-            z = blk.invert(z, f.d) if isinstance(blk, _MixBlock) else invert_block(blk, z, f.d)
+            if isinstance(blk, _MixBlock):
+                z = blk.invert(z, f.d)
+            elif isinstance(blk.made, CausalTransformerConditioner):
+                z = invert_block_cached(blk, z)       # one decode step per row, not d full passes
+            else:
+                z = invert_block(blk, z, f.d)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
         x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
         x = self._unfold(x)
