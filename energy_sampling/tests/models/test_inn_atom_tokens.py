@@ -196,6 +196,96 @@ def test_missing_atoms_raise():
     raise AssertionError("a condition with no atoms did not raise")
 
 
+def _live_flow(atoms=True):
+    """A double-precision conditional flow with every parameter moved off its initialisation, so the cross-attention
+    (zero-initialised output) and the head are both live."""
+    torch.manual_seed(8)
+    kw = dict(atoms=dict(node_dim=32, convs=2, cutoff=10.0, radial=8)) if atoms else {}
+    f = im.ConditionalLatentFlow(12, WRAP, [], 1 if atoms else 5, 32, 64, 1, 8, (64,), 5.0, 0,
+                                 transformer=(64, 2, 4), **kw)
+    for blk in f.flow.blocks:
+        blk.min_height = torch.full_like(blk.bound, 1e-5)
+        blk.tied = 2.0
+        blk.made.bf16 = False
+    with torch.no_grad():
+        for prm in f.parameters():
+            prm.add_(0.1 * torch.randn_like(prm))
+    f = f.double()
+    if atoms:
+        z, pos, n = _molecules(n_mol=6)
+        f.flow.set_atom_table(z, pos.double(), n)
+    return f
+
+
+def _cond(atoms, b, seed=9):
+    g = torch.Generator().manual_seed(seed)
+    if atoms:
+        return torch.randint(0, 6, (b, 1), generator=g).double()
+    return torch.randn(b, 5, generator=g, dtype=torch.float64)
+
+
+def _base_points(f, b, seed=10):
+    g = torch.Generator().manual_seed(seed)
+    u = 2 * torch.rand(b, 12, generator=g, dtype=torch.float64) - 1
+    return torch.where(f.flow.is_wrap, u, torch.randn(b, 12, generator=g, dtype=torch.float64))
+
+
+def test_cached_decode_with_context_equals_dpass():
+    # the sampler's cached decode (one conditioner step per row, the memory's keys and values projected once) against
+    # the d-pass inverse, on the same base points, with atom tokens and with a plain context vector
+    for atoms in (True, False):
+        f = _live_flow(atoms)
+        b = 400
+        c, z0 = _cond(atoms, b), _base_points(f, b)
+        blk = f.flow.blocks[0]
+        with torch.no_grad():
+            ctx = f.flow.context_input(c)[0]
+            x_d = blk.invert(z0, ctx)
+            x_c = im.invert_block_cached(blk, z0, ctx)
+        err = (x_c - x_d).abs().max(-1).values
+        assert float(torch.quantile(err, 0.99)) < 1e-9 and float(err.max()) < 1e-5, (atoms, float(err.max()))
+        if atoms:   # negative control: moving one molecule's atoms moves its rows' inverse
+            f.flow.atom_pos[c[0, 0].long(), 0] += 0.5
+            with torch.no_grad():
+                x_m = blk.invert(z0, f.flow.context_input(c)[0])
+            rows = c[:, 0] == c[0, 0]
+            assert float((x_m - x_d)[rows].abs().max()) > 1e-4
+
+
+def test_shared_context_encodes_once_per_tensor_and_changes_nothing():
+    # an energy step's reads -- draws on the fresh conditions, log q and the level on them and on the stored rows'
+    # conditions -- give the same loss and gradients with the context shared, from 3 encoder calls instead of 5
+    f = _live_flow(True)
+    calls = []
+    f.flow.atom_encoder.register_forward_hook(lambda *a: calls.append(1))
+    c_fresh, c_stored = _cond(True, 64, 11), _cond(True, 64, 12)
+    x_stored = f.sample(64, c_stored)
+
+    def step():
+        torch.manual_seed(13)
+        x = f.sample(64, c_fresh)
+        loss = (f.log_prob(x, c_fresh) - f.level(c_fresh)).sum() + (f.log_prob(x_stored, c_stored)
+                                                                    - f.level(c_stored)).sum()
+        f.zero_grad(set_to_none=True)
+        loss.backward()
+        return float(loss.detach()), {k: p.grad.clone() for k, p in f.named_parameters() if p.grad is not None}
+
+    calls.clear()
+    l0, g0 = step()
+    n0 = len(calls)
+    calls.clear()
+    with f.shared_context():
+        l1, g1 = step()
+        f.log_prob(x_stored[:4], c_stored[:4].clone())   # a different tensor is encoded again
+    n1 = len(calls)
+    assert f.flow._shared is None
+    assert l0 == l1 and g0.keys() == g1.keys()
+    # the same gradients up to summation order (one encoder backward with summed upstream gradients against two)
+    worst = max(float((g0[k] - g1[k]).abs().max() / g0[k].abs().max().clamp_min(1e-300)) for k in g0)
+    assert worst < 1e-12, worst
+    assert (n0, n1) == (5, 4), (n0, n1)
+
+
 def test_grouped_rows_keep_the_uniform_marginal():
     # --rows_per_molecule: k rows of one molecule per group, and every stored row as likely as in a uniform draw
     torch.manual_seed(7)
