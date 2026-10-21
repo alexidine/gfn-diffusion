@@ -527,6 +527,12 @@ class InnModeller(Modeller):
         if self.t_conditional and bool(self.args.temperature_conditioning):
             raise ValueError("--t_factor with the config's temperature_conditioning: one or the other")
         self.conditional = self.mol_conditional or self.t_conditional  # the flow reads a context, and has a level head
+        ck_inn = None
+        if inn.init_from is not None:
+            ck_inn = torch.load(inn.init_from, map_location='cpu', weights_only=False).get('inn') or {}
+        account = resolve_auto_options(inn, self.conditional, ck_inn)
+        if account:
+            print(f"options left unset, resolved: {account}", flush=True)
         cond_dim = mol_dim + int(self.t_conditional)
         self.log_T0 = math.log10(float(self.args.energy_config.temperature))
         self.t_span = math.log10(inn.t_factor) if self.t_conditional else 1.0
@@ -2247,16 +2253,19 @@ def build_parser():
     p.add_argument('--mix_k', type=int, default=0,
                    help='unconditional transformer runs: a mixture-CDF layer of this many wrapped-logistic components on '
                         'each wrapped row before its spline (empty gaps by construction); 0 = off')
-    p.add_argument('--min_bin_height', type=float, default=None,
-                   help='floor on the spline bin heights (fraction of the interval) on --min_bin_height_rows; '
-                        'unset = 1e-3 everywhere')
+    p.add_argument('--min_bin_height', default='auto',
+                   help="floor on the spline bin heights (fraction of the interval) on --min_bin_height_rows; 'auto' "
+                        "= 1e-7 on unconditional runs, the --init_from checkpoint's own floor, off on conditional "
+                        "runs; 'none' = 1e-3 everywhere")
     p.add_argument('--min_bin_height_rows', choices=['uniform', 'all'], default='all',
                    help='rows --min_bin_height applies to: the uniform-base (wrapped and bounded) rows, or every row')
-    p.add_argument('--tied_derivatives', action='store_true',
-                   help='derive each spline knot derivative from its two bins\' mean slopes (harmonic mean x a learned '
-                        'factor in [1/F, F], F = --tied_factor) instead of a free output')
-    p.add_argument('--tied_factor', type=float, default=2.0,
-                   help='with --tied_derivatives: the learned factor\'s range [1/F, F]; 1 = the pure harmonic mean')
+    p.add_argument('--tied_derivatives', action=argparse.BooleanOptionalAction, default=None,
+                   help="derive each spline knot derivative from its two bins' mean slopes (harmonic mean x a learned "
+                        "factor in [1/F, F], F = --tied_factor) instead of a free output; unset = on for unconditional "
+                        "runs, the --init_from checkpoint's own mode, off on conditional runs")
+    p.add_argument('--tied_factor', type=float, default=None,
+                   help="with --tied_derivatives: the learned factor's range [1/F, F]; 1 = the pure harmonic mean; "
+                        "unset = 2, or the --init_from checkpoint's own factor")
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--hidden_layers', type=int, default=2)
     p.add_argument('--bound', type=float, default=5.0)
@@ -2282,10 +2291,11 @@ def build_parser():
                         "w1r/worst <= --mle_plateau_w1_factor x w1r/perfect_worst; 0 = off (run to --mle_steps)")
     p.add_argument('--mle_plateau_nats', type=float, default=0.1)
     p.add_argument('--mle_plateau_w1_factor', type=float, default=1.5)
-    p.add_argument('--bounded_rows', default=None,
+    p.add_argument('--bounded_rows', default='auto',
                    help="unconditional runs: linear latent rows modelled on the closed interval [-1, 1] by a spline "
                         "with no tails and a uniform base, so q has no mass outside the latent box on them; "
-                        "'linear' = every live unwrapped row, or a comma-separated list; unset = off")
+                        "'linear' = every live unwrapped row, or a comma-separated list; 'none' = off; 'auto' = "
+                        "'linear' on unconditional runs, the --init_from checkpoint's own rows, off on conditional runs")
     p.add_argument('--context_dim', type=int, default=128, help='conditional runs: width of the condition embedding')
     p.add_argument('--context_hidden', type=int, default=512, help='conditional runs: width of the embedding MLP')
     # the two stages
@@ -2327,32 +2337,33 @@ def build_parser():
                         "batch's own Huber root (knee --beta_data). Evaluation reads the tied level in every mode")
     p.add_argument('--level_blend', type=float, default=0.5,
                    help="--level_mode blend: weight of the draws' (tied) level; the rest is the stored rows' own root")
-    # the tail bank: first-use draws with a large residual, reused as stored-like rows (off by default)
-    p.add_argument('--bank_frac', type=float, default=0.0,
-                   help='energy stage: share of the stored-side loss given to the tail bank (its own mean); 0 = off')
-    p.add_argument('--bank_admit', type=float, default=3.0,
+    # the replay bank: first-use draws with a large residual, reused as stored-like rows
+    p.add_argument('--bank_frac', type=float, default=None,
+                   help='energy stage: weight of the replay bank (its own mean); 0 = off; unset = 0.1 on unconditional '
+                        'runs, 0 on conditional runs')
+    p.add_argument('--bank_admit', type=float, default=2.0,
                    help='bank: a first-use draw is admitted when |log q - log R + root| exceeds this (nats)')
-    p.add_argument('--bank_max_excess', type=float, default=30.0,
+    p.add_argument('--bank_max_excess', type=float, default=1e9,
                    help='bank: only draws within this many kT (nats of log R) of the best stored row are admitted; '
                         'clash draws further out get their one fresh push and are never reused')
-    p.add_argument('--bank_admit_top', type=float, default=0.02,
+    p.add_argument('--bank_admit_top', type=float, default=1.0,
                    help='bank: at most this fraction of a scored batch is admitted per update, the largest residuals')
     p.add_argument('--bank_retire', type=float, default=1.0,
                    help='bank: a row retires once its residual against the stored level is under this (nats)')
     p.add_argument('--bank_max_visits', type=int, default=8, help='bank: a row retires after this many visits')
     p.add_argument('--bank_min_gap', type=int, default=10,
                    help='bank: a row is not revisited within this many updates of its last visit')
-    p.add_argument('--bank_batch', type=int, default=512, help='bank: rows per update (with replacement when fewer)')
+    p.add_argument('--bank_batch', type=int, default=256, help='bank: rows per update (with replacement when fewer)')
     p.add_argument('--bank_cap', type=int, default=200000, help='bank: ring capacity in rows')
     p.add_argument('--bank_beta', type=float, default=None, help='bank: Huber knee; unset = --beta')
     p.add_argument('--bank_anneal_from', type=float, default=None,
                    help='bank: from this fraction of the energy stage, the replay weight falls linearly to 0 at its end')
-    p.add_argument('--bank_additive', action='store_true',
+    p.add_argument('--bank_additive', action=argparse.BooleanOptionalAction, default=True,
                    help='bank: add the bank loss at weight --bank_frac x (fraction drawn) to the stored-side loss, '
                         'instead of taking that share from the stored rows')
     p.add_argument('--split_seed', type=int, default=None,
                    help='seed of the held-out-crystal split; unset = the run seed + 1')
-    p.add_argument('--bank_alpha', type=float, default=0.0,
+    p.add_argument('--bank_alpha', type=float, default=1.0,
                    help='bank: draw eligible rows with probability proportional to 1 + alpha |residual|; 0 = uniform')
     p.add_argument('--bank_min_excess', type=float, default=None,
                    help='bank: admit only over-weighted draws at least this many kT above the best stored row (clashes)')
@@ -2432,6 +2443,52 @@ def apply_overrides(args, overrides):
 
 
 ARM_OVERRIDES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', 'inn_arm_overrides.yaml')
+
+# the unconditional route's defaults for the options left unset ('auto' / None) on the command line: bounded linear rows,
+# tied knot derivatives, the bin-height floor and error-filtered replay. The conditional route refuses all four.
+UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0,
+                              bank_frac=0.1)
+
+
+def resolve_auto_options(inn, conditional, ck_inn=None):
+    """Fill the options left unset with a value and return a one-line account of where each came from.
+
+    Unset = 'auto' (`--bounded_rows`, `--min_bin_height`) or None (`--tied_derivatives`, `--tied_factor`,
+    `--bank_frac`). The density options (bounded rows, floor, derivative mode and factor) take the `--init_from`
+    checkpoint's own setting when `ck_inn` (its saved `inn` entry) is given, a key absent there meaning the setting it
+    was trained under before the key existed (off, 1e-3 everywhere, free); otherwise the unconditional route's default
+    (UNCONDITIONAL_DEFAULTS), or off on a conditional run. Replay (`--bank_frac`) is a training setting and takes the
+    route's default either way. 'none' turns `--bounded_rows` or `--min_bin_height` off explicitly."""
+    src = []
+
+    def pick(key, from_ck, route, off):
+        if ck_inn is not None and from_ck:
+            val, where = ck_inn.get(key, off), 'checkpoint'
+        elif conditional:
+            val, where = off, 'conditional route'
+        else:
+            val, where = route, 'unconditional default'
+        src.append(f"{key}={val} ({where})")
+        return val
+
+    if inn.bounded_rows == 'auto':
+        inn.bounded_rows = pick('bounded_rows', True, UNCONDITIONAL_DEFAULTS['bounded_rows'], None)
+    elif inn.bounded_rows == 'none':
+        inn.bounded_rows = None
+    if inn.min_bin_height == 'auto':
+        inn.min_bin_height = pick('min_bin_height', True, UNCONDITIONAL_DEFAULTS['min_bin_height'], None)
+    elif inn.min_bin_height == 'none':
+        inn.min_bin_height = None
+    elif inn.min_bin_height is not None:
+        inn.min_bin_height = float(inn.min_bin_height)
+    if inn.tied_derivatives is None:
+        inn.tied_derivatives = bool(pick('tied_derivatives', True, UNCONDITIONAL_DEFAULTS['tied_derivatives'], False))
+    if inn.tied_factor is None:
+        inn.tied_factor = float(pick('tied_factor', True, UNCONDITIONAL_DEFAULTS['tied_factor'], 2.0)
+                                if inn.tied_derivatives else 2.0)
+    if inn.bank_frac is None:
+        inn.bank_frac = float(pick('bank_frac', False, UNCONDITIONAL_DEFAULTS['bank_frac'], 0.0))
+    return ', '.join(src)
 
 
 def apply_arm_overrides(inn, path=ARM_OVERRIDES):
