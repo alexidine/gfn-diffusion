@@ -25,7 +25,10 @@ from energies.prior_flow import _SOFTPLUS_ONE
 
 
 class _CausalLayer(nn.Module):
-    def __init__(self, width, heads, mlp_ratio=4):
+    """Pre-norm causal self-attention and MLP; with `cross`, a cross-attention block between them in which every slot
+    attends to a memory of tokens (the molecule's atoms), all of which every slot may see."""
+
+    def __init__(self, width, heads, mlp_ratio=4, cross=False):
         super().__init__()
         if width % heads:
             raise ValueError(f"transformer width {width} is not a multiple of {heads} heads")
@@ -33,25 +36,49 @@ class _CausalLayer(nn.Module):
         self.ln1 = nn.LayerNorm(width)
         self.qkv = nn.Linear(width, 3 * width)
         self.proj = nn.Linear(width, width)
+        self.cross = bool(cross)
+        if self.cross:
+            self.ln_x = nn.LayerNorm(width)
+            self.q_x = nn.Linear(width, width)
+            self.kv_x = nn.Linear(width, 2 * width)
+            self.proj_x = nn.Linear(width, width)
+            nn.init.zeros_(self.proj_x.weight)  # a new cross block starts as the identity
+            nn.init.zeros_(self.proj_x.bias)
         self.ln2 = nn.LayerNorm(width)
         self.mlp = nn.Sequential(nn.Linear(width, mlp_ratio * width), nn.SiLU(),
                                  nn.Linear(mlp_ratio * width, width))
 
-    def forward(self, h):
+    def forward(self, h, mem=None, mem_mask=None):
         b, n, w = h.shape
         q, k, v = self.qkv(self.ln1(h)).view(b, n, 3, self.heads, w // self.heads).permute(2, 0, 3, 1, 4)
         a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         h = h + self.proj(a.transpose(1, 2).reshape(b, n, w))
+        if self.cross and mem is not None:
+            h = h + self.proj_x(_cross_attend(self.q_x(self.ln_x(h)), self.kv_x(mem), mem_mask, self.heads))
         return h + self.mlp(self.ln2(h))
+
+
+def _cross_attend(q, kv, mem_mask, heads):
+    """Multi-head attention of queries q [b, n, w] over memory keys and values kv [b, m, 2w]; mem_mask [b, m] is True
+    on real tokens (padding is never attended)."""
+    b, n, w = q.shape
+    m = kv.shape[1]
+    q = q.view(b, n, heads, w // heads).transpose(1, 2)
+    k, v = kv.view(b, m, 2, heads, w // heads).permute(2, 0, 3, 1, 4)
+    bias = None if mem_mask is None else mem_mask[:, None, None, :]
+    a = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+    return a.transpose(1, 2).reshape(b, n, w)
 
 
 class CausalTransformerConditioner(nn.Module):
     """Features of x in, spline parameters of every dim out (dim order), autoregressive in `order`."""
 
-    def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, context_dim=None):
+    def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, context_dim=None, cross=False):
         super().__init__()
-        # conditional runs: the condition's embedding, projected to the width, is added to every token
+        # conditional runs: the condition's embedding, projected to the width, is added to every token; with `cross`,
+        # every layer also cross-attends to a memory of tokens passed with it (forward's ctx = (vector, memory, mask))
         self.ctx = nn.Linear(context_dim, width) if context_dim else None
+        self.cross = bool(cross)
         d = len(order)
         self.d, self.n_params = d, 3 * n_bins + 1
         self.register_buffer('order', torch.as_tensor(order, dtype=torch.long))
@@ -61,7 +88,7 @@ class CausalTransformerConditioner(nn.Module):
         self.dim_emb = nn.Parameter(torch.zeros(d, width))           # which dim a value belongs to
         self.slot_emb = nn.Parameter(0.02 * torch.randn(d, width))   # which dim a slot predicts
         self.start = nn.Parameter(torch.zeros(width))
-        self.layers = nn.ModuleList(_CausalLayer(width, heads) for _ in range(layers))
+        self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross) for _ in range(layers))
         self.ln = nn.LayerNorm(width)
         self.bf16 = True
         self.head = nn.Linear(width, self.n_params)
@@ -79,6 +106,13 @@ class CausalTransformerConditioner(nn.Module):
         h = torch.cat((self.start.expand(b, 1, width), val[:, self.order[:-1]]), dim=1) + self.slot_emb
         if (ctx is None) != (self.ctx is None):
             raise ValueError("a conditional transformer conditioner needs ctx, an unconditional one takes none")
+        mem = mem_mask = None
+        if isinstance(ctx, tuple):
+            ctx, mem, mem_mask = ctx
+            if not self.cross:
+                raise ValueError("a memory of tokens was passed to a conditioner built without cross-attention")
+        elif self.cross and ctx is not None:
+            raise ValueError("a cross-attending conditioner needs ctx = (vector, memory, mask)")
         if ctx is not None:
             h = h + self.ctx(ctx).unsqueeze(1)
         # layers in bf16 on CUDA (2x faster on the local card; causal masking stays exact),
@@ -90,7 +124,8 @@ class CausalTransformerConditioner(nn.Module):
             for layer in self.layers:
                 # under autograd each layer is recomputed in backward: a full-width layer's
                 # internals at 8192 rows x 12 tokens are ~1.7 GB, stored they exceed a shared card
-                h = checkpoint(layer, h, use_reentrant=False) if torch.is_grad_enabled() else layer(h)
+                h = (checkpoint(layer, h, mem, mem_mask, use_reentrant=False) if torch.is_grad_enabled()
+                     else layer(h, mem, mem_mask))
         out = self.head(self.ln(h.to(feats.dtype)))       # [b, d, n_params], slot order
         return out[:, self.slot_of_dim].reshape(b, self.d * self.n_params)
 

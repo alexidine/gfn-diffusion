@@ -373,7 +373,7 @@ class _ContextBlock(_Block):
         shift, sp = self.spline_params(x, ctx)
         z = x + shift
         z = torch.where(self.is_wrap, _wrap(z), z)
-        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap)
+        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
         return y, ld.sum(-1)
 
     @torch.no_grad()
@@ -382,9 +382,50 @@ class _ContextBlock(_Block):
         x = torch.zeros_like(y)
         for _ in range(self.d):
             shift, sp = self.spline_params(x, ctx)
-            z = rq_spline_inverse(y, sp, self.bound, self.is_wrap)
+            z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
             x = torch.where(self.is_wrap, _wrap(z - shift), z - shift)
         return x
+
+
+class AtomEncoder(nn.Module):
+    """A molecule as tokens, one per atom, for the conditional flow to cross-attend to.
+
+    Node inputs are the atomic number and the atom's coordinates in the frame the latent's orientation rows rotate
+    from (the standard frame), PointNet style; mxtaltools' ScalarGNN runs radial-basis message passing over a radius
+    graph within each molecule. Each atom's token is its node embedding with an embedding of its coordinates
+    re-appended, projected to the transformer width; an attention pool gives one vector per molecule. Not
+    rotation-invariant by design: the condition and its orientation target share the frame. Norms see the batch index,
+    so a molecule's tokens do not depend on the molecules encoded with it."""
+
+    def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64):
+        super().__init__()
+        from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
+        self.cutoff, self.max_neighbors = float(cutoff), int(max_neighbors)
+        self.gnn = ScalarGNN(input_node_dim=4, node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2,
+                             embedding_dim=node_dim, num_convs=convs, num_radial=radial, cutoff=cutoff,
+                             max_num_neighbors=max_neighbors, atom_type_embedding_dim=16, norm='layer')
+        self.pos_emb = nn.Sequential(nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64))
+        self.tok = nn.Linear(node_dim + 64, width)
+        self.pool_q = nn.Parameter(torch.zeros(node_dim))
+        self.pool_out = nn.Linear(node_dim, pooled_dim)
+
+    def forward(self, z, pos, n):
+        """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> tokens [u, a, width],
+        mask [u, a] (True on atoms), pooled [u, pooled_dim]."""
+        from mxtaltools.models.functions.radial_graph import build_radial_graph
+        u, a = z.shape
+        mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
+        batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
+        zf, pf = z[mask], pos[mask]
+        ptr = F.pad(torch.cumsum(n, 0), (1, 0))
+        edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
+        h = self.gnn(torch.cat([zf.to(pf.dtype)[:, None], pf], -1), pf, batch, edges)       # [nodes, node_dim]
+        node = h.new_zeros(u, a, h.shape[-1])
+        node[mask] = h
+        tokens = self.tok(torch.cat([node, self.pos_emb(pos)], -1))
+        score = (node * self.pool_q).sum(-1).masked_fill(~mask, float('-inf'))
+        pooled = self.pool_out((torch.softmax(score, -1)[..., None] * node).sum(1))
+        return tokens, mask, pooled
 
 
 class _ResMLP(nn.Module):
@@ -409,9 +450,12 @@ class _ContextFlow(nn.Module):
     """The blocks of a conditional flow, the condition's embedding, and the level head."""
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None):
+                 transformer=None, atoms=None):
         super().__init__()
         d = len(wrap_mask)
+        # atoms: AtomEncoder settings (dict). The condition is then the molecule itself: column 0 of c is the condition
+        # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through
+        self.atoms = atoms is not None
         self.d, self.bound = d, bound
         self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
         self.register_buffer('mu', torch.zeros(d))
@@ -428,16 +472,45 @@ class _ContextFlow(nn.Module):
                 orders.append(list(range(d))[::-1])
             else:
                 orders.append(torch.randperm(d, generator=g).tolist())
+        self.orders = orders
         self.blocks = nn.ModuleList(
             _ContextBlock(o, wrap_mask, n_bins, hidden, bound, context_dim) for o in orders)
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
-                                                        context_dim=context_dim)
-        self.context = _ResMLP(cond_dim, context_hidden, context_dim)
-        self.level = _ResMLP(cond_dim, 256, 1)
+                                                        context_dim=context_dim, cross=self.atoms)
+        elif self.atoms:
+            raise NotImplementedError("atom tokens need --conditioner transformer (the MADE has no cross-attention)")
+        n_in = cond_dim
+        if self.atoms:
+            self.atom_encoder = AtomEncoder(transformer[0], **atoms)
+            n_in = self.atom_encoder.pool_out.out_features + cond_dim - 1   # pooled molecule + the columns after the id
+            for name in ('atom_z', 'atom_pos', 'atom_n'):
+                self.register_buffer(name, None, persistent=False)
+        self.context = _ResMLP(n_in, context_hidden, context_dim)
+        self.level = _ResMLP(n_in, 256, 1)
         nn.init.zeros_(self.level.out[-1].weight)
         nn.init.zeros_(self.level.out[-1].bias)
+
+    def set_atom_table(self, z, pos, n):
+        """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
+        atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
+        self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+
+    def context_input(self, c):
+        """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's
+        input in atom mode, else the embedded standardised condition and the standardised condition."""
+        if not self.atoms:
+            s = self.standardise(c)
+            return self.context(s), s
+        cid = c[:, 0].round().long()
+        if self.atom_z is None or bool((self.atom_n[cid] == 0).any()):
+            raise RuntimeError("a condition id with no atoms in the atom table")
+        uniq, inv = torch.unique(cid, return_inverse=True)
+        dtype = self.c_mu.dtype   # the flow's own precision (a double copy for the round-trip check), as standardise
+        tokens, mask, pooled = self.atom_encoder(self.atom_z[uniq], self.atom_pos[uniq].to(dtype), self.atom_n[uniq])
+        s = torch.cat([pooled[inv], c[:, 1:].to(dtype)], -1)
+        return (self.context(s), tokens[inv], mask[inv]), s
 
     def set_scaler(self, x):
         """Standardise the LINEAR dims only; wrapped dims must stay on the circle."""
@@ -457,18 +530,18 @@ class ConditionalLatentFlow(nn.Module):
     """q(x | c): LatentFlow with every block reading an embedding of the condition vector c."""
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
-                 n_blocks, n_bins, hidden, bound, seed, transformer=None):
+                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
         self.dim = dim
         self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
-                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer)
+                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms)
 
     def to_base(self, x, c):
         f = self.flow
-        ctx = f.context(f.standardise(c))
+        ctx = f.context_input(c)[0]
         x = x[:, self.live_idx]
         z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
         ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
@@ -489,7 +562,7 @@ class ConditionalLatentFlow(nn.Module):
     def sample(self, n, c, return_base: bool = False):
         f = self.flow
         dev, dtype = f.mu.device, f.mu.dtype
-        ctx = f.context(f.standardise(c))
+        ctx = f.context_input(c)[0]
         z0 = torch.where(f.is_wrap, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
@@ -502,7 +575,7 @@ class ConditionalLatentFlow(nn.Module):
     def rsample(self, z0, c):
         """The draw sample() makes from base points z0, differentiable in the parameters."""
         f = self.flow
-        ctx = f.context(f.standardise(c))
+        ctx = f.context_input(c)[0]
         z = z0
         for blk in reversed(list(f.blocks)):
             z = invert_differentiable(blk, z, ctx)
@@ -512,7 +585,7 @@ class ConditionalLatentFlow(nn.Module):
 
     def level(self, c):
         """log Z(c) up to the batch's shared level: the head, zero at initialisation."""
-        return self.flow.level(self.flow.standardise(c)).squeeze(-1)
+        return self.flow.level(self.flow.context_input(c)[1]).squeeze(-1)
 
 
 def tb_loss(resid, beta):
@@ -585,9 +658,20 @@ class InnModeller(Modeller):
             if block_orders is not None or half_rows or bounded_rows or inn.mix_k:
                 raise NotImplementedError("--block_orders, --fold_half_rows, --bounded_rows and --mix_k are built "
                                           "for unconditional runs only")
+            atoms = None
+            if inn.atom_tokens:
+                # the condition is the molecule itself: c = [condition id] (+ the temperature column), the atoms looked
+                # up in the table set from the conditions files (init_data_rows) and encoded by the flow
+                if not self.mol_conditional:
+                    raise NotImplementedError("--atom_tokens needs molecule conditions (embedding_conditioning)")
+                if transformer is None:
+                    raise NotImplementedError("--atom_tokens needs --conditioner transformer")
+                atoms = dict(node_dim=inn.atom_node_dim, convs=inn.atom_convs, cutoff=inn.atom_cutoff,
+                             radial=inn.atom_radial)
+                cond_dim = 1 + int(self.t_conditional)
             self.sampler = ConditionalLatentFlow(dim, wrap_mask, dead_rows, cond_dim, inn.context_dim,
                                                  inn.context_hidden, *shape, seed=int(self.args.seed),
-                                                 transformer=transformer)
+                                                 transformer=transformer, atoms=atoms)
         else:
             self.sampler = LatentFlow(dim, wrap_mask, dead_rows, *shape, seed=int(self.args.seed),
                                       transformer=transformer, block_orders=block_orders, half_rows=half_rows,
@@ -597,8 +681,6 @@ class InnModeller(Modeller):
             # a lower floor on the spline's bin heights on the chosen rows: with a uniform base (wrapped and bounded
             # rows) each bin holds at least its height floor of the row's mass whatever the weights, so the default
             # 1e-3 x n_bins is mass no training can remove
-            if not isinstance(self.sampler, LatentFlow):
-                raise NotImplementedError("--min_bin_height is built for unconditional runs only")
             h0 = float(inn.min_bin_height)  # an arm-override file may hand a YAML '1e-6' over as a string
             if not 0.0 < h0 < 1.0 / inn.n_bins:
                 raise ValueError(f"--min_bin_height {h0:g} must lie in (0, 1/n_bins = {1.0 / inn.n_bins:g}): at or "
@@ -618,8 +700,8 @@ class InnModeller(Modeller):
         if inn.tied_derivatives:
             # knot derivatives derived from the neighbouring bin slopes (prior_flow._tied_derivatives): no knot far
             # steeper than both bins it joins, so near-empty bins carry no density spikes
-            if not isinstance(self.sampler, LatentFlow) or inn.mix_k:
-                raise NotImplementedError("--tied_derivatives is built for unconditional runs without --mix_k")
+            if inn.mix_k:
+                raise NotImplementedError("--tied_derivatives with --mix_k")
             tf = float(inn.tied_factor)
             if not tf >= 1.0:
                 raise ValueError(f"--tied_factor {tf:g} must be at least 1 (the learned factor's range is [1/F, F])")
@@ -742,15 +824,34 @@ class InnModeller(Modeller):
         self.mol_row_of_cid = torch.full((n_cond,), -1, dtype=torch.long, device=self.device)
         self.mol_row_of_cid[mol_cid] = torch.arange(mol_cid.numel(), device=self.device)
 
+        if self.inn.atom_tokens:
+            # per condition id, its molecule's atoms in the standard frame, filled from the conditions files below
+            sets = [self.mol_dataset] + ([self.test_mol_dataset]
+                                         if getattr(self, 'test_mol_dataset', None) is not None else [])
+            a_max = max(int(torch.diff(ds.batch.ptr).max()) for ds in sets)
+            self.atom_table = (torch.zeros(n_cond, a_max, dtype=torch.long, device=self.device),
+                               torch.zeros(n_cond, a_max, 3, device=self.device),
+                               torch.zeros(n_cond, dtype=torch.long, device=self.device))
         if self.mol_conditional:
             # the conditions files' own crystals: one reference structure per molecule, held-out included
             self.fold_condition_crystals(self.mol_dataset, held_out=False)
             if getattr(self, 'test_mol_dataset', None) is not None:
                 self.fold_condition_crystals(self.test_mol_dataset, held_out=True)
+        if self.inn.atom_tokens:
+            z_t, pos_t, n_t = self.atom_table
+            need = torch.unique(torch.cat([self.cid_train, self.cid_val]))
+            if bool((n_t[need] == 0).any()):
+                raise RuntimeError(f"--atom_tokens: {int((n_t[need] == 0).sum())} stored-row conditions have no "
+                                   f"molecule in the conditions files")
+            self.sampler.flow.set_atom_table(z_t, pos_t, n_t)
+            print(f"atom tokens: {int((n_t > 0).sum())} molecules in the atom table, up to {z_t.shape[1]} atoms, "
+                  f"standard-frame coordinates", flush=True)
         if self.conditional:
             ids = (self.cond_known.nonzero().flatten() if self.mol_conditional
                    else torch.zeros(4096, dtype=torch.long, device=self.device))
             self.sampler.flow.set_condition_scaler(self.context_of(ids, self.training_log_T(ids.numel())))
+        if self.mol_conditional and getattr(self, 'mol_crystals_test', None) is not None:
+            self.save_condition_neighbours()
 
         e = -lr * T
         q10, q50, q90 = quantiles(e)
@@ -767,6 +868,40 @@ class InnModeller(Modeller):
                   f"{int(torch.isfinite(self.condition_log_z.best_energy).sum())} training and "
                   f"{int(torch.isfinite(self.test_floor).sum())} held-out conditions an energy floor", flush=True)
         self.data_energy = dict(min=float(e.min()), p10=q10, p50=q50, p90=q90)
+
+    @torch.no_grad()
+    def save_condition_neighbours(self, chunk: int = 1024):
+        """condition_neighbours.npz: for each molecule of molecule_nll (held-out, and the fixed training draw), its
+        nearest OTHER training molecule and the distance to it in the stored condition vectors (the conditions
+        file's embedding), the same distance for every arm whatever its conditioner reads."""
+        train = torch.unique(self.cid_train)
+        e_tr = self.cond_table[train].float()
+        out = {}
+        for side in ('train', 'test'):
+            cid = torch.unique(getattr(self, f'mol_crystals_{side}')[1])
+            near, dist = [], []
+            for start in range(0, cid.numel(), chunk):
+                q = cid[start:start + chunk]
+                d = torch.cdist(self.cond_table[q].float(), e_tr)
+                d[q[:, None] == train[None, :]] = float('inf')   # a training molecule's own row
+                v, i = d.min(1)
+                dist.append(v)
+                near.append(train[i])
+            out.update({f'{side}_cid': cid.cpu().numpy(), f'{side}_near': torch.cat(near).cpu().numpy(),
+                        f'{side}_dist': torch.cat(dist).cpu().numpy()})
+        np.savez(os.path.join(self.out_dir, 'condition_neighbours.npz'), **out)
+
+    def note_atoms(self, cid, mol_batch):
+        """Each molecule's atomic numbers and coordinates, as the batch holds them (the standard frame), into the
+        atom table at its condition id."""
+        z_t, pos_t, n_t = self.atom_table
+        nodes = mol_batch.batch.to(self.device)
+        ptr = mol_batch.ptr.to(self.device)
+        idx = torch.arange(nodes.numel(), device=self.device) - ptr[nodes]
+        rows = cid[nodes]
+        z_t[rows, idx] = mol_batch.z.long().to(self.device).flatten()
+        pos_t[rows, idx] = mol_batch.pos.float().to(self.device)
+        n_t[cid] = torch.diff(ptr)
 
     def note_conditions(self, cid, cond):
         if self.mol_conditional:
@@ -791,6 +926,8 @@ class InnModeller(Modeller):
             cid = cid.long().to(self.device)
             log_r = ef.log_reward(x, sub, log_T, False, internal_oom_recovery=True).flatten().to(self.device)
             self.note_conditions(cid, cond)
+            if self.inn.atom_tokens:
+                self.note_atoms(cid, sub)
             ok = torch.isfinite(log_r)
             if held_out:
                 self.test_floor.scatter_reduce_(0, cid[ok], -log_r[ok] * T, reduce='amin')
@@ -807,13 +944,17 @@ class InnModeller(Modeller):
             x, cid = x[keep], cid[keep]
         setattr(self, 'mol_crystals_test' if held_out else 'mol_crystals_train', (x, cid))
 
-    def pack(self, cond, log_T):
-        """The flow's context input: the row's condition vector, when the config gives one, and
-        under temperature conditioning where log T sits in the trained range (0 at the run's
-        own temperature, 1 at t_factor times it)."""
+    def pack(self, cond, log_T, cid=None):
+        """The flow's context input: the row's condition vector, when the config gives one (under
+        --atom_tokens its condition id instead, whose atoms the flow looks up), and under
+        temperature conditioning where log T sits in the trained range (0 at the run's own
+        temperature, 1 at t_factor times it)."""
         if not self.conditional:
             return None
-        parts = [cond.float().to(self.device)] if self.mol_conditional else []
+        if self.inn.atom_tokens:
+            parts = [cid.float().to(self.device).reshape(-1, 1)]
+        else:
+            parts = [cond.float().to(self.device)] if self.mol_conditional else []
         if self.t_conditional:
             parts.append(((log_T.flatten().float().to(self.device) - self.log_T0) / self.t_span).unsqueeze(-1))
         return torch.cat(parts, -1)
@@ -824,7 +965,7 @@ class InnModeller(Modeller):
             return None
         if log_T is None:
             log_T = torch.full((cid.shape[0],), self.log_T0, device=self.device)
-        return self.pack(self.cond_table[cid] if self.mol_conditional else None, log_T)
+        return self.pack(self.cond_table[cid] if self.mol_conditional else None, log_T, cid)
 
     def level_of(self, c):
         return self.sampler.level(c) if self.conditional else 0.0
@@ -876,7 +1017,7 @@ class InnModeller(Modeller):
         mol_batch, run_log_T, cond, cid = self.energy_function.condition_samples(mol_batch)
         if log_T is not None:
             run_log_T = log_T.to(run_log_T).reshape(run_log_T.shape)
-        return mol_batch, run_log_T, self.pack(cond, run_log_T), cid.long().to(self.device)
+        return mol_batch, run_log_T, self.pack(cond, run_log_T, cid), cid.long().to(self.device)
 
     def jitter(self, x, log_range):
         """Stored rows displaced along a random direction by a log10-uniform magnitude in
@@ -1109,6 +1250,11 @@ class InnModeller(Modeller):
                             m['Excess Energy Frac Above 50'] = float((u > 50.0).mean())
                             m['Excess Energy Nats P99.9'] = float(np.quantile(u, 0.999))
                     self.write(m, step)
+                    rows = getattr(self, 'molecule_nll_rows', {})
+                    if rows:   # -log q of each molecule's own crystal, by condition id (non-finite kept)
+                        np.savez(os.path.join(self.out_dir, f'molecule_nll_step{step:06d}.npz'),
+                                 **{f'{side}_{k}': v for side, (c, l) in rows.items()
+                                    for k, v in (('cid', c), ('nll', l))})
                     # the draws' per-row excess, log10(1 + excess kT): write() sends arrays to wandb as a 32-bin
                     # histogram only, and a bootstrap error on a tail quantile needs the rows themselves
                     ex = m.get('Excess Energy Nats')
@@ -1586,12 +1732,29 @@ class InnModeller(Modeller):
         m = P + min(self.n_appended, cap)
         self.x_train, self.lr_train, self.cid_train, self.src_train = (st[k][:m] for k in ('x', 'lr', 'cid', 'src'))
 
+    def molecule_grouped_rows(self, n, k):
+        """About n stored-row indices as n // k molecules with k rows each: molecules in proportion to their row
+        counts, rows uniformly within a molecule (with replacement), so every row's marginal is the uniform draw's.
+        Under --atom_tokens the encoder then runs on n // k molecules instead of about n."""
+        m = self.cid_train.shape[0]
+        if getattr(self, '_by_molecule', (None,))[0] != m:
+            order = torch.argsort(self.cid_train)
+            _, counts = torch.unique_consecutive(self.cid_train[order], return_counts=True)
+            self._by_molecule = (m, order, counts, F.pad(torch.cumsum(counts, 0), (1, 0))[:-1])
+        _, order, counts, start = self._by_molecule
+        mol = torch.multinomial(counts.float(), max(1, n // k), replacement=True)
+        off = (torch.rand(mol.numel(), k, device=counts.device) * counts[mol, None]).long()
+        return order[(start[mol, None] + off).flatten()]
+
     def step_loss(self, stage, log_z):
         inn = self.inn
         stats = {}
-        idx = torch.randint(0, self.x_train.shape[0],
-                            (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
-                            device=self.device)
+        if stage == 'mle' and inn.rows_per_molecule > 1:
+            idx = self.molecule_grouped_rows(self.batch_now['mle'], inn.rows_per_molecule)
+        else:
+            idx = torch.randint(0, self.x_train.shape[0],
+                                (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
+                                device=self.device)
         x_d, cid_d, src_all = self.x_train[idx], self.cid_train[idx], self.src_train[idx]
         log_T_d = self.training_log_T(idx.numel())
         c_d = self.context_of(cid_d, log_T_d)
@@ -2090,6 +2253,7 @@ class InnModeller(Modeller):
         on a fixed 10,000 training molecules (eval_bwd/mle_mol_crystals). eval_bwd/mle_heldout_rows
         is on held-out ROWS of training molecules, so it cannot see generalisation across molecules."""
         m = {}
+        self.molecule_nll_rows = {}   # per crystal, for the gap against distance to the training molecules
         for side in ('train', 'test'):
             held = getattr(self, f'mol_crystals_{side}', None)
             if held is None or held[0].shape[0] == 0:
@@ -2097,6 +2261,7 @@ class InnModeller(Modeller):
             x, cid = held
             lq = torch.cat([self.sampler.log_prob(x[i:i + chunk], self.context_of(cid[i:i + chunk]))
                             for i in range(0, x.shape[0], chunk)])
+            self.molecule_nll_rows[side] = (cid.cpu().numpy(), (-lq).double().cpu().numpy())
             lq = lq[torch.isfinite(lq)]
             key = 'eval_test/mle' if side == 'test' else 'eval_bwd/mle_mol_crystals'
             m[key] = float(-lq.mean())
@@ -2299,6 +2464,19 @@ def build_parser():
     p.add_argument('--tied_factor', type=float, default=None,
                    help="with --tied_derivatives: the learned factor's range [1/F, F]; 1 = the pure harmonic mean; "
                         "unset = 2, or the --init_from checkpoint's own factor")
+    p.add_argument('--atom_tokens', action='store_true',
+                   help='conditional runs: condition on the molecule itself, one token per atom (atomic number and '
+                        'standard-frame coordinates) from a ScalarGNN, which every causal layer cross-attends to, '
+                        'instead of the stored embedding vector')
+    p.add_argument('--atom_node_dim', type=int, default=128, help="--atom_tokens: the atom encoder's node width")
+    p.add_argument('--atom_convs', type=int, default=3, help='--atom_tokens: radial message-passing rounds')
+    p.add_argument('--atom_cutoff', type=float, default=10.0,
+                   help='--atom_tokens: radius-graph cutoff within a molecule (angstrom)')
+    p.add_argument('--atom_radial', type=int, default=32, help='--atom_tokens: radial basis functions per edge')
+    p.add_argument('--rows_per_molecule', type=int, default=1,
+                   help='likelihood stage: draw each batch as batch / k molecules with k stored rows each (molecules in '
+                        'proportion to their rows, so each row is as likely as in a uniform draw); with --atom_tokens '
+                        'the encoder runs on k times fewer molecules')
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--hidden_layers', type=int, default=2)
     p.add_argument('--bound', type=float, default=5.0)
