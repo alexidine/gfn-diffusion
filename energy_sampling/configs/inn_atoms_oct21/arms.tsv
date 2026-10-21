@@ -1,0 +1,7 @@
+# inn_atoms_oct21 arms, read by submit_inn_atoms_oct21.sbatch when the job STARTS (edit here, in place, before it starts).
+# Columns (tab-separated, 4): index, arm, flags beyond common.args ('-' = none; later flags win), the arm's share of the
+# card's memory (--cuda_memory_fraction; the local prototype peaked at 12.2 GB, so 0.2 = 16 GB). All arms run at once.
+0	atoms	--atom_tokens	0.2
+1	atoms_big	--atom_tokens --tf_width 384 --tf_layers 6 --tf_heads 8	0.3
+2	base	-	0.2
+3	atoms_s1	--atom_tokens --set seed=1 --split_seed 12346	0.2
