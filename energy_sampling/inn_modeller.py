@@ -2259,12 +2259,16 @@ class InnModeller(Modeller):
         err = torch.where(s.flow.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values
         m['eval_fwd/round_trip_p99'] = quantiles(err, (0.99,))[0]
 
-        lq_val = s.log_prob(self.x_val, self.context_of(self.cid_val))
+        # in chunks, as molecule_nll: under --atom_tokens each call encodes its rows' molecules at once
+        rows = lambda fn, n, k=4096: torch.cat([fn(slice(i, min(i + k, n))) for i in range(0, n, k)])
+        lq_val = rows(lambda j: s.log_prob(self.x_val[j], self.context_of(self.cid_val[j])), self.x_val.shape[0])
         sub = torch.arange(min(self.x_val.shape[0], self.n_prior_rows), device=self.device)
         # -log q of stored rows: the training split, and held-out rows of the same molecules
         m['eval_bwd/mle_heldout_rows'] = float(-lq_val.mean())
-        m['eval_bwd/mle'] = float(-s.log_prob(self.x_train[sub], self.context_of(self.cid_train[sub])).mean())
-        head_val = self.level_of(self.context_of(self.cid_val)) if self.conditional else 0.0
+        m['eval_bwd/mle'] = float(-rows(lambda j: s.log_prob(self.x_train[sub[j]], self.context_of(self.cid_train[sub[j]])),
+                                        sub.numel()).mean())
+        head_val = (rows(lambda j: self.level_of(self.context_of(self.cid_val[j])), self.cid_val.shape[0])
+                    if self.conditional else 0.0)
 
         # calibration of the exact density: log q (+ the row's level) regressed on log R, on the draws
         # and on stored rows -- the parity plots' fitted line. Slope 1 where q is Boltzmann-shaped;
