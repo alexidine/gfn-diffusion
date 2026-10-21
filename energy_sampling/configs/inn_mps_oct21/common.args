@@ -1,0 +1,10 @@
+# inn_mps_oct21 flags shared by every run, read when the job STARTS. BOTH: both stages; MLE: stage 1; ENERGY: stage 2;
+# SEED_<tag>: the seed flags of a stage-1 run and of the arms that start from it (split kept: the held-out crystals are
+# the same for both seeds). Stage 1 is the 20 Oct recipe (floor 1e-5); stage 2 the candidate default (bounded rows, tied
+# derivatives, floor 1e-7, error-filtered replay 0.1) with the occupancy sizer off, 4096 stored rows per update, 10k-draw
+# evals and a 26-hour clock schedule. Every option is explicit, so the code defaults do not matter.
+BOTH	--config configs/mk_dev.yaml --tag inn_mps21 --prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_elj_pooled_oct05_prior.pt --conditioner transformer --tf_width 256 --tf_layers 4 --tf_heads 8 --n_bins 32 --n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0 --val_group_ignore_rows 6,7,8 --bounded_rows linear --tied_derivatives --tied_factor 2 --set energy_config.bounding_coeff=1000 --set energy_config.reduction_coeff=1000 --set checkpoints_dir=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints --set gpu_util_sample_period_s=10 --oom_retries 3 --log_every 50 --util_target 0
+MLE	--energy_steps 0 --mle_steps 10000 --lr_mle 1e-3 --mle_batch 8192 --mle_noise_log_range -1.6126 -1.6126 --eval_every 1000 --eval_samples 4000 --min_bin_height 1e-5 --bank_frac 0 --max_minutes 150 --cuda_memory_fraction 0.3
+ENERGY	--mle_steps 0 --tf_fp32 --batch 2000 --stored_batch 4096 --lr_energy 3e-4 --lr_energy_final 1e-5 --energy_warmup 200 --beta_data 80 --fast_scoring --min_bin_height 1e-7 --bank_frac 0.1 --bank_additive --bank_admit 2 --bank_admit_top 1.0 --bank_max_excess 1e9 --bank_batch 256 --bank_alpha 1.0 --eval_every 2000 --eval_samples 10000 --budget_minutes 1560 --max_minutes 1620 --cuda_memory_fraction 0.12
+SEED_s0	-
+SEED_s1	--set seed=1 --split_seed 12346
