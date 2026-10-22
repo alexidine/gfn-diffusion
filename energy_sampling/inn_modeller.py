@@ -35,7 +35,7 @@ artifacts/inn_proto/<tag>_<run_name>/metrics.jsonl; the weights sit beside it.
 A metric carries the crystal trainer's name wherever that trainer logs the same
 quantity, and a reading it has no counterpart for sits in the family it belongs
 to (fwd/ bwd/ per branch, eval_fwd/ eval_bwd/ eval_test/, energy/, rollout/,
-rewardgrad/). log P_B is zero for a one-step map, so every TB statistic reads
+rewardgrad/, gradnorm/ per part of the flow). log P_B is zero for a one-step map, so every TB statistic reads
 log R - log q exactly; "bwd"/"Backward" means the stored prior rows.
 """
 import argparse
@@ -641,6 +641,46 @@ def tb_loss_asym(resid, beta, beta_pos=None):
 def quantiles(x, qs=(0.1, 0.5, 0.9)):
     return [float(v) for v in torch.quantile(x.double().flatten(), torch.tensor(qs, dtype=torch.float64,
                                                                                device=x.device))]
+
+
+def grad_parts(sampler):
+    """The sampler's parameters by part, for gradnorm/*: each block (a transformer conditioner split into its input
+    embeddings, each causal layer, and its output norm and head), then every other child of the flow under its own
+    name (context, level, atom_encoder in conditional runs). A parameter none of these holds goes to 'other', so a
+    part added later is still reported."""
+    f, parts = sampler.flow, {}
+    for i, blk in enumerate(f.blocks):
+        m = blk.made
+        if isinstance(m, CausalTransformerConditioner):
+            for j, layer in enumerate(m.layers):
+                parts[f'block{i}/layer{j}'] = list(layer.parameters())
+            parts[f'block{i}/head'] = [*m.ln.parameters(), *m.head.parameters()]
+            taken = {id(p) for ps in parts.values() for p in ps}
+            parts[f'block{i}/embed'] = [p for p in blk.parameters() if id(p) not in taken]
+        else:
+            parts[f'block{i}'] = list(blk.parameters())
+    for name, mod in f.named_children():
+        if name != 'blocks':
+            parts[name] = list(mod.parameters())
+    taken = {id(p) for ps in parts.values() for p in ps}
+    rest = [p for p in sampler.parameters() if id(p) not in taken]
+    if rest:
+        parts['other'] = rest
+    return parts
+
+
+def part_grad_norms(sampler):
+    """gradnorm/<part>: the gradient L2 norm of each part of grad_parts, the crystal trainer's per-submodel family
+    (train.py's _submodel_grad_norms). A part with no gradient reads 0.0 rather than going missing, so a part the loss
+    does not reach is a line pinned at zero. The squares sum to the square of the norm clip_grad_norm_ returns; call it
+    before that clip, which rescales the gradients in place. One device sync for the set."""
+    dev = next(sampler.parameters()).device
+    names, norms = [], []
+    for name, ps in grad_parts(sampler).items():
+        g = [torch.linalg.vector_norm(p.grad.detach().float()) for p in ps if p.grad is not None]
+        names.append(name)
+        norms.append(torch.linalg.vector_norm(torch.stack(g)) if g else torch.zeros((), device=dev))
+    return {f'gradnorm/{n}': v for n, v in zip(names, torch.stack(norms).cpu().tolist())}
 
 
 class InnModeller(Modeller):
@@ -1322,6 +1362,8 @@ class InnModeller(Modeller):
                         return stats, False, level
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
+                    if step % inn.log_every == 0:  # before the clip, which rescales the gradients in place
+                        stats.update(part_grad_norms(self.sampler))
                     stats['grad_norm_pre_clip'] = float(
                         torch.nn.utils.clip_grad_norm_(self.sampler.parameters(), inn.grad_clip))
                     if not math.isfinite(stats['grad_norm_pre_clip']):  # a finite loss with a non-finite gradient
