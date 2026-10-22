@@ -69,6 +69,42 @@ from train import (Modeller, adjust_fig_filesize, condition_tracker_figs, equipa
 from utils import get_train_args, is_cuda_oom
 
 
+ORIENTATION_ROWS = slice(9, 12)   # Z' = 1 latent: polar angle, azimuth and angle of the asymmetric unit's rotation
+
+
+def random_frames(n, device, dtype=torch.float32):
+    """n unit quaternions (w, x, y, z), uniform (Haar) on SO(3), w >= 0."""
+    q = torch.randn(n, 4, device=device, dtype=dtype)
+    q = q / q.norm(dim=1, keepdim=True)
+    return torch.where(q[:, :1] < 0, -q, q)
+
+
+def quat_to_rotmat(q):
+    """Unit quaternions [..., 4] (w, x, y, z) -> rotation matrices [..., 3, 3]."""
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1
+                       ).reshape(q.shape[:-1] + (3, 3))
+
+
+def rotate_latent(x, R0):
+    """The latent rows of the same crystals with the molecule presented as R0 applied to its standard-frame
+    coordinates. The builder applies the orientation R to the molecule recentred on its heavy-atom centroid, so R
+    becomes R R0^T and no other row changes. x [n, 12] (Z' = 1), R0 [n, 3, 3] proper rotations. The orientation rows
+    are clamped as latent_to_cell_params clamps them before building, so x' describes the crystal x builds."""
+    from mxtaltools.common.geometry_utils import (cart2sph_rotvec, lat2sph_rotvec, rotmat2rotvec_stable,
+                                                  rotvec2rotmat, sph2cart_rotvec, sph_rotvec2lat)
+    from mxtaltools.crystal_building.utils import canonicalize_rotvec
+    o = x[:, ORIENTATION_ROWS].double()
+    o = torch.stack([o[:, 0].clamp(-0.99, 1.0), o[:, 1].clamp(-1.0, 1.0), o[:, 2].clamp(-0.99, 1.0)], 1)
+    R = rotvec2rotmat(sph2cart_rotvec(lat2sph_rotvec(o, 1)))
+    v = canonicalize_rotvec(rotmat2rotvec_stable(R @ R0.double().transpose(1, 2)))
+    y = x.clone()
+    y[:, ORIENTATION_ROWS] = sph_rotvec2lat(cart2sph_rotvec(v), 1).to(x.dtype)
+    return y
+
+
 @torch.no_grad()
 def invert_block_cached(blk, y, ctx=None):
     """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
@@ -454,12 +490,17 @@ class _ContextFlow(nn.Module):
     """The blocks of a conditional flow, the condition's embedding, and the level head."""
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None, atoms=None):
+                 transformer=None, atoms=None, frames=False):
         super().__init__()
         d = len(wrap_mask)
         # atoms: AtomEncoder settings (dict). The condition is then the molecule itself: column 0 of c is the condition
-        # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through
+        # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through.
+        # frames: columns 1-4 of c are a unit quaternion, the frame the row's molecule is presented in (its atoms are
+        # rotated by it before encoding)
         self.atoms = atoms is not None
+        self.frames = bool(frames)
+        if self.frames and not self.atoms:
+            raise NotImplementedError("molecule frames need the atom-token condition")
         self.d, self.bound = d, bound
         self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
         self.register_buffer('mu', torch.zeros(d))
@@ -488,7 +529,8 @@ class _ContextFlow(nn.Module):
         n_in = cond_dim
         if self.atoms:
             self.atom_encoder = AtomEncoder(transformer[0], **atoms)
-            n_in = self.atom_encoder.pool_out.out_features + cond_dim - 1   # pooled molecule + the columns after the id
+            # pooled molecule + the columns after the id (and after the frame)
+            n_in = self.atom_encoder.pool_out.out_features + cond_dim - 1 - 4 * int(self.frames)
             for name in ('atom_z', 'atom_pos', 'atom_n'):
                 self.register_buffer(name, None, persistent=False)
         self.context = _ResMLP(n_in, context_hidden, context_dim)
@@ -522,10 +564,19 @@ class _ContextFlow(nn.Module):
         cid = c[:, 0].round().long()
         if self.atom_z is None or bool((self.atom_n[cid] == 0).any()):
             raise RuntimeError("a condition id with no atoms in the atom table")
-        uniq, inv = torch.unique(cid, return_inverse=True)
         dtype = self.c_mu.dtype   # the flow's own precision (a double copy for the round-trip check), as standardise
-        tokens, mask, pooled = self.atom_encoder(self.atom_z[uniq], self.atom_pos[uniq].to(dtype), self.atom_n[uniq])
-        s = torch.cat([pooled[inv], c[:, 1:].to(dtype)], -1)
+        if self.frames:
+            # one encoding per (molecule, frame), the atoms rotated into the row's frame
+            uniq, inv = torch.unique(c[:, :5], dim=0, return_inverse=True)
+            mol = uniq[:, 0].round().long()
+            pos = self.atom_pos[mol].to(dtype) @ quat_to_rotmat(uniq[:, 1:5].to(dtype)).transpose(1, 2)
+            rest = c[:, 5:]
+        else:
+            mol, inv = torch.unique(cid, return_inverse=True)
+            pos = self.atom_pos[mol].to(dtype)
+            rest = c[:, 1:]
+        tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
+        s = torch.cat([pooled[inv], rest.to(dtype)], -1)
         return (self.context(s), tokens[inv], mask[inv]), s
 
     def set_scaler(self, x):
@@ -546,14 +597,15 @@ class ConditionalLatentFlow(nn.Module):
     """q(x | c): LatentFlow with every block reading an embedding of the condition vector c."""
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
-                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None):
+                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, frames=False):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
         self.dim = dim
         self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
-                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms)
+                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
+                                 frames=frames)
 
     def to_base(self, x, c):
         f = self.flow
@@ -744,10 +796,12 @@ class InnModeller(Modeller):
                     raise NotImplementedError("--atom_tokens needs --conditioner transformer")
                 atoms = dict(node_dim=inn.atom_node_dim, convs=inn.atom_convs, cutoff=inn.atom_cutoff,
                              radial=inn.atom_radial)
-                cond_dim = 1 + int(self.t_conditional)
+                cond_dim = 1 + 4 * int(inn.rotate_frames) + int(self.t_conditional)
+            elif inn.rotate_frames:
+                raise NotImplementedError("--rotate_frames needs --atom_tokens (the atoms are what is rotated)")
             self.sampler = ConditionalLatentFlow(dim, wrap_mask, dead_rows, cond_dim, inn.context_dim,
                                                  inn.context_hidden, *shape, seed=int(self.args.seed),
-                                                 transformer=transformer, atoms=atoms)
+                                                 transformer=transformer, atoms=atoms, frames=inn.rotate_frames)
         else:
             self.sampler = LatentFlow(dim, wrap_mask, dead_rows, *shape, seed=int(self.args.seed),
                                       transformer=transformer, block_orders=block_orders, half_rows=half_rows,
@@ -1020,7 +1074,7 @@ class InnModeller(Modeller):
             x, cid = x[keep], cid[keep]
         setattr(self, 'mol_crystals_test' if held_out else 'mol_crystals_train', (x, cid))
 
-    def pack(self, cond, log_T, cid=None):
+    def pack(self, cond, log_T, cid=None, frames=None):
         """The flow's context input: the row's condition vector, when the config gives one (under
         --atom_tokens its condition id instead, whose atoms the flow looks up), and under
         temperature conditioning where log T sits in the trained range (0 at the run's own
@@ -1029,19 +1083,24 @@ class InnModeller(Modeller):
             return None
         if self.inn.atom_tokens:
             parts = [cid.float().to(self.device).reshape(-1, 1)]
+            if self.inn.rotate_frames:   # the frame the molecule is presented in: the standard frame unless given
+                if frames is None:
+                    frames = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(cid.shape[0], 4)
+                parts.append(frames.float().to(self.device))
         else:
             parts = [cond.float().to(self.device)] if self.mol_conditional else []
         if self.t_conditional:
             parts.append(((log_T.flatten().float().to(self.device) - self.log_T0) / self.t_span).unsqueeze(-1))
         return torch.cat(parts, -1)
 
-    def context_of(self, cid, log_T=None):
-        """Context input of stored conditions, at the run's own temperature unless log_T is given."""
+    def context_of(self, cid, log_T=None, frames=None):
+        """Context input of stored conditions, at the run's own temperature unless log_T is given (under
+        --rotate_frames, with the molecules in the standard frame unless frames, unit quaternions, are given)."""
         if not self.conditional:
             return None
         if log_T is None:
             log_T = torch.full((cid.shape[0],), self.log_T0, device=self.device)
-        return self.pack(self.cond_table[cid] if self.mol_conditional else None, log_T, cid)
+        return self.pack(self.cond_table[cid] if self.mol_conditional else None, log_T, cid, frames)
 
     def level_of(self, c):
         return self.sampler.level(c) if self.conditional else 0.0
@@ -1839,6 +1898,13 @@ class InnModeller(Modeller):
         log_T_d = self.training_log_T(idx.numel())
         c_d = self.context_of(cid_d, log_T_d)
         if stage == 'mle':
+            if inn.rotate_frames:
+                # the molecules in random frames, one per group of --rows_per_molecule rows (the rows of one molecule
+                # are consecutive), and their rows re-expressed for those frames before the noise
+                k = max(1, int(inn.rows_per_molecule))
+                q = random_frames(-(-idx.numel() // k), self.device).repeat_interleave(k, 0)[:idx.numel()]
+                x_d = rotate_latent(x_d, quat_to_rotmat(q))
+                c_d = self.context_of(cid_d, log_T_d, frames=q)
             if inn.mle_noise_log_range is not None:
                 x_d = self.jitter(x_d, inn.mle_noise_log_range)
             mle = -self.sampler.log_prob(x_d, c_d).mean()
@@ -2557,6 +2623,10 @@ def build_parser():
     p.add_argument('--atom_cutoff', type=float, default=10.0,
                    help='--atom_tokens: radius-graph cutoff within a molecule (angstrom)')
     p.add_argument('--atom_radial', type=int, default=32, help='--atom_tokens: radial basis functions per edge')
+    p.add_argument('--rotate_frames', action='store_true',
+                   help='--atom_tokens, likelihood stage: each molecule is presented in a random frame (uniform on '
+                        'SO(3), one per --rows_per_molecule group), its stored rows re-expressed for that frame '
+                        '(orientation R -> R R0^T); evaluation, sampling and the energy stage use the standard frame')
     p.add_argument('--rows_per_molecule', type=int, default=1,
                    help='draw each batch of stored rows as batch / k molecules with k rows each (molecules in '
                         'proportion to their rows, so each row is as likely as in a uniform draw), and in the energy '
