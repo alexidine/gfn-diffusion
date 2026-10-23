@@ -60,7 +60,14 @@ Run them on the GPU, one at a time: on the CPU, `pool_assemble_mace`'s MACE chec
 
 `submit_inn_acr_oct23.sbatch`, flags in `common.args` and `arms.tsv`: one A100, 2-day job, one process on the card at a
 time and no MPS (MACE fills the card on its own): the stage-1 run, then the stage-2 arm `base` (2000 fresh draws per
-update) from its best held-out checkpoint, on a 40-hour clock, each at 0.9 of the card. The stages are separate processes
+update) from its best held-out checkpoint, on a 38-hour clock, each at 0.9 of the card. Stage 1 runs 20k steps (owner,
+2026-10-23; at most 300 min) and the occupancy batch sizer is on in both stages (`--util_target 0.75`: stage 1's
+likelihood batch and stage 2's stored-row batch grow while the card is under 75% busy; the fresh draws never do), with
+its memory guard off (`--grow_mem_frac 1.0`): the guard reads the peak memory since the last change, MACE's adaptive
+chunking leaves that at the card share after any out-of-memory back-off, and in the local smoke it froze stage 1's sizer
+at its first check (`held at 8192 rows per update ... (memory guard)`). With it off, the forced smoke (target 0.99,
+dwell 100 s, the 8,000-row slice) grew stage 1 8192 -> 12288 -> 18432 and stage 2 4096 -> 6144 -> 9216 rows per update
+with no out-of-memory; one still backs a batch off one rung and freezes it. The stages are separate processes
 because stage 2 changes what stage 1 fixes (floor 1e-5 -> 1e-7, fp32 transformer, replay); stage 1 writes the prior scan
 cache, so stage 2 re-scores 512 rows instead of 271k.
 
@@ -81,8 +88,8 @@ their images), 2026-10-23:
 
   | run | best held-out NLL (nats), at step | held-out NLL at the end (nats) | train NLL at the end (nats) |
   |---|---|---|---|
-  | 10k steps (the battery's) | -19.62, 9,000 | -19.55 | -23.10 |
-  | 20k steps | -19.51, 8,000 | -19.01 | -24.13 |
+  | 10k steps | -19.62, 9,000 | -19.55 | -23.10 |
+  | 20k steps (the battery's, by the owner's choice) | -19.51, 8,000 | -19.01 | -24.13 |
 
   The held-out curve flattens by ~6k steps in both runs while the training NLL keeps falling; the longer run's held-out
   NLL gets worse as its rate decays. Stage 1 is limited by fitting the training crystals, not by its length, and stage 2

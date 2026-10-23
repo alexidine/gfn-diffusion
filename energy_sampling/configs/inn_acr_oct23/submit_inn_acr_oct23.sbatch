@@ -20,8 +20,12 @@
 # noise = the old checkpoint's 1 kT kick, held-out split by crystal over all 8 images (rows 6-11 ignored: the sg 14 screw
 # image moves the orientation too). MACE-specific: cells denser than packing coefficient 2 are kept from MACE and scored
 # as clashes (energy_config.mlip_max_packing_coeff; the untrained flow's first eval ran a 16 GB card out of memory on
-# one crystal), the energy's adaptive chunking kept (no --fast_scoring), evals every 500 updates, and a 40-hour stage-2
-# clock (--budget_minutes 2400): locally a 2000-draw update was 99% MACE, at ~25 ms per crystal on a laptop GPU.
+# one crystal), the energy's adaptive chunking kept (no --fast_scoring), evals every 500 updates, and a 38-hour stage-2
+# clock (--budget_minutes 2300): locally a 2000-draw update was 99% MACE, at ~25 ms per crystal on a laptop GPU.
+# Owner 2026-10-23: stage 1 at 20k steps (cap 300 min), and the occupancy batch sizer on in both stages
+# (--util_target 0.75): it grows stage 1's likelihood batch and stage 2's stored-row batch, never the fresh draws. Its
+# memory guard is off (--grow_mem_frac 1.0): MACE's adaptive chunking leaves the peak at the card share, which froze
+# stage 1's sizer on its first check in the local smoke; an out-of-memory still backs a batch off one rung and freezes it.
 #
 #   phase 1  the stage-1 run (s0), cap 0.9 of the card (prior scan ~271k MACE rows) -> inn_acr23_s0_mle
 #   phase 2  the stage-2 arm from s0's best.pt, cap 0.9                              -> inn_acr23_base
