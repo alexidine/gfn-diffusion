@@ -175,15 +175,103 @@ def test_a_success_clears_the_streak(monkeypatch):
 
 def test_recovery_failure_does_not_mask_the_original_error(monkeypatch):
     """On a sticky CUDA fault the synchronize/empty_cache recovery raises too. That
-    secondary error must not escape -- it would bury the error worth reading."""
+    secondary error must not escape -- it would bury the error worth reading.
+    CUDA is pinned available: without it the recovery is skipped and this would pass
+    without reaching the path it names."""
     def _sticky(*a, **k):
         raise RuntimeError('CUDA context is corrupt')
 
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'synchronize', _sticky)
     monkeypatch.setattr(torch.cuda, 'empty_cache', _sticky)
     U._CONSECUTIVE_CRASHES = 0
     out, crashed = U.safe_predict_uma(_AlwaysFails(), None, retries=1)
     assert out is None and crashed is True
+
+
+# ------------------------------------------- 5. a CPU-only process makes no CUDA call
+
+class _Counting:
+    """A predictor that records its calls; fails when told to."""
+
+    def __init__(self, fail):
+        self.fail, self.calls = fail, 0
+
+    def predict(self, batch):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError('simulated non-OOM UMA failure')
+        return {'energy': torch.zeros(1)}
+
+
+def _no_gpu(monkeypatch):
+    """What CUDA_VISIBLE_DEVICES=-1 gives: no device, and any CUDA call raises."""
+    def _raise(*a, **k):
+        raise RuntimeError('No CUDA GPUs are available')
+
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch.cuda, 'synchronize', _raise)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', _raise)
+
+
+def test_a_cpu_only_forward_succeeds(monkeypatch):
+    """The defect: the unguarded synchronize raised on every CPU-only call, so a
+    working CPU predictor came back as a crash (NaN energies, then the tripwire)."""
+    _no_gpu(monkeypatch)
+    U._CONSECUTIVE_CRASHES = 0
+    pred = _Counting(fail=False)
+    out, crashed = U.safe_predict_uma(pred, None, retries=1)
+    assert crashed is False and out is not None
+    assert pred.calls == 1
+
+
+def test_a_cpu_only_failure_still_retries_and_counts(monkeypatch):
+    """Without CUDA there is nothing to reset, but the retry and the streak still run."""
+    _no_gpu(monkeypatch)
+    U._CONSECUTIVE_CRASHES = 0
+    pred = _Counting(fail=True)
+    out, crashed = U.safe_predict_uma(pred, None, retries=1)
+    assert out is None and crashed is True
+    assert pred.calls == 2, 'the retry was skipped'
+    assert U._CONSECUTIVE_CRASHES == 1
+
+
+def test_the_unguarded_call_turned_a_working_forward_into_a_crash(monkeypatch):
+    """Negative control: with the device check defeated (CUDA claimed available, every
+    CUDA call raising, as an unguarded call does on a CPU-only process) a working
+    predictor reports a crash. This is the failure the guard removes."""
+    _no_gpu(monkeypatch)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    U._CONSECUTIVE_CRASHES = 0
+    out, crashed = U.safe_predict_uma(_Counting(fail=False), None, retries=1)
+    assert out is None and crashed is True
+
+
+_ESEN = 'D:/crystal_datasets/esen_s.pt'
+_MINI = 'D:/crystal_datasets/mini_new_prot_csd.pt'
+
+
+@pytest.mark.slow
+def test_uma_route_scores_real_crystals_without_cuda(monkeypatch):
+    """End to end on the production UMA checkpoint, with CUDA unavailable to the
+    process: analyze(['uma']) on four real crystals returns finite energies and
+    counts no crash. Skipped without the checkpoint or the data drive."""
+    import os
+    if not (os.path.exists(_ESEN) and os.path.exists(_MINI)):
+        pytest.skip('needs the esen_s checkpoint and mini_new_prot_csd on D:')
+    from mxtaltools.dataset_utils.utils import collate_data_list
+    _no_gpu(monkeypatch)
+    rows = torch.load(_MINI, weights_only=False)[:4]
+    batch = collate_data_list(rows)
+    pred = U.init_uma_crystal_predictor(_ESEN, device='cpu')
+    U._CONSECUTIVE_CRASHES, U._CRASH_CALLS = 0, 0
+    with torch.no_grad():
+        out = batch.analyze(['reduction_en', 'uma'], cutoff=10, supercell_size=10,
+                            std_orientation=False, predictor=pred)
+    energy = torch.as_tensor(out['uma'])
+    assert energy.shape[0] == 4
+    assert torch.isfinite(energy).all(), f'non-finite UMA energies on CPU: {energy}'
+    assert U._CRASH_CALLS == 0
 
 
 # ------------------------------------------- 4. eval aggregates survive one bad row
