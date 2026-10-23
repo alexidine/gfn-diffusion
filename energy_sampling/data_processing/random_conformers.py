@@ -7,7 +7,10 @@ coordinates); every rotor -- a SINGLE bond in no ring whose smaller side, hydrog
 methyl, amine and hydroxyl rotors included -- spun by an independent uniform angle in [-pi, pi), the smaller side
 moving; the spun conformer kept only when it passes every validity check, else the angles redrawn (seeded by
 SMILES|j:attempt) up to --max-attempts times. No force-field relief: the conformer is the embedded geometry with random
-torsions. mxtaltools mol_building.smiles2conformer differs: it spins double-bond bridges too, spins only when a
+torsions. Conjugated single bonds (amide C-N, ester C-O, aryl-C=O, biaryl) are rotors like any other, so their
+planarity is not kept and nothing restores it; rejection alone also gets rarer to pass as molecules grow. Not the
+method for larger molecules: there, spin and then relax locally under a force field. mxtaltools
+mol_building.smiles2conformer differs: it spins double-bond bridges too, spins only when a
 methyl/amine/hydroxyl rotor exists, relieves clashes with short MMFF cycles, and its scramble path raises at HEAD.
 
 Validity of a conformer (check): finite coordinates; H/C/N/O/F only; every pair two or more bonds apart farther than
