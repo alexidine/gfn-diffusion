@@ -58,8 +58,11 @@ Run them on the GPU, one at a time: on the CPU, `pool_assemble_mace`'s MACE chec
 
 ## The runs
 
-`submit_inn_acr_oct23.sbatch`, flags in `common.args` and `arms.tsv`: one stage-1 run, then the two stage-2 arms (`base`,
-2000 fresh draws per update; `b1000`, 1000) at once on the same A100 under MPS, 2-day job, 40-hour stage-2 clock.
+`submit_inn_acr_oct23.sbatch`, flags in `common.args` and `arms.tsv`: one A100, 2-day job, one process on the card at a
+time and no MPS (MACE fills the card on its own): the stage-1 run, then the stage-2 arm `base` (2000 fresh draws per
+update) from its best held-out checkpoint, on a 40-hour clock, each at 0.9 of the card. The stages are separate processes
+because stage 2 changes what stage 1 fixes (floor 1e-5 -> 1e-7, fp32 transformer, replay); stage 1 writes the prior scan
+cache, so stage 2 re-scores 512 rows instead of 271k.
 
 Local smoke on the dev box (RTX 5080 laptop GPU, cap 0.4 = 6.4 GB, an 8,000-row slice of the prior = 1,000 states with
 their images), 2026-10-23:

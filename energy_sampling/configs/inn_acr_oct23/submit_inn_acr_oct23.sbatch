@@ -23,16 +23,14 @@
 # one crystal), the energy's adaptive chunking kept (no --fast_scoring), evals every 500 updates, and a 40-hour stage-2
 # clock (--budget_minutes 2400): locally a 2000-draw update was 99% MACE, at ~25 ms per crystal on a laptop GPU.
 #
-#   phase 1  one stage-1 run (s0), cap 0.45 of the card (prior scan ~271k MACE rows) -> inn_acr23_s0_mle
-#   phase 2  two stage-2 arms at once from s0, cap 0.45 each                         -> inn_acr23_<arm>
+#   phase 1  the stage-1 run (s0), cap 0.9 of the card (prior scan ~271k MACE rows) -> inn_acr23_s0_mle
+#   phase 2  the stage-2 arm from s0's best.pt, cap 0.9                              -> inn_acr23_base
 #     0 base       the recipe, 2000 fresh draws per update
-#     1 b1000      1000 fresh draws per update (more updates per energy call: ~2x ELBO per call on MIPCAS, inn_mps_oct21)
 #
-# MPS: the job starts nvidia-cuda-mps-control on the node before the container and the processes connect through
-# CUDA_MPS_PIPE_DIRECTORY; if it does not start, the processes time-share the card (stated in the .info file). A card
-# in Exclusive_Process mode without MPS cannot host two processes, and the job stops before training.
-# Flags are read when the job STARTS from configs/inn_acr_oct23/arms.tsv and common.args (edit in place while queued;
-# deleting a row of arms.tsv drops that arm).
+# One process on the card at a time, no MPS: MACE fills the card on its own. The two stages are separate processes
+# because stage 2 changes settings stage 1 fixes (floor 1e-5 -> 1e-7, fp32 transformer, replay) and starts from stage
+# 1's best held-out checkpoint; stage 1 writes the prior scan cache, so stage 2 re-scores 512 rows, not 271k.
+# Flags are read when the job STARTS from configs/inn_acr_oct23/arms.tsv and common.args (edit in place while queued).
 # Outputs: artifacts/inn_proto/inn_acr23_<run>/, wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
 # THERE IS NO RESUME. DRY_RUN=1 bash submit_inn_acr_oct23.sbatch prints every command and stops.
 module purge 2>/dev/null
@@ -123,23 +121,14 @@ if ! grep -q 'def analyze_density_guarded' ${WORKDIR}/energies/molecular_crystal
     echo "FATAL: gfn-diffusion predates energy_config.mlip_max_packing_coeff -- git pull gfn-diffusion" >&2; exit 1
 fi
 
-# MPS, on the node, before the container; the processes inherit the pipe directory through the environment
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_${SLURM_JOB_ID}
-export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_${SLURM_JOB_ID}
-mkdir -p ${CUDA_MPS_PIPE_DIRECTORY} ${CUDA_MPS_LOG_DIRECTORY}
-MODE=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader 2>/dev/null | head -1)
-if command -v nvidia-cuda-mps-control >/dev/null 2>&1 && nvidia-cuda-mps-control -d; then
-    MPS=on
-else
-    MPS=off
-    unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY
-    case "${MODE}" in
-        *Exclusive_Process*) echo "FATAL: compute mode ${MODE} and MPS did not start: the card cannot host several processes" >&2; exit 1 ;;
-    esac
+# one arm: a second stage-2 process would share the card that MACE already fills
+if [ ${#ARMS[@]} -ne 1 ]; then
+    echo "FATAL: ${#ARMS[@]} arms in arms.tsv; this job runs one process on the card at a time (no MPS)" >&2; exit 1
 fi
+MODE=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader 2>/dev/null | head -1)
 
 { nvidia-smi -L
-  echo "compute mode: ${MODE}   MPS: ${MPS}"
+  echo "compute mode: ${MODE}"
   scontrol show job ${SLURM_JOB_ID}
   echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"
   echo "gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse HEAD 2>&1)  MXtalTools $(git -C ${PROJECT_ROOT}/MXtalTools rev-parse HEAD 2>&1)"
@@ -151,7 +140,6 @@ stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.me
 SMI_PID=$!
 epilogue() {
     kill ${SMI_PID} 2>/dev/null
-    if [ "${MPS}" = "on" ]; then echo quit | nvidia-cuda-mps-control 2>/dev/null; fi
     sacct -j ${SLURM_JOB_ID} --format=JobID,State,ExitCode,Elapsed,NodeList,Reason,Comment%64 > ${J}_sacct.txt 2>&1
 }
 trap epilogue EXIT TERM
@@ -162,7 +150,7 @@ INNER=${J}_inner.sh
     echo 'source /ext3/env.sh'
     echo "export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH"
     echo "${NIG_EXPORT}"
-    echo 'export GFN_ALLOW_GPU_SHARING=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTHONUNBUFFERED=1'
+    echo 'export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1'
     echo "python -c \"import mxtaltools.common.sym_utils as s; assert getattr(s, 'NIGGLI_TRICLINIC', True), 'Niggli triclinic penalty is OFF'\" || exit 1"
     echo "python -c \"import inn_modeller\" || { echo 'FATAL: inn_modeller does not import in this container' >&2; exit 1; }"
     echo 'FAIL=0; PIDS=(); NAMES=()'
