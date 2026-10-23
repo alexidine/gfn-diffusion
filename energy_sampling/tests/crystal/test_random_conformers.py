@@ -79,8 +79,7 @@ def test_checks_catch_broken_geometry_negative_controls():
     assert 'bond_length' in rc.check(mol, bad, pos0, st0, topo, bonds)
     db = [b for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE][0]
     a1, a2 = db.GetBeginAtomIdx(), db.GetEndAtomIdx()
-    side = rc.rotors(Chem.RWMol(mol))   # not used; a double bond is never a rotor, so twist it by hand
-    mask = np.zeros(mol.GetNumAtoms(), bool)
+    mask = np.zeros(mol.GetNumAtoms(), bool)                          # a double bond is never a rotor: twist by hand
     stack, seen = [a2], {a2}
     while stack:
         x = stack.pop()
@@ -92,7 +91,6 @@ def test_checks_catch_broken_geometry_negative_controls():
     mask[list(seen - {a2})] = True
     bad = rc.rotate_about(pos0.copy(), a1, a2, mask, np.pi / 2)
     assert 'db_twist' in rc.check(mol, bad, pos0, st0, topo, bonds)
-    assert side is not None
 
 
 def test_moldata_fields():
