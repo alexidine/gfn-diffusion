@@ -1,0 +1,6 @@
+# inn_acr_oct23 arms, read by submit_inn_acr_oct23.sbatch when the job STARTS (edit here, in place, before it starts).
+# Columns (tab-separated, 4): index, arm, stage-1 seed (which stage-1 run the arm starts from, and its seed flags from
+# common.args), stage-2 flags beyond common.args ('-' = none). Later flags win, so an arm's flags override the shared
+# ones. Both stage-2 arms run at once on one GPU, after the stage-1 run.
+0	base	s0	-
+1	b1000	s0	--batch 1000
