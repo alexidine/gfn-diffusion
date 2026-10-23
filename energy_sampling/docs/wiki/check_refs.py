@@ -267,7 +267,9 @@ def _bound_names(node: ast.AST) -> list[str]:
 
 def _index_module(path: Path) -> ModuleIndex:
     idx = ModuleIndex()
-    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    # utf-8-sig: a source written with a byte-order mark (PowerShell's default) is
+    # valid Python, and plain utf-8 leaves the mark in the text for ast to refuse
+    tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
 
     def walk_body(body, sink: set[str]):
         for node in body:
@@ -463,7 +465,7 @@ def _flatten(obj, prefix='') -> set[str]:
 def _string_constants(path: Path) -> set[str]:
     """Every identifier-shaped string literal in a module."""
     try:
-        tree = ast.parse(path.read_text(encoding='utf-8'))
+        tree = ast.parse(path.read_text(encoding='utf-8-sig'))
     except (OSError, SyntaxError):
         return set()
     return {n.value for n in ast.walk(tree)
@@ -482,7 +484,7 @@ def _config_vocabulary(root: Path) -> set[str]:
     for rel in ('*.py', 'energies/*.py', 'models/*.py'):
         for f in root.glob(rel):
             try:
-                tree = ast.parse(f.read_text(encoding='utf-8'))
+                tree = ast.parse(f.read_text(encoding='utf-8-sig'))
             except (OSError, SyntaxError, UnicodeDecodeError):
                 continue
             for n in ast.walk(tree):

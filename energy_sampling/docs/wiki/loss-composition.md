@@ -1,6 +1,6 @@
 # Loss composition
 
-*Drift: **M** (mixed). Verified against commit `e17167e`, 2026-09-20. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04. Sources at the end.*
 
 A fused training step assembles one scalar loss out of three branches: forward, backward and replay. This page is about that assembly, from the branch draws up through the per-branch coefficient blocks to the weighted sum, and what each branch's residual can and cannot see. The controllers that move the weights during a stage are on [balance-controllers](balance-controllers.md); the VarGrad objective is on [vargrad](vargrad.md); the trajectory-balance residual and its fixed point are on [trajectory-balance](trajectory-balance.md); the coupling between the rollout that fills the replay buffer and the branch that drains it is on [on-policy-and-off-policy-training](on-policy-and-off-policy-training.md).
 
@@ -8,13 +8,13 @@ A fused training step assembles one scalar loss out of three branches: forward, 
 
 Each branch is a separate draw, a separate pass and a separate per-row loss, fired by `train.py::Modeller.fused_train_step`.
 
-The **forward** branch rolls out its own trajectories. `train.py::Modeller.fwd_train_step` draws $B$ rows from `mol_dataset`, tiles each `repeats` times, samples forward under $P_F$ and calls the energy function on the terminals; it is the only branch that calls the energy function inside a training step. Its loss is built by `gflownet_losses.py::get_gfn_forward_loss`.
+The **forward** branch rolls out its own trajectories. `train.py::Modeller.fwd_train_step` draws $B$ rows from `mol_dataset`, tiles each `repeats` times, samples forward under $P_F$ and calls the energy function on the terminals. Its loss is built by `gflownet_losses.py::get_gfn_forward_loss`. It is the only branch that calls the energy function inside a training step, except that the replay branch at `resample_last_k` above zero re-scores the reward on each re-sampled terminal.
 
-The **backward** branch draws terminal states, not trajectories: from the prior buffer under `cfg:stage.bwd_sampling_mode` `prior`, or from the fixed prior dataset under `dataset` (`train.py::Modeller.draw_bwd_sample`). A trajectory is then sampled backward from each terminal under $P_B$, and the reward is the stored one.
+The **backward** branch draws terminal states, not trajectories: from the prior buffer under `cfg:stage.bwd_sampling_mode` `prior`, or from the fixed prior dataset under `dataset` (`train.py::Modeller.draw_bwd_sample`). A trajectory is then sampled backward from each terminal under $P_B$, and the reward is recomposed from the energy terms stored on the drawn rows by the energy function's `prebuilt_sample_to_reward` (`energies/molecular_crystal.py::MolecularCrystal.prebuilt_sample_to_reward` on the crystal route), without re-analysing the crystal.
 
 The **replay** branch draws stored forward trajectories from the replay buffer (`train.py::Modeller.draw_replay_sample`) and re-scores them under the current $P_F$ and $P_B$: the path is fixed, the densities move. Backward and replay share one builder, `gflownet_losses.py::get_gfn_backward_loss`, whose `trajectories` argument is what distinguishes a replayed path from a freshly sampled backward one.
 
-Every branch that runs, runs a full batch. `cfg:stage.fracs` are coefficients on losses, not sample fractions, so a branch at a small nonzero weight still draws, scores and backpropagates $B$ rows.
+Every branch that runs, runs a full batch. `cfg:stage.fracs` are coefficients on losses, not sample fractions, so a branch at a small nonzero weight still draws, scores and backpropagates $B$ rows. Under `cfg:stage.condition_draw` the backward and replay draws are sized by the step's condition set instead: `train.py::Modeller._choose_draw_conditions` picks the conditions, and the two branches draw `prior_rows` and `replay_rows` rows of each. On a step where it returns no eligible condition the backward branch draws its usual $B$ rows and the replay branch is skipped.
 
 ## The fused sum
 
@@ -26,9 +26,11 @@ L = \sum_{k \in \mathcal{A}} \frac{w_k}{\sum_{j \in \mathcal{A}} w_j}\, L_k
 \;+\; \mathbb{1}[\text{sidecar}]\, L_{\text{fwd}} ,
 $$
 
-with $\mathcal{A}$ the set of branches whose frac is at or above `cfg:stage.deactivate_threshold` (falling back to `cfg:controller.deactivate_threshold`). A branch below the bar is skipped entirely rather than down-weighted. The renormalisation is over the survivors, so the three fracs summing to 1 does not mean the weights entering the sum do. Two terms sit outside the renormalised mix: the cross-branch pooled VarGrad term, whose coefficient and Huber knee are its own, and the forward Z sidecar, which enters at weight 1 on a rollout that is not a Z pin and is refused if the forward branch also carries a frac.
+with $\mathcal{A}$ the set of branches whose frac is at or above `cfg:stage.deactivate_threshold` (falling back to `cfg:controller.deactivate_threshold`). A branch below the bar is skipped entirely rather than down-weighted. The renormalisation is over the survivors, so the three fracs summing to 1 does not mean the weights entering the sum do. Two terms sit outside the renormalised mix: the cross-branch pooled VarGrad term, whose coefficient and Huber knee are its own, and the forward Z sidecar (`cfg:stage.fwd_z_sidecar`), which enters at weight 1 on a rollout that is not a Z pin; the step raises if the forward frac is also at or above the bar.
 
-Two further paths change the set. Every `cfg:controller.refresh_every` steps a branch that some rule or exit term reads (`protocol.py::StageProtocol.mode_dormant` is false for it) is evaluated regardless of its frac; that evaluation is detached and enters at weight 0, so it refreshes the branch's rolling statistics and contributes no gradient. And when the replay buffer is empty or unavailable, replay's share is added to the backward weight.
+Two further paths change the set. Every `cfg:controller.refresh_every` steps a branch that some rule or exit term reads (`protocol.py::StageProtocol.mode_dormant` is false for it) is evaluated regardless of its frac; that evaluation is detached and enters at weight 0, so it refreshes the branch's rolling statistics and contributes no gradient. And when the replay branch is unavailable on a step (`protocol.py::StageProtocol.mode_boostable` is false for it, the replay buffer is absent or empty, or the aligned draw of `cfg:stage.condition_draw` finds no eligible condition) and the backward branch is active, replay's share is added to the backward weight. A replay branch that is available and below the bar is skipped with no such transfer.
+
+On a stage with `cfg:stage.fwd_rollout_every` above zero the forward branch is gated by the rollout cadence in place of the frac test and the refresh. It runs on the steps `train.py::Modeller._fwd_gates` returns `fwd_ran` for (the cadence, the replay warm-up, an off-cadence trigger, a Z pin), the refresh does not run it, and it is in $\mathcal{A}$ on such a step only when its frac is at or above the bar and the step is not a Z pin.
 
 ## Inside a branch
 
@@ -52,18 +54,20 @@ The table lists each key of the three coefficient blocks against the branches th
 | `mle` | bwd, replay | maximum likelihood on stored terminals | `gflownet_losses.py::terminal_mle` |
 | `tbc` | bwd | reward-free VarGrad over K backward rollouts from one terminal | `gflownet_losses.py::get_tbc_loss` |
 | `pf_boost` | bwd, replay | $P_F$ retention term | `gflownet_losses.py::get_pf_retention_loss` |
-| `level_gap` (`level_gap_clamp`, `level_gap_pf_only`) | bwd, replay | detached EMA level delta times $-\log P_F$, or times $\log w$ | `gflownet_losses.py::get_gfn_backward_loss` |
+| `level_gap` (`level_gap_clamp`, `level_gap_pf_only`) | bwd | detached EMA level delta times $-\log P_F$, or times $\log w$ | `gflownet_losses.py::get_gfn_backward_loss` |
 | `pooled_vg` (`pooled_beta`, `pooled_ratio`, `pooled_source`, `pooled_bridge_only`, `pooled_thin_by_condition`) | declared on fwd, spans two branches | one condition group over both branches' live rows, added outside the mix | `gflownet_losses.py::pooled_condition_vargrad` |
-| `beta`; `loss_clip` | fwd, bwd, replay | Huber knee inside every TB-style term above; elementwise ceiling on each term before the sum | `gflownet_losses.py::get_tb_loss`, `::soft_clip` |
+| `beta`; `loss_clip` | fwd, bwd, replay | Huber knee inside every TB-style term above; elementwise soft clip on each term before the sum, the identity up to the cutoff and logarithmic beyond it, skipped at `-1` | `gflownet_losses.py::get_tb_loss`, `::soft_clip` |
 | `freeze_policy`; `freeze_z` | fwd, bwd, replay | detaches $\log P_F$, $\log P_B$ and the conditioner-to-flow path at source; detaches $\log Z$ and the flow | `gflownet_losses.py::get_gfn_forward_loss` |
-| `traj_grads` | fwd, bwd, replay | keeps the reparameterised trajectory path live | `models/gfn.py::GFN.get_traj_fwd` |
+| `traj_grads` | fwd, bwd | keeps the reparameterised trajectory path live; the replay block carries the key and the builder does not read it on a stored path, which goes through `models/gfn.py::GFN.get_traj_replay` | `models/gfn.py::GFN.get_traj_fwd`, `::GFN.get_traj_bwd` |
 | `reward_grads` (`reward_grad_clip`, `reward_grad_gate`, `reward_grad_force_clip`, `path_grad_last_k`, `path_grad_scale`) | fwd; replay under `resample_last_k` | lets $d\log R/dx_T$ reach the policy, plain or reshaped | `gflownet_losses.py::get_gfn_forward_loss` |
 | `stored_force_k` (`stored_force_mode`, `force_chunk_rows`); `resample_last_k` | replay | a zero-valued surrogate adding the stored terminal force to $\log R$; a live re-sample of the last k steps with the reward re-scored. Mutually exclusive | `gflownet_losses.py::get_gfn_backward_loss` |
 | `tb_z_source` | fwd, bwd, replay | which level the TB term uses: `learned`, `persistent`, or `batch_root` on fwd | `gflownet_losses.py::batch_root_z` |
 | `repeats` | fwd, bwd, replay | K-tiling of the draw; a cross-terminal group on fwd, a shared-terminal group on bwd | `train.py::Modeller.mode_repeats` |
-| `condition_block_m` | bwd, replay | makes the draw condition-blocked, M distinct same-condition terminals per block | `buffer.py::CrystalBuffer._sample_indices` |
+| `condition_block_m` | bwd, replay | makes the draw condition-blocked, M distinct same-condition terminals per block; applied only while `config_invariants.py::runs_grouped_vargrad` holds for the branch, and on replay only with `vg_by_condition` on | `buffer.py::CrystalBuffer._sample_indices` |
 | `vg_by_condition`, `vg_detach_center` | fwd, bwd, replay | group by `condition_id` rather than by K-tile; treat the group centre as constant | `gflownet_losses.py::condition_grouped_empirical_z` |
 | `exploration_std` | fwd | additive per-step log-std on the sampling kernel only | `train.py::Modeller._fwd_exploration_std` |
+
+The backward and replay branches share `gflownet_losses.py::get_gfn_backward_loss`, which reads `mle`, `tbc`, `pf_boost` and `level_gap` from whichever block it is handed. The canonical `cfg:replay_loss_coeffs` block carries no `tbc` or `level_gap` key, and `protocol.py::StageProtocol.coeffs` raises on a stage override of a key the base block lacks.
 
 Rules over these blocks live in `config_invariants.py`: `vargrad_needs_groups` refuses a VarGrad coefficient with no group to centre over; `runs_grouped_vargrad` is the single predicate for whether grouped VarGrad is running, over the keys `BRANCH_VARGRAD_COEFFS` and `CROSS_BRANCH_VARGRAD_COEFF`; `batch_root_forward_is_well_formed` confines `batch_root` to the forward branch; `replay_seat_problems` and `condition_draw_problems` are re-run against the resolved config for every stage by `set_loss_coeffs`. `train.py::Modeller._warn_if_z_untrained` prints a warning naming the stage when the live coefficients leave no trainer on the flow head.
 
@@ -81,7 +85,7 @@ An on-policy draw is therefore exponentially unlikely to contain a strongly nega
 
 In the equilibration stage of the canonical config the forward block is `fwd: { tb: 1.0, freeze_policy: 1.0 }` and `cfg:stage.fracs` pins `fwd` at 0, below that stage's `deactivate_threshold` of 0.01. Two mechanisms then hold the forward residual out of training. `freeze_policy` detaches $\log P_F$ and $\log P_B$ at source inside `get_gfn_forward_loss`, so no term built from them reaches the policy parameters whatever else is active. And `fwd_active` is false, so `fused_train_step` detaches the whole forward loss before the sum and gives it weight 0. The policy is trained by the backward and replay branches only, and `fwd/tb_err`, the batch RMS residual computed by `utils.py::quick_tb_stats`, is a measurement on rows against which no policy gradient was taken, while `bwd/tb_err` and `replay/tb_err` are measurements on the branches that took them.
 
-`train.py::Modeller._fwd_gates` separates `fwd_ran` from `fwd_active`: under `cfg:stage.fwd_rollout_every` the rollout is paid for on the steps it fires, for the replay admission and the $\log Z$ pin, and carries no weight on any of them. On such a step $\log Z$ is in no live graph, so `train.py::Modeller.z_level_fill` runs before the other two branches and their residuals are computed against the pinned level.
+`train.py::Modeller._fwd_gates` separates `fwd_ran` from `fwd_active`: `fwd_ran` gates the rollout, and with it the $\log Z$ stash (`train.py::Modeller._stash_z_fill_logw`) and, off a Z pin, the replay admission; `fwd_active` is `fwd_ran` with the frac at or above the bar on a step that is not a Z pin. This stage sets `cfg:stage.fwd_rollout_every` and holds the forward frac at 0, so the rollout carries no weight on any step it fires. On a step where the rollout ran and its loss is neither active nor the sidecar, the forward loss is detached and $\log Z$ is in no live graph at that point, so `train.py::Modeller.z_level_fill` is called before the other two branches and their residuals are computed against the level the fill leaves; with a live forward loss the fill is left to the call after the optimizer step in `train.py::Modeller.train`.
 
 ## Retired and dead keys
 
@@ -95,9 +99,9 @@ In the equilibration stage of the canonical config the forward block is `fwd: { 
 
 ## Config keys
 
-`cfg:stage.fracs`, `cfg:stage.deactivate_threshold`, `cfg:stage.loss_coeffs`, `cfg:stage.fwd_rollout_every`, `cfg:stage.fwd_z_sidecar`, `cfg:stage.bwd_sampling_mode`, `cfg:controller.deactivate_threshold`, `cfg:controller.refresh_every`, `cfg:freeze_backward_policy`, and every key of `cfg:fwd_loss_coeffs`, `cfg:bwd_loss_coeffs`, `cfg:replay_loss_coeffs` named in the inventory above.
+`cfg:stage.fracs`, `cfg:stage.deactivate_threshold`, `cfg:stage.loss_coeffs`, `cfg:stage.fwd_rollout_every`, `cfg:stage.fwd_z_sidecar`, `cfg:stage.condition_draw`, `cfg:stage.bwd_sampling_mode`, `cfg:controller.deactivate_threshold`, `cfg:controller.refresh_every`, `cfg:freeze_backward_policy`, and every key of `cfg:fwd_loss_coeffs`, `cfg:bwd_loss_coeffs`, `cfg:replay_loss_coeffs` named in the inventory above.
 
-Code: `train.py::Modeller.fused_train_step`, `.fwd_train_step`, `.bwd_train_step`, `.replay_train_step`, `.set_loss_coeffs`, `._warn_if_z_untrained`, `._fwd_gates`, `.mode_repeats`, `.draw_bwd_sample`, `.draw_replay_sample`, `.z_level_fill`, `._stash_z_fill_logw`; `gflownet_losses.py::get_gfn_forward_loss`, `::get_gfn_backward_loss`, `::combine_branch_terms`, `::soft_clip`, `::get_tb_loss`, `::pooled_condition_vargrad`, `::condition_grouped_empirical_z`; `protocol.py::StageProtocol.coeffs`, `.base_coeffs`, `.mode_dormant`, `.mode_boostable`, `protocol.py::POOLED_SOURCES`; `config_invariants.py::vargrad_needs_groups`, `::runs_grouped_vargrad`, `::batch_root_forward_is_well_formed`, `::replay_seat_problems`, `::condition_draw_problems`; `utils.py::quick_tb_stats`.
+Code: `train.py::Modeller.fused_train_step`, `.fwd_train_step`, `.bwd_train_step`, `.replay_train_step`, `.set_loss_coeffs`, `._warn_if_z_untrained`, `._fwd_gates`, `.mode_repeats`, `.draw_bwd_sample`, `.draw_replay_sample`, `._choose_draw_conditions`, `.z_level_fill`, `._stash_z_fill_logw`, `.train`; `gflownet_losses.py::get_gfn_forward_loss`, `::get_gfn_backward_loss`, `::combine_branch_terms`, `::soft_clip`, `::get_tb_loss`, `::pooled_condition_vargrad`, `::condition_grouped_empirical_z`; `protocol.py::StageProtocol.coeffs`, `.base_coeffs`, `.mode_dormant`, `.mode_boostable`, `protocol.py::POOLED_SOURCES`; `config_invariants.py::vargrad_needs_groups`, `::runs_grouped_vargrad`, `::batch_root_forward_is_well_formed`, `::replay_seat_problems`, `::condition_draw_problems`; `models/gfn.py::GFN.get_traj_fwd`, `::GFN.get_traj_bwd`, `::GFN.get_traj_replay`; `energies/molecular_crystal.py::MolecularCrystal.prebuilt_sample_to_reward`; `utils.py::quick_tb_stats`.
 
 ## Could be tooling
 
