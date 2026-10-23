@@ -53,8 +53,12 @@ def components(smi):
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return []
+    try:
+        frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
+    except Exception:   # a component RDKit parses whole but cannot re-sanitise alone (kekulisation)
+        return []
     out = []
-    for frag in Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True):
+    for frag in frags:
         if any(a.GetAtomicNum() not in ALLOWED_Z for a in frag.GetAtoms()):
             continue
         if sum(a.GetFormalCharge() for a in frag.GetAtoms()) != 0:
@@ -216,22 +220,26 @@ def process_lines(lines, lo, hi, max_parent, max_per_parent, smiles_col=0):
             continue
         stats['prefilter_kept'] += 1
         for comp in components(smi):
-            n = comp.GetNumHeavyAtoms()
-            if lo <= n <= hi:
-                stats['direct'] += 1
-                rec = agg.setdefault(canon(comp), [0, 0, 10 ** 6])
-                rec[0] += 1
-            elif hi < n <= max_parent:
-                stats['parents'] += 1
-                key = canon(comp)
-                frs = fragments(comp, lo, hi, max_per_parent, key)
-                stats['fragments'] += len(frs)
-                for f in frs:
-                    rec = agg.setdefault(f, [0, 0, 10 ** 6])
-                    rec[1] += 1
-                    rec[2] = min(rec[2], n)
-            elif n > max_parent:
-                stats['too_large'] += 1
+            try:   # any RDKit failure on one component skips it, counted, and never aborts the chunk
+                n = comp.GetNumHeavyAtoms()
+                if lo <= n <= hi:
+                    key = canon(comp)
+                    stats['direct'] += 1
+                    rec = agg.setdefault(key, [0, 0, 10 ** 6])
+                    rec[0] += 1
+                elif hi < n <= max_parent:
+                    key = canon(comp)
+                    frs = fragments(comp, lo, hi, max_per_parent, key)
+                    stats['parents'] += 1
+                    stats['fragments'] += len(frs)
+                    for f in frs:
+                        rec = agg.setdefault(f, [0, 0, 10 ** 6])
+                        rec[1] += 1
+                        rec[2] = min(rec[2], n)
+                elif n > max_parent:
+                    stats['too_large'] += 1
+            except Exception:
+                stats['errors'] += 1
     return agg, dict(stats)
 
 
