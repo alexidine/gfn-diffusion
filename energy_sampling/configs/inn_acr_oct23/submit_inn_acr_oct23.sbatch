@@ -29,7 +29,8 @@
 #
 #   phase 1  the stage-1 run (s0), cap 0.9 of the card (prior scan ~271k MACE rows) -> inn_acr23_s0_mle
 #   phase 2  the stage-2 arm from s0's best.pt, cap 0.9                              -> inn_acr23_base
-#     0 base       the recipe, 2000 fresh draws per update
+#     0 base       the recipe, 2000 fresh draws per scored batch, each scored batch serving 5 updates (rare rollouts,
+#                  --updates_per_batch 5, the GFN production cadence n5; owner 2026-10-23)
 #
 # One process on the card at a time, no MPS: MACE fills the card on its own. The two stages are separate processes
 # because stage 2 changes settings stage 1 fixes (floor 1e-5 -> 1e-7, fp32 transformer, replay) and starts from stage

@@ -60,7 +60,8 @@ Run them on the GPU, one at a time: on the CPU, `pool_assemble_mace`'s MACE chec
 
 `submit_inn_acr_oct23.sbatch`, flags in `common.args` and `arms.tsv`: one A100, 2-day job, one process on the card at a
 time and no MPS (MACE fills the card on its own): the stage-1 run, then the stage-2 arm `base` (2000 fresh draws per
-update) from its best held-out checkpoint, on a 38-hour clock, each at 0.9 of the card. Stage 1 runs 20k steps (owner,
+scored batch; rare rollouts, `--updates_per_batch 5`: each MACE-scored batch serves 5 updates, the GFN production
+cadence n5, owner 2026-10-23; stored rows are new every update and cost no energy call) from its best held-out checkpoint, on a 38-hour clock, each at 0.9 of the card. Stage 1 runs 20k steps (owner,
 2026-10-23; at most 300 min) and the occupancy batch sizer is on in both stages (`--util_target 0.75`: stage 1's
 likelihood batch and stage 2's stored-row batch grow while the card is under 75% busy; the fresh draws never do), with
 its memory guard off (`--grow_mem_frac 1.0`): the guard reads the peak memory since the last change, MACE's adaptive
