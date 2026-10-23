@@ -212,6 +212,50 @@ def head_log_z(run: Run, rows) -> torch.Tensor:
 
 
 @torch.no_grad()
+def draw_latents(run: Run, rows, batch_size: int = 2048, seed: Optional[int] = None) -> torch.Tensor:
+    """One forward draw per row of `rows` with no energy call: the raw terminal states,
+    [n, data_ndim] on the CPU. The rollout is the eval's (GFN.get_traj_fwd on a uniform grid
+    of cfg:eval_T steps); nothing is scored. `crystals_from` builds the crystals."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    ef = run.energy_function
+    out = []
+    for start in range(0, rows.num_graphs, batch_size):
+        mol_batch = rows.subsample_new_batch(torch.arange(start, min(start + batch_size, rows.num_graphs))).to(run.device)
+        mol_batch.orient_molecule(mode='standard')
+        bsz = mol_batch.num_graphs
+        temperatures = run.temperature * torch.ones(bsz, dtype=torch.float32, device=run.device)
+        mol_batch, _, condition, _ = ef.condition_samples(mol_batch, temperature=temperatures)
+        states, *_ = run.gfn.get_traj_fwd(get_gfn_init_state(bsz, ef.data_ndim, run.device),
+                                          lambda b: uniform_discretizer(b, run.eval_T), None, condition.to(run.gfn.device), mol_batch)
+        out.append(states[:, -1].detach().cpu())
+    return torch.cat(out)
+
+
+@torch.no_grad()
+def crystals_from(run: Run, rows, terminals, scored: bool = True, batch_size: int = 1024):
+    """The crystals the trainer builds from `terminals`, one row of `rows` each (CPU batch).
+    With `scored` they come out of the reward function, as `draw` returns them, at one energy
+    call each. Without, they come from MolecularCrystal.instantiate_crystals alone: cell and
+    pose set, nothing analysed, no energy call."""
+    ef = run.energy_function
+    out = None
+    for start in range(0, rows.num_graphs, batch_size):
+        mol_batch = rows.subsample_new_batch(torch.arange(start, min(start + batch_size, rows.num_graphs))).to(run.device)
+        mol_batch.orient_molecule(mode='standard')
+        temperatures = run.temperature * torch.ones(mol_batch.num_graphs, dtype=torch.float32, device=run.device)
+        mol_batch, log_T, _, _ = ef.condition_samples(mol_batch, temperature=temperatures)
+        x = terminals[start:start + batch_size].float().to(run.device)
+        if scored:
+            _, part = ef.log_reward(x, mol_batch=mol_batch, log_temperature=log_T, return_exp=True)
+        else:
+            part = ef.instantiate_crystals(x, mol_batch)
+        part = part.cpu().detach()
+        out = part if out is None else out.append_batch(part)
+    return out
+
+
+@torch.no_grad()
 def draw(run: Run, rows, batch_size: int = 1000, seed: Optional[int] = None) -> dict:
     """One forward draw per row of `rows`, through the eval's own sampling function.
 

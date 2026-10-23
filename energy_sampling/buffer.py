@@ -36,6 +36,10 @@ from utils import compute_sample_overlap, iter_forever, stdz
 #: evidence-weighted cumulative mean, with no division by zero and no code path
 #: that assumes finiteness -- so there is headroom above this, not a cliff.
 DEFAULT_HALF_LIFE_VISITS = 200.0
+# ConditionLogZTracker.untrusted_z: which Z the TB residual uses for a condition still
+# below min_visits -- the learned flow head, or the tracker's all-condition level
+UNTRUSTED_Z_MODES = ('head', 'global')
+DEFAULT_GLOBAL_HALF_LIFE_UPDATES = 50.0
 
 # Space-group lookup tables (indexed 0..230) that data_classes builds lazily the
 # first time a batch runs a latent transform. They are deterministic globals, not
@@ -2660,13 +2664,27 @@ class ConditionLogZTracker:
     def __init__(self, library_size: int, min_visits: int = 20,
                  half_life_visits: float = DEFAULT_HALF_LIFE_VISITS,
                  trim_frac: float = 0.1, max_batch_weight: float = 200.0,
-                 discovery_half_life_steps: float = 200.0, clip_beta: float = 10.0):
+                 discovery_half_life_steps: float = 200.0, clip_beta: float = 10.0,
+                 untrusted_z: str = 'head',
+                 global_half_life_updates: float = DEFAULT_GLOBAL_HALF_LIFE_UPDATES):
+        if untrusted_z not in UNTRUSTED_Z_MODES:
+            raise ValueError(f"condition_log_z.untrusted_z must be one of {UNTRUSTED_Z_MODES}, "
+                             f"got {untrusted_z!r}")
         self.library_size = library_size
         self.min_visits = min_visits
         self.half_life_visits = half_life_visits
         self.trim_frac = trim_frac
         self.max_batch_weight = max_batch_weight
         self.discovery_half_life_steps = discovery_half_life_steps
+        # THE ALL-CONDITION LEVEL. One observation per update() call -- the mean over
+        # conditions of that call's trimmed per-condition means, i.e. the values
+        # ema_logw mixes, pooled -- folded into an EMA whose half-life counts calls.
+        # Read by untrusted_fallback() as the Z for a condition still below
+        # min_visits when untrusted_z is 'global'; unread under 'head'.
+        self.untrusted_z = untrusted_z
+        self.global_half_life_updates = float(global_half_life_updates)
+        self.global_logw = float('nan')
+        self.global_effective_count = 0.0
         # FIXED reference Huber beta for the z_grad stream. Taken once from the
         # base fwd_loss_coeffs rather than the live stage's beta on purpose: a
         # per-stage beta would silently rescale the ruler at every transition,
@@ -2749,6 +2767,16 @@ class ConditionLogZTracker:
         # not gated on.
         self.fwd_level_visits = torch.zeros((library_size,), dtype=torch.long)
         self.bwd_level_visits = torch.zeros((library_size,), dtype=torch.long)
+        # the SHARED per-condition clock both level streams decay on (see
+        # update_mode_level). level_clock ticks once per training step on which
+        # the condition is fed to EITHER stream (level_clock_step dedupes the
+        # two feeds of one step); *_level_clock is the clock reading at that
+        # stream's last update, so a stream decays by one half_life_visits
+        # factor per tick elapsed since it was last fed.
+        self.level_clock = torch.zeros((library_size,), dtype=torch.long)
+        self.level_clock_step = torch.full((library_size,), -1, dtype=torch.long)
+        self.fwd_level_clock = torch.zeros((library_size,), dtype=torch.long)
+        self.bwd_level_clock = torch.zeros((library_size,), dtype=torch.long)
         # discovery-rate telemetry over best_energy: update_best_energy()
         # accumulates strict per-condition minimum improvements (count/depth)
         # and first visits into the _window_* scalars; pop_discovery_stats()
@@ -2975,6 +3003,26 @@ class ConditionLogZTracker:
         self.count[unique_ids] += counts_this_step.long()
         self.last_update_step[unique_ids] = int(step)
 
+        # the all-condition level (see __init__): equal weight per condition in this call
+        finite = torch.isfinite(mean_logw)
+        if bool(finite.any()):
+            obs = float(mean_logw[finite].mean())
+            decay = 0.5 ** (1.0 / self.global_half_life_updates)
+            self.global_effective_count = self.global_effective_count * decay + 1.0
+            if math.isfinite(self.global_logw):
+                w = 1.0 / self.global_effective_count
+                self.global_logw = (1.0 - w) * self.global_logw + w * obs
+            else:
+                self.global_logw = obs
+
+    def untrusted_fallback(self):
+        """The Z the TB residual uses for a condition below min_visits, as a float, or
+        None to keep the learned head there: the all-condition level under untrusted_z
+        'global', once update() has run; None under 'head' and before the first update."""
+        if self.untrusted_z != 'global' or not math.isfinite(self.global_logw):
+            return None
+        return self.global_logw
+
     @torch.no_grad()
     def update_z_residual(self, condition_id, logw, log_Z_learned, step: int,
                           half_life_visits: Optional[float] = None):
@@ -3091,25 +3139,42 @@ class ConditionLogZTracker:
                           half_life_visits: Optional[float] = None):
         """
         Feed one mode's per-condition level stream (fwd_level_ema /
-        bwd_level_ema, see __init__): an own-visit-decayed, evidence-capped
-        EMA of the per-condition trimmed mean of log w, same decay
-        convention as update()/update_z_residual() (decayed once per own
-        visit on THIS stream, not by elapsed training steps -- see update()'s
-        docstring). Trimming for the same reason as update()'s ema_logw: the
-        delta gate reads levels, and one catastrophic-energy outlier in a
-        batch mean would otherwise swing a whole condition's level reading
-        for a half-life.
+        bwd_level_ema, see __init__): an evidence-capped EMA of the
+        per-condition trimmed mean of log w. Trimming for the same reason as
+        update()'s ema_logw: the delta gate reads levels, and one
+        catastrophic-energy outlier in a batch mean would otherwise swing a
+        whole condition's level reading for a half-life.
+
+        DECAY IS ON THE SHARED PER-CONDITION CLOCK, not per own visit as in
+        update()/update_z_residual(). delta(c) subtracts the two streams, and
+        they are fed at different rates: bwd on every fused step, fwd only on
+        rollout steps. Decayed once per OWN visit, each stream's mean lag is
+        ~half_life_visits/ln2 of its own visits, so at fwd_rollout_every N the
+        fwd level lags N times as many steps as the bwd one, and whenever the
+        levels drift at rate v the gap reads (tau_fwd - tau_bwd) * v on top of
+        the real one. Here the clock (level_clock) ticks once per step on which
+        this condition reaches either stream, and a stream decays by
+        decay_per_visit ** (ticks since its own last update), so both streams
+        carry the same time constant in steps and a common drift cancels in
+        the difference. A second feed of the same stream on the same step (a
+        z-calibration rollout beside the fused one) adds evidence without
+        decaying. The clock is per condition rather than the global step so a
+        sparsely revisited condition keeps a memory of half_life_visits of its
+        OWN steps -- the reason update() is keyed to own visits (its
+        docstring).
         """
         if mode == 'fwd':
             level_ema = self.fwd_level_ema
             eff_count = self.fwd_level_effective_count
             last_step_t = self.fwd_level_last_step
             visits = self.fwd_level_visits
+            stream_clock = self.fwd_level_clock
         elif mode == 'bwd':
             level_ema = self.bwd_level_ema
             eff_count = self.bwd_level_effective_count
             last_step_t = self.bwd_level_last_step
             visits = self.bwd_level_visits
+            stream_clock = self.bwd_level_clock
         else:
             raise ValueError(f"unknown mode-level stream '{mode}' (expected 'fwd' or 'bwd')")
 
@@ -3128,11 +3193,18 @@ class ConditionLogZTracker:
         unique_ids, inverse = torch.unique(condition_id, return_inverse=True)
         mean_logw, counts = self._group_trimmed_mean(inverse, logw, unique_ids.shape[0])
 
+        # tick the shared clock once per step per condition, whichever stream
+        # arrives first; the other stream's feed on the same step sees no tick
+        self.level_clock[unique_ids] += (self.level_clock_step[unique_ids] != int(step)).long()
+        self.level_clock_step[unique_ids] = int(step)
+        elapsed_ticks = (self.level_clock[unique_ids] - stream_clock[unique_ids]).float()
+        stream_clock[unique_ids] = self.level_clock[unique_ids]
+
         old_mean = level_ema[unique_ids]
         old_eff_count = eff_count[unique_ids]
         nan_mask = torch.isnan(old_mean)
 
-        decayed_eff_count = old_eff_count * decay_per_visit
+        decayed_eff_count = old_eff_count * torch.pow(decay_per_visit, elapsed_ticks)
         evidence_count = torch.clamp(counts, max=self.max_batch_weight)
         new_eff_count = decayed_eff_count + evidence_count
         w_new = evidence_count / new_eff_count
@@ -3842,6 +3914,10 @@ class ConditionLogZTracker:
             "bwd_level_last_step": self.bwd_level_last_step.cpu(),
             "fwd_level_visits": self.fwd_level_visits.cpu(),
             "bwd_level_visits": self.bwd_level_visits.cpu(),
+            "level_clock": self.level_clock.cpu(),
+            "level_clock_step": self.level_clock_step.cpu(),
+            "fwd_level_clock": self.fwd_level_clock.cpu(),
+            "bwd_level_clock": self.bwd_level_clock.cpu(),
             "discovery_half_life_steps": self.discovery_half_life_steps,
             "minima_improved_total": self.minima_improved_total,
             "minima_depth_total": self.minima_depth_total,
@@ -3852,6 +3928,10 @@ class ConditionLogZTracker:
             "discovery_rate_ema": self.discovery_rate_ema,
             "discovery_depth_rate_ema": self.discovery_depth_rate_ema,
             "discovery_last_step": self.discovery_last_step,
+            "untrusted_z": self.untrusted_z,
+            "global_half_life_updates": self.global_half_life_updates,
+            "global_logw": self.global_logw,
+            "global_effective_count": self.global_effective_count,
         }
 
     @classmethod
@@ -3955,6 +4035,33 @@ class ConditionLogZTracker:
             "fwd_level_visits", torch.zeros_like(obj.count)).cpu()
         obj.bwd_level_visits = state.get(
             "bwd_level_visits", torch.zeros_like(obj.count)).cpu()
+        if "level_clock" in state:
+            obj.level_clock = state["level_clock"].cpu()
+            obj.level_clock_step = state["level_clock_step"].cpu()
+            obj.fwd_level_clock = state["fwd_level_clock"].cpu()
+            obj.bwd_level_clock = state["bwd_level_clock"].cpu()
+        else:
+            # a checkpoint without the shared level clock accumulated the two
+            # level streams under per-own-visit decay, which leaves the fwd
+            # stream's effective count ~fwd_rollout_every times above its steady
+            # state on the clock. Carried over, the fwd level keeps that long
+            # memory for several half-lives after the resume -- the lag the clock
+            # removes. So the streams RESTART empty, visit counts included:
+            # delta_stats reads +inf until min_visits re-accumulate on both.
+            if bool((obj.fwd_level_visits > 0).any() or (obj.bwd_level_visits > 0).any()):
+                print("condition_log_z: checkpoint predates the shared level clock -- the "
+                      "fwd/bwd level streams (zmatch/delta_*) restart empty and read +inf until "
+                      f"both have {obj.min_visits} visits again")
+            obj.fwd_level_ema = torch.full_like(obj.count, float("nan"), dtype=torch.float32)
+            obj.bwd_level_ema = torch.full_like(obj.count, float("nan"), dtype=torch.float32)
+            obj.fwd_level_effective_count = torch.zeros_like(obj.count, dtype=torch.float32)
+            obj.bwd_level_effective_count = torch.zeros_like(obj.count, dtype=torch.float32)
+            obj.fwd_level_visits = torch.zeros_like(obj.count)
+            obj.bwd_level_visits = torch.zeros_like(obj.count)
+            obj.level_clock = torch.zeros_like(obj.count)
+            obj.level_clock_step = torch.full_like(obj.count, -1)
+            obj.fwd_level_clock = torch.zeros_like(obj.count)
+            obj.bwd_level_clock = torch.zeros_like(obj.count)
         # older checkpoints predate the discovery telemetry -- zeroed
         # accumulators/EMAs are the honest fallback (rates rebuild within a
         # half-life), and discovery_last_step falls back to current_step so
@@ -3969,6 +4076,14 @@ class ConditionLogZTracker:
         obj.discovery_rate_ema = state.get("discovery_rate_ema", 0.0)
         obj.discovery_depth_rate_ema = state.get("discovery_depth_rate_ema", 0.0)
         obj.discovery_last_step = state.get("discovery_last_step", int(current_step))
+        # older checkpoints predate the all-condition level: 'head' is what they ran,
+        # and an unset level rebuilds from the first post-reload update(). The trainer
+        # re-applies the LIVE config's untrusted_z / half-life after this returns.
+        obj.untrusted_z = state.get("untrusted_z", "head")
+        obj.global_half_life_updates = float(
+            state.get("global_half_life_updates", DEFAULT_GLOBAL_HALF_LIFE_UPDATES))
+        obj.global_logw = float(state.get("global_logw", float("nan")))
+        obj.global_effective_count = float(state.get("global_effective_count", 0.0))
         return obj
 
 

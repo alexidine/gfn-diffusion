@@ -2695,7 +2695,8 @@ def dmat_row_indices(batch, results, energy_key, kT=2.5):
 
 def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
                        cluster_labels, p_maxima, n_basins, indexed_cluster_labels, extra_refs=None,
-                       umap_kwargs=None, kT=2.5, uma_bundle=None, elj_bundle=None):
+                       umap_kwargs=None, kT=2.5, uma_bundle=None, elj_bundle=None, scale_label=None,
+                       extra_scales=None):
     """extra_refs: structures placed on the UMAP and nowhere else (see
     new_analysis.score_embedding_references). They enter a SEPARATE matrix used only
     for the UMAP fit, so every density, table value and basin assignment below is
@@ -2854,6 +2855,23 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     # is a copy of 'density' and must not be shown as a second, LJ measurement
     stats['energy_function'] = energy_function
     stats['paired_density'] = uma_results is not elj_results
+    # scale_label names the kernel of uma_results['d_cuts'][0] in the table; extra_scales {label: d_cut} adds the
+    # SAME points' percentiles at other kernel widths (basins and points unchanged), from the distances in hand
+    stats['scale_label'] = scale_label
+    stats['extra_scales'] = []
+    for label, dc in (extra_scales or {}).items():
+        dk = dc / 3
+        ro = (torch.exp(-(full_dmat[:num_filtered_samples, :num_filtered_samples] ** 2) / (2 * dk ** 2)).sum(1) - 1).double()
+        rn = torch.exp(-(full_dmat[num_filtered_samples:, :num_filtered_samples] ** 2) / (2 * dk ** 2)).sum(1).double()
+        u = _rank(ro, torch.cat([ro[p_maxima], rn[:num_polymorphs]]))
+        eo = (torch.exp(-(edmat ** 2) / (2 * dk ** 2)).sum(1) - 1).double()
+        en = torch.exp(-(dists_to_elj ** 2) / (2 * dk ** 2)).sum(1).double()
+        e = _rank(eo, en[:n_basins + num_polymorphs])
+        stats['extra_scales'].append({'label': label, 'uma_pct': u[0], 'uma_below': u[2], 'elj_pct': e[0],
+                                      'elj_below': e[2]})
+        print(f"  scale {label} (d_cut {dc:.4f}): UMA percentiles {np.round(u[0], 1).tolist()} "
+              f"(<LOD {u[2].astype(int).tolist()}), LJ {np.round(e[0], 1).tolist()} (<LOD {e[2].astype(int).tolist()}); "
+              f"draws below one draw's weight: UMA {u[1]:.1f}%, LJ {e[1]:.1f}%")
     # stats['local_en_var'] = uma_thermos['local_en_var'][p_maxima]
     poly_to_basin_dists = torch.zeros((num_polymorphs, n_basins))
     for ind in range(num_polymorphs):
@@ -2870,7 +2888,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
 
 
 def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int,
-               scan_device=None, return_anchors=False):
+               scan_device=None, return_anchors=False, cc_max: float = 2.0):
     """
     scan_device: where to run the cutoff scan ONLY. None picks cuda when
     available. The scan calls mean_shift_density up to 200 times and each call
@@ -2901,7 +2919,9 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     b_rec = []
     b_sz_rec = []
     try:
-        for cc in torch.linspace(0.33, 2, 200):
+        # cc_max > 2 carries the same step further: a COMPACK-anchored d_cut can be small against the distance
+        # between a molecule's packing families
+        for cc in 0.33 + (2 - 0.33) / 199 * torch.arange(int(round((cc_max - 0.33) / ((2 - 0.33) / 199))) + 1):
             cluster_labels = mean_shift_density(
                 len(dmat), 100, dmat_scan, d_cuts[0] * cc, density_scan).cpu()
 

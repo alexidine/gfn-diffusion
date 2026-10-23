@@ -67,22 +67,28 @@ def search_stages(path, fixed_steps, plan=None):
     return stages, cfg
 
 
-def relax(batch, stages, device, scratch):
+def relax(batch, stages, device, scratch, trajectory=False):
     """Run the stages on a crystal batch. Returns the relaxed crystals (CPU batch) and, per
-    row, the energy and packing coefficient before the first step and at the end."""
+    row, the energy and packing coefficient before the first step and at the end. With
+    `trajectory`, the end dict also carries 'traj': the energy at every recorded step of
+    every stage in order, [steps, rows] float32 (one step is one energy and force call a row)."""
     from mxtaltools.dataset_utils.utils import collate_data_list
     b = batch.to(device)
     key = str(stages[-1]['optim_target'])
-    start = {}
+    start, traj = {}, []
     for stage in stages:
         out, rec = b.optimize_crystal_parameters(return_record=True, intermediates_path=scratch, **stage)
         assert len(out) == b.num_graphs, 'the optimiser dropped rows'
         if not start:
             start = {'e': rec[key][0].detach().cpu().double().flatten(), 'cp': rec['cp'][0].detach().cpu().double().flatten()}
+        if trajectory:
+            traj.append(rec[key].detach().cpu().float().reshape(rec[key].shape[0], -1))
         b = collate_data_list(out).to(device)
     b.box_analysis()
     b = b.cpu().detach()
     end = {'e': getattr(b, key).double().flatten(), 'cp': b.packing_coeff.double().flatten()}
+    if trajectory:
+        end['traj'] = torch.cat(traj).numpy()
     return b, start, end
 
 

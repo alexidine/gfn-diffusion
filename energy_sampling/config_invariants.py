@@ -2011,11 +2011,44 @@ def conformer_set_policy_is_not_compiled(cfg: dict) -> list[Violation]:
         f'assumption until a cluster smoke measures it: set compile_policy: false.')]
 
 
+def energy_reference_is_consistent(cfg: dict) -> list[Violation]:
+    """energy_config.energy_reference and condition_log_z.untrusted_z, judged together.
+
+    untrusted_z 'global' stands ONE all-condition level in for every condition below
+    min_visits. That is only a usable Z once energy_reference has removed each
+    condition's depth from its log Z; without it the conditions' log Z differ by tens
+    of nats. The reference itself is refused with temperature_conditioning, because the
+    absolute reward floors undo E_ref/T at the run's single temperature. The trainer
+    raises on all three at init; this reports them before a launch.
+
+    Absence is judged: an unset untrusted_z is the code default 'head', an unset
+    energy_reference is null -- both fine on their own."""
+    out = []
+    ref = _get(cfg, 'energy_config.energy_reference', None)
+    unz = _get(cfg, 'condition_log_z.untrusted_z', 'head')
+    if ref not in (None, 'seed_min'):
+        out.append(Violation(ERROR, 'energy_reference_is_consistent',
+                             f"energy_config.energy_reference {ref!r} is not one of null, 'seed_min'"))
+    if unz not in ('head', 'global'):
+        out.append(Violation(ERROR, 'energy_reference_is_consistent',
+                             f"condition_log_z.untrusted_z {unz!r} is not one of 'head', 'global'"))
+    if unz == 'global' and ref is None:
+        out.append(Violation(ERROR, 'energy_reference_is_consistent',
+                             "condition_log_z.untrusted_z 'global' needs energy_config.energy_reference: "
+                             "without it one all-condition level stands in for conditions whose log Z "
+                             "differ by their depth"))
+    if ref is not None and _get(cfg, 'temperature_conditioning', False) is True:
+        out.append(Violation(ERROR, 'energy_reference_is_consistent',
+                             "energy_config.energy_reference is refused with temperature_conditioning"))
+    return out
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
     vargrad_needs_groups,
     conditional_z_settings_are_conditional,
+    energy_reference_is_consistent,
     auto_lr_requires_lr_control,
     lr_bracket_is_well_formed,
     burn_in_reaches_adam_steady_state,

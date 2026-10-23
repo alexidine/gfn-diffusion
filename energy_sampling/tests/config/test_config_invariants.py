@@ -194,10 +194,20 @@ def test_the_selector_rule_abstains_on_a_fragment(canonical):
 
 def test_a_disarmed_stage_check_is_caught_by_the_selector_rule(canonical):
     """The two halves together: with a bad selector the stage-scoped rule goes
-    quiet, and the selector rule is what keeps the config from passing."""
-    cfg = broken(canonical, protocol='does_not_exist')
-    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor'),         'fixture assumption: the stage rule DOES go quiet'
-    assert errors(cfg), 'but the config must still be rejected'
+    quiet, and the selector rule is what keeps the config from passing.
+
+    The rule is first shown firing on the fault under a valid selector, because
+    `_fires` matches by name and a name no rule emits is quiet on every config.
+    The fault is one `protocol.Stage` parses, so `every_protocol_parses`, which
+    reads every protocol whether selected or not, does not reject it either."""
+    rule = 'exit_patience_is_reachable'         # iterates active_stages(cfg)
+    # more writes of its metric than the run has steps: unreachable at any cadence
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 0, patience=canonical['epochs'] + 1)
+    assert _fires(cfg, rule), 'fixture assumption: the stage rule sees the fault'
+    cfg['protocol'] = 'does_not_exist'
+    assert not _fires(cfg, rule), 'fixture assumption: the stage rule DOES go quiet'
+    assert {v.rule for v in errors(cfg)} == {'protocol_selector_resolves'}, \
+        'but the config must still be rejected, and by the selector rule alone'
 
 
 def test_an_inactive_protocol_that_cannot_parse_is_caught(canonical):
@@ -1048,6 +1058,19 @@ def test_condition_draws_are_judged_on_the_resolved_config(canonical):
                              condition_log_z__rollout_under_drawn_power=2.0),
                       'condition_draw_is_well_formed')
     assert not _fires(canonical, 'condition_draw_is_well_formed')
+
+
+def test_a_global_untrusted_z_without_an_energy_reference_is_an_error(canonical):
+    # one all-condition level only stands in for conditions whose depth was removed
+    cfg = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference=None)
+    assert _fires(cfg, 'energy_reference_is_consistent')
+    ok = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference='seed_min')
+    assert not _fires(ok, 'energy_reference_is_consistent')
+
+
+def test_an_energy_reference_with_temperature_conditioning_is_an_error(canonical):
+    cfg = broken(canonical, energy_config__energy_reference='seed_min', temperature_conditioning=True)
+    assert _fires(cfg, 'energy_reference_is_consistent')
 
 
 def test_every_rule_is_mutation_tested():

@@ -105,8 +105,9 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
     '''TB plot'''
     # log R is the EXACT training reward written by new_analysis.py
     # (MolecularCrystal.prebuilt_sample_to_reward), not a hand-rolled copy
-    prior_data = torch.load(prior_path, weights_only=False)
-    en_scaling_factor = elj_prescale_factor(elj_results, prior_data['thermal_scaling_factor'])
+    # the prior is only read for results that stored the raw eLJ sum (some prior files are several GB)
+    en_scaling_factor = 1.0 if 'lj_coeff' in elj_results else elj_prescale_factor(
+        elj_results, torch.load(prior_path, weights_only=False)['thermal_scaling_factor'])
     for tag, res, res_path in (('elj', elj_results, elj_results_path), ('uma', uma_results, uma_results_path)):
         if not (res.get('provenance') or {}).get('pb_frozen_installed'):
             # the landscape draws predate the frozen-P_B fix; tb_draws.py writes fresh ones for this figure only
@@ -124,6 +125,9 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         if not (res.get('provenance') or {}).get('pb_frozen_installed'):
             print(f"  !! {tag} TB parity SKIPPED: results predate the frozen-P_B fix (no pb_frozen_installed in "
                   f"provenance); resample to regenerate it")
+            continue
+        if 'log_r' not in res:
+            print(f"  !! {tag} TB parity SKIPPED: results carry no 'log_r' (analysis run without train_config)")
             continue
         x = res['log_pbs'] + require_log_r(res, tag).to(res['log_pbs'].dtype)
         y = res['log_pfs'] + res['learned_log_z']
@@ -328,7 +332,32 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
                 new_min_inds, sample_energy, polymorph_colorscale, sample_colors, icl, basin_colorscale,
                 basin_min_batch, polymorph_basin_index, energy_function='uma')}, mol_name, out_dir)
         return
-    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters=4, min_basin_size=100)
+    scale_kw = {}
+    if mol_name in SCALE_RADII:
+        # the paper's definition, on the 10k analysis set: density, mean shift, shading and the first percentile
+        # rows at the 10/20 kernel; the same points' percentiles at 15/20 as extra rows
+        kernel = {name: 3 * r / KERNEL_REACH for name, r in SCALE_RADII[mol_name].items()}
+        d10 = kernel['match10of20']
+        uma_results = dict(uma_results, d_cuts=[d10])
+        uma_thermos = {'density': (torch.exp(-uma_results['dmat'].double() ** 2 / (2 * (d10 / 3) ** 2)).sum(-1) - 1).numpy()}
+        scale_kw = dict(scale_label='10/20', extra_scales={'15/20': kernel['match15of20']})
+        print(f"  landscape (10k): kernel d_cut {d10:.4f}; {100 * float(np.mean(uma_thermos['density'] < 1)):.1f}% of "
+              f"samples below one sample's weight")
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(
+        uma_results, uma_thermos, max_n_clusters=4, min_basin_size=100, cc_max=3.0 if scale_kw else 2.0)
+    if n_basins > 4:   # the scan ran out above four modes: keep the four largest, in density order
+        sizes = torch.tensor([int((indexed_cluster_labels == k).sum()) for k in range(n_basins)])
+        keep = torch.sort(torch.argsort(-sizes)[:4]).values
+        remap = torch.full((n_basins,), -1, dtype=torch.long)
+        remap[keep] = torch.arange(4)
+        print(f"  {n_basins} basins of 100+ at the end of the scan (sizes {sizes.tolist()}); the four largest are drawn")
+        cluster_labels = torch.where(torch.isin(indexed_cluster_labels, keep), cluster_labels,
+                                     torch.full_like(cluster_labels, -1))
+        indexed_cluster_labels = torch.where(indexed_cluster_labels >= 0,
+                                             remap[indexed_cluster_labels.clamp(min=0)], indexed_cluster_labels)
+        p_maxima, n_basins = p_maxima[keep.numpy()], 4
+    print(f"  basins: {[int((indexed_cluster_labels == k).sum()) for k in range(n_basins)]}; unassigned "
+          f"{100 * float((indexed_cluster_labels < 0).float().mean()):.1f}%")
     #cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering3(uma_results, uma_thermos, max_n_clusters=6,min_basin_size=100)
     # cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering2(uma_results, uma_thermos, n_clusters=10, n_keep=6)
 
@@ -337,7 +366,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
      polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
      sample_energy, sample_inds, stats) = combo_fig_analysis(
         ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, 'uma', cluster_labels, p_maxima,
-        n_basins, indexed_cluster_labels)
+        n_basins, indexed_cluster_labels, **scale_kw)
 
     fig_dict['cluster_analysis'] = combo_fig(
         num_polymorphs,
@@ -777,8 +806,21 @@ if __name__ == '__main__':
     PAIRS_P23_RED0_100K = {mol: dict(p, uma_bundle=bundle_of(p['uma_results_path']),
                                      elj_bundle=bundle_of(p['elj_results_path']))
                            for mol, p in PAIRS_P23_RED0.items()}
+    # PAIR_SET=ppl_red0: the prod_pool_oct07 arms (pooled oct05 priors), reduced cells only
+    PAIRS_PPL_RED0 = {
+        mol: dict(exp_path=PAIRS_P20[mol]['exp_path'],
+                  uma_results_path=os.path.join(RES, f'ppl_{fam}u_n5_running_10k_red0.pt'),
+                  elj_results_path=os.path.join(RES, f'ppl_{fam}_n5_running_10k_red0.pt'),
+                  prior_path=os.path.join(PRIORS, f'{mol}_elj_pooled_oct05_prior.pt'))
+        for mol, fam in (('mipcas', 'mip'), ('nehzor', 'neh'))}
+    # PAIR_SET=pft_red0: the ft_pool_oct12 fine-tunes of those arms (box + reduction penalties ramped), reduced cells only
+    PAIRS_PFT_RED0 = {
+        mol: dict(p, uma_results_path=os.path.join(RES, f'pft_{fam}u_ft_running_10k_red0.pt'),
+                  elj_results_path=os.path.join(RES, f'pft_{fam}_ft_running_10k_red0.pt'))
+        for (mol, p), fam in zip(PAIRS_PPL_RED0.items(), ('mip', 'neh'))}
     PAIRS = {'p12': PAIRS, 'p20': PAIRS_P20, 'p23': PAIRS_P23, 'p23_red0': PAIRS_P23_RED0,
-             'p23_red0_100k': PAIRS_P23_RED0_100K}[os.environ.get('PAIR_SET', 'p12')]
+             'p23_red0_100k': PAIRS_P23_RED0_100K, 'ppl_red0': PAIRS_PPL_RED0,
+             'pft_red0': PAIRS_PFT_RED0}[os.environ.get('PAIR_SET', 'p12')]
     only = {m.strip() for m in os.environ.get('ONLY_MOL', '').split(',') if m.strip()}
     out_dir = os.environ.get('FIG_OUT_DIR', PAPER_FIG_DIR)
     for mol_name, paths in PAIRS.items():

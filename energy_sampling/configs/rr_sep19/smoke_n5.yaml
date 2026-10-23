@@ -68,7 +68,6 @@ bwd_loss_coeffs:
   beta: 10.0
   condition_block_m: 2
   db: 0.0
-  detach_pb: 0.0
   emp_z: 0
   emp_z_persistent: 0
   freeze_policy: 0.0
@@ -500,7 +499,6 @@ replay_loss_coeffs:
   beta: 10.0
   condition_block_m: 0
   db: 0.0
-  detach_pb: 0.0
   emp_z: 0
   emp_z_persistent: 0
   freeze_policy: 0.0

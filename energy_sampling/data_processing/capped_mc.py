@@ -14,7 +14,10 @@ Energy
       elj        eLJ x the prior's thermal_scaling_factor (stamped as lj_coeff, as train.py does);
       uma, mace  the MLIP lattice energy (kJ/mol per molecule). The gas-phase leg is computed ONCE per run on the
                  first seed and attached as <ef>_gas_pot, as the training energy does (it depends on the molecule only).
-    No Jacobians, no density, bounding or reduction terms. reduction_en is recorded, not used. With --pc_max, a
+    No Jacobians, no density, bounding or reduction terms. reduction_en is recorded, and used only with --red_max: a
+    proposal whose reduction penalty exceeds it is rejected (counted as 'red'), which
+    keeps a chain inside the reduced-cell domain the trainer penalises leaving (without it 65% of the states of the
+    2026-09-29 MIPCAS eLJ flood carry a non-zero penalty). With --pc_max, a
     proposal denser than that packing coefficient is rejected before the energy call (MLIPs can show spurious
     low-energy holes at overlapping geometries).
 
@@ -587,6 +590,11 @@ def run(a, resume):
             En[ii] = rn['E']
         fin = torch.isfinite(En)
         under = En <= cap
+        if a.red_max is not None and rn is not None:  # keep the chain inside the reduced-cell domain
+            red_n = torch.zeros(N, dtype=torch.float64, device=dev)
+            red_n[ii] = rn['red'].double()
+            tot['red'] = tot.get('red', 0) + int((ok & fin & under & (red_n > a.red_max)).sum())
+            under = under & (red_n <= a.red_max)
         u = torch.rand(N, generator=gen, device=dev, dtype=torch.float64)
         acc = ok & fin & under & (torch.log(u) < -(En - E) / T_c)
         tot['prop'] += N; tot['box'] += int((~ok).sum()); tot['nonfin'] += int((ok & ~fin).sum())
@@ -660,6 +668,8 @@ def main():
     p.add_argument('--cap_global', type=float, default=None, help='absolute override (training units)')
     p.add_argument('--seed_window', type=float, default=None, help='absolute override (training units)')
     p.add_argument('--pc_max', type=float, default=None, help='reject denser proposals unscored (default 0.9 for MLIPs)')
+    p.add_argument('--red_max', type=float, default=None,
+                   help='reject a proposal whose reduction penalty (reduction_en) exceeds this; default: not used')
     p.add_argument('--max_spread', type=float, default=1.0,
                    help='max median |fresh - stored - offset| over the seeds before refusing (training units)')
     p.add_argument('--replicas', type=int, default=2, help='walkers per distinct minimum per temperature rung')

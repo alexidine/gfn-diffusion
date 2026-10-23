@@ -47,9 +47,10 @@ import profiling
 import wandb
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal
+from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
+    DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, \
     ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
@@ -65,7 +66,7 @@ from energy_sampling.utils import is_cuda_oom, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
     cal_subtb_coef_matrix, per_condition_fraction
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
-                             winsorized_z_root, pooled_condition_vargrad)
+                             winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
@@ -231,6 +232,35 @@ def _dataset_row_batches(source, limit: Optional[int] = None):
         keep = torch.randperm(batch.num_graphs)[:limit]
         batch = batch.subsample_new_batch(keep)
     return [batch]
+
+
+#: The conversion Modeller._refuse_mirrored_rows names for a refused file. It lives in a
+#: build script, which the trainer does not import, so it is named here and not called.
+TRAINER_CHART_CONVERSION = 'build_qm9_full_prior.py::to_trainer_chart'
+
+
+def mirrored_rows(batch):
+    """Rows of a stored crystal batch with an ACTIVE asymmetric unit whose
+    `aunit_handedness` is not +1, as (Z'=1 row indices, Z'>1 row indices).
+
+    Active means column < the row's z_prime: collate zero-pads the columns past a
+    row's own Z', and those pads are not a handedness. A batch without the column
+    (a conformer graph, a latents-only file) has no such rows; a batch without
+    z_prime is read as Z'=1 throughout.
+    """
+    h = getattr(batch, 'aunit_handedness', None)
+    empty = torch.zeros(0, dtype=torch.long)
+    if h is None:
+        return empty, empty
+    n = int(batch.num_graphs)
+    h = torch.as_tensor(h).detach().cpu().reshape(n, -1)
+    zp = getattr(batch, 'z_prime', None)
+    zp = (torch.ones(n, dtype=torch.long) if zp is None
+          else torch.as_tensor(zp).detach().cpu().reshape(-1).long().clamp(min=1))
+    active = torch.arange(h.shape[1])[None, :] < zp[:, None]
+    off = ((h != 1) & active).any(dim=1)
+    return (torch.nonzero(off & (zp == 1)).flatten(),
+            torch.nonzero(off & (zp > 1)).flatten())
 
 
 def _val_flags(k: int, val_frac: float):
@@ -2340,13 +2370,26 @@ class Modeller:
         config section is optional -- missing fields (or the whole section)
         fall back to ConditionLogZTracker's own defaults.
         """
+        cfg = getattr(self.args, 'condition_log_z', None)
+        untrusted_z = getattr(cfg, 'untrusted_z', 'head') if cfg is not None else 'head'
+        global_half_life_updates = (getattr(cfg, 'global_half_life_updates', DEFAULT_GLOBAL_HALF_LIFE_UPDATES)
+                                    if cfg is not None else DEFAULT_GLOBAL_HALF_LIFE_UPDATES)
+        if untrusted_z == 'global' and getattr(self.energy_function, 'energy_reference', None) is None:
+            raise ValueError(
+                "condition_log_z.untrusted_z 'global' needs energy_config.energy_reference: without a "
+                "per-condition reference the conditions' log Z differ by their depth, and one "
+                "all-condition level is no stand-in for any of them")
         if hasattr(self, 'condition_log_z'):
             # restored by load_full, whose from_state_dict rebuilds the tracker
             # with the guard OFF -- so a full resume must re-arm it here too
             self._arm_phys_energy_guard()
+            # the config owns behaviour: the fallback choice is re-read, not restored
+            if untrusted_z not in UNTRUSTED_Z_MODES:
+                raise ValueError(f"condition_log_z.untrusted_z must be one of {UNTRUSTED_Z_MODES}, "
+                                 f"got {untrusted_z!r}")
+            self.condition_log_z.untrusted_z = untrusted_z
+            self.condition_log_z.global_half_life_updates = float(global_half_life_updates)
             return
-
-        cfg = getattr(self.args, 'condition_log_z', None)
         min_visits = getattr(cfg, 'min_visits', 20) if cfg is not None else 20
         # ONE definition of the default, in buffer.py -- a second literal here is
         # how a fresh run and a resumed run come to disagree about the decay.
@@ -2366,6 +2409,8 @@ class Modeller:
             # coefficient, never a stage override, so the ruler reads the same in
             # every stage (see ConditionLogZTracker.clip_beta)
             clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', 10.0),
+            untrusted_z=untrusted_z,
+            global_half_life_updates=global_half_life_updates,
         )
         self._arm_phys_energy_guard()
 
@@ -3611,10 +3656,65 @@ class Modeller:
         # before the calibrator exists, so it cannot describe its own sensor there.
         self.lr_controller.announce()
 
+    def _refuse_mirrored_rows(self, batch, path, key):
+        """Refuse a stored file whose Z'=1 rows the trainer would read as a different crystal.
+
+        THE TRAINER NEVER READS `aunit_handedness`. Every crystal route scores with
+        analyze(..., std_orientation=False) (MolecularCrystal.analyze_crystal_batch), and
+        MolCrystalBuilding.pose_aunit applies the flag only under std_orientation=True;
+        on the cluster routes init_blank_crystal_batch also overwrites it with +1. A row
+        is therefore built from its stored molecule at +1. The crystal search scores with
+        std_orientation=True, which mirrors the aligned molecule at -1, so a search row
+        at -1 is a different crystal to the trainer: finite, plausible, wrong. Measured
+        2026-09-30, trainer-read eLJ against the stored value on the -1 rows: a median
+        ~280 raw units higher on 99% of the qm9_full_sep29 search rows, 820 to 1,020
+        higher on every sampled -1 row of 14_1_elj.pt (sg 14).
+
+        Z'>1 rows carrying -1 on some unit are counted and printed, NOT refused. Every
+        Z'=2 prior on disk is acridine (sg 9 and 14), with -1 on ~74% of rows, and there
+        the trainer's read sat a median 0.25 to 0.46 raw eLJ units from the search
+        convention's (at most 3.4; 200 rows per sign pattern, 2026-09-30): for acridine
+        the reflection the flag applies is nearly one of the molecule's own symmetries.
+        That is the molecule's doing, not the trainer's, so a Z'>1 file of a molecule
+        without such a symmetry is misread and passes here.
+
+        Physical crystal energies only. The toy routes (is_crystal False) and the
+        latent-scored ones (latent_energy) never place the molecule, and the toy priors
+        on disk carry -1 on about half their rows.
+
+        Called by each load site BEFORE anything scores the file, so a refused prior
+        costs a torch.load rather than a whole-prior re-analysis.
+        """
+        ef = self.energy_function
+        if not (getattr(ef, 'is_crystal', False) and not getattr(ef, 'latent_energy', False)):
+            return
+        zp1, zpn = mirrored_rows(batch)
+        if len(zp1):
+            n_zp1 = int((torch.as_tensor(batch.z_prime).detach().cpu().reshape(-1) <= 1).sum()) \
+                if getattr(batch, 'z_prime', None) is not None else int(batch.num_graphs)
+            raise ValueError(
+                f"{key} {path}: {len(zp1)} of {n_zp1} Z'=1 rows carry aunit_handedness != +1 "
+                f"(first: row {int(zp1[0])}). The trainer builds every crystal from the stored "
+                f"molecule at handedness +1 and never reads the flag (analyze runs with "
+                f"std_orientation=False), while the crystal search applies it, so each of these "
+                f"rows would train as a different crystal from the one the file describes "
+                f"(measured on search rows: trainer-read eLJ a median ~280 raw units above the "
+                f"stored value). Re-describe the rows in the trainer's chart first: "
+                f"{TRAINER_CHART_CONVERSION} refits the source molecule onto each row's "
+                f"asymmetric unit by a proper rotation and sets handedness +1 (P-1, Z'=1). "
+                f"Setting the flag to +1 is not a conversion: the search stores the molecule "
+                f"mirrored on about a quarter of its rows.")
+        if len(zpn):
+            print(f"{key} {path}: {len(zpn)} of {int(batch.num_graphs)} rows are Z'>1 with "
+                  f"aunit_handedness -1 on some asymmetric unit. NOT refused: the build ignores "
+                  f"the flag there too, so each such unit is read as its +1 description of the "
+                  f"stored atoms (see _refuse_mirrored_rows).", flush=True)
+
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
         prior = prior_data['equalized_prior']
+        self._refuse_mirrored_rows(prior, self.args.prior_path, 'prior_path')
         prior['smiles'] = None
         # identifier is NOT wiped (unlike smiles) -- init_identifiers() needs it
         # to build the mol_id registry, and since backward training draws
@@ -3837,13 +3937,17 @@ class Modeller:
         return data
 
     def init_mol_dataset(self):
-        self.mol_dataset = CrystalBuffer(self._load_condition_file(self.args.molecules_path),
+        mols = self._load_condition_file(self.args.molecules_path)
+        self._refuse_mirrored_rows(mols, self.args.molecules_path, 'molecules_path')
+        self.mol_dataset = CrystalBuffer(mols,
                                          device=self.buffer_device,
                                          **self._buffer_kwargs(),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
         if self.args.test_molecules_path is not None:
-            self.test_mol_dataset = CrystalBuffer(self._load_condition_file(self.args.test_molecules_path),
+            test_mols = self._load_condition_file(self.args.test_molecules_path)
+            self._refuse_mirrored_rows(test_mols, self.args.test_molecules_path, 'test_molecules_path')
+            self.test_mol_dataset = CrystalBuffer(test_mols,
                                                   device=self.buffer_device,
                                                   **self._buffer_kwargs(),
                                                   exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
@@ -3893,6 +3997,81 @@ class Modeller:
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
 
+    def init_energy_reference(self):
+        """
+        Install energy_config.energy_reference on the energy function. Under 'seed_min'
+        E_ref(c) is each condition's lowest SEED energy: the minimum, over the prior's rows
+        and the molecules / held-out conditions files' crystals, of
+        MolecularCrystal.seed_energy_from -- this run's own scoring of those structures,
+        without the Jacobian, penalties or clips, so it does not depend on temperature.
+        The physical leg of every reward is then scored against it; only each
+        condition's log Z moves.
+
+        Runs after init_identifiers (condition ids need the registry) and before any
+        buffer is seeded. A FULL RESUME must carry the same setting and the same table:
+        the tracker's levels, the per-condition energy records and stored rewards are all
+        in the currency they were written in, so a mismatch raises rather than mixing two.
+        load_weights_only starts all of those fresh and is unaffected.
+        """
+        ef = self.energy_function
+        table = resolve_energy_reference(
+            ef.energy_reference_mode,
+            getattr(self, '_resumed_energy_reference', None),  # set by Checkpointer.load_full
+            self._seed_min_reference_table,
+            float(self.args.energy_config.temperature))
+        if table is None:
+            return
+        ef.set_energy_reference(table)
+        n_mol = max(len(getattr(self, 'identifier_registry', {})), 1)
+        print(f"energy reference 'seed_min' installed on {table.numel()} conditions "
+              f"({n_mol} molecules): E_ref mean {float(table.mean()):.2f}, min {float(table.min()):.2f}, "
+              f"max {float(table.max()):.2f} energy units; log R is now scored against each "
+              f"condition's lowest seed energy", flush=True)
+
+    @torch.no_grad()
+    def _seed_min_reference_table(self, chunk: int = 8192) -> torch.Tensor:
+        """Per condition_id, the minimum seed energy (MolecularCrystal.seed_energy_from)
+        over prior_dataset's rows (already analysed at init) and the molecules / held-out
+        conditions files' crystals (analysed here). Raises if a condition in the library
+        gets no finite seed energy."""
+        ef = self.energy_function
+        T = float(self.args.energy_config.temperature)
+        ids, energies = [], []
+
+        def score(batch, analyse: bool):
+            for start in range(0, batch.num_graphs, chunk):
+                sub = batch.subsample_new_batch(
+                    torch.arange(start, min(start + chunk, batch.num_graphs), device=batch.device))
+                if analyse:
+                    sub = sub.to(self.device)
+                    _, sub = ef.batched_analyze_crystal_batch(
+                        self._batch_latents(sub), sub,
+                        T * torch.ones(sub.num_graphs, dtype=torch.float32, device=self.device),
+                        return_batch=True, internal_oom_recovery=True)
+                _, ens = ef.prebuilt_sample_to_reward(
+                    sub, T * torch.ones(sub.num_graphs, dtype=torch.float32, device=sub.device),
+                    return_ens_dict=True)
+                energies.append(ef.seed_energy_from(ens).detach().float().flatten().cpu())
+                ids.append(ef.condition_ids_of(sub).cpu())
+
+        with ef.allow_unreferenced():
+            score(self.prior_dataset.batch, analyse=False)
+            score(self.mol_dataset.batch, analyse=True)
+            if getattr(self, 'test_mol_dataset', None) is not None:
+                score(self.test_mol_dataset.batch, analyse=True)
+        ids = torch.cat(ids)
+        energies = torch.cat(energies)
+        ok = torch.isfinite(energies)
+        table = torch.full((ef.condition_library_size,), float('inf'), dtype=torch.float32)
+        table.scatter_reduce_(0, ids[ok], energies[ok], reduce='amin', include_self=True)
+        missing = ~torch.isfinite(table)
+        if bool(missing.any()):
+            raise ValueError(
+                f"energy_reference 'seed_min': {int(missing.sum())} of {table.numel()} conditions "
+                f"have no finite seed energy in the prior or the conditions files (e.g. condition_id "
+                f"{int(torch.nonzero(missing)[0])}). Every condition the run can score needs a seed.")
+        return table
+
     def train(self):
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
@@ -3921,12 +4100,17 @@ class Modeller:
             # energy_function.condition_library_size, set by init_identifiers())
             self.init_mol_dataset()
             self.vram_ledger('mol_dataset')
-            self.init_prior_dataset()
+            # the whole-prior re-analysis runs before any per-condition energy reference
+            # can exist (it needs the identifier registry and these very energies)
+            with self.energy_function.allow_unreferenced():
+                self.init_prior_dataset()
             # THE ONE TO WATCH: this is the whole-prior MLIP re-analysis. If `cached`
             # jumps here and never comes back down, the startup energy evaluations are
             # holding the card and every later OOM is downstream of this line.
             self.vram_ledger('prior_dataset (MLIP scan)')
             self.init_identifiers()
+            # before ANY buffer is seeded: every reward from here on is in the run's currency
+            self.init_energy_reference()
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
             # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
@@ -5399,10 +5583,14 @@ class Modeller:
         # These come from the same quick_tb_stats _update_rolling uses; one extra
         # call per step while armed is cheap against a rollout.
         cal = {}
+        # the same centre _update_rolling uses: the persistent target when the loss
+        # reads one, the learned head otherwise
+        _pz = loss_dict.get('log_z_target')
+        _pz = loss_dict['log_Z'] if _pz is None else _pz
         try:
             cal = quick_tb_stats(
                 loss_dict['log_pf'], loss_dict['log_pb'],
-                loss_dict['log_Z'], loss_dict['log_r'],
+                _pz, loss_dict['log_r'],
                 clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'),
                                   'beta', None),
                 condition_id=loss_dict.get('condition_id'),
@@ -5432,15 +5620,26 @@ class Modeller:
             print(f"per-step probe: wrote {arr.shape[0]} rows to {path}")
 
     def _update_rolling(self, loss_dict, sub_loss, sub_type):
+        # CENTRE THE DIAGNOSTICS ON THE Z THE LOSS USES. Under tb_z_source 'persistent' the
+        # residual in get_tb_loss is u - ema_logw(c), while log_Z_learned is trained by no
+        # branch -- its conditional scalarMLP only drifts because the conditioner it reads
+        # trains. Handing that to quick_tb_stats made tb_resid, tb_resid_clipped, tb_err,
+        # tb_err_worst, cond_tb_err, scatter/slope/intercept_err and the coverage family all
+        # measure a centre the objective never touches (measured 2026-09-25 on ctb25_tb_f:
+        # fwd/tb_resid_clipped tracked log_Z_learned minus jensen_z exactly). Nothing is lost
+        # by switching -- log_Z_learned and jensen_z are both still logged and their
+        # difference IS the old unclipped tb_resid.
+        _z = loss_dict.get('log_z_target')
+        _z = loss_dict['log_Z'] if _z is None else _z
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
-                               loss_dict['log_Z'], loss_dict['log_r'],
+                               _z, loss_dict['log_r'],
                                clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'), 'beta', None),
                                condition_id=loss_dict.get('condition_id'),
                                worst_quantile=self.args.conditional_worst_quantile,
                                **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id',
-                       'log_T_tensor']})
+                       'log_T_tensor', 'log_z_target']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
         # NB the condition-aware metrics -- 'logw_std_within' (the clean
@@ -6894,18 +7093,17 @@ class Modeller:
         self.replay_buffer.update_logw_stats(logw, inds)
 
         # Memorisation sensor -> the METRIC TRACKER, not just the wandb metrics
-        # dict: buffer_servo resolves its sensor through metric_tracker.get, so
-        # a stat that only reaches the report path is invisible to it.
-        # On the 10-step metric cadence, like every other rolling stat -- it is
-        # a mean over all resident rows, and the only consumer (the servo) ticks
-        # every 10 steps.
+        # dict: the fwd_rollout_triggers ess_min / val_gap_max read it through
+        # metric_tracker.get, so a stat that only reaches the report path is
+        # invisible to them. On the 10-step metric cadence, like every other
+        # rolling stat -- it is a mean over all resident rows.
         #
-        # ONE update() per direction per step, deliberately: MetricTracker's
-        # alpha is 1 - exp(-dt/period) with dt PER DIRECTION, so a second
-        # same-step write to 'replay' would land at dt=1 and run ~10x slower
-        # than the 10-step one. Absorption, policy drift and the held-out gap
-        # therefore share a single payload. absorption_stats returns
-        # already-prefixed keys and the tracker prefixes again, hence the strip.
+        # 'replay' has a second writer, _update_rolling on replay_step_count %
+        # 10, whose phase against step_ind is not fixed (a resume re-runs the
+        # saved step and shifts it by one). MetricTracker clocks each key on its
+        # own last write, so both families decay on dt = 10 whatever the phase.
+        # absorption_stats returns already-prefixed keys and the tracker
+        # prefixes again, hence the strip.
         if self.step_ind % 10 == 0:
             payload = {}
             if (st := self.replay_buffer.absorption_stats()):
@@ -7473,8 +7671,12 @@ class Modeller:
                                    f"pair 1:1 with the {mol_batch.num_graphs} drawn rows; bounding "
                                    f"cannot be scored on the stored terminals")
             raw = traj[:, -1]
+        # raw_latents is a CRYSTAL-only keyword: the conformer energies take (mols, temperature)
+        # and raised TypeError here on every replay draw, including the force_refresh draw that
+        # runs at replay frac 0 -- so a conformer fused stage died within a few steps
+        kw = {'raw_latents': raw} if self.energy_function.is_crystal else {}
         log_reward = self.energy_function.prebuilt_sample_to_reward(
-            mol_batch, temperature, raw_latents=raw)  # relies on the energy terms being attached to the graphs!
+            mol_batch, temperature, **kw)  # relies on the energy terms being attached to the graphs!
         # the drawn temperatures ride on the batch: the replay tail re-score
         # (replay_loss_coeffs.resample_last_k) must use THIS draw's T, and
         # condition_samples re-draws a fresh one on every call
@@ -7735,6 +7937,23 @@ class Modeller:
         log_z = stats['log_Z_learned']
         log_r = stats['log_r']
         cid = stats.get('condition_id')
+        # CENTRE ON THE Z THE LOSS USES, as _update_rolling does. Under tb_z_source
+        # 'persistent' the training residual is u - ema_logw(c), so an eval stream
+        # centred on log_Z_learned measured a different quantity from the training
+        # stream of the same name: 2026-09-25 on pr2i43we, bwd/tb_err 33.0 against
+        # eval_bwd/tb_err 81.7, the latter ~ |bwd_level - log_Z_learned|. Conditions
+        # the tracker does not yet trust (below min_visits -- including every held-out
+        # condition, which eval never feeds) get what the TB residual gives them: the
+        # all-condition level under condition_log_z.untrusted_z 'global', else the head
+        # (the one estimator that can generalise to an unseen condition, which is what
+        # emp_z_persistent trains it to do).
+        tracker = getattr(self, 'condition_log_z', None)
+        if (tracker is not None and cid is not None
+                and getattr(coeffs, 'tb_z_source', 'learned') == 'persistent'):
+            zt, zm = tracker.lookup(cid)
+            zt = zt.to(device=log_z.device, dtype=log_z.dtype)
+            zm = zm.to(device=log_z.device).bool()
+            log_z = tb_z_per_traj(log_z, zt, zm, tracker.untrusted_fallback())
         return quick_tb_stats(log_pf, log_pb, log_z, log_r,
                               clip_beta=getattr(coeffs, 'beta', None),
                               condition_id=cid,
@@ -9474,7 +9693,9 @@ class Modeller:
             good_inds = torch.argwhere(
                 energy < energy_floor + self._ramp_params()[0]).flatten()
         else:
-            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+            # absolute floor: judged on the unreferenced log R (MolecularCrystal.unreferenced_log_r)
+            good_inds = torch.argwhere(self.energy_function.unreferenced_log_r(reward, metrics['condition_id'])
+                                       > self.args.buffers.prior_buffer.reward_min).flatten()
         if good_inds.numel() > 0:
             self._admit_to_prior_buffer(sample_batch.subsample_new_batch(good_inds))
         # denominator for the source mix: how much of the churn budget the
@@ -9768,7 +9989,9 @@ class Modeller:
             good_inds = torch.argwhere(
                 energy < energy_floor + self._ramp_params()[0]).flatten()
         else:
-            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+            # absolute floor: judged on the unreferenced log R (MolecularCrystal.unreferenced_log_r)
+            good_inds = torch.argwhere(self.energy_function.unreferenced_log_r(reward, condition_id)
+                                       > self.args.buffers.prior_buffer.reward_min).flatten()
         if good_inds.numel() > 0:
             self._admit_to_prior_buffer(anchor_batch.subsample_new_batch(good_inds))
         # accumulated across calls (shortfall + reach trigger can both fire in
@@ -10201,7 +10424,9 @@ class Modeller:
         # on it. None disables.
         reward_min = getattr(rb_cfg, 'admit_reward_min', None)
         if reward_min is not None:
-            below = sane & (log_r_cpu < float(reward_min))
+            # absolute floor: judged on the unreferenced log R (MolecularCrystal.unreferenced_log_r)
+            below = sane & (self.energy_function.unreferenced_log_r(log_r_cpu, fwd_stats.get('condition_id'))
+                            < float(reward_min))
             self.replay_churn['reward_rejected'] += int(below.sum())
             sane &= ~below
 
@@ -10710,6 +10935,7 @@ class Modeller:
                 seed_data = seed_data.get('equalized_prior', seed_data.get('prior', seed_data))
             seed_batch = collate_data_list(seed_data, max_z_prime=max(self.args.z_primes)) \
                 if isinstance(seed_data, list) else seed_data
+            self._refuse_mirrored_rows(seed_batch, seed_source, 'buffers.anchor_buffer.seed_source')
             seed_batch = seed_batch.to(self.device)
             # Strip lazily-built caches before anything computes off a
             # side-loaded batch. See buffer.strip_lazy_sg_caches for why.

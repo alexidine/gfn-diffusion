@@ -80,11 +80,11 @@ def load_gfn(checkpoint_path, device):
     return model, ck['problem_def'], int(train_T), prov
 
 
-def load_predictor(energy_function, device):
+def load_predictor(energy_function, device, mace_path=MACE_PATH):
     if energy_function == 'uma':
         return init_uma_crystal_predictor(UMA_PATH, device=device)
     if energy_function == 'mace':
-        return load_mace_model(MACE_PATH, device=device, dtype=torch.float32)
+        return load_mace_model(mace_path, device=device, dtype=torch.float32)
     return None
 
 
@@ -195,6 +195,8 @@ def score_embedding_references(config, rdf_mode, std_orientation, sample_crystal
     size: std_opt_acridine_polymorphs.pt and std_acridine_polymorphs.pt share cells
     but carry conformers 0.199 A apart, and only one of them is this model's."""
     ref_fp = _conformer_fingerprint(sample_crystal)
+    # `conformer_tol` (A) loosens the match for a run whose references were built on a near-identical conformer
+    tol = float(getattr(config, 'conformer_tol', None) or CONFORMER_TOL)
     # atomwise channels are atom PAIRS of the asymmetric unit, so a Z'=2 form has 1081 channels against Z'=1's 276
     # and is not comparable at all; envwise channels do not depend on Z'. Such forms are skipped, by name.
     want_shape = tuple(sample_crystal.rdf.shape[-2:])
@@ -205,10 +207,10 @@ def score_embedding_references(config, rdf_mode, std_orientation, sample_crystal
         _assert_orientation_safe(crystals, std_orientation, f"embedding references ({spec['tag']})")
         for c in crystals:
             gap = float((_conformer_fingerprint(c) - ref_fp).abs().max())
-            if gap > CONFORMER_TOL:
+            if gap > tol:
                 raise ValueError(
                     f"{c.identifier} in {spec['path']} carries a different conformer from the "
-                    f"samples (max fingerprint gap {gap:.4f} A > {CONFORMER_TOL}); its RDF is not "
+                    f"samples (max fingerprint gap {gap:.4f} A > {tol}); its RDF is not "
                     f"comparable. Use the file whose molecule matches the model's.")
             # one structure per call: the forms mix space groups and Z', which do not collate
             b = collate_data_list([c]).to(config.device)
@@ -222,7 +224,7 @@ def score_embedding_references(config, rdf_mode, std_orientation, sample_crystal
             tags.append(spec['tag'])
             sampleable.append((int(c.sg_ind), int(c.z_prime)))
         print(f"  embedding references ({spec['tag']}): {len(crystals)} from "
-              f"{os.path.basename(spec['path'])}, conformer matches the samples")
+              f"{os.path.basename(spec['path'])}, conformer matches the samples within {tol} A")
     if skipped:
         print(f"  embedding references SKIPPED, rdf not comparable with the samples' {want_shape}: "
               + ', '.join(skipped))
@@ -452,7 +454,8 @@ def live_energy_coeffs(cfg, stage, step, entry):
 
 
 def exact_log_rewards(samples, raw_latents, train_config_path, energy_function, lj_coeff,
-                      prior_file, device, chunk=500, stage=None, step=None, sched_entry=None):
+                      prior_file, device, chunk=500, stage=None, step=None, sched_entry=None,
+                      mace_path=MACE_PATH):
     """The TRAINING reward log R for every sample, from the arm's own MolecularCrystal.
 
     Replaces utils.generator_reward, a frozen copy of an old molecular_crystal
@@ -481,7 +484,7 @@ def exact_log_rewards(samples, raw_latents, train_config_path, energy_function, 
         ec.update(live)
     ec['internal_oom_recovery'] = False
     ef = MolecularCrystal(device=device, energy_function=energy_function,
-                          mlip_path={'uma': UMA_PATH, 'mace': MACE_PATH}.get(energy_function),
+                          mlip_path={'uma': UMA_PATH, 'mace': mace_path}.get(energy_function),
                           space_groups=cfg['space_groups'], z_primes=cfg['z_primes'],
                           sg_conditioning=cfg['sg_conditioning'],
                           temperature_conditioning=cfg['temperature_conditioning'],
@@ -542,7 +545,9 @@ def resolve_molecule(config, prior_file):
     swapping it changes every crystal built here while nothing errors.
     `molecule_path` overrides, loudly."""
     override = getattr(config, 'molecule_path', None)
-    ref = prior_file['prior'].batch_to_list()[0]
+    # row 0 from a two-row slice: splitting a pooled prior of millions of rows into a list takes tens of GB and many
+    # minutes, and a ONE-row slice comes back without its per-crystal fields
+    ref = prior_file['prior'].subsample_new_batch(torch.arange(2)).batch_to_list()[0]
     if not override:
         print(f"  molecule: prior['prior'][0] (identifier {ref.identifier}), "
               f"matching train.py's conditioning source")
@@ -599,7 +604,11 @@ def run_analysis(config):
     print(f"lj_coeff (thermal_scaling_factor) = {lj_coeff}")
     molecule = resolve_molecule(config, prior_file)
 
-    predictor = load_predictor(energy_function, device)
+    # `mace_path` names the local copy of the MACE model the arm trained against when it is not MACE_PATH
+    mace_path = getattr(config, 'mace_path', None) or MACE_PATH
+    if energy_function == 'mace':
+        print(f"  MACE model: {mace_path}")
+    predictor = load_predictor(energy_function, device, mace_path)
     max_batch = int(getattr(config, 'max_analysis_batch_size', config.analysis_batch_size))
 
     "sample, or reload"
@@ -626,6 +635,10 @@ def run_analysis(config):
         # silently reload last round's samples from different weights
         if cached_step != provenance['step_ind']:
             stale.append(f"checkpoint step: cached {cached_step!r} vs now {provenance['step_ind']!r}")
+        # energies from another MLIP file are another measurement (files that predate the key are not judged)
+        mlip_now = {'mace': mace_path, 'uma': UMA_PATH}.get(energy_function)
+        if 'mlip_path' in cached and cached['mlip_path'] != mlip_now:
+            stale.append(f"mlip_path: cached {cached['mlip_path']!r} vs now {mlip_now!r}")
         if stale:
             if source_path:
                 raise ValueError(f"source_results {source_path} does not match this run's configuration: {stale}")
@@ -687,7 +700,7 @@ def run_analysis(config):
             results_dict['log_r'], results_dict['reward_info'] = exact_log_rewards(
                 samples, raw, train_config, energy_function, lj_coeff, prior_file, device,
                 stage=provenance['stage'], step=provenance['step_ind'],
-                sched_entry=provenance.get('coeff_sched_entry'))
+                sched_entry=provenance.get('coeff_sched_entry'), mace_path=mace_path)
         else:
             print("  !! no train_config for this run: 'log_r' NOT written, "
                   "generate_figs will refuse the TB parity figure")
@@ -696,6 +709,11 @@ def run_analysis(config):
     "experimental reference structures"
     ebatch = score_experimental(config, energy_function, lj_coeff, predictor, device,
                                 std_orientation, sg_ind, zp, max_batch, rdf_mode)
+    # reported, not refused: the references' RDFs move with their molecule's size
+    fp_s = _conformer_fingerprint(samples[0])
+    print("  experimental references, largest heavy-atom distance gap to the samples' conformer (A): "
+          + ', '.join(f"{e.identifier} {float((_conformer_fingerprint(e) - fp_s).abs().max()):.4f}"
+                      for e in ebatch.batch_to_list()))
     num_polymorphs = ebatch.num_graphs
     poly_labels = [str(i) for i in ebatch.identifier] if hasattr(ebatch, 'identifier') else None
 
@@ -747,7 +765,7 @@ def run_analysis(config):
     assert results_dict['dmat'].shape[0] == len(good_ens), (
         f"dmat has {results_dict['dmat'].shape[0]} rows but the filters kept {len(good_ens)}")
     results_dict['provenance'] = provenance
-    results_dict['mlip_path'] = {'mace': MACE_PATH, 'uma': UMA_PATH}.get(energy_function)
+    results_dict['mlip_path'] = {'mace': mace_path, 'uma': UMA_PATH}.get(energy_function)
     results_dict['n_good'] = len(good_ens)
     results_dict['energy_threshold'] = threshold
     results_dict['good_ens'] = good_ens

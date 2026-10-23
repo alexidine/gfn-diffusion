@@ -74,16 +74,40 @@ def _thin_idx(n, cap=SCATTER_MAX_POINTS, seed=0):
     return idx
 
 
-def _hist_bar(values, nbins=100, **bar_kwargs):
+def _hist_bar(values, nbins=100, bin_range=None, **bar_kwargs):
     """Pre-binned stand-in for go.Histogram, which ships the raw sample array
-    and bins it client-side (10k floats ~ 52 kB per panel)."""
+    and bins it client-side (10k floats ~ 52 kB per panel). `bin_range` (lo, hi)
+    bins that interval only -- values outside it are left out, not folded into
+    the end bars -- and None bins the sample's own min..max."""
     values = _np(values, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
         return go.Bar(x=[], y=[], **bar_kwargs)
-    counts, edges = np.histogram(values, bins=nbins)
+    counts, edges = np.histogram(values, bins=nbins, range=bin_range)
     centers = np.round(0.5 * (edges[1:] + edges[:-1]), 4)
     return go.Bar(x=centers, y=counts, width=float(edges[1] - edges[0]), **bar_kwargs)
+
+
+def _central_window(values, tail=0.005, pad=0.25, keep=()):
+    """Bin range that follows the bulk of a heavy-tailed sample: its central
+    [tail, 1 - tail] quantile span, padded by `pad` of that span on each side,
+    never past the sample's own extremes, then widened to hold every value in
+    `keep`. A sample with no stragglers keeps its full range. Returns (lo, hi),
+    or None when fewer than two finite values or a zero central span leave
+    nothing to window."""
+    values = _np(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+    q_lo, q_hi = np.quantile(values, [tail, 1.0 - tail])
+    span = q_hi - q_lo
+    if not span > 0:
+        return None
+    lo = max(values.min(), q_lo - pad * span)
+    hi = min(values.max(), q_hi + pad * span)
+    for k in keep:
+        lo, hi = min(lo, k - 0.02 * span), max(hi, k + 0.02 * span)
+    return float(lo), float(hi)
 
 
 def adjust_fig_filesize(fig_dict):
@@ -463,8 +487,8 @@ def condition_tracker_figs(tracker, energy_function, current_step, worst_quantil
     # a single-visit condition) go -inf and are dropped by the finite filter.
     #
     # `bar` is the gate's own quantile for the gated distributions, drawn as a
-    # vline (two, symmetric, for the signed ones -- the gates read |x|) and set
-    # in the SAME units as the panel. None = not gated / gate still cold.
+    # vline (mirrored for the signed ones -- the gates read |x|) and set in the
+    # SAME units as the panel. None = not gated / gate still cold.
     q = worst_quantile
     with np.errstate(divide='ignore', invalid='ignore'):
         # `or None` on the 0.0-when-cold convention worst_tb_err/worst_z_grad
@@ -484,16 +508,46 @@ def condition_tracker_figs(tracker, energy_function, current_step, worst_quantil
             ('ema_logw (Z target)', ema_logw, None, False),
             ('best energy', best_energy, None, False),
         ]
-    fig = make_subplots(rows=2, cols=4, subplot_titles=[m[0] for m in hist_metrics])
-    for i, (name, arr, bar, symmetric) in enumerate(hist_metrics):
+    # Each panel is binned over the BULK of its distribution (_central_window),
+    # not its min..max. Over a large library a handful of conditions sit far
+    # outside the rest -- best energy is a running minimum, so one deep draw
+    # holds its condition there for the rest of the run -- and min..max bins
+    # then put the whole library in a few bars under an axis that never moves.
+    # What the window leaves out is counted in the panel title with the extreme
+    # it reaches, so a tail reads as a number rather than as an invisible bar.
+    #
+    # A gate bar is drawn only where it falls among the conditions, and is then
+    # always inside the window. The mirrored bar of a signed panel whose
+    # conditions all sit on one side (delta on a run where every level gap is
+    # positive) marks nothing, and plotly's autorange includes shapes, so
+    # drawing it stretched the axis across an empty half.
+    panels = []
+    for name, arr, bar, symmetric in hist_metrics:
+        finite = arr[np.isfinite(arr)]
+        bars = ()
+        if bar is not None and np.isfinite(bar) and finite.size:
+            bars = tuple(x for x in ((bar, -bar) if symmetric else (bar,))
+                         if finite.min() <= x <= finite.max())
+        window = _central_window(finite, keep=bars)
+        if window is not None:
+            n_below, n_above = int((finite < window[0]).sum()), int((finite > window[1]).sum())
+            cropped = ([f'{n_below} below, to {finite.min():.3g}'] if n_below else []) + \
+                      ([f'{n_above} above, to {finite.max():.3g}'] if n_above else [])
+            if cropped:
+                name += f"<br><sup>{'; '.join(cropped)}</sup>"
+        panels.append((name, arr, bars, window))
+    fig = make_subplots(rows=2, cols=4, subplot_titles=[p[0] for p in panels])
+    for i, (name, arr, bars, window) in enumerate(panels):
         row, col = i // 4 + 1, i % 4 + 1
         fig.add_trace(
-            _hist_bar(arr, nbins=nbins, showlegend=False, marker_color='#3f7fbf'),
+            _hist_bar(arr, nbins=nbins, bin_range=window, showlegend=False,
+                      marker_color='#3f7fbf'),
             row=row, col=col)
-        if bar is not None and np.isfinite(bar):
-            for x in ((bar, -bar) if symmetric else (bar,)):
-                fig.add_vline(x=x, row=row, col=col,
-                              line=dict(color='#c0392b', dash='dash', width=1))
+        for x in bars:
+            fig.add_vline(x=x, row=row, col=col,
+                          line=dict(color='#c0392b', dash='dash', width=1))
+    # four panels across: the default 16 px titles run into their neighbours
+    fig.update_annotations(font_size=13)
     title = (f'Per-condition tracker stats, step {current_step} '
              f'({n_visited} visited, {n_trusted} trusted)')
     if q is not None:

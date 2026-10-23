@@ -54,6 +54,54 @@ def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
 #: the instance attribute below and name-only callers (eval figure code) must
 #: agree, or the toy gauge-fix bug (P1, 2026-08-24) comes back split-brained.
 TOY_ENERGY_FUNCTIONS = ('latent_harmonic', 'latent_multiharmonic')
+# energy_config.energy_reference: None, or 'seed_min' (each condition's lowest seed energy)
+ENERGY_REFERENCE_MODES = (None, 'seed_min')
+# how far a resumed run's freshly computed reference may sit from the checkpoint's, as the
+# log Z shift it implies: max |change| / T, in nats. The recompute is not bit-reproducible
+# (float32 sums, chunk sizes set by memory at init; 0.018 energy units = 0.003 nats at T 6.9
+# measured on qm9c100k), so the bar sits above that and far below a tracker's own noise.
+ENERGY_REFERENCE_RESUME_TOL_NATS = 0.05
+
+
+def resolve_energy_reference(mode, resumed, compute_table, temperature: float):
+    """The per-condition reference table to install, or None.
+
+    mode: the live energy_config.energy_reference. resumed: the resumed checkpoint's
+    stored {'mode', 'table'} on a FULL resume, None otherwise. compute_table: a thunk
+    returning this run's freshly computed table (called only when mode is set).
+    temperature: the run's configured temperature, which turns a change in the table
+    into the shift of log Z it implies.
+
+    A full resume must carry the same mode and the same table: the tracker's levels,
+    the per-condition records and stored rewards are in the currency they were written
+    in, so a mismatch raises rather than mixing two. The stored table is what gets
+    installed, so a resumed run continues bit-for-bit."""
+    if resumed is not None and resumed.get('mode') != mode:
+        raise ValueError(
+            f"energy_config.energy_reference is {mode!r} but the checkpoint being resumed trained "
+            f"with {resumed.get('mode')!r}. Its tracker levels, per-condition energy records and "
+            f"stored buffer rewards are in that currency. Resume with the checkpoint's setting, or "
+            f"start fresh (load_weights_only: true).")
+    if mode is None:
+        return None
+    table = torch.as_tensor(compute_table(), dtype=torch.float32).cpu()
+    if resumed is None:
+        return table
+    stored = resumed.get('table')
+    stored = None if stored is None else torch.as_tensor(stored, dtype=torch.float32).cpu()
+    if stored is None or stored.shape != table.shape:
+        raise ValueError("the resumed checkpoint's energy reference table is missing or sized for a "
+                         "different condition library")
+    drift = float((stored - table).abs().max())
+    drift_nats = drift / float(temperature)
+    if drift_nats > ENERGY_REFERENCE_RESUME_TOL_NATS:
+        raise ValueError(
+            f"the energy reference moved since the checkpoint (max |change| {drift:.4g} energy "
+            f"units = {drift_nats:.3g} nats of log Z at T={float(temperature):g}, bar "
+            f"{ENERGY_REFERENCE_RESUME_TOL_NATS} nats): the prior, the conditions files or the "
+            f"energy function differ, and the checkpoint's Z levels are in the old reference. "
+            f"Start fresh.")
+    return stored
 
 
 def is_crystal_energy(name: str) -> bool:
@@ -101,6 +149,7 @@ class MolecularCrystal(BaseSet):
                  prior_knn_min_radius: Optional[float] = None,  # floor on r_k, in latent units
                  prior_flow_path: Optional[str] = None,  # density proxy for the PRIOR POLICY, written by build_prior_flow.py
                  lambda_mix: float = 1.0,  # 1 = pure physical target; 0 = pure prior-flow target (the null test). Schedulable via balance.anneal_coeffs.
+                 energy_reference: Optional[str] = None,  # 'seed_min': score the physical leg against each condition's lowest seed energy (set_energy_reference); None: no reference
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -232,6 +281,27 @@ class MolecularCrystal(BaseSet):
                                                       'latent_knn']
         self.is_crystal = is_crystal_energy(self.energy_function)  # not a toy model
 
+        # PER-CONDITION ENERGY REFERENCE (energy_config.energy_reference). Under 'seed_min'
+        # the physical leg is scored against a constant per condition, E_ref(c), installed
+        # by the trainer once the identifier registry exists (set_energy_reference). A
+        # constant per condition leaves every condition's target distribution at T
+        # unchanged; only that condition's log Z moves. Until the table is installed,
+        # scoring RAISES except inside allow_unreferenced() -- a reward computed without
+        # the reference would be in another currency from the one the run trains in.
+        if energy_reference not in ENERGY_REFERENCE_MODES:
+            raise ValueError(f"energy_config.energy_reference must be one of "
+                             f"{ENERGY_REFERENCE_MODES}, got {energy_reference!r}")
+        if energy_reference is not None and not (self.is_crystal and not self.latent_energy):
+            raise ValueError(f"energy_config.energy_reference {energy_reference!r} needs a physical "
+                             f"crystal energy; energy_function is {self.energy_function!r}")
+        if energy_reference is not None and temperature_conditioning:
+            raise ValueError("energy_config.energy_reference is refused with temperature_conditioning: "
+                             "the trainer undoes E_ref/T at the absolute admission floors, which "
+                             "assumes the run's single temperature")
+        self.energy_reference_mode = energy_reference
+        self.energy_reference = None  # [condition_library_size] float32, raw energy units
+        self._unreferenced_scoring_ok = False
+
         # LAMBDA MIX. The target is a geometric path between the prior's own
         # implied density and the physical energy:
         #     p_lambda  ~  q_flow^(1-lambda) * exp(-lambda * E_phys / T)
@@ -335,6 +405,88 @@ class MolecularCrystal(BaseSet):
         """
         self.n_molecules = n_molecules
         self.condition_library_size = self.n_molecules * self.n_sg * self.n_zp
+
+    def condition_ids_of(self, crystal_batch) -> torch.Tensor:
+        """Each row's condition_id, as condition_samples() builds it: the batch's own
+        `condition_id` when it carries one, else mol_id x local space group x local Z'.
+        Raises on a batch with neither, or with a space group / Z' outside this run's
+        condition library."""
+        cid = getattr(crystal_batch, 'condition_id', None)
+        if cid is not None:
+            return torch.as_tensor(cid).long().flatten()
+        mol_id = getattr(crystal_batch, 'mol_id', None)
+        if mol_id is None:
+            raise ValueError("energy_reference: a scored batch carries neither condition_id nor "
+                             "mol_id, so its rows cannot be matched to a per-condition reference")
+        mol_id = torch.as_tensor(mol_id).long().flatten()
+        sg = torch.as_tensor(crystal_batch.sg_ind).long().flatten().to(mol_id.device)
+        zp = torch.as_tensor(crystal_batch.z_prime).long().flatten().to(mol_id.device)
+        sg_lut = self.sg_to_local.to(mol_id.device)
+        zp_lut = self.zp_to_local.to(mol_id.device)
+        if int(sg.max()) >= len(sg_lut) or int(zp.max()) >= len(zp_lut):
+            raise ValueError("energy_reference: a scored row's space group or Z' is outside this "
+                             "run's condition library")
+        sg_local, zp_local = sg_lut[sg], zp_lut[zp]
+        if bool((sg_local < 0).any()) or bool((zp_local < 0).any()):
+            raise ValueError("energy_reference: a scored row's space group or Z' is outside this "
+                             "run's condition library")
+        return mol_id * (self.n_sg * self.n_zp) + sg_local * self.n_zp + zp_local
+
+    def seed_energy_from(self, ens_dict) -> torch.Tensor:
+        """The energy an energy reference is built from, per row of a generator_energy
+        ens_dict: mol_energy + density_coeff * density_energy + pressure_energy -- the
+        crystal energy WITHOUT the Jacobian change of measure, the reduction and bounding
+        penalties, or any clip. It does not depend on temperature."""
+        return (ens_dict['mol_energy'] + self.density_coeff * ens_dict['density_energy']
+                + ens_dict['pressure_energy'])
+
+    def set_energy_reference(self, table):
+        """Install E_ref per condition_id ([condition_library_size], raw energy units).
+        Every entry must be finite: a condition without a reference cannot be scored."""
+        if self.energy_reference_mode is None:
+            raise ValueError("set_energy_reference on a run with energy_config.energy_reference: null")
+        table = torch.as_tensor(table, dtype=torch.float32).flatten().cpu()
+        if table.numel() != self.condition_library_size:
+            raise ValueError(f"energy reference has {table.numel()} entries, the condition library "
+                             f"{self.condition_library_size}")
+        if not bool(torch.isfinite(table).all()):
+            raise ValueError(f"energy reference: {int((~torch.isfinite(table)).sum())} conditions "
+                             f"have no finite reference")
+        self.energy_reference = table
+
+    def energy_reference_for(self, condition_id) -> torch.Tensor:
+        """E_ref per row, on condition_id's device."""
+        ids = torch.as_tensor(condition_id).long().flatten()
+        return self.energy_reference.to(ids.device)[ids]
+
+    def energy_reference_state(self) -> dict:
+        """What a checkpoint stores: the mode and the installed table (or None)."""
+        return {'mode': self.energy_reference_mode,
+                'table': None if self.energy_reference is None else self.energy_reference.clone()}
+
+    def unreferenced_log_r(self, log_r, condition_id):
+        """log R with the reference undone, for the trainer's ABSOLUTE reward floors, so
+        each floor admits exactly what it did without it. Referenced log R is
+        -(E - E_ref)/T = log R_raw + E_ref/T, so this subtracts E_ref(c)/T. Identity
+        when no reference is installed; T is the run's single temperature."""
+        if self.energy_reference is None:
+            return log_r
+        if condition_id is None:
+            raise ValueError("an absolute reward floor under energy_config.energy_reference needs "
+                             "each row's condition_id to undo the reference")
+        ref = self.energy_reference_for(condition_id).to(device=log_r.device, dtype=log_r.dtype)
+        return log_r - ref.reshape(log_r.shape) / float(self.temperature)
+
+    @contextlib.contextmanager
+    def allow_unreferenced(self):
+        """Scoring before the reference exists -- the trainer's init pass over the seeds,
+        whose results build the table -- without the not-installed refusal."""
+        prev = self._unreferenced_scoring_ok
+        self._unreferenced_scoring_ok = True
+        try:
+            yield
+        finally:
+            self._unreferenced_scoring_ok = prev
 
     def set_reward_clip(self, dataset_rewards):
         """
@@ -880,6 +1032,22 @@ class MolecularCrystal(BaseSet):
             physical_energy = (crystal_leg +
                                  reduction_energy * self.reduction_coeff +
                                  jacobian_energy)
+
+        # THE PER-CONDITION REFERENCE, on the PHYSICAL leg only and after any clip: under
+        # lambda mixing it scales with lambda so the flow endpoint stays exact, and the
+        # clips keep their absolute thresholds. ens_dict['mol_energy'] stays raw.
+        if self.energy_reference_mode is not None:
+            if self.energy_reference is not None:
+                reference = self.energy_reference_for(
+                    self.condition_ids_of(crystal_batch)).to(physical_energy)
+                physical_energy = physical_energy - reference
+                ens_dict['energy_reference'] = reference
+            elif not self._unreferenced_scoring_ok:
+                raise RuntimeError(
+                    f"energy_config.energy_reference is {self.energy_reference_mode!r} but no "
+                    f"reference table is installed: this reward would be in the unreferenced "
+                    f"currency. The trainer installs it after init_identifiers; an offline tool "
+                    f"must load the checkpoint's 'energy_reference' with set_energy_reference.")
 
         # WHETHER THE CLIP ACTUALLY FIRED, as a number. Deliberately OUTSIDE the
         # branch above -- that block is frozen by owner decision and this reads

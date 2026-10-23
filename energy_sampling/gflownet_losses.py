@@ -545,10 +545,12 @@ def get_gfn_forward_loss(loss_coeffs,
         z_for_tb = log_Z_learned
         if tb_z_source == 'batch_root':
             z_for_tb = batch_root_z(log_Z_learned, log_pb, log_pf, log_r, beta)
+        untrusted_log_Z = untrusted_z_for(condition_log_z, use_persistent_z)
         tb_loss = get_tb_loss(z_for_tb, log_pb, log_pf, log_r,
                               beta=beta,
                               log_Z_target=log_z_target if use_persistent_z else None,
-                              target_mask=log_z_target_mask if use_persistent_z else None)
+                              target_mask=log_z_target_mask if use_persistent_z else None,
+                              untrusted_log_Z=untrusted_log_Z)
         losses.append(tb_loss * loss_coeffs.tb)
 
     """sidecar regression of the learned flow onto the per_z_errsistent per-condition target"""
@@ -660,6 +662,23 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['emp_z_persistent'] = emp_z_persistent_loss.mean().detach()
         if log_z_target_mask is not None:
             loss_dict['condition_log_z_visited_frac'] = log_z_target_mask.float().mean().detach()
+        # tb > 0 FIRST: use_persistent_z is bound only when the TB term ran, so a tb=0
+        # step (every phase-1 MLE step) would otherwise raise UnboundLocalError here
+        if loss_coeffs.tb > 0 and use_persistent_z and log_z_target is not None:
+            # THE CENTRE THE LOSS ACTUALLY USES, carried out so the TB diagnostics can be
+            # computed against it. quick_tb_stats is otherwise handed log_Z_learned, which
+            # under tb_z_source 'persistent' no branch trains -- on a conditional run its
+            # scalarMLP still drifts because the conditioner it reads is training, so every
+            # published residual moves for a reason unrelated to the objective. Measured
+            # 2026-09-25 on ctb25_tb_f: fwd/tb_resid_clipped tracked log_Z_learned minus
+            # jensen_z exactly and had no reason to converge, while the residual the loss
+            # minimises was not published at all.
+            # the per-row Z the residual used: the tracker where trusted, elsewhere the
+            # all-condition level (untrusted_z 'global') or the head (tb_z_per_traj)
+            loss_dict['log_z_target'] = tb_z_per_traj(z_for_tb, log_z_target, log_z_target_mask,
+                                                      untrusted_log_Z).detach()
+            if untrusted_log_Z is not None:
+                loss_dict['log_z_global'] = torch.tensor(float(untrusted_log_Z))
 
     else:
         loss_dict = None
@@ -1002,10 +1021,12 @@ def get_gfn_backward_loss(loss_coeffs,
     """TB loss"""
     if loss_coeffs.tb > 0:
         use_persistent_z = tb_z_source == 'persistent'
+        untrusted_log_Z = untrusted_z_for(condition_log_z, use_persistent_z)
         tb_loss = get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
                               beta=beta,
                               log_Z_target=log_z_target if use_persistent_z else None,
-                              target_mask=log_z_target_mask if use_persistent_z else None)
+                              target_mask=log_z_target_mask if use_persistent_z else None,
+                              untrusted_log_Z=untrusted_log_Z)
         losses.append(tb_loss * loss_coeffs.tb)
 
     """sidecar regression of the learned flow onto the persistent per-condition target"""
@@ -1109,6 +1130,23 @@ def get_gfn_backward_loss(loss_coeffs,
             loss_dict['emp_z_persistent'] = emp_z_persistent_loss.mean().detach()
         if log_z_target_mask is not None:
             loss_dict['condition_log_z_visited_frac'] = log_z_target_mask.float().mean().detach()
+        # tb > 0 FIRST: use_persistent_z is bound only when the TB term ran, so a tb=0
+        # step (every phase-1 MLE step) would otherwise raise UnboundLocalError here
+        if loss_coeffs.tb > 0 and use_persistent_z and log_z_target is not None:
+            # THE CENTRE THE LOSS ACTUALLY USES, carried out so the TB diagnostics can be
+            # computed against it. quick_tb_stats is otherwise handed log_Z_learned, which
+            # under tb_z_source 'persistent' no branch trains -- on a conditional run its
+            # scalarMLP still drifts because the conditioner it reads is training, so every
+            # published residual moves for a reason unrelated to the objective. Measured
+            # 2026-09-25 on ctb25_tb_f: fwd/tb_resid_clipped tracked log_Z_learned minus
+            # jensen_z exactly and had no reason to converge, while the residual the loss
+            # minimises was not published at all.
+            # the per-row Z the residual used: the tracker where trusted, elsewhere the
+            # all-condition level (untrusted_z 'global') or the head (tb_z_per_traj)
+            loss_dict['log_z_target'] = tb_z_per_traj(log_Z_learned, log_z_target, log_z_target_mask,
+                                                      untrusted_log_Z).detach()
+            if untrusted_log_Z is not None:
+                loss_dict['log_z_global'] = torch.tensor(float(untrusted_log_Z))
 
     else:
         loss_dict = None
@@ -1260,10 +1298,32 @@ def get_subtb_loss(log_pfs, log_pbs, log_flow, coeff_matrix, beta: float = 10.0)
     return loss
 
 
+def tb_z_per_traj(log_Z_learned, log_Z_target: Optional[torch.Tensor] = None,
+                  target_mask: Optional[torch.Tensor] = None,
+                  untrusted_log_Z: Optional[float] = None):
+    """The Z each trajectory's TB residual is measured against. No mask: log_Z_learned.
+    With a mask: the persistent target (detached) where it is True; elsewhere
+    untrusted_log_Z as a constant when given, else log_Z_learned (live)."""
+    if target_mask is None:
+        return log_Z_learned
+    other = log_Z_learned if untrusted_log_Z is None else torch.full_like(log_Z_learned, float(untrusted_log_Z))
+    return torch.where(target_mask, log_Z_target.detach(), other)
+
+
+def untrusted_z_for(condition_log_z, use_persistent_z: bool):
+    """The tracker's fallback Z for conditions below min_visits, or None (keep the head):
+    only under a persistent TB target, and only as ConditionLogZTracker.untrusted_fallback
+    decides (untrusted_z 'global', level initialised)."""
+    if not use_persistent_z or condition_log_z is None:
+        return None
+    return condition_log_z.untrusted_fallback()
+
+
 def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
                 beta: float = 10,
                 log_Z_target: Optional[torch.Tensor] = None,
-                target_mask: Optional[torch.Tensor] = None
+                target_mask: Optional[torch.Tensor] = None,
+                untrusted_log_Z: Optional[float] = None,
                 ):
     """
     Policy/Z freezing is handled upstream by get_gfn_forward_loss /
@@ -1279,11 +1339,11 @@ def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
     log_Z_target is always detached (a running statistic, never a network
     output), so the flow model gets no TB gradient for those trajectories
     (see emp_z_persistent for its sidecar regression target instead). Where
-    target_mask is False (or is None), behavior is unchanged from before.
+    target_mask is False, untrusted_log_Z is used when given (the tracker's
+    all-condition level, condition_log_z.untrusted_z 'global'), else
+    log_Z_learned -- see tb_z_per_traj.
     """
-    log_Z_per_traj = log_Z_learned
-    if target_mask is not None:
-        log_Z_per_traj = torch.where(target_mask, log_Z_target.detach(), log_Z_per_traj)
+    log_Z_per_traj = tb_z_per_traj(log_Z_learned, log_Z_target, target_mask, untrusted_log_Z)
 
     tb = (log_pf + log_Z_per_traj - log_pb - log_r)
 

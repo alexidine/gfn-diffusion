@@ -40,9 +40,10 @@ ROUTE_TABLE = {
     'z_calibration.fill_from_eval': 'fill',
 }
 #: constructor parameters ConformerModeller.init_energy_function writes from the top level
-#: (or leaves to torch's default dtype), so energy_config does not carry them
+#: (or leaves to torch's default dtype), or from the conditions file (each member's stored
+#: reference), so energy_config does not carry them
 _INJECTED = {'device', 'dtype', 'temperature_conditioning', 'embedding_conditioning',
-             'embedding_conditioning_dim'}
+             'embedding_conditioning_dim', 'reference_positions'}
 
 
 @pytest.fixture(scope='module')

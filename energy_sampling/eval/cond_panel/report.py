@@ -26,6 +26,7 @@ SECTIONS = (
     ('Packing motifs', ('motif_prevalence', 'motif_agreement', 'motif_energy')),
     ('Other geometries of the same molecule', ('jitter_ladder', 'conformers', 'conformer_frames')),
     ('Draws relaxed to their minima', ('relax_outcomes', 'relax_spread', 'relax_two_relaxers')),
+    ('Mock structure prediction', ('csp_recall',)),
 )
 CSS = """
 :root { --surface: #fcfcfb; --page: #f9f9f7; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --rule: #e1e0d9; }

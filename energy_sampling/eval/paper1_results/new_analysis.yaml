@@ -623,3 +623,255 @@ runs:
     embedding_references:
       - {path: 'D:\crystal_datasets\acridine\opt_acrdin.pt', tag: relaxed}
       - {path: 'D:\crystal_datasets\acridine\std_acridine_polymorphs.pt', tag: as-deposited}
+
+  # ============ prod_pool_oct07 (tag ppl): phase 2 on the pooled oct05 priors, _running.pt pulled 2026-10-12. No
+  # train_config: the battery's yamls are not in this tree, so log R (TB parity) is not written. ============
+  - run_name: ppl_mip_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_mip_n5_elj-mipcas_elj_pooled_oct05_prior-T2.5-d27722_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: ppl_neh_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_neh_n5_elj-nehzor_elj_pooled_oct05_prior-T2.5-3e67a3_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: ppl_mipu_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_mipu_n5_uma-mipcas_uma_pooled_oct05_prior-T2.5-45b0e5_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\ppl_mip_n5_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: ppl_nehu_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_nehu_n5_uma-nehzor_uma_pooled_oct05_prior-T2.5-ef2048_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\ppl_neh_n5_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: ppl_mip_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\ppl_mip_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_mip_n5_elj-mipcas_elj_pooled_oct05_prior-T2.5-d27722_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: ppl_neh_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\ppl_neh_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_neh_n5_elj-nehzor_elj_pooled_oct05_prior-T2.5-3e67a3_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: ppl_mipu_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\ppl_mipu_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_mipu_n5_uma-mipcas_uma_pooled_oct05_prior-T2.5-45b0e5_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\ppl_mip_n5_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: ppl_nehu_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\ppl_nehu_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_nehu_n5_uma-nehzor_uma_pooled_oct05_prior-T2.5-ef2048_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\ppl_neh_n5_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  # ============ prod_pool_oct07 acridine (ppl_acr_dens_n5: phase 2 from the MLE seed with the density penalty ramped
+  # 10 -> 1000), _running.pt pulled 2026-10-13. Trained against acr_newmodel.model on the pooled oct05 prior, whose
+  # molecule is the acr_newmodel gas-phase conformer (N first). References: std_opt_acridine_polymorphs.pt, the
+  # AS-DEPOSITED cells on a conformer 0.0076 A from the model's (conformer_tol admits it); opt_acrdin.pt and
+  # std_acridine_polymorphs.pt carry the old compressed conformer (0.19 A off) and do not apply. No form has been
+  # relaxed under acr_newmodel, so reference energies are provisional. No train_config. ============
+  - run_name: ppl_acr_dens_n5_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_acr_dens_n5_mace-acridine_mace_pooled_oct05_prior-T2.5-f32900_running.pt
+    rdf_mode: envwise
+    mace_path: D:\crystal_datasets\acr_newmodel.model
+    exp_sample_path: D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt
+    conformer_tol: 0.01
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_mace_pooled_oct05_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+    embedding_references:
+      - {path: 'D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt', tag: as-deposited}
+
+  - run_name: ppl_acr_dens_n5_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\ppl_acr_dens_n5_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: ppl_ppl_acr_dens_n5_mace-acridine_mace_pooled_oct05_prior-T2.5-f32900_running.pt
+    rdf_mode: envwise
+    mace_path: D:\crystal_datasets\acr_newmodel.model
+    exp_sample_path: D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt
+    conformer_tol: 0.01
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_mace_pooled_oct05_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+
+  # ============ ft_pool_oct12 (tag pft): box + reduction penalties 10 -> 1000 over 20k steps on the prod_pool_oct07
+  # arms, _running.pt pulled 2026-10-14 (runs still live). No train_config, so no log R. ============
+  - run_name: pft_mip_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_mip_ft_elj-mipcas_elj_pooled_oct05_prior-T2.5-d27722_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: pft_neh_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_neh_ft_elj-nehzor_elj_pooled_oct05_prior-T2.5-3e67a3_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: pft_mipu_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_mipu_ft_uma-mipcas_uma_pooled_oct05_prior-T2.5-45b0e5_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\pft_mip_ft_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: pft_nehu_ft_running_10k
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_nehu_ft_uma-nehzor_uma_pooled_oct05_prior-T2.5-ef2048_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\pft_neh_ft_running_10k.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: pft_mip_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\pft_mip_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_mip_ft_elj-mipcas_elj_pooled_oct05_prior-T2.5-d27722_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: pft_neh_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\pft_neh_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_neh_ft_elj-nehzor_elj_pooled_oct05_prior-T2.5-3e67a3_running.pt
+    rdf_mode: atomwise
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_elj_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: pft_mipu_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\pft_mipu_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_mipu_ft_uma-mipcas_uma_pooled_oct05_prior-T2.5-45b0e5_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\pft_mip_ft_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized_niggli.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\mipcas_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
+
+  - run_name: pft_nehu_ft_running_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\pft_nehu_ft_running_10k.pt
+    max_reduction_en: 1.0e-6
+    checkpoints_dir: D:\crystal_datasets\checkpoints
+    checkpoint: pft_pft_nehu_ft_uma-nehzor_uma_pooled_oct05_prior-T2.5-ef2048_running.pt
+    rdf_mode: atomwise
+    elj_results_path: D:\crystal_datasets\gfn_results\pft_neh_ft_running_10k_red0.pt
+    exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+    identifiers: ['NEHZOR', 'NEHZOR01']
+    dataset_path: D:\crystal_datasets\conditional\priors\nehzor_uma_pooled_oct05_prior.pt
+    num_samples: 10000
+    min_basin_size: 100
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    make_figures: false
