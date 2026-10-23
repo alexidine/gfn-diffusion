@@ -15,14 +15,21 @@ GDB and the relaxed-geometry SMILES of every QM9 xyz file, and of the identifier
         pubchem=600000 --out D:/.../selection/new_oct22
     python -m data_processing.smiles_mixture --qm9 --out D:/.../selection/qm9_oct22
 
-write <out>/selected.tsv (smiles first, shuffled; mixture columns: the pools' own, then source and sources;
-QM9 columns: heavy_atoms, split -- 'train' or 'held_out', the qm9full prior's) and <out>/selection.json
-(arguments and counts); a mixture also writes <out>/by_source/<source>.tsv, its rows of each source, shuffled on
-their own so that the file does not change when a later source's quota does: each source can be searched as its own
-chunk family and the shares chosen by how many of each family's chunks run. An existing <out> is refused.
+Split. Every mixture molecule carries a fixed side, 'held_out' when blake2b(salt, SMILES) mod 1000 < --holdout-permille
+(default 50, the qm9full prior's 5%), so a molecule's side never depends on which molecules or how many search chunks a
+later prior build gathers. QM9 molecules keep the qm9full prior's side.
+
+write <out>/selected.tsv (smiles first, shuffled; mixture columns: the pools' own, then source, sources and split;
+QM9 columns: heavy_atoms, split) and <out>/selection.json (arguments and counts); a mixture also writes
+<out>/by_source/<source>.tsv, its rows of each source, shuffled on their own: the SMILES and their order in a source's
+file do not change when a later source's quota does or a source is added after it (its `sources` column does gain the
+added pool's name), so each source can be searched as its own chunk family and the shares chosen by how many of each
+family's chunks run. Adding a source to a selection already searched means re-running every earlier source with the
+same quotas, order and seed and checking their SMILES columns are unchanged. An existing <out> is refused.
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
@@ -35,6 +42,11 @@ RDLogger.DisableLog('rdApp.*')
 QM9_XYZ = r'D:\crystal_datasets\qm9_xyz'
 PRIORS = r'D:\crystal_datasets\conditional\priors'
 CONDITIONS = {'train': 'qm9full_conditions.pt', 'held_out': 'qm9full_test_conditions.pt'}
+
+
+def split_of(smiles, salt, permille):
+    h = int.from_bytes(hashlib.blake2b(f'{salt}\0{smiles}'.encode(), digest_size=8, person=b'rc_split').digest(), 'big')
+    return 'held_out' if h % 1000 < permille else 'train'
 
 
 def canon(s):
@@ -141,6 +153,8 @@ def main(argv=None):
     p.add_argument('--qm9-xyz', default=QM9_XYZ)
     p.add_argument('--priors', default=PRIORS, help='the directory holding the qm9full conditions files')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--split-salt', default='rc_oct22')
+    p.add_argument('--holdout-permille', type=int, default=50)
     args = p.parse_args(argv)
     if os.path.exists(args.out):
         raise SystemExit(f'{args.out} exists')
@@ -162,8 +176,10 @@ def main(argv=None):
         if len(headers) != 1:
             raise SystemExit(f'the pools have different columns: {headers}')
         rows, counts = mix({s: r for s, (_, r) in read.items()}, quotas, exclude, args.seed)
-        meta.update(qm9_reference=len(exclude), counts=counts, total=len(rows))
-        write(args.out, rows, [*headers.pop(), 'source', 'sources'], meta, args.seed, by='source')
+        rows = [(*r, split_of(r[0], args.split_salt, args.holdout_permille)) for r in rows]
+        meta.update(qm9_reference=len(exclude), counts=counts, total=len(rows),
+                    held_out=sum(r[-1] == 'held_out' for r in rows))
+        write(args.out, rows, [*headers.pop(), 'source', 'sources', 'split'], meta, args.seed, by='source')
     print(json.dumps({k: v for k, v in meta.items() if k != 'argv'}, indent=1))
 
 

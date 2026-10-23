@@ -93,6 +93,19 @@ def test_checks_catch_broken_geometry_negative_controls():
     assert 'db_twist' in rc.check(mol, bad, pos0, st0, topo, bonds)
 
 
+def test_molecule_without_distant_pairs_and_a_raising_smiles_do_not_abort(tmp_path, monkeypatch):
+    m, info = rc.conformer('n12n3n1n23', 0)        # every atom pair bonded: no pair two bonds apart to clash-check
+    assert m is not None, info
+    real = rc.conformer
+    monkeypatch.setattr(rc, 'conformer', lambda s, j, a: (_ for _ in ()).throw(RuntimeError()) if s == 'CCO' else
+                        real(s, j, a))
+    path = str(tmp_path / 't_raw_shard000.pt')
+    n, made, failed = rc._shard((path, path[:-3] + '.tsv', str(tmp_path / 't_failed_shard000.tsv'), ['CCO', 'CCN'], 1,
+                                 20))
+    assert (n, made, failed) == (2, 1, 1)
+    assert 'error:RuntimeError' in (tmp_path / 't_failed_shard000.tsv').read_text(encoding='utf-8')
+
+
 def test_moldata_fields():
     smi = 'OCC1CCOC1'
     mol, _ = rc.conformer(smi, 0)

@@ -125,7 +125,8 @@ def check(mol, pos, pos0, stereo0, topo, bonds):
     if not set(z) <= ALLOWED_Z:
         fails.append('elements')
     D = pair_d(pos)
-    if D[topo >= 2].min() <= CLASH:
+    nb2 = topo >= 2    # empty for a molecule whose atoms are all bonded to each other (n12n3n1n23, in ZINC)
+    if nb2.any() and D[nb2].min() <= CLASH:
         fails.append('clash')
     nb3 = topo >= 3
     if nb3.any():
@@ -219,7 +220,10 @@ def _shard(job):
     out, rows, failed = [], [], []
     for smi in smiles:
         for j in range(n_conf):
-            mol, info = conformer(smi, j, max_attempts)
+            try:   # one SMILES that raises must not take its shard (and the worker pool) down with it
+                mol, info = conformer(smi, j, max_attempts)
+            except Exception as e:
+                mol, info = None, {'reason': f'error:{type(e).__name__}'}
             if mol is None:
                 failed.append((smi, j, info['reason']))
                 continue
