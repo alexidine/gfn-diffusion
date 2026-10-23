@@ -76,6 +76,17 @@ their images), 2026-10-23:
   (adaptive chunks of ~7 crystals at this cap; ~0.9 GB per crystal); the guard took 0.4-2% of draws; host RAM peak 11.6 GB.
   An A100 share runs larger chunks, so the cluster rate is not measured here: the clock schedule stretches each arm's
   rate decay over whatever speed it gets.
+- stage-1 length, on the FULL prior with stage 1's flags, scored with eLJ (the stage-1 loss reads no energy), one seed,
+  held-out = 10,000 rows of 1,225 whole crystals; 0.11 s/step at cap 0.6:
+
+  | run | best held-out NLL (nats), at step | held-out NLL at the end (nats) | train NLL at the end (nats) |
+  |---|---|---|---|
+  | 10k steps (the battery's) | -19.62, 9,000 | -19.55 | -23.10 |
+  | 20k steps | -19.51, 8,000 | -19.01 | -24.13 |
+
+  The held-out curve flattens by ~6k steps in both runs while the training NLL keeps falling; the longer run's held-out
+  NLL gets worse as its rate decays. Stage 1 is limited by fitting the training crystals, not by its length, and stage 2
+  starts from `best.pt`, the best held-out eval. Eval-to-eval wobble is ~0.2 nats, so the two bests do not differ.
 
 Submit, on the cluster, after `git pull` in gfn-diffusion (the prior must be in `conditional/priors/` at its byte count):
 
