@@ -125,6 +125,10 @@ class BaseSet(abc.ABC, Dataset):
             # rows the implausible-energy screen replaced in this window; absent = no screen configured
             out['energy/implausible_rows'] = float(getattr(self, 'implausible_rows', 0))
             self.implausible_rows = 0
+        if getattr(self, 'mlip_max_packing_coeff', None) is not None:
+            # cells the density guard kept from the MLIP in this window; absent = no guard configured
+            out['energy/mlip_guarded_rows'] = float(getattr(self, 'mlip_guarded_rows', 0))
+            self.mlip_guarded_rows = 0
         out.update({'energy/seconds': secs,
                 'energy/calls': calls,
                 # directly comparable across energies: uma measured ~5.5 ms/sample

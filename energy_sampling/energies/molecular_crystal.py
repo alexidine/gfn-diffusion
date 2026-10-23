@@ -157,6 +157,7 @@ class MolecularCrystal(BaseSet):
                  mlip_edge_chunk_size: Optional[int] = None,
                  mlip_activation_checkpointing: bool = True,
                  implausible_energy_below: Optional[float] = None,  # a physical energy under this (run energy units, negative) is replaced by its magnitude: see screen_implausible_energy. None = no screen
+                 mlip_max_packing_coeff: Optional[float] = None,  # mace only: a cell denser than this is not handed to the MLIP and is scored as a clash: see analyze_density_guarded. None = every cell goes to the MLIP
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
                  prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
@@ -195,6 +196,17 @@ class MolecularCrystal(BaseSet):
         self.implausible_energy_below = (None if implausible_energy_below is None
                                          else float(implausible_energy_below))
         self.implausible_rows = 0          # rows the screen has replaced since the last drain_energy_timing
+        if mlip_max_packing_coeff is not None:
+            if energy_function != 'mace':
+                raise ValueError(f'energy_config.mlip_max_packing_coeff is for the mace route (uma guards its own dense '
+                                 f'cells inside MXtalTools), not {energy_function!r}')
+            if not float(mlip_max_packing_coeff) > 0:
+                raise ValueError(f'energy_config.mlip_max_packing_coeff must be positive, got {mlip_max_packing_coeff!r}')
+            if self.implausible_energy_below is None:
+                raise ValueError('energy_config.mlip_max_packing_coeff scores a guarded cell as a clash, at the magnitude '
+                                 'of energy_config.implausible_energy_below: set that too')
+        self.mlip_max_packing_coeff = None if mlip_max_packing_coeff is None else float(mlip_max_packing_coeff)
+        self.mlip_guarded_rows = 0         # cells the density guard kept from the MLIP since the last drain_energy_timing
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
         self.temperature_conditioning = temperature_conditioning
@@ -757,6 +769,49 @@ class MolecularCrystal(BaseSet):
                 f'are stamped, so this is two energy currencies mixed in one '
                 f'batch, not a missing migration.')
 
+    def analyze_density_guarded(self, crystal_batch, analyze_kwargs):
+        """crystal_batch.analyze(self.computes), except that with cfg:energy_config.mlip_max_packing_coeff set, a cell
+        whose packing coefficient is above it is not handed to the MLIP: its energy key carries
+        |cfg:energy_config.implausible_energy_below|, so it is read downstream as the screen's rows are (a clash), and
+        its other computes (the reduction penalty) are evaluated as usual. The rows are counted in mlip_guarded_rows.
+
+        Why: MACE's neighbour list grows with the density, and one cell far denser than any crystal can run the card
+        out of memory on its own. A barely trained exact-density flow draws such cells: over acridine's sg 14 latent box
+        (inn_acr_oct23, 2026-10-23) 73% of cells have a packing coefficient above 1, the median 3.3 and the largest
+        ~600, and the untrained flow's first evaluation failed at one crystal per call. The density wall already puts
+        any such cell hundreds of kJ/mol above every crystal, so the guard moves no reward a sampler of the problem
+        should see."""
+        cap = self.mlip_max_packing_coeff
+        if cap is not None:
+            dense = crystal_batch.packing_coeff.flatten() > cap
+        if cap is None or not bool(dense.any()):
+            return crystal_batch.analyze(self.computes, **analyze_kwargs)
+        keep, drop = torch.nonzero(~dense).flatten(), torch.nonzero(dense).flatten()
+        if not hasattr(crystal_batch, 'computes'):
+            # analyze binds these on the batch it runs on; the sub-batches get them, so the batch itself must too, or
+            # it no longer appends to a batch analyze ran on (batched_analyze_crystal_batch's chunks)
+            crystal_batch._init_computes()
+        rest = [k for k in self.computes if k != self.energy_function]
+        parts = []  # (rows, outputs) per sub-batch
+        if len(keep):
+            parts.append((keep, crystal_batch.subsample_new_batch(keep).analyze(self.computes, **analyze_kwargs)))
+        guarded = crystal_batch.subsample_new_batch(drop).analyze(rest, **analyze_kwargs) if rest else {}
+        like = parts[0][1][self.energy_function] if parts else torch.zeros(0, dtype=torch.float32)
+        guarded[self.energy_function] = torch.full((len(drop),) + tuple(like.shape[1:]),
+                                                   abs(self.implausible_energy_below), dtype=like.dtype,
+                                                   device=crystal_batch.device)
+        parts.append((drop, guarded))
+        order = torch.cat([rows for rows, _ in parts])
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(len(order), device=order.device)
+        keys = set().union(*(o.keys() for _, o in parts))
+        missing = [k for k in keys if any(k not in o for _, o in parts)]
+        if missing:
+            raise RuntimeError(f'analyze_density_guarded: outputs {missing} came back from one sub-batch only')
+        self.mlip_guarded_rows += len(drop)
+        return {k: torch.cat([o[k].to(crystal_batch.device) for _, o in parts])[inverse.to(crystal_batch.device)]
+                for k in keys}
+
     def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
@@ -789,7 +844,7 @@ class MolecularCrystal(BaseSet):
                 analyze_kwargs['width'] = crystal_batch.width.to(x.device)
 
         with torch.set_grad_enabled(keep_grads):
-            out = crystal_batch.analyze(self.computes, **analyze_kwargs)
+            out = self.analyze_density_guarded(crystal_batch, analyze_kwargs)
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)

@@ -833,6 +833,9 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # a screen for evaluations no real structure reaches: it moves no
                                     # energy a sampler of the problem should ever see
                                     'implausible_energy_below',
+                                    # the same for cells far denser than any crystal, which the density
+                                    # wall already scores hundreds of kJ/mol above every crystal
+                                    'mlip_max_packing_coeff',
                                     'host_gas_phase_reference',
                                     # lambda_mix is SCHEDULABLE -- balance.anneal_coeffs moves it
                                     # during a run -- so it cannot be part of a static problem hash
