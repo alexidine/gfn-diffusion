@@ -100,7 +100,13 @@ def parse_args(argv=None):
     p.add_argument("--combined-tag", default=None, help="--combine: name of the combined files (default --tag)")
     p.add_argument("--rows-per-molecule", type=int, default=0,
                    help="--combine: keep at most this many crystals per molecule (0: all; thin_rows)")
-    return p.parse_args(argv)
+    p.add_argument("--molecule-fraction", type=float, default=1.0,
+                   help="--combine: keep the training molecules whose molecule_u is below this (the held-out files "
+                        "are untouched; a smaller fraction keeps a subset of a larger one's molecules)")
+    args = p.parse_args(argv)
+    if not 0.0 < args.molecule_fraction <= 1.0:
+        p.error("--molecule-fraction must be in (0, 1]")
+    return args
 
 
 def _atomic_save(obj, path):
@@ -532,9 +538,17 @@ def thin_rows(b, k):
     return sorted(keep)
 
 
+def molecule_u(m):
+    """A molecule's fixed draw in [0, 1), from its identifier on a hash stream of its own (not thin_rows'): --molecule-
+    fraction f keeps the training molecules with molecule_u below f, the same ones in every file and build."""
+    import hashlib
+    return int(hashlib.blake2b(m.encode(), digest_size=8, person=b'rc_molsub').hexdigest(), 16) / 2.0 ** 64
+
+
 def combine(args):
     """The combined files a run names, from the chosen families' per-family files, one file name at a time; with
-    --rows-per-molecule, the prior and held-out prior keep at most that many crystals per molecule (thin_rows)."""
+    --rows-per-molecule, the prior and held-out prior keep at most that many crystals per molecule (thin_rows); with
+    --molecule-fraction, the conditions and prior keep only the training molecules that molecule_u selects."""
     from data_processing.smiles_mixture import canon
     metas, ids = [], {}
     out_tag = args.combined_tag or args.tag
@@ -543,6 +557,10 @@ def combine(args):
         for fam in args.combine:
             d = torch.load(args.out_dir / f"{args.tag}_{fam}_{name}.pt", weights_only=False)
             b = d['prior']
+            if args.molecule_fraction < 1.0 and name in ('conditions', 'prior'):
+                sel = [i for i, m in enumerate(b.identifier) if molecule_u(str(m)) < args.molecule_fraction]
+                assert sel, f"{fam} {name}: --molecule-fraction {args.molecule_fraction} keeps no molecule"
+                b = b.subsample_new_batch(sel)
             if args.rows_per_molecule and name in ('prior', 'test_prior'):
                 b = b.subsample_new_batch(thin_rows(b, args.rows_per_molecule))
             parts.append(b)
@@ -567,6 +585,8 @@ def combine(args):
         meta = {"n_molecules": sum(m['n_molecules'] for m in metas) if metas else None,
                 "n_structures": sum(m['n_structures'] for m in metas) if metas else None,
                 "families": list(args.combine), "rows_per_molecule_cap": args.rows_per_molecule or None,
+                "molecule_fraction": args.molecule_fraction, "rows_in_file": out.num_graphs,
+                "molecules_in_file": len(set(ids[name])),
                 "frame": "orient_molecule(mode=std) fixed point", "sg_ind": 2,
                 "z_prime": 1, "energy_function": "elj",
                 "provenance": "rc_oct22 per-family files combined by build_rc_prior.py --combine"}
