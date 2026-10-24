@@ -2694,7 +2694,9 @@ def dmat_row_indices(batch, results, energy_key, kT=2.5):
 
 
 def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
-                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels, extra_refs=None):
+                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels, extra_refs=None,
+                       umap_kwargs=None, kT=2.5, uma_bundle=None, elj_bundle=None, scale_label=None,
+                       extra_scales=None):
     """extra_refs: structures placed on the UMAP and nowhere else (see
     new_analysis.score_embedding_references). They enter a SEPARATE matrix used only
     for the UMAP fit, so every density, table value and basin assignment below is
@@ -2754,8 +2756,13 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
                 if (lab, tag_order[0]) in pos and (lab, tag_order[1]) in pos:
                     d = float(umap_dmat[n0 + pos[(lab, tag_order[0])], n0 + pos[(lab, tag_order[1])]])
                     print(f"  {lab}: {tag_order[0]} <-> {tag_order[1]} RDF distance {d:.4f}")
-    umap_model = UMAP(n_components=2, n_neighbors=300, min_dist=0.75,
-                      init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
+    # umap_kwargs: display-only override (e.g. n_neighbors, min_dist, densmap); densities, basins and the
+    # table do not depend on the layout
+    umap_kw = dict(n_neighbors=300, min_dist=0.75)
+    umap_kw.update(umap_kwargs or {})
+    if umap_kwargs:
+        print(f"  UMAP layout: {umap_kw}")
+    umap_model = UMAP(n_components=2, init='pca', metric='precomputed', low_memory=True, n_jobs=-1, **umap_kw)
     sample_embedding = umap_model.fit_transform(umap_dmat.cpu().numpy().astype(np.float32))
     basin_colorscale = px.colors.qualitative.Vivid[:n_basins + 2]
     basin_colorscale[0] = 'rgb(100, 100, 100)'
@@ -2767,6 +2774,8 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     dnorm = old_dens.sum()
     new_dens = (torch.exp(-(full_dmat[num_filtered_samples:, :num_filtered_samples] ** 2) / (2 * d_kernel ** 2)).sum(
         dim=1)) / dnorm  # no minus one because we have deleted the self term
+    # raw kernel sums (in draws' worth of weight), kept BEFORE `dnorm` is reused for the eLJ run below
+    raw_old_uma, raw_new_uma = old_dens.clone().double(), (new_dens * dnorm).double()
     old_dens /= dnorm
     """get polymorph & basin probs under elj"""
     edmat = elj_results['dmat']
@@ -2788,6 +2797,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     dnorm = old_elj_dens.sum()
     new_elj_dens = (torch.exp(-(dists_to_elj ** 2) / (2 * d_kernel ** 2)).sum(
         dim=1)) / dnorm  # no minus one because we have deleted the self term
+    raw_old_elj, raw_new_elj = old_elj_dens.clone().double(), (new_elj_dens * dnorm).double()
     old_elj_dens /= dnorm
     new_elj_dens /= old_elj_dens.amax()
     stats = {}
@@ -2797,7 +2807,71 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     stats['sample_cp'] = torch.cat([sample_cps[p_maxima], ebatch.packing_coeff]).numpy()
     stats['density'] = torch.cat(
         [old_dens[p_maxima], new_dens[:num_polymorphs]]).numpy() / old_dens.amax()  # replace with per-basin maxima
+    # The same KDE read two more ways, from the RAW kernel sums (dnorm cancels in both):
+    #  - density percentile: % of the model's own (filtered) draws whose leave-one-out sum is below the point's,
+    #    mid-rank for ties; a point whose sum is under one draw's weight (< 1) is below what N draws resolve and
+    #    is reported as '< f', f = % of draws that are themselves under one draw's weight;
+    #  - implied -kT ln P_sigma^RDF relative to the densest draw, kJ/mol; below resolution it is '> floor',
+    #    floor = kT ln(peak sum), the value a point carrying exactly one draw's weight would get.
+    #  The same reading is applied to the eLJ partner's density (its own draws as the reference set).
+    def _rank(raw_draws, raw_pts):
+        lt = (raw_draws[None, :] < raw_pts[:, None]).double().mean(1)
+        eq = (raw_draws[None, :] == raw_pts[:, None]).double().mean(1)
+        return (100 * (lt + 0.5 * eq)).numpy(), float(100 * (raw_draws < 1).double().mean()), (raw_pts < 1).numpy()
+
+    raw_pts = torch.cat([raw_old_uma[p_maxima], raw_new_uma[:num_polymorphs]])
+    stats['density_pct'], stats['density_pct_floor'], stats['below_resolution'] = _rank(raw_old_uma, raw_pts)
+    stats['implied_F'] = (-kT * torch.log(raw_pts / raw_old_uma.max())).numpy()
+    stats['implied_F_floor'] = float(kT * torch.log(raw_old_uma.max()))
+    # eLJ rows are ordered basins-then-polymorphs already (all_new_rdf above), matching the table columns
+    (stats['elj_density_pct'], stats['elj_density_pct_floor'],
+     stats['elj_below_resolution']) = _rank(raw_old_elj, raw_new_elj[:n_basins + num_polymorphs])
     stats['elj_density'] = new_elj_dens[:num_polymorphs + n_basins].numpy()
+    # uma_bundle / elj_bundle: dens_engine bundles (many more draws of the same two models). The percentile rows are
+    # then read against the bundle's draws instead of this figure's own; basins, the embedding and the normed
+    # densities stay on the figure's samples. Each bundle must sit on this figure's kernel and checkpoint.
+    if uma_bundle is not None or elj_bundle is not None:
+        from energy_sampling.eval.paper1_results.dens_engine import point_sums
+        table_rdf = all_new_rdf[:n_basins + num_polymorphs]   # basin density maxima, then the polymorphs
+        for tag, bundle, results, keys in (
+                ('uma', uma_bundle, uma_results, ('density_pct', 'density_pct_floor', 'below_resolution')),
+                ('elj', elj_bundle, elj_results,
+                 ('elj_density_pct', 'elj_density_pct_floor', 'elj_below_resolution'))):
+            if bundle is None:
+                continue
+            ps = point_sums(bundle, table_rdf)
+            assert abs(ps['d_cut'] / float(uma_results['d_cuts'][0]) - 1) < 1e-6, (
+                f"{bundle} was streamed with d_cut {ps['d_cut']}, this figure's kernel is {float(uma_results['d_cuts'][0])}")
+            assert ps['rdf_mode'] == results.get('rdf_mode') and ps['step_ind'] == results['provenance']['step_ind'], (
+                f"{bundle} (rdf_mode {ps['rdf_mode']}, step {ps['step_ind']}) does not match the {tag} results")
+            old = np.array(stats[keys[0]], dtype=float)
+            stats[keys[0]], stats[keys[1]], stats[keys[2]] = _rank(ps['draw_sums'], ps['point_sums'])
+            stats[f'{tag}_bundle_n_draws'] = ps['n_draws']
+            print(f"  {tag} percentiles from {ps['n_draws']} bundle draws (was {len(raw_old_uma if tag == 'uma' else raw_old_elj)}): "
+                  + ', '.join(f"{o:.0f} -> {n:.1f}" for o, n in zip(old, stats[keys[0]]))
+                  + f"; floor {stats[keys[1]]:.2f}%; below resolution {int(np.sum(stats[keys[2]]))}")
+    # the table labels its density rows from these: `paired_density` is False when the caller
+    # passed one run in both slots (new_analysis.py's single-run figures), where 'elj_density'
+    # is a copy of 'density' and must not be shown as a second, LJ measurement
+    stats['energy_function'] = energy_function
+    stats['paired_density'] = uma_results is not elj_results
+    # scale_label names the kernel of uma_results['d_cuts'][0] in the table; extra_scales {label: d_cut} adds the
+    # SAME points' percentiles at other kernel widths (basins and points unchanged), from the distances in hand
+    stats['scale_label'] = scale_label
+    stats['extra_scales'] = []
+    for label, dc in (extra_scales or {}).items():
+        dk = dc / 3
+        ro = (torch.exp(-(full_dmat[:num_filtered_samples, :num_filtered_samples] ** 2) / (2 * dk ** 2)).sum(1) - 1).double()
+        rn = torch.exp(-(full_dmat[num_filtered_samples:, :num_filtered_samples] ** 2) / (2 * dk ** 2)).sum(1).double()
+        u = _rank(ro, torch.cat([ro[p_maxima], rn[:num_polymorphs]]))
+        eo = (torch.exp(-(edmat ** 2) / (2 * dk ** 2)).sum(1) - 1).double()
+        en = torch.exp(-(dists_to_elj ** 2) / (2 * dk ** 2)).sum(1).double()
+        e = _rank(eo, en[:n_basins + num_polymorphs])
+        stats['extra_scales'].append({'label': label, 'uma_pct': u[0], 'uma_below': u[2], 'elj_pct': e[0],
+                                      'elj_below': e[2]})
+        print(f"  scale {label} (d_cut {dc:.4f}): UMA percentiles {np.round(u[0], 1).tolist()} "
+              f"(<LOD {u[2].astype(int).tolist()}), LJ {np.round(e[0], 1).tolist()} (<LOD {e[2].astype(int).tolist()}); "
+              f"draws below one draw's weight: UMA {u[1]:.1f}%, LJ {e[1]:.1f}%")
     # stats['local_en_var'] = uma_thermos['local_en_var'][p_maxima]
     poly_to_basin_dists = torch.zeros((num_polymorphs, n_basins))
     for ind in range(num_polymorphs):
@@ -2814,7 +2888,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
 
 
 def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int,
-               scan_device=None):
+               scan_device=None, return_anchors=False, cc_max: float = 2.0):
     """
     scan_device: where to run the cutoff scan ONLY. None picks cuda when
     available. The scan calls mean_shift_density up to 200 times and each call
@@ -2845,7 +2919,9 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     b_rec = []
     b_sz_rec = []
     try:
-        for cc in torch.linspace(0.33, 2, 200):
+        # cc_max > 2 carries the same step further: a COMPACK-anchored d_cut can be small against the distance
+        # between a molecule's packing families
+        for cc in 0.33 + (2 - 0.33) / 199 * torch.arange(int(round((cc_max - 0.33) / ((2 - 0.33) / 199))) + 1):
             cluster_labels = mean_shift_density(
                 len(dmat), 100, dmat_scan, d_cuts[0] * cc, density_scan).cpu()
 
@@ -2863,7 +2939,9 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     "assign samples to basins"
     sig = d_cuts[0] / 3
     weights = np.exp(-dmat[anchors] ** 2 / (2 * sig ** 2))
-    weights = weights / weights.sum(0)
+    # a sample too far from every anchor for any kernel weight (possible at a narrow kernel) has a zero total; it
+    # must come out unassigned, not NaN (which the 0.8 test below lets through to the first anchor)
+    weights = weights / weights.sum(0).clamp(min=1e-30)
     assignments = weights.argmax(dim=0)
     assignments[weights.amax(dim=0) < 0.8] = -1
     cluster_labels = torch.tensor([i[ass] if ass > -1 else -1 for ass in assignments])
@@ -2894,6 +2972,8 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
     assert torch.all(cluster_labels[p_maxima] == p_maxima)
     assert len(cluster_labels) == num_filtered_samples, "cluster_labels mismatch"
 
+    if return_anchors:   # every mean-shift anchor (dmat rows), including those of basins killed as too small
+        return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins, np.asarray(anchors)
     return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins
 
 
