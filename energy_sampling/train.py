@@ -4123,6 +4123,30 @@ class Modeller:
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
 
+    def publish_data_set_sizes(self, **extra):
+        """The sizes of the run's data sets, measured after init_identifiers, into the wandb run config under data/
+        (printed too), in every trainer that calls it: train_molecules and test_molecules (distinct identifiers in
+        molecules_path and test_molecules_path; 0 when there is no test file), prior_rows and prior_molecules
+        (prior_dataset as loaded), molecules (the identifier registry: the union of the three) and
+        condition_library_size (molecules x space groups x Z'). extra: a trainer's own data/ keys. Returns the dict."""
+        def molecules(ds):
+            if ds is None:
+                return 0
+            b = ds.batch
+            return len(set(b.identifier)) if hasattr(b, 'identifier') else int(b.num_graphs)
+
+        sizes = {'data/train_molecules': molecules(self.mol_dataset),
+                 'data/test_molecules': molecules(getattr(self, 'test_mol_dataset', None)),
+                 'data/prior_rows': int(self.prior_dataset.batch.num_graphs),
+                 'data/prior_molecules': molecules(self.prior_dataset),
+                 'data/molecules': len(self.identifier_registry),
+                 'data/condition_library_size': int(self.energy_function.condition_library_size),
+                 **extra}
+        print('data sets: ' + ', '.join(f'{k[5:]} {v:,}' for k, v in sizes.items()), flush=True)
+        if wandb.run is not None:
+            wandb.config.update(sizes, allow_val_change=True)
+        return sizes
+
     def init_energy_reference(self):
         """
         Install energy_config.energy_reference on the energy function. Under 'seed_min'
@@ -4235,6 +4259,7 @@ class Modeller:
             # holding the card and every later OOM is downstream of this line.
             self.vram_ledger('prior_dataset (MLIP scan)')
             self.init_identifiers()
+            self.publish_data_set_sizes()
             # before ANY buffer is seeded: every reward from here on is in the run's currency
             self.init_energy_reference()
             # grow_prior_buffer() must run after init_identifiers() so the freshly

@@ -1208,6 +1208,10 @@ class InnModeller(Modeller):
             # eval and figure code reads. Nothing in this loop's loss reads it.
             self.init_condition_log_z()
             self.init_data_rows()
+            # train.py's data/ keys, and this trainer's split of the prior rows: the stored training rows
+            # (prior_buffer_length) and the rows held out of training molecules (eval_bwd/mle_heldout_rows)
+            self.publish_data_set_sizes(**{'data/train_rows': int(self.n_prior_rows),
+                                           'data/val_rows': int(self.x_val.shape[0])})
             if inn.init_from is not None:
                 # after init_data_rows: the saved standardisation replaces the one just fitted
                 ck = torch.load(inn.init_from, map_location='cpu')
