@@ -65,6 +65,8 @@ def components(smi):
             continue
         if any(a.GetNumRadicalElectrons() for a in frag.GetAtoms()):
             continue
+        for a in frag.GetAtoms():   # RemoveHs keeps isotopic H: [2H]C... would become [H]C..., a second spelling
+            a.SetIsotope(0)
         frag = Chem.RemoveHs(frag)
         Chem.RemoveStereochemistry(frag)
         out.append(frag)

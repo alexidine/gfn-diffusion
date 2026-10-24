@@ -172,6 +172,11 @@ def main(argv=None):
             raise SystemExit('a source is named twice')
         exclude = qm9_reference(args.qm9_xyz, args.priors)
         read = {s: read_pool(args.pool, s) for s, _ in quotas}
+        for s, (_, rows) in read.items():   # exclusion, dedupe and the split all compare strings exactly
+            bad = [r[0] for r in rows if canon(r[0]) != r[0]]
+            if bad:
+                raise SystemExit(f"{s}: {len(bad)} pool SMILES are not canonical (e.g. {bad[:3]}); rebuild the pool "
+                                 f"with the current smiles_pool.py (isotopic H used to survive as [H])")
         headers = {tuple(h) for h, _ in read.values()}
         if len(headers) != 1:
             raise SystemExit(f'the pools have different columns: {headers}')

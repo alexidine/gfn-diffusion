@@ -40,6 +40,13 @@ def test_components_keep_neutral_closed_shell_hcnof():
     assert sp.components('not a smiles') == []
 
 
+def test_isotopes_give_the_one_canonical_spelling():
+    # RemoveHs keeps isotopic H, so a deuterated entry used to come out as a second, H-explicit spelling
+    # ('[H]C([H])([H])OC(=O)CC(C)C') that escaped every exact-string comparison downstream
+    for s in ('[2H]C([2H])([2H])OC(=O)CC(C)C', '[13CH3]OC(=O)CC(C)C', 'COC(=O)CC(C)C'):
+        assert [sp.canon(m) for m in sp.components(s)] == [_can('COC(=O)CC(C)C')], s
+
+
 def test_cuttable_bonds():
     mol = Chem.MolFromSmiles('CCc1ccccc1F')
     cut = set(sp.cuttable_bonds(mol))
