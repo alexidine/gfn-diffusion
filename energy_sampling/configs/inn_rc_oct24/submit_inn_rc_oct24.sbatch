@@ -11,12 +11,15 @@
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/inn_rc_oct24/joblogs/%x_%j.out
 
 # inn_rc_oct24: the conditional exact-density flow (inn_modeller.py), stage 1 (likelihood) only, on the rc_oct22
-# random-conformer priors (eLJ, T 6.9, space group 2, Z' 1; build_rc_prior.py, installment 1), three arms packed onto ONE
-# A100 under NVIDIA MPS:
+# random-conformer priors (eLJ, T 6.9, space group 2, Z' 1; build_rc_prior.py, installment 1), three arms in two jobs of
+# one A100 each, the arms of a job packed onto its card under NVIDIA MPS:
 #
-#   0 rcq        qm9rc only: the qm9full SMILES with one random conformer each in place of the DFT geometry
-#   1 rcall      all five families of installment 1 (qm9rc, csdrc, zincrc, gdbrc, pubrc)
-#   2 rcall_big  as rcall, with the wider and deeper conditioner (384 x 6 x 8)
+#   0 rcq        job 1   qm9rc only: the qm9full SMILES with one random conformer each in place of the DFT geometry
+#   1 rcall      job 1   all five families of installment 1 (qm9rc, csdrc, zincrc, gdbrc, pubrc)
+#   2 rcall_big  job 2   as rcall, with the wider and deeper conditioner (384 x 6 x 8)
+#
+# Each arm holds its whole prior on the card (13.2 GB on disk for the all-family prior), so one card cannot hold two
+# all-family arms.
 #
 # Every arm is scored on the same held-out set, the qm9rc held-out molecules (the qm9full prior's held-out SMILES, with
 # random-conformer geometries), so rcq against rcall isolates the training molecules. The recipe is inn_atoms_oct21's
@@ -28,7 +31,10 @@
 # MPS: the job starts nvidia-cuda-mps-control on the node before the container and the processes connect through
 # CUDA_MPS_PIPE_DIRECTORY; if it does not start, the processes time-share the card (stated in the .info file). A card
 # in Exclusive_Process mode without MPS cannot host two processes, and the job stops before training.
-# Flags are read when the job STARTS from configs/inn_rc_oct24/arms.tsv and common.args (edit in place while queued).
+# Flags are read when the job STARTS from configs/inn_rc_oct24/arms.tsv (or the file ARMS_TSV names) and common.args
+# (edit in place while queued). Two jobs, one card each:
+#   sbatch submit_inn_rc_oct24.sbatch                                      (arms.tsv: rcq + rcall)
+#   sbatch --export=ALL,ARMS_TSV=arms_big.tsv submit_inn_rc_oct24.sbatch   (arms_big.tsv: rcall_big)
 # Outputs: artifacts/inn_proto/inn_rc24_<arm>/, wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
 # THERE IS NO RESUME. DRY_RUN=1 bash submit_inn_rc_oct24.sbatch prints every command and stops.
 module purge 2>/dev/null
@@ -40,10 +46,12 @@ WORKDIR=${PROJECT_ROOT}/gfn-diffusion/energy_sampling
 BATTERY=${BATTERY_DIR:-${WORKDIR}/configs/inn_rc_oct24}  # BATTERY_DIR: a local copy, for DRY_RUN only
 LOGS=${BATTERY}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22
-# the five files and their sizes in bytes (the uploads of D:\crystal_datasets\conditional\priorsc_oct22)
+# the five files and their sizes in bytes (the uploads of D:/crystal_datasets/conditional/priors/rc_oct22)
 FILES=(rcoct22i1_qm9rc_prior.pt rcoct22i1_qm9rc_conditions.pt rcoct22i1_qm9rc_test_conditions.pt rcoct22i1_prior.pt rcoct22i1_conditions.pt)
 BYTES=(2207012889 228547666 13259723 13156215839 1357117492)
 
+ARMS_FILE=${BATTERY}/${ARMS_TSV:-arms.tsv}
+if [ ! -f "${ARMS_FILE}" ]; then echo "FATAL: no arms file ${ARMS_FILE}" >&2; exit 1; fi
 ALL=$(awk -F'\t' '$1 == "ALL" {print $2}' ${BATTERY}/common.args)
 if [ -z "${ALL}" ]; then echo "FATAL: no ALL line in ${BATTERY}/common.args" >&2; exit 1; fi
 
@@ -60,8 +68,8 @@ while IFS=$'\t' read -r IDX ARM FLAGS SHARE; do
     ARMS+=("${ARM}")
     ARM_CMD[${ARM}]="${ALL} ${FLAGS} --cuda_memory_fraction ${SHARE} --run_name ${ARM}"
     TOTAL_SHARE=$(awk -v a="${TOTAL_SHARE}" -v b="${SHARE}" 'BEGIN {print a + b}')
-done < ${BATTERY}/arms.tsv
-if [ ${#ARMS[@]} -eq 0 ]; then echo "FATAL: no arms in ${BATTERY}/arms.tsv" >&2; exit 1; fi
+done < ${ARMS_FILE}
+if [ ${#ARMS[@]} -eq 0 ]; then echo "FATAL: no arms in ${ARMS_FILE}" >&2; exit 1; fi
 if awk -v t="${TOTAL_SHARE}" 'BEGIN {exit !(t > 0.95)}'; then
     echo "FATAL: the arms' memory shares sum to ${TOTAL_SHARE} of the card (> 0.95)" >&2; exit 1
 fi
@@ -117,7 +125,7 @@ fi
   scontrol show job ${SLURM_JOB_ID}
   echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"
   echo "gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse HEAD 2>&1)  MXtalTools $(git -C ${PROJECT_ROOT}/MXtalTools rev-parse HEAD 2>&1)"
-  cat ${BATTERY}/arms.tsv ${BATTERY}/common.args
+  cat ${ARMS_FILE} ${BATTERY}/common.args
 } > ${J}.info 2>&1
 
 stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,clocks_throttle_reasons.active,power.draw,temperature.gpu \
