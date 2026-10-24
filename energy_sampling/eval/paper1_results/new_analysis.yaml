@@ -875,3 +875,38 @@ runs:
     analysis_batch_size: 4
     max_analysis_batch_size: 16
     make_figures: false
+
+  # ============ inn_acr_oct23 stage-2 arm base (AR flow, inn_modeller): old acridine prior rebuilt as
+  # acridine_oldmace_oct23_prior.pt, OLD MACE (acr_112025_mh1_stagetwo, = MACE_PATH), old compressed conformer, so the
+  # opt_acrdin.pt references apply. Draws from the live latest.pt (update 24,000, pulled 2026-10-24) by the flow at the
+  # job's commit f8b7c177 (inn_draws.py); this script decodes and scores them. ============
+  - run_name: inn_acr23_base_u24000_10k
+    stored_draws: D:\crystal_datasets\inn_acr23\base_oct24_draws10k.pt
+    checkpoints_dir: D:\crystal_datasets\inn_acr23
+    checkpoint: base_oct24_draws10k.pt
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_oldmace_oct23_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: inn_acr23_base_u24000_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\inn_acr23_base_u24000_10k.pt
+    max_reduction_en: 1.0e-6
+    stored_draws: D:\crystal_datasets\inn_acr23\base_oct24_draws10k.pt
+    checkpoints_dir: D:\crystal_datasets\inn_acr23
+    checkpoint: base_oct24_draws10k.pt
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_oldmace_oct23_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
+

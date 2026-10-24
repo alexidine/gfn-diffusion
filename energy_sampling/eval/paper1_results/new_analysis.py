@@ -80,6 +80,24 @@ def load_gfn(checkpoint_path, device):
     return model, ck['problem_def'], int(train_T), prov
 
 
+def load_stored_draws(path, num_samples):
+    """Terminal latents drawn elsewhere (a model this script cannot load, e.g. an inn_modeller flow), in the trainer's
+    latent chart, with the problem identity the file states. Returns what load_gfn returns, the model slot holding the
+    draws: {'latents', 'log_pf', 'log_pb', 'learned_log_z', 'max_z_prime'}."""
+    d = torch.load(path, map_location='cpu', weights_only=False)
+    x = d['latents'][:num_samples]
+    assert len(x) == num_samples, f"{path} holds {len(d['latents'])} draws, the run asks for {num_samples}"
+    problem_def = {'energy_function': d['energy_function'], 'space_groups': [int(d['space_group'])],
+                   'z_primes': [int(d['z_prime'])]}
+    prov = {'checkpoint_file': os.path.basename(d['checkpoint_file']), 'step_ind': int(d['step']),
+            'stage': d.get('model'), 'coeff_sched_entry': None}
+    print(f"stored draws {os.path.basename(path)}: {len(x)} of {len(d['latents'])}, from {d.get('model')} "
+          f"{prov['checkpoint_file']} at update {prov['step_ind']}")
+    drawn = {'latents': x, 'log_pf': d['log_q'][:num_samples].unsqueeze(-1), 'log_pb': torch.zeros(len(x), 1),
+             'learned_log_z': float(d.get('log_z', float('nan'))), 'max_z_prime': int(d['max_z_prime'])}
+    return drawn, problem_def, None, prov
+
+
 def load_predictor(energy_function, device, mace_path=MACE_PATH):
     if energy_function == 'uma':
         return init_uma_crystal_predictor(UMA_PATH, device=device)
@@ -577,13 +595,19 @@ def run_analysis(config):
     checkpoint_path = os.path.join(config.checkpoints_dir, config.checkpoint)
 
     "problem identity comes from the checkpoint"
-    model, problem_def, train_T, provenance = load_gfn(checkpoint_path, device)
+    # `stored_draws` (a file written by the model's own sampler) replaces sampling a GFN checkpoint; `checkpoint` then
+    # names that file, for the cache identity
+    stored = getattr(config, 'stored_draws', None)
+    if stored:
+        model, problem_def, train_T, provenance = load_stored_draws(stored, config.num_samples)
+    else:
+        model, problem_def, train_T, provenance = load_gfn(checkpoint_path, device)
     energy_function = problem_def['energy_function']
     space_groups, z_primes = problem_def['space_groups'], problem_def['z_primes']
     assert len(space_groups) == 1 and len(z_primes) == 1, (
         f"this analysis samples one (sg, Z') cell; checkpoint trained on {space_groups} x {z_primes}")
     sg_ind, zp = int(space_groups[0]), int(z_primes[0])
-    max_z_prime = model.max_z_prime
+    max_z_prime = model['max_z_prime'] if stored else model.max_z_prime
     std_orientation = bool(getattr(config, 'std_orientation', True))
     # No default: the right mode is a property of the MOLECULE. atomwise for
     # mipcas/nehzor; envwise for acridine, whose C2 symmetry makes atomwise
@@ -651,8 +675,12 @@ def run_analysis(config):
             reloaded = True
             print(f"reloaded {len(samples)} samples from {load_path}")
     if not reloaded:
-        latents, log_pf, log_pb, latents_raw = sample_latents(
-            model, config.num_samples, config.sample_batch_size, train_T, device)
+        if stored:
+            latents, log_pf, log_pb = model['latents'], model['log_pf'], model['log_pb']
+            latents_raw = latents
+        else:
+            latents, log_pf, log_pb, latents_raw = sample_latents(
+                model, config.num_samples, config.sample_batch_size, train_T, device)
         samples, kept = decode_and_score(latents, molecule, max_z_prime, sg_ind, zp, energy_function,
                                          lj_coeff, predictor, config.analysis_batch_size, device,
                                          std_orientation, max_batch, rdf_mode)
@@ -672,7 +700,7 @@ def run_analysis(config):
             'log_pfs': log_pf,
             'log_pbs': log_pb,
             'samples': samples,
-            'learned_log_z': model.flow_model().item(),
+            'learned_log_z': model['learned_log_z'] if stored else model.flow_model().item(),
         }
         assert len(samples) == len(log_pf) == len(latents), "per-sample tensors out of step with samples"
     del model
