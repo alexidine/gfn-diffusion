@@ -1,8 +1,9 @@
 # inn_rc_oct24 arms of job 1, read by submit_inn_rc_oct24.sbatch when the job STARTS (edit here, in place, before it
 # starts). Columns (tab-separated, 4): index, arm, flags beyond common.args ('-' = none; later flags win), the arm's share
-# of the card's memory (--cuda_memory_fraction). Both arms run at once on one A100 under MPS. Each arm holds its prior
-# on the card for the whole run: the qm9rc-only prior (1.12M rows) ran at 13.4 GB on a 16 GB card locally; the
-# all-family prior has 3.3x its rows and 5.7x its molecules, and the 2M-row local version needed more than 14.6 GB.
+# of the card's memory (--cuda_memory_fraction; 0.3 of an 80 GB A100 = 24 GB). Both arms run at once on one A100 under
+# MPS. Each arm holds its prior on the card for the whole run: the qm9rc-only prior (1,120,750 rows, 114,817 molecules)
+# ran at 13.4 GB on a 16 GB card locally; the all-family prior has 6.0x its rows (6,675,860) and 5.9x its molecules
+# (681,553), many of them larger, and the all-family set thinned to 3 rows per molecule ran out at 14.6 GB locally.
 #   rcq        qm9rc only: the qm9full SMILES, one random conformer each (the control)
 #   rcall      every family of installment 1: qm9rc + csdrc + zincrc + gdbrc + pubrc
 # Every arm is scored on the same held-out set (common.args: the qm9rc held-out molecules). Job 2 (arms_big.tsv)
