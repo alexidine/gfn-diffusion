@@ -4125,15 +4125,13 @@ class Modeller:
 
     def publish_data_set_sizes(self, **extra):
         """The sizes of the run's data sets, measured after init_identifiers, into the wandb run config under data/
-        (printed too), in every trainer that calls it: train_molecules and test_molecules (distinct identifiers in
-        molecules_path and test_molecules_path; 0 when there is no test file), prior_rows and prior_molecules
+        when a run is open (printed always): train_molecules and test_molecules (distinct identifiers in molecules_path
+        and test_molecules_path; 0 for no test file, or a batch without identifiers), prior_rows and prior_molecules
         (prior_dataset as loaded), molecules (the identifier registry: the union of the three) and
-        condition_library_size (molecules x space groups x Z'). extra: a trainer's own data/ keys. Returns the dict."""
+        condition_library_size (the energy function's). extra: a trainer's own data/ keys. Returns the dict."""
         def molecules(ds):
-            if ds is None:
-                return 0
-            b = ds.batch
-            return len(set(b.identifier)) if hasattr(b, 'identifier') else int(b.num_graphs)
+            b = getattr(ds, 'batch', None)
+            return len(set(b.identifier)) if b is not None and hasattr(b, 'identifier') else 0
 
         sizes = {'data/train_molecules': molecules(self.mol_dataset),
                  'data/test_molecules': molecules(getattr(self, 'test_mol_dataset', None)),
@@ -4259,7 +4257,8 @@ class Modeller:
             # holding the card and every later OOM is downstream of this line.
             self.vram_ledger('prior_dataset (MLIP scan)')
             self.init_identifiers()
-            self.publish_data_set_sizes()
+            if getattr(self.energy_function, 'is_crystal', False):  # not the conformer route, which inherits train()
+                self.publish_data_set_sizes()
             # before ANY buffer is seeded: every reward from here on is in the run's currency
             self.init_energy_reference()
             # grow_prior_buffer() must run after init_identifiers() so the freshly

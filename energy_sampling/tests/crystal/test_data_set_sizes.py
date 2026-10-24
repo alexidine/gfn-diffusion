@@ -1,6 +1,7 @@
 """train.py's Modeller.publish_data_set_sizes: the data/ keys that train.py and inn_modeller.py write to the wandb run
 config once the data sets are loaded. The molecule counts are DISTINCT identifiers per file, not rows; a missing test
-file counts 0; a trainer's own keys ride along; the dict reaches wandb.config only when a run is open.
+file, or a batch without identifiers, counts 0; a trainer's own keys ride along; the dict reaches wandb.config only
+when a run is open.
 
 Nothing is built: the method is called on a namespace holding stand-in data sets.
 
@@ -34,6 +35,13 @@ def test_no_test_file_counts_zero_and_extra_keys_ride_along():
     sizes = Modeller.publish_data_set_sizes(_modeller(test=False), **{'data/train_rows': 5, 'data/val_rows': 1})
     assert sizes['data/test_molecules'] == 0
     assert sizes['data/train_rows'] == 5 and sizes['data/val_rows'] == 1
+
+
+def test_a_batch_without_identifiers_counts_no_molecules():
+    m = _modeller()
+    m.prior_dataset = SimpleNamespace(batch=SimpleNamespace(num_graphs=6))
+    sizes = Modeller.publish_data_set_sizes(m)
+    assert sizes['data/prior_molecules'] == 0 and sizes['data/prior_rows'] == 6
 
 
 def test_written_to_the_run_config_only_when_a_run_is_open(monkeypatch):
