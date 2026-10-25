@@ -18,7 +18,7 @@
 #   2 rcall_big  job 2 (arms_big.tsv)   as rcall, with the wider and deeper conditioner (384 x 6 x 8)
 #
 # In inn_rc_oct24 both arms spent their whole jobs in the start-up scoring of the prior and the cluster cancelled them
-# for low GPU use; this battery needs the scoring pass of gfn-diffusion ec52c505 (MolecularCrystal.batched_analyze_
+# for low GPU use; this battery needs the scoring pass of gfn-diffusion ec52c505 + d2fb10fa (MolecularCrystal.batched_analyze_
 # crystal_batch with energies/molecular_crystal.py::merge_batches). rcq (qm9rc only) finished in inn_rc_oct24 (wandb
 # inn_rc24_rcq) and is the control. --mem 192G: a 2.04M-row local run peaked near 35 GB private with its stores on the
 # host; these arms hold 6.7M rows, their stores on the card (mk_dev's buffer_device).
@@ -103,8 +103,8 @@ done
 if ! grep -q 'class AtomEncoder' ${WORKDIR}/inn_modeller.py || ! grep -q 'def shared_context' ${WORKDIR}/inn_modeller.py; then
     echo "FATAL: gfn-diffusion predates the atom-token condition -- git pull gfn-diffusion" >&2; exit 1
 fi
-if ! grep -q 'def merge_batches' ${WORKDIR}/energies/molecular_crystal.py; then
-    echo "FATAL: gfn-diffusion predates the start-up scoring fix (merge_batches, ec52c505) -- git pull gfn-diffusion" >&2; exit 1
+if ! grep -q '^SG_LOOKUP_TABLES = ' ${WORKDIR}/energies/molecular_crystal.py; then
+    echo "FATAL: gfn-diffusion predates the start-up scoring fix (merge_batches and SG_LOOKUP_TABLES, d2fb10fa) -- git pull gfn-diffusion" >&2; exit 1
 fi
 
 # MPS, on the node, before the container; the processes inherit the pipe directory through the environment
@@ -159,6 +159,7 @@ INNER=${J}_inner.sh
     echo 'exit ${FAIL}'
 } > ${INNER}
 
+set -o pipefail   # the job's exit status is the inner script's (a failed arm), not tee's
 srun singularity exec --nv \
     --overlay ${OVERLAY}:ro \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
