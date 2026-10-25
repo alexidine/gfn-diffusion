@@ -1,6 +1,6 @@
 # Run reading
 
-*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20; the data set sizes section verified 2026-10-24 against commit `70303ce9`. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20; the data set sizes section verified 2026-10-24 against commit `06f2adff`. Sources at the end.*
 
 A run publishes one flat stream of named scalars to wandb, from two clocks: a ten-step report (`train.py::Modeller.ten_step_reporting`) and an eval (`::Modeller.log_metrics`, reached from `.evaluation`). This page defines those namespaces, the EMA behind three of them, the held-out quantities, the relations the code states between keys, the data set sizes a run writes to its run config outside the stream, the in-repo package that reads a run, and the figure budget. The coverage family is defined on [under-coverage-metric-family](under-coverage-metric-family.md), `z_fill/` and `z_cal/` on [z-calibration](z-calibration.md), `batch/` on [batch-size](batch-size.md), `gpu/` on [gpu-occupancy](gpu-occupancy.md).
 

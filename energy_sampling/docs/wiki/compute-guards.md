@@ -1,6 +1,6 @@
 # Compute guards
 
-*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the pre-flight guard section re-verified on 2026-09-26 against commit `5f4828d` plus uncommitted working-tree changes that are in no commit yet, and its sentence on the offline log Z check written on 2026-09-26 against commit `9c532ac` plus uncommitted working-tree changes; the sentence on joining the chunks verified on 2026-10-25 against commit `d2fb10fa`. Sources at the end.*
+*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the pre-flight guard section re-verified on 2026-09-26 against commit `5f4828d` plus uncommitted working-tree changes that are in no commit yet, and its sentence on the offline log Z check written on 2026-09-26 against commit `9c532ac` plus uncommitted working-tree changes; the sentence on joining the chunks verified on 2026-10-25 against commit `c1fb45a4`. Sources at the end.*
 
 A *compute guard* is a mechanism that keeps a run inside the machine it is on: it refuses a launch, caps an allocation, cuts a size after a failure, or trades memory for time. This page takes them in launch order. What a batch size costs and how the sizer chooses one is [batch-size](batch-size.md); the occupancy sensors are [gpu-occupancy](gpu-occupancy.md); job submission is [cluster-operations](cluster-operations.md).
 
