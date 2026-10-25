@@ -699,6 +699,48 @@ def scale_embeddings(mol_name, uma_bundle, out_dir):
     export_figs({'embedding_scales': fig}, mol_name, out_dir)
 
 
+def scale_embeddings_10k(name, results_path, exp_path, identifiers, scales, out_dir, kT=2.5):
+    """scale_embeddings for a 10k analysis results file (new_analysis.py) instead of a 100k bundle: its analysed set
+    (dmat rows) embedded by UMAP with the landscape figure's settings, together with the experimental forms, and
+    coloured by lattice energy (capped 10 kT above the lowest sample) and by the P(x) percentile at each kernel scale
+    of `scales` ({label: d_cut}; sigma = d_cut / 3, sums in samples' worth of weight, own sample excluded)."""
+    from scipy.stats import rankdata
+    from umap import UMAP
+    R = torch.load(results_path, map_location='cpu', weights_only=False)
+    good = torch.as_tensor(R['good_ens']).long()
+    D = R['dmat'].double()
+    D = 0.5 * (D + D.T)
+    energy = R['sample_energy'][good].numpy()
+    rdf_s = R['sample_batch'].rdf[good].float()
+    exp = torch.load(exp_path, map_location='cpu', weights_only=False)
+    exp = exp if isinstance(exp, list) else exp.batch_to_list()
+    exp = [e for e in exp if str(e.identifier) in identifiers]
+    assert [str(e.identifier) for e in exp] == list(identifiers), f"{exp_path}: {[e.identifier for e in exp]}"
+    eb = collate_data_list([e.clone() for e in exp])
+    eb.analyze(['rdf'], cutoff=10, std_orientation=bool(R['std_orientation']), assign_outputs=True,
+               rdf_mode=R['rdf_mode'])
+    rdf_r = eb.rdf.float()
+    bins = torch.linspace(0, 10, rdf_s.shape[-1])
+    d_rs = torch.stack([compute_rdf_distance(rdf_r[i], rdf_s, bins) for i in range(len(exp))]).double()
+    d_rr = torch.stack([compute_rdf_distance(rdf_r[i], rdf_r, bins) for i in range(len(exp))]).double()
+    print(f"  {name}: nearest sample to " + ', '.join(f"{lab} {float(d_rs[i].min()):.3f}" for i, lab in enumerate(identifiers)))
+    full = torch.cat([torch.cat([D, d_rs.T], 1), torch.cat([d_rs, 0.5 * (d_rr + d_rr.T)], 1)], 0)
+    full.fill_diagonal_(0)
+    n = len(good)
+    xy = UMAP(n_components=2, init='pca', metric='precomputed', low_memory=True, n_neighbors=300, min_dist=0.75,
+              random_state=0).fit_transform(full.numpy())
+    panels = [dict(values=energy, title='Lattice energy', colorbar='E (kJ/mol)', colorscale='Turbo_r',
+                   range=(float(energy.min()), float(energy.min()) + 10 * kT), top='low')]
+    for label, d_cut in scales.items():
+        s = (torch.exp(-D ** 2 / (2 * (d_cut / 3) ** 2)).sum(1) - 1).numpy()
+        panels.append(dict(values=100 * (rankdata(s) - 0.5) / len(s), title=f'P<sup>{label}</sup>(x) percentile',
+                           colorbar='percentile', colorscale='Turbo', range=(0, 100), top='high'))
+        print(f"  {name} {label} (d_cut {d_cut:.3f}): {100 * float(np.mean(s < 1)):.1f}% of samples below one "
+              f"sample's weight")
+    fig = scale_embedding_fig(xy[:n], panels, xy[n:], poly_labels=list(identifiers))
+    export_figs({'embedding_scales': fig}, name, out_dir)
+
+
 def fused_energies(mol_names, out_dir, row_height=1500):
     """One figure from the exported `<mol>_energy_marginal.png` and `<mol>_density_contours.png`: a row per
     molecule (marginals, then contours), lettered panels, a row label, a dashed rule between rows, and the
@@ -823,6 +865,29 @@ if __name__ == '__main__':
              'pft_red0': PAIRS_PFT_RED0}[os.environ.get('PAIR_SET', 'p12')]
     only = {m.strip() for m in os.environ.get('ONLY_MOL', '').split(',') if m.strip()}
     out_dir = os.environ.get('FIG_OUT_DIR', PAPER_FIG_DIR)
+    # ONLY_FIG=embedding_scales_10k: the three-panel embedding figure from a 10k results file, for a system without
+    # paired UMA/LJ runs; the kernel scales are that system's own COMPACK calibration
+    # (compack_calibration/landscape_compack.py), read from its <tag>_scales.json
+    SCALE_EMB_10K = {
+        'acridine_inn_final': dict(
+            results_path=os.path.join(RES, 'inn_acr23_base_u65361_10k_red0.pt'),
+            exp_path=r'D:\crystal_datasets\acridine\opt_acrdin.pt', identifiers=('ACRDIN04', 'ACRDIN12'),
+            scales_json=os.path.join(RES, 'compack_calibration', 'inn_acr23_final_scales.json'),
+            # acridine (envwise RDF): P(>= N of 20) = 0.95 lies below nearly every sample pair (15/20 extrapolates under
+            # all of them; at 10/20 every sample is under one sample's weight), so this figure takes the 50% distances
+            scale_key='scales_p50')}
+    if 'embedding_scales_10k' in {k.strip() for k in os.environ.get('ONLY_FIG', '').split(',')}:
+        import json
+        import sys
+        for name, spec in SCALE_EMB_10K.items():
+            if only and name not in only:
+                continue
+            key = spec.pop('scale_key', 'scales')
+            cal = json.load(open(spec.pop('scales_json')))[key]
+            tag = '' if key == 'scales' else ', 50%'
+            scale_embeddings_10k(name, **spec, out_dir=out_dir,
+                                 scales={f'10/20{tag}': cal['match10of20']['r'], f'15/20{tag}': cal['match15of20']['r']})
+        sys.exit(0)
     for mol_name, paths in PAIRS.items():
         if only and mol_name not in only:
             continue
