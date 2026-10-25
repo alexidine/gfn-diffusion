@@ -123,6 +123,15 @@ def is_crystal_energy(name: str) -> bool:
     return name not in TOY_ENERGY_FUNCTIONS
 
 
+def merge_batches(batches):
+    """One batch from a list, in order, by append_batch on adjacent pairs in a balanced tree: each row is copied about
+    log2(len) times, where appending one at a time copies the growing batch once per part (quadratic in the parts)."""
+    while len(batches) > 1:
+        batches = [batches[i].append_batch(batches[i + 1]) if i + 1 < len(batches) else batches[i]
+                   for i in range(0, len(batches), 2)]
+    return batches[0]
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -1479,7 +1488,7 @@ class MolecularCrystal(BaseSet):
         n_samples = len(x)
         energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
         already_oomed = False
-        samples_batch = None
+        parts = []   # each chunk's analysed batch, merged once after the loop (merge_batches)
         while cursor < n_samples:  # todo get a single unified interface for all the places we do this
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
@@ -1494,12 +1503,8 @@ class MolecularCrystal(BaseSet):
                     energies[inds] = outs[0].cpu()
 
                 if return_batch:
-                    batch_i = outs[1].detach().cpu()
-
-                    if samples_batch is None:
-                        samples_batch = batch_i
-                    else:
-                        samples_batch = samples_batch.append_batch(batch_i)
+                    parts.append(outs[1].detach().cpu())
+                outs = None   # this chunk's device results, released before the next chunk is analysed
 
                 cursor += len(inds)
                 if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:
@@ -1530,6 +1535,8 @@ class MolecularCrystal(BaseSet):
                     raise e
 
         del outs
+        samples_batch = merge_batches(parts) if parts else None
+        del parts
         # RESTORED 2026-08-14. These were commented out; on the mace/uma route that
         # left the largest allocation the process ever makes -- the init pass over the
         # whole prior dataset, chunked at supercell_size 10 -- holding its blocks in
