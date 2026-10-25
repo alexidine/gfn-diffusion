@@ -123,13 +123,27 @@ def is_crystal_energy(name: str) -> bool:
     return name not in TOY_ENERGY_FUNCTIONS
 
 
+#: the per-space-group tables MXtalTools builds lazily on a crystal batch (231 rows each) and rebuilds where absent.
+#: append_batch classifies a tensor by its length, so a table beside an operand of exactly 231 rows or atoms is joined
+#: as per-row or per-atom data and the next join fails; batched_analyze_crystal_batch drops them from each chunk.
+SG_LOOKUP_TABLES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
+
+
 def merge_batches(batches):
     """One batch from a list, in order, by append_batch on adjacent pairs in a balanced tree: each row is copied about
-    log2(len) times, where appending one at a time copies the growing batch once per part (quadratic in the parts)."""
+    log2(len) times, where appending one at a time copies the growing batch once per part (quadratic in the parts).
+    Consumes the list: each pair is released from it once joined."""
     while len(batches) > 1:
-        batches = [batches[i].append_batch(batches[i + 1]) if i + 1 < len(batches) else batches[i]
-                   for i in range(0, len(batches), 2)]
-    return batches[0]
+        joined = []
+        for i in range(0, len(batches), 2):
+            if i + 1 < len(batches):
+                joined.append(batches[i].append_batch(batches[i + 1]))
+                batches[i] = batches[i + 1] = None
+            else:
+                joined.append(batches[i])
+                batches[i] = None
+        batches[:] = joined
+    return batches.pop()
 
 
 class MolecularCrystal(BaseSet):
@@ -1503,8 +1517,11 @@ class MolecularCrystal(BaseSet):
                     energies[inds] = outs[0].cpu()
 
                 if return_batch:
-                    parts.append(outs[1].detach().cpu())
-                outs = None   # this chunk's device results, released before the next chunk is analysed
+                    batch_i = outs[1].detach().cpu()
+                    for attr in SG_LOOKUP_TABLES:
+                        if hasattr(batch_i, attr):
+                            delattr(batch_i, attr)
+                    parts.append(batch_i)
 
                 cursor += len(inds)
                 if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:

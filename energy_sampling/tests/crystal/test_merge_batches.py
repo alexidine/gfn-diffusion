@@ -49,9 +49,11 @@ def test_tree_merge_equals_appending_one_part_at_a_time(n_parts):
     seq = parts[0]
     for p in parts[1:]:
         seq = seq.append_batch(p)
-    tree = merge_batches(list(parts))
+    handed = list(parts)
+    tree = merge_batches(handed)
     _same(tree, seq)
     _same(tree, whole)
+    assert handed == []   # consumed: no chunk is held by the caller's list after the merge
 
 
 def _energy_function():
@@ -65,6 +67,47 @@ def _energy_function():
            'embedding_conditioning_dim': getattr(args, 'embedding_conditioning_dim', None)}
     cfg.update(vars(args.energy_config))
     return MolecularCrystal(**cfg)
+
+
+def _with_tables(b):
+    """the three 231-row space-group tables MXtalTools leaves on a scored crystal batch"""
+    b.asym_unit_lut = torch.zeros(231, 3)
+    b.sym_mult_lut = torch.ones(231)
+    b.free_axis_lut = torch.zeros(231, 3, dtype=torch.bool)
+    return b
+
+
+def test_chunks_of_231_rows_with_the_space_group_tables_still_merge(capsys, monkeypatch):
+    """append_batch takes a 231-row table beside a 231-row operand for per-row data, so two such chunks paired in the
+    tree double it and the next join raises; the chunked pass drops the tables from each chunk first."""
+    whole = collate_data_list([_molecule(i) for i in range(4 * 231 + 100)])
+    sizes = [231, 231, 231, 231, 100]
+    starts = [sum(sizes[:k]) for k in range(len(sizes))]
+    raw = [_with_tables(whole.subsample_new_batch(list(range(s, s + n)))) for s, n in zip(starts, sizes)]
+    with pytest.raises(ValueError):
+        merge_batches(raw)
+
+    ef = _energy_function()
+    capsys.readouterr()
+    calls = []
+
+    def fake_analyze(x, mol_batch, temperature, return_batch=False, keep_grads=False):
+        calls.append(mol_batch.num_graphs)
+        if len(calls) == 1:
+            raise RuntimeError('CUDA out of memory (simulated)')
+        return torch.zeros(mol_batch.num_graphs), _with_tables(mol_batch.subsample_new_batch(
+            list(range(mol_batch.num_graphs))))
+
+    monkeypatch.setattr(ef, 'analyze_crystal_batch', fake_analyze)
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda *a, **k: None)
+    ef.batch_size = 356   # one OOM cuts it to int(356 * 0.65) = 231, and it stops growing
+    n = whole.num_graphs
+    energy, out = ef.batched_analyze_crystal_batch(torch.zeros(n, 12), whole, torch.full((n,), 2.5),
+                                                   return_batch=True, internal_oom_recovery=True)
+    assert calls == [356] + sizes
+    assert out.num_graphs == n and list(out.identifier) == list(whole.identifier)
+    assert not any(hasattr(out, t) for t in ('asym_unit_lut', 'sym_mult_lut', 'free_axis_lut'))
 
 
 def test_the_chunked_pass_returns_what_one_call_returns(capsys):
