@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --mem=128G
+#SBATCH --mem=192G
 #SBATCH --cpus-per-task=16
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
@@ -19,8 +19,9 @@
 #
 # In inn_rc_oct24 both arms spent their whole jobs in the start-up scoring of the prior and the cluster cancelled them
 # for low GPU use; this battery needs the scoring pass of gfn-diffusion ec52c505 (MolecularCrystal.batched_analyze_
-# crystal_batch with energies/molecular_crystal.py::merge_batches) and keeps the sample stores on the host
-# (common.args: buffer_device=cpu). rcq (qm9rc only) finished in inn_rc_oct24 (wandb inn_rc24_rcq) and is the control.
+# crystal_batch with energies/molecular_crystal.py::merge_batches). rcq (qm9rc only) finished in inn_rc_oct24 (wandb
+# inn_rc24_rcq) and is the control. --mem 192G: a 2.04M-row local run peaked near 35 GB private with its stores on the
+# host; these arms hold 6.7M rows, their stores on the card (mk_dev's buffer_device).
 #
 # Every arm is scored on the qm9rc held-out molecules (the qm9full prior's held-out SMILES, random-conformer
 # geometries), as rcq was. The recipe is inn_atoms_oct21's atoms arm (atom-token condition, 200k steps, batch 2048,
