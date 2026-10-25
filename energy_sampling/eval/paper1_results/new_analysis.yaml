@@ -910,3 +910,35 @@ runs:
     min_basin_size: 100
     make_figures: true
 
+  # the same arm at its end, final.pt (update 65,361, the 2,300-minute budget; job ended 2026-10-25), pulled 2026-10-25
+  - run_name: inn_acr23_base_u65361_10k
+    stored_draws: D:\crystal_datasets\inn_acr23\base_final_oct25_draws10k.pt
+    checkpoints_dir: D:\crystal_datasets\inn_acr23
+    checkpoint: base_final_oct25_draws10k.pt
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_oldmace_oct23_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    max_packing_coeff: 2.0
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: false
+
+  - run_name: inn_acr23_base_u65361_10k_red0
+    source_results: D:\crystal_datasets\gfn_results\inn_acr23_base_u65361_10k.pt
+    max_reduction_en: 1.0e-6
+    stored_draws: D:\crystal_datasets\inn_acr23\base_final_oct25_draws10k.pt
+    checkpoints_dir: D:\crystal_datasets\inn_acr23
+    checkpoint: base_final_oct25_draws10k.pt
+    rdf_mode: envwise
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt
+    dataset_path: D:\crystal_datasets\conditional\priors\acridine_oldmace_oct23_prior.pt
+    identifiers: ['ACRDIN04', 'ACRDIN12']
+    num_samples: 10000
+    max_packing_coeff: 2.0
+    analysis_batch_size: 4
+    max_analysis_batch_size: 16
+    min_basin_size: 100
+    make_figures: true
