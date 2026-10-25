@@ -2510,13 +2510,18 @@ def scale_embedding_fig(xy, panels, poly_xy, poly_labels=None):
         tails = []
         for head, label in zip(poly_xy, heads):
             best, best_score = None, None
-            for r_frac in (0.14, 0.20):
+            for r_frac in (0.14, 0.20, 0.26):
                 for ang in np.linspace(0, 2 * np.pi, 24, endpoint=False):
                     tail = head + r_frac * span * np.array([np.cos(ang), np.sin(ang)])
                     if np.any(tail < xy.min(0)) or np.any(tail > xy.max(0)):
                         continue
                     score = int((np.linalg.norm(xy - tail, axis=1) < 0.06 * span).sum())
-                    score += sum(10 ** 7 for other in tails if np.linalg.norm(other - tail) < 0.10 * span)
+                    # labels clear of each other (boxes about 0.3 x 0.07 span)
+                    score += sum(10 ** 7 for other in tails
+                                 if abs(other[0] - tail[0]) < 0.32 * span and abs(other[1] - tail[1]) < 0.08 * span)
+                    # nor over another form's marker: the label is drawn centred on the tail, about 0.3 span wide
+                    score += sum(10 ** 7 for j, other in enumerate(poly_xy) if j != len(tails)
+                                 and abs(other[0] - tail[0]) < 0.18 * span and abs(other[1] - tail[1]) < 0.07 * span)
                     if best_score is None or score < best_score:
                         best, best_score = tail, score
             tails.append(best)
