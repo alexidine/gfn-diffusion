@@ -3,7 +3,10 @@ new_analysis.py's `stored_draws`. The flow is rebuilt from the flags the checkpo
 strictly; the draws are in the trainer's latent chart, with the flow's log-density of each.
 usage: python inn_draws.py <checkpoint> <out.pt> <n>, with the run's own commit of energy_sampling first on PYTHONPATH
 (inn_modeller is imported from there)."""
-import sys, torch
+import os, sys
+# run as a script, this folder leads sys.path and its utils.py would shadow the trainer's (inn_modeller -> buffer)
+sys.path = [q for q in sys.path if os.path.abspath(q or '.') != os.path.dirname(os.path.abspath(__file__))]
+import torch
 from inn_modeller import LatentFlow
 ck_path, out_path, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 ck = torch.load(ck_path, map_location='cpu', weights_only=False)

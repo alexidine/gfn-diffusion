@@ -274,9 +274,14 @@ def _drop_nonfinite(crystals, energy_function, tag):
 
 def decode_and_score(latents, molecule, max_z_prime, sg_ind, zp, energy_function,
                      lj_coeff, predictor, batch_size, device, std_orientation,
-                     max_batch_size, rdf_mode):
-    """latents -> crystals -> energies/RDF, batched with OOM back-off."""
+                     max_batch_size, rdf_mode, max_packing_coeff=None):
+    """latents -> crystals -> energies/RDF, batched with OOM back-off.
+
+    max_packing_coeff: a cell denser than this is not scored and not returned (the trainer's
+    energy_config.mlip_max_packing_coeff guard scores it as a clash; one such cell can need more memory than the card).
+    It lies far above the 15 kT window, so the analysed set is the same."""
     num_samples = len(latents)
+    scored_idx, n_dense = [], 0
     computes = _computes_for(energy_function)
     _assert_orientation_safe([molecule], std_orientation, 'conditioning molecule')
     samples = []
@@ -293,15 +298,34 @@ def decode_and_score(latents, molecule, max_z_prime, sg_ind, zp, energy_function
                 batch = collate_data_list(mols, max_z_prime=max_z_prime).to(device)
                 batch.reset_sg_info(sg_ind)
                 batch.latent_to_cell_params(latents[inds].to(device))
+                n_in = len(inds)
+                if max_packing_coeff is not None:
+                    dense = (batch.packing_coeff.flatten() > max_packing_coeff).cpu().numpy()
+                    if dense.any():
+                        n_dense += int(dense.sum())
+                        inds = inds[~dense]
+                        batch = None
+                        if len(inds):  # rebuilt from the kept rows (a one-row slice of a batch drops per-crystal fields)
+                            mols = [molecule.clone() for _ in inds]
+                            for m in mols:
+                                m.z_prime = zp
+                            batch = collate_data_list(mols, max_z_prime=max_z_prime).to(device)
+                            batch.reset_sg_info(sg_ind)
+                            batch.latent_to_cell_params(latents[inds].to(device))
+                if batch is None:
+                    cursor += n_in
+                    pbar.update(n_in)
+                    continue
                 stamp_lj_coeff(batch, lj_coeff)
                 batch.analyze(computes, cutoff=10, std_orientation=std_orientation,
                               assign_outputs=True, predictor=predictor, rdf_mode=rdf_mode)
                 batch = batch.to('cpu')
                 samples.extend(batch.batch_to_list())
+                scored_idx.extend(int(i) for i in inds)
                 del batch
                 batch = None
-                cursor += len(inds)
-                pbar.update(len(inds))
+                cursor += n_in
+                pbar.update(n_in)
                 if batch_size < min(num_samples, max_batch_size) and not already_oomed:
                     batch_size = min(batch_size + max(int(batch_size * 0.05), 1), max_batch_size)
             except (RuntimeError, ValueError) as e:
@@ -319,9 +343,12 @@ def decode_and_score(latents, molecule, max_z_prime, sg_ind, zp, energy_function
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 sleep(0.1)
+    if max_packing_coeff is not None:
+        print(f"  {n_dense}/{num_samples} cells denser than packing coefficient {max_packing_coeff} not scored")
     # returns (kept crystals, their indices into `latents`) so per-sample tensors
     # can be filtered in step
-    return _drop_nonfinite(samples, energy_function, 'sample')
+    samples, keep = _drop_nonfinite(samples, energy_function, 'sample')
+    return samples, torch.tensor(scored_idx, dtype=torch.long)[keep]
 
 
 def score_experimental(config, energy_function, lj_coeff, predictor, device,
@@ -683,7 +710,8 @@ def run_analysis(config):
                 model, config.num_samples, config.sample_batch_size, train_T, device)
         samples, kept = decode_and_score(latents, molecule, max_z_prime, sg_ind, zp, energy_function,
                                          lj_coeff, predictor, config.analysis_batch_size, device,
-                                         std_orientation, max_batch, rdf_mode)
+                                         std_orientation, max_batch, rdf_mode,
+                                         max_packing_coeff=getattr(config, 'max_packing_coeff', None))
         # keep every per-sample tensor aligned with `samples` if any MLIP call crashed
         latents, latents_raw, log_pf, log_pb = (latents[kept], latents_raw[kept],
                                                 log_pf[kept], log_pb[kept])
