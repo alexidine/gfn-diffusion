@@ -1,0 +1,4 @@
+# inn_rc_oct26 arm of job 2 (sbatch --export=ALL,ARMS_TSV=arms_big.tsv submit_inn_rc_oct26.sbatch), read when the
+# job STARTS. Same columns as arms.tsv. One arm on its own A100.
+#   rcall_big_s2  stage 2 of inn_rc_oct25 rcall_big (the 384 x 6 x 8 conditioner)
+2	rcall_big_s2	--prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_conditions.pt --tf_width 384 --tf_layers 6 --tf_heads 8 --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_rc25_rcall_big/best.pt	0.9
