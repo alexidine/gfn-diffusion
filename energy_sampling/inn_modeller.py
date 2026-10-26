@@ -802,7 +802,6 @@ class InnModeller(Modeller):
               + (f"temperature-conditioned over T x [1, {inn.t_factor:g}], " if self.t_conditional else "")
               + f"{n_par / 1e6:.2f}M parameters", flush=True)
 
-    @torch.no_grad()
     def subset_training_molecules(self, batch, what):
         """--molecule_fraction: the rows of the molecules file or the prior whose molecule's molecule_u is below it."""
         f = float(self.inn.molecule_fraction)
@@ -813,6 +812,7 @@ class InnModeller(Modeller):
               f"(molecule_u < {f:g})", flush=True)
         return sub
 
+    @torch.no_grad()
     def init_data_rows(self, chunk: int = 8192):
         """Latent, stored log R and condition id of every prior row, split into train and
         held-out rows; per condition, its condition vector. The lowest energy known for a

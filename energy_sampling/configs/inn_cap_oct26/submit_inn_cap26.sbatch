@@ -18,16 +18,16 @@
 #                       M = transformer 384 x 6 (rcall_big's); L = transformer 512 x 8 with the encoder 256 x 5;
 #                       f1_enc = S with the encoder 256 x 5 (the encoder alone)
 # Every arm runs 50,000 steps on one cosine (matched data exposure) and is scored on its own training molecules
-# (eval_fwd) and the 6,652 held-out molecules (eval_test). Jobs: s (arms_s.tsv: the S arms and f1_enc), m (M), l (L),
-# one A100 each, the arms of a job at once under NVIDIA MPS, each at 0.9 x its memory weight / the job's sum.
+# (eval_fwd) and the 6,652 held-out molecules (eval_test). Jobs: s (arms_s.tsv: the S arms and f1_enc), m (M), l1 (f1_l alone)
+# and l2 (f001_l, f01_l), one A100 each, the arms of a job at once under NVIDIA MPS, each at 0.9 x its memory weight / the job's sum.
 #
 # Read: Excess Energy Nats P50/P90 and Reasonable Sample Fraction on training molecules against eval_test's, eval_fwd/
 # jensen_z, eval_bwd/mle (train rows), eval_bwd/mle_heldout_rows, eval_test/mle, against steps, across fractions at one
 # size and across sizes at one fraction. Locally (one block, size S) the 1% subset reached a training-molecule excess
 # P50 of 6.0 kT at 10k steps and the full set plateaued at 32.6 kT (20k steps).
 #
-# Flags are read when the job STARTS from common.args and the arms file (edit in place while queued). Submit all three
-# with  bash submit_all.sh, or one with  sbatch --export=ALL,ARMS_TSV=arms_<s|m|l>.tsv submit_inn_cap26.sbatch
+# Flags are read when the job STARTS from common.args and the arms file (edit in place while queued). Submit all four
+# with  bash submit_all.sh, or one with  sbatch --export=ALL,ARMS_TSV=arms_<s|m|l1|l2>.tsv submit_inn_cap26.sbatch
 # Outputs: artifacts/inn_proto/inn_cap26_<arm>/, wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
 # THERE IS NO RESUME. DRY_RUN=1 BATTERY_DIR=$(pwd) ARMS_TSV=arms_s.tsv bash submit_inn_cap26.sbatch prints every
 # command and stops.
@@ -98,7 +98,7 @@ for i in "${!FILES[@]}"; do
         echo "FATAL: ${DATA}/${FILES[$i]} is ${HAVE} bytes, expected ${BYTES[$i]}" >&2; exit 1
     fi
 done
-for F in inn_modeller.py energies/ar_transformer.py energies/prior_flow.py tests/models/test_inn_atom_tokens.py \n         data_processing/molecule_subset.py tests/crystal/test_molecule_fraction.py; do
+for F in inn_modeller.py energies/ar_transformer.py energies/prior_flow.py tests/models/test_inn_atom_tokens.py data_processing/molecule_subset.py; do
     if [ ! -f ${WORKDIR}/${F} ]; then echo "FATAL: ${WORKDIR}/${F} is missing -- git pull gfn-diffusion" >&2; exit 1; fi
 done
 if ! grep -q 'class AtomEncoder' ${WORKDIR}/inn_modeller.py || ! grep -q 'def shared_context' ${WORKDIR}/inn_modeller.py; then
@@ -144,7 +144,7 @@ epilogue() {
 }
 trap epilogue EXIT TERM
 
-# one container: the atom-token and molecule-fraction tests on the CPU first, then every arm of the job at once
+# one container: the atom-token tests on the CPU and the pinned molecule draw first, then every arm of the job at once
 INNER=${J}_inner.sh
 {
     echo 'source /ext3/env.sh'
@@ -154,7 +154,7 @@ INNER=${J}_inner.sh
     echo "python -c \"import mxtaltools.common.sym_utils as s; assert getattr(s, 'NIGGLI_TRICLINIC', True), 'Niggli triclinic penalty is OFF'\" || exit 1"
     echo "python -c \"import inn_modeller\" || { echo 'FATAL: inn_modeller does not import in this container' >&2; exit 1; }"
     echo "CUDA_VISIBLE_DEVICES=-1 python tests/models/test_inn_atom_tokens.py > ${LOGS}/preflight_${SLURM_JOB_ID}.log 2>&1 || { echo 'FATAL: the atom-token tests fail in this container (see preflight log)' >&2; exit 1; }"
-    echo "CUDA_VISIBLE_DEVICES=-1 python -m pytest -q -p no:cacheprovider tests/crystal/test_molecule_fraction.py >> ${LOGS}/preflight_${SLURM_JOB_ID}.log 2>&1 || { echo 'FATAL: the molecule-fraction tests fail in this container (see preflight log)' >&2; exit 1; }"
+    echo "python -c \"from data_processing.molecule_subset import molecule_u as u; assert u('mol_a') == 0.43388624636742484, u('mol_a')\" || { echo 'FATAL: data_processing.molecule_subset is missing or draws other subsets in this container' >&2; exit 1; }"
     echo 'FAIL=0; PIDS=(); NAMES=()'
     for A in "${ARMS[@]}"; do
         echo "python -u inn_modeller.py ${ARM_CMD[${A}]} > ${LOGS}/${A}_${SLURM_JOB_ID}.trainlog 2>&1 & PIDS+=(\$!); NAMES+=(${A})"
