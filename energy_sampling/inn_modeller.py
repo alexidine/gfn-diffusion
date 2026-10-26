@@ -56,7 +56,7 @@ import torch.nn.functional as F
 import wandb
 import yaml
 
-from energies.ar_transformer import CausalTransformerConditioner
+from energies.ar_transformer import NORMS, CausalTransformerConditioner
 from energies.prior_flow import _Block, _Flow, _MADE, _rq_spline, _wrap, invert_block, rq_spline_inverse
 from energy_sampling.eval.evaluations import (FUNNEL_MAX_POINTS, boltzmann_fig, flow_parity_plot, vargrad_error,
                                               xy_scatter_plot)
@@ -719,7 +719,8 @@ class InnModeller(Modeller):
         self.log_T0 = math.log10(float(self.args.energy_config.temperature))
         self.t_span = math.log10(inn.t_factor) if self.t_conditional else 1.0
         shape = (inn.n_blocks, inn.n_bins, (inn.hidden,) * inn.hidden_layers, inn.bound)
-        transformer = (inn.tf_width, inn.tf_layers, inn.tf_heads) if inn.conditioner == 'transformer' else None
+        transformer = ((inn.tf_width, inn.tf_layers, inn.tf_heads, inn.tf_norm) if inn.conditioner == 'transformer'
+                       else None)
         block_orders = inn.block_orders.split(',') if inn.block_orders else None
         half_rows = [int(r) for r in inn.fold_half_rows.split(',')] if inn.fold_half_rows else []
         if inn.mix_k and inn.w_path > 0:
@@ -795,7 +796,7 @@ class InnModeller(Modeller):
               + (f"half-period images folded on rows {half_rows}, " if half_rows else "")
               + (f"bounded (no-tail, uniform-base) rows {bounded_rows}, " if bounded_rows else "")
               + (f"causal transformer width {inn.tf_width} x {inn.tf_layers} layers, {inn.tf_heads} heads, "
-                 if transformer is not None else f"hidden {inn.hidden} x {inn.hidden_layers}, ")
+                 f"{inn.tf_norm} norm, " if transformer is not None else f"hidden {inn.hidden} x {inn.hidden_layers}, ")
               + (f"condition width {cond_dim} embedded to {inn.context_dim}, " if self.conditional else "")
               + (f"temperature-conditioned over T x [1, {inn.t_factor:g}], " if self.t_conditional else "")
               + f"{n_par / 1e6:.2f}M parameters", flush=True)
@@ -2574,6 +2575,8 @@ def build_parser():
     p.add_argument('--tf_width', type=int, default=256)
     p.add_argument('--tf_layers', type=int, default=4)
     p.add_argument('--tf_heads', type=int, default=8)
+    p.add_argument('--tf_norm', choices=NORMS, default='layer',
+                   help="the transformer's pre-norm and final normalisation: LayerNorm, RMSNorm, or none")
     p.add_argument('--tf_fp32', action='store_true',
                    help="transformer layers in fp32 instead of bf16 (a trained stack of blocks can fail the "
                         "working-precision round trip in bf16)")
