@@ -35,12 +35,15 @@ Stages, each resumable from its files in --work-dir:
        (no diversity cap);
      - re-describe each kept crystal in the trainer's chart (build_qm9_full_prior.to_trainer_chart: the source molecule
        refitted, handedness +1, centroid x in [0, 1/2]); a row the source molecule fits neither copy of is left out.
-  2. assemble, per family: the registry's kept identifiers and sides; writes
+  2. assemble, per family: leave out the crystals the trainer's density penalty touches
+     (build_qm9_full_prior.density_keep; a molecule left with none drops out, carrier included), then the registry's
+     kept identifiers and sides; writes
      <tag>_<family>_{conditions,prior,test_conditions,test_prior,prior_provenance}.pt, and checks the prior as the
      trainer reads it (trainer_read_check).
   3. --combine FAMILY ...: concatenate those families' files into <tag>_{conditions,prior,test_conditions,
      test_prior}.pt, the files a run names, re-checking one identifier per molecule and disjoint sides by canonical
-     SMILES. One file at a time; the combined prior of installment 1 (about 7M rows) still needs tens of GB.
+     SMILES; a family file assembled without the density bound is refused (re-run stage 2 on the same --work-dir).
+     One file at a time; the combined prior of installment 1 (about 7M rows) still needs tens of GB.
 
 CPU only. Usage (from energy_sampling/):
     python build_rc_prior.py --search-dir D:\\...\\anchors\\rc_oct22 --mol-dir D:\\...\\rc_oct22\\mols
@@ -429,6 +432,7 @@ def trainer_read_check(prior, n=32, seed=0):
 
 
 def stage_assemble(args, units, waiting, audits, registry):
+    from build_qm9_full_prior import DENSITY_RULE, density_keep
     gfn, mxt = _commits()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for fam in args.families:
@@ -437,11 +441,19 @@ def stage_assemble(args, units, waiting, audits, registry):
             continue
         prior_parts, cond_parts, test_parts, test_prior_parts, prov, test_prov = [], [], [], [], [], []
         per_mol_rows, dropped = Counter(), Counter()
+        n_density, ids_before, ids_after = 0, set(), set()
         for k in ks:
             d = torch.load(args.work_dir / f"{fam}_c{k}.pt", weights_only=False)
             b, pv = d['batch'], d['provenance']
+            assert [p[0] for p in pv] == [str(i) for i in b.identifier], f"{fam} chunk {k}: provenance and rows disagree"
+            ids_before.update(p[0] for p in pv)
+            dense = density_keep(b)
+            n_density += int((~dense).sum())
+            if not bool(dense.all()):
+                rows = torch.nonzero(dense).flatten().tolist()
+                b, pv = b.subsample_new_batch(rows), [pv[i] for i in rows]
             ids = [p[0] for p in pv]
-            assert ids == [str(i) for i in b.identifier], f"{fam} chunk {k}: provenance and rows disagree"
+            ids_after.update(ids)
             for m in set(ids):
                 if m not in registry:
                     raise SystemExit(f"{fam} chunk {k}: {m} is in no selection file")
@@ -466,6 +478,9 @@ def stage_assemble(args, units, waiting, audits, registry):
             del d, b
         prior, cond, test, test_prior = (_merge(x) for x in (prior_parts, cond_parts, test_parts, test_prior_parts))
         del prior_parts, cond_parts, test_parts, test_prior_parts
+        density_gone = ids_before - ids_after   # molecules whose every crystal the density bound left out
+        print(f"{fam}: density: {n_density:,} rows left out ({DENSITY_RULE}); {len(density_gone):,} molecules had no "
+              f"row left", flush=True)
         p_ids, c_ids, t_ids, tp_ids = (set(x.identifier) for x in (prior, cond, test, test_prior))
         assert p_ids == c_ids, "every training molecule needs rows in both the prior and the conditions"
         assert t_ids == tp_ids, "every held-out molecule needs its carrier and its crystals"
@@ -498,6 +513,8 @@ def stage_assemble(args, units, waiting, audits, registry):
                       "diversity_cap": None,
                       "trainer_chart": "source molecule refitted, handedness +1, centroid x in [0, 1/2] "
                                        "(build_qm9_full_prior.to_trainer_chart)",
+                      "density_rule": DENSITY_RULE, "dropped_density_penalty": n_density,
+                      "molecules_dropped_density_penalty": len(density_gone),
                       "trainer_read_check": check,
                       "audit": {key: sum(au.get(key, 0) for au in fa) for key in
                                 ('loaded', 'kept', 'dropped_duplicate', 'dropped_standardize',
@@ -556,6 +573,9 @@ def combine(args):
         parts = []
         for fam in args.combine:
             d = torch.load(args.out_dir / f"{args.tag}_{fam}_{name}.pt", weights_only=False)
+            if not (d.get('build') or {}).get('density_rule'):
+                raise SystemExit(f"{args.tag}_{fam}_{name}.pt was assembled without the density bound; re-run the "
+                                 f"assemble stage (this script without --combine, the same --work-dir) first")
             b = d['prior']
             if args.molecule_fraction < 1.0 and name in ('conditions', 'prior'):
                 sel = [i for i, m in enumerate(b.identifier) if molecule_u(str(m)) < args.molecule_fraction]
@@ -587,6 +607,7 @@ def combine(args):
                 "families": list(args.combine), "rows_per_molecule_cap": args.rows_per_molecule or None,
                 "molecule_fraction": args.molecule_fraction, "rows_in_file": out.num_graphs,
                 "molecules_in_file": len(set(ids[name])),
+                "density_rule": metas[0]['build']['density_rule'] if metas else None,
                 "frame": "orient_molecule(mode=std) fixed point", "sg_ind": 2,
                 "z_prime": 1, "energy_function": "elj",
                 "provenance": "rc_oct22 per-family files combined by build_rc_prior.py --combine"}

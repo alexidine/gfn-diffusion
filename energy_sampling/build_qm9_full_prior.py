@@ -18,7 +18,8 @@ Stages, each resumable from its files in --work-dir:
      - chunks below --diverse-below keep the --keep most diverse survivors: farthest-point sampling in RDF distance,
        seeded with the lowest-eLJ crystal.
   3. assemble: re-describe every crystal in the trainer's chart (to_trainer_chart: handedness +1, centroid x in
-     [0, 1/2]; the search draws handedness at random and the trainer reads every row at +1), then
+     [0, 1/2]; the search draws handedness at random and the trainer reads every row at +1), leave out the crystals
+     the trainer's density penalty touches (density_keep; a molecule left with none drops out), then
      hold out a random --holdout-frac of the molecules (distinct SMILES drawn under --holdout-seed; all of
      their crystals leave the prior), write the three training files, <tag>_test_prior.pt (every kept crystal of the
      held-out molecules, in the prior's envelope, for offline evaluation; the trainer does not read it) and a
@@ -101,6 +102,16 @@ def stage_embed(args):
 def _metric_ok(c):
     a, b, g = torch.cos(c.cell_angles.double().flatten())
     return float(1 - a * a - b * b - g * g + 2 * a * b * g) > 1e-6
+
+
+DENSITY_RULE = "packing coefficient in the zero region of energies.molecular_crystal.density_penalty (0.55 to 0.95)"
+
+
+def density_keep(b):
+    """[n] bool: the rows of batch b the trainer's density penalty leaves at zero (DENSITY_RULE), the bound
+    data_processing/pool_assemble.py applies to the pooled priors (owner 2026-10-05)."""
+    from energies.molecular_crystal import density_penalty
+    return density_penalty(b.packing_coeff.double().flatten()) == 0
 
 
 def _standardize(crystals):
@@ -340,7 +351,8 @@ def stage_assemble(args, audits, emb):
           f"{args.holdout_seed})", flush=True)
     prior_parts, cond_parts, test_parts, test_prior_parts, prov, test_prov = [], [], [], [], [], []
     per_mol_rows = Counter()
-    n_flipped = n_shifted = n_unfit = 0
+    n_flipped = n_shifted = n_unfit = n_density = 0
+    ids_before, ids_after = set(), set()
     for k in range(args.n_chunks):
         d = torch.load(args.work_dir / f"chunk{k}.pt", weights_only=False)
         b, pv = d['batch'], d['provenance']
@@ -353,7 +365,14 @@ def stage_assemble(args, audits, emb):
         if unfit:
             rows = torch.nonzero(keep).flatten().tolist()
             b, pv = b.subsample_new_batch(rows), [pv[i] for i in rows]
+        ids_before.update(p[0] for p in pv)
+        dense = density_keep(b)
+        n_density += int((~dense).sum())
+        if not bool(dense.all()):
+            rows = torch.nonzero(dense).flatten().tolist()
+            b, pv = b.subsample_new_batch(rows), [pv[i] for i in rows]
         ids = [p[0] for p in pv]
+        ids_after.update(ids)
         energy = [p[3] for p in pv]
         best = {}
         for i, (m, en) in enumerate(zip(ids, energy)):
@@ -377,14 +396,17 @@ def stage_assemble(args, audits, emb):
     del prior_parts, cond_parts, test_parts, test_prior_parts
     print(f"trainer chart: {n_flipped:,} rows refitted onto their inversion partner, {n_shifted:,} moved by -1/2 in x, "
           f"{n_unfit:,} left out (the source molecule fitted neither copy within {FIT_TOL} A)", flush=True)
+    density_gone = ids_before - ids_after   # molecules whose every crystal the density bound left out
+    print(f"density: {n_density:,} rows left out ({DENSITY_RULE}); {len(density_gone):,} molecules had no row left "
+          f"({len(density_gone & held_ids):,} of them held out)", flush=True)
 
     # the trainer assumes these; check them here, where they are cheap
     p_ids, c_ids, t_ids = set(prior.identifier), set(cond.identifier), set(test.identifier)
     assert p_ids == c_ids, "every training molecule needs rows in both the prior and the conditions"
     assert not (t_ids & c_ids), "a held-out molecule is also a training condition"
     assert len(c_ids) == cond.num_graphs and len(t_ids) == test.num_graphs, "one carrier per molecule"
-    assert t_ids == held_ids, f"{len(held_ids - t_ids)} held-out molecules have no kept crystal"
-    assert set(test_prior.identifier) == held_ids and not (p_ids & held_ids), "held-out crystals leaked into the prior"
+    assert t_ids == held_ids - density_gone, f"{len(held_ids - density_gone - t_ids)} held-out molecules have no kept crystal"
+    assert set(test_prior.identifier) == t_ids and not (p_ids & held_ids), "held-out crystals leaked into the prior"
     flat_dim = int(emb['embedding'].shape[1] * emb['embedding'].shape[2])
     for name, bt in (('prior', prior), ('conditions', cond), ('test', test), ('test prior', test_prior)):
         assert bt.embedding.reshape(bt.num_graphs, -1).shape[1] == flat_dim, name
@@ -415,7 +437,9 @@ def stage_assemble(args, audits, emb):
                   "diverse_below_chunk": args.diverse_below, "keep": args.keep,
                   "trainer_chart": "source molecule refitted, handedness +1, centroid x in [0, 1/2] "
                                    f"(to_trainer_chart); {n_flipped} onto the inversion partner, {n_shifted} shifted, "
-                                   f"{n_unfit} left out"},
+                                   f"{n_unfit} left out",
+                  "density_rule": DENSITY_RULE, "dropped_density_penalty": n_density,
+                  "molecules_dropped_density_penalty": len(density_gone)},
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cond_path, prior_path = args.out_dir / f"{args.tag}_conditions.pt", args.out_dir / f"{args.tag}_prior.pt"
