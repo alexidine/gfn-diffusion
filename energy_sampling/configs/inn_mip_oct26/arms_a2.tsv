@@ -1,0 +1,7 @@
+# inn_mip_oct26 job a2 (sbatch --export=ALL,ARMS_TSV=arms_a2.tsv submit_inn_mip26.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, stage-1 key (stage1.tsv), stage-2 flags (later flags win;
+# '-' = none), description.
+25	blocks2	blocks2	-	two blocks
+26	order_nat	order_nat	-	natural row order
+27	untied	untied	-	free knot derivatives
+28	made	made	-	MADE conditioner
