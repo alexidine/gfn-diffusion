@@ -1,0 +1,3 @@
+# inn_rc_oct26 rare-rollout arm (sbatch --export=ALL,ARMS_TSV=arms_rr.tsv submit_inn_rc_oct26.sbatch), read when the
+# job STARTS: rcall_s2 of arms.tsv with each scored batch reused for 16 updates (common.args: 4). One arm on its own A100.
+1	rcall_s2_upb16	--prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_conditions.pt --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_rc25_rcall/best.pt --updates_per_batch 16	0.9
