@@ -621,8 +621,10 @@ class ConditionalLatentFlow(nn.Module):
         return x
 
     def level(self, c):
-        """log Z(c) up to the batch's shared level: the head, zero at initialisation."""
-        return self.flow.level(self.flow.context_input(c)[1]).squeeze(-1)
+        """log Z(c) up to the batch's shared level: the head, zero at initialisation. It reads a detached copy of
+        the condition features, so its regression trains the head alone and not the atom encoder every flow block
+        reads (the invariant models/gfn.py::GFN._condition_flow keeps on the SDE route)."""
+        return self.flow.level(self.flow.context_input(c)[1].detach()).squeeze(-1)
 
 
 def tb_loss(resid, beta):
@@ -898,6 +900,11 @@ class InnModeller(Modeller):
         if self.inn.level_mode in ('is', 'blend') and self.conditional:
             raise NotImplementedError(f"--level_mode {self.inn.level_mode} on a conditional run: one shared level "
                                       "does not fit rows centred on a per-condition head")
+        if self.inn.level_mode == 'ema' and self.inn.bank_frac > 0:
+            raise NotImplementedError("--level_mode ema with --bank_frac: the tail bank scores its rows against one "
+                                      "shared level, not a per-condition one")
+        if not 0.0 <= self.inn.level_mix <= 1.0:
+            raise ValueError(f"--level_mix must lie in [0, 1], got {self.inn.level_mix}")
         if self.inn.bank_frac > 0 and (self.conditional or not 0.0 < self.inn.bank_frac < 1.0):
             raise NotImplementedError("--bank_frac: unconditional runs only, and a share strictly between 0 and 1")
         if self.inn.mle_plateau_evals > 0 and (self.inn.energy_steps > 0 or self.inn.budget_minutes is not None):
@@ -1057,6 +1064,66 @@ class InnModeller(Modeller):
 
     def level_of(self, c):
         return self.sampler.level(c) if self.conditional else 0.0
+
+    @torch.no_grad()
+    def ema_levels(self, cid, fallback_f, fallback_b):
+        """--level_mode ema: each row's level, from its condition's two level streams on the trainer's tracker
+        (buffer.py::ConditionLogZTracker.fwd_level_ema / bwd_level_ema, fed by note_step: the draws' log w and the
+        stored rows' log w, evidence-capped EMAs on one per-condition clock). --level_source fwd reads the forward
+        stream; pooled reads --level_mix x forward + (1 - --level_mix) x backward. A stream that has had fewer than
+        the tracker's min_visits updates for a condition, or none, gives that row its fallback instead (per row,
+        on the rows' device). Returns (level, forward trusted, backward trusted or None under fwd)."""
+        tr = self.condition_log_z
+        idx = cid.detach().long().cpu()
+
+        def stream(ema, visits, fallback):
+            v = ema[idx].to(device=fallback.device, dtype=fallback.dtype)
+            ok = ((visits[idx] >= tr.min_visits) & torch.isfinite(ema[idx])).to(fallback.device)
+            return torch.where(ok, v, fallback), ok
+
+        lf, ok_f = stream(tr.fwd_level_ema, tr.fwd_level_visits, fallback_f)
+        if self.inn.level_source == 'fwd':
+            return lf, ok_f, None
+        lb, ok_b = stream(tr.bwd_level_ema, tr.bwd_level_visits, fallback_b)
+        m = float(self.inn.level_mix)
+        return m * lf + (1.0 - m) * lb, ok_f, ok_b
+
+    @torch.no_grad()
+    def ema_stats(self, stats, root, root_d, lvl_f, lvl_d, okf_f, okb_d, ok, ok_d, log_q, log_r, log_q_d, lr_d,
+                  cid_d):
+        """--level_mode ema readouts (level/...): the share of rows whose stream is trusted, each branch's level and
+        mean residual against it, the share past each knee, the mean log q on each branch (the two rising in lockstep
+        is the failure the one-sided level_gap tether showed), and the stored-minus-draws gap where a condition is
+        trusted on both streams. The first call also prints the entry state."""
+        inn, tr = self.inn, self.condition_log_z
+        rf = (log_q - log_r + lvl_f)[ok].detach()
+        rd = (log_q_d - lr_d + lvl_d)[ok_d].detach()
+        stats.update({
+            'level/fwd_trusted_frac': float(okf_f[ok].float().mean()),
+            'level/fresh_mean': float(lvl_f[ok].mean()), 'level/stored_mean': float(lvl_d[ok_d].mean()),
+            'level/fresh_resid_mean': float(rf.mean()), 'level/stored_resid_mean': float(rd.mean()),
+            'level/fresh_clip_frac': float((rf.abs() > inn.beta).float().mean()),
+            'level/stored_clip_frac': float((rd.abs() > inn.beta_data).float().mean()),
+            'level/logq_fresh_mean': float(log_q.detach()[ok].mean()),
+            'level/logq_stored_mean': float(log_q_d.detach()[ok_d].mean()),
+            'level/root_fresh': float(root), 'level/root_stored': float(root_d)})
+        if okb_d is not None:
+            stats['level/bwd_trusted_frac'] = float(okb_d[ok_d].float().mean())
+        ic = cid_d.detach().long().cpu()
+        both = (tr.fwd_level_visits[ic] >= tr.min_visits) & (tr.bwd_level_visits[ic] >= tr.min_visits)
+        stats['level/both_trusted_frac'] = float(both.float().mean())
+        if bool(both.any()):
+            stats['level/delta_mean'] = float((tr.bwd_level_ema[ic] - tr.fwd_level_ema[ic])[both].mean())
+        if not getattr(self, '_ema_entry_printed', False):
+            self._ema_entry_printed = True
+            print(f"level_mode ema ({inn.level_source}"
+                  + (f", forward share {inn.level_mix:g}" if inn.level_source == 'pooled' else '')
+                  + f"; condition_log_z min_visits {tr.min_visits}, half_life_visits {tr.half_life_visits:g}): first "
+                  f"update: the draws' Huber root {float(root):.2f}, the stored rows' {float(root_d):.2f} (gap "
+                  f"{float(root_d) - float(root):.2f} nats, head-centred); residual means: draws "
+                  f"{float(rf.mean()):.2f}, stored {float(rd.mean()):.2f}; past the knee: draws "
+                  f"{stats['level/fresh_clip_frac']:.3f} (knee {inn.beta:g}), stored "
+                  f"{stats['level/stored_clip_frac']:.3f} (knee {inn.beta_data:g})", flush=True)
 
     def training_log_T(self, n, repeats: int = 1):
         """log10 T of n training rows: the run's own temperature, or under temperature
@@ -1964,7 +2031,21 @@ class InnModeller(Modeller):
             root_d = winsorized_z_root((lr_d - log_q_d.detach() - h_d_fixed)[ok_d], inn.beta_data)[0]
             level_now = inn.level_blend * log_z + (1.0 - inn.level_blend) * root_d
             stats['bwd/level_blend'], stats['bwd/root_stored'] = float(level_now), float(root_d)
-        resid_d = (log_q_d - lr_d + h_d_fixed + level_now)[ok_d]
+        elif inn.level_mode == 'ema':
+            # pooled TB: the draws and the stored rows of a condition are scored against ONE per-condition level
+            # (ema_levels). Where a condition's stream is not yet trusted, that branch's own Huber root plus the
+            # head's offset stands in. level_now is then per stored row, and the draws' loss is recomputed on it.
+            off_f = h_fixed if self.conditional else torch.zeros_like(log_r)
+            off_d = h_d_fixed if self.conditional else torch.zeros_like(lr_d)
+            root_d = winsorized_z_root((lr_d - log_q_d.detach() - off_d)[ok_d], inn.beta_data)[0]
+            lvl_f, okf_f, _ = self.ema_levels(cid, root + off_f, root_d + off_f)
+            lvl_d, _, okb_d = self.ema_levels(cid_d, root + off_d, root_d + off_d)
+            fwd = tb_loss_asym((log_q - log_r + lvl_f)[ok], inn.beta, inn.beta_pos).mean()
+            level_now = lvl_d
+            self.ema_stats(stats, root, root_d, lvl_f, lvl_d, okf_f, okb_d, ok, ok_d, log_q, log_r, log_q_d, lr_d,
+                           cid_d)
+        # the stored rows' residual: the head's offset plus the shared level, or (ema) the per-row level alone
+        resid_d = (log_q_d - lr_d + (level_now if inn.level_mode == 'ema' else h_d_fixed + level_now))[ok_d]
         data = tb_loss(resid_d, inn.beta_data).mean()
         with torch.no_grad():  # train.py's per-row select_counts and ema_loss (beta 0.9) for the stored rows
             rows_d = idx[ok_d]
@@ -2026,6 +2107,8 @@ class InnModeller(Modeller):
         level_d = ((h_d.detach() + log_z) if self.conditional else
                    torch.full_like(log_q_d.detach(),
                                    float(level_now) if inn.level_mode in ('is', 'blend') else log_z))
+        if inn.level_mode == 'ema':   # both branches report the per-row level they were trained against
+            level, level_d = lvl_f.detach(), lvl_d.detach()
         # the trainer's tracker and train-cadence series take rows at the run's own temperature;
         # stored rows go in as the branch trained on them, noised or not, as a GFN's backward
         # branch takes its noised anchors
@@ -2182,6 +2265,10 @@ class InnModeller(Modeller):
         out['log_pfs'] = a['log_q'].unsqueeze(-1)
         out['log_pbs'] = torch.zeros_like(out['log_pfs'])
         out['log_Z_learned'] = a['head'] + float(shared)
+        if self.inn.level_mode == 'ema' and a.get('condition_id') is not None:
+            # the per-condition level the energy stage trains against; untrusted conditions keep head + shared
+            fb = out['log_Z_learned']
+            out['log_Z_learned'] = self.ema_levels(torch.as_tensor(a['condition_id']), fb, fb)[0]
         return out
 
     @torch.no_grad()
@@ -2651,16 +2738,27 @@ def build_parser():
     p.add_argument('--beta', type=float, default=10.0)
     p.add_argument('--beta_data', type=float, default=80.0)
     p.add_argument('--z_half_life', type=float, default=20.0)
-    p.add_argument('--level_mode', choices=['tied', 'union', 'is', 'blend'], default='tied',
+    p.add_argument('--level_mode', choices=['tied', 'union', 'is', 'blend', 'ema'], default='tied',
                    help="energy stage: 'tied' scores stored rows against a lagged copy of the draws' Huber root; "
                         "'union' scores both branches against one root refit every update over draws and stored "
                         "rows together; 'is' scores stored rows against an exponentially averaged importance "
                         "estimate of log Z from each scored batch's draws on first use, every log weight capped at "
                         "the previous level + --beta (see InnModeller.advance_is_level); 'blend' scores stored (and "
                         "bank) rows against --level_blend x the tied level + (1 - --level_blend) x the stored "
-                        "batch's own Huber root (knee --beta_data). Evaluation reads the tied level in every mode")
+                        "batch's own Huber root (knee --beta_data); 'ema' scores the draws AND the stored rows of a "
+                        "condition against one per-condition level read off the trainer's tracker "
+                        "(InnModeller.ema_levels: --level_source). Evaluation reads the tied level in every mode but "
+                        "'ema', where it reads the per-condition level")
     p.add_argument('--level_blend', type=float, default=0.5,
                    help="--level_mode blend: weight of the draws' (tied) level; the rest is the stored rows' own root")
+    p.add_argument('--level_source', choices=['fwd', 'pooled'], default='pooled',
+                   help="--level_mode ema: 'fwd' = each condition's forward level (the tracker's fwd_level_ema, the "
+                        "draws' log w); 'pooled' = --level_mix x that + (1 - --level_mix) x its backward level "
+                        "(bwd_level_ema, the stored rows' log w). Both streams are the tracker's per-condition "
+                        "evidence-capped EMAs on one per-condition clock (condition_log_z.half_life_visits and "
+                        "min_visits, set with --set)")
+    p.add_argument('--level_mix', type=float, default=0.5,
+                   help="--level_mode ema --level_source pooled: the forward level's share of the per-condition level")
     # the replay bank: first-use draws with a large residual, reused as stored-like rows
     p.add_argument('--bank_frac', type=float, default=None,
                    help='energy stage: weight of the replay bank (its own mean); 0 = off; unset = 0.1 on unconditional '

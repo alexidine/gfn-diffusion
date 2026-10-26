@@ -286,6 +286,18 @@ def test_shared_context_encodes_once_per_tensor_and_changes_nothing():
     assert (n0, n1) == (5, 4), (n0, n1)
 
 
+def test_level_head_does_not_train_the_atom_encoder():
+    # the head reads a detached copy of the condition features: its loss trains the head alone, not the atom encoder
+    # that conditions every flow block (models/gfn.py::GFN._condition_flow keeps the same invariant on the SDE route)
+    f = _live_flow(atoms=True)
+    c = _cond(True, 8)
+    f.level(c).pow(2).sum().backward()
+    enc = [prm.grad for prm in f.flow.atom_encoder.parameters()]
+    assert all(g is None or float(g.abs().max()) == 0.0 for g in enc)
+    head = [prm.grad for prm in f.flow.level.parameters()]
+    assert any(g is not None and float(g.abs().max()) > 0.0 for g in head)
+
+
 def test_grouped_rows_keep_the_uniform_marginal():
     # --rows_per_molecule: k rows of one molecule per group, and every stored row as likely as in a uniform draw
     torch.manual_seed(7)
