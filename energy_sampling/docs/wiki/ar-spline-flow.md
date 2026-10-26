@@ -56,7 +56,7 @@ with $v$ and $y$ each block's input and output, $\zeta$ the last block's output 
 
 `inn_modeller.py::invert_differentiable` runs the same $d$ passes with the autograd graph kept, and `LatentFlow.rsample` composes it over the blocks to give the draw `sample` makes from given base points, differentiable in the parameters. The $d$-pass map coincides with the exact inverse for every parameter value, so the derivative autograd takes through the passes is the derivative of the exact inverse.
 
-`inn_modeller.py::InnModeller.check_sampler_round_trip` runs at start-up, after any `--init_from` load: it draws 4096 base points, samples, maps the draws back with `LatentFlow.to_base`, and raises `RuntimeError` unless the largest error on a double-precision copy of the flow is below $10^{-6}$ and the 99th percentile of the working-precision error is below $10^{-2}$ base units.
+`inn_modeller.py::InnModeller.check_sampler_round_trip` runs at start-up, after any `--init_from` load: it draws 4096 base points (in chunks of 512, so the double-precision pass does not set the run's memory share), samples, maps the draws back with `LatentFlow.to_base`, and raises `RuntimeError` unless the largest error on a double-precision copy of the flow is below $10^{-6}$ and the 99th percentile of the working-precision error is below $10^{-2}$ base units.
 
 ## The rational-quadratic spline in one bin
 

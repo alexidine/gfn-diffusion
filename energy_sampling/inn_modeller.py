@@ -57,6 +57,7 @@ import wandb
 import yaml
 
 from energies.ar_transformer import NORMS, CausalTransformerConditioner
+from data_processing.molecule_subset import keep_molecules
 from energies.prior_flow import _Block, _Flow, _MADE, _rq_spline, _wrap, invert_block, rq_spline_inverse
 from energy_sampling.eval.evaluations import (FUNNEL_MAX_POINTS, boltzmann_fig, flow_parity_plot, vargrad_error,
                                               xy_scatter_plot)
@@ -802,6 +803,16 @@ class InnModeller(Modeller):
               + f"{n_par / 1e6:.2f}M parameters", flush=True)
 
     @torch.no_grad()
+    def subset_training_molecules(self, batch, what):
+        """--molecule_fraction: the rows of the molecules file or the prior whose molecule's molecule_u is below it."""
+        f = float(self.inn.molecule_fraction)
+        if f >= 1.0:
+            return batch
+        sub, n_mol = keep_molecules(batch, f)
+        print(f"molecule fraction {f:g} ({what}): {sub.num_graphs} of {batch.num_graphs} rows kept, {n_mol} molecules "
+              f"(molecule_u < {f:g})", flush=True)
+        return sub
+
     def init_data_rows(self, chunk: int = 8192):
         """Latent, stored log R and condition id of every prior row, split into train and
         held-out rows; per condition, its condition vector. The lowest energy known for a
@@ -1128,11 +1139,15 @@ class InnModeller(Modeller):
         """
         c = self.context_of(self.cid_train[torch.randint(0, self.cid_train.shape[0], (n,), device=self.device)])
 
-        def per_draw_error(sampler):
-            x, z0 = sampler.sample(n, c, return_base=True)
-            z1, _ = sampler.to_base(x, c)
-            f = sampler.flow
-            return torch.where(f.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values
+        def per_draw_error(sampler, chunk: int = 512):
+            # in chunks of draws: the double copy's atom encoder over 4096 molecules at once peaks above 7 GB
+            f, out = sampler.flow, []
+            for s in range(0, n, chunk):
+                cs = None if c is None else c[s:s + chunk]
+                x, z0 = sampler.sample(min(chunk, n - s), cs, return_base=True)
+                z1, _ = sampler.to_base(x, cs)
+                out.append(torch.where(f.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values)
+            return torch.cat(out)
 
         exact = float(per_draw_error(copy.deepcopy(self.sampler).double()).max())
         working = per_draw_error(self.sampler)
@@ -2562,6 +2577,11 @@ def build_parser():
     p.add_argument('--atom_cutoff', type=float, default=10.0,
                    help='--atom_tokens: radius-graph cutoff within a molecule (angstrom)')
     p.add_argument('--atom_radial', type=int, default=32, help='--atom_tokens: radial basis functions per edge')
+    p.add_argument('--molecule_fraction', type=float, default=1.0,
+                   help='keep only the training molecules whose molecule_u (data_processing/molecule_subset.py: a '
+                        'fixed draw from the identifier) is below this, in --molecules_path and --prior_path alike, '
+                        'before the prior is scored; nested across fractions. The held-out conditions file is kept '
+                        'whole')
     p.add_argument('--rows_per_molecule', type=int, default=1,
                    help='draw each batch of stored rows as batch / k molecules with k rows each (molecules in '
                         'proportion to their rows, so each row is as likely as in a uniform draw), and in the energy '

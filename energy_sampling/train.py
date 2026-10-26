@@ -3848,7 +3848,7 @@ class Modeller:
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
-        prior = prior_data['equalized_prior']
+        prior = self.subset_training_molecules(prior_data['equalized_prior'], 'prior_path')
         prior['smiles'] = None
         # identifier is NOT wiped (unlike smiles) -- init_identifiers() needs it
         # to build the mol_id registry, and since backward training draws
@@ -4066,8 +4066,14 @@ class Modeller:
                     return value
         return data
 
+    def subset_training_molecules(self, batch, what):
+        """The rows of a training-molecule file (`what`: 'molecules_path' or 'prior_path') this run keeps: every row
+        here. inn_modeller.py's --molecule_fraction keeps a nested subset of the molecules, from both files alike."""
+        return batch
+
     def init_mol_dataset(self):
-        self.mol_dataset = CrystalBuffer(self._load_condition_file(self.args.molecules_path),
+        self.mol_dataset = CrystalBuffer(self.subset_training_molecules(self._load_condition_file(self.args.molecules_path),
+                                                                        'molecules_path'),
                                          device=self.buffer_device,
                                          **self._buffer_kwargs(),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
