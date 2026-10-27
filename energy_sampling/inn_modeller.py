@@ -47,6 +47,7 @@ import math
 import os
 import re
 import time
+import types
 from collections import defaultdict
 
 import numpy as np
@@ -68,6 +69,38 @@ from paths import artifact
 from train import (Modeller, adjust_fig_filesize, condition_tracker_figs, equipartition_bar, fig_guard,
                    flatten_wandb_params, loggable_array, quick_tb_stats)
 from utils import get_train_args, is_cuda_oom
+
+# --stored_source buffer (InnModeller.init_inn_buffers): training rows per anchor-seed chunk; children requested per
+# prior-buffer fill cycle; refill passes per churn (each asks every deficit once); requested children with no admission
+# before a condition leaves the quota; the gauss tile's calibration pilot (rows, at most this many rounds, relative
+# tolerance, relative miss that raises)
+ANCHOR_SEED_CHUNK = 131072
+PBUF_FILL_CYCLE = 20000
+PBUF_REFILL_ROUNDS = 4
+PBUF_STARVE_MISSES = 8
+GAUSS_PILOT_ROWS, GAUSS_PILOT_ROUNDS, GAUSS_TOL, GAUSS_FAIL = 2048, 6, 0.1, 0.5
+
+
+def calibrate_gauss_sigma(score, target, sigma0, rounds=GAUSS_PILOT_ROUNDS, tol=GAUSS_TOL, fail=GAUSS_FAIL):
+    """The gauss tile's scale: score(sigma) -> (m, se), the pilot's mean excess over the parent and its standard error.
+    Stops at the first sigma with |m - target| <= tol x target and se <= tol x target; otherwise moves sigma by
+    sqrt(target / m), clamped to [1/4, 4] (x 4 while m <= 0), since the excess is quadratic in sigma near a minimum.
+    At most `rounds` scores, which bounds the calibration. Returns (the sigma whose m came closest to the target, the
+    table of (sigma, m, se)); raises when that closest m misses the target by more than fail x target."""
+    sigma, table = float(sigma0), []
+    for _ in range(int(rounds)):
+        m, se = score(sigma)
+        if not (math.isfinite(m) and math.isfinite(se)):
+            raise RuntimeError(f"gauss tile: a non-finite pilot excess ({m}, se {se}) at sigma {sigma:.4g}")
+        table.append((sigma, float(m), float(se)))
+        if abs(m - target) <= tol * target and se <= tol * target:
+            break
+        sigma *= 4.0 if m <= 0 else min(4.0, max(0.25, math.sqrt(target / m)))
+    best = min(table, key=lambda r: abs(r[1] - target))
+    if abs(best[1] - target) > fail * target:
+        raise RuntimeError(f"gauss tile: no scale reached a mean excess of {target:g} kT within {fail:g} x it in "
+                           f"{len(table)} rounds; (sigma, mean excess kT, se): {table}")
+    return best[0], table
 
 
 @torch.no_grad()
@@ -845,10 +878,16 @@ class InnModeller(Modeller):
         x, lr, cid = torch.cat(xs), torch.cat(lrs), torch.cat(cids)
         lr_hot = torch.cat(lrs_hot) if self.t_conditional else lr
         ok = torch.isfinite(lr) & torch.isfinite(lr_hot) & torch.isfinite(x).all(-1)
+        kept = torch.nonzero(ok).flatten()   # prior_dataset row of each row kept
         if not bool(ok.all()):
             print(f"data rows: dropping {int((~ok).sum())} of {ok.numel()} rows with a non-finite latent or reward")
             x, lr, lr_hot, cid = x[ok], lr[ok], lr_hot[ok], cid[ok]
-        self.condition_log_z.update_best_energy(cid, -lr * T)
+        if self.inn.stored_source != 'buffer':
+            # held-out rows included. On the buffer route the anchor seed folds in the training rows alone
+            # (init_anchor_buffer_seed), and fold_condition_crystals leaves the floors alone too (a training
+            # molecule's carrier is a copy of one of its prior rows, which the split may hold out), so no
+            # held-out row sets the admission gate's Emin(c)
+            self.condition_log_z.update_best_energy(cid, -lr * T)
 
         # the held-out split's seed: --split_seed, else the run's seed + 1 (so a second training seed can keep the
         # start checkpoint's split)
@@ -882,6 +921,7 @@ class InnModeller(Modeller):
             va, tr = perm[:n_val], perm[n_val:]
         self.x_val, self.lr_val, self.cid_val = x[va], lr[va], cid[va]
         self.x_train, self.lr_train, self.cid_train = x[tr], lr[tr], cid[tr]
+        self.prior_row_train = kept[tr]   # x_train[j] is prior_dataset row prior_row_train[j] (the anchor seed reads it)
         if self.t_conditional:
             # a stored row's reward energy is a + b T, so two temperatures give both parts
             self.a_train = (lr_hot[tr] - lr[tr]) * T / (1.0 - 1.0 / self.inn.t_factor)
@@ -929,7 +969,8 @@ class InnModeller(Modeller):
                                torch.zeros(n_cond, dtype=torch.long, device=self.device))
         if self.mol_conditional:
             # the conditions files' own crystals: one reference structure per molecule, held-out included
-            self.fold_condition_crystals(self.mol_dataset, held_out=False)
+            self.fold_condition_crystals(self.mol_dataset, held_out=False,
+                                         fold_floor=not getattr(self, 'pbuf_on', False))
             if getattr(self, 'test_mol_dataset', None) is not None:
                 self.fold_condition_crystals(self.test_mol_dataset, held_out=True)
         if self.inn.atom_tokens:
@@ -1004,10 +1045,12 @@ class InnModeller(Modeller):
             self.cond_known[cid] = True
 
     @torch.no_grad()
-    def fold_condition_crystals(self, dataset, held_out: bool, chunk: int = 4096):
+    def fold_condition_crystals(self, dataset, held_out: bool, chunk: int = 4096, fold_floor: bool = True):
         """A conditions file's own crystals: their condition vectors into the table, and the
         reward energy of each, rebuilt from its latent, into its condition's floor (the
-        tracker's for training conditions, test_floor for held-out ones)."""
+        tracker's for training conditions, test_floor for held-out ones). fold_floor False (--stored_source
+        buffer) leaves the tracker's floors to the anchor seed: a training carrier is a copy of a prior row, and
+        the row split may hold that row out."""
         ef = self.energy_function
         T = float(self.args.energy_config.temperature)
         batch = dataset.batch
@@ -1026,7 +1069,7 @@ class InnModeller(Modeller):
             ok = torch.isfinite(log_r)
             if held_out:
                 self.test_floor.scatter_reduce_(0, cid[ok], -log_r[ok] * T, reduce='amin')
-            else:
+            elif fold_floor:
                 self.condition_log_z.update_best_energy(cid[ok], -log_r[ok] * T)
             xs.append(x.to(self.device)[ok])
             cids.append(cid[ok])
@@ -1273,6 +1316,393 @@ class InnModeller(Modeller):
             raise RuntimeError("the energy function returned the same log R at another temperature: "
                                "it is not scoring at the temperature it is handed")
 
+    # -- stored rows from train.py's anchor -> prior buffers (--stored_source buffer) --------
+
+    def check_buffer_options(self):
+        """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on."""
+        inn, args = self.inn, self.args
+        acfg = args.buffers.anchor_buffer
+        tile = getattr(acfg, 'tile', 'iso')
+        self.pbuf_on = inn.stored_source == 'buffer'
+        if tile not in ('iso', 'shaped', 'gauss'):
+            raise ValueError(f"buffers.anchor_buffer.tile must be iso, shaped or gauss on this route, got {tile!r}")
+        if tile != 'iso' and not self.pbuf_on:
+            raise ValueError(f"buffers.anchor_buffer.tile {tile!r} is read only by --stored_source buffer")
+        if (tile == 'gauss') != (inn.gauss_excess_kT is not None):
+            raise ValueError("--gauss_excess_kT goes with buffers.anchor_buffer.tile gauss, and only with it")
+        if not self.pbuf_on:
+            return
+        T = float(args.energy_config.temperature)
+        ramp_floor = float(args.buffers.prior_buffer.ramp_floor)
+        if tile == 'gauss' and not 0.0 < inn.gauss_excess_kT < ramp_floor / T:
+            raise ValueError(f"--gauss_excess_kT must lie in (0, ramp_floor / T = {ramp_floor / T:.3g}) kT, "
+                             f"got {inn.gauss_excess_kT}")
+        refusals = [
+            (not self.mol_conditional, "a run without molecule conditions (one condition: a two-row stored pool)"),
+            (self.t_conditional, "temperature conditioning (children are drawn and gated at the run's one T)"),
+            (inn.data_noise_log_range is not None, "--data_noise_log_range (the per-batch re-score it replaces)"),
+            (inn.grow_stored, "--grow_stored"),
+            (inn.rows_per_molecule > 1, "--rows_per_molecule > 1"),
+            (inn.w_mle > 0, "--w_mle (its term reads the rows as stored)"),
+            (inn.pbuf_rows_per_condition < 1, "--pbuf_rows_per_condition below 1"),
+            (inn.energy_steps <= 0 and inn.budget_minutes is None, "no energy stage (--energy_steps 0)"),
+            (str(args.molecules_path) == str(args.prior_path),
+             "molecules_path == prior_path (the conditions would be the prior's rows, held-out ones included)"),
+            (getattr(acfg, 'seed_source', None) != 'prior_dataset', "buffers.anchor_buffer.seed_source other than "
+                                                                     "'prior_dataset'"),
+            (not bool(getattr(acfg, 'frozen', False)), "buffers.anchor_buffer.frozen false (the anchor index cache "
+                                                       "assumes fixed membership)"),
+        ]
+        for bad, why in refusals:
+            if bad:
+                raise NotImplementedError(f"--stored_source buffer with {why}")
+
+    @torch.no_grad()
+    def init_inn_buffers(self):
+        """The stored-row buffers. Anchors: train.py's init_anchor_buffer_seed over the TRAINING prior rows only
+        (prior_row_train; held-out rows never enter), checked row by row against x_train / lr_train / cid_train.
+        Children: per-condition quotas through top_up_prior_from_anchors (noise once by the tile, score once, admit
+        below Emin(c) + ramp_floor), up to --pbuf_rows_per_condition per training condition. The fill, the gauss
+        pilot and a currency check go to energy/startup_calls."""
+        ef, inn = self.energy_function, self.inn
+        T = float(self.args.energy_config.temperature)
+        n_cond = int(ef.condition_library_size)
+        self.energy_startup_calls = getattr(self, 'energy_startup_calls', 0)
+        self.pbuf_scored, self.pbuf_updates, self.pbuf_updates_churned = 0, 0, 0
+        self.pbuf_window = dict(drawn=0, retired=0, churn_scored=0)
+        self._pbuf_miss = torch.zeros(n_cond, dtype=torch.long)
+        self._pbuf_off = torch.zeros(n_cond, dtype=torch.bool)
+        self.pbuf_train_conds = torch.unique(self.cid_train).long().cpu()
+        if getattr(self, 'anchor_buffer', None) is not None or getattr(self, 'prior_buffer', None) is not None:
+            raise RuntimeError("init_inn_buffers: a buffer already exists")
+
+        # anchors: the training rows, in prior_dataset order, through train.py's own seed (energy-call free)
+        rows = torch.sort(self.prior_row_train.cpu()).values
+        full = self.prior_dataset
+        dev = full.batch.ptr.device if hasattr(full.batch, 'ptr') else self.device
+        self.prior_dataset = types.SimpleNamespace(row_batches=lambda limit=None: (
+            full.batch.subsample_new_batch(rows[i:i + ANCHOR_SEED_CHUNK].to(dev))
+            for i in range(0, rows.numel(), ANCHOR_SEED_CHUNK)))
+        try:
+            Modeller.init_anchor_buffer_seed(self)
+        finally:
+            self.prior_dataset = full
+        ab = self.anchor_buffer
+        perm = torch.argsort(self.prior_row_train.cpu())   # x_train[perm] is in anchor (sorted prior-row) order
+        dx = float((ab.x.detach().float().cpu() - self.x_train[perm.to(self.device)].float().cpu()).abs().max())
+        dr = float((ab.reward.detach().float().cpu().flatten() - self.lr_train.cpu()[perm]).abs().max())
+        same_cid = torch.equal(ab.condition_id.detach().long().cpu().flatten(), self.cid_train.cpu()[perm].long())
+        print(f"anchor buffer: {len(ab)} anchors from the {self.n_prior_rows} training rows (no held-out row); against "
+              f"x_train max |dx| {dx:.2e}, against lr_train max |d log R| {dr:.2e} nats, condition ids "
+              f"{'equal' if same_cid else 'DIFFER'}; frozen {ab.frozen}", flush=True)
+        if len(ab) != self.n_prior_rows or dx > 1e-3 or dr > 1e-2 or not same_cid or not ab.frozen:
+            raise RuntimeError("the anchor buffer is not the training rows: see the line above")
+
+        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'gauss':
+            self.gauss_sigma = self.calibrate_gauss()
+
+        self.pbuf_refresh_pool()
+        k = int(inn.pbuf_rows_per_condition)
+        self.pbuf_target = k * int(self.pbuf_train_conds.numel())
+        n0 = self.pbuf_scored
+        t = time.perf_counter()
+        for _ in range(4 * math.ceil(self.pbuf_target / PBUF_FILL_CYCLE) + 4):   # bounded; also stops on no admission
+            if self.pbuf_top_up(PBUF_FILL_CYCLE) == 0:
+                break
+        fill_calls = self.pbuf_scored - n0
+        self.energy_startup_calls += fill_calls
+        if self._prior_buffer_len() == 0:
+            raise RuntimeError("the prior buffer admitted no child: every child failed Emin(c) + ramp_floor")
+        pb = self.prior_buffer
+        counts = torch.as_tensor(pb.condition_row_counts(n_cond)).long()[self.pbuf_train_conds]
+        cid_pb = pb.batch.condition_id.detach().cpu().long()
+        u = (self._prior_row_energy() - self._condition_energy_floor(cid_pb).cpu().flatten()) / T
+        q = quantiles(u[torch.isfinite(u)], (0.1, 0.5, 0.9))
+        print(f"prior buffer: {len(pb)} rows of target {self.pbuf_target} ({k} per training condition) from "
+              f"{fill_calls} scored children (yield {len(pb) / max(fill_calls, 1):.3f}) in "
+              f"{time.perf_counter() - t:.0f} s; rows per training condition min {int(counts.min())} median "
+              f"{float(counts.float().median()):.0f}, none {float((counts == 0).float().mean()):.4f}; conditions "
+              f"with no anchor under the gate {int(self.pbuf_train_conds.numel() - self.pbuf_conds.numel())}, "
+              f"excluded {int(self._pbuf_off.sum())}; excess over Emin(c) P10 {q[0]:.2f} P50 {q[1]:.2f} P90 "
+              f"{q[2]:.2f} kT (tile {self.args.buffers.anchor_buffer.tile})", flush=True)
+        self.check_buffer_reward_currency()
+        ef.drain_energy_timing()   # the fill is start-up, not the first window's energy/*
+        for key in self.prior_churn:   # nor the first window's churn
+            self.prior_churn[key] = 0
+        for key in self.pbuf_window:
+            self.pbuf_window[key] = 0
+        self._pbuf_mark = self.pbuf_scored
+
+    @torch.no_grad()
+    def check_buffer_reward_currency(self, n: int = 512, bar: float = 0.05):
+        """A drawn buffer row's log R from its stored legs (prebuilt_sample_to_reward, what a stored-row update reads)
+        against its latent rebuilt on its condition's mol_dataset molecule (what a fresh draw at that latent would
+        score): one chart and one currency."""
+        ef, pb = self.energy_function, self.prior_buffer
+        graphs, inds, _ = pb.sample_graphs(n, replace=True)
+        t = torch.as_tensor(inds, device=pb.x.device, dtype=torch.long)
+        x = pb.x[t].to(self.device, torch.float32)
+        graphs = graphs.to(self.device)
+        graphs, log_T, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
+        stored = ef.prebuilt_sample_to_reward(graphs, 10 ** log_T).flatten().float().to(self.device)
+        mol_batch, log_T_r, _, _ = self.mol_batch_for(cid.long().to(self.device))
+        fresh = ef.log_reward(x, mol_batch, log_T_r, False, internal_oom_recovery=True).flatten().to(self.device)
+        self.energy_startup_calls += int(x.shape[0])
+        d = (fresh - stored).abs()
+        d = d[torch.isfinite(d)]
+        med, p99 = quantiles(d, (0.5, 0.99))
+        print(f"buffer reward currency: |log R rebuilt from the latent - stored legs| median {med:.2e}, P99 "
+              f"{p99:.2e} nats over {d.numel()} buffer rows (bar on the median {bar})", flush=True)
+        if not med < bar:
+            raise RuntimeError(f"a buffer row and the crystal rebuilt from its latent score differently (median "
+                               f"{med:.3g} nats): the stored rows and the draws are not in one currency")
+
+    @torch.no_grad()
+    def pbuf_refresh_pool(self):
+        """The anchors a child may be drawn from, by condition: those whose own energy is under Emin(c) + ramp_floor
+        (a child of an anchor already above the gate almost never clears it). Recomputed as Emin(c) moves."""
+        ab = self.anchor_buffer
+        n_cond = int(self.energy_function.condition_library_size)
+        cid = ab.condition_id.detach().long().cpu().flatten()
+        floor = self._condition_energy_floor(cid)
+        elig = (torch.ones_like(cid, dtype=torch.bool) if floor is None else
+                ab.energy.detach().cpu().flatten() < floor.cpu().flatten() + self._ramp_params()[0])
+        order = torch.argsort(cid, stable=True)
+        self._anc_order = order[elig[order]]
+        self._anc_count = torch.bincount(cid[self._anc_order], minlength=n_cond)
+        self._anc_start = torch.cumsum(self._anc_count, 0) - self._anc_count
+        self.pbuf_conds = self.pbuf_train_conds[self._anc_count[self.pbuf_train_conds] > 0]
+
+    @torch.no_grad()
+    def pbuf_top_up(self, budget):
+        """At most `budget` children, as per-condition quotas over the eligible training conditions' deficits below
+        --pbuf_rows_per_condition (a uniform pick over the missing slots), through top_up_prior_from_anchors. A
+        condition asked PBUF_STARVE_MISSES children with none admitted leaves the quota (printed) until pbuf_churn
+        clears the exclusion before its next refill. Returns the rows admitted."""
+        n_cond = int(self.energy_function.condition_library_size)
+        k = int(self.inn.pbuf_rows_per_condition)
+        conds = self.pbuf_conds[~self._pbuf_off[self.pbuf_conds]]
+        counts = (torch.as_tensor(self.prior_buffer.condition_row_counts(n_cond)).long()[:n_cond]
+                  if self._prior_buffer_len() else torch.zeros(n_cond, dtype=torch.long))
+        deficit = (k - counts[conds]).clamp(min=0)
+        want = min(int(budget), int(deficit.sum()))
+        if want <= 0 or conds.numel() == 0:
+            return 0
+        slots = conds.repeat_interleave(deficit)
+        q = torch.bincount(slots[torch.randperm(slots.numel())[:want]], minlength=n_cond)
+        a0 = self.prior_churn['from_anchors']
+        self.top_up_prior_from_anchors(int(q.sum()), per_condition=q)
+        after = (torch.as_tensor(self.prior_buffer.condition_row_counts(n_cond)).long()[:n_cond]
+                 if self._prior_buffer_len() else counts)
+        got = (after - counts).clamp(min=0)
+        asked = q > 0
+        self._pbuf_miss[asked & (got > 0)] = 0
+        miss = asked & (got == 0)
+        self._pbuf_miss[miss] += q[miss]
+        newly = (self._pbuf_miss >= PBUF_STARVE_MISSES) & ~self._pbuf_off
+        if bool(newly.any()):
+            self._pbuf_off |= newly
+            print(f"prior buffer: {int(newly.sum())} condition(s) left the quota after {PBUF_STARVE_MISSES} requested "
+                  f"children with none under the gate (e.g. {torch.nonzero(newly).flatten()[:5].tolist()}); "
+                  f"{int(self._pbuf_off.sum())} excluded in all", flush=True)
+        return self.prior_churn['from_anchors'] - a0
+
+    @torch.no_grad()
+    def pbuf_churn(self):
+        """At an eval: gate-staleness expiry (train.py's _expire_stale_prior_rows), then a uniform retirement of
+        churn_batch_ref / mean_lifetime rows per energy-stage update that stepped since the last churn, then a
+        per-condition refill of at most PBUF_REFILL_ROUNDS passes, stopping at a pass that admits nothing; the
+        starvation exclusion is cleared before each refill, so it binds within one refill and a condition is asked
+        again at the next. Safe to retry (yielding): the retirement runs once per window, the refill on every call,
+        and the children scored count once in energy/samples_total, a retried call's included."""
+        cfg = self.args.buffers.prior_buffer
+        n_upd = self.pbuf_updates - self.pbuf_updates_churned
+        if n_upd > 0 and self._prior_buffer_len() > 0:
+            self.pbuf_updates_churned = self.pbuf_updates
+            self._expire_stale_prior_rows()
+            self.pbuf_refresh_pool()
+            n_ret = min(self._prior_buffer_len(),
+                        max(1, int(round(n_upd * float(cfg.churn_batch_ref) / float(cfg.mean_lifetime)))))
+            drop = np.random.choice(self._prior_buffer_len(), n_ret, replace=False)
+            self.prior_buffer.purge_by_index(drop)
+            self.prior_churn['evicted'] += int(n_ret)
+            self.pbuf_window['retired'] += int(n_ret)
+        else:
+            self.pbuf_refresh_pool()   # Emin(c) moves with the draws
+        self._pbuf_off.zero_()
+        self._pbuf_miss.zero_()
+        for _ in range(PBUF_REFILL_ROUNDS):   # the deficits: the retired, the expired, any left by an earlier refill
+            if self.pbuf_top_up(10 ** 9) == 0:
+                break
+        d = self.pbuf_scored - self._pbuf_mark
+        self._pbuf_mark = self.pbuf_scored
+        self.energy_samples_scored += d
+        self.pbuf_window['churn_scored'] += d
+
+    def commit_pbuf_step(self):
+        """After an energy-stage update that stepped: its buffer rows' ema_loss (CrystalBuffer.update_losses) and the
+        update count the churn rate reads. A draw whose update did not step leaves neither."""
+        pend = getattr(self, '_pbuf_pending', None)
+        if pend is None:
+            return
+        self._pbuf_pending = None
+        self.prior_buffer.update_losses(*pend)
+        self.pbuf_updates += 1
+
+    @torch.no_grad()
+    def pbuf_draw(self, n):
+        """n stored rows for an energy-stage update, uniform over the prior buffer's training rows: latents from the
+        buffer's x (gauge-fixed latent_params, this trainer's chart), log R recomposed from the stored legs at each
+        row's training temperature, condition ids from the row's own space group. No energy call."""
+        ef, pb = self.energy_function, self.prior_buffer
+        graphs, inds, _ = pb.sample_graphs(n, replace=True)
+        self.pbuf_inds = np.asarray(inds, dtype=np.int64)
+        t = torch.as_tensor(self.pbuf_inds, device=pb.x.device, dtype=torch.long)
+        x = pb.x[t].to(self.device, torch.float32)
+        graphs = graphs.to(self.device)
+        graphs, _, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
+        cid = cid.long().to(self.device)
+        log_T = self.training_log_T(cid.numel())
+        lr = ef.prebuilt_sample_to_reward(graphs, 10 ** log_T.to(graphs.device)).flatten().float().to(self.device)
+        self._pbuf_pending = None   # set by step_loss, committed by commit_pbuf_step once the update steps
+        return x, cid, log_T, lr
+
+    def _stratified_anchor_draw(self, per_condition):
+        """train.py's per-condition quota (exact counts; a condition with no eligible anchor is printed and its quota
+        dropped, never reassigned), drawn uniformly WITH replacement over the cached pool of anchors under the gate
+        (pbuf_refresh_pool). train.py's own draw takes all of a condition's anchors, without replacement while the
+        pool allows, and weights by ema_loss when replay_beta < 1. Returns (graphs, inds) or (None, None)."""
+        if not getattr(self, 'pbuf_on', False):
+            return super()._stratified_anchor_draw(per_condition)
+        q = torch.as_tensor(per_condition).long().cpu().flatten()
+        c = torch.nonzero(q > 0).flatten()
+        empty = self._anc_count[c] == 0
+        if bool(empty.any()):
+            print(f"anchor draw: {int(empty.sum())} condition(s) with no anchor under the gate "
+                  f"(e.g. {c[empty][:5].tolist()}) -- quota dropped, never reassigned", flush=True)
+            c = c[~empty]
+        if c.numel() == 0:
+            return None, None
+        kc = q[c]
+        start = self._anc_start[c].repeat_interleave(kc)
+        count = self._anc_count[c].repeat_interleave(kc)
+        pick = torch.minimum((torch.rand(start.numel()) * count).long(), count - 1)
+        inds = self._anc_order[start + pick].numpy()
+        self.anchor_buffer._bump_counts(inds)
+        graphs = self.anchor_buffer.batch.subsample_new_batch(inds)
+        graphs = self.anchor_buffer._drop_keys(graphs, ("symmetry_operators", "smiles", "identifier"))
+        return graphs, inds
+
+    def _noise_and_condition(self, batch, noise_log_range, anchor_inds=None):
+        """train.py's anchor-noise seam, with the buffer's tally of scored children and the 'gauss' tile: an isotropic
+        Gaussian kick at the calibrated scale (_gauss_kick), read, clipped and decoded as the iso tile's primitive
+        is. 'iso' and 'shaped' are train.py's own."""
+        if getattr(self, 'pbuf_on', False):
+            self.pbuf_scored += int(batch.num_graphs)
+            self.pbuf_window['drawn'] += int(batch.num_graphs)
+        tile = getattr(self.args.buffers.anchor_buffer, 'tile', 'iso')
+        if tile in ('iso', 'shaped'):
+            return super()._noise_and_condition(batch, noise_log_range, anchor_inds=anchor_inds)
+        if tile != 'gauss':
+            raise ValueError(f"buffers.anchor_buffer.tile {tile!r}: iso, shaped or gauss")
+        self._gauss_kick(batch, self.gauss_sigma)
+        batch, log_T, condition, condition_id = self.energy_function.condition_samples(
+            batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)
+        batch.orient_molecule(mode='std')
+        return batch, log_T, condition, condition_id
+
+    @staticmethod
+    @torch.no_grad()
+    def _gauss_kick(batch, sigma, eps=None):
+        """In place: gauge-free latents + sigma x N(0, I), clipped to the open box, decoded and hard-cleaned -- the
+        iso primitive's sequence (MXtalTools log_noise_latent_parameters) with a Gaussian step in place of a unit
+        direction times 10^U."""
+        lat = batch.latent_params(gauge_fix_free_axes=False)
+        eps = torch.randn_like(lat) if eps is None else eps.to(lat)
+        batch.latent_to_cell_params((lat + float(sigma) * eps).clip(min=-1 + 1e-6, max=1 - 1e-6))
+        batch.clean_cell_parameters(mode='hard')
+
+    @torch.no_grad()
+    def calibrate_gauss(self):
+        """The gauss tile's sigma: a pilot of GAUSS_PILOT_ROWS anchors (one per uniformly drawn training condition,
+        through the churn's own draw), kicked with fixed noise (common random numbers), scored, and the mean excess
+        over the parent (E_child - E_anchor) / T, winsorised at the gate ramp_floor / T (a child with no finite
+        energy counts at the gate), brought to
+        --gauss_excess_kT (calibrate_gauss_sigma). At most GAUSS_PILOT_ROWS x GAUSS_PILOT_ROUNDS energy calls."""
+        ef, inn = self.energy_function, self.inn
+        T = float(self.args.energy_config.temperature)
+        u_gate = float(self._ramp_params()[0]) / T
+        self.pbuf_refresh_pool()
+        n_cond = int(ef.condition_library_size)
+        pick = self.pbuf_conds[torch.randint(0, self.pbuf_conds.numel(), (GAUSS_PILOT_ROWS,))]
+        graphs, inds = self._stratified_anchor_draw(torch.bincount(pick, minlength=n_cond))
+        e_anchor = self.anchor_buffer.energy.detach().cpu().flatten()[torch.as_tensor(inds)]
+        lat = graphs.latent_params(gauge_fix_free_axes=False)
+        eps = torch.randn(lat.shape, generator=torch.Generator().manual_seed(int(self.args.seed) + 11))
+
+        def score(sigma):
+            b = graphs.clone().to(self.device)
+            self._gauss_kick(b, sigma, eps=eps)
+            b, log_T, _, _ = ef.condition_samples(b, sg_inds=b.sg_ind, z_primes=b.z_prime)
+            b.orient_molecule(mode='std')
+            lr = ef.log_reward(self._batch_latents(b), b, log_T, False, internal_oom_recovery=True).flatten()
+            self.energy_startup_calls += int(lr.numel())
+            du = (-lr.detach().float().cpu() * T - e_anchor) / T
+            du = torch.where(torch.isfinite(du), du, torch.full_like(du, u_gate)).clamp(max=u_gate)   # unscorable = gate
+            return float(du.mean()), float(du.std() / max(du.numel(), 1) ** 0.5)
+
+        lo, hi = self.args.buffers.anchor_buffer.noise_log_range
+        sigma0 = 10 ** (0.5 * (float(lo) + float(hi))) / lat.shape[1] ** 0.5
+        sigma, table = calibrate_gauss_sigma(score, float(inn.gauss_excess_kT), sigma0)
+        print("gauss tile: (sigma, mean excess over the parent kT, se) per round "
+              + ', '.join(f"({s:.4g}, {m:.3g}, {e:.2g})" for s, m, e in table)
+              + f"; sigma {sigma:.4g} for a target of {inn.gauss_excess_kT:g} kT", flush=True)
+        inn.gauss_sigma = sigma
+        wandb.config.update({'inn/gauss_sigma': sigma}, allow_val_change=True)
+        return sigma
+
+    def _reward_ramp_kwargs(self, condition_id=None):
+        """The eval's under_coverage weighting stays the uniform form this trainer has always reported: train.py's
+        anchor-relative ramp switches on at the mere presence of an anchor buffer, which --stored_source buffer
+        builds."""
+        return dict(reward_floor=None, ramp_width=None)
+
+    def pbuf_stats(self):
+        """train.py's prior_buffer_* keys for the stored-row buffer, the churn of the window (drained here), and the
+        per-condition coverage (pbuf/*)."""
+        pb, ch, w = self.prior_buffer, self.prior_churn, self.pbuf_window
+        T = float(self.args.energy_config.temperature)
+        n_cond = int(self.energy_function.condition_library_size)
+        out = {'prior_buffer_length': len(pb), 'anchor_buffer_length': len(self.anchor_buffer),
+               'prior_buffer_added': ch['from_anchors'], 'prior_buffer_evicted': ch['evicted'],
+               'prior_buffer_expired': ch['expired'], 'prior_buffer_retired': w['retired'],
+               'prior_buffer_drawn': w['drawn'], 'energy/buffer_churn_calls': w['churn_scored'],
+               'prior_buffer_admit_yield': ch['from_anchors'] / w['drawn'] if w['drawn'] else float('nan')}
+        sc = pb.select_counts.float()
+        out['prior_buffer_mean_steps'], out['prior_buffer_median_steps'] = float(sc.mean()), float(sc.median())
+        ema = pb.ema_loss[torch.isfinite(pb.ema_loss)]
+        if ema.numel():
+            out['prior_buffer_mean_loss'], out['prior_buffer_median_loss'] = float(ema.mean()), float(ema.median())
+        e = self._prior_row_energy()
+        out.update(self.energy_stats('prior_buffer', energy=e))
+        u = (e - self._condition_energy_floor(pb.batch.condition_id.detach().cpu()).cpu().flatten()) / T
+        u = u[torch.isfinite(u)]
+        if u.numel():
+            for qq, v in zip((10, 50, 90), quantiles(u, (0.1, 0.5, 0.9))):
+                out[f'prior_buffer_excess_kT_p{qq}'] = v
+        counts = torch.as_tensor(pb.condition_row_counts(n_cond)).long()[self.pbuf_train_conds]
+        out.update({'pbuf/cond_rows_min': int(counts.min()), 'pbuf/cond_rows_median': float(counts.float().median()),
+                    'pbuf/cond_zero_frac': float((counts == 0).float().mean()),
+                    'pbuf/eligible_conditions': int(self.pbuf_conds.numel()),
+                    'pbuf/excluded_conditions': int(self._pbuf_off.sum())})
+        if getattr(self, 'gauss_sigma', None) is not None:
+            out['pbuf/gauss_sigma'] = float(self.gauss_sigma)
+        for key in ch:
+            ch[key] = 0
+        for key in w:
+            w[key] = 0
+        return out
+
     # -- the loop ---------------------------------------------------------------
 
     def train(self):
@@ -1282,6 +1712,7 @@ class InnModeller(Modeller):
             wandb.config.update({f'inn/{k}': v for k, v in vars(inn).items()})
             self.init_energy_function()
             self.init_gfn()
+            self.check_buffer_options()   # after init_gfn, which sets mol_conditional / t_conditional
             self.init_mol_dataset()
             with self.energy_function.allow_unreferenced():
                 self.init_prior_dataset()
@@ -1348,6 +1779,10 @@ class InnModeller(Modeller):
             torch.manual_seed(int(self.args.seed) + 7919)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(self.args.seed) + 7919)
+            if self.pbuf_on:
+                self.init_inn_buffers()   # after the reseed: its draws follow the run's seed
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
             # with a budget the energy stage ends on the clock (energy_fraction), not on a step count
             total = inn.mle_steps + (10 ** 9 if inn.budget_minutes is not None else inn.energy_steps)
             opt = sched = None
@@ -1391,6 +1826,8 @@ class InnModeller(Modeller):
                     self.save('mle_exit.pt', step, log_z)
                 if step % inn.eval_every == 0 or step == inn.mle_steps or done:
                     self.save('latest.pt', step, log_z)
+                    if self.pbuf_on:   # before the eval reads the buffer, as train.py churns before its stats
+                        self.yielding(self.pbuf_churn, f'prior buffer churn at step {step}')
                     figs = inn.figs_every > 0 and (n_evals % inn.figs_every == 0 or done)
                     n_evals += 1
                     m = self.yielding(lambda: self.evaluate(figs), f'eval at step {step}')
@@ -1457,6 +1894,8 @@ class InnModeller(Modeller):
                         opt.zero_grad(set_to_none=True)
                         return stats, False, level
                     opt.step()
+                    if stage == 'energy' and self.pbuf_on:
+                        self.commit_pbuf_step()
                     return stats, True, level
 
                 stats, stepped, log_z = self.yielding(update, f'step {step}')
@@ -1691,6 +2130,9 @@ class InnModeller(Modeller):
         added / evicted / expired are 0). replay_buffer_* and replay/*: the tail bank, the reused draws (stage 2 with
         --bank_frac); per-eval-window counts are drained here, as train.py drains its churn."""
         out = {}
+        if getattr(self, 'pbuf_on', False) and self._prior_buffer_len():
+            out.update(self.pbuf_stats())
+            return out
         n = int(self.n_prior_rows)
         T0 = 10 ** self.log_T0
         if not hasattr(self, '_stored_energy'):
@@ -1916,14 +2358,20 @@ class InnModeller(Modeller):
     def step_loss(self, stage, log_z):
         inn = self.inn
         stats = {}
-        if inn.rows_per_molecule > 1:
-            idx = self.molecule_grouped_rows(self.batch_now[stage], inn.rows_per_molecule)
+        buf = stage == 'energy' and getattr(self, 'pbuf_on', False)
+        if buf:   # --stored_source buffer: the prior buffer's rows and their stored log R, no energy call
+            idx = None
+            x_d, cid_d, log_T_d, lr_buf = self.pbuf_draw(self.batch_now['energy'])
+            src_all = torch.zeros_like(cid_d)
         else:
-            idx = torch.randint(0, self.x_train.shape[0],
-                                (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
-                                device=self.device)
-        x_d, cid_d, src_all = self.x_train[idx], self.cid_train[idx], self.src_train[idx]
-        log_T_d = self.training_log_T(idx.numel())
+            if inn.rows_per_molecule > 1:
+                idx = self.molecule_grouped_rows(self.batch_now[stage], inn.rows_per_molecule)
+            else:
+                idx = torch.randint(0, self.x_train.shape[0],
+                                    (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
+                                    device=self.device)
+            x_d, cid_d, src_all = self.x_train[idx], self.cid_train[idx], self.src_train[idx]
+            log_T_d = self.training_log_T(idx.numel())
         c_d = self.context_of(cid_d, log_T_d)
         if stage == 'mle':
             if inn.mle_noise_log_range is not None:
@@ -1962,7 +2410,7 @@ class InnModeller(Modeller):
             x_d, cid_d, log_T_d, c_d, lr_d = (self.scored_d[k] for k in ('x', 'cid', 'log_T', 'c', 'log_r'))
             log_q_d = self.sampler.log_prob(x_d, c_d)
         else:
-            lr_d, log_q_d = self.stored_log_r(idx, log_T_d), log_q_stored
+            lr_d, log_q_d = (lr_buf if buf else self.stored_log_r(idx, log_T_d)), log_q_stored
         ok_d = torch.isfinite(lr_d) & torch.isfinite(log_q_d.detach())
         stats['bwd/nonfinite_frac'] = 1.0 - float(ok_d.float().mean())
 
@@ -2047,14 +2495,17 @@ class InnModeller(Modeller):
         # the stored rows' residual: the head's offset plus the shared level, or (ema) the per-row level alone
         resid_d = (log_q_d - lr_d + (level_now if inn.level_mode == 'ema' else h_d_fixed + level_now))[ok_d]
         data = tb_loss(resid_d, inn.beta_data).mean()
-        with torch.no_grad():  # train.py's per-row select_counts and ema_loss (beta 0.9) for the stored rows
-            rows_d = idx[ok_d]
-            prior_d = rows_d < self.n_prior_rows
-            if bool(prior_d.any()):
-                r_i, a_i = rows_d[prior_d], resid_d.detach().abs()[prior_d].float()
-                self.stored_counts.index_add_(0, r_i, torch.ones_like(r_i))
-                old = self.stored_ema[r_i]
-                self.stored_ema[r_i] = torch.where(torch.isnan(old), a_i, 0.9 * old + 0.1 * a_i)
+        if buf:   # the buffer's own per-row ema_loss, written once the update steps (the draw bumped select_counts)
+            self._pbuf_pending = (resid_d.detach().abs().float().cpu(), self.pbuf_inds[ok_d.cpu().numpy()])
+        else:
+            with torch.no_grad():  # train.py's per-row select_counts and ema_loss (beta 0.9) for the stored rows
+                rows_d = idx[ok_d]
+                prior_d = rows_d < self.n_prior_rows
+                if bool(prior_d.any()):
+                    r_i, a_i = rows_d[prior_d], resid_d.detach().abs()[prior_d].float()
+                    self.stored_counts.index_add_(0, r_i, torch.ones_like(r_i))
+                    old = self.stored_ema[r_i]
+                    self.stored_ema[r_i] = torch.where(torch.isnan(old), a_i, 0.9 * old + 0.1 * a_i)
         data_stored = data  # bwd/tb reports the stored rows alone, as runs without the bank did
         if inn.bank_frac > 0:
             # the tail bank: first-use draws whose residual against their own batch's root is large are kept and
@@ -2759,6 +3210,21 @@ def build_parser():
                         "min_visits, set with --set)")
     p.add_argument('--level_mix', type=float, default=0.5,
                    help="--level_mode ema --level_source pooled: the forward level's share of the per-condition level")
+    p.add_argument('--stored_source', choices=['prior', 'buffer'], default='prior',
+                   help="energy stage: where the stored rows come from. 'prior' = the prior's training rows (as stored, "
+                        "or with --data_noise_log_range displaced and scored again each scored batch); 'buffer' = "
+                        "train.py's anchor -> prior buffers (InnModeller.init_inn_buffers): anchors seeded from the "
+                        "training rows only, each child noised once by buffers.anchor_buffer.tile (iso | shaped | "
+                        "gauss), scored once and admitted below Emin(c) + buffers.prior_buffer.ramp_floor, "
+                        "--pbuf_rows_per_condition children per training condition, refreshed at every eval by "
+                        "gate-staleness expiry plus a uniform retirement of churn_batch_ref / mean_lifetime rows per "
+                        "update, each refilled by condition. No energy call when a stored row is drawn")
+    p.add_argument('--pbuf_rows_per_condition', type=int, default=2,
+                   help='--stored_source buffer: prior-buffer rows kept per training condition')
+    p.add_argument('--gauss_excess_kT', type=float, default=None,
+                   help="buffers.anchor_buffer.tile gauss: the mean excess over the parent anchor, in kT, the "
+                        "isotropic Gaussian kick is calibrated to at start-up (calibrate_gauss_sigma, winsorised at "
+                        "the admission gate)")
     # the replay bank: first-use draws with a large residual, reused as stored-like rows
     p.add_argument('--bank_frac', type=float, default=None,
                    help='energy stage: weight of the replay bank (its own mean); 0 = off; unset = 0.1 on unconditional '
