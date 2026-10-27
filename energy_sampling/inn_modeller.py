@@ -1703,40 +1703,41 @@ class InnModeller(Modeller):
         builds."""
         return dict(reward_floor=None, ramp_width=None)
 
+    @property
+    def bwd_sampling_mode(self):
+        """What the stored rows are drawn from, as train.py names it (there it is the stage protocol's): 'prior' on
+        --stored_source buffer, else 'dataset' (the prior's stored training rows). Read by Modeller.log_buffer_stats."""
+        return 'prior' if getattr(self, 'pbuf_on', False) else 'dataset'
+
     def pbuf_stats(self):
-        """train.py's prior_buffer_* keys for the stored-row buffer, the churn of the window (drained here), and the
-        per-condition coverage (pbuf/*)."""
+        """train.py's own buffer readout (Modeller.log_buffer_stats, read as the crystal trainer reads it while its
+        backward branch draws from the prior buffer): prior_buffer_* core stats, step and loss histograms, the
+        window's churn by source (drained there), anchor_buffer_* and the anchors' energy above their condition's
+        minimum. Then this route's own extras: rows retired by the churn, children scored, admission yield, the rows'
+        excess over Emin(c) in kT, and the per-condition coverage (pbuf/*); the window counts are drained here."""
         pb, ch, w = self.prior_buffer, self.prior_churn, self.pbuf_window
         T = float(self.args.energy_config.temperature)
         n_cond = int(self.energy_function.condition_library_size)
-        out = {'prior_buffer_length': len(pb), 'anchor_buffer_length': len(self.anchor_buffer),
-               'prior_buffer_added': ch['from_anchors'], 'prior_buffer_evicted': ch['evicted'],
-               'prior_buffer_expired': ch['expired'], 'prior_buffer_retired': w['retired'],
-               'prior_buffer_drawn': w['drawn'], 'energy/buffer_churn_calls': w['churn_scored'],
-               'prior_buffer_admit_yield': ch['from_anchors'] / w['drawn'] if w['drawn'] else float('nan')}
-        sc = pb.select_counts.float()
-        out['prior_buffer_mean_steps'], out['prior_buffer_median_steps'] = float(sc.mean()), float(sc.median())
-        ema = pb.ema_loss[torch.isfinite(pb.ema_loss)]
-        if ema.numel():
-            out['prior_buffer_mean_loss'], out['prior_buffer_median_loss'] = float(ema.mean()), float(ema.median())
+        extra = {'prior_buffer_retired': w['retired'], 'prior_buffer_drawn': w['drawn'],
+                 'energy/buffer_churn_calls': w['churn_scored'],
+                 'prior_buffer_admit_yield': ch['from_anchors'] / w['drawn'] if w['drawn'] else float('nan')}
         e = self._prior_row_energy()
-        out.update(self.energy_stats('prior_buffer', energy=e))
         u = (e - self._condition_energy_floor(pb.batch.condition_id.detach().cpu()).cpu().flatten()) / T
         u = u[torch.isfinite(u)]
         if u.numel():
             for qq, v in zip((10, 50, 90), quantiles(u, (0.1, 0.5, 0.9))):
-                out[f'prior_buffer_excess_kT_p{qq}'] = v
+                extra[f'prior_buffer_excess_kT_p{qq}'] = v
         counts = torch.as_tensor(pb.condition_row_counts(n_cond)).long()[self.pbuf_train_conds]
-        out.update({'pbuf/cond_rows_min': int(counts.min()), 'pbuf/cond_rows_median': float(counts.float().median()),
-                    'pbuf/cond_zero_frac': float((counts == 0).float().mean()),
-                    'pbuf/eligible_conditions': int(self.pbuf_conds.numel()),
-                    'pbuf/excluded_conditions': int(self._pbuf_off.sum())})
+        extra.update({'pbuf/cond_rows_min': int(counts.min()), 'pbuf/cond_rows_median': float(counts.float().median()),
+                      'pbuf/cond_zero_frac': float((counts == 0).float().mean()),
+                      'pbuf/eligible_conditions': int(self.pbuf_conds.numel()),
+                      'pbuf/excluded_conditions': int(self._pbuf_off.sum())})
         if getattr(self, 'gauss_sigma', None) is not None:
-            out['pbuf/gauss_sigma'] = float(self.gauss_sigma)
-        for key in ch:
-            ch[key] = 0
+            extra['pbuf/gauss_sigma'] = float(self.gauss_sigma)
         for key in w:
             w[key] = 0
+        out = Modeller.log_buffer_stats(self)   # drains prior_churn
+        out.update(extra)
         return out
 
     # -- the loop ---------------------------------------------------------------
