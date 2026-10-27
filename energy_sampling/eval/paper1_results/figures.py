@@ -2080,22 +2080,30 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     return table_trace
 
 
-def pes_cartoon(seed=42, distributions=('prior', 'equilibrium'), line_width=2.5, bare=False):
+def pes_cartoon(seed=42, distributions=('prior', 'equilibrium'), line_width=2.5, bare=False, ruggedness=1.0,
+                barrier_softness=0.0):
     """Cartoon rugged 1-D potential V(x) with distributions drawn over it. seed: the sub-basins' draw (42 = the paper's
     figure). distributions: any of 'prior' (cold, trapped in every basin) and 'equilibrium' (Boltzmann at kT 2.5); ()
-    draws V(x) alone. line_width: every curve's. bare: no text at all (axis titles and legend)."""
+    draws V(x) alone. line_width: every curve's. bare: no text at all (axis titles and legend). ruggedness: scales the
+    sub-basins' depths (same sub-basins, same places; 1 = the paper's). barrier_softness: the two wells are joined by
+    their minimum, which leaves a corner at the central barrier; s > 0 joins them by the smooth minimum
+    -s log(exp(-L/s) + exp(-R/s)) instead (0 = the paper's)."""
     # --- PES ---
     x = np.linspace(-6, 6, 2000)
     well_L = 8.0 * (1 - np.exp(-0.3 * (x + 2.5) ** 2))
     well_R = 9.5 * (1 - np.exp(-0.3 * (x - 2.5) ** 2))
-    base = np.minimum(well_L, well_R) + 0.12 * x ** 2
+    if barrier_softness > 0:
+        s = float(barrier_softness)
+        base = -s * np.logaddexp(-well_L / s, -well_R / s) + 0.12 * x ** 2
+    else:
+        base = np.minimum(well_L, well_R) + 0.12 * x ** 2
     rng = np.random.default_rng(seed)
 
     # Place sub-basins with controlled randomness. 20, down from 30: with only two distributions drawn
     # over the landscape, 30 wells made the figure read as noise rather than as a rugged PES.
     n_sub = 20
     centers = rng.uniform(-5.5, 5.5, n_sub)
-    depths = -rng.uniform(0.3, 2.5, n_sub)
+    depths = -rng.uniform(0.3, 2.5, n_sub) * ruggedness
     widths = rng.uniform(5, 18, n_sub)
 
     sub = sum(a * np.exp(-w * (x - c) ** 2) for a, w, c in zip(depths, widths, centers))
