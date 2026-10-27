@@ -2081,13 +2081,14 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
 
 
 def pes_cartoon(seed=42, distributions=('prior', 'equilibrium'), line_width=2.5, bare=False, ruggedness=1.0,
-                barrier_softness=0.0):
+                barrier_softness=0.0, p_height=0.65):
     """Cartoon rugged 1-D potential V(x) with distributions drawn over it. seed: the sub-basins' draw (42 = the paper's
     figure). distributions: any of 'prior' (cold, trapped in every basin) and 'equilibrium' (Boltzmann at kT 2.5); ()
     draws V(x) alone. line_width: every curve's. bare: no text at all (axis titles and legend). ruggedness: scales the
     sub-basins' depths (same sub-basins, same places; 1 = the paper's). barrier_softness: the two wells are joined by
     their minimum, which leaves a corner at the central barrier; s > 0 joins them by the smooth minimum
-    -s log(exp(-L/s) + exp(-R/s)) instead (0 = the paper's)."""
+    -s log(exp(-L/s) + exp(-R/s)) instead (0 = the paper's). p_height: the tallest P(x) peak as a fraction of V's range
+    (0.65 = the paper's)."""
     # --- PES ---
     x = np.linspace(-6, 6, 2000)
     well_L = 8.0 * (1 - np.exp(-0.3 * (x + 2.5) ** 2))
@@ -2161,7 +2162,7 @@ def pes_cartoon(seed=42, distributions=('prior', 'equilibrium'), line_width=2.5,
         # P=0 on V's own zero line, so the two curves share a baseline. Titled on the right so which axis
         # is which is readable off the frame, with the curves themselves named in the legend.
         yaxis2=dict(overlaying='y', side='right', showticklabels=False, ticks='', showgrid=False,
-                    zeroline=False, range=[-0.03 / 0.65, 1 / 0.65], title_text="P(x)" if distributions else None,
+                    zeroline=False, range=[-0.03 / p_height, 1 / p_height], title_text="P(x)" if distributions else None,
                     title_font=dict(color=curves[distributions[-1]][1] if distributions else eq_c)),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         margin=dict(l=60, r=60, t=60, b=50),
