@@ -14,8 +14,8 @@ sys.path.insert(0, str(ROOT))
 
 from models.flow_policy import FlowPolicy  # noqa: E402
 from models.gfn import GFN  # noqa: E402
-from models.policy_interface import (GETATTR_ONLY, POLICY_ATTRIBUTES, RECEIVERS, TRAINER_FILES,  # noqa: E402
-                                     WRITTEN_STATE, missing_policy_attributes)
+from models.policy_interface import (GETATTR_ONLY, OPTIONAL_HOOKS, POLICY_ATTRIBUTES, RECEIVERS,  # noqa: E402
+                                     TRAINER_FILES, WRITTEN_STATE, missing_policy_attributes)
 
 pytestmark = pytest.mark.fast
 DEV = 'cpu'
@@ -56,7 +56,7 @@ def _trainer_reads():
 
 def test_the_interface_is_every_policy_read_in_the_trainer():
     reads = _trainer_reads()
-    known = set(POLICY_ATTRIBUTES) | set(WRITTEN_STATE)
+    known = set(POLICY_ATTRIBUTES) | set(WRITTEN_STATE) | set(OPTIONAL_HOOKS)
     assert reads <= known, f"the trainer reads policy attributes the interface lacks: {sorted(reads - known)}"
     stale = known - reads - set(GETATTR_ONLY)
     assert not stale, f"interface names the trainer no longer reads: {sorted(stale)}"
@@ -179,3 +179,32 @@ def test_molecule_mode_reads_atom_tokens_from_the_batch():
     assert pol.flow_model(pol.get_condition_embedding(None, mb)).shape == (3,)
     with pytest.raises(ValueError, match='one graph per row'):
         pol.get_traj_bwd(torch.zeros(4, 12), None, None, mb)
+
+
+# -- the trainer's selection -----------------------------------------------------------------------------------------
+
+def test_mk_dev_policy_block_is_the_sde_policy_with_the_flow_defaults():
+    import yaml
+    from models.flow_policy import FLOW_DEFAULTS
+    cfg = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
+    assert cfg['policy']['kind'] == 'sde'
+    assert cfg['policy']['flow'] == FLOW_DEFAULTS   # one set of defaults: the YAML block and the code agree
+
+
+def test_build_policy_dispatches_and_leaves_an_sde_config_alone():
+    from types import SimpleNamespace
+    from models.flow_policy import build_policy
+    from train import Modeller
+    host = object.__new__(Modeller)
+    host.args = SimpleNamespace(policy=SimpleNamespace(kind='sde', flow=SimpleNamespace(**SMALL)), seed=3)
+    assert host._policy_entry() == {}                        # the SDE gfn_config gains no key
+    host.args = SimpleNamespace(seed=3)
+    assert host._policy_entry() == {}                        # nor without a policy block
+    host.args = SimpleNamespace(policy=SimpleNamespace(kind='flow', flow=SimpleNamespace(**SMALL)), seed=3)
+    entry = host._policy_entry()
+    assert entry == {'policy': {'kind': 'flow', 'flow': SMALL, 'seed': 3}}
+    torch.manual_seed(0)
+    assert isinstance(build_policy(gfn_config()), GFN)
+    assert isinstance(build_policy(gfn_config() | entry), FlowPolicy)
+    with pytest.raises(ValueError):
+        build_policy(gfn_config() | {'policy': {'kind': 'other'}})

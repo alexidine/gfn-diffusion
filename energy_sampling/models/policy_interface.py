@@ -36,6 +36,10 @@ WRITTEN_STATE = ('_pb_frozen', '_stash_live_branches', '_live_fwd', '_live_bwd',
 # read only through getattr with a default (absent = the z-calibration step silently does nothing)
 GETATTR_ONLY = ('_z_cal_embedding',)
 
+# optional hooks: the trainer checks for them first (train.py::Modeller.fit_policy_data_scalers), and a policy
+# without them skips that step (the SDE policy has none)
+OPTIONAL_HOOKS = ('fit_data_scalers',)
+
 
 def missing_policy_attributes(model):
     """The interface names `model` does not have at construction (an empty list for a conforming policy)."""

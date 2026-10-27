@@ -39,6 +39,21 @@ FLOW_DEFAULTS = dict(
 )
 
 
+def build_policy(gfn_config: dict):
+    """The policy a gfn_config describes: models/gfn.py::GFN unless the config carries a `policy` entry whose kind is
+    'flow' (train.py writes that entry only for a non-SDE policy, so an SDE gfn_config, its checkpoints and problem
+    hashes are unchanged)."""
+    cfg = dict(gfn_config)
+    pol = cfg.pop('policy', None)
+    kind = 'sde' if pol is None else pol.get('kind', 'sde')
+    if kind == 'sde':
+        from models.gfn import GFN
+        return GFN(**cfg)
+    if kind == 'flow':
+        return FlowPolicy(cfg, dict(pol.get('flow') or {}), seed=int(pol.get('seed', 0)))
+    raise ValueError(f"policy kind {kind!r}: 'sde' or 'flow'")
+
+
 class _Empty(nn.Module):
     """A parameter group with nothing in it (t_model, s_model, backward_policy of a one-step flow)."""
 
@@ -139,6 +154,7 @@ class FlowPolicy(nn.Module):
         self._force_stats = self._reward_grad_stats = self._path_grad_stats = self._replay_force_stats = None
         self.path_grad_scale_live = False
         self.traj_checkpoint, self.traj_checkpoint_modes = False, None   # runtime flags train.py sets on every build
+        self.register_buffer('scalers_fitted', torch.tensor(False))   # persistent: a restored checkpoint keeps its own
         self.to(self.device)
 
     # -- data-dependent set-up the trainer calls once the prior is loaded ------------------------------------------
@@ -150,6 +166,7 @@ class FlowPolicy(nn.Module):
         self.sampler.flow.set_scaler(latents.to(self.device, torch.float32)[:, self.live_idx])
         if self.conditional and not self.settings['atom_tokens'] and conditions is not None:
             self.sampler.flow.set_condition_scaler(conditions.to(self.device, torch.float32))
+        self.scalers_fitted.fill_(True)
 
     # -- the condition -------------------------------------------------------------------------------------------
 

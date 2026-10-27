@@ -364,6 +364,34 @@ model:
   state_atoms_t_min: 0.0       # trajectory time in [0, 1) before which the state encoder is given no atoms (it reads the state and the condition alone) and the trunk is not called for the state unless a force term reads it; 0 = atoms at every state. Read with state_atoms > 0; state_crystal_t_min, when set, must not be below it
   state_force_input: false     # true: the state encoder is also given the force on the state from the drift_force trunk (over the trunk's per-row scale, bounded in RMS, then its log magnitude; dim + 1 numbers), for states from force_drift_t_min on and zeros before. Independent of force_drift_fwd / force_drift_bwd and of state_atoms
 
+# which policy the trainer trains (models/flow_policy.py::build_policy). The `model:` block above configures the SDE
+# policy, and under kind 'flow' only the geometry it shares (wrapped and dead rows, conditioning)
+policy:
+  kind: sde                    # 'sde' = models/gfn.py::GFN; 'flow' = models/flow_policy.py::FlowPolicy, the exact-density spline flow as a one-step policy (log P_B = 0)
+  flow:                        # FlowPolicy settings, read only under kind 'flow' (models/flow_policy.py FLOW_DEFAULTS has the same keys)
+    conditioner: transformer   # 'transformer' (causal transformer) or 'made'
+    n_blocks: 1
+    n_bins: 32
+    bound: 1.0
+    hidden: 512                # the MADE conditioner's width
+    hidden_layers: 2
+    tf_width: 256              # the transformer conditioner's width, layers, heads and norm
+    tf_layers: 4
+    tf_heads: 8
+    tf_norm: layer
+    tf_fp32: true              # transformer layers in the input's precision (false = bf16)
+    context_dim: 128           # width of the condition context every block reads
+    context_hidden: 512
+    atom_tokens: false         # true: the condition is the molecule, its atoms encoded as tokens (needs molecule conditioning)
+    atom_node_dim: 128
+    atom_convs: 3
+    atom_cutoff: 10.0
+    atom_radial: 32
+    min_bin_height: null       # a floor on the spline's bin heights (null = the spline's 1e-3 x n_bins)
+    min_bin_height_rows: uniform
+    tied_derivatives: true     # knot derivatives tied to the neighbouring bin slopes
+    tied_factor: 2.0
+
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
 drift_force:

@@ -69,6 +69,7 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
+from models.flow_policy import build_policy
 from models.crystal_force import CrystalDriftForce, TrunkForce
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
@@ -3222,7 +3223,51 @@ class Modeller:
             max_z_prime=max(self.args.z_primes),
             do_periodic_angles=self.energy_function.is_crystal,
             **vars(self.args.model),
-        )
+        ) | self._policy_entry()
+
+    def _policy_entry(self):
+        """gfn_config's `policy` entry: {} for the SDE policy (absent or `policy.kind: sde`), so its gfn_config,
+        checkpoints and problem hashes are unchanged; else the kind, the flow's settings (`policy.flow`) and the
+        run's seed, which models/flow_policy.py::build_policy reads."""
+        pol = getattr(self.args, 'policy', None)
+        kind = getattr(pol, 'kind', 'sde') if pol is not None else 'sde'
+        if kind == 'sde':
+            return {}
+        flow = getattr(pol, 'flow', None)
+        flow = dict(vars(flow)) if flow is not None and not isinstance(flow, dict) else dict(flow or {})
+        return {'policy': {'kind': kind, 'flow': flow, 'seed': int(self.args.seed)}}
+
+    def gfn_from_config(self, config):
+        """The policy a gfn_config describes (Checkpointer._build_gfn's seam): models/flow_policy.py::build_policy."""
+        return build_policy(config)
+
+    @torch.no_grad()
+    def fit_policy_data_scalers(self, chunk: int = 65536):
+        """A policy fitted to data before training (models/flow_policy.py::FlowPolicy.fit_data_scalers: the flow's
+        standardisers) gets the prior's latents and, in vector conditioning, the conditions files' condition vectors;
+        the train and EMA models alike. Skipped for a policy without the hook (the SDE policy) and for one restored
+        already fitted from a checkpoint."""
+        fit = getattr(self.gfn_model, 'fit_data_scalers', None)
+        if fit is None or bool(getattr(self.gfn_model, 'scalers_fitted', False)):
+            return
+        batch = self.prior_dataset.batch
+        lat = []
+        for i in range(0, batch.num_graphs, chunk):
+            sub = batch.subsample_new_batch(torch.arange(i, min(i + chunk, batch.num_graphs), device=batch.ptr.device))
+            lat.append(self._batch_latents(sub).float().cpu())
+        lat = torch.cat(lat)
+        conds = None
+        if self.gfn_model.conditional and self.gfn_model.conditions_type == 'vector':
+            mb = self.mol_dataset.batch
+            cs = []
+            for i in range(0, mb.num_graphs, chunk):
+                sub = mb.subsample_new_batch(torch.arange(i, min(i + chunk, mb.num_graphs), device=mb.ptr.device))
+                cs.append(self.energy_function.condition_samples(sub)[2].float().cpu())
+            conds = torch.cat(cs)
+        for model in (self.gfn_model, self.ema_model):
+            model.fit_data_scalers(lat, conds)
+        print(f"policy data scalers fitted on {lat.shape[0]} prior rows"
+              + (f" and {conds.shape[0]} condition vectors" if conds is not None else ""), flush=True)
 
     def set_pb_freeze(self, mode, source_state=None):
         """
@@ -3439,7 +3484,7 @@ class Modeller:
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
-            self.gfn_model = GFN(**self.gfn_config).to(self.device)
+            self.gfn_model = build_policy(self.gfn_config).to(self.device)
             self.ema_model = deepcopy(self.gfn_model)
             self.init_schedulers_optimizers()
 
@@ -4039,7 +4084,7 @@ class Modeller:
             # its device arg internally at sampling time, so override it or a
             # cross-device load breaks past .to()
             gfn_config = {**checkpoint['gfn_config'], 'device': self.device}
-            self.prior_model = GFN(**gfn_config).to(self.device)
+            self.prior_model = build_policy(gfn_config).to(self.device)   # either policy kind
             self.prior_model.load_state_dict(checkpoint['model_eval'])
             self.prior_model.eval()
             # sample this reused prior at ITS OWN training T, not the consumer's
@@ -4267,6 +4312,7 @@ class Modeller:
                 self.publish_data_set_sizes()
             # before ANY buffer is seeded: every reward from here on is in the run's currency
             self.init_energy_reference()
+            self.fit_policy_data_scalers()   # a flow policy's standardisers; a no-op for the SDE policy
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
             # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
