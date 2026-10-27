@@ -391,6 +391,7 @@ policy:
     min_bin_height_rows: uniform
     tied_derivatives: true     # knot derivatives tied to the neighbouring bin slopes
     tied_factor: 2.0
+    bounded_rows: null           # null, or 'linear': every live unwrapped row modelled on the closed [-1, 1] (no tails, uniform base); unconditional policies only
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################

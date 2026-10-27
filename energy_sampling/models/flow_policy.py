@@ -36,6 +36,7 @@ FLOW_DEFAULTS = dict(
     atom_tokens=False, atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
     min_bin_height=None, min_bin_height_rows='uniform',
     tied_derivatives=True, tied_factor=2.0,
+    bounded_rows=None,              # None, or 'linear': every live unwrapped row modelled on the closed [-1, 1]
 )
 
 
@@ -109,6 +110,9 @@ class FlowPolicy(nn.Module):
         if self.conditional:
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial']) if s['atom_tokens'] else None)
+            if s['bounded_rows'] is not None:
+                raise NotImplementedError("flow bounded_rows on a conditional policy (ConditionalLatentFlow has no "
+                                          "bounded rows yet)")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             cond_dim = 1 if atoms is not None else self.conditions_dim
@@ -122,8 +126,14 @@ class FlowPolicy(nn.Module):
                 embed['atom_encoder'] = self.sampler.flow.atom_encoder
             self.conditions_embedding_model = embed
         else:
+            bounded = []
+            if s['bounded_rows'] == 'linear':
+                dead = set(int(r) for r in self.dead_rows)
+                bounded = [i for i in range(self.dim) if i not in dead and not wrap_mask[i]]
+            elif s['bounded_rows'] is not None:
+                raise ValueError(f"flow bounded_rows {s['bounded_rows']!r}: null or 'linear'")
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
-                                      transformer=transformer)
+                                      transformer=transformer, bounded_rows=bounded)
             self.flow_model = LearnableScalar(0.0)
             blocks = self.sampler.flow.blocks
             self.conditions_embedding_model = _Empty()

@@ -208,3 +208,13 @@ def test_build_policy_dispatches_and_leaves_an_sde_config_alone():
     assert isinstance(build_policy(gfn_config() | entry), FlowPolicy)
     with pytest.raises(ValueError):
         build_policy(gfn_config() | {'policy': {'kind': 'other'}})
+
+
+def test_bounded_rows_linear_bounds_every_live_unwrapped_row():
+    pol = flow_policy(False, dead=(9,), bounded_rows='linear')
+    wrap = pol.ang_mask.tolist()
+    assert pol.sampler.bounded_rows == [i for i in range(12) if i != 9 and not wrap[i]]
+    states, *_ = pol.get_traj_fwd(torch.zeros(64, 12), None, 0, None, None)
+    assert bool((states[:, 1].abs() <= 1 + 1e-6).all())
+    with pytest.raises(NotImplementedError):
+        flow_policy(True, bounded_rows='linear')
