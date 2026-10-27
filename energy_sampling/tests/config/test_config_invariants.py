@@ -25,7 +25,8 @@ CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 @pytest.fixture(scope='module')
 def canonical():
-    return yaml.safe_load(CANONICAL.read_text(encoding='utf-8'))
+    # the resolved form (config_invariants.canonical_model_section), which the dotted mutations below address
+    return ci.canonical_model_section(yaml.safe_load(CANONICAL.read_text(encoding='utf-8')))
 
 
 def broken(canonical, **dotted):
@@ -1035,17 +1036,17 @@ def test_an_energy_reference_with_temperature_conditioning_is_an_error(canonical
     assert _fires(cfg, 'energy_reference_is_consistent')
 
 
-def test_a_flow_policy_refuses_sde_only_settings(canonical):
-    """Under policy.kind flow an SDE-only setting refuses at load; the canonical keys pass once the auto clip (fitted
-    to SDE gradients) is given a number. Full coverage: tests/models/test_flow_policy.py."""
+def test_an_nf_policy_refuses_sde_only_settings(canonical):
+    """Under model.kind nf an SDE-only setting refuses at load; the canonical keys pass once the auto clip (fitted
+    to SDE gradients) is given a number. Full coverage: tests/models/test_nf_policy.py."""
     cfg = copy.deepcopy(canonical)
-    assert not _fires(cfg, 'flow_policy_refuses_sde_only_settings')      # kind sde
-    cfg['policy']['kind'] = 'flow'
-    assert _fires(cfg, 'flow_policy_refuses_sde_only_settings')          # gradient_norm_clip auto
+    assert not _fires(cfg, 'nf_policy_refuses_sde_only_settings')      # kind sde
+    cfg['policy']['kind'] = 'nf'
+    assert _fires(cfg, 'nf_policy_refuses_sde_only_settings')          # gradient_norm_clip auto
     cfg['gradient_norm_clip'] = 10.0
-    assert not _fires(cfg, 'flow_policy_refuses_sde_only_settings')
+    assert not _fires(cfg, 'nf_policy_refuses_sde_only_settings')
     cfg['compile_policy'] = True
-    assert _fires(cfg, 'flow_policy_refuses_sde_only_settings')
+    assert _fires(cfg, 'nf_policy_refuses_sde_only_settings')
 
 
 def test_every_rule_is_mutation_tested():

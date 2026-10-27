@@ -1,4 +1,4 @@
-"""models/flow_policy.py::FlowPolicy, the exact-density flow as a train.py policy (docs/design/flow_policy_port.md):
+"""models/nf_policy.py::NFPolicy, a normalizing flow as a train.py policy (docs/design/flow_policy_port.md):
 the policy interface the trainer reads (models/policy_interface.py, re-derived here from the trainer's source), its
 one-step trajectories (states [N, 2, D], log P_F = log q exact, log P_B = 0, log_flow[:, 0] the level head), the
 SDE policy's geometry (wrapped and dead rows), Z-only training, condition scrambling, and parameter groups."""
@@ -12,7 +12,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from models.flow_policy import FlowPolicy  # noqa: E402
+from models.nf_policy import NFPolicy  # noqa: E402
 from models.gfn import GFN  # noqa: E402
 from models.policy_interface import (GETATTR_ONLY, OPTIONAL_HOOKS, POLICY_ATTRIBUTES, RECEIVERS,  # noqa: E402
                                      TRAINER_FILES, WRITTEN_STATE, missing_policy_attributes)
@@ -38,7 +38,7 @@ SMALL = dict(conditioner='made', hidden=32, hidden_layers=1, n_bins=8, context_d
 
 def flow_policy(conditional=False, dead=None, **flow):
     torch.manual_seed(0)
-    return FlowPolicy(gfn_config(conditional, dead=dead), {**SMALL, **flow}, seed=0)
+    return NFPolicy(gfn_config(conditional, dead=dead), {**SMALL, **flow}, seed=0)
 
 
 # -- the interface -------------------------------------------------------------------------------------------------
@@ -166,7 +166,7 @@ def test_molecule_mode_reads_atom_tokens_from_the_batch():
     cfg = gfn_config(True)
     cfg['conditions_type'] = 'molecule'
     torch.manual_seed(0)
-    pol = FlowPolicy(cfg, {**SMALL, 'conditioner': 'transformer', 'tf_width': 32, 'tf_layers': 1, 'tf_heads': 2,
+    pol = NFPolicy(cfg, {**SMALL, 'conditioner': 'transformer', 'tf_width': 32, 'tf_layers': 1, 'tf_heads': 2,
                            'atom_tokens': True, 'atom_node_dim': 16, 'atom_convs': 1}, seed=0)
     counts = torch.tensor([3, 5, 4])
     ptr = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
@@ -183,29 +183,29 @@ def test_molecule_mode_reads_atom_tokens_from_the_batch():
 
 # -- the trainer's selection -----------------------------------------------------------------------------------------
 
-def test_mk_dev_policy_block_is_the_sde_policy_with_the_flow_defaults():
+def test_mk_dev_model_section_is_the_sde_policy_with_the_nf_defaults():
     import yaml
-    from models.flow_policy import FLOW_DEFAULTS
-    cfg = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
-    assert cfg['policy']['kind'] == 'sde'
-    assert cfg['policy']['flow'] == FLOW_DEFAULTS   # one set of defaults: the YAML block and the code agree
+    from models.nf_policy import NF_DEFAULTS
+    raw = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
+    assert raw['model']['kind'] == 'sde' and 'policy' not in raw
+    assert raw['model']['nf'] == NF_DEFAULTS   # one set of defaults: the YAML block and the code agree
 
 
 def test_build_policy_dispatches_and_leaves_an_sde_config_alone():
     from types import SimpleNamespace
-    from models.flow_policy import build_policy
+    from models.nf_policy import build_policy
     from train import Modeller
     host = object.__new__(Modeller)
-    host.args = SimpleNamespace(policy=SimpleNamespace(kind='sde', flow=SimpleNamespace(**SMALL)), seed=3)
+    host.args = SimpleNamespace(policy=SimpleNamespace(kind='sde', nf=SimpleNamespace(**SMALL)), seed=3)
     assert host._policy_entry() == {}                        # the SDE gfn_config gains no key
     host.args = SimpleNamespace(seed=3)
     assert host._policy_entry() == {}                        # nor without a policy block
-    host.args = SimpleNamespace(policy=SimpleNamespace(kind='flow', flow=SimpleNamespace(**SMALL)), seed=3)
+    host.args = SimpleNamespace(policy=SimpleNamespace(kind='nf', nf=SimpleNamespace(**SMALL)), seed=3)
     entry = host._policy_entry()
-    assert entry == {'policy': {'kind': 'flow', 'flow': SMALL, 'seed': 3}}
+    assert entry == {'policy': {'kind': 'nf', 'nf': SMALL, 'seed': 3}}
     torch.manual_seed(0)
     assert isinstance(build_policy(gfn_config()), GFN)
-    assert isinstance(build_policy(gfn_config() | entry), FlowPolicy)
+    assert isinstance(build_policy(gfn_config() | entry), NFPolicy)
     with pytest.raises(ValueError):
         build_policy(gfn_config() | {'policy': {'kind': 'other'}})
 
@@ -223,14 +223,14 @@ def test_bounded_rows_linear_bounds_every_live_unwrapped_row():
 # -- the config audit's fixes (2026-10-27) -------------------------------------------------------------------------
 
 def test_unset_settings_resolve_per_route_as_the_inn_does():
-    from models.flow_policy import FLOW_DEFAULTS, Z1_ORDER, resolve_flow_settings
-    u = resolve_flow_settings(FLOW_DEFAULTS, False, list(range(12)))
+    from models.nf_policy import NF_DEFAULTS, Z1_ORDER, resolve_flow_settings
+    u = resolve_flow_settings(NF_DEFAULTS, False, list(range(12)))
     assert (u['bounded_rows'], u['min_bin_height'], u['tied_derivatives'], u['tied_factor'], u['block_orders']) == \
         ('linear', 1e-7, True, 2.0, Z1_ORDER)
-    assert resolve_flow_settings(FLOW_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
-    c = resolve_flow_settings(FLOW_DEFAULTS, True, list(range(12)))
+    assert resolve_flow_settings(NF_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
+    c = resolve_flow_settings(NF_DEFAULTS, True, list(range(12)))
     assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == (None, None, False, None)
-    n = resolve_flow_settings({**FLOW_DEFAULTS, 'bounded_rows': 'none', 'block_orders': 'none'}, False, list(range(12)))
+    n = resolve_flow_settings({**NF_DEFAULTS, 'bounded_rows': 'none', 'block_orders': 'none'}, False, list(range(12)))
     assert n['bounded_rows'] is None and n['block_orders'] is None
 
 
@@ -258,7 +258,7 @@ def test_a_resume_refuses_a_checkpoint_of_another_policy():
     from types import SimpleNamespace
     from checkpointing import Checkpointer
     ck = object.__new__(Checkpointer)
-    flow_entry = {'policy': {'kind': 'flow', 'flow': SMALL, 'seed': 1}}
+    flow_entry = {'policy': {'kind': 'nf', 'nf': SMALL, 'seed': 1}}
     ck.modeller = SimpleNamespace(_policy_entry=lambda: flow_entry, args=SimpleNamespace(model=SimpleNamespace()))
     with pytest.raises(ValueError, match="policy in this run's config"):
         ck._gfn_config_from({'gfn_config': gfn_config()})                       # an SDE checkpoint, a flow run
@@ -271,11 +271,11 @@ def test_flow_runs_refuse_sde_only_settings_at_load():
     import copy
     import yaml
     import config_invariants as ci
-    cfg = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
-    rule = ci.flow_policy_refuses_sde_only_settings
+    cfg = ci.canonical_model_section(yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8')))
+    rule = ci.nf_policy_refuses_sde_only_settings
     assert rule(cfg) == []                                                       # kind sde: nothing judged
     f = copy.deepcopy(cfg)
-    f['policy']['kind'] = 'flow'
+    f['policy']['kind'] = 'nf'
     assert [v.detail for v in rule(f)] and all('gradient_norm_clip' in v.detail for v in rule(f))
     f['gradient_norm_clip'] = 10.0
     for proto in ('unconditional_tb', 'conditional_vargrad'):                   # both canonical protocols are clean
@@ -288,3 +288,30 @@ def test_flow_runs_refuse_sde_only_settings_at_load():
     found = ' | '.join(v.detail for v in rule(g))
     for needle in ('compile_policy', 'bwd tbc', 'bwd repeats', 'set_traj_checkpoint'):
         assert needle in found, needle
+
+
+
+def test_the_loader_resolves_a_sectioned_model_block():
+    import config_invariants as ci
+    raw = {'seed': 1, 'model': {'kind': 'nf', 'shared': {'periodic_centroids': True},
+                                'sde': {'dplr_rank': 6}, 'nf': {'n_bins': 8}}}
+    out = ci.canonical_model_section(raw)
+    assert out['model'] == {'periodic_centroids': True, 'dplr_rank': 6}
+    assert out['policy'] == {'kind': 'nf', 'nf': {'n_bins': 8}}
+    assert ci.canonical_model_section(out) == out                       # the resolved form passes through
+    flat = {'model': {'dplr_rank': 6}}
+    assert ci.canonical_model_section(flat) is flat                     # an unsectioned config untouched
+    for bad in ({'model': {'kind': 'other'}},
+                {'model': {'kind': 'sde', 'extra': {}}},
+                {'model': {'kind': 'sde', 'shared': {'a': 1}, 'sde': {'a': 2}}},
+                {'model': {'kind': 'sde'}, 'policy': {'kind': 'nf'}}):
+        with pytest.raises(ValueError):
+            ci.canonical_model_section(bad)
+
+
+def test_mk_dev_resolves_to_the_unsectioned_keys_the_sde_code_reads():
+    from utils import load_yaml
+    cfg = load_yaml(str(ROOT / 'configs' / 'mk_dev.yaml'))
+    assert cfg['policy']['kind'] == 'sde'
+    for key in ('hold_dead_latent_rows', 'periodic_centroids', 'dplr_rank', 's_emb_dim', 'full_flow'):
+        assert key in cfg['model'], key

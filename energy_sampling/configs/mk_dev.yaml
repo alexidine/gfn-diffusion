@@ -303,72 +303,70 @@ max_reloads_per_1k_steps: 1.0  # divergence-rewind budget, as a RATE: a run is a
 # model parameters
 ################################################################
 model:
-  full_flow: false           # true for subtb or db losses
-  hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system
-  # shared dimensions
-  s_emb_dim: 512             # dimensionality of state embedding
-  t_dim: 64                   # dimensionality of time embedding
-  harmonics_dim: 64           # dimensionality of harmonic embedding
-  condition_embedding_dim: 16  # dimensionality of the conditioning embedding
-  # per-sub-model architecture
-  t_hidden_dim: 512          # time encoder hidden dim
-  s_hidden_dim: 512          # state encoder hidden dim
-  s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 512     # forward/backward policy hidden dim
-  policy_layers: 4            # forward/backward policy layers
-  flow_hidden_dim: 512       # flow model hidden dim
-  flow_layers: 4              # flow model layers
-  cond_hidden_dim: 512       # conditioning embedding hidden dim
-  cond_layers: 4              # conditioning embedding layers
-  # regularization (shared)
-  dropout: 0                  # dropout probability
-  norm: layer                 # null, "layer" - DON'T PUT 'batch'
-  zero_init: false
-  # SDE params
-  t_scale: 0.05               # scales fixed forward policy variance
-  log_var_range: 6            # controls dynamic range of learned policy variance
-  pb_drift_range: 0.4         # range of learned backward drift corrections
-  pb_var_range: 6             # range of learned backward policy variance
-  learn_pb: true              # whether to learn a correction to the backward policy
-  learned_variance: true      # whether to learn policy variance
-  clipping: true              # clip the maximum step size induced by the policy model
-  gfn_clip: 200.0             # clip value for policy step size
-  # Wrap the aunit centroid dims whose aunit spans the full cell width (auv == 1)
-  # so the SDE flows through the aunit face instead of piling up against the
-  # bounding-energy wall. Resolved per space group and intersected over
-  # `space_groups` (models/aunit_periodicity.py); wrap-safe in all 80 SGs with
-  # defined aunit bounds. Changes expanded_dim, so NOT checkpoint compatible
-  # with a run trained without it.
-  periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)
-  # Diagonal-plus-low-rank forward covariance C = diag(d) + V V^T, forward SDE
-  # only. Fixed marginal-variance budget: rho redistributes the existing policy
-  # variance between private (d) and correlated (V) parts, never inflating it.
-  dplr_rank: 6                 # rank r of the low-rank factor V; 0 = disabled (exactly original diagonal SDE)
-  dplr_rho_max: 0.5            # cap on correlated variance fraction; also an exact cap on pairwise |corr_jk| <= rho_max. Keep < 1 strictly
-  dplr_mask_angular: true      # zero the correlated fraction on wrapped dims (angular, plus any periodic_centroids ones); correlations then only couple non-wrapped dims. Required true when DPLR runs with periodic dims (asserted at construction)
-  pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
-  # Force term in the kernel means (GFN.init_force_drift): mean += cap(gate(t) * step variance * force), the
-  # force from the trunk named by drift_force.checkpoint. eLJ, Z' = 1, fixed temperature. On a reload these six
-  # are read from THIS config, not the checkpoint's.
-  force_drift_fwd: null        # starting value of P_F's gate; null = no force term in P_F
-  force_drift_bwd: null        # starting value of P_B's gate (positive = the backward step moves to lower energy); null = no force term in P_B
-  force_drift_learned: true    # gates are learned functions of time, one per latent row; false = held at their starting values (no parameters)
-  force_drift_max_sigma: 2.0   # cap on one step's force displacement, in that step's noise standard deviations (RMS over live rows); null = no cap
-  force_drift_t_min: 0.0       # trajectory time in [0, 1) before which a state gets no force and the trunk is not called
-  force_drift_differentiable: false  # true = the force carries its graph to the state (second derivatives through the trunk); read only by path-gradient options
-  state_atoms: 0               # > 0: the state encoder reads this many atoms (padded) of per-atom features from the drift_force trunk at every state; 0 = the latent and the condition only
-  state_atom_hidden_dim: 128   # token width of the atom layers of the state encoder (read with state_atoms > 0)
-  state_atom_blocks: 2         # rounds of self-attention over a row's atoms
-  state_atom_heads: 4          # attention heads per round; must divide state_atom_hidden_dim
-  state_crystal_t_min: 0.0     # trajectory time in [0, 1) before which a state's atoms are described by the molecule alone (trunk state and energy columns zero; no pair list, no trunk call unless a force term reads the state); 0 = every state in its crystal. Read with state_atoms > 0
-  state_atoms_t_min: 0.0       # trajectory time in [0, 1) before which the state encoder is given no atoms (it reads the state and the condition alone) and the trunk is not called for the state unless a force term reads it; 0 = atoms at every state. Read with state_atoms > 0; state_crystal_t_min, when set, must not be below it
-  state_force_input: false     # true: the state encoder is also given the force on the state from the drift_force trunk (over the trunk's per-row scale, bounded in RMS, then its log magnitude; dim + 1 numbers), for states from force_drift_t_min on and zeros before. Independent of force_drift_fwd / force_drift_bwd and of state_atoms
-
-# which policy the trainer trains (models/flow_policy.py::build_policy). The `model:` block above configures the SDE
-# policy, and under kind 'flow' only the geometry it shares (wrapped and dead rows, conditioning)
-policy:
-  kind: sde                    # 'sde' = models/gfn.py::GFN; 'flow' = models/flow_policy.py::FlowPolicy, the exact-density spline flow as a one-step policy (log P_B = 0)
-  flow:                        # FlowPolicy settings, read only under kind 'flow' (models/flow_policy.py FLOW_DEFAULTS: the same keys and values, inn_modeller.py's flag defaults)
+  kind: sde                    # the model the trainer trains: 'sde' = models/gfn.py::GFN, the SDE policy; 'nf' = models/nf_policy.py::NFPolicy, a normalizing flow as a one-step policy (log P_B = 0). The loader resolves this block (config_invariants.canonical_model_section): the code reads shared + sde as `model` and {kind, nf} as `policy`
+  shared:                      # read by both kinds: the latent geometry
+    hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system
+    # Wrap the aunit centroid dims whose aunit spans the full cell width (auv == 1)
+    # so the SDE flows through the aunit face instead of piling up against the
+    # bounding-energy wall. Resolved per space group and intersected over
+    # `space_groups` (models/aunit_periodicity.py); wrap-safe in all 80 SGs with
+    # defined aunit bounds. Changes expanded_dim, so NOT checkpoint compatible
+    # with a run trained without it.
+    periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)
+  sde:                         # the SDE policy's architecture; under kind nf it builds only the geometry probe
+    full_flow: false           # true for subtb or db losses
+    # shared dimensions
+    s_emb_dim: 512             # dimensionality of state embedding
+    t_dim: 64                   # dimensionality of time embedding
+    harmonics_dim: 64           # dimensionality of harmonic embedding
+    condition_embedding_dim: 16  # dimensionality of the conditioning embedding
+    # per-sub-model architecture
+    t_hidden_dim: 512          # time encoder hidden dim
+    s_hidden_dim: 512          # state encoder hidden dim
+    s_layers: 4                 # state encoder layers
+    policy_hidden_dim: 512     # forward/backward policy hidden dim
+    policy_layers: 4            # forward/backward policy layers
+    flow_hidden_dim: 512       # flow model hidden dim
+    flow_layers: 4              # flow model layers
+    cond_hidden_dim: 512       # conditioning embedding hidden dim
+    cond_layers: 4              # conditioning embedding layers
+    # regularization (shared)
+    dropout: 0                  # dropout probability
+    norm: layer                 # null, "layer" - DON'T PUT 'batch'
+    zero_init: false
+    # SDE params
+    t_scale: 0.05               # scales fixed forward policy variance
+    log_var_range: 6            # controls dynamic range of learned policy variance
+    pb_drift_range: 0.4         # range of learned backward drift corrections
+    pb_var_range: 6             # range of learned backward policy variance
+    learn_pb: true              # whether to learn a correction to the backward policy
+    learned_variance: true      # whether to learn policy variance
+    clipping: true              # clip the maximum step size induced by the policy model
+    gfn_clip: 200.0             # clip value for policy step size
+    # Diagonal-plus-low-rank forward covariance C = diag(d) + V V^T, forward SDE
+    # only. Fixed marginal-variance budget: rho redistributes the existing policy
+    # variance between private (d) and correlated (V) parts, never inflating it.
+    dplr_rank: 6                 # rank r of the low-rank factor V; 0 = disabled (exactly original diagonal SDE)
+    dplr_rho_max: 0.5            # cap on correlated variance fraction; also an exact cap on pairwise |corr_jk| <= rho_max. Keep < 1 strictly
+    dplr_mask_angular: true      # zero the correlated fraction on wrapped dims (angular, plus any periodic_centroids ones); correlations then only couple non-wrapped dims. Required true when DPLR runs with periodic dims (asserted at construction)
+    pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
+    # Force term in the kernel means (GFN.init_force_drift): mean += cap(gate(t) * step variance * force), the
+    # force from the trunk named by drift_force.checkpoint. eLJ, Z' = 1, fixed temperature. On a reload these six
+    # are read from THIS config, not the checkpoint's.
+    force_drift_fwd: null        # starting value of P_F's gate; null = no force term in P_F
+    force_drift_bwd: null        # starting value of P_B's gate (positive = the backward step moves to lower energy); null = no force term in P_B
+    force_drift_learned: true    # gates are learned functions of time, one per latent row; false = held at their starting values (no parameters)
+    force_drift_max_sigma: 2.0   # cap on one step's force displacement, in that step's noise standard deviations (RMS over live rows); null = no cap
+    force_drift_t_min: 0.0       # trajectory time in [0, 1) before which a state gets no force and the trunk is not called
+    force_drift_differentiable: false  # true = the force carries its graph to the state (second derivatives through the trunk); read only by path-gradient options
+    state_atoms: 0               # > 0: the state encoder reads this many atoms (padded) of per-atom features from the drift_force trunk at every state; 0 = the latent and the condition only
+    state_atom_hidden_dim: 128   # token width of the atom layers of the state encoder (read with state_atoms > 0)
+    state_atom_blocks: 2         # rounds of self-attention over a row's atoms
+    state_atom_heads: 4          # attention heads per round; must divide state_atom_hidden_dim
+    state_crystal_t_min: 0.0     # trajectory time in [0, 1) before which a state's atoms are described by the molecule alone (trunk state and energy columns zero; no pair list, no trunk call unless a force term reads the state); 0 = every state in its crystal. Read with state_atoms > 0
+    state_atoms_t_min: 0.0       # trajectory time in [0, 1) before which the state encoder is given no atoms (it reads the state and the condition alone) and the trunk is not called for the state unless a force term reads it; 0 = atoms at every state. Read with state_atoms > 0; state_crystal_t_min, when set, must not be below it
+    state_force_input: false     # true: the state encoder is also given the force on the state from the drift_force trunk (over the trunk's per-row scale, bounded in RMS, then its log magnitude; dim + 1 numbers), for states from force_drift_t_min on and zeros before. Independent of force_drift_fwd / force_drift_bwd and of state_atoms
+  nf:                          # the NF's settings, read only under kind nf (models/nf_policy.py NF_DEFAULTS: the same keys and values, inn_modeller.py's flag defaults)
     conditioner: transformer   # 'transformer' (causal transformer) or 'made'
     n_blocks: 1
     n_bins: 32

@@ -769,7 +769,9 @@ def load_yaml(path):
     with yaml_path.open("r", encoding="utf-8") as f:
         target_dict = yaml.safe_load(f)
 
-    return target_dict
+    # a sectioned `model: {kind, shared, sde, nf}` block resolved to the form the code reads (config_invariants)
+    from config_invariants import canonical_model_section
+    return canonical_model_section(target_dict)
 
 
 def dict2namespace(data_dict: dict):

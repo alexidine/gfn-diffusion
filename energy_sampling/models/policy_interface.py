@@ -1,5 +1,5 @@
-"""The policy interface: every attribute and method of a policy model (models/gfn.py::GFN, models/flow_policy.py::
-FlowPolicy) that the trainer reads, beyond torch.nn.Module's own. tests/models/test_flow_policy.py re-derives this set
+"""The policy interface: every attribute and method of a policy model (models/gfn.py::GFN, models/nf_policy.py::
+NFPolicy) that the trainer reads, beyond torch.nn.Module's own. tests/models/test_nf_policy.py re-derives this set
 from the trainer's source by AST, so a new read in train.py fails the test until both policies answer it: a missing
 attribute on one policy is otherwise a flag that goes silently inert.
 

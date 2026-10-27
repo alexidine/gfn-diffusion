@@ -1,4 +1,4 @@
-"""The exact-density spline flow as a train.py policy: a one-step sampler with the interface of models/gfn.py::GFN.
+"""A normalizing flow (NF) as a train.py policy -- here the exact-density autoregressive spline flow -- a one-step sampler with the interface of models/gfn.py::GFN.
 
 A trajectory is one step, s0 -> x. Forward, x is drawn from q(x | c) and log P_F = log q(x | c), exact; backward, the
 path x -> s0 is deterministic, log P_B = 0. log_flow[:, 0] is the level head log Z(c); there is no per-step flow. With
@@ -8,7 +8,7 @@ Plan: docs/design/flow_policy_port.md.
 
 The geometry -- the wrapped (angular) rows, the dead rows and the values they are pinned at -- is read off a GFN built
 from the same config, so it is the SDE policy's own. The flow itself is models/spline_flow.py's ConditionalLatentFlow
-(conditional runs) or LatentFlow (unconditional), built from the `flow` settings dict (FLOW_DEFAULTS).
+(conditional runs) or LatentFlow (unconditional), built from the `nf` settings dict (NF_DEFAULTS; mk_dev's model.nf).
 
 Parameter groups, under the names the trainer's optimizers read: forward_policy = the flow's blocks;
 conditions_embedding_model = what reads the condition (the context network, and the atom encoder in molecule mode);
@@ -26,9 +26,9 @@ import torch.nn as nn
 from models.architectures import LearnableScalar
 from models.spline_flow import ConditionalLatentFlow, LatentFlow
 
-# the flow's settings: inn_modeller.py's flags of the same names, with its defaults, so policy.kind flow reproduces
+# the flow's settings: inn_modeller.py's flags of the same names, with its defaults, so model.kind nf reproduces
 # its flow. 'auto' / None are resolved per route as it resolves them (resolve_flow_settings)
-FLOW_DEFAULTS = dict(
+NF_DEFAULTS = dict(
     conditioner='transformer',      # 'transformer' (causal transformer) or 'made'
     n_blocks=1, n_bins=32, bound=5.0,
     hidden=512, hidden_layers=2,    # the MADE conditioner's width and depth
@@ -71,7 +71,7 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
 
 def build_policy(gfn_config: dict):
     """The policy a gfn_config describes: models/gfn.py::GFN unless the config carries a `policy` entry whose kind is
-    'flow' (train.py writes that entry only for a non-SDE policy, so an SDE gfn_config, its checkpoints and problem
+    'nf' (train.py writes that entry only for a non-SDE policy, so an SDE gfn_config, its checkpoints and problem
     hashes are unchanged)."""
     cfg = dict(gfn_config)
     pol = cfg.pop('policy', None)
@@ -79,9 +79,9 @@ def build_policy(gfn_config: dict):
     if kind == 'sde':
         from models.gfn import GFN
         return GFN(**cfg)
-    if kind == 'flow':
-        return FlowPolicy(cfg, dict(pol.get('flow') or {}), seed=int(pol.get('seed', 0)))
-    raise ValueError(f"policy kind {kind!r}: 'sde' or 'flow'")
+    if kind == 'nf':
+        return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)))
+    raise ValueError(f"model kind {kind!r}: 'sde' or 'nf'")
 
 
 class _Empty(nn.Module):
@@ -103,16 +103,16 @@ class _LevelHead(nn.Module):
         return self.head(condition_embedding.detach()).squeeze(-1)
 
 
-class FlowPolicy(nn.Module):
+class NFPolicy(nn.Module):
     GAUSS_PARAM_KEYS = ('means_f', 'logvars_f', 'diag_logvars_f', 'rho_f', 'means_b', 'logvars_b')
 
     def __init__(self, gfn_config: dict, flow: dict, seed: int = 0):
         super().__init__()
         from models.gfn import GFN
-        unknown = set(flow) - set(FLOW_DEFAULTS)
+        unknown = set(flow) - set(NF_DEFAULTS)
         if unknown:
-            raise KeyError(f"unknown flow settings {sorted(unknown)}; known: {sorted(FLOW_DEFAULTS)}")
-        s = {**FLOW_DEFAULTS, **flow}
+            raise KeyError(f"unknown nf settings {sorted(unknown)}; known: {sorted(NF_DEFAULTS)}")
+        s = {**NF_DEFAULTS, **flow}
         probe = GFN(**gfn_config)   # geometry only
         self.device = probe.device
         self.dim = int(probe.dim)

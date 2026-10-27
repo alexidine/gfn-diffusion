@@ -69,7 +69,7 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
-from models.flow_policy import build_policy
+from models.nf_policy import build_policy
 from models.crystal_force import CrystalDriftForce, TrunkForce
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
@@ -3226,24 +3226,24 @@ class Modeller:
         ) | self._policy_entry()
 
     def _policy_entry(self):
-        """gfn_config's `policy` entry: {} for the SDE policy (absent or `policy.kind: sde`), so its gfn_config,
-        checkpoints and problem hashes are unchanged; else the kind, the flow's settings (`policy.flow`) and the
-        run's seed, which models/flow_policy.py::build_policy reads."""
+        """gfn_config's `policy` entry: {} for the SDE policy (model.kind sde, or no kind), so its gfn_config,
+        checkpoints and problem hashes are unchanged; else the kind, the NF's settings (model.nf, resolved to
+        args.policy.nf by the loader) and the run's seed, which models/nf_policy.py::build_policy reads."""
         pol = getattr(self.args, 'policy', None)
         kind = getattr(pol, 'kind', 'sde') if pol is not None else 'sde'
         if kind == 'sde':
             return {}
-        flow = getattr(pol, 'flow', None)
-        flow = dict(vars(flow)) if flow is not None and not isinstance(flow, dict) else dict(flow or {})
-        return {'policy': {'kind': kind, 'flow': flow, 'seed': int(self.args.seed)}}
+        nf = getattr(pol, 'nf', None)
+        nf = dict(vars(nf)) if nf is not None and not isinstance(nf, dict) else dict(nf or {})
+        return {'policy': {'kind': kind, 'nf': nf, 'seed': int(self.args.seed)}}
 
     def gfn_from_config(self, config):
-        """The policy a gfn_config describes (Checkpointer._build_gfn's seam): models/flow_policy.py::build_policy."""
+        """The policy a gfn_config describes (Checkpointer._build_gfn's seam): models/nf_policy.py::build_policy."""
         return build_policy(config)
 
     @torch.no_grad()
     def fit_policy_data_scalers(self, chunk: int = 65536):
-        """A policy fitted to data before training (models/flow_policy.py::FlowPolicy.fit_data_scalers: the flow's
+        """A policy fitted to data before training (models/nf_policy.py::NFPolicy.fit_data_scalers: the flow's
         standardisers) gets the prior's latents and, in vector conditioning, the conditions files' condition vectors;
         the train and EMA models alike. Skipped for a policy without the hook (the SDE policy) and for one restored
         already fitted from a checkpoint."""
@@ -3298,7 +3298,7 @@ class Modeller:
         if mode not in (None, 'head', 'full'):
             raise ValueError(f"freeze_backward_policy must be false, 'head' or 'full'/true, got {mode!r}")
         if not any(True for _ in self.gfn_model.backward_policy.parameters()):
-            # a policy whose P_B is fixed by construction (models/flow_policy.py: log P_B = 0) has nothing to freeze
+            # a policy whose P_B is fixed by construction (models/nf_policy.py: log P_B = 0) has nothing to freeze
             print(f"freeze_backward_policy={mode}: this policy has no learned P_B -- nothing to freeze")
             return
         models = (self.gfn_model, self.ema_model)

@@ -1,6 +1,7 @@
 # The exact-density flow as a train.py policy
 
-*Plan, 2026-10-27. Status: agreed by the owner (direction and shape); not built. Not policy: the owner decisions it
+*Plan, 2026-10-27. Status: agreed by the owner (direction and shape). Built: Shape items 1-2 and the checkpoint and
+config work item (`models/nf_policy.py`, `models/policy_interface.py`, the `model:` section); the rest is open. Not policy: the owner decisions it
 records are listed under "Decisions"; everything else is a plan, to be checked against the code as it lands.*
 
 ## Why
@@ -20,6 +21,12 @@ optimizer, no loss-spike rewind, ~100 flags outside config validation, and about
   losses, buffers, clipping, LR control, evaluation and checkpointing run unchanged; only what is intrinsically
   multi-step is adapted.
 - One prior construction for both phases (anchors + their noised cloud, noising at eval), as the SDE trainer.
+- The family is named NF (normalizing flows): coupling-layer INNs and autoregressive flows are both NFs. The policy
+  is `models/nf_policy.py::NFPolicy`.
+- One config file, the model selected by kind: mk_dev's `model: {kind, shared, sde, nf}` (`kind` sde | nf; `shared`
+  the geometry both read; `sde` the SDE architecture; `nf` the NF settings). The loader resolves it
+  (`config_invariants.canonical_model_section`), so SDE configs, checkpoints and problem hashes are unchanged. INN
+  flags enter as keys only where no trainer key already covers them.
 
 ## Shape
 
@@ -33,10 +40,13 @@ optimizer, no loss-spike rewind, ~100 flags outside config validation, and about
    `conditions_type`, the `_live_*` stash, ...). Each read is either moved behind a method both policies implement or
    given a flow answer; no scattered `if flow:` branches. One config key selects the policy class where the model is
    built (`train.py::Modeller._build_gfn_config`, `checkpointing.py::Checkpointer._build_gfn` / `_gfn_config_from`).
-3. **Trainer additions useful to every policy:** the held-out split of prior rows (train.py seeds anchors from every
-   prior row, so held-out rows would set Emin(c)); the `gauss` anchor tile in `Modeller._noise_and_condition`; the
-   exact-density readouts (per-molecule NLL on held-out molecules, round-trip and reward-currency start-up checks,
-   exact cross-condition metrics, excess against the held-out floor).
+3. **Trainer additions useful to every policy:** the `gauss` anchor tile in `Modeller._noise_and_condition`; the
+   density readouts (per-molecule NLL on held-out molecules, the importance-weighted term, round-trip and
+   reward-currency start-up checks, cross-condition metrics, excess against the held-out floor), written against the
+   policy's density estimate (exact for the NF, `log_pf_estimate` for the SDE, owner 2026-10-27). Held-out data is
+   train.py's `test_molecules_path` (whole molecules); the INN's held-out split of rows within a molecule is not
+   ported. The INN's `updates_per_batch` and stored-row bank are covered by replay construction and maintenance.
+   Each addition only once the first ported runs show a need.
 4. **Retire `InnModeller`** once the ported flow reproduces it on one system (see Verification).
 
 ## What carries over unchanged (from the 2026-10-27 audit)

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import config_invariants as ci
 import config_snapshot as cs
 
 HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
@@ -23,7 +24,8 @@ CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 
 @pytest.fixture(scope='module')
 def raw():
-    return yaml.safe_load(CANONICAL.read_text(encoding='utf-8'))
+    # the sectioned model block resolved, as utils.load_yaml does
+    return ci.canonical_model_section(yaml.safe_load(CANONICAL.read_text(encoding='utf-8')))
 
 
 @pytest.fixture(scope='module')

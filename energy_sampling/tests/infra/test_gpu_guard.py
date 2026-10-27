@@ -312,7 +312,7 @@ def test_signature_agrees_across_dict_and_namespace():
     checked = 0
     loaded_args = None
     for path in cfgs:
-        d = yaml.safe_load(open(path, encoding='utf-8'))
+        d = G.read_config(path)   # the CLI's own read (the sectioned model block resolved)
         try:
             args = resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))
         except ValueError as e:
@@ -398,7 +398,7 @@ def test_conformer_signature_keys_the_policy_and_the_set():
               len(written) == 1 and a in written[0], str(written))
 
         # crystal: the canonical config's key must not see the new fields at all
-        mk = yaml.safe_load(open(os.path.join(_here, 'configs', 'mk_dev.yaml'), encoding='utf-8'))
+        mk = G.read_config(os.path.join(_here, 'configs', 'mk_dev.yaml'))
         sig = G.config_signature(mk)
         moved = copy.deepcopy(mk)
         moved.setdefault('model', {})['policy_kind'] = 'set'
