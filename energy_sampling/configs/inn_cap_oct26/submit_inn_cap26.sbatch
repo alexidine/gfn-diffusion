@@ -22,11 +22,19 @@
 # and l2 (f001_l, f01_l), one A100 each, the arms of a job at once under NVIDIA MPS, each at 0.9 x its memory weight / the job's sum.
 #
 # Read: Excess Energy Nats P50/P90 and Reasonable Sample Fraction on training molecules against eval_test's, eval_fwd/
-# jensen_z, eval_bwd/mle (train rows), eval_bwd/mle_heldout_rows, eval_test/mle, against steps, across fractions at one
+# jensen_z, eval_bwd/mle (the clean training rows, the anchors -- not the noised rows stage 1 fits), E/noised_* (the
+# draws' energy marginal against the buffer's at start-up), eval_bwd/mle_heldout_rows, eval_test/mle, against steps, across fractions at one
 # size and across sizes at one fraction. Locally (one block, size S) the 1% subset reached a training-molecule excess
 # P50 of 6.0 kT at 10k steps and the full set plateaued at 32.6 kT (20k steps).
 #
-# Flags are read when the job STARTS from common.args and the arms file (edit in place while queued). Submit all four
+# Prior construction (both stages): the prior buffer (--stored_source buffer): the training rows as anchors, a Gaussian
+# kick calibrated to 6 kT mean excess over the anchor, admitted under Emin(c) + ramp_floor, 4 rows per training
+# condition, churned at every eval. Stage 2 (COMMON=common_s2.args, arms_s2a.tsv: f1_s forward / pooled level;
+# arms_s2b.tsv: f1_l forward) runs from a full-set arm's best.pt on the same construction; submit_all.sh chains
+# s2a after job s and s2b after job l1 (--dependency=afterok).
+#
+# Flags are read when the job STARTS from common.args (or the file COMMON names) and the arms file (edit in place
+# while queued). Submit all six
 # with  bash submit_all.sh, or one with  sbatch --export=ALL,ARMS_TSV=arms_<s|m|l1|l2>.tsv submit_inn_cap26.sbatch
 # Outputs: artifacts/inn_proto/inn_cap26_<arm>/, wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
 # THERE IS NO RESUME. DRY_RUN=1 BATTERY_DIR=$(pwd) ARMS_TSV=arms_s.tsv bash submit_inn_cap26.sbatch prints every
@@ -46,8 +54,10 @@ BYTES=(13259723 2207012889 228547666)
 
 ARMS_FILE=${BATTERY}/${ARMS_TSV:-arms_s.tsv}
 if [ ! -f "${ARMS_FILE}" ]; then echo "FATAL: no arms file ${ARMS_FILE}" >&2; exit 1; fi
-ALL=$(awk -F'\t' '$1 == "ALL" {print $2}' ${BATTERY}/common.args)
-if [ -z "${ALL}" ]; then echo "FATAL: no ALL line in ${BATTERY}/common.args" >&2; exit 1; fi
+COMMON_FILE=${BATTERY}/${COMMON:-common.args}
+if [ ! -f "${COMMON_FILE}" ]; then echo "FATAL: no common flags file ${COMMON_FILE}" >&2; exit 1; fi
+ALL=$(awk -F'\t' '$1 == "ALL" {print $2}' ${COMMON_FILE})
+if [ -z "${ALL}" ]; then echo "FATAL: no ALL line in ${COMMON_FILE}" >&2; exit 1; fi
 
 # the arms: index, arm, flags, memory weight, description; each arm's share of the card is 0.9 x weight / the sum
 ARMS=()
@@ -75,6 +85,16 @@ if awk -v t="${TOTAL_SHARE}" 'BEGIN {exit !(t > 0.95)}'; then
 fi
 for A in "${ARMS[@]}"; do echo "${A}: python -u inn_modeller.py ${ARM_CMD[${A}]}"; done
 echo "memory shares sum to ${TOTAL_SHARE}"
+for A in "${ARMS[@]}"; do   # the common file must suit the arms: stage 1 has no --init_from, stage 2 has one
+    MS=$(echo "${ARM_CMD[${A}]}" | grep -o -- '--mle_steps [0-9]*' | tail -1 | cut -d' ' -f2)
+    CK=$(echo "${ARM_CMD[${A}]}" | grep -o -- '--init_from [^ ]*' | tail -1 | cut -d' ' -f2)
+    if [ -n "${CK}" ] && [ "${MS}" != "0" ]; then
+        echo "FATAL: arm ${A} has --init_from and a stage 1 (--mle_steps ${MS}): wrong COMMON for ${ARMS_FILE}?" >&2; exit 1
+    fi
+    if [ -z "${CK}" ] && [ "${MS}" = "0" ]; then
+        echo "FATAL: arm ${A} has no stage 1 (--mle_steps 0) and no --init_from: wrong COMMON for ${ARMS_FILE}?" >&2; exit 1
+    fi
+done
 if [ -n "${DRY_RUN:-}" ]; then exit 0; fi
 
 mkdir -p ${LOGS}
@@ -107,6 +127,15 @@ fi
 if ! grep -q "add_argument('--molecule_fraction'" ${WORKDIR}/inn_modeller.py || ! grep -q 'def subset_training_molecules' ${WORKDIR}/train.py; then
     echo "FATAL: gfn-diffusion predates --molecule_fraction -- git pull gfn-diffusion" >&2; exit 1
 fi
+if grep -q -- '--stored_source buffer' ${COMMON_FILE} ${ARMS_FILE} && ! grep -q 'def pbuf_ref_energy' ${WORKDIR}/inn_modeller.py; then
+    echo "FATAL: the arms read --stored_source buffer in stage 1, which this gfn-diffusion lacks or predates (pbuf_ref_energy) -- git pull gfn-diffusion" >&2; exit 1
+fi
+for A in "${ARMS[@]}"; do   # a stage-2 arm: its stage-1 run finished (final.pt) and left its best.pt
+    CK=$(echo "${ARM_CMD[${A}]}" | grep -o -- '--init_from [^ ]*' | tail -1 | cut -d' ' -f2)
+    if [ -n "${CK}" ] && { [ ! -s "${CK}" ] || [ ! -s "$(dirname "${CK}")/final.pt" ]; }; then
+        echo "FATAL: arm ${A}: its stage-1 run has no best.pt or did not finish (no final.pt beside '${CK}')" >&2; exit 1
+    fi
+done
 if ! grep -q '^SG_LOOKUP_TABLES = ' ${WORKDIR}/energies/molecular_crystal.py; then
     echo "FATAL: gfn-diffusion predates the start-up scoring fix (merge_batches and SG_LOOKUP_TABLES, c1fb45a4) -- git pull gfn-diffusion" >&2; exit 1
 fi
@@ -131,7 +160,7 @@ fi
   scontrol show job ${SLURM_JOB_ID}
   echo "nodelist: ${SLURM_NODELIST}  host: $(hostname)"
   echo "gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse HEAD 2>&1)  MXtalTools $(git -C ${PROJECT_ROOT}/MXtalTools rev-parse HEAD 2>&1)"
-  cat ${ARMS_FILE} ${BATTERY}/common.args
+  cat ${ARMS_FILE} ${COMMON_FILE}
 } > ${J}.info 2>&1
 
 stdbuf -oL nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,clocks_throttle_reasons.active,power.draw,temperature.gpu \
@@ -153,6 +182,7 @@ INNER=${J}_inner.sh
     echo 'export GFN_ALLOW_GPU_SHARING=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTHONUNBUFFERED=1'
     echo "python -c \"import mxtaltools.common.sym_utils as s; assert getattr(s, 'NIGGLI_TRICLINIC', True), 'Niggli triclinic penalty is OFF'\" || exit 1"
     echo "python -c \"import inn_modeller\" || { echo 'FATAL: inn_modeller does not import in this container' >&2; exit 1; }"
+    echo "python -c \"import inn_modeller as m; s, _ = m.calibrate_gauss_sigma(lambda x: (600 * x * x, 0.05), 6.0, 0.01); assert abs(s - 0.1) < 1e-3\" || { echo 'FATAL: the gauss-tile calibration check fails in this container' >&2; exit 1; }"
     echo "CUDA_VISIBLE_DEVICES=-1 python tests/models/test_inn_atom_tokens.py > ${LOGS}/preflight_${SLURM_JOB_ID}.log 2>&1 || { echo 'FATAL: the atom-token tests fail in this container (see preflight log)' >&2; exit 1; }"
     echo "python -c \"from data_processing.molecule_subset import molecule_u as u; assert u('mol_a') == 0.43388624636742484, u('mol_a')\" || { echo 'FATAL: data_processing.molecule_subset is missing or draws other subsets in this container' >&2; exit 1; }"
     echo 'FAIL=0; PIDS=(); NAMES=()'
