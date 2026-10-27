@@ -2080,13 +2080,16 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     return table_trace
 
 
-def pes_cartoon():
+def pes_cartoon(seed=42, distributions=('prior', 'equilibrium'), line_width=2.5, bare=False):
+    """Cartoon rugged 1-D potential V(x) with distributions drawn over it. seed: the sub-basins' draw (42 = the paper's
+    figure). distributions: any of 'prior' (cold, trapped in every basin) and 'equilibrium' (Boltzmann at kT 2.5); ()
+    draws V(x) alone. line_width: every curve's. bare: no text at all (axis titles and legend)."""
     # --- PES ---
     x = np.linspace(-6, 6, 2000)
     well_L = 8.0 * (1 - np.exp(-0.3 * (x + 2.5) ** 2))
     well_R = 9.5 * (1 - np.exp(-0.3 * (x - 2.5) ** 2))
     base = np.minimum(well_L, well_R) + 0.12 * x ** 2
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
 
     # Place sub-basins with controlled randomness. 20, down from 30: with only two distributions drawn
     # over the landscape, 30 wells made the figure read as noise rather than as a rugged PES.
@@ -2130,13 +2133,14 @@ def pes_cartoon():
     prior_c, eq_c = "#c44e52", "#4c72b0"
     rgba = lambda c, a: f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},{a})"
 
-    fig.add_trace(go.Scatter(x=x, y=V, line=dict(color="#555", width=2.5),
+    # bare: every one of the 2000 points drawn (plotly's line simplification leaves visible corners on thick lines)
+    fig.add_trace(go.Scatter(x=x, y=V, line=dict(color="#555", width=line_width, simplify=not bare),
                              name="V(x)", hoverinfo='skip'))
     # P is drawn on its own axis with the SAME span as V, so the tallest P peak meets the top of V's range
-    for p, c, name in ((p_cold, prior_c, "Prior Distribution"),
-                       (p_full, eq_c, "Equilibrium Distribution")):
+    curves = {'prior': (p_cold, prior_c, "Prior Distribution"), 'equilibrium': (p_full, eq_c, "Equilibrium Distribution")}
+    for p, c, name in (curves[k] for k in distributions):
         fig.add_trace(go.Scatter(x=x, y=p / p.max(), fill='tozeroy', fillcolor=rgba(c, 0.30),
-                                 line=dict(color=c, width=2.5), name=name, yaxis='y2'))
+                                 line=dict(color=c, width=line_width, simplify=not bare), name=name, yaxis='y2'))
 
     fig.update_layout(
         template="plotly_white",
@@ -2149,11 +2153,16 @@ def pes_cartoon():
         # P=0 on V's own zero line, so the two curves share a baseline. Titled on the right so which axis
         # is which is readable off the frame, with the curves themselves named in the legend.
         yaxis2=dict(overlaying='y', side='right', showticklabels=False, ticks='', showgrid=False,
-                    zeroline=False, range=[-0.03 / 0.65, 1 / 0.65], title_text="P(x)",
-                    title_font=dict(color=eq_c)),
+                    zeroline=False, range=[-0.03 / 0.65, 1 / 0.65], title_text="P(x)" if distributions else None,
+                    title_font=dict(color=curves[distributions[-1]][1] if distributions else eq_c)),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         margin=dict(l=60, r=60, t=60, b=50),
     )
+    if bare:
+        fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
+        fig.update_xaxes(title_text=None)
+        fig.update_yaxes(title_text=None)
+        fig.update_layout(yaxis2=dict(title_text=None))
     return fig
 
 
