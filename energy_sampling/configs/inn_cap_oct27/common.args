@@ -1,0 +1,15 @@
+# inn_cap_oct27 flags shared by every arm, read when a job STARTS (edit in place while queued). Tab-separated: name,
+# flags. The stage-1 (likelihood) recipe of inn_rc_oct25 on the qm9rc prior (rc_oct22, 114,817 training molecules,
+# 1,120,750 rows; held-out conditions 6,652 molecules), 50,000 steps on one cosine from 5e-4 for every arm (matched
+# data exposure), evals on 4,000 draws every 2,500 steps. An arm's flags (arms_*.tsv) come after these: later flags win.
+# The rows stage 1 fits are the prior buffer (--stored_source buffer), the construction stage 2 reads: the training
+# rows as anchors, each kicked by an isotropic Gaussian whose width is calibrated at start-up to a mean excess of
+# 6 kT over its anchor (buffers.anchor_buffer.tile gauss), admitted under Emin(c) + ramp_floor, up to 4 rows per
+# training condition by default, churned at every eval at mk_dev's rate (churn_batch_ref / mean_lifetime = 10 rows
+# per update, as train.py). Each arm sets --pbuf_rows_per_condition so that every buffer holds ~450k rows (1%: 400,
+# 10%: 40, full set: 4 per molecule): a row is drawn equally often in every arm and turns over at the same pace, so
+# the fraction axis does not also change how often the flow sees one noised row (the inn_cap26 runs redrew 4 rows
+# per molecule whole at every eval, and the small-fraction arms memorised them). An arm's 'rows' in arms_*.tsv are
+# its training rows, the anchors; stage 1 fits their noised cloud. Tag inn_cap27 (inn_cap26 is the earlier set).
+# configs/inn_cap_s2_oct27 is the chained stage 2 from each full-set arm's best.pt on the same construction.
+ALL	--config configs/mk_dev.yaml --tag inn_cap27 --prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_conditions.pt --test_molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_test_conditions.pt --set embedding_conditioning=true --set energy_config.temperature=6.9 --set energy_config.reward_range=null --set energy_config.energy_reference=seed_min --set checkpoints_dir=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints --set gpu_util_sample_period_s=10 --stored_source buffer --set buffer_device=cpu --set buffers.anchor_buffer.tile=gauss --gauss_excess_kT 6 --pbuf_rows_per_condition 4 --conditioner transformer --n_blocks 1 --n_bins 32 --tf_width 256 --tf_layers 4 --tf_heads 8 --context_dim 128 --context_hidden 512 --atom_node_dim 128 --atom_convs 3 --tied_derivatives --tied_factor 2 --min_bin_height 1e-5 --bank_frac 0 --atom_tokens --rows_per_molecule 1 --mle_steps 50000 --mle_batch 2048 --lr_mle 5e-4 --energy_steps 0 --eval_every 2500 --eval_samples 4000 --log_every 100 --util_target 0 --oom_retries 3 --max_minutes 2700

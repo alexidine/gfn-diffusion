@@ -36,7 +36,7 @@
 # Flags are read when the job STARTS from common.args (or the file COMMON names) and the arms file (edit in place
 # while queued). Submit all six
 # with  bash submit_all.sh, or one with  sbatch --export=ALL,ARMS_TSV=arms_<s|m|l1|l2>.tsv submit_inn_cap26.sbatch
-# Outputs: artifacts/inn_proto/inn_cap27_<arm>/ (stage 2: inn_cap27s2_<arm>/), wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
+# Outputs: artifacts/inn_proto/inn_cap26_<arm>/, wandb runs of the same names, joblogs/<arm>_<jobid>.trainlog.
 # THERE IS NO RESUME. DRY_RUN=1 BATTERY_DIR=$(pwd) ARMS_TSV=arms_s.tsv bash submit_inn_cap26.sbatch prints every
 # command and stops.
 module purge 2>/dev/null
