@@ -1,5 +1,5 @@
 # inn_cap_oct26 job l2 (sbatch --export=ALL,ARMS_TSV=arms_l2.tsv submit_inn_cap26.sbatch), read when the job
 # STARTS: size L on the 1% and 10% sets. Columns (tab-separated, 5): index, arm, flags (after common.args; later flags win), memory
 # weight (the arm's share of the card is 0.9 x weight / the job's sum), description.
-7	f001_l	--molecule_fraction 0.01 --tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5	1	size L (transformer 512 x 8, encoder 256 x 5), 1,105 molecules, 10,785 rows
-8	f01_l	--molecule_fraction 0.1 --tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5	1.4	size L, 11,452 molecules, 111,732 rows
+7	f001_l	--molecule_fraction 0.01 --tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5 --pbuf_rows_per_condition 400	1	size L (transformer 512 x 8, encoder 256 x 5), 1,105 molecules, 10,785 rows
+8	f01_l	--molecule_fraction 0.1 --tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5 --pbuf_rows_per_condition 40	1.4	size L, 11,452 molecules, 111,732 rows

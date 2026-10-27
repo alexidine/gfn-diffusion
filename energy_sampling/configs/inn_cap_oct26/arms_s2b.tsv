@@ -2,4 +2,4 @@
 # submit_inn_cap26.sbatch; submit_all.sh chains it, afterany, after stage-1 job l1 and it refuses to train unless that arm finished), read when the
 # job STARTS. Columns (tab-separated, 5): index, arm, flags (after common_s2.args; later flags win), memory weight
 # (the arm's share of the card is 0.9 x weight / the job's sum), description.
-22	f1_l_fwd	--tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5 --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_cap26_f1_l/best.pt --level_source fwd	1	stage 2 of f1_l (size L, full set): against the forward level
+22	f1_l_fwd	--tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5 --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_cap27_f1_l/best.pt --level_source fwd	1	stage 2 of f1_l (size L, full set): against the forward level
