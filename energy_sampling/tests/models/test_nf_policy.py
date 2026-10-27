@@ -315,3 +315,92 @@ def test_mk_dev_resolves_to_the_unsectioned_keys_the_sde_code_reads():
     assert cfg['policy']['kind'] == 'sde'
     for key in ('hold_dead_latent_rows', 'periodic_centroids', 'dplr_rank', 's_emb_dim', 'full_flow'):
         assert key in cfg['model'], key
+
+
+# -- the trainer's losses on a one-step trajectory -------------------------------------------------------------------
+
+def _bwd_coeffs(**on):
+    from types import SimpleNamespace
+    base = dict(freeze_policy=0, freeze_z=0, traj_grads=1, beta=10.0, vg_lb=0, vg_lme=0, pf_boost=0, db=0, subtb=0,
+                emp_z=0, tb=0, mle=0, loss_clip=-1)
+    return SimpleNamespace(**{**base, **on})
+
+
+@pytest.mark.parametrize('repeats', [1, 3])
+def test_the_backward_losses_are_their_hand_values_on_one_step(repeats):
+    """gflownet_losses.get_gfn_backward_loss on the NF policy: log P_F = log q(x | c), log P_B = 0, Z = the level head,
+    so terminal MLE is -log q (the Jensen bound at K = 1; the DReG 'exact' estimator over K identical deterministic
+    backward paths at K > 1), TB is beta * smooth_l1(log q + Z - log r), and the live stash the pooled VarGrad term
+    reads carries log q, 0 and log r."""
+    import torch.nn.functional as F
+    from gflownet_losses import get_gfn_backward_loss
+    pol = flow_policy(True, dead=(9,))
+    n = 5
+    c = torch.randn(n, 4).repeat_interleave(repeats, 0)
+    with torch.no_grad():
+        x = pol.get_traj_fwd(torch.zeros(n, 12), None, 0, c[::repeats], None)[0][:, 1]
+    x = x.repeat_interleave(repeats, 0)
+    log_r = torch.randn(n * repeats) * 5
+    log_q = pol.sampler.log_prob(x, c).detach()
+    z = pol.get_traj_bwd(x, None, c, None)[3][:, 0].detach()
+
+    loss, d = get_gfn_backward_loss(_bwd_coeffs(mle=1), x, pol, log_r, None, None, condition=c, repeats=repeats,
+                                    report_losses=True)
+    assert torch.allclose(d['log_pf'], log_q, atol=1e-5) and bool((d['log_pb'] == 0).all())
+    assert torch.allclose(d['mle'], -log_q.mean(), atol=1e-5) and torch.allclose(loss, -log_q.mean(), atol=1e-5)
+
+    beta = 10.0
+    tb_hand = beta * F.smooth_l1_loss(log_q + z - log_r, torch.zeros_like(log_r), reduction='none', beta=beta)
+    pol._stash_live_branches = True
+    loss, d = get_gfn_backward_loss(_bwd_coeffs(tb=1, beta=beta), x, pol, log_r, None, None, condition=c,
+                                    repeats=repeats, report_losses=True, condition_id=torch.arange(n * repeats))
+    assert torch.allclose(loss, tb_hand.mean(), atol=1e-4)
+    live = pol._live_bwd
+    assert torch.allclose(live['log_pf'].detach(), log_q, atol=1e-5) and bool((live['log_pb'] == 0).all())
+    assert torch.equal(live['log_r'], log_r) and live['log_pf'].requires_grad
+
+
+def test_the_forward_tb_is_its_hand_value_on_one_step():
+    """gflownet_losses.get_gfn_forward_loss on the NF policy: one draw x ~ q(. | c), log r scored on it, and TB =
+    beta * smooth_l1(log q(x | c) + Z - log r), with log q the flow's own density of the row it drew."""
+    import torch.nn.functional as F
+    from gflownet_losses import get_gfn_forward_loss
+    pol = flow_policy(True, dead=(9,))
+    n, beta = 6, 10.0
+    c = torch.randn(n, 4)
+    seen = {}
+
+    def log_reward_fn(x, mol_batch, log_T, return_exp, keep_grads=False):
+        seen['x'] = x.detach().clone()
+        return -(x ** 2).sum(-1) * 3
+
+    coeffs = _bwd_coeffs(tb=1, beta=beta, traj_grads=0, reward_grads=0, pooled_source=None, coeff_matrix=None)
+    loss, d = get_gfn_forward_loss(coeffs, torch.zeros(n, 12), pol, log_reward_fn, None, None, torch.zeros(n),
+                                   condition=c, report_losses=True)
+    x = seen['x']
+    log_q = pol.sampler.log_prob(x, c).detach()
+    z = pol.get_traj_bwd(x, None, c, None)[3][:, 0].detach()
+    log_r = -(x ** 2).sum(-1) * 3
+    tb_hand = beta * F.smooth_l1_loss(log_q + z - log_r, torch.zeros_like(log_r), reduction='none', beta=beta)
+    assert torch.allclose(loss, tb_hand.mean(), atol=1e-4)
+
+
+def test_a_state_dict_round_trip_restores_the_flow_and_its_scalers(tmp_path):
+    """A resume rebuilds the policy from its gfn_config and loads the state dict (checkpointing.py): the fitted
+    standardisers ride in it (scalers_fitted stays True, so train.py's fit_policy_data_scalers does not refit them on
+    the resumed run's data), and the restored flow scores every row as the saved one did."""
+    pol = flow_policy(True, dead=(9,))
+    torch.manual_seed(1)
+    pol.fit_data_scalers(torch.randn(200, 12) * 3 + 1, torch.randn(50, 4) * 2)
+    c = torch.randn(8, 4)
+    with torch.no_grad():
+        x = pol.get_traj_fwd(torch.zeros(8, 12), None, 0, c, None)[0][:, 1]
+        ref = pol.sampler.log_prob(x, c)
+    torch.save(pol.state_dict(), tmp_path / 'p.pt')
+
+    fresh = NFPolicy(gfn_config(True, dead=(9,)), SMALL, seed=7)
+    assert not bool(fresh.scalers_fitted)
+    fresh.load_state_dict(torch.load(tmp_path / 'p.pt'))
+    assert bool(fresh.scalers_fitted)
+    with torch.no_grad():
+        assert torch.allclose(fresh.sampler.log_prob(x, c), ref, atol=1e-5)
