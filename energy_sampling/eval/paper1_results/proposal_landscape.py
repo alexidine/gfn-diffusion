@@ -116,5 +116,5 @@ if __name__ == '__main__':
     emb = embed_bundles([bundle])
     xy = emb['draws'][0][rows]
     fig = proposal_fig(xy, basin, emb['refs'], [label] * len(np.atleast_2d(emb['refs'])))
-    fig.write_image(out, scale=1)
+    fig.write_image(out, width=fig.layout.width, height=fig.layout.height, scale=1)   # kaleido ignores the layout size
     print('wrote', out)
