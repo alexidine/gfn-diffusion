@@ -20,8 +20,12 @@ import math
 import pytest
 import torch
 
-from energies.fd_coordinates import FDCoordinates
-from mxtaltools.crystal_fd import canon, charts, measure
+# crystal_fd is in MXtalTools commits not yet on every checkout (the cluster's included): skip there, rather than
+# halting the whole lane at collection
+pytest.importorskip('mxtaltools.crystal_fd')
+
+from energies.fd_coordinates import FDCoordinates  # noqa: E402
+from mxtaltools.crystal_fd import canon, charts, measure  # noqa: E402
 
 F64 = torch.float64
 GROUPS = [1, 2, 7, 14, 92, 148]

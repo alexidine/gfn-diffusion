@@ -915,6 +915,10 @@ def get_problem_definition(args) -> dict:
     energy_config = _to_plain(args.energy_config)
     for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
         energy_config.pop(key, None)
+    # crystal_coordinates enters the identity only when off its default, as emb_cond below: the 'latent' state space
+    # is the one every existing run already has, and writing it would change their hash
+    if energy_config.get('crystal_coordinates', 'latent') == 'latent':
+        energy_config.pop('crystal_coordinates', None)
 
     definition = {
         # explicit schema version -- bump when adding/removing a field below
