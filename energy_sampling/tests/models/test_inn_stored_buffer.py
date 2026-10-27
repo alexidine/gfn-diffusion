@@ -22,7 +22,7 @@ pytestmark = pytest.mark.fast
 
 def _opts_host(**inn_over):
     inn = dict(stored_source='buffer', gauss_excess_kT=None, data_noise_log_range=None, grow_stored=False,
-               rows_per_molecule=1, w_mle=0.0, pbuf_rows_per_condition=2, energy_steps=2000, budget_minutes=None)
+               rows_per_molecule=1, w_mle=0.0, pbuf_rows_per_condition=2, mle_noise_log_range=None)
     inn.update(inn_over)
     host = object.__new__(im.InnModeller)
     host.inn = SimpleNamespace(**inn)
@@ -76,7 +76,7 @@ def test_the_gauss_excess_lies_under_the_admission_gate(excess):
     ('--rows_per_molecule', lambda h: setattr(h.inn, 'rows_per_molecule', 2)),
     ('--w_mle', lambda h: setattr(h.inn, 'w_mle', 0.1)),
     ('--pbuf_rows_per_condition', lambda h: setattr(h.inn, 'pbuf_rows_per_condition', 0)),
-    ('no energy stage', lambda h: setattr(h.inn, 'energy_steps', 0)),
+    ('--mle_noise_log_range', lambda h: setattr(h.inn, 'mle_noise_log_range', (-2.5, -1.5))),
     ('molecules_path == prior_path', lambda h: setattr(h.args, 'molecules_path', 'prior.pt')),
     ('seed_source', lambda h: setattr(h.args.buffers.anchor_buffer, 'seed_source', 'generated')),
     ('frozen false', lambda h: setattr(h.args.buffers.anchor_buffer, 'frozen', False)),
@@ -228,6 +228,7 @@ def _churn_host(counts, admit_every):
     host._expire_stale_prior_rows = lambda: None
     host.pbuf_refresh_pool = lambda: None
     host.pbuf_scored, host.energy_samples_scored, host._pbuf_mark = 0, 0, 0
+    host.pbuf_target = 2 * 3
     host.pbuf_window = dict(drawn=0, retired=0, churn_scored=0)
     return host
 
@@ -240,7 +241,7 @@ def test_churn_retires_at_the_configured_rate_and_refills_in_bounded_passes():
     torch.manual_seed(0)
     host.pbuf_churn()
     assert host.prior_churn['evicted'] == 6               # 1 update x 1000 / 100 = 10, capped at the 6 rows
-    assert len(host.asked) <= im.PBUF_REFILL_ROUNDS       # bounded
+    assert len(host.asked) <= 4 + im.PBUF_REFILL_ROUNDS   # bounded: 4 per fill cycle of deficit + the rounds
     assert len(host.asked) >= 2                           # a pass that left a deficit was followed by another
     assert sum(host.prior_buffer.counts[:3]) >= 5         # one pass alone would leave half the slots empty
     n_asked = len(host.asked)
@@ -278,13 +279,16 @@ def test_a_buffer_update_is_committed_only_once_it_steps():
     got = []
     host.prior_buffer = SimpleNamespace(update_losses=lambda losses, inds: got.append((losses, inds)))
     host.pbuf_updates = 0
-    host.commit_pbuf_step()                               # nothing pending: nothing written
+    host.commit_pbuf_step()                               # no draw: nothing counted, nothing written
     assert got == [] and host.pbuf_updates == 0
-    host._pbuf_pending = (torch.tensor([1.0, 2.0]), [3, 4])
+    host._pbuf_drawn, host._pbuf_pending = True, None     # a stage-1 update: counted, no ema_loss
     host.commit_pbuf_step()
-    assert len(got) == 1 and host.pbuf_updates == 1
+    assert got == [] and host.pbuf_updates == 1
+    host._pbuf_drawn, host._pbuf_pending = True, (torch.tensor([1.0, 2.0]), [3, 4])   # an energy-stage update
+    host.commit_pbuf_step()
+    assert len(got) == 1 and host.pbuf_updates == 2
     host.commit_pbuf_step()                               # committed once
-    assert len(got) == 1 and host.pbuf_updates == 1
+    assert len(got) == 1 and host.pbuf_updates == 2
 
 
 # -- the gauss tile ---------------------------------------------------------------------------

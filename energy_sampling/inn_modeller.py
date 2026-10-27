@@ -71,9 +71,9 @@ from train import (Modeller, adjust_fig_filesize, condition_tracker_figs, equipa
 from utils import get_train_args, is_cuda_oom
 
 # --stored_source buffer (InnModeller.init_inn_buffers): training rows per anchor-seed chunk; children requested per
-# prior-buffer fill cycle; refill passes per churn (each asks every deficit once); requested children with no admission
-# before a condition leaves the quota; the gauss tile's calibration pilot (rows, at most this many rounds, relative
-# tolerance, relative miss that raises)
+# prior-buffer fill call (pbuf_fill, at the start-up and every churn); calls a fill may make beyond 4 per cycle of
+# deficit; requested children with no admission before a condition leaves the quota; the gauss tile's calibration
+# pilot (rows, at most this many rounds, relative tolerance, relative miss that raises)
 ANCHOR_SEED_CHUNK = 131072
 PBUF_FILL_CYCLE = 20000
 PBUF_REFILL_ROUNDS = 4
@@ -1319,7 +1319,8 @@ class InnModeller(Modeller):
     # -- stored rows from train.py's anchor -> prior buffers (--stored_source buffer) --------
 
     def check_buffer_options(self):
-        """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on."""
+        """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on.
+        On this route both stages read the buffer: stage 1 fits its rows, stage 2 trains on them as stored rows."""
         inn, args = self.inn, self.args
         acfg = args.buffers.anchor_buffer
         tile = getattr(acfg, 'tile', 'iso')
@@ -1345,7 +1346,7 @@ class InnModeller(Modeller):
             (inn.rows_per_molecule > 1, "--rows_per_molecule > 1"),
             (inn.w_mle > 0, "--w_mle (its term reads the rows as stored)"),
             (inn.pbuf_rows_per_condition < 1, "--pbuf_rows_per_condition below 1"),
-            (inn.energy_steps <= 0 and inn.budget_minutes is None, "no energy stage (--energy_steps 0)"),
+            (inn.mle_noise_log_range is not None, "--mle_noise_log_range (stage 1 fits the buffer's rows)"),
             (str(args.molecules_path) == str(args.prior_path),
              "molecules_path == prior_path (the conditions would be the prior's rows, held-out ones included)"),
             (getattr(acfg, 'seed_source', None) != 'prior_dataset', "buffers.anchor_buffer.seed_source other than "
@@ -1406,9 +1407,7 @@ class InnModeller(Modeller):
         self.pbuf_target = k * int(self.pbuf_train_conds.numel())
         n0 = self.pbuf_scored
         t = time.perf_counter()
-        for _ in range(4 * math.ceil(self.pbuf_target / PBUF_FILL_CYCLE) + 4):   # bounded; also stops on no admission
-            if self.pbuf_top_up(PBUF_FILL_CYCLE) == 0:
-                break
+        self.pbuf_fill()
         fill_calls = self.pbuf_scored - n0
         self.energy_startup_calls += fill_calls
         if self._prior_buffer_len() == 0:
@@ -1437,13 +1436,19 @@ class InnModeller(Modeller):
     def check_buffer_reward_currency(self, n: int = 512, bar: float = 0.05):
         """A drawn buffer row's log R from its stored legs (prebuilt_sample_to_reward, what a stored-row update reads)
         against its latent rebuilt on its condition's mol_dataset molecule (what a fresh draw at that latent would
-        score): one chart and one currency."""
+        score): one chart and one currency; and the rows' stored condition ids against condition_samples' (what
+        stage 1's tensor draw reads)."""
         ef, pb = self.energy_function, self.prior_buffer
         graphs, inds, _ = pb.sample_graphs(n, replace=True)
         t = torch.as_tensor(inds, device=pb.x.device, dtype=torch.long)
         x = pb.x[t].to(self.device, torch.float32)
         graphs = graphs.to(self.device)
+        cid_stored = pb.batch.condition_id[t.to(pb.batch.condition_id.device)].long().flatten().cpu()
         graphs, log_T, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
+        if not torch.equal(cid_stored, cid.long().flatten().cpu()):
+            raise RuntimeError(f"buffer rows' stored condition ids differ from condition_samples' on "
+                               f"{int((cid_stored != cid.long().flatten().cpu()).sum())} of {cid.numel()} rows: "
+                               f"stage 1's tensor draw would condition them wrongly")
         stored = ef.prebuilt_sample_to_reward(graphs, 10 ** log_T).flatten().float().to(self.device)
         mol_batch, log_T_r, _, _ = self.mol_batch_for(cid.long().to(self.device))
         fresh = ef.log_reward(x, mol_batch, log_T_r, False, internal_oom_recovery=True).flatten().to(self.device)
@@ -1508,10 +1513,20 @@ class InnModeller(Modeller):
         return self.prior_churn['from_anchors'] - a0
 
     @torch.no_grad()
+    def pbuf_fill(self):
+        """Top up the deficits in calls of at most PBUF_FILL_CYCLE children (each scored as one batch), until none is
+        left or a call admits nothing. Bounded: at most 4 x ceil(deficit / PBUF_FILL_CYCLE) + PBUF_REFILL_ROUNDS calls,
+        the deficit counted against pbuf_target."""
+        deficit = max(0, int(self.pbuf_target) - self._prior_buffer_len())
+        for _ in range(4 * math.ceil(deficit / PBUF_FILL_CYCLE) + PBUF_REFILL_ROUNDS):
+            if self.pbuf_top_up(PBUF_FILL_CYCLE) == 0:
+                break
+
+    @torch.no_grad()
     def pbuf_churn(self):
         """At an eval: gate-staleness expiry (train.py's _expire_stale_prior_rows), then a uniform retirement of
         churn_batch_ref / mean_lifetime rows per energy-stage update that stepped since the last churn, then a
-        per-condition refill of at most PBUF_REFILL_ROUNDS passes, stopping at a pass that admits nothing; the
+        per-condition refill (pbuf_fill), stopping at a call that admits nothing; the
         starvation exclusion is cleared before each refill, so it binds within one refill and a condition is asked
         again at the next. Safe to retry (yielding): the retirement runs once per window, the refill on every call,
         and the children scored count once in energy/samples_total, a retried call's included."""
@@ -1531,30 +1546,49 @@ class InnModeller(Modeller):
             self.pbuf_refresh_pool()   # Emin(c) moves with the draws
         self._pbuf_off.zero_()
         self._pbuf_miss.zero_()
-        for _ in range(PBUF_REFILL_ROUNDS):   # the deficits: the retired, the expired, any left by an earlier refill
-            if self.pbuf_top_up(10 ** 9) == 0:
-                break
+        self.pbuf_fill()   # the deficits: the retired, the expired, any left by an earlier refill
         d = self.pbuf_scored - self._pbuf_mark
         self._pbuf_mark = self.pbuf_scored
         self.energy_samples_scored += d
         self.pbuf_window['churn_scored'] += d
 
+    def pbuf_ref_energy(self, n):
+        """Stage 1's reachable energy marginal on the buffer route: the energies (-T log R, stored legs) of n buffer
+        rows drawn uniformly at start-up (seed + 7), the reference of E/noised_*. No energy call."""
+        e = self._prior_row_energy().flatten()
+        e = e[torch.isfinite(e)]
+        g = torch.Generator(device='cpu').manual_seed(int(self.args.seed) + 7)
+        return e[torch.randint(0, e.numel(), (int(n),), generator=g)].double().numpy()
+
     def commit_pbuf_step(self):
-        """After an energy-stage update that stepped: its buffer rows' ema_loss (CrystalBuffer.update_losses) and the
-        update count the churn rate reads. A draw whose update did not step leaves neither."""
-        pend = getattr(self, '_pbuf_pending', None)
-        if pend is None:
+        """After an update that drew from the buffer and stepped: the update count the churn rate reads, and in the
+        energy stage its rows' ema_loss (CrystalBuffer.update_losses). A draw whose update did not step leaves
+        neither."""
+        if not getattr(self, '_pbuf_drawn', False):
             return
-        self._pbuf_pending = None
-        self.prior_buffer.update_losses(*pend)
+        self._pbuf_drawn = False
         self.pbuf_updates += 1
+        pend = getattr(self, '_pbuf_pending', None)
+        self._pbuf_pending = None
+        if pend is not None:
+            self.prior_buffer.update_losses(*pend)
 
     @torch.no_grad()
-    def pbuf_draw(self, n):
-        """n stored rows for an energy-stage update, uniform over the prior buffer's training rows: latents from the
-        buffer's x (gauge-fixed latent_params, this trainer's chart), log R recomposed from the stored legs at each
-        row's training temperature, condition ids from the row's own space group. No energy call."""
+    def pbuf_draw(self, n, reward: bool = True):
+        """n stored rows for an update, uniform over the prior buffer's training rows: latents from the buffer's x
+        (gauge-fixed latent_params, this trainer's chart), log R recomposed from the stored legs at each row's
+        training temperature, condition ids from the row's own space group. No energy call. reward False (stage 1)
+        takes the latents and the stored condition ids alone (CrystalBuffer.sample_tensors, no graph built; the
+        start-up currency check confirms those ids) and returns log R None."""
         ef, pb = self.energy_function, self.prior_buffer
+        if not reward:
+            x, _, _, inds = pb.sample_tensors(n, replace=True)
+            self.pbuf_inds = np.asarray(inds, dtype=np.int64)
+            t = torch.as_tensor(self.pbuf_inds, device=pb.batch.condition_id.device, dtype=torch.long)
+            cid = pb.batch.condition_id[t].long().flatten().to(self.device)
+            self._pbuf_pending = None
+            self._pbuf_drawn = True
+            return x.to(self.device, torch.float32), cid, self.training_log_T(cid.numel()), None
         graphs, inds, _ = pb.sample_graphs(n, replace=True)
         self.pbuf_inds = np.asarray(inds, dtype=np.int64)
         t = torch.as_tensor(self.pbuf_inds, device=pb.x.device, dtype=torch.long)
@@ -1563,8 +1597,10 @@ class InnModeller(Modeller):
         graphs, _, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
         cid = cid.long().to(self.device)
         log_T = self.training_log_T(cid.numel())
-        lr = ef.prebuilt_sample_to_reward(graphs, 10 ** log_T.to(graphs.device)).flatten().float().to(self.device)
+        lr = (ef.prebuilt_sample_to_reward(graphs, 10 ** log_T.to(graphs.device)).flatten().float().to(self.device)
+              if reward else None)
         self._pbuf_pending = None   # set by step_loss, committed by commit_pbuf_step once the update steps
+        self._pbuf_drawn = True
         return x, cid, log_T, lr
 
     def _stratified_anchor_draw(self, per_condition):
@@ -1796,7 +1832,9 @@ class InnModeller(Modeller):
             self.stored_ema = torch.full((self.n_prior_rows,), float('nan'), device=self.device)
             self.mle_val_hist = []
             self.noised_ref_energy = (self.score_noised_reference(4 * int(inn.eval_samples))
-                                      if inn.mle_noise_log_range is not None and inn.mle_steps > 0 else None)
+                                      if inn.mle_noise_log_range is not None and inn.mle_steps > 0 else
+                                      self.pbuf_ref_energy(4 * int(inn.eval_samples))
+                                      if self.pbuf_on and inn.mle_steps > 0 else None)
             self.rows = self.scored = self.scored_d = None
             self.reset_window()
             t0 = self.t_loop0 = time.time()
@@ -1894,7 +1932,7 @@ class InnModeller(Modeller):
                         opt.zero_grad(set_to_none=True)
                         return stats, False, level
                     opt.step()
-                    if stage == 'energy' and self.pbuf_on:
+                    if self.pbuf_on:
                         self.commit_pbuf_step()
                     return stats, True, level
 
@@ -2358,10 +2396,10 @@ class InnModeller(Modeller):
     def step_loss(self, stage, log_z):
         inn = self.inn
         stats = {}
-        buf = stage == 'energy' and getattr(self, 'pbuf_on', False)
-        if buf:   # --stored_source buffer: the prior buffer's rows and their stored log R, no energy call
-            idx = None
-            x_d, cid_d, log_T_d, lr_buf = self.pbuf_draw(self.batch_now['energy'])
+        buf = getattr(self, 'pbuf_on', False)
+        if buf:   # --stored_source buffer: both stages read the prior buffer's rows (log R from the stored legs, no
+            idx = None    # energy call; stage 1 reads no reward)
+            x_d, cid_d, log_T_d, lr_buf = self.pbuf_draw(self.batch_now[stage], reward=stage != 'mle')
             src_all = torch.zeros_like(cid_d)
         else:
             if inn.rows_per_molecule > 1:
@@ -2378,7 +2416,7 @@ class InnModeller(Modeller):
                 x_d = self.jitter(x_d, inn.mle_noise_log_range)
             mle = -self.sampler.log_prob(x_d, c_d).mean()
             stats['bwd/mle'] = stats['bwd/loss'] = float(mle.detach())
-            self.win['samples'] += idx.numel()
+            self.win['samples'] += x_d.shape[0]
             return stats, mle, log_z
 
         # A SCORED BATCH -- the fresh draws, and with noise the displaced stored rows -- costs the
@@ -2569,7 +2607,7 @@ class InnModeller(Modeller):
             cold_d = cold_d & (src_all == 0)
         self.note_step(cid[cold], log_r[cold], log_q.detach()[cold], level[cold], log_T.flatten()[cold],
                        cid_d[cold_d], lr_d[cold_d], log_q_d.detach()[cold_d], level_d[cold_d],
-                       x[cold], x_d[cold_d], feed_tracker=first)
+                       x[cold], x_d[cold_d], feed_tracker=first, feed_stored=first or not noised)
 
         # per-branch values under the trainer's names; rolling_stats smooths them with its own
         fwd_loss, bwd_loss = inn.w_fwd * fwd, inn.w_data * data + inn.w_mle * mle
@@ -2614,13 +2652,14 @@ class InnModeller(Modeller):
         return stats, loss, log_z
 
     def note_step(self, cid, log_r, log_q, level, log_T, cid_d, log_r_d, log_q_d, level_d, x, x_d,
-                  feed_tracker: bool = True):
+                  feed_tracker: bool = True, feed_stored=None):
         """This step's rows to the trainer's per-condition tracker, the way its losses feed it:
         the draws' log weights (level and level streams) and energies (the running minimum), and
         the stored rows' log weights (the backward level stream). Kept for rolling_stats too,
         with their latents. Either set may be empty (step_loss passes only rows at the run's own
         temperature). A reused scored batch (feed_tracker False) refreshes the kept rows only, so
-        the tracker counts each draw once."""
+        the tracker counts each draw once; feed_stored (default feed_tracker) does the same for the stored rows,
+        which are new every update unless they were displaced and scored once per scored batch."""
         cpu = lambda t: t.detach().cpu()
         cid, log_r, log_q, level, log_T, x = map(cpu, (cid, log_r, log_q, level, log_T, x))
         cid_d, log_r_d, log_q_d, level_d, x_d = map(cpu, (cid_d, log_r_d, log_q_d, level_d, x_d))
@@ -2629,7 +2668,7 @@ class InnModeller(Modeller):
             update_and_lookup_condition_log_z(tracker, cid, log_r, torch.zeros_like(log_q), log_q, 'cpu', step,
                                               log_Z_learned=level, mode_level_stream='fwd')
             update_condition_best_energy(tracker, cid, log_r, log_T)
-        if cid_d.numel() and feed_tracker:
+        if cid_d.numel() and (feed_tracker if feed_stored is None else feed_stored):
             tracker.update_mode_level('bwd', cid_d, log_r_d - log_q_d, step=step)
         self.rows = dict(step=step, cid=cid, log_r=log_r, log_q=log_q, level=level, x=x,
                          cid_d=cid_d, log_r_d=log_r_d, log_q_d=log_q_d, level_d=level_d, x_d=x_d)
@@ -2836,8 +2875,9 @@ class InnModeller(Modeller):
         mad = lambda v: float(1.4826 * (v - v.median()).abs().median())
         m.update(self.flow_buffer_stats())
         if self.noised_ref_energy is not None and self.step_ind <= self.inn.mle_steps:
-            # stage 1 fits the stored rows displaced by --mle_noise_log_range, so the reachable energy marginal is
-            # that of the displaced rows (scored once at start-up), not of the stored rows themselves
+            # stage 1 fits the stored rows displaced by --mle_noise_log_range (or, on the buffer route, the buffer's
+            # rows), so the reachable energy marginal is that of the rows it fits (taken once at start-up), not of
+            # the stored rows themselves
             from energies.conformer_eval_metrics import energy_marginal_overlap
             if not hasattr(self, '_w1_floor_cache'):
                 self._w1_floor_cache = {}
