@@ -776,6 +776,9 @@ class Modeller:
         translation gauge, held dead in the SDE); toys must NOT (every dim is
         real there -- the P1 delta-target fix, 2026-08-24).
         """
+        if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd':
+            # energy_config.crystal_coordinates 'fd': the state is crystal_fd's chart row s, not the latent
+            return self.energy_function.fd_rows_of(batch).to(batch.cell_lengths.device)
         return batch.latent_params(
             gauge_fix_free_axes=self.energy_function.is_crystal)
 
@@ -3204,6 +3207,13 @@ class Modeller:
         return atoms * (TrunkForce.atom_feature_dim(checkpoint) + 2)
 
     def _build_gfn_config(self):
+        fd = getattr(self.energy_function, 'fd_layout', None)
+        if fd is not None:  # energy_config.crystal_coordinates 'fd': the chart's width and circle rows, no dead rows
+            return dict(self._build_latent_gfn_config(), dim=fd.dim, angular_mask=list(fd.wrap_mask),
+                        periodic_centroid_axes=None, dead_latent_rows=None)
+        return self._build_latent_gfn_config()
+
+    def _build_latent_gfn_config(self):
         return dict(
             state_features_dim=self._state_features_dim(),
             dim=self.energy_function.data_ndim,

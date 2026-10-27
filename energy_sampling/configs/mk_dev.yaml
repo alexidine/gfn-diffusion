@@ -1346,6 +1346,7 @@ energy_config:
   mlip_max_packing_coeff: null  # mace only, needs implausible_energy_below: a cell whose packing coefficient is above this number is not handed to MACE; its physical energy is the magnitude of implausible_energy_below instead (MolecularCrystal.analyze_density_guarded), counted in energy/mlip_guarded_rows. null = every cell goes to MACE. Not part of the problem identity
   bounding_coeff: 10.0  # static (the old soft-start + terminal anneal was removed with the terminal-stage redesign)
   reduction_coeff: 10.0
+  crystal_coordinates: latent  # 'latent': the trainer latent; 'fd': crystal_fd's fundamental-domain chart in [-1, 1]^d (one space group, Z' = 1; energies/fd_coordinates.py)
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   physical_energy_clip: null # absolute crystal-energy cutoff above which the PHYSICAL leg is log-compressed (cutoff + log1p). Valid under lambda mixing (the flow leg is untouched); reward_range is not. Logs physical_clip_active_frac

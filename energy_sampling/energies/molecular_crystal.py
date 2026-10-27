@@ -24,6 +24,12 @@ from mxtaltools.mlip_interfaces.uma_utils import (init_uma_crystal_predictor,
                                                   drain_uma_phase_timing)
 
 
+#: MolecularCrystal(crystal_coordinates=...): the trainer latent, or crystal_fd's fundamental-domain chart
+CRYSTAL_COORDINATES = ('latent', 'fd')
+#: any radius: the FD chart's width and circle rows do not depend on it (only its length box does)
+FD_LAYOUT_RADIUS = 4.0
+
+
 def density_penalty(packing_coeff, turnover = 1):
     """
     draw crystals into the physically reasonable region
@@ -189,6 +195,7 @@ class MolecularCrystal(BaseSet):
                  prior_flow_path: Optional[str] = None,  # density proxy for the PRIOR POLICY, written by build_prior_flow.py
                  lambda_mix: float = 1.0,  # 1 = pure physical target; 0 = pure prior-flow target (the null test). Schedulable via balance.anneal_coeffs.
                  energy_reference: Optional[str] = None,  # 'seed_min': score the physical leg against each condition's lowest seed energy (set_energy_reference); None: no reference
+                 crystal_coordinates: str = 'latent',  # 'latent': x is the trainer latent; 'fd': x is crystal_fd's fundamental-domain chart in [-1, 1]^d (energies/fd_coordinates.py), Z' = 1 only
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -236,6 +243,18 @@ class MolecularCrystal(BaseSet):
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
         self.reduction_coeff = reduction_coeff
+        if crystal_coordinates not in CRYSTAL_COORDINATES:
+            raise ValueError(f"crystal_coordinates must be one of {CRYSTAL_COORDINATES}, got {crystal_coordinates!r}")
+        self.crystal_coordinates = crystal_coordinates
+        self._fd_charts = {}  # (sg, radius) -> FDCoordinates, built on first use
+        self.fd_layout = None
+        if crystal_coordinates == 'fd':
+            # the state is the chart of ONE space group (its width and circle rows are the group's); Z' = 1
+            if len(space_groups) != 1 or max(z_primes) != 1:
+                raise NotImplementedError(f"crystal_coordinates 'fd' needs one space group and Z' = 1, got "
+                                          f"space_groups={list(space_groups)}, z_primes={list(z_primes)}")
+            self.fd_layout = self.fd_coordinates_for(int(space_groups[0]), FD_LAYOUT_RADIUS)
+            self.data_ndim = self.fd_layout.dim
         self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
         self.max_z_prime = max_z_prime
@@ -558,11 +577,74 @@ class MolecularCrystal(BaseSet):
             - min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
         self.reward_clip = min_allowed_reward
 
+    def fd_coordinates_for(self, sg: int, radius: float):
+        """The FDCoordinates of space group ``sg`` at molecule radius ``radius`` (cached per pair)."""
+        from energies.fd_coordinates import FDCoordinates
+        key = (int(sg), round(float(radius), 6))
+        if key not in self._fd_charts:
+            self._fd_charts[key] = FDCoordinates(key[0], key[1])
+        return self._fd_charts[key]
+
+    def fd_rows_to_params(self, x, crystal_batch):
+        """crystal_coordinates 'fd': ([B, 12] cell parameters, [B] handedness, [B] log reference density on s) of
+        rows x [B, d] in [-1, 1], each through the chart of its own (space group, molecule radius); differentiable
+        in x. Raises for Z' > 1 or rows of different widths."""
+        if self.max_z_prime != 1:
+            raise NotImplementedError("crystal_coordinates 'fd' is Z' = 1 only")
+        sg = crystal_batch.sg_ind.reshape(-1).cpu()
+        radius = crystal_batch.radius.reshape(-1).detach().cpu()
+        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg.tolist(), radius.tolist())]
+        params = x.new_zeros(x.shape[0], 12)
+        hand = x.new_ones(x.shape[0])
+        log_ref = x.new_zeros(x.shape[0])
+        for key in sorted(set(keys)):
+            fc = self.fd_coordinates_for(*key)
+            rows = torch.tensor([i for i, k in enumerate(keys) if k == key], device=x.device)
+            xs = x[rows]
+            if xs.shape[1] < fc.dim or (xs.shape[1] > fc.dim and bool((xs[:, fc.dim:] != 0).any())):
+                raise ValueError(f'sg {key[0]}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
+                                 f'{xs.shape[1]}')
+            p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu())
+            params = params.index_copy(0, rows, p.to(x))
+            hand = hand.index_copy(0, rows, h.to(x))
+            log_ref = log_ref.index_copy(0, rows, lr.to(x))
+        return params, hand, log_ref
+
+    def fd_rows_of(self, batch) -> torch.Tensor:
+        """crystal_coordinates 'fd': [B, data_ndim] float32 chart rows s of a stored crystal batch (its cell
+        parameters and handedness; any description of each crystal), each through the chart of its own (space group,
+        molecule radius). Raises ValueError, with the statuses, if a row has no s (it does not canonicalise, or its
+        canonical cell is outside the length box): filter such rows out of the file first."""
+        params = batch.full_cell_parameters().detach().cpu()
+        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+        sg = batch.sg_ind.reshape(-1).cpu().tolist()
+        radius = batch.radius.reshape(-1).detach().cpu().tolist()
+        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg, radius)]
+        out = torch.zeros(len(keys), self.data_ndim, dtype=torch.float32)
+        for key in sorted(set(keys)):
+            fc = self.fd_coordinates_for(*key)
+            rows = torch.tensor([i for i, k in enumerate(keys) if k == key])
+            r = fc.from_params(params[rows], hand[rows])
+            if not bool(r.ok.all()):
+                from collections import Counter
+                bad = Counter(st for st, ok in zip(r.status, r.ok.tolist()) if not ok)
+                raise ValueError(f'sg {key[0]}: {int((~r.ok).sum())} of {len(rows)} stored rows have no FD chart '
+                                 f'point ({dict(bad)})')
+            out[rows, :fc.dim] = r.s.float()
+        return out
+
     def instantiate_crystals(self, x, mol_batch):
         if self.computes_require_cluster:
             crystal_batch = self.init_blank_crystal_batch(mol_batch)
         else:
             crystal_batch = mol_batch.clone()
+        if self.crystal_coordinates == 'fd':  # canonical crystals by construction: no clamp, no crystal-system step
+            params, hand, log_ref = self.fd_rows_to_params(x, crystal_batch)
+            crystal_batch.set_cell_parameters(params)
+            crystal_batch.aunit_handedness = hand.reshape(crystal_batch.aunit_handedness.shape).to(
+                crystal_batch.aunit_handedness.dtype)
+            crystal_batch.fd_log_reference = log_ref
+            return crystal_batch
         crystal_batch.latent_to_cell_params(x)
         if self.max_z_prime > 1:
             # Aunit labelling is a gauge: relabelling the z' units describes the same
@@ -1049,6 +1131,11 @@ class MolecularCrystal(BaseSet):
         # stops being log 2 per dim.
         if not self.is_crystal or self.latent_energy:
             jacobian_energy = torch.zeros_like(bounding_energy)
+        elif self.crystal_coordinates == 'fd':
+            # the same change of measure, from Lebesgue on the FD chart's s to the reference measure (Haar
+            # orientation, fractional centre x Z' log V, the latent's cell measure): fd_coordinates.log_reference
+            jacobian_energy = -temperature * crystal_batch.fd_log_reference
+            ens_dict['jacobian_energy'] = jacobian_energy
         else:
             jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)
             ens_dict.update(jacobian_components)
