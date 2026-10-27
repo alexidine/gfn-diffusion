@@ -218,3 +218,73 @@ def test_bounded_rows_linear_bounds_every_live_unwrapped_row():
     assert bool((states[:, 1].abs() <= 1 + 1e-6).all())
     with pytest.raises(NotImplementedError):
         flow_policy(True, bounded_rows='linear')
+
+
+# -- the config audit's fixes (2026-10-27) -------------------------------------------------------------------------
+
+def test_unset_settings_resolve_per_route_as_the_inn_does():
+    from models.flow_policy import FLOW_DEFAULTS, Z1_ORDER, resolve_flow_settings
+    u = resolve_flow_settings(FLOW_DEFAULTS, False, list(range(12)))
+    assert (u['bounded_rows'], u['min_bin_height'], u['tied_derivatives'], u['tied_factor'], u['block_orders']) == \
+        ('linear', 1e-7, True, 2.0, Z1_ORDER)
+    assert resolve_flow_settings(FLOW_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
+    c = resolve_flow_settings(FLOW_DEFAULTS, True, list(range(12)))
+    assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == (None, None, False, None)
+    n = resolve_flow_settings({**FLOW_DEFAULTS, 'bounded_rows': 'none', 'block_orders': 'none'}, False, list(range(12)))
+    assert n['bounded_rows'] is None and n['block_orders'] is None
+
+
+def test_scrambled_conditions_train_the_blocks_and_not_the_condition_encoder():
+    pol = flow_policy(True)
+    x = torch.rand(6, 12) * 2 - 1
+    _, log_pfs, _, _ = pol.get_traj_bwd(x, None, torch.randn(6, 4), None, scramble_condition_tiles=2)
+    log_pfs.sum().backward()
+    assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in pol.conditions_embedding_model.parameters())
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in pol.forward_policy.parameters())
+
+
+def test_freezing_p_b_on_a_policy_without_one_is_a_no_op(capsys):
+    from copy import deepcopy
+    from train import Modeller
+    host = object.__new__(Modeller)
+    host.gfn_model = flow_policy(True)
+    host.ema_model = deepcopy(host.gfn_model)
+    for mode in ('full', 'head', None):
+        host.set_pb_freeze(mode)
+    assert 'no learned P_B' in capsys.readouterr().out
+
+
+def test_a_resume_refuses_a_checkpoint_of_another_policy():
+    from types import SimpleNamespace
+    from checkpointing import Checkpointer
+    ck = object.__new__(Checkpointer)
+    flow_entry = {'policy': {'kind': 'flow', 'flow': SMALL, 'seed': 1}}
+    ck.modeller = SimpleNamespace(_policy_entry=lambda: flow_entry, args=SimpleNamespace(model=SimpleNamespace()))
+    with pytest.raises(ValueError, match="policy in this run's config"):
+        ck._gfn_config_from({'gfn_config': gfn_config()})                       # an SDE checkpoint, a flow run
+    ck.modeller = SimpleNamespace(_policy_entry=lambda: {}, args=SimpleNamespace(model=SimpleNamespace()))
+    with pytest.raises(ValueError, match="policy in this run's config"):
+        ck._gfn_config_from({'gfn_config': gfn_config() | flow_entry})          # a flow checkpoint, an SDE run
+
+
+def test_flow_runs_refuse_sde_only_settings_at_load():
+    import copy
+    import yaml
+    import config_invariants as ci
+    cfg = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
+    rule = ci.flow_policy_refuses_sde_only_settings
+    assert rule(cfg) == []                                                       # kind sde: nothing judged
+    f = copy.deepcopy(cfg)
+    f['policy']['kind'] = 'flow'
+    assert [v.detail for v in rule(f)] and all('gradient_norm_clip' in v.detail for v in rule(f))
+    f['gradient_norm_clip'] = 10.0
+    for proto in ('unconditional_tb', 'conditional_vargrad'):                   # both canonical protocols are clean
+        f['protocol'] = proto
+        assert rule(f) == []
+    g = copy.deepcopy(f)
+    g['compile_policy'] = True
+    g['protocols'][g['protocol']]['stages'][0].setdefault('loss_coeffs', {})['bwd'] = {'tbc': 1.0, 'repeats': 4}
+    g['protocols'][g['protocol']]['stages'][0].setdefault('on_enter', []).append('set_traj_checkpoint:true')
+    found = ' | '.join(v.detail for v in rule(g))
+    for needle in ('compile_policy', 'bwd tbc', 'bwd repeats', 'set_traj_checkpoint'):
+        assert needle in found, needle

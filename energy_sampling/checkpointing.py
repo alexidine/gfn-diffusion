@@ -753,6 +753,16 @@ class Checkpointer:
         every arm as the control. Changes print, so a silent miss can't happen.
         """
         config = dict(checkpoint['gfn_config'])
+        # the policy is architecture: the stored entry decides what loads, so a run asking for another kind or other flow
+        # settings would silently train the checkpoint's (an SDE checkpoint carries no entry)
+        entry = getattr(self.modeller, '_policy_entry', None)
+        asked = (entry() if entry is not None else {}).get('policy')
+        held = config.get('policy')
+        strip = lambda e: None if e is None else {k: v for k, v in e.items() if k != 'seed'}
+        if strip(asked) != strip(held):
+            raise ValueError(f"policy in this run's config {strip(asked) or {'kind': 'sde'}} differs from the "
+                             f"checkpoint's {strip(held) or {'kind': 'sde'}}: the checkpoint's policy is what would "
+                             f"load and train")
         current = vars(self.modeller.args.model)
         # the state encoder is architecture: the checkpoint's is the one that loads, so a run asking for
         # another would silently train as the checkpoint's arm

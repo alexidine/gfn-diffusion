@@ -1035,6 +1035,19 @@ def test_an_energy_reference_with_temperature_conditioning_is_an_error(canonical
     assert _fires(cfg, 'energy_reference_is_consistent')
 
 
+def test_a_flow_policy_refuses_sde_only_settings(canonical):
+    """Under policy.kind flow an SDE-only setting refuses at load; the canonical keys pass once the auto clip (fitted
+    to SDE gradients) is given a number. Full coverage: tests/models/test_flow_policy.py."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'flow_policy_refuses_sde_only_settings')      # kind sde
+    cfg['policy']['kind'] = 'flow'
+    assert _fires(cfg, 'flow_policy_refuses_sde_only_settings')          # gradient_norm_clip auto
+    cfg['gradient_norm_clip'] = 10.0
+    assert not _fires(cfg, 'flow_policy_refuses_sde_only_settings')
+    cfg['compile_policy'] = True
+    assert _fires(cfg, 'flow_policy_refuses_sde_only_settings')
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check

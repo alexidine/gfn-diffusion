@@ -3297,6 +3297,10 @@ class Modeller:
         mode = {True: 'full', False: None}.get(mode, mode)
         if mode not in (None, 'head', 'full'):
             raise ValueError(f"freeze_backward_policy must be false, 'head' or 'full'/true, got {mode!r}")
+        if not any(True for _ in self.gfn_model.backward_policy.parameters()):
+            # a policy whose P_B is fixed by construction (models/flow_policy.py: log P_B = 0) has nothing to freeze
+            print(f"freeze_backward_policy={mode}: this policy has no learned P_B -- nothing to freeze")
+            return
         models = (self.gfn_model, self.ema_model)
         if mode is None:
             for model in models:

@@ -26,18 +26,47 @@ import torch.nn as nn
 from models.architectures import LearnableScalar
 from models.spline_flow import ConditionalLatentFlow, LatentFlow
 
-# the flow's settings, as inn_modeller.py's flags of the same names (its recipe defaults where it has one)
+# the flow's settings: inn_modeller.py's flags of the same names, with its defaults, so policy.kind flow reproduces
+# its flow. 'auto' / None are resolved per route as it resolves them (resolve_flow_settings)
 FLOW_DEFAULTS = dict(
     conditioner='transformer',      # 'transformer' (causal transformer) or 'made'
-    n_blocks=1, n_bins=32, bound=1.0,
+    n_blocks=1, n_bins=32, bound=5.0,
     hidden=512, hidden_layers=2,    # the MADE conditioner's width and depth
-    tf_width=256, tf_layers=4, tf_heads=8, tf_norm='layer', tf_fp32=True,
+    tf_width=256, tf_layers=4, tf_heads=8, tf_norm='layer', tf_fp32=False,
     context_dim=128, context_hidden=512,
     atom_tokens=False, atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
-    min_bin_height=None, min_bin_height_rows='uniform',
-    tied_derivatives=True, tied_factor=2.0,
-    bounded_rows=None,              # None, or 'linear': every live unwrapped row modelled on the closed [-1, 1]
+    min_bin_height='auto', min_bin_height_rows='all',
+    tied_derivatives=None, tied_factor=None,
+    bounded_rows='auto',            # 'auto', 'none'/None, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
+    block_orders='auto',            # 'auto', 'none'/None, or one order per block: 'id', 'rev' or rows '8.11.10...'
+    fold_half_rows=None,            # rows '7,8' whose distribution repeats every half period
+    mix_k=0,                        # > 0: a mixture-of-logistics block of k components (unconditional)
 )
+# as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
+UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0)
+Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
+
+
+def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
+    """inn_modeller.py::resolve_auto_options for a fresh build: an unset setting takes the unconditional route's
+    default, or off on a conditional policy; block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose
+    live rows are exactly 0-11 (the Z' = 1 crystal latent's own rows), else the alternating orders."""
+    s = dict(s)
+    for key in ('bounded_rows', 'min_bin_height', 'block_orders'):
+        if s[key] == 'none':
+            s[key] = None
+    if s['bounded_rows'] == 'auto':
+        s['bounded_rows'] = None if conditional else UNCONDITIONAL_DEFAULTS['bounded_rows']
+    if s['min_bin_height'] == 'auto':
+        s['min_bin_height'] = None if conditional else UNCONDITIONAL_DEFAULTS['min_bin_height']
+    if s['tied_derivatives'] is None:
+        s['tied_derivatives'] = False if conditional else UNCONDITIONAL_DEFAULTS['tied_derivatives']
+    if s['tied_factor'] is None:
+        s['tied_factor'] = 2.0
+    if s['block_orders'] == 'auto':
+        z1 = not conditional and int(s['n_blocks']) == 1 and list(live_rows) == list(range(12))
+        s['block_orders'] = Z1_ORDER if z1 else None
+    return s
 
 
 def build_policy(gfn_config: dict):
@@ -84,7 +113,6 @@ class FlowPolicy(nn.Module):
         if unknown:
             raise KeyError(f"unknown flow settings {sorted(unknown)}; known: {sorted(FLOW_DEFAULTS)}")
         s = {**FLOW_DEFAULTS, **flow}
-        self.settings = s
         probe = GFN(**gfn_config)   # geometry only
         self.device = probe.device
         self.dim = int(probe.dim)
@@ -100,6 +128,8 @@ class FlowPolicy(nn.Module):
         self.live_dim = int(probe.live_dim)
         self.register_buffer('_dead_values', probe._dead_values.clone(), persistent=False)
         del probe
+        s = resolve_flow_settings(s, self.conditional, self.live_idx.tolist())
+        self.settings = s
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
 
@@ -107,12 +137,22 @@ class FlowPolicy(nn.Module):
         transformer = ((s['tf_width'], s['tf_layers'], s['tf_heads'], s['tf_norm'])
                        if s['conditioner'] == 'transformer' else None)
         shape = (s['n_blocks'], s['n_bins'], (s['hidden'],) * s['hidden_layers'], s['bound'])
+        bounded = []
+        if s['bounded_rows'] == 'linear':
+            dead = set(int(r) for r in self.dead_rows)
+            bounded = [i for i in range(self.dim) if i not in dead and not wrap_mask[i]]
+        elif s['bounded_rows'] is not None:
+            bounded = [int(r) for r in str(s['bounded_rows']).split(',')]
+        orders = str(s['block_orders']).split(',') if s['block_orders'] is not None else None
+        half_rows = [int(r) for r in str(s['fold_half_rows']).split(',')] if s['fold_half_rows'] else []
+        if s['mix_k'] and s['tied_derivatives']:
+            raise NotImplementedError("flow tied_derivatives with mix_k")
         if self.conditional:
+            if bounded or orders is not None or half_rows or s['mix_k']:
+                raise NotImplementedError("flow bounded_rows, block_orders, fold_half_rows and mix_k are built for "
+                                          "unconditional policies only (as inn_modeller.py)")
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial']) if s['atom_tokens'] else None)
-            if s['bounded_rows'] is not None:
-                raise NotImplementedError("flow bounded_rows on a conditional policy (ConditionalLatentFlow has no "
-                                          "bounded rows yet)")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             cond_dim = 1 if atoms is not None else self.conditions_dim
@@ -126,14 +166,9 @@ class FlowPolicy(nn.Module):
                 embed['atom_encoder'] = self.sampler.flow.atom_encoder
             self.conditions_embedding_model = embed
         else:
-            bounded = []
-            if s['bounded_rows'] == 'linear':
-                dead = set(int(r) for r in self.dead_rows)
-                bounded = [i for i in range(self.dim) if i not in dead and not wrap_mask[i]]
-            elif s['bounded_rows'] is not None:
-                raise ValueError(f"flow bounded_rows {s['bounded_rows']!r}: null or 'linear'")
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
-                                      transformer=transformer, bounded_rows=bounded)
+                                      transformer=transformer, block_orders=orders, half_rows=half_rows,
+                                      bounded_rows=bounded, mix_k=int(s['mix_k']))
             self.flow_model = LearnableScalar(0.0)
             blocks = self.sampler.flow.blocks
             self.conditions_embedding_model = _Empty()
@@ -209,7 +244,7 @@ class FlowPolicy(nn.Module):
     def _scramble(self, c, n, k):
         """train.py's scramble_conditions on a one-step flow: the condition rows permuted tile-wise (tile size k), so
         likelihood training learns the unconditional mixture; as GFN._maybe_scramble_condition_embedding, the
-        conditioner's output is not trained through the scrambled rows (the context is detached by the caller)."""
+        condition's encoder is not trained through the scrambled rows (_one_step detaches the context when k > 0)."""
         if k <= 0 or c is None:
             return c
         if n % k:
@@ -237,10 +272,11 @@ class FlowPolicy(nn.Module):
 
     # -- the trajectory interface ---------------------------------------------------------------------------------
 
-    def _one_step(self, s0, x, c, freeze_policy, return_gauss_params, ctx=None):
+    def _one_step(self, s0, x, c, freeze_policy, return_gauss_params, scrambled: bool = False):
         n = x.shape[0]
         with (torch.no_grad() if freeze_policy else contextlib.nullcontext()):
-            log_q = self.sampler.log_prob(x, c) if self.conditional else self.sampler.log_prob(x)
+            log_q = (self.sampler.log_prob(x, c, detach_context=scrambled) if self.conditional
+                     else self.sampler.log_prob(x))
         if freeze_policy:
             log_q = log_q.detach()
         states = torch.stack([s0.to(x.dtype), x], 1)
@@ -276,7 +312,7 @@ class FlowPolicy(nn.Module):
         x = self._pin_dead(self._wrap_ang(terminal_state.detach().to(self.device, torch.float32)))
         c = self._scramble(self._context(condition, mol_batch, n), n, scramble_condition_tiles)
         s0 = torch.zeros_like(x)
-        return self._one_step(s0, x, c, freeze_policy, return_gauss_params)
+        return self._one_step(s0, x, c, freeze_policy, return_gauss_params, scrambled=scramble_condition_tiles > 0)
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch, return_gauss_params: bool = False,
                         freeze_policy: bool = False, scramble_condition_tiles: int = 0, resample_last_k: int = 0,
@@ -287,7 +323,7 @@ class FlowPolicy(nn.Module):
         x = self._pin_dead(self._wrap_ang(trajectory[:, -1].detach().to(self.device, torch.float32)))
         c = self._scramble(self._context(condition, mol_batch, n), n, scramble_condition_tiles)
         return self._one_step(trajectory[:, 0].detach().to(self.device, torch.float32), x, c, freeze_policy,
-                              return_gauss_params)
+                              return_gauss_params, scrambled=scramble_condition_tiles > 0)
 
     # -- P_B snapshots and the SDE-only calls ------------------------------------------------------------------------
 

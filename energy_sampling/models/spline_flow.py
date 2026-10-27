@@ -500,9 +500,11 @@ class ConditionalLatentFlow(nn.Module):
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
                                  n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms)
 
-    def to_base(self, x, c):
+    def to_base(self, x, c, detach_context: bool = False):
         f = self.flow
         ctx = f.context_input(c)[0]
+        if detach_context:   # the blocks train, the condition's encoder does not (scramble_conditions)
+            ctx = tuple(t.detach() for t in ctx) if isinstance(ctx, tuple) else ctx.detach()
         x = x[:, self.live_idx]
         z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
         ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
@@ -511,9 +513,9 @@ class ConditionalLatentFlow(nn.Module):
             ld = ld + l
         return z, ld
 
-    def log_prob(self, x, c):
+    def log_prob(self, x, c, detach_context: bool = False):
         f = self.flow
-        z, ld = self.to_base(x, c)
+        z, ld = self.to_base(x, c, detach_context=detach_context)
         zl = z[:, ~f.is_wrap]
         base = (-math.log(2.0) * int(f.is_wrap.sum())
                 - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])

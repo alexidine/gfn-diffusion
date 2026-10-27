@@ -1038,6 +1038,63 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
     return out
 
 
+# keys that act only through the SDE policy's machinery; under policy.kind flow each is inert, raises mid-run, or
+# (gradient_norm_clip auto) derives a value from SDE quantities. key -> the values a flow run may carry
+FLOW_REFUSED_GLOBALS = {
+    'compile_policy': (False, None),
+    'traj_checkpoint': (False, None),
+    'model.full_flow': (False, None),
+    'model.force_drift_fwd': (False, None, 0),
+    'model.force_drift_bwd': (False, None, 0),
+    'model.state_atoms': (0, None, False),
+    'model.state_force_input': (False, None),
+}
+# per-branch loss coefficients a flow run must leave at 0 (or the stated value), resolved through each stage
+FLOW_ZERO_COEFFS = {'fwd': ('subtb', 'db', 'exploration_std', 'traj_grads', 'path_grad_last_k', 'reward_grads'),
+                    'bwd': ('subtb', 'db', 'tbc'),
+                    'replay': ('subtb', 'db', 'stored_force_k', 'resample_last_k', 'reward_grads')}
+FLOW_REFUSED_ACTIONS = ('set_traj_checkpoint',)
+
+
+def flow_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
+    """Under policy.kind flow (models/flow_policy.py: a one-step policy, log P_B = 0, no time grid, no drift or
+    variance heads, no force terms) the SDE-only settings refuse at load: each would otherwise sit in the run's config
+    looking live while doing nothing (compile_policy, traj_checkpoint, the force and state-atom keys, full_flow, tbc,
+    backward repeats > 1, db as a second TB), raise at its first use mid-run (subtb, the forward path-gradient keys,
+    replay stored forces and resampling), or derive a value from SDE quantities (gradient_norm_clip auto: the (W, T)
+    rule fitted to SDE gradients). Absent policy block or kind sde: nothing to judge."""
+    if _get(cfg, 'policy.kind', 'sde') != 'flow':
+        return []
+    out = []
+    for key, ok in FLOW_REFUSED_GLOBALS.items():
+        v = _get(cfg, key)
+        if v not in ok:
+            out.append(Violation(ERROR, 'flow_policy_refuses_sde_only_settings',
+                                 f'{key} = {v!r} acts only through the SDE policy (allowed under policy.kind flow: {ok})'))
+    if _is_auto(_get(cfg, 'gradient_norm_clip', 'auto')):
+        out.append(Violation(ERROR, 'flow_policy_refuses_sde_only_settings',
+                             "gradient_norm_clip 'auto' is fitted to SDE gradients from (W, integrator.T): give the "
+                             "flow policy a number"))
+    for stage in active_stages(cfg) or [{}]:
+        name = stage.get('name', '(base)')
+        for mode, keys in FLOW_ZERO_COEFFS.items():
+            for key in keys:
+                v = _coeff(cfg, stage, mode, key)
+                if v not in (None, 0.0):
+                    out.append(Violation(ERROR, 'flow_policy_refuses_sde_only_settings',
+                                         f"stage '{name}': {mode} {key} = {v:g} is SDE-only (0 under policy.kind flow)"))
+        rep = _coeff(cfg, stage, 'bwd', 'repeats')
+        if rep is not None and rep > 1:
+            out.append(Violation(ERROR, 'flow_policy_refuses_sde_only_settings',
+                                 f"stage '{name}': bwd repeats = {rep:g}: a one-step policy's backward copies are "
+                                 f"identical (1 under policy.kind flow)"))
+        for act in list(stage.get('on_enter') or []) + list(stage.get('on_exit') or []):
+            if str(act).split(':')[0] in FLOW_REFUSED_ACTIONS:
+                out.append(Violation(ERROR, 'flow_policy_refuses_sde_only_settings',
+                                     f"stage '{name}': action {act!r} acts only on the SDE policy"))
+    return out
+
+
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     """Three Z-side keys are documented as UNCONDITIONAL-route settings and must
     be switched when the route is conditional.
@@ -2069,6 +2126,7 @@ RULES = (
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
     condition_draw_is_well_formed,
+    flow_policy_refuses_sde_only_settings,
     # the conformer route; each returns [] off energy_function conformer_torsions
     conformer_dplr_is_off_on_a_set,
     conformer_set_policy_is_conditioned,

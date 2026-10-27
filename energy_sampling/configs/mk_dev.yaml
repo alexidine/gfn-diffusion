@@ -368,18 +368,18 @@ model:
 # policy, and under kind 'flow' only the geometry it shares (wrapped and dead rows, conditioning)
 policy:
   kind: sde                    # 'sde' = models/gfn.py::GFN; 'flow' = models/flow_policy.py::FlowPolicy, the exact-density spline flow as a one-step policy (log P_B = 0)
-  flow:                        # FlowPolicy settings, read only under kind 'flow' (models/flow_policy.py FLOW_DEFAULTS has the same keys)
+  flow:                        # FlowPolicy settings, read only under kind 'flow' (models/flow_policy.py FLOW_DEFAULTS: the same keys and values, inn_modeller.py's flag defaults)
     conditioner: transformer   # 'transformer' (causal transformer) or 'made'
     n_blocks: 1
     n_bins: 32
-    bound: 1.0
+    bound: 5.0                 # the spline's tail bound on unbounded linear rows
     hidden: 512                # the MADE conditioner's width
     hidden_layers: 2
     tf_width: 256              # the transformer conditioner's width, layers, heads and norm
     tf_layers: 4
     tf_heads: 8
     tf_norm: layer
-    tf_fp32: true              # transformer layers in the input's precision (false = bf16)
+    tf_fp32: false             # true = transformer layers in the input's precision (false = bf16)
     context_dim: 128           # width of the condition context every block reads
     context_hidden: 512
     atom_tokens: false         # true: the condition is the molecule, its atoms encoded as tokens (needs molecule conditioning)
@@ -387,11 +387,14 @@ policy:
     atom_convs: 3
     atom_cutoff: 10.0
     atom_radial: 32
-    min_bin_height: null       # a floor on the spline's bin heights (null = the spline's 1e-3 x n_bins)
-    min_bin_height_rows: uniform
-    tied_derivatives: true     # knot derivatives tied to the neighbouring bin slopes
-    tied_factor: 2.0
-    bounded_rows: null           # null, or 'linear': every live unwrapped row modelled on the closed [-1, 1] (no tails, uniform base); unconditional policies only
+    min_bin_height: auto       # a floor on the spline's bin heights: auto (unconditional 1e-7, conditional the spline's own), none, or a number
+    min_bin_height_rows: all   # 'all' rows or the 'uniform'-base rows only
+    tied_derivatives: null     # knot derivatives tied to the neighbouring bin slopes: null = auto (unconditional true, conditional false)
+    tied_factor: null          # null = 2.0
+    bounded_rows: auto         # auto (unconditional 'linear', conditional none), none, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'; unconditional only
+    block_orders: auto         # auto (Z' = 1 latent, one block, unconditional: 8.11.10.9.7.6.5.4.3.2.1.0; else alternating), none, or one order per block; unconditional only. Set it explicitly on a chart whose rows mean something else
+    fold_half_rows: null       # rows '7,8' whose distribution repeats every half period; unconditional only
+    mix_k: 0                   # > 0: mixture-of-logistics blocks of k components; unconditional only
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
