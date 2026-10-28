@@ -308,10 +308,10 @@ class _ContextMADE(_MADE):
 
 
 class _ContextBlock(_Block):
-    """_Block whose conditioner is a _ContextMADE."""
+    """_Block whose conditioner is a _ContextMADE. Bounded rows as _Block's: the closed [-1, 1], no tails, no shift."""
 
-    def __init__(self, order, wrap_mask, n_bins, hidden, bound, context_dim):
-        super().__init__(order, wrap_mask, n_bins, hidden, bound)
+    def __init__(self, order, wrap_mask, n_bins, hidden, bound, context_dim, bounded_mask=None):
+        super().__init__(order, wrap_mask, n_bins, hidden, bound, bounded_mask)
         self.made = _ContextMADE(order, wrap_mask, hidden, n_bins, context_dim)
 
     def spline_params(self, x, ctx):
@@ -320,6 +320,11 @@ class _ContextBlock(_Block):
 
     def forward(self, x, ctx):
         shift, sp = self.spline_params(x, ctx)
+        if self.has_bounded:
+            z = x + torch.where(self.is_bounded, torch.zeros_like(shift), shift)
+            z = torch.where(self.is_wrap, _wrap(z), z)
+            y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height, self.tied)
+            return y, ld.sum(-1)
         z = x + shift
         z = torch.where(self.is_wrap, _wrap(z), z)
         y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
@@ -331,7 +336,12 @@ class _ContextBlock(_Block):
         x = torch.zeros_like(y)
         for _ in range(self.d):
             shift, sp = self.spline_params(x, ctx)
-            z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
+            if self.has_bounded:
+                z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height,
+                                      self.tied)
+                shift = torch.where(self.is_bounded, torch.zeros_like(shift), shift)
+            else:
+                z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
             x = torch.where(self.is_wrap, _wrap(z - shift), z - shift)
         return x
 
@@ -399,9 +409,14 @@ class _ContextFlow(nn.Module):
     """The blocks of a conditional flow, the condition's embedding, and the level head."""
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None, atoms=None):
+                 transformer=None, atoms=None, bounded_mask=None):
         super().__init__()
         d = len(wrap_mask)
+        # bounded dims (see _Block) are not standardised and take a uniform base, as wrapped dims do
+        bmask = [False] * d if bounded_mask is None else [bool(b) for b in bounded_mask]
+        self.register_buffer('is_bounded', torch.tensor(bmask, dtype=torch.bool), persistent=False)
+        self.register_buffer('unit_base', torch.tensor([bool(w) or b for w, b in zip(wrap_mask, bmask)],
+                                                       dtype=torch.bool), persistent=False)
         # atoms: AtomEncoder settings (dict). The condition is then the molecule itself: column 0 of c is the condition
         # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through
         self.atoms = atoms is not None
@@ -423,7 +438,7 @@ class _ContextFlow(nn.Module):
                 orders.append(torch.randperm(d, generator=g).tolist())
         self.orders = orders
         self.blocks = nn.ModuleList(
-            _ContextBlock(o, wrap_mask, n_bins, hidden, bound, context_dim) for o in orders)
+            _ContextBlock(o, wrap_mask, n_bins, hidden, bound, context_dim, bmask) for o in orders)
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
@@ -474,10 +489,11 @@ class _ContextFlow(nn.Module):
         return (self.context(s), tokens[inv], mask[inv]), s
 
     def set_scaler(self, x):
-        """Standardise the LINEAR dims only; wrapped dims must stay on the circle."""
+        """Standardise the LINEAR dims only; wrapped dims must stay on the circle, and bounded dims on their
+        interval."""
         mu, sd = x.mean(0), x.std(0).clamp_min(1e-4)
-        self.mu.copy_(torch.where(self.is_wrap, torch.zeros_like(mu), mu))
-        self.sd.copy_(torch.where(self.is_wrap, torch.ones_like(sd), sd))
+        self.mu.copy_(torch.where(self.unit_base, torch.zeros_like(mu), mu))
+        self.sd.copy_(torch.where(self.unit_base, torch.ones_like(sd), sd))
 
     def set_condition_scaler(self, c):
         self.c_mu.copy_(c.mean(0))
@@ -491,14 +507,19 @@ class ConditionalLatentFlow(nn.Module):
     """q(x | c): LatentFlow with every block reading an embedding of the condition vector c."""
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
-                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None):
+                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, bounded_rows=()):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
+        # bounded rows: linear rows modelled on the closed interval [-1, 1], as LatentFlow's
+        self.bounded_rows = [int(r) for r in bounded_rows]
+        if any(r not in live or wrap_mask[r] for r in self.bounded_rows):
+            raise ValueError(f"bounded_rows {self.bounded_rows}: each must be a live linear (unwrapped) row")
         self.dim = dim
         self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
-                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms)
+                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
+                                 bounded_mask=[i in self.bounded_rows for i in live])
 
     def to_base(self, x, c, detach_context: bool = False):
         f = self.flow
@@ -516,8 +537,8 @@ class ConditionalLatentFlow(nn.Module):
     def log_prob(self, x, c, detach_context: bool = False):
         f = self.flow
         z, ld = self.to_base(x, c, detach_context=detach_context)
-        zl = z[:, ~f.is_wrap]
-        base = (-math.log(2.0) * int(f.is_wrap.sum())
+        zl = z[:, ~f.unit_base]
+        base = (-math.log(2.0) * int(f.unit_base.sum())
                 - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])
         return base + ld
 
@@ -526,7 +547,7 @@ class ConditionalLatentFlow(nn.Module):
         f = self.flow
         dev, dtype = f.mu.device, f.mu.dtype
         ctx = f.context_input(c)[0]
-        z0 = torch.where(f.is_wrap, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
+        z0 = torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
         for blk in reversed(list(f.blocks)):

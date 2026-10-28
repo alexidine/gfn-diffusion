@@ -49,14 +49,14 @@ Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
 
 def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
     """inn_modeller.py::resolve_auto_options for a fresh build: an unset setting takes the unconditional route's
-    default, or off on a conditional policy; block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose
+    default, or off on a conditional policy (bounded_rows excepted: 'linear' on both); block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose
     live rows are exactly 0-11 (the Z' = 1 crystal latent's own rows), else the alternating orders."""
     s = dict(s)
     for key in ('bounded_rows', 'min_bin_height', 'block_orders'):
         if s[key] == 'none':
             s[key] = None
-    if s['bounded_rows'] == 'auto':
-        s['bounded_rows'] = None if conditional else UNCONDITIONAL_DEFAULTS['bounded_rows']
+    if s['bounded_rows'] == 'auto':   # both flows: every row the policy writes lies in [-1, 1] (latent and FD chart)
+        s['bounded_rows'] = UNCONDITIONAL_DEFAULTS['bounded_rows']
     if s['min_bin_height'] == 'auto':
         s['min_bin_height'] = None if conditional else UNCONDITIONAL_DEFAULTS['min_bin_height']
     if s['tied_derivatives'] is None:
@@ -148,8 +148,8 @@ class NFPolicy(nn.Module):
         if s['mix_k'] and s['tied_derivatives']:
             raise NotImplementedError("flow tied_derivatives with mix_k")
         if self.conditional:
-            if bounded or orders is not None or half_rows or s['mix_k']:
-                raise NotImplementedError("flow bounded_rows, block_orders, fold_half_rows and mix_k are built for "
+            if orders is not None or half_rows or s['mix_k']:
+                raise NotImplementedError("flow block_orders, fold_half_rows and mix_k are built for "
                                           "unconditional policies only (as inn_modeller.py)")
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial']) if s['atom_tokens'] else None)
@@ -158,7 +158,7 @@ class NFPolicy(nn.Module):
             cond_dim = 1 if atoms is not None else self.conditions_dim
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
-                                                 transformer=transformer, atoms=atoms)
+                                                 transformer=transformer, atoms=atoms, bounded_rows=bounded)
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})

@@ -210,14 +210,24 @@ def test_build_policy_dispatches_and_leaves_an_sde_config_alone():
         build_policy(gfn_config() | {'policy': {'kind': 'other'}})
 
 
-def test_bounded_rows_linear_bounds_every_live_unwrapped_row():
-    pol = flow_policy(False, dead=(9,), bounded_rows='linear')
+@pytest.mark.parametrize('conditional', [False, True])
+def test_bounded_rows_linear_bounds_every_live_unwrapped_row(conditional):
+    """Both flows draw inside [-1, 1] on every row (the FD chart's box: a conditional FD draw past a face built a
+    degenerate crystal), and a draw maps back to its own base point."""
+    pol = flow_policy(conditional, dead=(9,), bounded_rows='linear')
     wrap = pol.ang_mask.tolist()
     assert pol.sampler.bounded_rows == [i for i in range(12) if i != 9 and not wrap[i]]
-    states, *_ = pol.get_traj_fwd(torch.zeros(64, 12), None, 0, None, None)
+    states, *_ = pol.get_traj_fwd(torch.zeros(64, 12), None, 0, torch.randn(64, 4) if conditional else None, None)
     assert bool((states[:, 1].abs() <= 1 + 1e-6).all())
-    with pytest.raises(NotImplementedError):
-        flow_policy(True, bounded_rows='linear')
+    flow = pol.sampler.double()   # in double, so the round trip is exact (float32 inverses miss by ~1e-3 here)
+    with torch.no_grad():   # a non-trivial map: every block's parameters away from the identity
+        for p in flow.parameters():
+            p.add_(0.3 * torch.randn_like(p))
+    c = torch.randn(256, 4, dtype=torch.float64) if conditional else None
+    x, z0 = flow.sample(256, c, return_base=True)
+    assert bool((x.abs() <= 1).all())
+    z, _ = flow.to_base(x, c)
+    assert torch.allclose(z, z0, atol=1e-9)
 
 
 # -- the config audit's fixes (2026-10-27) -------------------------------------------------------------------------
@@ -229,7 +239,7 @@ def test_unset_settings_resolve_per_route_as_the_inn_does():
         ('linear', 1e-7, True, 2.0, Z1_ORDER)
     assert resolve_flow_settings(NF_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
     c = resolve_flow_settings(NF_DEFAULTS, True, list(range(12)))
-    assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == (None, None, False, None)
+    assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == ('linear', None, False, None)
     n = resolve_flow_settings({**NF_DEFAULTS, 'bounded_rows': 'none', 'block_orders': 'none'}, False, list(range(12)))
     assert n['bounded_rows'] is None and n['block_orders'] is None
 
