@@ -28,7 +28,7 @@ molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_
 test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent  # todo make sure this is sympatico with our hold-out molecules & crystals methods
 prior_scan_cache: false      # true = reuse the init-time scoring of prior_path from <prior_path>.scan-<hash>.pt when its identity (file, row count, energy function, MLIP file, space groups, z_primes, eLJ coefficient, energy_config) matches and a re-score of 512 random rows agrees; otherwise score every row and write that file. false = score every row at every launch
 noised_prior:                # read only when prior_path is a pre-noised build (data_processing/build_noised_prior.py; noised_prior.py)  # todo how do we know / flag this?
-  window_kT: 6.0             # rows kept within window_kT x energy_config.temperature of their condition's floor (seed energy: molecule + density + pressure terms). null = no energy window  # todo does this also affect the noise scale or is that fixed
+  window_kT: 6.0             # rows kept within window_kT x energy_config.temperature of their condition's floor (seed energy: molecule + density + pressure terms). null = no energy window. A load-time filter only: the noise scale is fixed at build (the manifest's log_lo/log_hi)
   packing_window: null       # [lo, hi] packing coefficients kept. null = density_penalty's unpenalised range (molecular_crystal.PACKING_COEFF_WINDOW)
   train_kinds: ['child']     # row kinds the run trains on: 'child' (iso-tile kicks) and/or 'anchor' (the source rows)
   check_rows: 512            # rows re-scored at load, stratified by kind, split, space group and Z'; a miss past tolerance raises
@@ -151,18 +151,12 @@ lr_control:  # todo we had old notes on this. I don't care much for more complic
   fire_cut_factor: 1.0
 
   # ---- 1. BURN-IN --------------------------------------------------------
-  # Exactly burn_in_steps at burn_in_scale, then the root checkpoint. Step count
-  # only: it never waits on a learned metric to settle.
-  #
-  # THIS IS WHERE THE LONG HORIZON BELONGS, and the reason is arithmetic.  # todo what is this for, just to figure out grad noise or something?
-  # Optimizers are rebuilt at every stage transition, so Adam's step counter t
-  # restarts, and Adam's update carries sqrt(1-beta2^t)/(1-beta1^t) relative to
-  # steady state:  t=10 -> 0.153, t=100 -> 0.309, t=500 -> 0.627, t=1000 ->
-  # 0.795, t=3000 -> 0.975. Bracket from a young root and EVERY trial descended
-  # from it runs at that fraction of its nominal rate, so a too-hot rung survives
-  # for a reason that has nothing to do with the rate. Burn-in is paid ONCE;
-  # trials are paid N times. This is the cheap place to spend steps.
-  burn_in_steps: 3000        # ~0.975 bias correction at beta2 0.999
+  # A warm-up, restarted at every stage transition (the optimizers are rebuilt
+  # there): the auto rates are held at burn_in_scale x seed_lr for burn_in_steps,
+  # then moved geometrically to fixed_scale over promotion_ramp_steps and held.
+  # The last hard_failure.root_window steps of burn-in are the window the
+  # blow-up bars (section 4) are fitted on.
+  burn_in_steps: 3000
   burn_in_scale: 0.05        # x seed_lr = 6.25e-6, the conservative end of the range measured survivable on this route (5e-6 through 8e-5 clean; 2e-4 non-finite by step 1560)
   promotion_ramp_steps: 1000 # mode: fixed only -- steps over which the scale moves geometrically from burn_in_scale to fixed_scale after burn-in; the burn-in bars stay live through it and are refitted at fixed_scale. 0 = a single jump
   # GO / NO-GO ON MEASURING AT ALL, checked once, when burn-in ends and the
@@ -218,50 +212,27 @@ lr_control:  # todo we had old notes on this. I don't care much for more complic
   logz_detour_nats: 2.0      # a candidate FAILS if its batch-mean log_Z_learned falls more than this many nats BELOW the root's -- one-sided, so a dip-and-recover survives and a detour does not. Catches a minority-branch destabilization the frac-weighted composite bar is blind to under a dominant bwd frac. Judged outside the settle window; inert wherever Z does not train. null/0 = off
   verbose: true
 
-  # ---- 4. HARD FAILURE ----------------------------------------------------  # todo ditto the above
-  # TWO JOBS, ONE SET OF BARS: they fail a trial candidate, AND they are the live
-  # tripwire on ordinary steps, where a hit rewinds to the last checkpoint and
-  # spends one of the max_reloads_per_1k_steps budget.
-  #
-  # THE EXCURSION BAR IS DERIVED, NOT WRITTEN. A written 1.0e+9 catches numerical
-  # overflow and nothing else -- a rate one rung too hot took this route's loss
-  # from -25 to +318, eight orders under that bar. It is a SPAN, hi + k x (hi-lo)
-  # over the burn-in window, not a ratio: the MLE channel crosses zero, so a
-  # running minimum has no positive scale to divide by.
-  # config_invariants.lr_bracket_is_well_formed refuses a bar that high in
-  # mode: bracket only.
-  #
-  # ONE CHANNEL PER step_type (fwd/bwd/replay/fused), judging the scalar that
-  # step backpropagates -- so the channels differ by orders of magnitude and in
-  # SIGN. A channel below min_observations gets no bar and can fail only on the
-  # absolute backstops.
+  # ---- 4. HARD FAILURE ----------------------------------------------------
+  # The blow-up tripwire. Bars are fitted per branch (fwd/bwd/replay/fused) on the
+  # last root_window steps of burn-in: loss bar = max + k x (max - min), grad bar
+  # = x x the largest pre-clip grad norm. A step past a bar rewinds weights and
+  # optimizers to the last good checkpoint and spends one rewind of
+  # max_reloads_per_1k_steps; after promotion the bars are refitted at the held
+  # rate (cruise_rederive). A branch with fewer than min_observations gets only
+  # the absolute backstops.
   hard_failure:
     loss_excursion_k: 10.0   # bar = root_hi + k x (root_hi - root_lo), per branch
     grad_excursion_x: 100.0  # bar = x  x  the largest pre-clip grad norm seen at the root
     loss_abs: 1.0e+6         # numerical backstop only; >= 1e8 is refused at load in mode: bracket
     grad_abs: 1.0e+6
-    # THE BARS ARE DRAWN TWICE. Above they are fitted to the tail of burn-in, at
-    # burn_in_scale -- right for judging a trial (every trial restores that root),
-    # wrong for the live tripwire, which then holds for a whole stage at a hotter
-    # rate that moves the loss more for ordinary reasons. After promotion they are
-    # refitted from ordinary training AT the promoted rate. Watch
-    # lr_bracket/bars_redrawn and the step in lr_bracket/bar_loss_<channel>.
-    # In `fixed` mode nothing tested the rate, so the cold bars stay live until
-    # the refit replaces them: too tight costs a rewind, absent costs the run.
     cruise_rederive: true      # false = the live tripwire keeps the cold root bars for the whole stage
     cruise_settle_steps: 200   # steps discarded after promotion before the redraw window opens, so the rate change's own transient is not fitted as normal
     root_window: 200         # the TAIL of burn-in that defines the root scale. The opening of burn-in is the transient burn-in exists to pass through, and folding it in would inflate the span by the very movement that must not count as normal
     min_observations: 20     # below this on every channel, no bar can be derived and the bracket REFUSES rather than running with bars that cannot fire
 
 
-# GPU region timing (profiling.py). OFF, and off is the normal state: with no
-# block, or enabled false, `region()` returns one shared no-op and an energy call
-# allocates nothing extra. Enable it to answer "how much GPU time does the energy
-# consume", which wall clock cannot see through an async launch -- it reports
-# energy/seconds_gpu beside the existing wall-clock energy/seconds, and their
-# RATIO (energy/gpu_over_wall) is the reading: ~1 means the call occupies the
-# device, >1 means work outlives the return, <1 means host-bound.
-profiling:  # todo do we use this at all anymore and is it even functional?
+# GPU-time region timer and a bounded torch.profiler window (profiling.py); off = zero cost per call.
+profiling:
   enabled: false
   regions: null              # null = every region asked for; a list restricts it
   # Layer 2: a BOUNDED torch.profiler window -- op-level CPU and CUDA detail,
@@ -280,29 +251,12 @@ profiling:  # todo do we use this at all anymore and is it even functional?
     record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
     with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
 
-# todo check whether this is still a valid option in current models
-compile_policy: false          # torch.compile the policy. false = eager; 'auto' = on for Linux+CUDA only (no inductor on native Windows); true forces it; 'step' compiles the whole per-timestep body instead of the trunk submodules. Compile errors degrade to eager with a warning. Recompiles on every new batch size
+compile_policy: false          # torch.compile the policy; SDE only (refused under model.kind nf). false = eager; 'auto' = on for Linux+CUDA only (no inductor on native Windows); true forces it; 'step' compiles the whole per-timestep body instead of the trunk submodules. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream). Set TRUE by default under MACE or UMA
-# WHICH BRANCHES checkpoint. null = all of them. Only the forward branch holds  # todo an absurd amount of text
-# the energy function's footprint, so under rare rollouts the bwd/replay steps
-# pay the recompute while sitting on headroom nothing uses -- [fwd] buys the
-# step time back there. fwd is usually MOOT in the list either way: checkpointing
-# is skipped whenever grad is off, and at fracs.fwd 0 the forward branch carries
-# no gradient. THE RISK IT DOES NOT REMOVE is fragmentation: peak memory is the
-# worst step's, so a large bwd allocation can leave no contiguous block for the
-# next rollout's MLIP even where each step fits alone. Inert while traj_checkpoint
-# is false, and the OOM ladder's set_traj_checkpoint action clears it outright.
-# [fwd] is the default since 2026-09-13: tck_sep10 measured it 20% faster per step
-# than checkpointing every branch at a pinned batch of 1600 on mipu, values
-# identical. Unmeasured on MACE, which sits near the memory ceiling -- set null there.
-traj_checkpoint_modes: [fwd]   # null = every branch | a list from [fwd, bwd, replay]
-# Fallback clip. With grad_clip_guard on it does NOT clip the policy -- the guard
-# does -- so here it governs only the flow head in the z_calibration sidecars.
-# `auto` is fitted to POLICY gradient magnitudes and is not calibrated for that.
+traj_checkpoint_modes: [fwd]   # branches that checkpoint while traj_checkpoint is on: null = all, else a subset of [fwd, bwd, replay]; set_traj_checkpoint clears it to null
+# The bar grad_clip_guard uses for each branch's first warmup_steps observations (warmup_clip static), and the Z head clip in the z_calibration sidecars. `auto` is fitted to SDE policy gradients and refused under model.kind nf.
 gradient_norm_clip: auto     # explicit number overrides
-# The policy's actual clip while enabled. Per branch, because an MLE gradient and
-# a TB gradient are different distributions. See grad_clip_guard.py.
-grad_clip_guard:             # per-branch quantile bar on pre-clip policy grad norms  # todo is this used while gradient_norm_clip=auto?
+grad_clip_guard:             # the policy clip: a per-branch tracked quantile bar on pre-clip grad norms (grad_clip_guard.py)
   enabled: true                # false -> the bar is gradient_norm_clip, unchanged
   p: 0.99                      # target quantile; the bar binds on 1-p of steps
   eta: 0.01                    # log-space step of the bar per observation
@@ -402,14 +356,14 @@ model:
     min_bin_height_rows: all   # 'all' rows or the 'uniform'-base rows only
     tied_derivatives: null     # knot derivatives tied to the neighbouring bin slopes: null = auto (unconditional true, conditional false)
     tied_factor: null          # null = 2.0
-    bounded_rows: auto         # auto (unconditional 'linear', conditional none), none, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'; unconditional only
+    bounded_rows: auto         # auto ('linear' on both routes), none, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
     block_orders: auto         # auto (Z' = 1 latent, one block, unconditional: 8.11.10.9.7.6.5.4.3.2.1.0; else alternating), none, or one order per block; unconditional only. Set it explicitly on a chart whose rows mean something else
     fold_half_rows: null       # rows '7,8' whose distribution repeats every half period; unconditional only
     mix_k: 0                   # > 0: mixture-of-logistics blocks of k components; unconditional only
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
-drift_force:  # todo fine to keep as WiP code but not thoroughly tested
+drift_force:  # SDE only: unreachable under model.kind nf (its keys are refused there). Work in progress, CPU-tested only
   checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint (plain or stacked); required when a force term or state_atoms is on
   chunk: 1000                  # crystal states per geometry build
   max_images: 2000             # image molecules one crystal may hold inside the trunk's reach; its nearest are kept
@@ -554,7 +508,8 @@ integrator:
 # NUMERICS
 #   beta              Huber beta for the TB-style losses.
 #   loss_clip         absolute ceiling on the per-row loss.
-fwd_loss_coeffs:  # todo I'm fine with these being comprehensive as long as when composed in training phases they all work correctly (when applied correctly). One point is like, are we calling NF reverse KL 'TB'? I'm ok with it but it has to be clear
+# model.kind nf: fwd tb on fresh draws = reverse KL(q || pi) with log Z as a baseline (Huber-clipped past beta); bwd mle = -log q on stored rows (forward KL); bwd/replay tb = the off-policy squared log-ratio
+fwd_loss_coeffs:
   exploration_std: 0.0     # > 0: additive per-step LOG-STD on the forward SAMPLING kernel only; the scored log P_F stays the policy's own density, so the rows are off-policy (VarGrad-safe, emp_z's Z fit is then biased). 0 = on-policy draw
   tb: 0.0
   z_level: 0.0
@@ -776,6 +731,7 @@ protocols:
         # and progress_metrics ABSTAINS loudly when it cannot run at all.
         exit:
           - { metric: gates/progress_done, above: 0.5, patience: 1 }
+        max_steps: 50000               # bound: the stage exits at the first eval past this many steps if its exit has not fired
         on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
       # -- ONE always-on terminal stage, straight off the MLE prior. No exit
@@ -986,7 +942,7 @@ protocols:
         hot_lr_sensor: { channel: bwd/mle, form: absolute, rows: 31, above: 5.0 }
         flags:
           update_log_z: true
-          scramble_conditions: true
+          scramble_conditions: false   # conditional MLE trains the condition encoder
         loss_coeffs:
           bwd: { mle: 1.0, tbc: 0.0, repeats: 1.0, tb_z_source: persistent }
         # EXIT ON THE LEVEL GATE (progress_gate at the top of this file):
@@ -996,6 +952,7 @@ protocols:
         # and progress_metrics ABSTAINS loudly when it cannot run at all.
         exit:
           - { metric: gates/progress_done, above: 0.5, patience: 1 }
+        max_steps: 50000               # bound: the stage exits at the first eval past this many steps if its exit has not fired
         on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
       # REPLAY IN THE FORWARD BRANCH'S SEAT. The forward rollout is the only
@@ -1267,7 +1224,7 @@ buffers:
     # (floor/stalled retired -- exactly redundant with hazard+backstop once
     # the draw itself is prioritised). This block controls the DRAW only.
     prioritise:  # todo we should think carefully about when to use this and how the losses should be mixed
-      enabled: true     # CONDITIONAL ARM: false. REFUSED beside fwd pooled_source 'replay' and a stage condition_draw: both take the replay rows unweighted
+      enabled: false    # off until an on/off arm on MIPCAS shows a gain (owner 2026-10-28). CONDITIONAL ARM: false. REFUSED beside fwd pooled_source 'replay' and a stage condition_draw: both take the replay rows unweighted
       kappa: 1.0        # draw p ~ d+^kappa. The practical ceiling: kappa=2 blew is_ess_frac to 0.07 with one row at 58x the mean weight, and kappa=0 was the worst arm
       floor_frac: 0.25  # relative floor on surviving d+ as a fraction of the median, so the weight range is bounded by (median/floor)^kappa. Measured ESS knee: 0.01 -> ESS/n 0.11, 0.25 -> 0.63, 0.50 -> 0.80
       symmetric: true  # draw on |delta|^kappa instead of delta_plus^kappa. ON here (the code default is off): under the one-sided draw a row that falls to delta <= 0 gets p = 0, so its ema_logw is never refreshed and it ratchets out of the eligible set permanently -- is_elig_frac drifted 0.74 -> 0.33, monotonic. |delta| leaves every row eligible and holds is_elig_frac at 1.0. Whether it also closes the forward-tail fit gap is NOT yet measured: that needs an on/off arm
