@@ -30,6 +30,9 @@ CRYSTAL_COORDINATES = ('latent', 'fd')
 FD_LAYOUT_RADIUS = 4.0
 
 
+#: crystal_coordinates 'fd': rows are clamped this far inside [-1, 1] before a crystal is built (fd_rows_to_params)
+FD_OPEN_EPS = 1e-6
+
 #: the packing-coefficient range density_penalty leaves unpenalised; also a pre-noised prior's default load window
 #: (noised_prior.packing_window)
 PACKING_COEFF_WINDOW = (0.55, 0.95)
@@ -622,7 +625,9 @@ class MolecularCrystal(BaseSet):
             if xs.shape[1] < fc.dim or (xs.shape[1] > fc.dim and bool((xs[:, fc.dim:] != 0).any())):
                 raise ValueError(f'sg {g}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
                                  f'{xs.shape[1]}')
-            p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu())
+            # into the open box, as latent_to_cell_params clamps the latent: a policy whose rows are not bounded
+            # (the conditional flow) draws past the faces, and a chart face is a degenerate crystal (log reference -inf)
+            p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS))
             params = params.index_copy(0, rows, p.to(x))
             hand = hand.index_copy(0, rows, h.to(x))
             log_ref = log_ref.index_copy(0, rows, lr.to(x))
