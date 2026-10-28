@@ -664,10 +664,14 @@ class Modeller:
         ``x_fn`` lives here because it IS the data model: how the GFN state is
         read off a stored graph. None = latent_params() with its crystal
         gauge-fix; toy routes read gauge-FREE (every latent dim is real there --
-        the fix for P1's delta-pinned u,v,w targets, 2026-08-24).
+        the fix for P1's delta-pinned u,v,w targets, 2026-08-24). On
+        crystal_coordinates 'fd' it is the row's FD chart point (_buffer_state), so
+        every buffer's x -- wass, the eval figures, anchor distances and the anchor
+        refresh -- is in the policy's chart.
         """
         return dict(max_z_prime=max(self.args.z_primes),
-                    x_fn=None if self.energy_function.is_crystal else toy_latent_params)
+                    x_fn=(self._buffer_state if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
+                          else None if self.energy_function.is_crystal else toy_latent_params))
 
     def _eval_extra_stats(self, mol_batch):
         """Per-sample columns the eval accumulator should carry beyond the TB family.
@@ -3930,12 +3934,10 @@ class Modeller:
         return torch.cat(seed), torch.cat(log_r)
 
     @torch.no_grad()
-    def _attach_fd_reference(self, batch):
-        """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
-        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
-        row (`fd_state`, read by _batch_latents), attached as row attributes so they ride with every draw. Returns [n] bool: the rows that have an FD chart point (a row
-        that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
-        dropped; its reference is set to 0)."""
+    def _fd_chart_points(self, batch):
+        """crystal_coordinates 'fd': ([n] bool has a chart point, [n, data_ndim] chart rows s, zero where none, [n] log
+        reference density on s, zero where none) of the crystals of a stored batch, canonicalised through the chart of
+        each row's (space group, molecule radius)."""
         ef = self.energy_function
         params = batch.full_cell_parameters().detach().cpu()
         hand = batch.aunit_handedness.reshape(-1).detach().cpu()
@@ -3959,6 +3961,25 @@ class Modeller:
                 if good.numel():
                     _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
                     log_ref[good] = lr.float()
+        return ok, state, log_ref
+
+    def _buffer_state(self, batch):
+        """A buffer's x on the FD chart (_buffer_kwargs): the row's chart point -- its cached fd_state (a stored prior
+        row, _attach_fd_reference; a generated crystal, MolecularCrystal.instantiate_crystals), else canonicalised
+        here, NaN for a crystal with no chart point (a conditions-file crystal outside the length box)."""
+        if 'fd_state' in batch.keys():
+            return batch.fd_state.reshape(int(batch.num_graphs), -1)
+        ok, state, _ = self._fd_chart_points(batch)
+        state[~ok] = float('nan')
+        return state
+
+    def _attach_fd_reference(self, batch):
+        """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
+        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
+        row (`fd_state`, read by _batch_latents), attached as row attributes so they ride with every draw. Returns [n] bool: the rows that have an FD chart point (a row
+        that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
+        dropped; its reference is set to 0)."""
+        ok, state, log_ref = self._fd_chart_points(batch)
         batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
         # the chart rows themselves, which _batch_latents reads instead of canonicalising every draw again
         batch.add_graph_attr(state.to(batch.ptr.device), 'fd_state')
@@ -9305,7 +9326,11 @@ class Modeller:
         without an exact density reports nothing.
         `<key>_ref` is the same -log q against the common reference measure, -log q + log rho, with log rho the
         chart's log reference density (-jacobian_energy / T, the term the reward composes: compute_jacobian on the
-        latent chart, fd_log_reference on the FD chart), so runs on different charts compare."""
+        latent chart, fd_log_reference on the FD chart).
+        ⚠ NOT YET COMPARABLE ACROSS CHARTS. compute_jacobian is the latent's reference density only up to a constant
+        per space group, and the latent box holds k images of each crystal where the FD chart holds one, so a latent
+        row's `_ref` sits log k - c(sg) above the FD measure (sg 2: k 4, c -1.355, so latent `_ref` - 2.742 is the
+        comparable number; MXtalTools tests/fd/test_gate8_latent.py pins both). Within one chart it ranks runs."""
         policy = self.gfn_model
         if not hasattr(policy, 'log_density'):
             return {}
@@ -9356,9 +9381,15 @@ class Modeller:
                 out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
         finally:
             policy.train(was_training)
+        # the generalisation gaps (nats; one chart, so no reference term): held-out molecules against the training
+        # molecules' crystals (inn_modeller.py's eval_test/mle_gap), and held-out anchor groups against training rows
+        for gap, (a, b) in {'eval_test/mle_gap': ('eval_test/mle', 'eval_bwd/mle_mol_crystals'),
+                            'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle')}.items():
+            if a in out and b in out:
+                out[gap] = out[a] - out[b]
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
-                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref'))), flush=True)
+                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref', '_gap'))), flush=True)
         return out
 
     def evaluation(self, override_do_figs: bool = False):

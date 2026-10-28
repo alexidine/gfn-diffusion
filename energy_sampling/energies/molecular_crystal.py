@@ -668,6 +668,9 @@ class MolecularCrystal(BaseSet):
             crystal_batch.aunit_handedness = hand.reshape(crystal_batch.aunit_handedness.shape).to(
                 crystal_batch.aunit_handedness.dtype)
             crystal_batch.fd_log_reference = log_ref
+            # the chart row this crystal was built from (as clamped by fd_rows_to_params), so a stored draw is never
+            # canonicalised again (train.py _batch_latents reads it)
+            crystal_batch.add_graph_attr(x.detach().float().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS), 'fd_state')
             return crystal_batch
         crystal_batch.latent_to_cell_params(x)
         if self.max_z_prime > 1:
