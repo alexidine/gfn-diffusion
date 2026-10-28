@@ -45,7 +45,9 @@ def load_policy(ckpt_path, device):
     cfg = dict(blob['gfn_config'])
     cfg['device'] = device
     gfn = GFN(**cfg).to(device)
-    missing, unexpected = gfn.load_state_dict(blob['model_eval'], strict=False)
+    # model_eval: an EMA copy, written only by the conformer route and by older checkpoints
+    weights = blob['model_eval'] if 'model_eval' in blob else blob['model_train']
+    missing, unexpected = gfn.load_state_dict(weights, strict=False)
     if missing:
         raise ValueError(f'checkpoint is missing {len(missing)} policy tensors: {missing[:4]}')
     gfn.eval()

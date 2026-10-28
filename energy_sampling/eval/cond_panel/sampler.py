@@ -6,7 +6,7 @@ held-out samples over thousands of molecules, about 1.7 draws per held-out molec
 cannot show what any one molecule's distribution looks like. This module rebuilds the policy
 and the reward from an archive and draws through the function the trainer's eval calls,
 eval/utils.py::sample_eval_fwd_trajs, with the eval's own settings: the checkpoint's eval
-weights, a uniform grid of cfg:eval_T steps, T from the run's energy_config, no grad.
+weights, a uniform grid of the checkpoint's train_T steps, T from the run's energy_config, no grad.
 
 THREE THINGS THE EXISTING LOADERS GET WRONG ON THIS ROUTE, each handled here:
 
@@ -141,7 +141,8 @@ def load_run(checkpoint_path: str, config_path: str, device: str = 'cpu',
     gcfg = dict(ck['gfn_config'])
     gcfg['device'] = device
     gfn = GFN(**gcfg).to(device)
-    gfn.load_state_dict(ck['model_eval'], strict=True)
+    # model_eval: an EMA copy, written only by the conformer route and by older checkpoints
+    gfn.load_state_dict(ck['model_eval'] if 'model_eval' in ck else ck['model_train'], strict=True)
     gfn.eval()
     if ck.get('pb_frozen') is not None:
         gfn.freeze_backward_policy(source_state=ck['pb_frozen'])
@@ -223,7 +224,9 @@ def load_run(checkpoint_path: str, config_path: str, device: str = 'cpu',
     return Run(gfn=gfn, energy_function=ef, conditions=conditions, test_conditions=test,
                registry=registry, tracker=tracker, step=int(ck['modeller_state']['step_ind']),
                stage=str(ck['modeller_state'].get('stage')),
-               temperature=float(ec['temperature']), eval_T=int(cfg['eval_T']),
+               temperature=float(ec['temperature']),
+               # the checkpoint's training length (Checkpointer: train_T); configs before model.sde.T carry eval_T
+               eval_T=int(ck.get('train_T') or cfg['eval_T']),
                device=device, config=cfg)
 
 
@@ -240,7 +243,7 @@ def head_log_z(run: Run, rows) -> torch.Tensor:
 def draw_latents(run: Run, rows, batch_size: int = 2048, seed: Optional[int] = None) -> torch.Tensor:
     """One forward draw per row of `rows` with no energy call: the raw terminal states,
     [n, data_ndim] on the CPU. The rollout is the eval's (GFN.get_traj_fwd on a uniform grid
-    of cfg:eval_T steps); nothing is scored. `crystals_from` builds the crystals."""
+    of run.eval_T steps); nothing is scored. `crystals_from` builds the crystals."""
     if seed is not None:
         torch.manual_seed(seed)
     ef = run.energy_function

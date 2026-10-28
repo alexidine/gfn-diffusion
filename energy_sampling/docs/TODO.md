@@ -5,40 +5,23 @@ things the owner deferred, not a plan. Delete an item when it lands.
 
 ---
 
-## 1. Rip out the LR bracket
+## 1. LR bracket residue
 
-**Owner: deferred to "when I have spare tokens" (2026-09-10).**
+The bracket was deleted 2026-10-28 (owner): `lr_bracket.py`, `lr_bracket_probe.py`
+and `lr_control.mode: bracket` are gone, `LRController` refuses the mode, and the
+nine bracket keys raise off the conformer route
+(`config_invariants.LR_CONTROL_RETIRED_KEYS`). Left in place, each a choice:
 
-`lr_control.mode` is now `fixed` on the live route and the bracket is not
-expected to come back. Ripping it out means the mechanism, its config surface,
-its docs and its comments.
-
-**Scope, measured 2026-09-10:** 732 occurrences of `bracket` across ~40 files.
-
-| where | what |
-|---|---|
-| `lr_bracket.py`, `lr_bracket_probe.py` | the mechanism itself |
-| `controller.py` | `_managed_keys`, `_check_rails`, `BracketDriver` wiring, controller state `ver`/`scale`/`bracket` |
-| `configs/mk_dev.yaml` | `mode`, `candidate_scales`, `trial_steps`, `safety_rungs`, `repeat_every`, `boundary_confirm_repeats`, `boundary_densify`, `trial_settle_steps`, `logz_detour_nats`, and section 2 of the `lr_control` essay |
-| `analysis/keys.py`, `analysis/checks.py` | `lr_bracket/*` metric keys and the checks that read them |
-| `checkpointing.py` | bracket state in the checkpoint |
-| `bench/` | `runner.py`, `arms.py`, `band.py`, `ladder.py`, `surfaces.py`, `test_fidelity.py`, `test_tracking.py`, `test_ray_calibration.py` |
-| `configs/*/make.py` | every generator that writes `mode: bracket` |
-| `tests/config/test_config_invariants.py` | 5 tests currently FAILING because mk_dev is already `mode: fixed` (see §4 below) |
-
-**What survives the rip:** `seed_lr`, `fixed_scale`, `burn_in_*`, `min_lr`,
-`max_lr`, the whole `hard_failure` block (it is the live tripwire, not just the
-trial judge), and the divergence-response/rewind path.
-
-**What has to be decided, not just deleted:**
-
-- `hard_failure`'s bars are fitted at `burn_in_scale` and refitted after
-  promotion (`cruise_rederive`). With no bracket there is no promotion event —
-  what triggers the redraw?
-- `min_root_bias_correction` is a go/no-go on *measuring at all*. Meaningless
-  without trials; delete or repurpose as a burn-in adequacy check?
-- `lr_servo_managed` is written by `resolve_derived_config` (`utils.py:687`) from
-  which `lr_*` keys are spelled `auto`. If `auto` goes, so does that whole path.
+- names: the metric channels `lr_bracket/{phase, promoted_steps, bar_loss_*,
+  bar_grad, bars_redrawn}` (read by `analysis/keys.py`). Renaming them orphans
+  existing runs' readers.
+- `lr_control.verbose` is accepted and read by nothing.
+- the conformer configs (`conformer_mk*.yaml` and others) still carry bracket keys
+  and the four keys `lr_control.schedule` replaced
+  (`config_invariants.LR_SCHEDULE_REPLACED_KEYS`), so neither set is in
+  `utils._RETIRED_KEYS`; move them there once those configs drop them.
+- `config_state._lift_lr_control` (the state 9 -> 10 migration) still writes
+  `mode: bracket` for a config with `auto` rates.
 
 ---
 

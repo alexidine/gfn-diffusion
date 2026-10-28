@@ -466,6 +466,9 @@ CFG_ANCHOR_GATE_FLOOR_METRIC = 'buffers_anchor_buffer_health_gate_floor_metric'
 # §4 confounds, all config-level.
 CFG_EVAL_T = 'eval_T'
 CFG_TRAIN_T = 'integrator_T'
+# the crystal route's one trajectory length since 2026-10-28 (mk_dev model.sde.T, flattened
+# from the resolved model block); runs that carry it carry neither key above
+CFG_MODEL_T = 'model_T'
 CFG_CHECKPOINT_NAME = 'checkpoint_name'
 CFG_CONTINUE_FROM_CHECKPOINT = 'continue_from_checkpoint'
 CFG_PRIOR_PATH = 'prior_path'
@@ -633,18 +636,16 @@ MECHANISMS = (
               Declare.TRUTHY, ('lr_ctrl/scale',), Rule.MOVES,
               note='the earlier declaring key for the same controller'),
     # THE THIRD ERA, and its trace had to change WITH the mechanism rather than
-    # inherit the two above. `lr_ctrl/scale` under the bracket is piecewise
-    # constant BY DESIGN -- burn-in scale, then the promoted rung, and nothing in
-    # between -- so `Rule.MOVES` on it would report a correctly-working bracket
-    # as inert on any run whose selection happened to land on the burn-in scale,
-    # and would report EVERY fixed-mode run as inert. `lr_bracket/phase` moves in
-    # both modes (burn_in -> cruise) and moves only when the machine advances,
+    # inherit the two above. `lr_ctrl/scale` is constant on every hold segment
+    # of lr_control.schedule, and flat on a schedule whose segments share one
+    # `to`, so `Rule.MOVES` on it would report such a run as inert.
+    # `lr_bracket/phase` moves burn_in -> cruise when the first segment ends,
     # which is the thing being asserted.
     Mechanism('lr_control', 'global', 'lr_control_seed_lr', Declare.POSITIVE,
               ('lr_bracket/phase',), Rule.MOVES,
-              note='the brute-force bracket (project state 10). A flat scale is '
-                   'NOT evidence of inertness here -- that is what the mechanism '
-                   'does between selections'),
+              note='the lr_control schedule (project state 10; mode bracket '
+                   'deleted 2026-10-28). A flat scale is NOT evidence of '
+                   'inertness here'),
 
     # --- Z calibration. Measured inert on 11 of 69 runs that enable it.
     Mechanism('z_calibration', 'global', 'z_calibration_enabled', Declare.TRUTHY,

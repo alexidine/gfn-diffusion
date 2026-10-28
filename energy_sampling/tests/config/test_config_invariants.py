@@ -87,9 +87,26 @@ def test_util_target_must_be_actuable(canonical):
     assert not _fires(broken(canonical, batch_util_target=0), 'util_target_actuable')
 
 
-def test_figs_period_not_a_multiple_never_fires(canonical):
-    assert _fires(broken(canonical, figs_period=501), 'figs_period_fires')
-    assert not _fires(broken(canonical, figs_period=1000), 'figs_period_fires')
+def test_figs_period_not_a_multiple_never_fires_on_the_conformer_route(canonical):
+    conformer = dict(energy_function='conformer_torsions')
+    assert _fires(broken(canonical, figs_period=501, **conformer), 'figs_period_fires')
+    assert not _fires(broken(canonical, figs_period=1000, **conformer), 'figs_period_fires')
+    # off the conformer route figs_period is retired, not checked for coincidence
+    assert not _fires(broken(canonical, figs_period=501), 'figs_period_fires')
+
+
+def test_step_cadence_keys_are_retired_on_the_crystal_route(canonical):
+    assert _fires(broken(canonical, figs_period=500), 'step_cadence_keys_are_retired')
+    assert _fires(broken(canonical, xcond_eval__period=2500), 'step_cadence_keys_are_retired')
+    # presence, not value: a null still names a key nothing reads
+    assert _fires(broken(canonical, figs_period=None), 'step_cadence_keys_are_retired')
+    assert ci.retired_step_cadence_keys(broken(canonical, figs_period=500,
+                                               xcond_eval__period=2500)) == \
+        ['figs_period', 'xcond_eval.period']
+    # the conformer route still reads figs_period
+    assert not _fires(broken(canonical, figs_period=500, xcond_eval__period=2500,
+                             energy_function='conformer_torsions'),
+                      'step_cadence_keys_are_retired')
 
 
 def test_batch_ceiling_below_floor(canonical):
@@ -257,10 +274,7 @@ def test_auto_lr_with_no_lr_control_block_is_an_error(canonical):
     sets the scale, so the run trains at the seed for its whole life while the
     config reads as adaptive.
 
-    A RUN-LEVEL CHECK, where its predecessor was per stage. That is the
-    substantive change: the bracket is not declared per stage and cannot be
-    omitted from one, so the old way of failing -- a stage quietly missing its
-    `lr_sensor` block -- no longer exists."""
+    A RUN-LEVEL CHECK: `lr_control` is not declared per stage."""
     cfg = copy.deepcopy(canonical)
     cfg.pop('lr_control', None)
     assert _fires(cfg, 'auto_lr_requires_lr_control')
@@ -272,80 +286,126 @@ def test_auto_lr_with_an_unknown_mode_is_also_an_error(canonical):
     assert _fires(cfg, 'auto_lr_requires_lr_control')
 
 
-def _bracket(canonical):
-    """A copy of canonical in `lr_control.mode: bracket`, required clean first.
-
-    The grid, the absolute bars and the root bias correction are judged in
-    bracket mode only, as at runtime: `LRBracket` validates the grid and bars
-    in that mode only, and `fixed` never takes a root. mk_dev's mode is an
-    operational choice, so a test of those checks sets the mode rather than
-    inheriting it -- and a fire after one mutation is then that mutation's."""
+def test_an_absent_mode_reads_as_fixed(canonical):
+    """LRController defaults `mode` to 'fixed', so both rules judge absence as it."""
     cfg = copy.deepcopy(canonical)
-    cfg['lr_control']['mode'] = 'bracket'
-    assert not _fires(cfg, 'lr_bracket_is_well_formed'), \
-        [str(v) for v in check(cfg) if v.rule == 'lr_bracket_is_well_formed']
-    assert not _fires(cfg, 'burn_in_reaches_adam_steady_state', severity=BASELINE)
-    return cfg
+    cfg['lr_control'].pop('mode', None)
+    assert not _fires(cfg, 'auto_lr_requires_lr_control')
+    assert not _fires(cfg, 'lr_control_is_well_formed')
 
 
-def test_a_grid_that_cannot_fail_is_an_error(canonical):
-    """The bracket's only reading is "did this detonate", so its top rungs have
-    to be EXPECTED to fail. A grid inside the safe region finds no boundary on
-    any cycle, reports unbracketed_high every time and selects one rung below its
-    own ceiling -- a number this config chose, dressed as a measurement."""
-    cfg = _bracket(canonical)
-    cfg['lr_control']['candidate_scales'] = [0.1, 0.15, 0.2]
-    assert _fires(cfg, 'lr_bracket_is_well_formed')
+@pytest.mark.parametrize('mode', ['bracket', 'adaptive'])
+def test_a_mode_other_than_fixed_is_an_error(canonical, mode):
+    """`bracket` was deleted 2026-10-28; LRController raises on it."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+    cfg['lr_control']['mode'] = mode
+    assert _fires(cfg, 'lr_control_is_well_formed')
+    assert _fires(cfg, 'auto_lr_requires_lr_control')
 
 
-def test_an_unsorted_grid_is_an_error(canonical):
-    cfg = _bracket(canonical)
-    cfg['lr_control']['candidate_scales'] = [0.05, 0.4, 0.2, 1.6]
-    assert _fires(cfg, 'lr_bracket_is_well_formed')
-
-
-def test_a_divergence_bar_that_cannot_fire_is_an_error(canonical):
-    """MEASURED: a rate one rung too hot on this route took the loss from about
-    -25 to +318 -- finite, and eight orders of magnitude under a 1e9 bar. Under
-    it every rung completes, counts as a survivor, and the bracket returns the
-    same answer forever while every seam fires correctly."""
-    cfg = _bracket(canonical)
-    cfg['lr_control']['hard_failure']['loss_abs'] = 1.0e9
-    assert _fires(cfg, 'lr_bracket_is_well_formed')
-
-
-def test_a_control_arm_declaring_bracket_mode_is_an_error(canonical):
-    """Every rate an explicit float means nothing is bracket-managed -- a
-    documented control arm, and it must stay expressible. But `mode: bracket` is
-    the wrong way to spell it and it fails LATE: the config loads, and `LRBracket`
-    then refuses the absent candidate grid when the controller is CONSTRUCTED, so
-    a queued job dies at step 0 instead of saying so at load."""
-    cfg = _bracket(canonical)
+def test_a_control_arm_is_expressible_as_fixed_mode(canonical):
+    cfg = copy.deepcopy(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
-    assert _fires(cfg, 'lr_bracket_is_well_formed')
+    cfg['lr_control'] = {'mode': 'fixed',
+                         'schedule': [{'to': 1.0, 'steps': 0, 'kind': 'hold'}]}
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+    assert not _fires(cfg, 'auto_lr_requires_lr_control')
 
-    cfg['lr_control'] = {'mode': 'fixed', 'fixed_scale': 1.0}
-    assert not _fires(cfg, 'lr_bracket_is_well_formed'), (
-        'the control arm must remain expressible as `mode: fixed`')
 
-
-def test_fixed_mode_without_a_scale_is_an_error(canonical):
+def test_fixed_mode_without_a_schedule_is_an_error(canonical):
     cfg = copy.deepcopy(canonical)
     cfg['lr_control'] = {'mode': 'fixed'}
-    assert _fires(cfg, 'lr_bracket_is_well_formed')
+    assert _fires(cfg, 'lr_control_is_well_formed')
+    # on the conformer route the keys `schedule` replaced stand in for it
+    cfg['energy_function'] = 'conformer_torsions'
+    assert _fires(cfg, 'lr_control_is_well_formed')
+    cfg['lr_control'].update(burn_in_steps=3000, burn_in_scale=0.05, fixed_scale=0.2)
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+    cfg['lr_control']['schedule'] = [{'to': 1.0, 'steps': 0, 'kind': 'hold'}]
+    assert _fires(cfg, 'lr_control_is_well_formed'), 'schedule beside the replaced keys'
 
 
-def test_a_burn_in_short_of_adam_steady_state_is_reported(canonical):
-    """BASELINE, not ERROR: the run refuses to bracket at runtime if the MEASURED
-    factor is under the bar, reading the optimizer's real step counter. This is
-    the same arithmetic done in advance so the refusal is not the first anyone
-    hears of it -- and it cannot be an ERROR, because a stage that does not
-    rebuild its optimizers enters with t already large, which the config cannot
-    see."""
-    cfg = _bracket(canonical)
-    cfg['lr_control']['burn_in_steps'] = 100      # bias correction 0.309
-    assert _fires(cfg, 'burn_in_reaches_adam_steady_state', severity=ci.BASELINE)
+@pytest.mark.parametrize('segment,detail', [
+    ({'to': 0.2, 'steps': 10, 'kind': 'ramp'}, "kind is 'ramp'"),
+    ({'to': 0.0, 'steps': 10, 'kind': 'linear'}, 'to is 0.0'),
+    ({'to': -0.2, 'steps': 10, 'kind': 'cosine'}, 'to is -0.2'),
+    ({'to': 0.2, 'steps': 1.5, 'kind': 'exp'}, 'steps is 1.5'),
+])
+def test_a_malformed_schedule_segment_is_an_error(canonical, segment, detail):
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+    cfg['lr_control']['schedule'] = [cfg['lr_control']['schedule'][0], segment]
+    (v,) = [v for v in check(cfg) if v.rule == 'lr_control_is_well_formed']
+    assert detail in v.detail
+
+
+def test_a_first_segment_other_than_a_hold_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['schedule'][0]['kind'] = 'linear'
+    assert _fires(cfg, 'lr_control_is_well_formed')
+
+
+def test_an_open_ended_move_needs_every_stage_using_it_to_have_a_cap(canonical):
+    """`steps: null` runs a segment to the stage's max_steps; a non-hold one on a
+    stage with no cap and no lr_schedule of its own is refused."""
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['schedule'].append({'to': 0.01, 'steps': None, 'kind': 'cosine'})
+    (v, *_) = [v for v in check(cfg) if v.rule == 'lr_control_is_well_formed']
+    assert 'no max_steps' in v.detail
+    for proto in cfg['protocols'].values():
+        for st in proto['stages']:
+            st.setdefault('max_steps', None)
+            if st['max_steps'] is None:
+                st['lr_schedule'] = [{'to': 0.05, 'steps': 0, 'kind': 'hold'}]
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+    # an open-ended hold needs no cap
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_control']['schedule'].append({'to': 0.2, 'steps': None, 'kind': 'hold'})
+    assert not _fires(cfg, 'lr_control_is_well_formed')
+
+
+def test_a_stage_lr_schedule_is_judged_against_its_own_cap(canonical):
+    cfg = copy.deepcopy(canonical)
+    stage = cfg['protocols'][cfg['protocol']]['stages'][-1]
+    stage['lr_schedule'] = [{'to': 0.05, 'steps': 10, 'kind': 'hold'},
+                            {'to': 0.01, 'steps': None, 'kind': 'linear'}]
+    stage.pop('max_steps', None)
+    assert [v for v in check(cfg) if v.rule == 'every_protocol_parses'
+            and 'lr_schedule' in v.detail and 'no max_steps' in v.detail]
+    stage['max_steps'] = 1000
+    stage['exit'] = None
+    assert not [v for v in check(cfg) if v.rule == 'every_protocol_parses'
+                and 'lr_schedule' in v.detail]
+
+
+@pytest.mark.parametrize('key,value', [
+    ('burn_in_steps', 3000), ('burn_in_scale', 0.05),
+    ('promotion_ramp_steps', 1000), ('fixed_scale', 0.2)])
+def test_a_replaced_burn_in_key_is_an_error_off_the_conformer_route(canonical, key, value):
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'lr_schedule_replaces_burn_in_keys')
+    cfg['lr_control'][key] = value
+    (v,) = [v for v in check(cfg) if v.rule == 'lr_schedule_replaces_burn_in_keys']
+    assert v.severity == ERROR and key in v.detail and 'schedule' in v.detail
+    cfg['energy_function'] = 'conformer_torsions'
+    assert not _fires(cfg, 'lr_schedule_replaces_burn_in_keys')
+
+
+@pytest.mark.parametrize('key,value', [
+    ('candidate_scales', [0.05, 0.2, 0.8]), ('trial_steps', 150),
+    ('safety_rungs', 1), ('repeat_every', 0), ('trial_settle_steps', 10),
+    ('logz_detour_nats', 2.0), ('boundary_confirm_repeats', 1),
+    ('boundary_densify', True), ('min_root_bias_correction', 0.9)])
+def test_a_retired_bracket_key_is_an_error_off_the_conformer_route(canonical, key, value):
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'lr_bracket_keys_are_retired')
+    cfg['lr_control'][key] = value
+    (v,) = [v for v in check(cfg) if v.rule == 'lr_bracket_keys_are_retired']
+    assert v.severity == ERROR and key in v.detail
+    cfg['energy_function'] = 'conformer_torsions'
+    assert not _fires(cfg, 'lr_bracket_keys_are_retired')
 
 
 def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
@@ -1087,15 +1147,27 @@ def test_an_nf_policy_refuses_sde_only_settings(canonical):
     assert _fires(cfg, 'nf_policy_refuses_sde_only_settings')
 
 
+def test_a_malformed_heldout_gate_is_an_error(canonical):
+    """Full coverage: tests/protocol/test_heldout_gate.py."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'heldout_gate_is_well_formed')
+    cfg['heldout_gate']['smooth'] = 0
+    assert _fires(cfg, 'heldout_gate_is_well_formed', severity=ERROR)
+    cfg['heldout_gate'] = {'source': 'auto', 'patience': 2}
+    assert _fires(cfg, 'heldout_gate_is_well_formed', severity=ERROR)
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check
     that is asserted to pass and never shown capable of failing.
 
     The conformer-route rules are mutation-tested against their own minimal
-    conformer config in test_conformer_route_rules.py, so that file counts too."""
+    conformer config in test_conformer_route_rules.py, and the retired prior
+    model's rule in test_crystal_prior_model_retired.py, so those files count too."""
     src = ''.join(Path(__file__).with_name(name).read_text(encoding='utf-8')
-                  for name in (Path(__file__).name, 'test_conformer_route_rules.py'))
+                  for name in (Path(__file__).name, 'test_conformer_route_rules.py',
+                               'test_crystal_prior_model_retired.py'))
     for rule in RULES:
         assert f"'{rule.__name__}'" in src, (
             f'rule {rule.__name__} has no mutation test in this file or '
@@ -1118,7 +1190,7 @@ def test_rules_abstain_on_auto_values():
 
 
 def test_severity_ordering_puts_errors_first(canonical):
-    cfg = broken(canonical, figs_period=501, batch_size=10, max_batch_size=10,
+    cfg = broken(canonical, figs_period=500, batch_size=10, max_batch_size=10,
                  fused_grad_accum_min_samples=0)
     vs = check(cfg)
     severities = [v.severity for v in vs]
@@ -1146,11 +1218,95 @@ def test_the_lr_probe_rule_abstains_on_a_config_without_the_block(canonical):
     assert not _fires(copy.deepcopy(canonical), 'lr_probe_is_retired')
 
 
-def test_the_canonical_burn_in_reaches_steady_state(canonical):
-    """mk_dev runs burn_in_steps 3000, which is a bias correction of 0.975 at
-    beta2 0.999 -- so the root the bracket measures from applies the rate its
-    config names. The test is here so a burn_in_steps edit cannot silently take
-    it back to 0.795 (t=1000) or 0.309 (t=100), where every trial would run at a
-    fraction of the rate under test."""
-    assert not _fires(canonical, 'burn_in_reaches_adam_steady_state',
-                      severity=ci.BASELINE)
+def test_a_stray_grad_geometry_block_is_an_error_on_the_crystal_route(canonical):
+    """The fused-step gradient geometry probe is deleted from train.py, so a
+    crystal config carrying `grad_geometry` configures nothing."""
+    cfg = copy.deepcopy(canonical)
+    cfg['grad_geometry'] = {'enabled': False, 'every': 50}
+    assert _fires(cfg, 'grad_geometry_is_retired')
+
+
+def test_the_grad_geometry_rule_abstains_without_the_block_and_on_the_conformer_route(canonical):
+    """Silent on mk_dev, which no longer carries the block, and on
+    conformer_torsions, whose configs still do."""
+    assert not _fires(copy.deepcopy(canonical), 'grad_geometry_is_retired')
+    cfg = copy.deepcopy(canonical)
+    cfg['grad_geometry'] = {'enabled': True, 'every': 50}
+    cfg['energy_function'] = 'conformer_torsions'
+    assert not [v for v in check(cfg) if v.rule == 'grad_geometry_is_retired']
+
+
+def test_a_crystal_config_carrying_hold_dead_latent_rows_is_an_error(canonical):
+    """Dead rows are always held off the conformer route, so the key configures
+    nothing there, true or false; conformer_torsions configs still carry it."""
+    assert not _fires(copy.deepcopy(canonical), 'hold_dead_rows_is_retired')
+    for value in (True, False):
+        cfg = copy.deepcopy(canonical)
+        cfg['model']['hold_dead_latent_rows'] = value
+        assert _fires(cfg, 'hold_dead_rows_is_retired'), value
+    cfg['energy_function'] = 'conformer_torsions'
+    assert not [v for v in check(cfg) if v.rule == 'hold_dead_rows_is_retired']
+
+
+def test_a_crystal_config_carrying_eval_T_or_integrator_is_an_error(canonical):
+    """model.sde.T is the one trajectory length off the conformer route; an
+    `eval_T` or `integrator` block there configures nothing."""
+    assert not _fires(copy.deepcopy(canonical), 'trajectory_length_is_model_T')
+    for key, value in (('eval_T', 10), ('integrator', {'T': 10})):
+        cfg = copy.deepcopy(canonical)
+        cfg[key] = value
+        assert _fires(cfg, 'trajectory_length_is_model_T'), key
+
+
+def test_an_sde_crystal_config_without_model_T_is_an_error_and_nf_needs_none(canonical):
+    """The SDE policy needs model.T; the NF policy (one step) reads none."""
+    cfg = copy.deepcopy(canonical)
+    del cfg['model']['T']
+    assert _fires(cfg, 'trajectory_length_is_model_T')
+    cfg['model']['T'] = 0
+    assert _fires(cfg, 'trajectory_length_is_model_T')
+    del cfg['model']['T']
+    cfg['policy']['kind'] = 'nf'
+    assert not [v for v in check(cfg) if v.rule == 'trajectory_length_is_model_T']
+
+
+def test_the_trajectory_length_rule_abstains_on_the_conformer_routes(canonical):
+    """conformer_torsions configs and train_conformer.py's conformer_dev (no
+    energy_function) keep `integrator.T` and `eval_T`."""
+    for ef in ('conformer_torsions', None):
+        cfg = copy.deepcopy(canonical)
+        cfg['eval_T'], cfg['integrator'] = 32, {'T': 32}
+        del cfg['model']['T']
+        if ef is None:
+            del cfg['energy_function']
+        else:
+            cfg['energy_function'] = ef
+        assert not [v for v in check(cfg) if v.rule == 'trajectory_length_is_model_T'], ef
+
+
+def test_train_py_no_longer_reads_grad_geometry():
+    """The rule above is only true while nothing in train.py reads the key."""
+    src = (HERE / 'train.py').read_text(encoding='utf-8')
+    for name in ('grad_geometry', '_fused_grad_diag_armed', '_log_fused_gradient_geometry',
+                 '_fused_grad_geom_report'):
+        assert name not in src, name
+
+
+def test_a_crystal_ema_decay_is_an_error(canonical):
+    """There is no EMA model off the conformer route (ema_model IS gfn_model),
+    so a decay configures nothing."""
+    cfg = copy.deepcopy(canonical)
+    cfg['ema_decay'] = 0.99
+    assert _fires(cfg, 'ema_decay_is_conformer_only')
+
+
+def test_the_ema_decay_rule_abstains_on_null_and_on_the_conformer_route(canonical):
+    """Silent on mk_dev (no key), on an explicit null, and on conformer_torsions,
+    where ConformerModeller keeps its EMA copy."""
+    assert not _fires(copy.deepcopy(canonical), 'ema_decay_is_conformer_only')
+    cfg = copy.deepcopy(canonical)
+    cfg['ema_decay'] = None
+    assert not _fires(cfg, 'ema_decay_is_conformer_only')
+    cfg['ema_decay'] = 0.5
+    cfg['energy_function'] = 'conformer_torsions'
+    assert not [v for v in check(cfg) if v.rule == 'ema_decay_is_conformer_only']

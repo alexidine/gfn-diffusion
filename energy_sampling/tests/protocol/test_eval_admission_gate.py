@@ -3,7 +3,7 @@
 WHAT THE EVAL SITE DOES. evaluation() admits its own rollout to BOTH buffers.
 The prior buffer is off-policy by design and wants it. The replay buffer is a
 store of the training policy's own trajectories, and what arrives here is a
-different sample: the EMA model, at eval_T, over eval_num_samples. Admission is
+different sample: the eval rollout, at model.sde.T, over eval_num_samples. Admission is
 capped at churn_rate, so at eval_num_samples 10000 with churn_rate = batch 1000
 it puts 1000 rows per eval against a forward intake of 1000 per 20 steps -- ~17%
 of the buffer. Those rows are born with a NaN birth_log_pf and drop out of the
@@ -54,7 +54,7 @@ EXPECTED_ORIGIN = {
     # z-calibration's extra rollout. freeze_policy zeroes the policy's GRADIENT,
     # not its forward pass, so the sample is the same one the fused step admits
     '_z_rollout_step': 'ORIGIN_ROLLOUT',
-    # a one-off entry draw at eval_num_samples on the eval_T grid
+    # a one-off entry draw at eval_num_samples on the training grid
     'bootstrap_z_by_rollout': 'ORIGIN_BOOTSTRAP',
     # the EMA model on the eval grid
     '_admit_eval_rollout': 'ORIGIN_EVAL',

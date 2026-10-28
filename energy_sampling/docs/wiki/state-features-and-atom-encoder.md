@@ -162,7 +162,7 @@ Inside the pool a row's output is computed from that row's atoms alone: attentio
 
 The width is derived, not read from the config. `train.py::Modeller._state_features_dim` reads `cfg:model.state_atoms`; it returns 0 when that is 0 or absent, raises `ValueError` when it is positive and `cfg:drift_force.checkpoint` is null, and otherwise returns `state_atoms * (TrunkForce.atom_feature_dim(checkpoint) + 2)`. `::Modeller._build_gfn_config` puts the result in the constructor arguments as `state_features_dim`, beside every key of the `cfg:model` block, which carries `cfg:model.{state_atoms, state_atom_hidden_dim, state_atom_blocks, state_atom_heads, state_crystal_t_min, state_atoms_t_min, state_force_input}` under the constructor's own names. That dictionary is the `gfn_config` a checkpoint stores.
 
-`::Modeller.init_gfn` calls `::Modeller._build_drift_force` after the model has been built or reloaded and installs the result on the training model and the EMA model. `_build_drift_force` does the following in order.
+`::Modeller.init_gfn` calls `::Modeller._build_drift_force` after the model has been built or reloaded and installs the result on every module `::Modeller._policies` returns: the training model, plus a ConformerModeller's separate EMA copy. `_build_drift_force` does the following in order.
 
 1. It raises `ValueError` on a key under `cfg:drift_force` that is not in `::Modeller.DRIFT_FORCE_KEYS`.
 2. It returns `None` when the model has neither a force term nor features, printing a notice when a checkpoint is named all the same.

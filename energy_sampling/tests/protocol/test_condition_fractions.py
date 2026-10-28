@@ -374,7 +374,7 @@ def test_log_test_metrics_publishes_the_heldout_family():
     m.energy_function.energy_function = 'mol_energy'
     m.args.eval_num_samples = 6
     m.args.test_eval_num_samples = 6
-    m.ema_model = None
+    m.gfn_model = None
     m.test_mol_dataset = object()
     seen_kwargs = {}
 

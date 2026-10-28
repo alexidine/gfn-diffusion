@@ -2,8 +2,8 @@
 
 get_problem_definition folds all of energy_config into the identity minus
 _NON_IDENTITY_ENERGY_CONFIG_KEYS, and assert_problem_match raises on the
-checkpoint_name path -- which is exactly how a phase-1 exit is consumed, and how
-prior_model_name loads too. So adding a key to energy_config without exempting it
+checkpoint_name path -- which is exactly how a phase-1 exit is consumed. So
+adding a key to energy_config without exempting it
 silently REFUSES every checkpoint written before that key existed.
 
 That happened: 504277b added the three MLIP execution knobs and every phase-1

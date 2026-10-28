@@ -87,8 +87,8 @@ BUFFER_FORMAT_VERSION = 2
 ANCHOR_ENERGY_CURRENCY = 'e_anchor'
 
 #: WHICH ROLLOUT A ROW CAME OFF, stored per row as `origin` (int8). Not every
-#: admission is the same sample: the eval-site call admits the EMA model's
-#: rollout on the eval_T grid, and bootstrap_z_by_rollout admits a one-off
+#: admission is the same sample: the eval-site call admits the eval
+#: rollout (eval_num_samples, the training grid), and bootstrap_z_by_rollout admits a one-off
 #: measurement draw. Both used to be indistinguishable from the fused step's own
 #: forward rows once resident, so buffer composition was readable only as an
 #: absence -- eval rows are born with a NaN birth_log_pf and drop out of the
@@ -103,7 +103,7 @@ ANCHOR_ENERGY_CURRENCY = 'e_anchor'
 N_FORCE_LEGS = 3
 
 ORIGIN_ROLLOUT = 0     # the fused/fwd train step's own forward rollout
-ORIGIN_EVAL = 1        # evaluation()'s EMA-model rollout on the eval_T grid
+ORIGIN_EVAL = 1        # evaluation()'s rollout at eval_num_samples
 ORIGIN_BOOTSTRAP = 2   # bootstrap_z_by_rollout and any init/seed admission
 
 #: code -> metric-safe name, the ONE spelling the origin_frac keys are built

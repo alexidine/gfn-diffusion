@@ -71,7 +71,8 @@ def _modeller(ckdir, conditional, nf=None):
 
 
 def _fresh_run(ckdir, conditional):
-    """A fresh build: gfn_config, the policy and its EMA, standardisers fitted, two optimizer steps taken."""
+    """A fresh build: gfn_config, the policy (ema_model IS gfn_model off the conformer route), standardisers
+    fitted, two optimizer steps taken."""
     m = _modeller(ckdir, conditional)
     m.gfn_config = m._build_gfn_config()
     torch.manual_seed(0)
@@ -79,7 +80,7 @@ def _fresh_run(ckdir, conditional):
     torch.manual_seed(1)
     m.gfn_model.fit_data_scalers(torch.rand(200, 12) * 1.6 - 0.8,
                                  torch.randn(50, COND_DIM) * 2 + 1 if conditional else None)
-    m.ema_model = copy.deepcopy(m.gfn_model)
+    m.ema_model = m.gfn_model
     m.init_schedulers_optimizers()
     x, c = _rows(conditional, seed=2)
     for _ in range(2):
@@ -101,11 +102,11 @@ def _rows(conditional, seed, n=16):
 
 
 def _readout(m, conditional):
-    """log q of fixed rows under the train and EMA policies, and the level head on those rows."""
+    """log q of fixed rows under the policy, and the level head on those rows."""
     x, c = _rows(conditional, seed=5)
     with torch.no_grad():
         level = m.gfn_model.get_traj_bwd(x, None, c, None)[3][:, 0]
-    return m.gfn_model.log_density(x, c, None), m.ema_model.log_density(x, c, None), level
+    return m.gfn_model.log_density(x, c, None), level
 
 
 def _adam_steps(m):
@@ -120,8 +121,10 @@ def test_load_full_restores_the_flow_its_scalers_level_and_adam_state(tmp_path, 
     saved.checkpointer.save('running')
 
     m = _modeller(tmp_path, conditional)
+    assert 'model_eval' not in torch.load(m.checkpointer.path_for('running'), weights_only=False)
     m.checkpointer.load_full(m.checkpointer.path_for('running'))
-    assert bool(m.gfn_model.scalers_fitted) and bool(m.ema_model.scalers_fitted)
+    assert m.ema_model is m.gfn_model, 'no EMA copy off the conformer route'
+    assert bool(m.gfn_model.scalers_fitted)
     got = _readout(m, conditional)
     for a, b in zip(got, ref):
         assert torch.equal(a, b)

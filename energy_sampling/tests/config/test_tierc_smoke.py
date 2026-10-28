@@ -353,9 +353,9 @@ def test_stage_patch_returns_every_stage():
 # ------------------------------------------------------------ the LR pin ----
 
 #: A config as `config_state.migrate` leaves a historical one: the `adaptive_lr`
-#: block has been lifted to `lr_control`, carrying seed_lr, and the migration has
-#: deliberately NOT invented a candidate grid -- so nothing can move the four
-#: `auto` rates and the config does not load.
+#: block has been lifted to `lr_control` in `mode: bracket` (deleted 2026-10-28),
+#: carrying seed_lr -- so nothing can move the four `auto` rates and the config
+#: does not load.
 _UNMANAGED = {
     'lr_policy': 'auto', 'lr_back': 'auto', 'lr_replay': 'auto',
     'lr_fused': 'auto',
@@ -374,17 +374,25 @@ def test_pin_translates_an_unmanaged_auto_into_the_rate_it_trained_at():
     # ...and the rate policy is stated in the vocabulary that now exists: a
     # fixed scale of exactly 1.0 over the base rate is what that config did.
     assert cfg['lr_control']['mode'] == 'fixed'
-    assert cfg['lr_control']['fixed_scale'] == 1.0
+    assert cfg['lr_control']['schedule'] == [{'to': 1.0, 'steps': 0, 'kind': 'hold'}]
 
 
-def test_pin_is_inert_when_the_bracket_can_actually_move_the_rate():
-    """It must fire ONLY on the config that cannot load. Pinning a config whose
-    bracket has a real candidate grid would silently disable the bracket --
-    turning the repair into the largest behaviour change in the comparison."""
+def test_pin_is_inert_when_fixed_mode_can_already_move_the_rate():
+    """It must fire ONLY on the config that cannot load."""
     cfg = copy.deepcopy(_UNMANAGED)
-    cfg['lr_control']['candidate_scales'] = [0.05, 0.2, 0.8]
+    cfg['lr_control']['mode'] = 'fixed'
     assert T.pin_auto_lr_without_sensor(cfg) == []
     assert cfg['lr_policy'] == 'auto'
+
+
+def test_pin_drops_the_deleted_bracket_keys():
+    cfg = copy.deepcopy(_UNMANAGED)
+    cfg['lr_control']['candidate_scales'] = [0.05, 0.2, 0.8]
+    cfg['lr_control']['trial_steps'] = 150
+    assert T.pin_auto_lr_without_sensor(cfg)
+    assert 'candidate_scales' not in cfg['lr_control']
+    assert 'trial_steps' not in cfg['lr_control']
+    assert cfg['lr_control']['seed_lr'] == pytest.approx(1.25e-4)
 
 
 def test_pin_is_inert_when_the_rates_are_already_explicit():
@@ -431,11 +439,16 @@ def test_the_assembled_config_preflights():
     utils.resolve_derived_config(utils.preflight_config(args))
 
 
-def test_eval_is_pinned_to_integrator_T():
-    """`eval_T != integrator.T` is refused at load. The harness overrides both
-    from different layers, so the agreement is asserted rather than assumed."""
+def test_the_trajectory_length_is_model_T_alone():
+    """Off the conformer route `eval_T` and `integrator` are refused at load
+    (config_invariants.trajectory_length_problems); the benchmark's T reaches
+    the one key, model.sde.T."""
+    import config_invariants as ci
     cfg, _ = T.build_config('configs/mk_dev.yaml', steps=30)
-    assert cfg['eval_T'] == cfg['integrator']['T']
+    assert 'eval_T' not in cfg and 'integrator' not in cfg
+    resolved = ci.canonical_model_section(cfg)
+    assert resolved['model']['T'] == 10
+    assert ci.trajectory_length_problems(resolved) == []
 
 
 def test_the_problem_overlay_is_read_from_problems_yaml():
@@ -491,7 +504,7 @@ def test_the_remaining_gap_is_declared_rather_than_patched_quietly():
     assert ec['reward_range'] is None
     assert ec['log_temperature_range'] == [0.0, 0.0]
     assert math.isclose(ec['bounding_coeff'], 1.0)
-    assert fill['model']['hold_dead_latent_rows'] is True
+    assert 'hold_dead_latent_rows' not in fill['model']  # retired: rows are always held
     assert len(notes) == 2
     assert any('reward_range' in n for n in notes)
 

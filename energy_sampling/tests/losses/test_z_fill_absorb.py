@@ -25,7 +25,7 @@ def _stub(logw, current_z=0.0, step=1000, **fill_cfg):
         **{'fill_threshold': 0.5, 'fill_se': 3.0, 'fill_cooldown_steps': 0,
            'fill_mode': 'absorb', 'fill_process_var': 0.01, 'fill_moment_reset': 0.5,
            **fill_cfg})
-    flow, ema_flow = LearnableScalar(current_z), LearnableScalar(current_z)
+    flow = LearnableScalar(current_z)
     tracker = types.SimpleNamespace(
         clip_beta=BETA, z_bias_ema=torch.tensor([4.0]), z_grad_ema=torch.tensor([4.0]))
     m = types.SimpleNamespace(
@@ -35,7 +35,6 @@ def _stub(logw, current_z=0.0, step=1000, **fill_cfg):
             z_calibration=cfg,
             fwd_loss_coeffs=types.SimpleNamespace(beta=BETA, freeze_policy=1.0)),
         gfn_model=types.SimpleNamespace(flow_model=flow, conditional=False, full_flow=False),
-        ema_model=types.SimpleNamespace(flow_model=ema_flow),
         optimizers={},
         condition_log_z=tracker,
     )
@@ -60,7 +59,6 @@ def test_first_measurement_is_taken_whole_and_sets_P_to_its_variance():
     assert _z(m) == pytest.approx(rep['z_fill/root'])
     assert rep['z_fill/P'] == pytest.approx(rep['z_fill/se'] ** 2)
     assert m._z_fill_last_applied == 1000
-    assert float(m.ema_model.flow_model.scalar.detach()) == pytest.approx(_z(m))
 
 
 def test_precise_measurement_nearly_snaps_and_noisy_one_barely_moves():
@@ -162,5 +160,3 @@ def test_unknown_fill_mode_is_refused():
 
 def test_absorber_state_is_checkpointed():
     assert '_z_fill_P' in MODELLER_STATE_DEFAULTS and '_z_fill_last_applied' in MODELLER_STATE_DEFAULTS
-    from lr_bracket_probe import TrainerSnapshot
-    assert '_z_fill_P' in TrainerSnapshot.FIELDS and '_z_fill_last_applied' in TrainerSnapshot.FIELDS

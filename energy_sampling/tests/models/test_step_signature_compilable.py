@@ -82,3 +82,24 @@ def test_eval_pb_logprob_is_index_free():
         '_eval_pb_logprob takes an index again; it is called from inside both compiled '
         'step bodies, so an int here specialises the whole step.')
     assert 'is_first' in args and ann.get('is_first') == 'bool'
+
+
+TRAIN_SRC = os.path.join(os.path.dirname(GFN_SRC), os.pardir, 'train.py')
+
+
+def test_compile_site_turns_donated_buffers_off():
+    """A second backward through a compiled graph is only legal with donated
+    buffers off, and the choice is baked in when AOTAutograd traces -- so it must
+    be set BEFORE first forward, in Modeller.maybe_compile_policy. Cluster-only:
+    compile_policy 'auto' resolves OFF on Windows, so no local run can catch it."""
+    src = open(TRAIN_SRC, encoding='utf-8').read()
+    tree = ast.parse(src)
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == 'Modeller'):
+        for fn in (n for n in cls.body
+                   if isinstance(n, ast.FunctionDef) and n.name == 'maybe_compile_policy'):
+            body = ast.get_source_segment(src, fn)
+            assert 'donated_buffer = False' in body, (
+                'maybe_compile_policy no longer disables donated buffers -- with the '
+                'trunk compiled, any retain_graph/create_graph backward through it raises.')
+            return
+    pytest.fail(f'Modeller.maybe_compile_policy not found in {TRAIN_SRC}')

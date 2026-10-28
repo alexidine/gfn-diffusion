@@ -1,12 +1,9 @@
 """
 `max_lr`: an absolute rail on every rate the controller writes.
 
-WHY A RAIL AND NOT A NARROWER CANDIDATE GRID. The grid is deliberately wide --
-its top rungs are meant to be EXPECTED to fail, which is the only way a bracket
-finds a boundary at all -- so narrowing it to express a safety limit would delete
-the measurement along with the hazard. This is the other thing: a hard number in
-absolute learning-rate units that no group may exceed however the rate got there,
-and it applies to the flow group, which nothing else can lower.
+A hard number in absolute learning-rate units that no group may exceed however
+the rate got there, and it applies to the flow group, which nothing else can
+lower.
 
 THE MEASUREMENT BEHIND IT (hyperslope_aug17, 2026-08-17, QM9 conditional, one
 pinned rate per arm): 5e-6, 1.25e-5, 3e-5 and 8e-5 each run 2000 steps with zero
@@ -54,13 +51,10 @@ def _controller(max_lr=None, min_lr=1.0e-6, lr_flow=0.1, managed=('lr_fused',),
     hard_failure = _Bag(loss_excursion_k=10.0, grad_excursion_x=100.0,
                         loss_abs=1.0e6, grad_abs=1.0e6, root_window=200,
                         min_observations=20)
-    control = _Bag(mode='bracket', seed_lr=SEED_LR, control_flow_lr=False,
-                   burn_in_steps=3000, burn_in_scale=0.05,
-                   min_root_bias_correction=0.9,
-                   candidate_scales=(0.05, 0.1, 0.2, 0.4, 0.8, 1.6),
-                   trial_steps=150, safety_rungs=1, repeat_every=0,
-                   boundary_confirm_repeats=1, boundary_densify=False,
-                   fixed_scale=0.2, verbose=False, hard_failure=hard_failure)
+    control = _Bag(mode='fixed', seed_lr=SEED_LR, control_flow_lr=False,
+                   schedule=[{'to': 0.05, 'steps': 3000, 'kind': 'hold'},
+                             {'to': 0.2, 'steps': 1000, 'kind': 'geometric'}],
+                   verbose=False, hard_failure=hard_failure)
     args = _Bag(lr_control=control, min_lr=min_lr,
                 max_lr=max_lr, lr_policy=SEED_LR, lr_back=SEED_LR,
                 lr_replay=SEED_LR, lr_fused=lr_fused, lr_flow=lr_flow,
@@ -80,7 +74,7 @@ def _rates(modeller):
 
 
 def _drive_peak(ctrl, factor):
-    """Put the bracket's scale at `factor`, the way a promoted rung would."""
+    """Put the controller's scale at `factor`."""
     ctrl.set_scale(factor, why='test')
 
 

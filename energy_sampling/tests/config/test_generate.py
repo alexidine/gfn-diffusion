@@ -91,18 +91,18 @@ def test_deviation_summary_excludes_provenance(tmp_path):
 # ------------------------------------------------- an unloadable arm is fatal
 
 def test_an_unloadable_arm_is_fatal_not_zero_deviations(tmp_path):
-    """THE BUG. `integrator.T` without a matching `eval_T` is refused at load.
-    Before the fix this wrote the file and reported '0 deviations'."""
-    bad = generate.arm('bad', problem='latent_gaussian', **{'integrator.T': 25})
+    """THE BUG. A retired key (utils._RETIRED_KEYS: `max_reloads`) is refused at
+    load. Before the fix this wrote the file and reported '0 deviations'."""
+    bad = generate.arm('bad', problem='latent_gaussian', max_reloads=3)
     with pytest.raises(SystemExit, match='DOES NOT LOAD'):
         generate.emit({'bad': bad}, outdir=tmp_path, quiet=True, index=False)
 
 
-def test_the_same_arm_with_the_matching_key_is_accepted(tmp_path):
+def test_the_same_arm_with_the_renamed_key_is_accepted(tmp_path):
     """MUTATION IN THE PASSING DIRECTION. Without this the fatal rule could be
     rejecting every arm and the test above would not notice."""
-    good = generate.arm('good', problem='latent_gaussian', eval_T=25,
-                        **{'integrator.T': 25})
+    good = generate.arm('good', problem='latent_gaussian', max_reloads_per_1k_steps=3.0,
+                        **{'model.T': 25})
     written = generate.emit({'good': good}, outdir=tmp_path, quiet=True, index=False)
     assert len(written) == 1 and written[0].exists()
 
@@ -219,10 +219,10 @@ def test_dotted_override_refuses_to_tunnel_through_a_non_dict():
 
 
 def test_dotted_and_nested_overrides_reach_the_same_place():
-    a = generate.arm('a', problem='mipcas_elj', **{'integrator.T': 7, 'eval_T': 7})
-    b = generate.arm('b', problem='mipcas_elj', integrator={'T': 7}, eval_T=7)
-    assert a['integrator']['T'] == b['integrator']['T'] == 7
-    assert a['integrator'].keys() == b['integrator'].keys(), 'dotted set lost siblings'
+    a = generate.arm('a', problem='mipcas_elj', **{'model.T': 7})
+    b = generate.arm('b', problem='mipcas_elj', model={'T': 7})
+    assert a['model']['T'] == b['model']['T'] == 7
+    assert a['model'].keys() == b['model'].keys(), 'dotted set lost siblings'
 
 
 # ------------------------------------------------------------------- the stamp

@@ -18,7 +18,7 @@ defaults:
     archive_buffers: false
     grow_batch_size: false
     max_step_seconds: 0
-    figs_period: 100000000
+    figs_every_n_evals: 0
     # NO z_calibration ENTRY, and none is possible -- the same story as
     # ray_calibration below, and it cost a retracted floor to learn twice.
     # `z_calibration.enabled` was the switch until state 6 made it a STAGE FLAG
@@ -187,8 +187,7 @@ benchmarks:
       wallclock_cap_s: 3600
     overrides:
       energy_function: latent_gaussian
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -258,11 +257,9 @@ benchmarks:
       energy_function: latent_multiharmonic
       vector_conditioning: true
       vector_conditioning_dim: 3
-      model: {periodic_centroids: false}
+      model: {periodic_centroids: false, T: 10}
       space_groups: [1]
       energy_config: {temperature: 1.0}
-      integrator: {T: 10}
-      eval_T: 10
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -330,8 +327,7 @@ benchmarks:
       wallclock_cap_s: 3600
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -397,8 +393,7 @@ benchmarks:
       wallclock_cap_s: 3600
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -464,8 +459,7 @@ benchmarks:
       wallclock_cap_s: 3600
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -532,8 +526,7 @@ benchmarks:
       wallclock_cap_s: 3600
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -602,8 +595,7 @@ benchmarks:
       wallclock_cap_s: 7200
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -730,8 +722,7 @@ benchmarks:
       energy_function: elj
       embedding_conditioning: true
       embedding_conditioning_dim: 192
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 100000000
@@ -805,8 +796,7 @@ benchmarks:
       wallclock_cap_s: 10800
     overrides:
       energy_function: uma
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 100
       max_batch_size: 100
       cuda_memory_fraction: 0.7
@@ -915,8 +905,7 @@ benchmarks:
     overrides:
       energy_function: mace
       space_groups: [14]
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 100
       max_batch_size: 100
       cuda_memory_fraction: 0.7
@@ -1027,12 +1016,11 @@ benchmarks:
       wallclock_cap_s: 7200
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 1000
       max_batch_size: 1000
       eval_period: 250
-      figs_period: 500
+      figs_every_n_evals: 2
       eval_num_samples: 10000
     metrics:
       primary: [eval_step_time, eval_sampling_time, eval_figs_time]
@@ -1043,7 +1031,7 @@ benchmarks:
         energy/ms_per_sample: 'pools training and eval energy calls, which is the confound this benchmark exists to separate'
     liveness:
       - 'at least measure_evals evaluations fired'
-      - 'figs_period is a multiple of eval_period, so figures actually logged'
+      - 'figs_every_n_evals is nonzero, so figures actually logged'
     noise_floor:
       method: repeat_launch
       repeats: 5
@@ -1113,8 +1101,7 @@ benchmarks:
       min_wallclock_s: 7200
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       eval_period: 100000000
     metrics:
       primary: [samples_per_sec, gpu/util_policy, train_step_time]
@@ -1202,12 +1189,11 @@ benchmarks:
       min_wallclock_s: 14400
     overrides:
       energy_function: elj
-      integrator: {T: 10}
-      eval_T: 10
+      model: {T: 10}
       batch_size: 4491
       max_batch_size: 4491
       eval_period: 500
-      figs_period: 1000
+      figs_every_n_evals: 2
       eval_num_samples: 10000
     metrics:
       primary: [gpu/util_policy, eval_step_time, inter_eval_time]
@@ -1220,7 +1206,7 @@ benchmarks:
         energy/ms_per_sample: 'pools training and eval energy calls'
     liveness:
       - 'at least 8 evaluations fired inside the gpu/util_policy window'
-      - 'figs_period is a multiple of eval_period, so figures actually logged'
+      - 'figs_every_n_evals is nonzero, so figures actually logged'
       - 'the external nvidia-smi CSV covers the whole job, eval blocks included'
       - >-
         the run lasted at least min_wallclock_s, VERIFIED from the external

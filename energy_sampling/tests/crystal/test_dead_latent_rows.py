@@ -636,8 +636,8 @@ def test_multi_space_group_disagreement_raises():
     class StubModeller:
         _resolve_dead_latent_rows = train_mod.Modeller._resolve_dead_latent_rows
 
-        def __init__(self, sgs, zp=(1,), hold=True, is_crystal=True):
-            self.args = Namespace(model=Namespace(hold_dead_latent_rows=hold),
+        def __init__(self, sgs, zp=(1,), is_crystal=True):
+            self.args = Namespace(model=Namespace(),
                                   space_groups=list(sgs), z_primes=list(zp))
             self.energy_function = Namespace(is_crystal=is_crystal)
 
@@ -669,8 +669,7 @@ def test_multi_space_group_disagreement_raises():
     except ValueError as e:
         assert 'at least one entry' in str(e), str(e)
 
-    # and the knob-off / toy paths still short-circuit before any of this
-    assert StubModeller((4, 14), hold=False)._resolve_dead_latent_rows(quiet=True) is None
+    # the toy path still short-circuits before any of this; there is no knob-off path
     assert StubModeller((4, 14), is_crystal=False)._resolve_dead_latent_rows(quiet=True) is None
 
     print(f"PASS multi-SG disagreement raises ({len(bad_cases)} ambiguous sets refused, "

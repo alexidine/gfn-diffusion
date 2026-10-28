@@ -127,8 +127,8 @@ def test_the_protocol_panic_lever_drops_the_per_branch_restriction():
     class _Proto(StageProtocol):          # `stage` is a read-only property
         stage = type('S', (), {'name': 'equilibration'})()
 
-    m, gfn, ema = _M(), _Model(), _Model()
-    m.args, m.gfn_model, m.ema_model, m.batch_sizer = _Args(), gfn, ema, object()
+    m, gfn = _M(), _Model()
+    m.args, m.gfn_model, m.batch_sizer = _Args(), gfn, object()
     proto = object.__new__(_Proto)
     proto.m = m
 
@@ -136,7 +136,6 @@ def test_the_protocol_panic_lever_drops_the_per_branch_restriction():
 
     assert m.args.traj_checkpoint is True
     assert not m.args.traj_checkpoint_modes, 'args kept a restriction the panic lever must drop'
-    for mdl in (gfn, ema):
-        assert mdl.traj_checkpoint is True
-        assert not mdl.traj_checkpoint_modes, 'model still checkpoints one branch only'
+    assert gfn.traj_checkpoint is True
+    assert not gfn.traj_checkpoint_modes, 'model still checkpoints one branch only'
     assert m.batch_sizer is None, 'ladder must re-arm: per-sample memory changed'

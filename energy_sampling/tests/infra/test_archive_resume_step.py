@@ -71,7 +71,7 @@ def _modeller(ckdir, archive_buffers=True, archive_period=PERIOD):
     m.grad_guard = SimpleNamespace(state_dict=lambda: None, load_state_dict=lambda s: None)
     m.gfn_from_config = lambda cfg: _Policy()
     m.gfn_config = {}
-    m.gfn_model, m.ema_model = _Policy(), _Policy()
+    m.gfn_model = _Policy()
     m.optimizers = {}
     m.init_schedulers_optimizers = lambda: None
     m.prior_buffer = _Rows('unset')

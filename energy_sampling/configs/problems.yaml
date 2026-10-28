@@ -67,8 +67,8 @@ problems:
     z_primes: [ 1 ]
     vector_conditioning: false
     molecule_conditioning: false
-    prior_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
-    molecules_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
+    prior_path: 'D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt'
+    molecules_path: 'D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt'
     test_molecules_path: null
     temperature: 2.5
     analyze_kwargs: { }

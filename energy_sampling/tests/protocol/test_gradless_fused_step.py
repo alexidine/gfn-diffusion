@@ -117,7 +117,7 @@ def _modeller(cfg, rollout, replay_rows=None, condition_draw=True, accum_target=
             controller=SimpleNamespace(deactivate_threshold=cfg['controller']['deactivate_threshold'],
                                        refresh_every=cfg['controller']['refresh_every']),
             fwd_loss_coeffs=fwd_c, bwd_loss_coeffs=bwd_c, replay_loss_coeffs=rep_c,
-            integrator=SimpleNamespace(T=T), fused_grad_accum_min_samples=accum_target),
+            model=SimpleNamespace(T=T), fused_grad_accum_min_samples=accum_target),
         protocol=SimpleNamespace(stage=stage, mode_boostable=lambda mode: True,
                                  mode_dormant=lambda mode: False),
         gfn_model=gfn, fwd_frac=0.0, bwd_frac=0.5, replay_frac=0.5, fused_step_count=0,
@@ -159,7 +159,6 @@ def _modeller(cfg, rollout, replay_rows=None, condition_draw=True, accum_target=
     m.mode_repeats = lambda mode: 1
     m._stash_z_fill_logw = lambda d: None
     m.z_level_fill = lambda *a, **k: None  # the fill runs inside the fused step when fwd is detached
-    m._fused_grad_diag_armed = lambda: False
     m.manage_replay_buffer = lambda d, b, **kw: None
     m._ray_probe_armed = lambda: False
     m.record_fused_substep_losses = lambda subs: None

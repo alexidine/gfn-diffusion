@@ -192,21 +192,12 @@ class Run:
         grad_norm = float(g_before.norm()) if g_before is not None else None
 
         # THE CONTROLLER'S OWN SEAT, once per step, exactly where train.py puts
-        # it. Without this the LR bracket never leaves burn-in, `in_burn_in()`
+        # it. Without this the controller never leaves burn-in, `in_burn_in()`
         # stays true for the whole battery, and the shared actuator holds EVERY
         # arm for every step -- so every board reads "no controller moves the
         # rate", which is the pass-through failure `null` exists to catch
-        # arriving through the harness instead of through the arms. It was
-        # measured exactly that way when the bracket landed.
-        #
-        # The return value is the promoted horizon a bracket wants the host's
-        # step clock to skip. Arms run the controller in `mode: fixed`, which
-        # never brackets and so always returns 0; a `Bracket` arm would need the
-        # bench to honour it.
-        skipped = m.lr_controller.tick()
-        assert not skipped, (
-            'the controller asked the bench to skip {} steps, but this runner has '
-            'no skippable clock -- an arm put it in bracket mode'.format(skipped))
+        # arriving through the harness instead of through the arms.
+        m.lr_controller.tick()
 
         # --- train.py's step body ORDER, which the old harness inverted:
         #     1992 batch sizer | 1996 lr_controller.step() | 1998 monitor_losses

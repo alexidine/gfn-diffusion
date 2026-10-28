@@ -1,10 +1,8 @@
 """Fill prior_dataset / prior_buffer from the handcrafted prior -- no MLE model needed.
 
-In the crystal harness the prior sampler is a *trained* model: phase 1 fits it by MLE,
-and everything downstream draws prior states from it. For a toy that is circular work.
-``mxtaltools.conformers.prior.InternalPrior`` is already a generative model over internal
-DoF -- one-body histograms per DoF type, plus an empirical joint per ring system -- so it
-occupies exactly the ``prior_model`` slot and can emit prior states directly.
+``mxtaltools.conformers.prior.InternalPrior`` is a generative model over internal DoF --
+one-body histograms per DoF type, plus an empirical joint per ring system -- so it can emit
+prior states directly, with no trained prior sampler.
 
 MLE warm-start is unaffected: it still runs, it just trains against a dataset written by
 the handcrafted prior instead of by a learned one.

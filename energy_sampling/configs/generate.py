@@ -268,7 +268,7 @@ def arm(name: str, problem: Optional[str] = None, tag: Optional[str] = None,
     Dotted keys are accepted alongside nested dicts, since `loss_coeffs__fwd__tb`
     is unreadable and `{'fwd_loss_coeffs': {'tb': 1.0}}` is verbose for one value:
 
-        arm('a1', problem='latent_gaussian', **{'integrator.T': 25})
+        arm('a1', problem='latent_gaussian', **{'model.T': 25})
     """
     cfg = copy.deepcopy(base) if base is not None else canonical()
     if problem is not None:

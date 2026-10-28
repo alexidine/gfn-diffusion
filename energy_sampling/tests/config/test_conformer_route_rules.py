@@ -6,7 +6,7 @@ config that every conformer rule passes, and fires ALONE, at its declared
 severity -- so the test pins the rule rather than whichever neighbour happens to
 share the key. Each rule is also silent on mk_dev, and that silence is shown to
 come from the route gate rather than from rules that cannot fire: mk_dev carries
-DPLR, snapshot_prior, a molecules_path and crystal energy keys, and relabelled as
+DPLR, a molecules_path and crystal energy keys, and relabelled as
 a conformer config it trips the rules that read them.
 
 The names of the rules appear here in quotes because
@@ -123,14 +123,13 @@ def test_mk_dev_is_silent_on_every_conformer_rule(canonical):
 def test_the_route_gate_is_what_keeps_mk_dev_silent(canonical):
     """The same file, relabelled onto the conformer route. Its DPLR over a
     molecules_path, its crystal energy_config (no level, no force_field, crystal
-    keys), its snapshot_prior and its unclipped energy all trip the rules that
-    read them -- so the silence above is the energy_function gate."""
+    keys) and its unclipped energy all trip the rules that read them -- so the
+    silence above is the energy_function gate."""
     cfg = perturbed(canonical, energy_function='conformer_torsions')
     fired = {v.rule for v in _conformer_violations(cfg)}
     assert {'conformer_dplr_is_off_on_a_set',
             'conformer_level_and_force_field_are_stated',
             'conformer_energy_config_keys_are_read',
-            'conformer_protocol_omits_snapshot_prior',
             'conformer_set_clips_energy'} <= fired, fired
 
 

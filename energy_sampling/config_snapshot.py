@@ -335,7 +335,8 @@ _LOSS_TERMS = ('tb', 'mle', 'tbc', 'z_level', 'vg_lb', 'vg_lme', 'vg_by_conditio
 _PHRASED_COEFFS = set(_LOSS_TERMS) | {'freeze_policy', 'freeze_z', 'pooled_vg',
                                       'pooled_source', 'pooled_ratio'}
 # stage keys never phrased: listed in the tail whenever the stage declares them
-_TAIL_KEYS = ('hot_lr_sensor', 'lr_sensor', 'mle_gate', 'min_fracs', 'deactivate_threshold')
+_TAIL_KEYS = ('hot_lr_sensor', 'lr_sensor', 'mle_gate', 'min_fracs', 'deactivate_threshold',
+              'lr_schedule')
 _BRANCH_DATA = {'fwd': 'its own on-policy rollouts',
                 'replay': 'stored forward rollouts in the replay buffer'}
 _BWD_DATA = {'dataset': 'terminals drawn from the prior dataset',

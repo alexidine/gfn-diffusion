@@ -129,7 +129,6 @@ def test_set_traj_checkpoint_bare_means_on():
     class _M:
         args = _Args()
         gfn_model = None
-        ema_model = None
 
     # `stage` is a derived property that walks the whole config; this action only needs it
     # for its log line, so a subclass supplies one rather than standing up a modeller.
@@ -192,3 +191,20 @@ def test_snapshot_prior_refuses_where_prior_model_is_not_the_prior():
     sp.m = _M()
     with pytest.raises(NotImplementedError, match='never reads `prior_model`'):
         sp._snapshot_prior()
+
+
+def test_snapshot_prior_refuses_on_the_crystal_route_and_touches_nothing():
+    """Retired: no route samples a frozen prior model. Without an InternalPrior it raises
+    before any save, attribute write or deletion."""
+    import protocol
+
+    saved = []
+
+    class _M:
+        checkpointer = type('C', (), {'save': staticmethod(saved.append)})()
+
+    sp = protocol.StageProtocol.__new__(protocol.StageProtocol)
+    sp.m = _M()
+    with pytest.raises(NotImplementedError, match='retired'):
+        sp._snapshot_prior()
+    assert saved == [] and not hasattr(sp.m, 'prior_model')

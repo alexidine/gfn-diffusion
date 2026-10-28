@@ -49,11 +49,11 @@ MACE_PATH = r"D:\crystal_datasets\acr_112025_mh1_stagetwo.model"
 # model
 # ----------------------------------------------------------------------------
 def load_gfn(checkpoint_path, device):
-    """Rebuild the EMA model exactly as train.py does for prior_model_name."""
+    """Rebuild the policy from a checkpoint's stored gfn_config and its model_eval weights (model_train when absent)."""
     ck = torch.load(checkpoint_path, map_location=device, weights_only=False)
     gfn_config = {**ck['gfn_config'], 'device': device}
     model = GFN(**gfn_config).to(device)
-    model.load_state_dict(ck['model_eval'])
+    model.load_state_dict(ck['model_eval'] if 'model_eval' in ck else ck['model_train'])
     # Under freeze_pb:full, training evaluates P_B on the checkpoint's frozen snapshot, not on the live head in
     # model_eval (which kept drifting with the shared trunk). Without this, every log P_B read here -- the TB parity
     # figure's x axis -- is off by 1-2.4 nats with ~2 nats of per-path scatter (measured 2026-09-28 on p23 mipu/nehu/acr).

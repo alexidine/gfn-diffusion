@@ -32,9 +32,9 @@ def _stub(logw, current_z=0.0, step=1000, conditional=False, full_flow=False,
     if scalar_head is None:
         scalar_head = not (conditional or full_flow)
     if scalar_head:
-        flow, ema_flow = LearnableScalar(current_z), LearnableScalar(current_z)
+        flow = LearnableScalar(current_z)
     else:                      # a field-valued head: nothing for the fill to write
-        flow, ema_flow = types.SimpleNamespace(), types.SimpleNamespace()
+        flow = types.SimpleNamespace()
     tracker = types.SimpleNamespace(
         clip_beta=BETA,
         z_bias_ema=torch.tensor([4.0, float('nan')]),
@@ -51,7 +51,6 @@ def _stub(logw, current_z=0.0, step=1000, conditional=False, full_flow=False,
             fwd_loss_coeffs=types.SimpleNamespace(beta=BETA, freeze_policy=freeze_policy)),
         gfn_model=types.SimpleNamespace(flow_model=flow, conditional=conditional,
                                         full_flow=full_flow),
-        ema_model=types.SimpleNamespace(flow_model=ema_flow),
         optimizers={},
         condition_log_z=tracker,
     )
@@ -75,15 +74,6 @@ def test_a_large_well_resolved_gap_fills():
     Modeller.z_level_fill(m)
     assert m._z_cal_report.get('z_fill/fired') == 1
     assert _z(m) == pytest.approx(-500.0, abs=1.0)
-
-
-def test_the_ema_model_is_filled_too():
-    """Backward sampling runs off the EMA copy. Filling only the live scalar
-    leaves it on the pre-fill level, and the EMA rule then drags the live value
-    back toward it."""
-    m = _stub(_far_batch(), current_z=0.0)
-    Modeller.z_level_fill(m)
-    assert float(m.ema_model.flow_model.scalar.detach()) == pytest.approx(_z(m))
 
 
 def test_adam_moments_for_the_flow_scalar_are_dropped():

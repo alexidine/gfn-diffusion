@@ -28,7 +28,7 @@ Sources:
 
 The prior MODEL's own marginal -- what the policy is actually sitting at when
 phase 1 exits -- is a third source that needs a live modeller to sample from;
-that route belongs in a protocol on_exit action beside snapshot_prior, not here.
+that route belongs in a protocol on_exit action, not here.
 A dataset-built reference is the prior's SUPPORT, not the prior model's density,
 and the difference matters for a lambda=0 null test.
 """
@@ -176,7 +176,7 @@ def main() -> None:
     ap.add_argument('--periodic-centroids', action='store_true',
                     help="must match model.periodic_centroids in the training config")
     ap.add_argument('--hold-dead-rows', action='store_true', default=True,
-                    help="must match model.hold_dead_latent_rows")
+                    help="training always holds dead rows; leave on")
     ap.add_argument('--k', type=int, default=32)
     ap.add_argument('--min-radius', type=float, default=1e-4)
     ap.add_argument('--limit', type=int, default=0, help="subsample the source to N rows")

@@ -25,7 +25,7 @@ Fifty-two pages, each drafted from the code and the derivation notes, verified a
 
 ## Training dynamics and control
 
-- [learning-rate](learning-rate.md) — mixed page: the five rate keys and the optimizers they reach, the run-level scale and its burn-in and promotion legs, the hard-failure bars and the fire/rewind path, the per-stage drawdown sensor, and what the width and length scaling argument derives.
+- [learning-rate](learning-rate.md) — mixed page: the five rate keys and the optimizers they reach, the scale and its per-stage segment schedule and fire cut, the hard-failure bars and the fire/rewind path, the per-stage drawdown sensor, and what the width and length scaling argument derives.
 - [gradient-clipping](gradient-clipping.md) — mixed page: the per-branch adaptive clip bar and its one policy clip site, the static derived clip and where it survives, the loss-value and reward-gradient clips upstream, and what a binding norm clip does to the update under descent and under Adam.
 - [stage-protocol-engine](stage-protocol-engine.md) — mixed page: the stage spec a config may declare, the four entry points, the ACTIONS vocabulary, what a transition resets and what it leaves alone.
 - [balance-controllers](balance-controllers.md) — mixed page: the loss-weight controllers that exist, what each does mechanically, their fixed points and rails.

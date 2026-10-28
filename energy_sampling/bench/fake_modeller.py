@@ -53,8 +53,7 @@ MK_DEV_LR = dict(
     lr_flow=0.1, min_lr=1.0e-8,
     # what resolve_derived_config records for every lr_* key written `auto`;
     # an empty set is the controller's own control arm (reads and logs, actuates
-    # nothing), which is also what makes the bracket's bias-correction check
-    # abstain rather than refuse
+    # nothing)
     lr_servo_managed=('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'),
 )
 
@@ -62,19 +61,15 @@ MK_DEV_LR = dict(
 # different configuration than production is exactly the drift test_fidelity
 # exists to catch, so these are the shipping numbers rather than convenient ones.
 MK_DEV_CONTROL = dict(
-    mode='bracket', seed_lr=1.25e-4, control_flow_lr=False,
-    burn_in_steps=3000, burn_in_scale=0.05, min_root_bias_correction=0.9,
-    candidate_scales=(0.05, 0.1, 0.2, 0.4, 0.8, 1.6),
-    trial_steps=150, safety_rungs=1, repeat_every=20000,
-    boundary_confirm_repeats=1, boundary_densify=True,
-    fixed_scale=0.2, verbose=True,
+    mode='fixed', seed_lr=1.25e-4, control_flow_lr=False,
+    fire_cut_factor=1.0,
+    schedule=[{'to': 0.05, 'steps': 3000, 'kind': 'hold'},
+              {'to': 0.2, 'steps': 1000, 'kind': 'geometric'}],
+    verbose=True,
 )
 
 # The hard-failure bars. `loss_abs`/`grad_abs` are BACKSTOPS: the load-bearing
-# bar is derived at bracket time from the root's own loss span, because at 1e9
-# the shipped bars caught numerical death and nothing else -- a rate one rung too
-# hot on this route took the loss from about -25 to +318, finite and eight orders
-# of magnitude under them. Anything >= 1e8 is refused at construction.
+# bar is fitted at the end of burn-in from the run's own loss span.
 MK_DEV_HARD_FAILURE = dict(
     loss_excursion_k=10.0, grad_excursion_x=100.0,
     loss_abs=1.0e6, grad_abs=1.0e6, root_window=200, min_observations=20,
@@ -124,7 +119,7 @@ def make_args(**overrides):
     """
     Build an args namespace shaped like the real one, with mk_dev defaults.
 
-    Nested blocks are addressed with dots: make_args(**{'lr_control.trial_steps': 20}).
+    Nested blocks are addressed with dots: make_args(**{'lr_control.fire_cut_factor': 0.5}).
     The controller reads them via getattr chains, so SimpleNamespace is faithful.
 
     THE DOTTED PATH IS THE SHIPPING SPELLING, and unknown keys raise in EVERY
@@ -260,15 +255,8 @@ class FakeModeller:
         self._probe_exclude_from = 0
         self._probe_refusals_seen = set()
 
-        # Bracket-driver surface (lr_bracket_probe.TrainerSnapshot, which reads
-        # `gfn_model.state_dict()`): a real model to snapshot and a real
-        # MetricTracker to read coherence from. Tiny, but REAL -- the driver's
-        # contract is that a rollback is bitwise, and a stub with no parameters
-        # could not test that at all.
-        #
-        # This block used to name lr_ramp_probe.RampDriver, deleted 2026-09-09
-        # with the rest of the ramp. The requirement did not go with it: the
-        # bracket snapshots the same surface for the same reason.
+        # A real model and a real MetricTracker. Tiny, but REAL: a stub with
+        # no parameters could not stand in for a snapshot or a rollback.
         #
         # BUILT INSIDE fork_rng. `nn.Linear` initialises its weights from the
         # GLOBAL torch stream, so constructing a fake would shift the RNG for

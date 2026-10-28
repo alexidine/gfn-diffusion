@@ -72,11 +72,24 @@ def test_exact_matrix_is_the_k_rollout_estimate_at_log_pb_zero():
         assert abs(m_got[key] - m_ref[key]) < 1e-4, key
 
 
-def _modeller(policy, k):
-    xc = SimpleNamespace(enabled=True, period=1, conditions=C, per_condition=PER, k=k, chunk_rows=7)
-    args = SimpleNamespace(xcond_eval=xc, vector_conditioning=True, conditional_worst_quantile=0.9)
-    return SimpleNamespace(args=args, step_ind=0, device='cpu', ema_model=policy,
+def _modeller(policy, k, step_ind=0, every_n_evals=1):
+    xc = SimpleNamespace(enabled=True, every_n_evals=every_n_evals, conditions=C, per_condition=PER, k=k,
+                         chunk_rows=7)
+    args = SimpleNamespace(xcond_eval=xc, eval_period=250, vector_conditioning=True,
+                           conditional_worst_quantile=0.9)
+    return SimpleNamespace(args=args, step_ind=step_ind, device='cpu', gfn_model=policy,
                            _batch_latents=lambda b: torch.zeros(b.num_graphs, 12))
+
+
+@pytest.mark.parametrize('step_ind, every_n_evals, runs', [
+    (2500, 10, True), (250, 10, False), (50, 10, False), (2500, 0, False), (2500, None, False)])
+def test_the_matrix_runs_on_every_n_evals_eval_periods(step_ind, every_n_evals, runs):
+    """xcond_eval.every_n_evals counts eval periods on the step grid (train.py::eval_cadence_fires);
+    an off-cadence evaluation returns no xcond/ key at all."""
+    torch.manual_seed(2)
+    out = Modeller.log_xcond_metrics(_modeller(flow_policy(True), None, step_ind, every_n_evals),
+                                     lambda b: None, _cols())
+    assert (out.get('xcond/skipped') == 0.0) if runs else out == {}
 
 
 def test_k_null_is_accepted_under_the_flow_policy():

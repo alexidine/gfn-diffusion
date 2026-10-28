@@ -210,10 +210,15 @@ def util_target_actuable(cfg: dict) -> list[Violation]:
 
 
 def figs_period_fires(cfg: dict) -> list[Violation]:
-    """`figs_period` must be a positive multiple of `eval_period`.
+    """On the conformer route, `figs_period` must be a positive multiple of `eval_period`.
 
-    Figure logging is checked inside the eval branch, so a non-multiple simply
-    never coincides and no figures are ever produced."""
+    `train.py::Modeller.figs_due` reads `figs_period` (a step period) only on
+    `conformer_torsions`; it is checked inside the eval branch, so a non-multiple
+    never coincides and no figures are produced. Every other route reads
+    `figs_every_n_evals` and refuses `figs_period` (step_cadence_keys_are_retired);
+    there the rule returns []."""
+    if _get(cfg, 'energy_function') not in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
     figs = _num(_get(cfg, 'figs_period'))
     ev = _num(_get(cfg, 'eval_period'))
     if figs is None or ev is None or figs == 0 or ev == 0:
@@ -374,20 +379,17 @@ def auto_lr_requires_lr_control(cfg: dict,
     THE TWO SPELLINGS MEAN OPPOSITE THINGS and resolve to the same number, which
     is what makes the failure silent:
 
-      auto   -> bracket-managed. The rate is seeded at lr_control.seed_lr and the
-                brute-force bracket owns the multiplier over it from there.
+      auto   -> scale-managed. The rate is seeded at lr_control.seed_lr and the
+                LR controller's scale (lr_control.schedule) multiplies it.
       float  -> a fixed rate. It takes divergence handling and the max_lr rail,
-                and the bracket's scale never applies to it
+                and the controller's scale never applies to it
                 (controller.py::_apply_lrs: `scale if managed else 1.0`).
 
-    So `auto` with no `lr_control` block is a contradiction: the key is marked
-    managed, nothing sets the scale, and the run trains at the seed for its whole
-    life while the config reads as adaptive.
+    So `auto` with no `lr_control: {mode: fixed}` block is a contradiction: the
+    key is marked managed, nothing sets the scale, and the run trains at the seed
+    for its whole life.
 
-    THIS IS A RUN-LEVEL CHECK, where its predecessor was per stage. That is the
-    substantive change: the bracket is not declared per stage and cannot be
-    omitted from one, so the way this used to fail -- a stage quietly missing an
-    `lr_sensor` block -- no longer exists.
+    A RUN-LEVEL CHECK: `lr_control` is not declared per stage.
 
     `auto_keys` EXISTS BECAUSE THE EVIDENCE IS DESTROYED BY RESOLUTION.
     `resolve_derived_config` overwrites the string `auto` with the seed float in
@@ -402,196 +404,252 @@ def auto_lr_requires_lr_control(cfg: dict,
         return []                      # every rate explicitly pinned: nothing to own
 
     node = _get(cfg, 'lr_control')
-    if isinstance(node, dict) and node.get('mode') in ('bracket', 'fixed'):
-        return []
+    if isinstance(node, dict) and node.get('mode', 'fixed') == 'fixed':
+        return []                      # absent `mode` reads as 'fixed' (LRController)
     how = ('there is no `lr_control` block' if node is None
-           else f"`lr_control.mode` is {(node or {}).get('mode')!r}")
+           else f"`lr_control.mode` is {(node or {}).get('mode')!r} (the only mode "
+                f"is 'fixed'; 'bracket' was deleted 2026-10-28)")
     return [Violation(
         ERROR, 'auto_lr_requires_lr_control',
         f"{', '.join(auto_keys)} {'are' if len(auto_keys) > 1 else 'is'} `auto` "
-        f"(bracket-managed), but {how}. Nothing would set the scale, so the run "
-        f"trains at lr_control.seed_lr throughout while the config reads as "
-        f"adaptive. Add `lr_control: {{mode: bracket, ...}}`, or write an "
-        f"explicit float for any rate meant to be fixed.")]
+        f"(scale-managed), but {how}. Nothing would set the scale, so the run "
+        f"trains at lr_control.seed_lr throughout. Add `lr_control: {{mode: fixed, "
+        f"schedule: [...]}}`, or write an explicit float for any rate meant to be "
+        f"fixed.")]
 
 
-def lr_bracket_is_well_formed(cfg: dict) -> list[Violation]:
-    """The bracket's two ways of returning the same answer forever.
+def lr_control_is_well_formed(cfg: dict) -> list[Violation]:
+    """`lr_control` as `controller.py::LRController` will read it.
 
-    Both of these load as a working configuration, run every seam correctly, and
-    report a selection. Neither has measured anything.
-
-      A GRID THAT CANNOT FAIL. The bracket's only reading is "did this candidate
-      detonate", so its top rungs have to be EXPECTED to fail. A grid whose whole
-      span sits inside the safe region finds no boundary on any cycle, reports
-      `unbracketed_high` every time, and selects one rung below its own ceiling
-      -- a number the config chose, dressed as a measurement.
-
-      BARS THAT CANNOT FIRE. The shipped divergence bars were 1e9, which catches
-      numerical overflow and nothing else. Measured on this route, a rate one
-      rung too hot took the loss from about -25 to +318: finite, and eight orders
-      of magnitude under the bar. Every rung then completes its horizon and
-      counts as a survivor, which is the same failure by the other route.
-
-    The live bars are DERIVED at bracket time from the root's own loss span
-    (lr_bracket_probe.HardFailureBars), so they can always fire; what this rule
-    refuses is a configuration that leans on the absolute backstops instead.
-
-    ERROR, not BASELINE. A bracket that cannot fail a candidate is not a bracket,
-    and the whole point of replacing the previous controller was that its
-    machinery fired perfectly around a number that meant nothing.
-    """
+    ERROR on: a `mode` other than 'fixed' (absent reads as 'fixed'; 'bracket' was
+    deleted 2026-10-28), a negative `hard_failure.cruise_settle_steps`, no
+    `schedule` (on the conformer route the LR_SCHEDULE_REPLACED_KEYS stand in for
+    it), a malformed `schedule` (lr_schedule_problems), and a segment with
+    `steps: null` other than a hold on a stage that declares no `max_steps`. The
+    controller raises on each. A stage's own `lr_schedule` is judged where the
+    stage is parsed (protocol.py::Stage, every_protocol_parses)."""
     node = _get(cfg, 'lr_control')
     if not isinstance(node, dict):
         return []
-    # A CONTROL ARM HAS NO GRID TO JUDGE. With every lr_* key written as an
-    # explicit float the bracket's scale reaches no optimizer, so there is no
-    # rate under test -- and the documented arm in which the controller reads and
-    # logs while actuating nothing must stay expressible.
-    #
-    # BUT `mode: bracket` IS THE WRONG WAY TO SPELL IT, and it fails LATE if
-    # left: the config loads, and `LRBracket` then refuses the absent candidate
-    # grid when the controller is constructed at run start -- a crash at step 0
-    # of a queued job rather than a message at load. Say so here instead.
-    if not any(_is_auto(cfg.get(k)) for k in _LR_KEYS):
-        if node.get('mode', 'bracket') == 'bracket':
-            return [Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                "every lr_* rate is an explicit float, so nothing is "
-                "bracket-managed, but lr_control.mode is 'bracket'. There is no "
-                "rate under test and no grid to trial. Write `mode: fixed` with "
-                "`fixed_scale: 1.0` -- that is what a run with fixed rates does "
-                "-- or set a rate to `auto`.")]
-        return []
+    rule = 'lr_control_is_well_formed'
     out = []
-    mode = node.get('mode', 'bracket')
-    if mode == 'fixed':
-        if _num(node.get('fixed_scale')) is None:
-            out.append(Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                "lr_control.mode 'fixed' needs an explicit lr_control.fixed_scale -- "
-                "the point of the mode is that the rate is stated in the config "
-                "rather than discovered."))
-        return out
-
-    scales = node.get('candidate_scales')
-    safety = int(_num(node.get('safety_rungs', 1)) or 0)
-    if not isinstance(scales, (list, tuple)) or len(scales) < safety + 2:
+    mode = node.get('mode', 'fixed')
+    if mode != 'fixed':
         out.append(Violation(
-            ERROR, 'lr_bracket_is_well_formed',
-            f"lr_control.candidate_scales has "
-            f"{0 if not isinstance(scales, (list, tuple)) else len(scales)} rungs, "
-            f"which cannot support safety_rungs {safety}: the grid needs one rung to "
-            f"fail and {safety} below it to select from."))
-    else:
-        vals = [_num(v) for v in scales]
-        if any(v is None or v <= 0 for v in vals):
-            out.append(Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                f"lr_control.candidate_scales must all be positive numbers, got {scales}."))
-        elif any(b <= a for a, b in zip(vals, vals[1:])):
-            out.append(Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                f"lr_control.candidate_scales must be STRICTLY ASCENDING, got {scales}. "
-                f"Selection is defined by position in this ordering, so an unsorted "
-                f"grid makes the safety margin mean nothing."))
-        elif vals[-1] / vals[0] < 4.0:
-            out.append(Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                f"lr_control.candidate_scales spans only {vals[-1] / vals[0]:.3g}x "
-                f"({vals[0]:g} to {vals[-1]:g}). The top rungs must be EXPECTED to "
-                f"fail; a narrower grid reports unbracketed_high every cycle and the "
-                f"bracket will never have measured a boundary."))
-
-    for key in ('loss_abs', 'grad_abs'):
-        bar = _num(_get(cfg, f'lr_control.hard_failure.{key}'))
-        if bar is not None and bar >= 1.0e8:
-            out.append(Violation(
-                ERROR, 'lr_bracket_is_well_formed',
-                f"lr_control.hard_failure.{key} = {bar:g} is a numerical-overflow "
-                f"backstop, not a bar that can fail a candidate: a rate one rung too "
-                f"hot on this route took the loss to +318 from about -25. Under a bar "
-                f"this high every rung survives, no boundary is found, and the bracket "
-                f"returns the same answer forever while appearing to work."))
-
+            ERROR, rule,
+            f"lr_control.mode is {mode!r}; the only mode is 'fixed' ('bracket', the "
+            f"candidate-grid search, was deleted 2026-10-28). Write `mode: fixed` "
+            f"with an explicit schedule."))
     settle = _num(_get(cfg, 'lr_control.hard_failure.cruise_settle_steps'))
     if settle is not None and settle < 0:
         out.append(Violation(
-            ERROR, 'lr_bracket_is_well_formed',
+            ERROR, rule,
             f"lr_control.hard_failure.cruise_settle_steps = {settle:g} is negative. "
             f"It is the number of steps discarded after a rate change before the "
             f"excursion bars are refitted at the new rate."))
-    burn = _num(node.get('burn_in_steps'))
-    scale = _num(node.get('burn_in_scale'))
-    if burn is not None and scale is not None and burn > 0 and not scale > 0:
+    sched = node.get('schedule')
+    conformer = _member(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS
+    if sched is None:
+        if not (conformer and any(k in node for k in LR_SCHEDULE_REPLACED_KEYS)):
+            out.append(Violation(
+                ERROR, rule,
+                "lr_control needs an explicit lr_control.schedule -- the list of "
+                "{to, steps, kind} segments that sets the multiplier on the auto "
+                "rates over each stage."))
+        return out
+    both = [k for k in LR_SCHEDULE_REPLACED_KEYS if k in node]
+    if conformer and both:
         out.append(Violation(
-            ERROR, 'lr_bracket_is_well_formed',
-            f"lr_control.burn_in_scale = {scale!r} is not positive. Burn-in is "
-            f"conservative but it must still TRAIN -- an inert burn-in reaches the "
-            f"root with the transients it exists to pass through still running."))
+            ERROR, rule,
+            f"lr_control carries both `schedule` and {both}, which `schedule` "
+            f"replaced. Remove {both}."))
+    problems = lr_schedule_problems(sched, 'lr_control.schedule')
+    out.extend(Violation(ERROR, rule, p) for p in problems)
+    if problems:
+        return out
+    open_ended = [i for i, s in enumerate(sched)
+                  if _member(s, 'steps') is None and _member(s, 'kind') != 'hold']
+    if open_ended:
+        library = _member(cfg, PROTOCOL_LIBRARY) or {}
+        for pname, proto in (library.items() if isinstance(library, dict) else ()):
+            for st in _member(proto, 'stages', []) or []:
+                if (_member(st, 'lr_schedule') is None
+                        and _member(st, 'max_steps') is None):
+                    out.append(Violation(
+                        ERROR, rule,
+                        f"lr_control.schedule[{open_ended[0]}] runs to the stage's "
+                        f"max_steps (steps: null), and stage "
+                        f"'{_member(st, 'name')}' of protocol '{pname}' declares "
+                        f"no max_steps and no lr_schedule of its own."))
     return out
 
 
-def burn_in_reaches_adam_steady_state(cfg: dict) -> list[Violation]:
-    """Burn-in must be long enough that the root is at steady state.
+# ---------------------------------------------------------------------------
+# THE LR SCHEDULE: `lr_control.schedule` (run level) and `stage.lr_schedule`
+# (overrides it for that stage). An ordered list of segments
+# {to: multiplier on seed_lr, steps: int >= 0 or null, kind}. Segment 0 starts
+# at its own `to`; each later segment starts at the previous one's `to`; a
+# null `steps` runs to the stage's max_steps; past the last segment the value
+# holds. Evaluated by controller.py::lr_schedule_value.
+# ---------------------------------------------------------------------------
 
-    Optimizers are rebuilt at every stage transition, so Adam's step counter
-    restarts and its update carries sqrt(1 - beta2^t) / (1 - beta1^t) relative to
-    steady state:
+#: hold = `to` throughout; linear = a + (b - a) p; geometric and exp =
+#: a (b / a)^p; cosine = b + (a - b)(1 + cos(pi p)) / 2, for a segment from a to
+#: b at progress p in [0, 1].
+LR_SCHEDULE_KINDS = ('hold', 'linear', 'geometric', 'cosine', 'exp')
 
-        t     10     100    500    1000   3000
-        f     0.153  0.309  0.627  0.795  0.975
+#: The `lr_control` keys `schedule` replaced (2026-10-28). Refused off the
+#: conformer route (lr_schedule_replaces_burn_in_keys, LRController); on
+#: energy_function conformer_torsions, whose configs still carry them, a block
+#: with no `schedule` is read through legacy_lr_schedule.
+LR_SCHEDULE_REPLACED_KEYS = ('burn_in_steps', 'burn_in_scale',
+                             'promotion_ramp_steps', 'fixed_scale')
 
-    Bracket from a young root and EVERY trial descended from it runs at that
-    fraction of its nominal rate -- so a too-hot rung survives because the rate
-    under test is not the rate applied, and the bracket reports a boundary it
-    never found. Burn-in is paid ONCE and trials are paid N times, so it is the
-    cheap place to spend steps.
+_LR_SEGMENT_KEYS = frozenset({'to', 'steps', 'kind'})
 
-    BASELINE, not ERROR, and the difference is deliberate: the run REFUSES to
-    bracket at runtime if the measured factor is under
-    `min_root_bias_correction` (lr_bracket_probe.BracketDriver.take_root), which
-    reads the optimizer's actual counter. This rule is the same arithmetic done
-    in advance, from the config, so the refusal is not the first time anyone
-    hears about it. It cannot be an ERROR because a stage that does not rebuild
-    its optimizers enters with t already large, which the config cannot see.
-    """
-    node = _get(cfg, 'lr_control')
-    if not isinstance(node, dict) or node.get('mode', 'bracket') != 'bracket':
+
+def lr_schedule_problems(node, where: str, max_steps=None,
+                         judge_open_ended: bool = False) -> list:
+    """Messages for everything wrong with one schedule; [] when well formed.
+
+    Refused: not a non-empty list; a segment that is not a mapping, carries a
+    key other than to/steps/kind, or lacks `to` or `kind`; a kind outside
+    LR_SCHEDULE_KINDS; a `to` that is not a positive finite number; a `steps`
+    that is not null or an integer >= 0; a first segment whose kind is not
+    `hold` (it starts at its own `to`); a `steps: null` segment that is not the
+    last. With `judge_open_ended`, also a non-hold `steps: null` segment when
+    `max_steps` is None. Segments may be dicts or Namespaces."""
+    if not isinstance(node, (list, tuple)) or not node:
+        return [f"{where} must be a non-empty list of {{to, steps, kind}} "
+                f"segments, got {node!r}"]
+    out = []
+    last = len(node) - 1
+    for i, seg in enumerate(node):
+        at = f'{where}[{i}]'
+        keys = (set(seg) if isinstance(seg, dict)
+                else set(vars(seg)) if hasattr(seg, '__dict__') else None)
+        if keys is None:
+            out.append(f"{at} must be a mapping {{to, steps, kind}}, got {seg!r}")
+            continue
+        bad = sorted(keys - _LR_SEGMENT_KEYS)
+        if bad:
+            out.append(f"{at} has unknown key(s) {bad}; a segment is {{to, steps, kind}}")
+        kind = _member(seg, 'kind')
+        if kind not in LR_SCHEDULE_KINDS:
+            out.append(f"{at}.kind is {kind!r}; one of {list(LR_SCHEDULE_KINDS)}")
+        to = _member(seg, 'to')
+        if (isinstance(to, bool) or not isinstance(to, (int, float))
+                or not math.isfinite(float(to)) or not float(to) > 0):
+            out.append(f"{at}.to is {to!r}; a positive finite multiplier on seed_lr")
+        steps = _member(seg, 'steps')
+        if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int)
+                                  or steps < 0):
+            out.append(f"{at}.steps is {steps!r}; an integer >= 0, or null for the "
+                       f"stage's max_steps")
+        if i == 0 and kind in LR_SCHEDULE_KINDS and kind != 'hold':
+            out.append(f"{at}.kind is {kind!r}; the first segment starts at its own "
+                       f"`to`, so it must be a hold")
+        if steps is None and i != last:
+            out.append(f"{at}.steps is null (to the stage's max_steps) and segments "
+                       f"follow it")
+        if (judge_open_ended and steps is None and kind != 'hold'
+                and max_steps is None):
+            out.append(f"{at} is a {kind} segment with steps null on a stage with no "
+                       f"max_steps")
+    return out
+
+
+def normalize_lr_schedule(node) -> list:
+    """A well-formed schedule (lr_schedule_problems is empty) as a list of plain
+    {'to': float, 'steps': int | None, 'kind': str} dicts."""
+    return [{'to': float(_member(s, 'to')),
+             'steps': None if _member(s, 'steps') is None else int(_member(s, 'steps')),
+             'kind': str(_member(s, 'kind'))} for s in node]
+
+
+def legacy_lr_schedule(burn_in_steps=3000, burn_in_scale=0.05,
+                       promotion_ramp_steps=1000, fixed_scale=1.0) -> list:
+    """The schedule the LR_SCHEDULE_REPLACED_KEYS describe: a hold at
+    burn_in_scale for burn_in_steps, then a geometric move to fixed_scale over
+    promotion_ramp_steps (0 = a jump). The defaults are LRController's for a run
+    with no `lr_control` block."""
+    return [{'to': float(burn_in_scale), 'steps': int(burn_in_steps), 'kind': 'hold'},
+            {'to': float(fixed_scale), 'steps': int(promotion_ramp_steps or 0),
+             'kind': 'geometric'}]
+
+
+def replaced_lr_schedule_keys(cfg) -> list:
+    """The LR_SCHEDULE_REPLACED_KEYS present under `lr_control`, off the
+    conformer route; [] on energy_function conformer_torsions. Reads a raw dict
+    or a Namespace."""
+    if _member(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
         return []
-    if not any(_is_auto(cfg.get(k)) for k in _LR_KEYS):
-        return []                      # a control arm brackets nothing
-    burn = _num(node.get('burn_in_steps'))
-    want = _num(node.get('min_root_bias_correction', 0.9)) or 0.9
-    if burn is None:
+    node = _member(cfg, 'lr_control')
+    if node is None:
         return []
-    beta1, beta2 = 0.9, 0.999
-    adam = _get(cfg, 'adam') or {}
-    if isinstance(adam, dict):
-        betas = adam.get('betas')
-        if isinstance(betas, (list, tuple)) and len(betas) == 2:
-            beta1, beta2 = float(betas[0]), float(betas[1])
-    t = int(burn)
-    if t <= 0:
+    present = node if isinstance(node, dict) else vars(node)
+    return [k for k in LR_SCHEDULE_REPLACED_KEYS if k in present]
+
+
+def lr_schedule_replaces_burn_in_keys(cfg: dict) -> list[Violation]:
+    """`burn_in_steps`, `burn_in_scale`, `promotion_ramp_steps` and `fixed_scale`
+    are replaced by `lr_control.schedule` (2026-10-28).
+
+    A crystal-route rule rather than entries in utils._RETIRED_KEYS: the
+    conformer configs still carry these keys, `preflight_config` is shared with
+    that route, and a retired key raises at load. On `conformer_torsions` the
+    rule returns []."""
+    present = replaced_lr_schedule_keys(cfg)
+    if not present:
         return []
-    factor = math.sqrt(max(0.0, 1.0 - beta2 ** t)) / (1.0 - beta1 ** t)
-    if factor >= want:
-        return []
-    # smallest t clearing the bar, reported so the fix is a number rather than
-    # an instruction to experiment
-    need = t
-    while need < 100000:
-        need += 50
-        if math.sqrt(max(0.0, 1.0 - beta2 ** need)) / (1.0 - beta1 ** need) >= want:
-            break
     return [Violation(
-        BASELINE, 'burn_in_reaches_adam_steady_state',
-        f"lr_control.burn_in_steps = {t} gives an Adam bias correction of "
-        f"{factor:.3f} at beta2 {beta2:g}, under min_root_bias_correction {want:g}. "
-        f"Every trial from that root would run at {factor:.2f}x the rate under test, "
-        f"so a too-hot rung survives for a reason unrelated to the rate -- and the "
-        f"run will REFUSE to bracket rather than measure it. Raise burn_in_steps to "
-        f"about {need}.")]
+        ERROR, 'lr_schedule_replaces_burn_in_keys',
+        f"lr_control.{{{', '.join(present)}}}: replaced 2026-10-28 by "
+        f"lr_control.schedule; LRController raises on them. The old burn-in and "
+        f"ramp are `schedule: [{{to: <burn_in_scale>, steps: <burn_in_steps>, "
+        f"kind: hold}}, {{to: <fixed_scale>, steps: <promotion_ramp_steps>, "
+        f"kind: geometric}}]`.")]
+
+
+#: `lr_control` keys deleted 2026-10-28 with `lr_control.mode: bracket` (the
+#: candidate grid, its trials, boundary confirmation and densification, the
+#: re-bracket clock, and the root's bias-correction check). Read by nothing.
+LR_CONTROL_RETIRED_KEYS = (
+    'candidate_scales', 'trial_steps', 'safety_rungs', 'repeat_every',
+    'trial_settle_steps', 'logz_detour_nats', 'boundary_confirm_repeats',
+    'boundary_densify', 'min_root_bias_correction',
+)
+
+
+def retired_lr_control_keys(cfg) -> list:
+    """The LR_CONTROL_RETIRED_KEYS present under `lr_control`, off the conformer
+    route; [] on energy_function conformer_torsions. Reads a raw dict or a
+    Namespace (`controller.py::LRController._check_schema` raises on a
+    non-empty result)."""
+    if _member(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
+    node = _member(cfg, 'lr_control')
+    if node is None:
+        return []
+    present = node if isinstance(node, dict) else vars(node)
+    return [k for k in LR_CONTROL_RETIRED_KEYS if k in present]
+
+
+def lr_bracket_keys_are_retired(cfg: dict) -> list[Violation]:
+    """The bracket's `lr_control` keys are deleted (2026-10-28).
+
+    A crystal-route rule rather than entries in utils._RETIRED_KEYS: the
+    conformer configs still carry some of these keys, `preflight_config` is
+    shared with that route, and a retired key raises at load. On
+    `conformer_torsions` the rule returns []."""
+    present = retired_lr_control_keys(cfg)
+    if not present:
+        return []
+    return [Violation(
+        ERROR, 'lr_bracket_keys_are_retired',
+        f"lr_control.{{{', '.join(present)}}}: deleted 2026-10-28 with "
+        f"lr_control.mode 'bracket' and read by nothing; LRController raises on "
+        f"them. Remove them.")]
 
 
 def lr_probe_is_retired(cfg: dict) -> list[Violation]:
@@ -732,6 +790,148 @@ def loaded_data_paths_are_not_null(cfg: dict) -> list[Violation]:
     return out
 
 
+def grad_geometry_is_retired(cfg: dict) -> list[Violation]:
+    """`grad_geometry` is deleted (2026-10-28) on the crystal route.
+
+    It armed `Modeller._log_fused_gradient_geometry`, a periodic per-branch
+    autograd.grad probe on fused steps that logged `fused_grad/*`. The method,
+    its cadence gate and its metrics drain are gone, so nothing reads the block.
+
+    A crystal-route rule rather than an entry in utils._RETIRED_KEYS: the
+    conformer configs still carry the block, `preflight_config` is shared with
+    that route, and a retired key raises at load. On `conformer_torsions` the
+    rule returns []."""
+    if _get(cfg, 'grad_geometry') is None:
+        return []
+    if _get(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
+    return [Violation(
+        ERROR, 'grad_geometry_is_retired',
+        '`grad_geometry` is deleted (2026-10-28): the fused-step gradient '
+        'geometry probe and its `fused_grad/*` metrics are gone from train.py, '
+        'so the block configures nothing. Remove it.')]
+
+
+def hold_dead_rows_is_retired(cfg: dict) -> list[Violation]:
+    """`model.hold_dead_latent_rows` is retired (2026-10-28) on the crystal route.
+
+    Modeller._resolve_dead_latent_rows always holds the rows that carry no degree
+    of freedom for the configured (space group, Z'); there is no opt-out, so the
+    key configures nothing. A crystal-route rule rather than an entry in
+    utils._RETIRED_KEYS: the conformer configs still carry it. On
+    `conformer_torsions` the rule returns []."""
+    if _get(cfg, 'model.hold_dead_latent_rows') is None:
+        return []
+    if _on_conformer_route(cfg):
+        return []
+    return [Violation(
+        ERROR, 'hold_dead_rows_is_retired',
+        '`model.hold_dead_latent_rows` is retired (2026-10-28): dead latent rows '
+        'are always held on this route, so the key configures nothing. Remove it.')]
+
+
+def _present(node, name) -> bool:
+    if node is None:
+        return False
+    return name in node if isinstance(node, dict) else hasattr(node, name)
+
+
+def trajectory_length_problems(cfg) -> list[str]:
+    """What is wrong with the trajectory-length keys of `cfg` (a dict or a Namespace tree, the model block
+    resolved) off the conformer route: a top-level `eval_T` or an `integrator` block present (both retired
+    2026-10-28: training and evaluation integrate `model.T`, mk_dev's `model.sde.T`, read by
+    utils.trajectory_T), or, unless model.kind is nf, no positive integer `model.T`. [] on `conformer_torsions`
+    and where no energy_function is set (train_conformer.py's conformer_dev), whose configs keep
+    `integrator.T`. train.py::Modeller.init_gfn raises on a non-empty result."""
+    ef = _member(cfg, 'energy_function')
+    if ef is None or ef in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
+    out = []
+    if _present(cfg, 'eval_T'):
+        out.append("eval_T is retired (2026-10-28): evaluation integrates model.sde.T steps, the training "
+                   "length. Remove it.")
+    if _present(cfg, 'integrator'):
+        out.append("the integrator block is retired (2026-10-28): its T is model.sde.T. Move the value and "
+                   "remove the block.")
+    if _member(_member(cfg, 'policy'), 'kind', 'sde') != 'nf':
+        T = _member(_member(cfg, 'model'), 'T')
+        if T is None:
+            out.append("model.sde.T is unset: the SDE policy's steps per rollout, train and eval.")
+        elif isinstance(T, bool) or not isinstance(T, int) or T < 1:
+            out.append(f"model.sde.T = {T!r}: a positive integer step count.")
+    return out
+
+
+def trajectory_length_is_model_T(cfg: dict) -> list[Violation]:
+    """Off the conformer route `model.T` (mk_dev `model.sde.T`) is the one trajectory length
+    (trajectory_length_problems). A crystal-route rule rather than entries in utils._RETIRED_KEYS: the
+    conformer configs still set `integrator.T` and `eval_T`, and `preflight_config` is shared with that
+    route."""
+    return [Violation(ERROR, 'trajectory_length_is_model_T', p) for p in trajectory_length_problems(cfg)]
+
+
+#: Step-unit eval-cadence keys replaced 2026-10-28 by counts of eval periods, and
+#: their replacements: `figs_period` -> `figs_every_n_evals`,
+#: `xcond_eval.period` -> `xcond_eval.every_n_evals`.
+STEP_CADENCE_KEYS = {'figs_period': 'figs_every_n_evals',
+                     'xcond_eval.period': 'xcond_eval.every_n_evals'}
+
+
+def retired_step_cadence_keys(cfg) -> list[str]:
+    """The keys of STEP_CADENCE_KEYS present in `cfg` (a dict or a Namespace tree) off the
+    conformer route; [] on `conformer_torsions`, whose configs still set them."""
+    if _member(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
+    present = []
+    for dotted in STEP_CADENCE_KEYS:
+        node, parts = cfg, dotted.split('.')
+        for part in parts[:-1]:
+            node = _member(node, part)
+        if node is not None and (parts[-1] in node if isinstance(node, dict)
+                                 else hasattr(node, parts[-1])):
+            present.append(dotted)
+    return present
+
+
+def step_cadence_keys_are_retired(cfg: dict) -> list[Violation]:
+    """`figs_period` and `xcond_eval.period` are retired (2026-10-28) on the crystal route.
+
+    Figures and the cross-condition matrix fire on `figs_every_n_evals` and
+    `xcond_eval.every_n_evals`, counted in eval periods
+    (`train.py::eval_cadence_fires`). `Modeller.init_gfn` raises on the same
+    condition at startup.
+
+    A crystal-route rule rather than an entry in utils._RETIRED_KEYS: the
+    conformer configs still set `figs_period`, which `Modeller.figs_due` reads on
+    that route, and `preflight_config` is shared with it. On `conformer_torsions`
+    the rule returns []."""
+    return [Violation(
+        ERROR, 'step_cadence_keys_are_retired',
+        f'{key} is retired (2026-10-28): set {STEP_CADENCE_KEYS[key]} (a count of '
+        f'eval periods; null or 0 is off) and remove {key}.')
+        for key in retired_step_cadence_keys(cfg)]
+
+
+def ema_decay_is_conformer_only(cfg: dict) -> list[Violation]:
+    """A non-null `ema_decay` is refused off the conformer route (2026-10-28).
+
+    There `ema_model` IS `gfn_model` (utils.keeps_ema_copy): no EMA copy is
+    built, saved or loaded, so a decay would configure nothing.
+    `Modeller.init_gfn` raises on the same condition at startup.
+
+    A crystal-route rule rather than an entry in utils._RETIRED_KEYS: the
+    conformer route keeps its EMA copy and its configs and tests still set the
+    key, and `preflight_config` is shared with that route. On
+    `conformer_torsions` the rule returns []."""
+    decay = _get(cfg, 'ema_decay')
+    if decay is None or _get(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
+        return []
+    return [Violation(
+        ERROR, 'ema_decay_is_conformer_only',
+        f'ema_decay={decay!r}: this route has no EMA model (ema_model is gfn_model) '
+        f'and Modeller.init_gfn refuses a non-null decay. Remove the key.')]
+
+
 # ---------------------------------------------------------------------------
 # EXIT TRIGGERS. Two ways a declared exit condition ships dead, both found in
 # the 2026-08-16 audit of prod0810 / qm9anchor_aug14 (docs/design/next_battery.md
@@ -746,7 +946,7 @@ EXIT_TICK_STEPS = 10
 
 #: gates published from the EVAL path, not the 10-step tick block. Their patience is
 #: therefore denominated in eval_period. See _exit_metric_cadence.
-_EVAL_CADENCE_GATES = frozenset({'progress_done'})
+_EVAL_CADENCE_GATES = frozenset({'progress_done', 'heldout_flat'})
 
 
 def _exit_metric_cadence(cfg: dict, metric: str) -> Optional[float]:
@@ -1111,7 +1311,7 @@ def nf_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
                                  f'{key} = {v!r} acts only through the SDE policy (allowed under model.kind nf: {ok})'))
     if _is_auto(_get(cfg, 'gradient_norm_clip', 'auto')):
         out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
-                             "gradient_norm_clip 'auto' is fitted to SDE gradients from (W, integrator.T): give the "
+                             "gradient_norm_clip 'auto' is fitted to SDE gradients from (W, model.sde.T): give the "
                              "NF policy a number"))
     for stage in active_stages(cfg) or [{}]:
         name = stage.get('name', '(base)')
@@ -2006,6 +2206,56 @@ def conformer_prior_model_name_is_null(cfg: dict) -> list[Violation]:
         f'prior_loaded cannot hold -- the first stage runs anyway. Set it null.')]
 
 
+def crystal_prior_model_is_retired(cfg: dict) -> list[Violation]:
+    """No frozen prior MODEL exists off the conformer route.
+
+    Modeller loads no `prior_model_name`, `snapshot_prior` builds nothing, and
+    `skip_if: prior_loaded` never holds, so each is refused here rather than
+    ignored. The prior buffer's only source is `anchors`: under 'prior_model'
+    (the code default when the key is absent) _prior_churn_cycle finds no prior
+    sampler and admits nothing. The conformer route keeps its own rules
+    (conformer_prior_model_name_is_null, conformer_protocol_omits_snapshot_prior)
+    and its InternalPrior source."""
+    if _on_conformer_route(cfg):
+        return []
+    rule = 'crystal_prior_model_is_retired'
+    out = []
+    name = _get(cfg, 'prior_model_name')
+    if name is not None:
+        out.append(Violation(
+            ERROR, rule,
+            f'prior_model_name={name!r}: the frozen prior model is retired on this '
+            f'route and nothing loads it. Set it null; warm-start the policy with '
+            f'checkpoint_name + load_weights_only.'))
+    pb = _get(cfg, 'buffers.prior_buffer')
+    if isinstance(pb, dict):
+        source = pb.get('source', 'prior_model')
+        if source != 'anchors':
+            out.append(Violation(
+                ERROR, rule,
+                f"buffers.prior_buffer.source={source!r} (absent = 'prior_model'): "
+                f"'anchors' is the only source on this route; no prior model exists "
+                f"to draw from."))
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        if st.get('skip_if') == 'prior_loaded':
+            out.append(Violation(
+                ERROR, rule,
+                f"stage {st.get('name')!r} skip_if: prior_loaded never holds (no prior "
+                f"model is loaded). Use skip_if: weights_loaded with checkpoint_name + "
+                f"load_weights_only."))
+        for where in ('on_enter', 'on_exit'):
+            for action in (st.get(where) or []):
+                if str(action).partition(':')[0].strip() == 'snapshot_prior':
+                    out.append(Violation(
+                        ERROR, rule,
+                        f"stage {st.get('name')!r} {where} names snapshot_prior, which is "
+                        f"retired: no prior model is built. Drop it (snapshot:<tag> keeps "
+                        f"the checkpoint)."))
+    return out
+
+
 def conformer_set_policy_is_not_scrambled(cfg: dict) -> list[Violation]:
     """`flags.scramble_conditions` cannot act on a set policy's forward half.
 
@@ -2138,21 +2388,45 @@ def energy_reference_is_consistent(cfg: dict) -> list[Violation]:
     return out
 
 
+def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
+    """`heldout_gate` parses through progress_metrics.parse_heldout_gate, the parser
+    Modeller.__init__ runs (absent = the code defaults, progress_metrics._HELDOUT_GATE)."""
+    from progress_metrics import parse_heldout_gate
+    try:
+        parse_heldout_gate(_get(cfg, 'heldout_gate'))
+    except (TypeError, ValueError) as e:
+        return [Violation(ERROR, 'heldout_gate_is_well_formed', str(e))]
+    return []
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
     vargrad_needs_groups,
     conditional_z_settings_are_conditional,
     energy_reference_is_consistent,
+    heldout_gate_is_well_formed,
     auto_lr_requires_lr_control,
-    lr_bracket_is_well_formed,
-    burn_in_reaches_adam_steady_state,
+    lr_control_is_well_formed,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions
+    lr_bracket_keys_are_retired,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions
+    lr_schedule_replaces_burn_in_keys,
     periodic_centroids_needs_one_crystal_space_group,
     loaded_data_paths_are_not_null,
     lr_probe_is_retired,
+    grad_geometry_is_retired,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions
+    hold_dead_rows_is_retired,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions or unset
+    trajectory_length_is_model_T,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions
+    step_cadence_keys_are_retired,
+    ema_decay_is_conformer_only,
     exit_patience_is_reachable,
     exit_bar_is_within_measured_range,
     util_target_actuable,
+    # the conformer route; returns [] off energy_function conformer_torsions
     figs_period_fires,
     batch_ceiling_above_floor,
     dplr_is_well_formed,
@@ -2165,6 +2439,8 @@ RULES = (
     replay_seat_is_well_formed,
     condition_draw_is_well_formed,
     nf_policy_refuses_sde_only_settings,
+    # every route but the conformer one; returns [] on energy_function conformer_torsions
+    crystal_prior_model_is_retired,
     # the conformer route; each returns [] off energy_function conformer_torsions
     conformer_dplr_is_off_on_a_set,
     conformer_set_policy_is_conditioned,

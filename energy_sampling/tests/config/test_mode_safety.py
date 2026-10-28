@@ -145,7 +145,7 @@ def test_auto_lr_without_lr_control_is_refused_at_load(raw):
 
 def test_explicit_float_lrs_need_no_lr_control_at_load(raw):
     """A float is a fixed rate by intent: it takes divergence handling and the
-    max_lr rail but never the bracket's scale, so it has nothing to yield to."""
+    max_lr rail but never the controller's scale, so it has nothing to yield to."""
     cfg = copy.deepcopy(raw)
     cfg.pop('lr_control', None)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
@@ -194,8 +194,8 @@ def test_the_old_top_level_ray_block_is_refused(raw):
 
 
 def test_lr_flow_auto_is_refused(raw):
-    """`lr_flow` is NOT bracket-managed -- the flow groups are pinned flat and
-    exempt from the bracket's scale, and no resolver fills it in. Before this
+    """`lr_flow` is NOT scale-managed -- the flow groups are pinned flat and
+    exempt from the controller's scale, and no resolver fills it in. Before this
     guard, `auto` stayed the STRING 'auto' and
     was assigned straight to param_group['lr'], failing somewhere downstream that
     said nothing about the config."""
@@ -222,11 +222,10 @@ def test_lr_flow_accepts_every_value_in_live_use(raw):
 
 def test_the_check_detects_a_key_that_is_genuinely_live(raw, base_snap, tmp_path):
     """Without this, every assertion above would pass on a comparator that
-    reported nothing. `integrator.T` feeds the derived gradient_norm_clip, so
+    reported nothing. `model.sde.T` feeds the derived gradient_norm_clip, so
     perturbing it must show a derived consequence."""
     new = copy.deepcopy(raw)
-    new['integrator']['T'] = 25
-    new['eval_T'] = 25                      # preflight requires agreement
+    new['model']['T'] = 25                  # model.sde.T, resolved
     p = tmp_path / 'live.yaml'
     p.write_text(yaml.safe_dump(new, sort_keys=False), encoding='utf-8')
     changed = cs.compare(base_snap, cs.snapshot(str(p))).changed

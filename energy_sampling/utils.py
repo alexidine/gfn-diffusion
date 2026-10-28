@@ -137,7 +137,7 @@ def get_train_args(argv=None):
 
 # ---------------------------------------------------------------------------
 # Derived-config resolution. Values that are pure functions of the primitives
-# (W = model hidden width, T = integrator.T) are computed here instead of being
+# (W = model hidden width, T = utils.trajectory_T: model.T) are computed here instead of being
 # hand-materialized in the YAML, so they can never drift out of sync.
 #
 # `auto` MEANS TWO DIFFERENT THINGS and the difference is deliberate:
@@ -267,7 +267,7 @@ _RETIRED_KEYS = {
         "calibrations only catastrophic protection remains, by design: a loss-based "
         "hot indicator on this problem fires too late to be a useful LR sensor.",
     'reuse_prior':
-        "deleted -- point checkpoint_name/prior_model_name at the prior explicitly, "
+        "deleted -- point checkpoint_name at the warm start explicitly, "
         "or let the train_prior stage rebuild it. Auto-refinding a prior by run_name "
         "silently reloaded pre-fix checkpoints across scoring changes.",
     'terminal_logw_std':
@@ -473,7 +473,7 @@ _RETIRED_KEYS = {
         "candidate rungs are meant to be auditable effective rates, and an "
         "envelope underneath them makes the rate under test differ from the rate "
         "applied -- which is exactly how a too-hot rung survives its trial. Set "
-        "lr_control.burn_in_scale and lr_control.burn_in_steps.",
+        "lr_control.schedule.",
     'bwd_loss_coeffs.detach_pb':
         "retired 2026-09-20 -- it was NEVER READ. The key was carried in the "
         "coefficient block with a comment describing a per-branch detach of "
@@ -602,6 +602,9 @@ def preflight_config(args):
     # to be an integration-dt mismatch artifact, not a modelling result: the
     # policy learns a drift per step at ONE dt, so scoring it at another
     # changes the SDE being integrated. There is no legitimate reason to differ.
+    # The conformer route's configs still carry eval_T beside integrator.T; train.py
+    # evaluates at utils.trajectory_T on every route. Off the conformer route both keys
+    # are refused (config_invariants.trajectory_length_problems, raised by Modeller.init_gfn).
     T = int(getattr(getattr(args, 'integrator', None), 'T', 0) or 0)
     eval_T = getattr(args, 'eval_T', None)
     if T and eval_T is not None and int(eval_T) != T:
@@ -621,9 +624,9 @@ def _is_auto(v):
 def _require_lr_control(args, managed, seed_lr):
     """A `auto` learning rate must have something that can move it.
 
-    Under the bracket that something is a run-level block, not a per-stage
-    sensor: `lr_control` sets the multiplier every managed group runs at, and
-    without the block there is nothing to set it. Resolving `auto` to the seed
+    That something is a run-level block, not a per-stage sensor:
+    `lr_control` sets the multiplier every managed group runs at, and without
+    the block there is nothing to set it. Resolving `auto` to the seed
     and leaving it there is the silent failure this gate exists for -- the config
     reads as "let the system choose" and behaves as "pinned at a number nobody
     chose".
@@ -642,9 +645,9 @@ def _require_lr_control(args, managed, seed_lr):
         return
     detail = '\n'.join(f'  {v.detail}' for v in violations)
     raise ValueError(
-        f"{', '.join(managed)} set to `auto` (bracket-managed), seeded at "
+        f"{', '.join(managed)} set to `auto` (scale-managed), seeded at "
         f"{seed_lr:.3g}, but nothing can move them:\n{detail}\n\n"
-        f"Add an `lr_control` block (mode: bracket | fixed), or write an explicit "
+        f"Add an `lr_control` block (mode: fixed), or write an explicit "
         f"float for any rate that is meant to be fixed -- a float still takes "
         f"divergence handling and the max_lr rail, it just does not pretend to be "
         f"discovered.")
@@ -671,19 +674,18 @@ def _grad_median(T):
 def resolve_derived_config(args):
     """Fill in (W, T)-derived config values from the primitives, in place, and
     return args. See the block comment above. Idempotent given fixed primitives;
-    logs what it derived so the run record shows resolved numbers, not `auto`."""
-    integrator = getattr(args, 'integrator', None)
+    logs what it derived so the run record shows resolved numbers, not `auto`.
+    T = utils.trajectory_T (model.T, else integrator.T). The `auto` learning rates need neither primitive;
+    a `gradient_norm_clip: auto` without both raises."""
     model = getattr(args, 'model', None)
-    T = int(getattr(integrator, 'T', 0) or 0)
+    T = trajectory_T(args) or 0
     W = int(getattr(model, 'policy_hidden_dim', 0) or 0)  # canonical width (all *_hidden_dim expected equal)
-    if not T or not W:
-        return args  # no primitives to scale from -- leave everything as written
 
     resolved = {}
 
-    # LRs: `auto` hands the key to the LR BRACKET, seeded at lr_control.seed_lr.
-    # The set of managed keys is recorded on args because _apply_lrs needs to
-    # know which groups the bracket's scale applies to -- once resolved, `auto`
+    # LRs: `auto` hands the key to the LR controller's scale, seeded at
+    # lr_control.seed_lr. The set of managed keys is recorded on args because
+    # _apply_lrs needs to know which groups the scale applies to -- once resolved, `auto`
     # and an explicit float are indistinguishable as values, and that
     # distinction IS the semantics.
     seed_lr = float(getattr(getattr(args, 'lr_control', None), 'seed_lr', None)
@@ -710,8 +712,8 @@ def resolve_derived_config(args):
         # prevent), and it would REJECT a config using no ray_calibration at all.
         _require_lr_control(args, managed, seed_lr)
 
-    # `lr_flow` IS NOT BRACKET-MANAGED and deliberately not in _LR_KEYS: the
-    # bracket steers policy rates, and _apply_lrs pins the flow groups flat. So
+    # `lr_flow` IS NOT SCALE-MANAGED and deliberately not in _LR_KEYS: the
+    # scale reaches policy rates, and _apply_lrs pins the flow groups flat. So
     # `auto` has no resolver here and nothing to hand it to -- it stays the
     # STRING 'auto' and is
     # assigned straight to param_group['lr'] (controller.py) and to the optimizer
@@ -721,8 +723,8 @@ def resolve_derived_config(args):
     if not isinstance(flow, (int, float)) or isinstance(flow, bool):
         raise ValueError(
             f"lr_flow must be an explicit number, got {flow!r}. It is NOT "
-            f"bracket-managed -- the flow (Z head) groups are pinned flat and "
-            f"exempt from the bracket's scale, and there is no rule that would "
+            f"scale-managed -- the flow (Z head) groups are pinned flat and "
+            f"exempt from the LR controller's scale, and there is no rule that would "
             f"resolve `auto` for "
             f"it. Write the number: the value depends on WHAT THE FLOW HEAD IS, "
             f"which is a LearnableScalar when `model.full_flow` is false and the "
@@ -735,6 +737,10 @@ def resolve_derived_config(args):
     # magnitude, which is a property of the rollout length rather than of a
     # tuning choice, and nothing servos it.
     if _is_auto(getattr(args, 'gradient_norm_clip', None)):
+        if not T or not W:
+            raise ValueError(
+                f"gradient_norm_clip `auto` is derived from W = model.policy_hidden_dim ({W or 'unset'}) and "
+                f"T = model.sde.T ({T or 'unset'}); set both, or write the clip as a number.")
         clip = (_CLIP_ANCHOR
                 * (_grad_median(T) / _GRAD_MEDIAN[_SCALING_T_REF])
                 * math.sqrt(W / _SCALING_W_REF))
@@ -871,9 +877,8 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # because get_problem_definition folds all of
                                     # energy_config into the identity minus this list and
                                     # assert_problem_match raises on the checkpoint_name
-                                    # path, which is exactly how an exit is consumed
-                                    # (prior_model_name loads through the same assert, so
-                                    # every *_prior.pt goes with it). Verified: an old
+                                    # path, which is exactly how an exit is consumed.
+                                    # Verified: an old
                                     # prod_t100 mipu config and an mlipc_sep09 config differ
                                     # in energy_config ONLY by internal_oom_recovery plus
                                     # these, so exempting them restores the match exactly.
@@ -1170,30 +1175,33 @@ def sample_crystal_prior(crystal_batch, std):
     # return prior_samples
 
 
+def keeps_ema_copy(modeller) -> bool:
+    """Whether `modeller` keeps `ema_model` as a module of its own: a ConformerModeller
+    (conformer_modeller.py, the conformer route) only. Every other modeller has no EMA
+    model -- `ema_model` IS `gfn_model`, and a non-null `ema_decay` is refused
+    (Modeller.init_gfn, config_invariants.ema_decay_is_conformer_only). Matched by class
+    name, so nothing here imports the conformer route."""
+    return any(c.__name__ == 'ConformerModeller' for c in type(modeller).__mro__)
+
+
 @torch.no_grad()
-def update_ema(model, ema_model, decay=0.9999):
+def update_ema(model, ema_model, decay):
     """
-    Update ema_model parameters towards model parameters.
+    Move ema_model's floating-point state toward model's by one EMA step; copy the rest.
+    The two must be distinct modules.
 
     Args:
         model:      nn.Module, the training model
         ema_model:  nn.Module, the EMA copy
         decay:      float, EMA decay (close to 1.0 gives long memory)
     """
-    if decay is not None:
-        if decay > 0:
-            msd = model.state_dict()
-            emsd = ema_model.state_dict()
-            for k in msd.keys():
-                if msd[k].dtype.is_floating_point:
-                    emsd[k].mul_(decay).add_(msd[k], alpha=1 - decay)
-                else:
-                    emsd[k] = msd[k]  # copy over non-float buffers (e.g. ints, bools)
-    else:
-        msd = model.state_dict()
-        emsd = ema_model.state_dict()
-        for k in msd.keys():  # simply overwrite state dict to EMA model
-            emsd[k] = msd[k]
+    msd = model.state_dict()
+    emsd = ema_model.state_dict()
+    for k in msd.keys():
+        if msd[k].dtype.is_floating_point:
+            emsd[k].mul_(decay).add_(msd[k], alpha=1 - decay)
+        else:
+            emsd[k] = msd[k]  # copy over non-float buffers (e.g. ints, bools)
 
 
 def manual_batch_to_data_list(batch):
@@ -1741,8 +1749,25 @@ def atomic_save(state_dict, path):
         print("Save failed to", path)
 
 
-def get_discretizer(int_cfg):
-    """Uniform steps over integrator.T, always.
+def trajectory_T(args):
+    """The SDE policy's trajectory length (steps per rollout, train and eval): `model.T` (mk_dev `model.sde.T`),
+    else `integrator.T` (the conformer route's key), else None. Reads a dict or a Namespace tree.
+    config_invariants.trajectory_length_problems refuses `integrator` and `eval_T` off the conformer route."""
+    def member(node, name):
+        if node is None:
+            return None
+        return node.get(name) if isinstance(node, dict) else getattr(node, name, None)
+    for section in ('model', 'integrator'):
+        T = member(member(args, section), 'T')
+        if T is not None:
+            return int(T)
+    return None
+
+
+def get_discretizer(T):
+    """Uniform steps over T, always. `T` is a step count (utils.trajectory_T) or an object carrying it as `.T`
+    (the conformer route passes args.integrator). The grid is built when the discretizer is called, so a policy
+    that never calls it (model.kind nf) needs no T; a call without one raises.
 
     The variable-length / alternative-discretizer branches (random,
     low_discrepancy, equidistant; 'sampled' trajectory lengths between
@@ -1754,7 +1779,14 @@ def get_discretizer(int_cfg):
     just its quadrature. The alternatives are in git history if a variable-dt
     experiment is ever wanted; they should come back with the density
     correction that would make them valid, not as a config switch."""
-    return lambda bsz: uniform_discretizer(bsz, int_cfg.T)
+    if not isinstance(T, int):
+        T = getattr(T, 'T', None)
+
+    def discretizer(bsz):
+        if T is None:
+            raise ValueError("no trajectory length: model.sde.T (the SDE policy's steps per rollout) is unset")
+        return uniform_discretizer(bsz, int(T))
+    return discretizer
 
 
 def drain_elapsed_times(times):

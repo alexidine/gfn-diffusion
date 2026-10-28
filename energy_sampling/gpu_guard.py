@@ -357,7 +357,8 @@ def config_signature(cfg):
             int((_get(cfg, 'max_batch_size', 0) if _get(cfg, 'grow_batch_size', False)
                  else 0) or _get(cfg, 'batch_size', 0)
                 or _get(cfg, 'max_batch_size', 0) or 0),
-            int(_get(integ, 'T', 0)),
+            # trajectory length: model.T (mk_dev model.sde.T), else integrator.T (the conformer route)
+            int(_get(model, 'T', 0) or _get(integ, 'T', 0)),
             int(_get(model, 's_emb_dim', 0)),
             int(_get(model, 'dplr_rank', 0)),
             int(max(_get(cfg, 'z_primes', [1]) or [1])),

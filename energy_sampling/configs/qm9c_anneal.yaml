@@ -464,9 +464,6 @@ controller:
   anneal_patience: 5
   lookahead_horizon: 5
   lookahead_trend_alpha: 0.1
-grad_geometry:
-  enabled: false
-  every: 50
 buffers:
   prior_buffer:
     seed_source: prior_dataset

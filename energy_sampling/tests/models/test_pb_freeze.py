@@ -124,34 +124,30 @@ def test_snapshot_state_round_trip_restores_the_same_pb():
 class _Stub:
     """The slice of Modeller the checkpointer's restore hook touches."""
 
-    def __init__(self, g, ema):
-        self.gfn_model, self.ema_model, self.calls = g, ema, []
+    def __init__(self, g):
+        self.gfn_model, self.calls = g, []
 
     def set_pb_freeze(self, mode, source_state=None):
         self.calls.append((mode, source_state is not None))
         if mode is None:
-            for m in (self.gfn_model, self.ema_model):
-                m.unfreeze_backward_policy()
+            self.gfn_model.unfreeze_backward_policy()
             return
-        fr = self.gfn_model.freeze_backward_policy(source_state=source_state)
-        self.ema_model.install_pb_snapshot(fr)
+        self.gfn_model.freeze_backward_policy(source_state=source_state)
 
 
 def test_checkpointer_restore_hook_restores_and_lifts():
-    g, ema, traj = make_gfn(), make_gfn(), paths()
+    g, traj = make_gfn(), paths()
     g.freeze_backward_policy()
     ref = logpb(g, traj)
     ck = {'pb_frozen': g.pb_snapshot_state()}
 
     holder = type('H', (), {})()
-    holder.modeller = _Stub(make_gfn(), make_gfn())
+    holder.modeller = _Stub(make_gfn())
     holder.modeller.gfn_model.load_state_dict(g.state_dict())
     perturb_trunk(holder.modeller.gfn_model)
     Checkpointer._restore_pb_snapshot(holder, ck)
     assert holder.modeller.calls == [('full', True)]
-    assert holder.modeller.gfn_model.pb_frozen and holder.modeller.ema_model.pb_frozen
-    assert holder.modeller.gfn_model._pb_frozen is holder.modeller.ema_model._pb_frozen, \
-        "train and EMA models must share ONE snapshot object"
+    assert holder.modeller.gfn_model.pb_frozen
     assert torch.allclose(logpb(holder.modeller.gfn_model, traj), ref, atol=1e-6)
 
     # a trainable checkpoint (None) LIFTS a freeze -- a rewind must not keep a later snapshot

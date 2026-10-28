@@ -455,7 +455,7 @@ def test_set_traj_checkpoint_re_arms_the_ladder():
 
     m = _fresh()
     _drive(m, 60)
-    m.gfn_model, m.ema_model = _Model(), _Model()
+    m.gfn_model = _Model()
     proto = object.__new__(_Proto)
     proto.m = m
 
@@ -463,7 +463,6 @@ def test_set_traj_checkpoint_re_arms_the_ladder():
     _Proto._run_action(proto, 'set_traj_checkpoint', '1', {})
     assert m.args.traj_checkpoint is True
     assert m.gfn_model.traj_checkpoint is True, 'flag never reached the train model'
-    assert m.ema_model.traj_checkpoint is True, 'flag never reached the EMA model'
     assert m.batch_sizer is None, (
         'ladder rungs measured at the old per-sample memory survived the switch')
 

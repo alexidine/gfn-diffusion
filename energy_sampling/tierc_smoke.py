@@ -293,10 +293,9 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
     `lj_coeff`, `lj_rescale`, `internal_oom_recovery`) is parity with the
     gauss_aug12 arms and is INERT here: `molecular_crystal.py` zeroes
     `reduction_energy` structurally on a latent-scored problem and forms no
-    density or LJ term at all. `hold_dead_latent_rows` is pinned because it is the
-    knob gauss_aug12 varies and the closed form differs between its settings;
-    True is also `GFN`'s constructor default, so an arm omitting it lands on the
-    rows-held number anyway -- pinned so that is a statement rather than luck.
+    density or LJ term at all. Dead latent rows are always held (the
+    `hold_dead_latent_rows` knob gauss_aug12 varied is retired), so the closed form
+    used is the rows-held one.
 
     Values come from `configs/gauss_aug12/spec.py`, the single source of truth for
     this target, rather than retyped: a prior drawn at one width and scored at
@@ -321,7 +320,7 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
             'reward_range': None,
             'internal_oom_recovery': False,
         },
-        'model': {'hold_dead_latent_rows': True, 'periodic_centroids': False},
+        'model': {'periodic_centroids': False},
     }
     notes = [
         f'problems.yaml:{problem} cannot express reward_range / '
@@ -329,8 +328,8 @@ def problem_gap_fill(problem: str = PROBLEM) -> tuple[dict, list[str]]:
         f'target, and all three are tuning knobs elsewhere, so the registry '
         f'whitelist rejects them -> supplied null, [0, 0] and '
         f'k={spec.BOUNDING_COEFF} from gauss_aug12/spec.py',
-        f'model.hold_dead_latent_rows pinned True (the knob gauss_aug12 varies; '
-        f'the closed form differs between its settings) -> analytic log Z '
+        f'dead latent rows always held (gauss_aug12 varied this; the closed '
+        f'form differs between its settings) -> analytic log Z '
         f'{spec.analytic_log_z(1, hold=True):.4f} at T={spec.T}, w={spec.WIDTH}',
     ]
     return fill, notes
@@ -368,11 +367,10 @@ def pin_auto_lr_without_sensor(cfg: dict) -> list[str]:
       * retired keys -- mechanical, and `config_state.migrate` fixes them;
       * `lr_policy/lr_back/lr_replay/lr_fused: auto` with nothing that can move
         them. Under the sensor-era schema that meant no stage declared an
-        `lr_sensor`; under the bracket it means the migrated `lr_control` block
-        carries no candidate grid, because state 10's migration deliberately
-        REFUSES to invent one (a grid that cannot fail makes the bracket return
-        the same answer forever while appearing to work). Either way, migration
-        is right to refuse: choosing it is judgment.
+        `lr_sensor`; under state 10 it means the migrated `lr_control` block is
+        not `mode: fixed` (state 10's migration writes `mode: bracket`, deleted
+        2026-10-28). Either way, migration is right to refuse: choosing a rate
+        is judgment.
 
     WHY PINNING IS A TRANSLATION AND NOT A GUESS. The two spellings do this:
 
@@ -384,39 +382,43 @@ def pin_auto_lr_without_sensor(cfg: dict) -> list[str]:
     independently ('previously neither did, so all four `auto` rates sat at the
     seed for entire runs'). So the float and the unmanaged `auto` are the SAME
     RUN, and writing the float is how that run is spelled under the current
-    schema. The block is rewritten to `mode: fixed, fixed_scale: 1.0` for the
-    same reason: a fixed scale of exactly 1.0 over the base rate is what that
-    config did, stated in the vocabulary that now exists.
+    schema. The block is rewritten to `mode: fixed` with the one-segment
+    schedule `[{to: 1.0, steps: 0, kind: hold}]` for the same reason: a fixed
+    scale of exactly 1.0 over the base rate is what that config did, stated in
+    the vocabulary that now exists.
 
     It is still an assumption, it is still reported on every run that triggers
     it, and it is deliberately NOT silent -- because what it does not preserve is
-    the thing tier C is about to measure: the current config runs a BRACKET, so
-    the LR trajectories diverge by design from here."""
+    the thing tier C is about to measure: the current config runs its own
+    burn-in and ramp, so the LR trajectories diverge by design from here."""
     import utils
 
     auto = [k for k in utils._LR_KEYS if utils._is_auto(cfg.get(k))]
     if not auto:
         return []
     control = cfg.get('lr_control') or {}
-    if control.get('candidate_scales') or control.get('mode') == 'fixed':
+    if control.get('mode') == 'fixed':
         return []                       # it can already move them: nothing to repair
     seed = control.get('seed_lr')
     if not isinstance(seed, (int, float)) or isinstance(seed, bool):
         raise ValueError(
-            f'{auto} are `auto` with no bracket able to move them, and '
+            f'{auto} are `auto` with no lr_control mode able to move them, and '
             f'lr_control.seed_lr is {seed!r} -- there is no number to pin them '
             f'to, so what this config trained at cannot be reconstructed.')
     for k in auto:
         cfg[k] = float(seed)
-    # ...and state the rate policy in the current vocabulary rather than leaving
-    # a half-migrated bracket block that would fail validation for want of a grid
-    # nobody chose.
-    cfg['lr_control'] = {**control, 'mode': 'fixed', 'fixed_scale': 1.0,
-                         'burn_in_steps': 0, 'burn_in_scale': 1.0}
-    return [f'REPAIR: {", ".join(auto)} were `auto` with no bracket able to move '
+    # ...and state the rate policy in the current vocabulary, dropping the
+    # deleted bracket keys (config_invariants.LR_CONTROL_RETIRED_KEYS) and the
+    # keys `schedule` replaced (LR_SCHEDULE_REPLACED_KEYS).
+    from config_invariants import LR_CONTROL_RETIRED_KEYS, LR_SCHEDULE_REPLACED_KEYS
+    dropped = set(LR_CONTROL_RETIRED_KEYS) | set(LR_SCHEDULE_REPLACED_KEYS)
+    kept = {k: v for k, v in control.items() if k not in dropped}
+    cfg['lr_control'] = {**kept, 'mode': 'fixed',
+                         'schedule': [{'to': 1.0, 'steps': 0, 'kind': 'hold'}]}
+    return [f'REPAIR: {", ".join(auto)} were `auto` with no lr_control mode able to move '
             f'them -- pinned to lr_control.seed_lr={float(seed):g}, the rate this '
             f'config actually trained at, and the block set to mode: fixed, '
-            f'fixed_scale 1.0. `auto` with nothing to move it is a raising load '
+            f'schedule [hold 1.0]. `auto` with nothing to move it is a raising load '
             f'gate under current code; see pin_auto_lr_without_sensor.']
 
 
@@ -527,8 +529,12 @@ def build_config(base_yaml: str,
     through this identical pipeline, so nothing here can favour one of them."""
     import config_state
 
+    from config_invariants import canonical_model_section
+
+    # the sectioned model block resolved (model = shared + sde, policy = {kind, nf}): the layers below write
+    # the flat form
     with open(base_yaml, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
+        cfg = canonical_model_section(yaml.safe_load(f))
 
     prov: dict[str, Any] = {'base_yaml': os.path.abspath(base_yaml),
                             'layers': [], 'notes': []}
@@ -562,16 +568,13 @@ def build_config(base_yaml: str,
         'load_weights_only': False,
         'run_name': run_tag,
         'tag': 'tierc',
-        # No eval inside the window. `eval_T` must equal `integrator.T` or
-        # preflight refuses the config, so it is set from whatever T survived
-        # the merge rather than pinned to a literal.
+        # No eval inside the window.
         'eval_period': 100000000,
-        'figs_period': 100000000,
+        'figs_every_n_evals': 0,
         'figure_period': 100000000,
         'wandb_mode': 'disabled',
     }
     _deep_merge(cfg, pins)
-    cfg['eval_T'] = cfg.get('integrator', {}).get('T', cfg.get('eval_T'))
     prov['layers'].append({'name': 'harness pins', 'keys': sorted(pins)})
 
     if extra:

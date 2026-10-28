@@ -66,7 +66,7 @@ class Arm:
 
     #: How long the shipping burn-in runs before an arm may act. SHORTER THAN
     #: PRODUCTION, and it has to be said out loud: canonical burns in for 3,000
-    #: steps to reach Adam steady state before it brackets, which is longer than
+    #: steps before its promotion ramp, which is longer than
     #: this whole battery. A bench that inherited it would hold every arm for the
     #: entire run and every board would read as "no controller moves the rate" --
     #: the pass-through failure `null` exists to catch, arriving through the
@@ -76,19 +76,14 @@ class Arm:
     def args_overrides(self):
         """Config the run should be built with. Sensors off unless asked for.
 
-        `mode: fixed` IS THE POINT, not a convenience. Under it the shipping
-        controller burns in, promotes `fixed_scale`, and then holds -- so it is a
-        pure ACTUATOR and the arm owns the rate. In `bracket` mode the controller
-        would run its own candidate trials against whatever the arm was doing,
-        and the board would be comparing two controllers per row.
-
-        The bracket gets compared here the way everything else does: as an ARM
-        (see `Bracket`), on the same board as the fixed ladder.
+        `mode: fixed` (the only mode): the shipping controller holds a
+        one-segment schedule at 1.0 for BURN_IN_STEPS and then leaves the scale
+        alone -- so it is a pure ACTUATOR and the arm owns the rate.
         """
         return {'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
-                'lr_control.burn_in_steps': self.BURN_IN_STEPS,
-                'lr_control.burn_in_scale': 1.0,
+                'lr_control.mode': 'fixed',
+                'lr_control.schedule': [{'to': 1.0, 'steps': self.BURN_IN_STEPS,
+                                         'kind': 'hold'}],
                 # SILENCED HERE rather than in the transcribed defaults: a
                 # battery is hundreds of cells and the controller's announce is
                 # per run, but `MK_DEV_*` has to keep saying what the shipping
@@ -146,9 +141,8 @@ class Arm:
     #: whole battery at 1e6 x seed and drown the board in non-finite rows.
     #:
     #: IT LIVES HERE NOW, and that is the substantive change. It used to be
-    #: `adaptive_lr.bounds`, read off the shipping controller -- but the bracket
-    #: has no such knob: its candidate grid IS its range, and there is no
-    #: continuous scale for a rail to bound. An arm that wants a rail owns it.
+    #: `adaptive_lr.bounds`, read off the shipping controller -- but the fixed
+    #: schedule has no such knob. An arm that wants a rail owns it.
     SCALE_BOUNDS = (1.0e-3, 1.0e3)
 
     @staticmethod
@@ -159,13 +153,11 @@ class Arm:
         differs between them, and that difference is the point.
 
         NONE OF THESE LAWS HAS A PRODUCTION COUNTERPART ANY MORE. The shipping
-        controller sets its rate by a brute-force bracket -- burn in, checkpoint,
-        trial a fixed grid, keep a rung below the lowest failure -- and `ray`,
-        `hyper` and `plateau` reach no learning rate. What these arms are FOR is
-        unchanged and is the reason they were not deleted with the sensors: they
-        are the alternatives the bracket has to beat on a board where a fixed
-        ladder is also running, and an alternative nobody can run is not a
-        comparison.
+        controller follows a fixed schedule (lr_control.schedule) --
+        and `ray`, `hyper` and `plateau` reach no learning rate. What these arms
+        are FOR is unchanged and is the reason they were not deleted with the
+        sensors: they are alternatives compared on a board where a fixed ladder
+        is also running.
         """
         ctrl = run.m.lr_controller
         # THE SHIPPING HOLD, taken from the controller rather than
@@ -187,13 +179,14 @@ class Fixed(Arm):
         self.lr = float(lr)
 
     def args_overrides(self):
-        # `mode: fixed` with `burn_in_steps: 0` is how "this rate, from step 0,
-        # unmodified" is spelled now. The old spelling was `lr_warmup_ratio: 1`
-        # to defeat the warmup envelope; there is no envelope to defeat.
+        # `mode: fixed` with the schedule [hold 1.0 over 0 steps] is how "this
+        # rate, from step 0, unmodified" is spelled now. The old spelling was
+        # `lr_warmup_ratio: 1` to defeat the warmup envelope; there is no
+        # envelope to defeat.
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
                 'lr_servo_managed': (),      # nothing manages it
-                'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
-                'lr_control.burn_in_steps': 0, 'lr_control.burn_in_scale': 1.0}
+                'lr_control.mode': 'fixed',
+                'lr_control.schedule': [{'to': 1.0, 'steps': 0, 'kind': 'hold'}]}
 
 
 class Null(Arm):
@@ -453,8 +446,8 @@ class RayRay(Arm):
     uncorrelated with the rate it steered.
 
     So the law lives here, and the arm is honest about what it is: the rule the
-    project used to ship, kept runnable so the bracket can be compared against
-    it rather than merely declared better. `on_calibration` is still called, for
+    project used to ship, kept runnable so it can be compared against a fixed
+    ladder rather than merely declared worse. `on_calibration` is still called, for
     the counters and the status channel.
     """
 

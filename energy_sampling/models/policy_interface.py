@@ -7,8 +7,8 @@ RECEIVERS are the names the trainer holds a policy under; TRAINER_FILES the modu
 TRAINER_FILES = ('train.py', 'protocol.py', 'checkpointing.py', 'gflownet_losses.py', 'utils.py', 'eval/utils.py',
                  'eval/xcond.py', 'eval/evaluations.py', 'eval/traj_reporting.py', 'grad_clip_guard.py',
                  'controller.py')
-RECEIVERS = ('self.gfn_model', 'self.ema_model', 'self.prior_model', 'm.gfn_model', 'm.ema_model', 'gfn_model',
-             'ema_model', 'gfn', 'model', 'prior_model', 'policy')
+RECEIVERS = ('self.gfn_model', 'self.ema_model', 'm.gfn_model', 'm.ema_model', 'gfn_model',
+             'ema_model', 'gfn', 'model', 'policy')
 
 POLICY_ATTRIBUTES = (
     # the trajectory calls and the condition

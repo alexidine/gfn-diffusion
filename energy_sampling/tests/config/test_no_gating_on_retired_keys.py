@@ -46,7 +46,7 @@ pytestmark = pytest.mark.fast
 # retired keys as data rather than gating on them.
 RUNTIME = ('train.py', 'protocol.py', 'controller.py', 'buffer.py',
            'checkpointing.py', 'gflownet_losses.py', 'ray_calibration.py',
-           'lr_bracket.py', 'lr_bracket_probe.py', 'lr_larder.py',
+           'hard_failure_bars.py', 'lr_larder.py',
            'grad_clip_guard.py', 'profiling.py')
 
 

@@ -48,6 +48,7 @@ CANONICAL_DRIFT = {
     'config.continue_from_checkpoint', 'config.load_weights_only',
     # Run length and cadence are per-battery decisions, not canonical's.
     'config.epochs', 'config.eval_period', 'config.figs_period',
+    'config.figs_every_n_evals',
     'config.archive_period', 'config.archive_buffers',
     'config.checkpoint_read_only',
     # The warmup ramp-exit window was added 2026-08-17 and no historical arm
@@ -151,8 +152,8 @@ _BSZ_COMMON = {
     # the battery predates the bracket and ran a fixed rate throughout, which is
     # exactly what `mode: fixed` says under the current schema; the historical
     # spelling was four explicit floats under a controller nothing moved.
-    'lr_control.mode': 'fixed', 'lr_control.fixed_scale': 1.0,
-    'lr_control.burn_in_steps': 10, 'lr_control.burn_in_scale': 1.0,
+    'lr_control.mode': 'fixed',
+    'lr_control.schedule': [{'to': 1.0, 'steps': 10, 'kind': 'hold'}],
     'lr_control.ray_calibration.period': 200,
     'condition_log_z.half_life_visits': 7.0,
     'lr_policy': 1.25e-4, 'lr_back': 1.25e-4,
@@ -176,7 +177,7 @@ def _spec_elj_b1000():
     express anything."""
     return 'configs/bsz/b1000.yaml', dict(
         problem='mipcas_elj', batch_size=1000, max_batch_size=1000,
-        epochs=1900, eval_period=500, figs_period=1000, **_BSZ_COMMON)
+        epochs=1900, eval_period=500, figs_every_n_evals=2, **_BSZ_COMMON)
 
 
 def _spec_elj_b500():
@@ -190,7 +191,7 @@ def _spec_elj_b500():
     return 'configs/bsz/b500.yaml', dict(
         problem='mipcas_elj', batch_size=500, max_batch_size=500,
         fused_grad_accum_min_samples=500, epochs=1900, eval_period=500,
-        figs_period=1000, **{**_BSZ_COMMON,
+        figs_every_n_evals=2, **{**_BSZ_COMMON,
                              'lr_control.ray_calibration.n_sub': 16})
 
 
@@ -358,17 +359,18 @@ def test_the_corpus_check_can_fail(tmp_path):
         'the comparator did not see a changed seed -- it is not comparing')
 
 
-#: The one load failure every corpus arm is EXPECTED to carry, because the
-#: schema removed the key and old battery configs are never updated: every arm
-#: declares `lr_sensor: {kind: hyper}`, deleted 2026-09-20 and refused at parse.
+#: The load failures corpus arms are EXPECTED to carry, because the schema
+#: removed the key and old battery configs are never updated: every arm declares
+#: `lr_sensor: {kind: hyper}`, deleted 2026-09-20 and refused at parse, and some
+#: set `lr_control.mode: bracket`, deleted 2026-10-28 and refused at load.
 #: Named exactly, so any OTHER schema break still fails the test below.
-_EXPECTED_LOAD_ERROR = "lr_sensor kind 'hyper'"
+_EXPECTED_LOAD_ERRORS = ("lr_sensor kind 'hyper'", "'bracket' was deleted 2026-10-28")
 
 
 def test_the_loadable_corpus_is_measured_not_assumed():
     """The corpus is small for a stated reason. If a schema change makes these
     stop loading, this fails rather than the corpus quietly shrinking to zero --
-    except for the one removal whose refusal is the point (_EXPECTED_LOAD_ERROR),
+    except for the removals whose refusal is the point (_EXPECTED_LOAD_ERRORS),
     which is matched rather than waived."""
     for name in sorted(CORPUS):
         path = CORPUS[name]()[0]
@@ -376,6 +378,6 @@ def test_the_loadable_corpus_is_measured_not_assumed():
             err = config_snapshot.snapshot(path).get('load_error')
         except Exception as e:      # a stage-parse refusal RAISES; it is not recorded
             err = f'{type(e).__name__}: {e}'
-        if err and _EXPECTED_LOAD_ERROR in str(err):
+        if err and any(e in str(err) for e in _EXPECTED_LOAD_ERRORS):
             continue
         assert not err, f'{path} no longer loads; the corpus arm is inert: {err}'

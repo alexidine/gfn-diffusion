@@ -57,7 +57,7 @@ def test_null_does_not_move_its_rate_after_warmup():
     """Null is the do-nothing control: past burn-in its rate is constant, so
     any arm that matches it is also doing nothing."""
     run = _run(Null, steps=1400)
-    warm = int(run.m.args.lr_control.burn_in_steps)
+    warm = int(run.m.args.lr_control.schedule[0]['steps'])
     after = set(_lrs(run)[warm + 50:])
     assert len(after) == 1, f'null moved the rate: {sorted(after)[:5]}'
 
@@ -75,7 +75,7 @@ def test_hyper_moves_the_rate_and_respects_its_own_gain_cap():
     cosine. Checked past burn-in, where the controller is holding and the only
     thing moving the rate is the arm."""
     run = _run(Hyper, steps=1400)
-    warm = int(run.m.args.lr_control.burn_in_steps)
+    warm = int(run.m.args.lr_control.schedule[0]['steps'])
     lrs = _lrs(run)[warm + 50:]
     assert len(set(lrs)) > 10, 'hyper did not move the rate'
     jumps = [abs(math.log(b) - math.log(a)) for a, b in zip(lrs, lrs[1:])]

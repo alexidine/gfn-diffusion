@@ -15,8 +15,8 @@ Every module below sits at the package root unless its path says otherwise, and 
 | `protocol.py` | `Stage`, `StageProtocol`, `fresh_stage_ctrl`, the `ACTIONS` and `STAGE_FLAGS` vocabularies |
 | `buffer.py` | `CrystalBuffer`, `AnchorBuffer`, `ConditionLogZTracker`, the `ConformerGraphHooks` mixin and its two subclasses `ConformerBuffer` and `ConformerAnchorBuffer`, the compact conformer row store `ConformerCompactRows` with its per-condition graph table `ConformerStatics`, `BufferCurrencyError`, `BufferColumnError`, `CompactRowsError` |
 | `gflownet_losses.py` | `get_gfn_forward_loss` and `get_gfn_backward_loss`, the TB, VarGrad, DB, SubTB and MLE terms, the log Z estimators (`batch_root_z`, `winsorized_z_root`, `emp_Z`) |
-| `controller.py` | `LRController`: one multiplier over the managed policy optimizers, moved by the bracket, plus the always-on hard tripwire |
-| `lr_bracket.py`, `lr_bracket_probe.py`, `lr_hot_sensor.py`, `lr_larder.py`, `ray_calibration.py`, `grad_clip_guard.py` | the bracket's decision half and its trainer-side driver, the drawdown sensor, the per-branch ring of replay-scoreable batches, the ray sensor, and `GradClipGuard`'s per-branch quantile bar |
+| `controller.py` | `LRController`: one multiplier over the managed policy optimizers, moved by the per-stage segment schedule (`lr_control.schedule`, a stage's `lr_schedule`) and the fire cut, plus the always-on hard tripwire |
+| `hard_failure_bars.py`, `lr_hot_sensor.py`, `lr_larder.py`, `ray_calibration.py`, `grad_clip_guard.py` | the tripwire's fitted loss and gradient bars, the drawdown sensor, the per-branch ring of replay-scoreable batches, the ray sensor, and `GradClipGuard`'s per-branch quantile bar |
 | `checkpointing.py` | `Checkpointer`, `MODELLER_STATE_DEFAULTS`, `CHECKPOINT_TAGS`, `BUFFER_SUFFIX` |
 | `config_snapshot.py` | the resolved config, parsed protocol and per-stage coefficients, diffed |
 | `config_state.py`, `config_invariants.py` | the `project_state_version` history with its migrations; cross-key relations as pure functions of a raw config dict, at severities `ERROR` and `BASELINE` |

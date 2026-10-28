@@ -201,6 +201,17 @@ def test_T_key_absent_is_reported_as_absent_not_as_null(tb_ramp):
     assert '<missing>' in row.detail and '<null>' not in row.detail
 
 
+def test_a_run_carrying_model_T_alone_is_ok(tb_ramp):
+    """A run configured after 2026-10-28 carries one trajectory length, model.sde.T (flattened
+    `model_T`), and neither eval_T nor integrator_T: one key cannot disagree with itself."""
+    m = fixtures.mutate(tb_ramp, config={K.CFG_MODEL_T: 10})
+    m.config.pop(K.CFG_EVAL_T)
+    m.config.pop(K.CFG_TRAIN_T)
+    row = _row(check_confounds(m), 'tb_ramp/T')
+    assert row.state is State.OK
+    assert row.numbers[K.CFG_MODEL_T] == 10
+
+
 def test_a_non_numeric_T_is_unreadable(tb_ramp):
     """A string where a number belongs is neither a mismatch nor a match, and
     reporting it as either would be a guess."""
@@ -616,6 +627,18 @@ def test_a_start_key_missing_from_one_arm_fires(ring_probe, ring_cal, key):
     row = _row(check_confounds([ring_probe, m]), f'battery/start/{key}')
     assert row.state is State.FLAG
     assert '<missing>' in row.detail
+
+
+def test_model_T_differing_between_arms_fires(ring_probe, ring_cal):
+    """Arms configured after 2026-10-28 carry only `model_T` (mk_dev model.sde.T); a T difference
+    between them is a start condition like the older pair. The captured arms predate the key."""
+    a = fixtures.mutate(ring_probe, config={K.CFG_MODEL_T: 10})
+    b = fixtures.mutate(ring_cal, config={K.CFG_MODEL_T: 25})
+    row = _row(check_confounds([a, b]), f'battery/start/{K.CFG_MODEL_T}')
+    assert row.state is State.FLAG
+    assert row.numbers['n_values'] == 2
+    same = fixtures.mutate(ring_cal, config={K.CFG_MODEL_T: 10})
+    assert _state(check_confounds([a, same]), f'battery/start/{K.CFG_MODEL_T}') is State.OK
 
 
 def test_a_start_key_nulled_in_one_arm_reads_as_null_not_as_missing(

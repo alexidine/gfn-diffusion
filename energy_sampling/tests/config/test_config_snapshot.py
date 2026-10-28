@@ -73,7 +73,7 @@ def test_auto_swapped_for_its_own_resolved_value_is_caught(tmp_path, raw, base_s
     """THE case the resolved value alone cannot see.
 
     `lr_policy: auto` and `lr_policy: 1.25e-4` resolve to the SAME number and mean
-    opposite things -- bracket-managed versus a fixed rate the bracket's scale
+    opposite things -- scale-managed versus a fixed rate the controller's scale
     never touches. A comparator that only checked resolved values would wave this
     through."""
     seed = raw['lr_control']['seed_lr']
@@ -164,18 +164,19 @@ def test_a_leaf_becoming_a_block_is_a_change_not_an_add(tmp_path, raw, base_snap
     empty -- which reads as 'behaviour preserved'. Half the interesting config
     edits have this shape."""
     new = copy.deepcopy(raw)
-    new['ema_decay'] = {'kind': 'something', 'rate': 0.9}   # was a scalar (null)
+    assert not isinstance(raw['max_reloads_per_1k_steps'], dict)
+    new['max_reloads_per_1k_steps'] = {'kind': 'something', 'rate': 0.9}   # was a scalar
     c = cs.compare(base_snap, snap_of(tmp_path, 'shape.yaml', new))
     assert not c.behaviour_preserved, 'a scalar -> block edit must not pass clean'
-    assert any(p == 'config.ema_decay' for p, _, _ in c.changed)
+    assert any(p == 'config.max_reloads_per_1k_steps' for p, _, _ in c.changed)
 
 
 def test_a_block_becoming_a_leaf_is_also_caught(tmp_path, raw, base_snap):
     new = copy.deepcopy(raw)
-    new['integrator'] = 10                     # was {T: 10}
+    new['drift_force'] = 10                    # was a block
     c = cs.compare(base_snap, snap_of(tmp_path, 'shape2.yaml', new))
     assert not c.behaviour_preserved
-    assert any(p == 'config.integrator' for p, _, _ in c.changed)
+    assert any(p == 'config.drift_force' for p, _, _ in c.changed)
 
 
 def test_periodic_centroid_axes_are_resolved(base_snap):
@@ -363,8 +364,7 @@ def test_a_changed_derived_value_is_caught(tmp_path, raw, base_snap):
     """gradient_norm_clip is `auto`, derived from (W, T). Changing T must move it
     -- if the snapshot stored the string `auto` this would compare equal."""
     new = copy.deepcopy(raw)
-    new['integrator']['T'] = 25
-    new['eval_T'] = 25                      # preflight requires these to agree
+    new['model']['T'] = 25                  # model.sde.T, resolved
     c = cs.compare(base_snap, snap_of(tmp_path, 'derived.yaml', new))
     assert any(p == 'config.gradient_norm_clip' for p, _, _ in c.changed)
 

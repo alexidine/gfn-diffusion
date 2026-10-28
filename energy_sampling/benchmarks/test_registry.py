@@ -184,8 +184,8 @@ def test_floor_for_refuses_a_metric_the_floor_does_not_cover(reg):
 
 def test_resolved_overrides_are_deep_merged(reg):
     ov = R.resolved_overrides('toy-latentgauss-fused-uncond', reg)
-    assert ov['integrator']['T'] == 10                   # nested, from the benchmark
-    assert ov['figs_period'] == 100000000                # from defaults
+    assert ov['model']['T'] == 10                        # nested, from the benchmark (model.sde.T, resolved)
+    assert ov['figs_every_n_evals'] == 0                 # from defaults
     assert ov['controller']['refresh_every'] == 1000000  # from the benchmark
     assert ov['checkpoint_read_only'] is True
     # the deep merge must not have resurrected the retired switch

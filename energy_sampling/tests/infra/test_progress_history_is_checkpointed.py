@@ -4,9 +4,9 @@ progress_gate needs SIX evals per metric before `_series` returns anything, and
 the production phase-1 stage exits on `gates/progress_done`:
 
     exit    = [{'metric': 'gates/progress_done', 'above': 0.5, 'patience': 1}]
-    on_exit = ['snapshot:phase1_exit', 'snapshot_prior']
+    on_exit = ['snapshot:phase1_exit']
 
-so on_exit is the ONLY writer of phase1_exit.pt and the prior. With the history
+so on_exit is the ONLY writer of phase1_exit.pt. With the history
 unpersisted a resumed leg started empty and could not conclude for ~6 evals --
 ~3000 steps at eval_period 500, ~5.8 h on the MLIP route.
 
@@ -14,7 +14,7 @@ unpersisted a resumed leg started empty and could not conclude for ~6 evals --
 resume inherits at ~19000, so it passes instantly and the blackout is invisible.
 
 The failure that matters is not wasted steps: a leg that ENDS inside the blackout
-never fires on_exit, so it writes no phase1_exit and no prior -- and a _best.pt
+never fires on_exit, so it writes no phase1_exit -- and a _best.pt
 without a phase1_exit is the known-fatal case. On a leg shorter than the rebuild,
 phase 1 could never exit at all.
 """

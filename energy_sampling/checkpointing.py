@@ -9,7 +9,7 @@ import torch
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     BufferCurrencyError
 from energy_sampling.protocol import fresh_stage_ctrl
-from energy_sampling.utils import atomic_save, normalize_problem_def
+from energy_sampling.utils import atomic_save, keeps_ema_copy, normalize_problem_def, trajectory_T
 from models import GFN
 from models.nf_policy import PRECISION_ONLY_KEYS, resolve_policy_entry
 
@@ -100,13 +100,12 @@ MODELLER_STATE_DEFAULTS = {
     # default None mismatches every real signature, so old checkpoints clear
     # the record on their first post-resume tick.
     'combo_loss_metric': None,
-    # LRController state (see controller.py): the live scale, the step this
-    # stage's burn-in started at, and the LR bracket's own phase/verdict. A
-    # missing/mismatched 'ver' means "not yet attached, or written by a
-    # controller this build does not speak" -- discarded and rebuilt, never
-    # reinterpreted, because a v8 dict carries a peak_scale, a warmup envelope
-    # and a freeze latch that have no meaning under the bracket.
-    'lr_ctrl': {'ver': None, 'scale': None, 'stage_entry_step': 0, 'bracket': None},
+    # LRController state (see controller.py): the live scale and the stage's
+    # cumulative fire cut. The schedule's entry step rides stage_ctrl
+    # ('lr_sched_entry'). A missing/mismatched 'ver' means "not yet attached, or
+    # written by a controller this build does not speak" -- discarded and
+    # rebuilt, never reinterpreted.
+    'lr_ctrl': {'ver': None, 'scale': None, 'cut': 1.0},
     # the conformer route's prior-draw stream (ConformerModeller._prior_rng, a numpy
     # Generator created from cfg seed on first use). Unsaved, every leg recreated it from
     # the seed, so a requeued leg REPLAYED the first leg's InternalPrior draws: the prior
@@ -132,7 +131,8 @@ MODELLER_STATE_DEFAULTS = {
 BUFFER_SUFFIX = '_buffers.pt'
 
 # Every tag save() writes, used to strip a checkpoint's tag back to the
-# run-level prefix when resolving its rolling sidecar.
+# run-level prefix when resolving its rolling sidecar. 'prior' is no longer
+# written; it stays so an existing *_prior.pt still resolves its sidecar.
 CHECKPOINT_TAGS = ('best', 'running', 'prior', 'thermalized', 'final',
                    'phase1_exit', 'phase2_exit', 'ff_calibrated')
 
@@ -208,8 +208,8 @@ def best_energy_from_anchors_on_switch(modeller, checkpoint: dict, path: str) ->
 
 class Checkpointer:
     """
-    Saves/restores a Modeller's full training state (model, EMA model,
-    optimizers, buffers, condition_log_z, and the MODELLER_STATE_DEFAULTS
+    Saves/restores a Modeller's full training state (model, the conformer
+    route's EMA copy, optimizers, buffers, condition_log_z, and the MODELLER_STATE_DEFAULTS
     fields) to/from disk. Holds a reference to its owning Modeller rather
     than duplicating that state, since nearly every field on Modeller is
     part of what gets checkpointed.
@@ -362,8 +362,8 @@ class Checkpointer:
     def assert_problem_match(self, checkpoint: dict, path: str, config_key: str,
                              ignore_keys: tuple = ()):
         """
-        Hard-fail when an explicitly requested checkpoint (checkpoint_name /
-        prior_model_name) was trained on a different problem than the current
+        Hard-fail when an explicitly requested checkpoint (checkpoint_name)
+        was trained on a different problem than the current
         config. Restoring across problems corrupts state that is only
         meaningful for the problem it was saved under - most destructively the
         buffers, whose resident batches carry the old energy function's keys
@@ -534,7 +534,7 @@ class Checkpointer:
 
     def save(self, tag: str, with_buffers: bool = False):
         """
-        tag: 'best' | 'running' | 'prior' | 'final', or a pre-transition
+        tag: 'best' | 'running' | 'final', or a pre-transition
              snapshot tag from a stage's on_exit actions ('phase1_exit',
              'ff_calibrated', ... -- see protocol.StageProtocol._snapshot)
 
@@ -554,18 +554,16 @@ class Checkpointer:
             'problem_def': m.problem_def,  # human-readable dict: energy function + prior this checkpoint solves
             'problem_hash': m.problem_hash,  # fast fingerprint of problem_def, also embedded in the filename
             'model_train': m.gfn_model.state_dict(),
-            'model_eval': m.ema_model.state_dict(),
             # P_B's frozen snapshot (Modeller.set_pb_freeze 'full'), or None. Lives
             # outside the model state_dict on purpose (not a submodule) and is
             # restored by every load path below, so a resumed leg scores P_B on
             # the SAME function rather than re-snapshotting a drifted trunk.
             'pb_frozen': m.gfn_model.pb_snapshot_state(),
-            # the rollout length this checkpoint was trained at. A prior reused
-            # by another run (prior_model_name) must be SAMPLED at
-            # its own training T, not the consumer's eval_T -- a T=10 prior fed
-            # into a T=100 run is a 10x discretization mismatch (see
-            # sample_from_prior). None on pre-2026-07-23 checkpoints.
-            'train_T': getattr(getattr(m.args, 'integrator', None), 'T', None),
+            # the rollout length this checkpoint was trained at, read by offline
+            # consumers that sample a checkpoint at its own T (build_prior_flow,
+            # eval/paper1_results, eval/cond_panel). None on pre-2026-07-23 checkpoints and
+            # on a policy without a trajectory length (model.kind nf without model.sde.T).
+            'train_T': trajectory_T(m.args),
             'modeller_state': self.get_state_dict(),
             'metrics': m.metric_tracker.state_dict(),
             'optimizers': {k: opt.state_dict() for k, opt in m.optimizers.items()},
@@ -576,6 +574,9 @@ class Checkpointer:
                                  if hasattr(getattr(m, 'energy_function', None), 'energy_reference_state')
                                  else None),
         }
+        if keeps_ema_copy(m):
+            # the conformer route's EMA copy (ema_model, aliased to gfn_model under a null ema_decay)
+            checkpoint['model_eval'] = m.ema_model.state_dict()
         path = self.path_for(tag)
         atomic_save(checkpoint, path)
         if with_buffers:
@@ -864,9 +865,7 @@ class Checkpointer:
             f"space_groups={list(m.args.space_groups)}, but the checkpoint was built with "
             f"{stored}. These fix the policy input width (expanded_dim), so they cannot be "
             f"swapped on resume. The checkpoint predates the dead-row work (decisions.md "
-            f"D33) or was trained on a different crystal system -- retrain from scratch, or "
-            f"set model.hold_dead_latent_rows: false to reproduce the old architecture "
-            f"exactly (which also restores the D33 defect).")
+            f"D33) or was trained on a different crystal system -- retrain from scratch.")
 
     def load_full(self, path, load_opt_state: bool = True):
         m = self.modeller
@@ -875,12 +874,10 @@ class Checkpointer:
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
         self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
-        m.ema_model = deepcopy(m.gfn_model)
-        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
+        self._install_ema(checkpoint, path)
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
-        m.ema_model.eval()
 
         if 'stage' not in checkpoint['modeller_state']:
             raise ValueError(
@@ -979,7 +976,8 @@ class Checkpointer:
         """
         Warm-start from a checkpoint's model weights alone: rebuilds the GFN
         from the checkpoint's stored gfn_config (bar RECONFIGURABLE_GFN_KEYS,
-        which follow this run's config) and loads the train/EMA weights, but
+        which follow this run's config) and loads the policy weights (and the
+        conformer route's EMA copy, _install_ema), but
         restores nothing else - optimizers, schedulers, buffers, metrics,
         condition_log_z, and every MODELLER_STATE_DEFAULTS field are left for
         the caller to initialize fresh (phase 1, step 0, LR warmup from
@@ -1004,35 +1002,22 @@ class Checkpointer:
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
         self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
-        m.ema_model = deepcopy(m.gfn_model)
-        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
+        self._install_ema(checkpoint, path)
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
-        m.ema_model.eval()
         # read by the protocol's `skip_if: weights_loaded` (StageProtocol.begin): the
-        # phase-2 entry for a route that can never hold a `prior_model`. Set only here,
-        # after the load succeeded, so a failed load cannot skip a stage.
+        # phase-2 entry from a weights-only warm start. Set only here, after the load
+        # succeeded, so a failed load cannot skip a stage.
         m.weights_only_loaded = True
 
     def load_optimizer_state(self, checkpoint, strict: bool = False):
         """Restore every optimizer's state, including Adam's step counter.
 
-        `strict` TURNS THE TWO FALLBACKS BELOW INTO ERRORS, and the LR bracket
-        passes it. Outside a bracket, "no saved state for this optimizer" and
-        "the param groups no longer line up" are legitimate recovery: the run
-        continues with that optimizer fresh, which is worse than a perfect resume
-        and much better than refusing to start.
-
-        INSIDE A CANDIDATE TRIAL THEY ARE A CORRUPTED MEASUREMENT THAT LOOKS
-        NORMAL. `opt.load_state_dict` is what carries `state[p]['step']`, and
-        Adam's update scales as sqrt(1 - beta2^t) / (1 - beta1^t) relative to
-        steady state -- 0.153 at t=10, 0.309 at t=100, 0.795 at t=1000. A trial
-        that silently restarted the counter would run at 15-30% of its nominal
-        rate for its first hundred steps, so a too-hot rung survives because the
-        rate under test is not the rate applied, and the bracket then reports a
-        boundary it never found. A printed line in a log nobody reads mid-run is
-        not a defence against that.
+        `strict` TURNS THE TWO FALLBACKS BELOW INTO ERRORS. Without it, "no
+        saved state for this optimizer" and "the param groups no longer line up"
+        print and continue with that optimizer fresh, which resets Adam's step
+        counter (`opt.load_state_dict` is what carries `state[p]['step']`).
         """
         m = self.modeller
         saved_optimizers = checkpoint['optimizers']
@@ -1041,8 +1026,7 @@ class Checkpointer:
                 if strict:
                     raise KeyError(
                         f"no saved optimizer state for '{key}'. Starting it fresh would "
-                        f"reset Adam's step counter, and a trial from a reset counter "
-                        f"measures a rate that is not the one under test.")
+                        f"reset Adam's step counter.")
                 print(f"No saved optimizer state for '{key}' - starting it fresh")
                 continue
             saved = saved_optimizers[key]
@@ -1059,9 +1043,20 @@ class Checkpointer:
                 if strict:
                     raise RuntimeError(
                         f"could not restore optimizer state for '{key}': {e}. Starting "
-                        f"it fresh would reset Adam's step counter and corrupt the "
-                        f"measurement.") from e
+                        f"it fresh would reset Adam's step counter.") from e
                 print(f"Could not restore optimizer state for '{key}' ({e}) - starting it fresh")
+
+    def _install_ema(self, checkpoint, path):
+        """ema_model, after gfn_model has loaded. On the conformer route (utils.keeps_ema_copy)
+        a separate copy holding the checkpoint's `model_eval`, in eval mode; on every other
+        route gfn_model itself, and a stored `model_eval` is not read."""
+        m = self.modeller
+        if not keeps_ema_copy(m):
+            m.ema_model = m.gfn_model
+            return
+        m.ema_model = deepcopy(m.gfn_model)
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
+        m.ema_model.eval()
 
     def _restore_pb_snapshot(self, checkpoint):
         """A checkpoint written under a full P_B freeze carries the snapshot;
@@ -1082,9 +1077,11 @@ class Checkpointer:
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
         self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)', in_place=True)
-        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)', in_place=True)
+        if m.ema_model is not m.gfn_model:
+            # the conformer route's separate EMA copy (utils.keeps_ema_copy)
+            self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)', in_place=True)
+            m.ema_model.eval()
         self._restore_pb_snapshot(checkpoint)
         m.gfn_model.train()
-        m.ema_model.eval()
         if load_optimizers:
             self.load_optimizer_state(checkpoint)

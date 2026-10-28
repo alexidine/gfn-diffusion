@@ -236,8 +236,8 @@ def _frozen_screen_stub(buf, cfg_frozen=None):
     t.update_best_energy(torch.tensor([0]), torch.tensor([0.0]))
     m, made = A._screen_stub(t, A._screen_rows(), flow=False)
     rollouts = []
-    bwd = m.ema_model.get_traj_bwd
-    m.ema_model.get_traj_bwd = lambda *a: rollouts.append(1) or bwd(*a)
+    bwd = m.gfn_model.get_traj_bwd
+    m.gfn_model.get_traj_bwd = lambda *a: rollouts.append(1) or bwd(*a)
     if buf is not None:
         m.anchor_buffer = buf
     if cfg_frozen is not None:

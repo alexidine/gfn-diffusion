@@ -30,8 +30,7 @@ declares:
                     action ends the RUN when the exit fires (snapshots first),
                     instead of advancing -- for probe/fan runs that must yield
                     the GPU the moment their phase is done.
-  on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
-                    bootstrap_z, seed_prior_from_anchors,
+  on_exit/on_enter  transition actions (snapshot:<tag>, bootstrap_z, seed_prior_from_anchors,
                     reseed_prior_from_dataset, rebuild_prior_by_churn,
                     set_lr_flow:<float>; set_max_batch_size:<int>;
                     set_traj_checkpoint:<0|1>; freeze_pb[:full|head] /
@@ -44,12 +43,12 @@ declares:
                     NB the first stage is never ENTERED via a transition, so its
                     on_enter does not fire -- put entry actions on the stage
                     being transitioned INTO
-  skip_if           entry condition ('prior_loaded' | 'weights_loaded'): on a
-                    fresh run the stage is skipped when the condition holds
-                    (e.g. the MLE warm-start is redundant when a prior model
-                    was loaded by path given by prior_model_name, or -- on a
-                    route with no prior model, the conformer -- when this
-                    process loaded checkpoint_name with load_weights_only)
+  skip_if           entry condition ('weights_loaded' | 'prior_loaded'): on a
+                    fresh run the stage is skipped when the condition holds.
+                    'weights_loaded' holds when this process loaded
+                    checkpoint_name with load_weights_only. 'prior_loaded'
+                    never holds: no route loads a prior model (refused on the
+                    crystal route by crystal_prior_model_is_retired)
   max_steps         a BOUND on the stage, in its own train steps: when the stage
                     has run this many steps without its exit firing, the next
                     eval advances it anyway (or ends the run, with 'stop'), with
@@ -148,8 +147,6 @@ progress silently reset on every resume.
 
 import math
 import numbers
-import os
-from copy import deepcopy
 
 import numpy as np
 
@@ -182,10 +179,12 @@ ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors
            'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint', 'stop',
            'freeze_pb', 'unfreeze_pb')
 #: `weights_loaded` holds iff THIS process loaded checkpoint_name with load_weights_only
-#: (Checkpointer.load_weights_only sets modeller.weights_only_loaded). It exists for the
-#: conformer route, which can never satisfy `prior_loaded`: ConformerModeller's
-#: init_prior_dataset never builds a `prior_model`, so a crystal-style phase-2 arm there
-#: would silently re-run phase 1 from the loaded weights. Crystal configs never name it.
+#: (Checkpointer.load_weights_only sets modeller.weights_only_loaded). `prior_loaded` never
+#: holds -- no route builds a prior model -- and is kept only because conformer configs
+#: still name it; crystal_prior_model_is_retired refuses it, and `snapshot_prior`, off the
+#: conformer route. `snapshot_prior` stays in ACTIONS so a config naming it is refused by
+#: the route's own invariant rather than as an unknown action; _snapshot_prior refuses on
+#: every route.
 SKIP_CONDITIONS = ('prior_loaded', 'weights_loaded')
 
 #: `set_traj_checkpoint` argument vocabulary. BARE MEANS ON, like every other action --
@@ -199,7 +198,7 @@ TRAJ_CKPT_FALSE = ('0', 'false', 'off', 'no')
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
 # declared rather than derived from the active loss coefficients.
-# DIAGNOSTIC ONLY since the LR bracket took over actuation (controller.py).
+# DIAGNOSTIC ONLY: no sensor reaches a learning rate (controller.py).
 # `plateau` is gone entirely -- it was a pure actuator with nothing to report.
 # `hyper` (the hypergradient cosine) was deleted 2026-09-20 and is REFUSED at
 # load, not ignored -- see _parse_lr_sensor. `ray` is retained, OFF unless a
@@ -278,6 +277,10 @@ def fresh_stage_ctrl():
         # coeff_schedule: the train step the ramp is anchored at, stamped at the stage's first
         # energy_coeffs() evaluation; rides the checkpoint so a requeued leg continues the ramp
         'coeff_sched_entry': None,
+        # the LR schedule's anchor (controller.py::LRController._elapsed): the train step
+        # the stage's lr_control.schedule / lr_schedule clock starts at, stamped by
+        # LRController.on_stage_change or at its first tick; rides the checkpoint
+        'lr_sched_entry': None,
         # NB 'max_steps_entry' (the stage cap's clock) is NOT listed here: it is written
         # only for a stage that declares max_steps (advance / begin), so a stage without
         # one carries exactly the state it always did
@@ -342,7 +345,7 @@ class Stage:
                                # generic unknown-key error would say nothing useful
                                'buffer_servo',
                                'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
-                               'max_steps',
+                               'max_steps', 'lr_schedule',
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
                                'fwd_rollout_triggers', 'z_pin_rollout_every',
                                'fwd_z_sidecar', 'replay_warmup_rows',
@@ -536,11 +539,27 @@ class Stage:
         self.max_steps = (None if raw is None else
                           _require_count(raw, f"stage '{self.name}': max_steps", minimum=1))
 
+        # lr_schedule: this stage's LR schedule, replacing lr_control.schedule for
+        # it (controller.py::LRController._schedule); None = the run-level one.
+        # Judged against this stage's max_steps (config_invariants.lr_schedule_problems).
+        self.lr_schedule = self._parse_lr_schedule(spec.get('lr_schedule'))
+
         # after balance/fracs/loss_coeffs: every check below reads them
         self._parse_replay_seat(spec)
         self._parse_condition_draw(spec)
 
     # ------------------------------------------------------------ sub-parsers
+
+    def _parse_lr_schedule(self, node):
+        """A list of {to, steps, kind} segments, normalized; None when absent."""
+        if node is None:
+            return None
+        from config_invariants import lr_schedule_problems, normalize_lr_schedule
+        problems = lr_schedule_problems(node, f"stage '{self.name}': lr_schedule",
+                                        max_steps=self.max_steps, judge_open_ended=True)
+        if problems:
+            raise ValueError('; '.join(problems))
+        return normalize_lr_schedule(node)
 
     def _parse_coeff_schedule(self, node):
         """{coefficient: {'target': float, 'steps': int >= 1, 'kind': 'geometric'|'linear',
@@ -1040,13 +1059,10 @@ class Stage:
         An OPTIONAL, OFF-BY-DEFAULT DIAGNOSTIC this stage may run. It reaches no
         learning rate.
 
-        THIS BLOCK NO LONGER STEERS ANYTHING. Learning rates are set by the
-        brute-force bracket (controller.py, lr_bracket.py), which is a run-level
-        mechanism rather than a per-stage one: burn in, checkpoint, trial a fixed
-        grid, promote a rung a safety margin below the lowest failure, hold. The
-        one sensor below survives only as an instrument, so a future claim about
-        it can be measured rather than argued about, and no canonical config
-        declares it.
+        THIS BLOCK STEERS NOTHING. Learning rates are set by the run-level
+        `lr_control` schedule (controller.py), or the stage's `lr_schedule`. The
+        one sensor below survives only as an instrument,
+        and no canonical config declares it.
 
           kind: ray       the alpha* ray calibration -- scores the fused
                           composite this stage's step descends, on batches
@@ -2227,23 +2243,14 @@ class StageProtocol:
             self.ctrl['max_steps_entry'] = int(m.step_ind)
         while self.stage.skip_if is not None and self.stage.index + 1 < len(self.stages):
             if self.stage.skip_if == 'prior_loaded':
-                if not hasattr(m, 'prior_model'):
-                    break
-                # the loaded prior IS the product of the skipped warm-start, but
-                # it is a sampling-only object that may be a different
-                # architecture than the live model, so the policy is
-                # deliberately NOT warm-started from it -- warm-start explicitly
-                # via checkpoint_name + load_weights_only when the architectures
-                # do match
-                print(f"protocol: prior model loaded (prior_model_name) "
-                      f"-- skipping stage '{self.stage.name}' (policy weights untouched)")
+                # never holds: no route loads a prior model (SKIP_CONDITIONS)
+                break
             elif self.stage.skip_if == 'weights_loaded':
                 if not getattr(m, 'weights_only_loaded', False):
                     break
-                # the loaded weights ARE the skipped stage's product; unlike the
-                # prior_loaded case they are the live policy's own, so nothing else
-                # is needed -- the next stage's on_enter fires below exactly as it
-                # would at a natural transition
+                # the loaded weights ARE the skipped stage's product, so nothing
+                # else is needed -- the next stage's on_enter fires below exactly
+                # as it would at a natural transition
                 print(f"protocol: weights loaded (checkpoint_name, load_weights_only) "
                       f"-- skipping stage '{self.stage.name}'")
             self.advance(None, run_exit_actions=False)
@@ -2292,9 +2299,8 @@ class StageProtocol:
         # stream, its best-checkpoint minima shouldn't gate the new stage's
         # 'best' saves, and its Adam moments describe the wrong loss surface.
         # `LRController.on_stage_change` must run with m.stage already switched.
-        # It re-enters burn-in, which is not optional at a transition: rebuilding
-        # the optimizers restarts Adam's step counter, and bracketing from a
-        # counter at t=10 measures 0.153 of the rate under test.
+        # It restarts the LR schedule from this step: the optimizers are rebuilt
+        # here, so Adam's step counter restarts.
         m.combo_loss_record = []
         # batch sizer: its conclusion and rung table describe the OUTGOING stage's
         # step-cost and occupancy profile -- carried over, they would answer the
@@ -2331,9 +2337,10 @@ class StageProtocol:
         m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
         m.init_schedulers_optimizers()
         m.set_loss_coeffs()
-        burn_in_steps = m.lr_controller.on_stage_change()
-        if burn_in_steps:
-            print(f"protocol: optimizers rebuilt, LR burn-in over {burn_in_steps} train steps")
+        warmup_steps = m.lr_controller.on_stage_change()
+        if warmup_steps:
+            print(f"protocol: optimizers rebuilt, LR schedule's first segment over "
+                  f"{warmup_steps} train steps")
         # The adaptive clip bar is calibrated against a gradient distribution, and
         # a stage boundary is where that distribution moves -- new coeffs, new
         # branch fracs, fresh Adam moments, sometimes a different train_mode
@@ -2415,7 +2422,7 @@ class StageProtocol:
             # legal (the config decides what to keep)
             self.m._stop_requested = True
         elif name == 'set_lr_flow':
-            # The flow/Z group is exempt from the bracket's scale
+            # The flow/Z group is exempt from the LR controller's scale
             # (lr_control.control_flow_lr: false), so nothing else will move it
             # and nothing else will move it BACK -- this is the only lever on it.
             # It is a stage action because the right rate is a property of what
@@ -2473,11 +2480,11 @@ class StageProtocol:
             m.args.traj_checkpoint = v
             if v:
                 m.args.traj_checkpoint_modes = None
-            for mdl in (getattr(m, 'gfn_model', None), getattr(m, 'ema_model', None)):
-                if mdl is not None:
-                    mdl.traj_checkpoint = v
-                    if v:
-                        mdl.traj_checkpoint_modes = None
+            mdl = getattr(m, 'gfn_model', None)
+            if mdl is not None:
+                mdl.traj_checkpoint = v
+                if v:
+                    mdl.traj_checkpoint_modes = None
             m.batch_sizer = None
             print(f"protocol: traj_checkpoint -> {v} on entering "
                   f"'{self.stage.name}'; ladder re-armed"
@@ -2517,12 +2524,8 @@ class StageProtocol:
         elif name == 'set_lr_policy':
             # PER-STAGE BASE RATE for the managed policy groups. lr_control.seed_lr
             # is ONE number for every stage, but a bwd MLE stage and a fused VarGrad
-            # stage on a per-condition target do not want the same rate, and the
-            # bracket's candidate grid is a set of MULTIPLIERS on this base -- so a
-            # base that is wrong by 10x moves the whole grid off the interesting
-            # region and the bracket reports unbracketed_high or all_failed rather
-            # than a boundary.
-            # This sets the BASE only. The group stays bracket-managed, because
+            # stage on a per-condition target do not want the same rate.
+            # This sets the BASE only. The group stays scale-managed, because
             # _managed_keys reads args.lr_servo_managed -- recorded by
             # resolve_derived_config at load -- and not the live value.
             # _apply_lrs recomputes base * scale on the next tick.
@@ -2531,7 +2534,7 @@ class StageProtocol:
             for key in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
                 setattr(m.args, key, v)
             print(f"protocol: lr_policy/back/replay/fused -> {v:g} on entering "
-                  f"'{self.stage.name}' (base only; the bracket still owns the scale)")
+                  f"'{self.stage.name}' (base only; lr_control still owns the scale)")
 
     def _snapshot(self, tag: str):
         """Pre-transition snapshot: the untouched end-state of the outgoing
@@ -2550,40 +2553,24 @@ class StageProtocol:
         self.ctrl['request_eval'] = prev
 
     def _snapshot_prior(self):
-        """Freeze the converged warm-start as THE prior: checkpoint it, keep a
-        frozen eval copy of the EMA model for backward sampling, and delete the
-        outgoing stage's 'best' checkpoint -- it converged, 'prior' supersedes
-        it, and the best-gate restarts on the cleared combo record. (Backward
-        draws switch to the prior buffer via the next stage's declarative
-        bwd_sampling_mode -- no flip here any more.)"""
+        """Retired: refuses on every route. It froze the warm-start as a prior MODEL,
+        which nothing samples any more (the crystal prior buffer fills from anchors;
+        the conformer route draws from its fitted InternalPrior). Kept in ACTIONS so a
+        config naming it fails here and in the config invariants
+        (crystal_prior_model_is_retired, conformer_protocol_omits_snapshot_prior)
+        rather than as an unknown action."""
         m = self.m
-        # REFUSE WHERE `prior_model` IS NOT THE PRIOR. This action's whole contract is
-        # "freeze the warm-start as THE prior", and it ends by DELETING best.pt on that
-        # basis. On a route whose prior sampler is something else -- the conformer route
-        # draws from a fitted InternalPrior and never consults `prior_model` -- naming this
-        # action wrote a checkpoint nothing reads, set an attribute nothing reads, and
-        # deleted best.pt anyway. Silent, and the destructive half is the one that lands.
-        #
-        # Detected through the sampler rather than by route name: `_has_prior_sampler` is
-        # already the question "what does backward sampling actually draw from", and a
-        # route that answers it without `prior_model` is a route where this action's
-        # premise is false.
         if getattr(m, 'internal_prior', None) is not None:
             raise NotImplementedError(
                 "`snapshot_prior` freezes the warm-start policy as THE prior model and "
                 "deletes best.pt on that basis, but this run's backward sampling draws from "
                 "a fitted InternalPrior and never reads `prior_model` -- so the action would "
                 "delete a checkpoint and change nothing else. Drop it from this stage's "
-                "on_exit; the fitted prior already is the product the crystal route uses "
-                "this action to build.")
-        m.checkpointer.save('prior')
-        m.prior_model = deepcopy(m.ema_model)
-        m.prior_model.eval()
-        # tolerate a missing 'best': when the transition is REPLAYED from a
-        # reloaded pre-transition snapshot, the original run already deleted it
-        best_path = m.checkpointer.path_for('best')
-        if os.path.exists(best_path):
-            os.remove(best_path)
+                "on_exit; the fitted prior already is the prior.")
+        raise NotImplementedError(
+            "`snapshot_prior` is retired: no route samples a frozen prior model. The prior "
+            "buffer fills from anchors (buffers.prior_buffer.source 'anchors'). Drop it "
+            "from this stage's on_exit; snapshot:<tag> keeps the checkpoint.")
 
     def _bootstrap_z(self, eval_metrics, train_conditioner: bool = False):
         """Z warm start at a TB-stage entry. Unconditional single-scalar Z is
@@ -2656,7 +2643,6 @@ class StageProtocol:
                   + (f" (condition_log_z.ema_logw was {tracked[0]:.3f} over {tracked[1]} visited)"
                      if tracked is not None else " (tracker cold)"))
             m.gfn_model.flow_model.scalar.data.fill_(empirical_z)
-            m.ema_model.flow_model.scalar.data.fill_(empirical_z)
         else:
             m.bootstrap_log_z(train_conditioner=train_conditioner)
 

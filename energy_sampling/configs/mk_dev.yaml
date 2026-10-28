@@ -18,13 +18,10 @@ anomaly_detection: false  # dramatic slowdown when True
 continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt  # todo make sure this works for NF models
 mlip_path: null              # MLIP weights, for energy_function uma/mace only. Unused on elj and the toys. e.g. 'D:\crystal_datasets\esen_s.pt'
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
-# Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
-# cannot overwrite the warm start it is being started FROM.
-checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
-prior_model_name: null       # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only  # todo flag this for possible deprecation
+checkpoint_name: null  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh # todo make sure this works for NF models
-prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # seeds the prior buffer, and the anchor buffer on molecule routes
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
+prior_path: D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt  # pre-noised build (noised_prior.py) of the 2026-10-05 pooled MIPCAS eLJ anchors (mipcas_elj_pooled_oct05_prior.pt): K 10 iso children per anchor, held-out anchor groups
+molecules_path: D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
 test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent  # todo make sure this is sympatico with our hold-out molecules & crystals methods
 prior_scan_cache: false      # true = reuse the init-time scoring of prior_path from <prior_path>.scan-<hash>.pt when its identity (file, row count, energy function, MLIP file, space groups, z_primes, eLJ coefficient, energy_config) matches and a re-score of 512 random rows agrees; otherwise score every row and write that file. false = score every row at every launch
 noised_prior:                # read only when prior_path is a pre-noised build (data_processing/build_noised_prior.py; noised_prior.py)  # todo how do we know / flag this?
@@ -39,7 +36,7 @@ harvest:                     # scored rollout rows kept for the next prior build
   dir: null                  # null = <checkpoints_dir>/harvest
 archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
-override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR bracket re-stamps every rate on its next tick anyway
+override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR controller re-stamps every managed rate on its next 10-step tick anyway
 checkpoint_read_only: false  # suppress ALL checkpoint WRITES ('running', 'best', archives, 'final'); loading stays active. For smoke tests and refactor validation, which resume real state but must not rewrite the run they resumed from
 warm_start_ignore_problem_keys: null  # list of problem-definition keys a warm start may differ on. Only the keys in checkpointing.WARM_START_EXEMPTIBLE are nameable; the rest change what the target IS, and are refused at load. Every exemption is printed
 rewind_tolerance: 0.25       # 'last_ok' is relinked whenever the combo loss is within this FRACTION of the running best, additively in the metric's own scale (so it holds for negative metrics such as bwd/mle). 0 = only a new best relinks
@@ -49,22 +46,21 @@ freeze_backward_policy: false  # freeze P_B from step 0 of THIS process. false |
 #Optimizers
 ################################################################
 # Each lr_* key below takes one of two spellings:
-#   auto   BRACKET-MANAGED. Starts at lr_control.seed_lr and is then multiplied
-#          by the one scale the brute-force bracket sets. Requires an
-#          `lr_control` block; with none nothing sets the scale, the run trains
-#          at the seed for its whole life, and the config reads as adaptive
-#          (refused at load).
+#   auto   SCALE-MANAGED. Starts at lr_control.seed_lr and is then multiplied
+#          by the lr_control scale (lr_control.schedule x the fire cut).
+#          Requires an `lr_control` block in mode fixed (refused at load
+#          otherwise).
 #   float  a FIXED rate. Takes divergence handling and the max_lr rail; the
-#          bracket's scale never touches it. Mixing is legal (lr_fused: auto,
+#          scale never touches it. Mixing is legal (lr_fused: auto,
 #          lr_back: 3e-4).
 # There is no (W, T) scaling rule here. lr_flow is neither -- see below.
 lr_policy: auto  # todo possibly this should be a dict and only relevant optimizers are called? That would need its own i/o though that might be annoying. Possibly they could be attached in the model architecture sections? Though some apply to groups of losses rather than models per se. We need a simple/uniform approach
 lr_back: auto
 lr_replay: auto
 lr_fused: auto
-lr_flow: 0.1                 # PINNED: exempt from the bracket's scale entirely, because it is a different object. Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
-min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. A binding floor silently turns the conservative burn-in rate into a hotter one -- and then the root the bracket measures from is not the rate the config named. lr_ctrl/lr_floored_groups reports when it binds
-max_lr: null                 # hard ceiling on every group's rate, applied AFTER the bracket's scale. null = no cap. Refused at load if <= 0 or <= min_lr -- clamp order decides which bound wins, so the pair must not cross
+lr_flow: 0.1                 # PINNED: exempt from the lr_control scale entirely (unless lr_control.control_flow_lr). Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
+min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. A binding floor silently turns the conservative burn-in rate into a hotter one. lr_ctrl/lr_floored_groups reports when it binds
+max_lr: null                 # hard ceiling on every group's rate, applied AFTER the scale. null = no cap. Refused at load if <= 0 or <= min_lr -- clamp order decides which bound wins, so the pair must not cross
 
 weight_decay: 1.0e-4
 use_weight_decay: false
@@ -101,30 +97,26 @@ progress_gate:  # todo fixed step count, sample stats levelling off, or MLE leve
     - { key: 'w1r/median', bar: 5.0 }
     - { key: 'w1r/worst',  bar: 10.0 }
 
+# Held-out plateau gate: publishes gates/heldout_flat each eval (Modeller.update_heldout_gate).
+# A stage uses it by naming gates/heldout_flat in its exit; no stage here does.
+heldout_gate:
+  source: auto   # auto = first present of eval_test/mle_ref, eval_test/mle, eval_bwd/mle_heldout_rows_ref, eval_bwd/mle_heldout_rows (density readouts; absent under the SDE policy, and the gate then abstains, printing once per stage); else one metric key
+  evals: 6       # N: 1 when the best smoothed value of the last N evals improves on the best before them by <= nats
+  nats: 0.25     # M, nats of -log q
+  smooth: 3      # K: trailing median over K evals before the comparison
+
 # ---- THE LEARNING RATE ------------------------------------------------------
-# A BRUTE-FORCE BRACKET. Burn in at a deliberately conservative fixed rate,
-# checkpoint the complete mature state, run a configured grid of fixed-LR
-# continuations from that one checkpoint, find the lowest rung that detonates,
-# and keep the highest rung a safety margin below it. Nothing here is estimated,
-# fitted, pooled or servoed; every rate the run applies is a number written in
-# this file.
-#
-# WHY, AND IT IS WORTH READING ONCE. The adaptive controller this replaced
-# steered `peak_scale` to a line-search optimum alpha*. alpha* is defined as
-# s*/lr, so the slope of log(alpha*) against log(lr) MUST be -1 -- and measured
-# 0.00 +- 0.2 across twelve runs, two stages and 2.7 decades of rate. The sensor
-# was uncorrelated with the variable it steered, and everything built on it (the
-# pooled estimator, the sweep, the rung ladder, alpha_target) inherited that. A
-# cruise that held one rate for 1,200 steps with zero moves was reported as the
-# controller working; it is the null output, and the null output is what a dead
-# sensor produces. The bracket's only reading is "did this candidate detonate",
-# which is not a statistic and so cannot be uncorrelated with the rate.
+# One scale multiplies every `auto` rate (controller.py::LRController):
+# scale = schedule(steps since stage entry) x cut. The schedule is
+# lr_control.schedule, or a stage's own lr_schedule. A fire rewinds and
+# multiplies the cut by fire_cut_factor; a stage transition restarts the
+# schedule and resets the cut to 1.
 
 
-lr_control:  # todo we had old notes on this. I don't care much for more complicated approaches. I mostly want to be able to compose things like ramps, cool-downs (exponential, cosine), and cuts on blow-ups. I think we already mostly have this # OLD todo RIP OUT the whole bracket -- scope and the three decisions it needs are in docs/TODO.md #1
-  mode: fixed              # bracket | fixed. `fixed` performs burn-in, then holds fixed_scale and runs no trials -- for batteries of related runs where the rate is already known
-  seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to. THE CANDIDATE SCALES ARE MULTIPLIERS ON THIS, so a seed that is wrong by 10x moves the whole grid off the interesting region and the bracket reports unbracketed_high or all_failed rather than a boundary
-  control_flow_lr: false     # true = the flow/Z groups also take the bracket's scale
+lr_control:  # ramps and cool-downs compose as lr_control.schedule segments (per stage: lr_schedule); cuts on blow-ups are fire_cut_factor
+  mode: fixed              # the only mode ('bracket' was deleted 2026-10-28 and is refused): the schedule below, per stage
+  seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the schedule's multipliers apply to it
+  control_flow_lr: false     # true = the flow/Z groups also take the scale
 
   # ---- DIVERGENCE RESPONSE -----------------------------------------------
   # A fire ALWAYS rewinds (weights, EMA, optimizer moments) to the freshest
@@ -135,9 +127,9 @@ lr_control:  # todo we had old notes on this. I don't care much for more complic
   # 1.0 = the rate never moves, which is what makes an LR fan readable: with no
   # cut ever applied, the scale recorded in every checkpoint IS the nominal
   # scale, so fire_loss_spike's set_state_dict restore is a no-op and the rate
-  # is pinned at nominal by induction. Under `mode: fixed` with repeat_every 0
-  # the fire response is the ONLY thing that can move the scale, so 1.0 makes it
-  # immutable for the stage and every arm keeps naming its own rate.
+  # is pinned at nominal by induction. Past the schedule's last segment the fire
+  # response is the ONLY thing that can move the scale, so 1.0 makes it
+  # immutable for the rest of the stage and every arm keeps naming its own rate.
   #
   # The cost is deliberate: a genuinely too-hot arm re-detonates instead of
   # descending, burns the reload budget and dies. That death IS the measurement
@@ -150,85 +142,38 @@ lr_control:  # todo we had old notes on this. I don't care much for more complic
   # rate measurement, and expect to read lr_ctrl/scale rather than the arm name.
   fire_cut_factor: 1.0
 
-  # ---- 1. BURN-IN --------------------------------------------------------
-  # A warm-up, restarted at every stage transition (the optimizers are rebuilt
-  # there): the auto rates are held at burn_in_scale x seed_lr for burn_in_steps,
-  # then moved geometrically to fixed_scale over promotion_ramp_steps and held.
-  # The last hard_failure.root_window steps of burn-in are the window the
-  # blow-up bars (section 4) are fitted on.
-  burn_in_steps: 3000
-  burn_in_scale: 0.05        # x seed_lr = 6.25e-6, the conservative end of the range measured survivable on this route (5e-6 through 8e-5 clean; 2e-4 non-finite by step 1560)
-  promotion_ramp_steps: 1000 # mode: fixed only -- steps over which the scale moves geometrically from burn_in_scale to fixed_scale after burn-in; the burn-in bars stay live through it and are refitted at fixed_scale. 0 = a single jump
-  # GO / NO-GO ON MEASURING AT ALL, checked once, when burn-in ends and the
-  # root is taken. Pass -> the grid runs and a rate is selected. Fail -> NO
-  # TRIALS RUN, and the stage holds burn_in_scale for its whole length: the
-  # run trains at 0.05 x seed_lr with only a print to say so. The factor is
-  # read from the optimizer's own step counter, not from burn_in_steps, so a
-  # stage that never rebuilt its optimizers passes it trivially and correctly.
-  min_root_bias_correction: 0.9   # mode: bracket only -- fixed mode takes no root. At burn_in_steps 3000 the factor is ~0.975, so this cannot fire; lower burn_in_steps far enough and it does
+  # ---- 1. SCHEDULE -------------------------------------------------------
+  # An ordered list of segments {to, steps, kind}, restarted at every stage
+  # transition (the optimizers are rebuilt there) and run on steps since stage
+  # entry. `to` is the multiplier on seed_lr a segment ends at; `steps` its
+  # length (0 = a jump; null = to the stage's max_steps, last segment only);
+  # kind hold | linear | geometric | cosine | exp (exp = geometric). Segment 0
+  # starts at its own `to` and must be a hold; each later segment moves from the
+  # previous `to`; past the last the value holds. The last hard_failure.root_window
+  # steps of segment 0 are the window the blow-up bars (section 2) are fitted on.
+  # A stage's `lr_schedule` replaces this list for that stage.
+  schedule:
+    - { to: 0.05, steps: 3000, kind: hold }      # x seed_lr = 6.25e-6, the conservative end of the range measured survivable on this route (5e-6 through 8e-5 clean; 2e-4 non-finite by step 1560)
+    - { to: 0.2, steps: 1000, kind: geometric }  # then held at 0.2 x seed_lr for the rest of each stage
+  verbose: true             # accepted and read by nothing since mode 'bracket' was deleted (it switched the trial prints)
 
-  # ---- 2. THE CANDIDATE GRID -------------------------------------------  # todo we're not doing this anymore at all - hard deprecate
-  # todo goes with the bracket -- docs/TODO.md #1
-  # Strictly ascending multipliers on seed_lr, i.e. 6.25e-6 .. 2.0e-4 here. WIDE
-  # ENOUGH THAT THE TOP RUNGS ARE EXPECTED TO FAIL -- a grid that fits inside the
-  # safe region finds no boundary on any cycle and selects one rung below its own
-  # ceiling, which is a number this file chose dressed as a measurement. 2e-4 is
-  # where this route was measured to go non-finite, so the top rung is a real bet.
-  candidate_scales: [ 0.05, 0.1, 0.2, 0.4, 0.8, 1.6 ]
-  # SHORT, AND THERE IS NO FLOOR. Every trial restores a root whose Adam moments
-  # are already equilibrated, and changing the LR does not invalidate `v` (it
-  # estimates the gradient second moment, not the step size), so the
-  # 1/(1-beta2)=1000 warm-up argument does not apply. Divergence from a too-hot
-  # rate takes tens of steps. And CRUISE IS THE LONG TRIAL: a rate that survives
-  # the screen and detonates at step 400 of cruise surfaces through the ordinary
-  # fatal-error path, at a cost of one detonation rather than a silently wrong
-  # rate held for tens of thousands of steps. The horizon validates itself --
-  # steps_to_failure is recorded for every failure and a late one publishes
-  # lr_bracket/horizon_marginal.
-  trial_steps: 150
-  safety_rungs: 1            # select this many rungs BELOW the lowest confirmed failure, so the margin IS the grid spacing (2x here) and the selected rate is one a trial actually ran. Widen the margin by widening the grid, not by cutting off the boundary
-  # THE DOMINANT COST KNOB, more than trial_steps. A cycle costs about
-  # len(candidate_scales) x trial_steps discarded steps: 900 here, negligible
-  # amortised over a stage. At 1000-step trials on a 10k clock it would be 60% of
-  # a stage, which on the MLIP routes can eat a 48-hour SLURM budget in
-  # calibration alone. 0 = once per stage, which is the default posture; a
-  # transition re-brackets regardless, because the optimizers were rebuilt.
-  repeat_every: 20000
-
-  # ---- 3. CONFIRMING THE BOUNDARY ----------------------------------------  # todo way too much text - what are we doing here in very simple terms?
-  # Hard failure is stochastic, so one unlucky low rung would otherwise bound the
-  # whole search far below the real boundary. The re-run uses a DIFFERENT seed,
-  # derived from the root: screen trials all restore an identical RNG state so
-  # they are comparable, which makes a same-seed re-run a deterministic replay
-  # that reproduces the failure by construction and confirms nothing. A rung that
-  # survives its repeat is recorded as a non-reproducing failure and the search
-  # continues upward from it. Both of these are hard-capped -- no adaptive loop,
-  # no convergence criterion.
-  boundary_confirm_repeats: 1
-  boundary_densify: true    # insert ONE geometric rung between the boundary and the survivor below it, once. Refines the boundary by one step and nothing more
-
-  fixed_scale: 0.2           # mode: fixed only -- the multiplier held for the whole run, x seed_lr. On a standalone config this is redundant with seed_lr; it stays a separate key so a battery arm can override one number and keep the same seed_lr as its bracket-mode siblings
-  trial_settle_steps: 10     # head of each trial where the BAR verdicts are not judged -- trials jump burn-in -> candidate instantly, and that jump alone produced few-step excursions past k x span on a quiet root. Non-finite values and exceptions still fail inside it. Refused at load if >= trial_steps
-  logz_detour_nats: 2.0      # a candidate FAILS if its batch-mean log_Z_learned falls more than this many nats BELOW the root's -- one-sided, so a dip-and-recover survives and a detour does not. Catches a minority-branch destabilization the frac-weighted composite bar is blind to under a dominant bwd frac. Judged outside the settle window; inert wherever Z does not train. null/0 = off
-  verbose: true
-
-  # ---- 4. HARD FAILURE ----------------------------------------------------
+  # ---- 2. HARD FAILURE ----------------------------------------------------
   # The blow-up tripwire. Bars are fitted per branch (fwd/bwd/replay/fused) on the
-  # last root_window steps of burn-in: loss bar = max + k x (max - min), grad bar
+  # last root_window steps of schedule segment 0: loss bar = max + k x (max - min), grad bar
   # = x x the largest pre-clip grad norm. A step past a bar rewinds weights and
   # optimizers to the last good checkpoint and spends one rewind of
-  # max_reloads_per_1k_steps; after promotion the bars are refitted at the held
-  # rate (cruise_rederive). A branch with fewer than min_observations gets only
+  # max_reloads_per_1k_steps; once the last segment whose `to` differs from the
+  # previous one's ends, the bars are refitted at that rate (cruise_rederive). A branch with fewer than min_observations gets only
   # the absolute backstops.
   hard_failure:
     loss_excursion_k: 10.0   # bar = root_hi + k x (root_hi - root_lo), per branch
     grad_excursion_x: 100.0  # bar = x  x  the largest pre-clip grad norm seen at the root
-    loss_abs: 1.0e+6         # numerical backstop only; >= 1e8 is refused at load in mode: bracket
+    loss_abs: 1.0e+6         # numerical backstop: |loss| at or above this fires whether or not a bar was fitted
     grad_abs: 1.0e+6
     cruise_rederive: true      # false = the live tripwire keeps the cold root bars for the whole stage
-    cruise_settle_steps: 200   # steps discarded after promotion before the redraw window opens, so the rate change's own transient is not fitted as normal
-    root_window: 200         # the TAIL of burn-in that defines the root scale. The opening of burn-in is the transient burn-in exists to pass through, and folding it in would inflate the span by the very movement that must not count as normal
-    min_observations: 20     # below this on every channel, no bar can be derived and the bracket REFUSES rather than running with bars that cannot fire
+    cruise_settle_steps: 200   # steps discarded after the last rate-changing segment ends before the redraw window opens, so the rate change's own transient is not fitted as normal
+    root_window: 200         # the TAIL of schedule segment 0 that defines the root scale. The opening of the segment is the transient the warm-up exists to pass through, and folding it in would inflate the span by the very movement that must not count as normal
+    min_observations: 20     # a branch with fewer finite losses in the window gets no loss bar; below this on every branch only the non-finite and absolute checks fire
 
 
 # GPU-time region timer and a bounded torch.profiler window (profiling.py); off = zero cost per call.
@@ -264,7 +209,6 @@ grad_clip_guard:             # the policy clip: a per-branch tracked quantile ba
   warmup_clip: static          # bar until then: static = gradient_norm_clip, off = no clip
   max_ratio: 100.0             # furthest the bar may travel from its last calibration, either direction
   refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live meanwhile
-ema_decay: null                # set to null for no ema # NOTE this breaks some important statistics - leave as null for now  # todo we're just not doing this at all and it complicates the code. I would rip out the functionality altogether
 max_reloads_per_1k_steps: 1.0  # divergence-rewind budget, as a RATE: a run is aborted once total rewinds exceed this x steps/1000 (floor 3). A rate rather than a count so a long run is not aborted for the same per-step behaviour as a short one
 
 # model parameters
@@ -272,7 +216,6 @@ max_reloads_per_1k_steps: 1.0  # divergence-rewind budget, as a RATE: a run is a
 model:
   kind: sde                    # the model the trainer trains: 'sde' = models/gfn.py::GFN, the SDE policy; 'nf' = models/nf_policy.py::NFPolicy, a normalizing flow as a one-step policy (log P_B = 0). The loader resolves this block (config_invariants.canonical_model_section): the code reads shared + sde as `model` and {kind, nf} as `policy`
   shared:                      # read by both kinds: the latent geometry
-    hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system  # todo no reason to allow this at all, is there?
     # Wrap the aunit centroid dims whose aunit spans the full cell width (auv == 1)
     # so the SDE flows through the aunit face instead of piling up against the
     # bounding-energy wall. Resolved per space group and intersected over
@@ -281,6 +224,7 @@ model:
     # with a run trained without it.
     periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)  # todo this was coded for latent aunits. Does it work for FD? (are any FD simple periodic other than P1? How do we know?)
   sde:                         # the SDE policy's architecture; under kind nf it builds only the geometry probe
+    T: 10                      # steps per rollout, training and evaluation: a uniform grid of T steps on [0, 1] (utils.get_discretizer). Optional under kind nf, whose one-step policy never calls the grid
     full_flow: false           # true for subtb or db losses
     # shared dimensions
     s_emb_dim: 512             # dimensionality of state embedding
@@ -382,14 +326,14 @@ test_eval_num_samples: 2000   # held-out conditional eval batch; inert while tes
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
 epochs: 100000             # number of training epochs
 eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_every_n_evals: 2        # custom figures EXPENSIVE: on evals at steps that are multiples of figs_every_n_evals * eval_period; null/0 = off. A request_eval forces figures regardless
 
 xcond_eval:                   # cross-conditional density matrix; fires inside eval, costs no energy calls
   enabled: true               # inert unless one of {embedding,molecule,vector}_conditioning is set
-  period: 2500                # steps between runs; must be a multiple of eval_period or it won't fire  # todo can we enforce that? Maybe units of eval periods rather than steps
+  every_n_evals: 10           # runs on evals at steps that are multiples of every_n_evals * eval_period; null/0 = off
   conditions: 20              # matrix side C; needs C distinct condition_id in the eval batch or the pass skips
   per_condition: 4            # terminals rolled forward per condition; diagonal is averaged over C*per_condition cells
-  k: 4                        # backward rollouts per cell, split into two replicates; must be even # todo null for NF models, right?
+  k: 4                        # backward rollouts per cell, split into two replicates; must be even. SDE only; under model.kind nf one exact pass (k unread)
   chunk_rows: 2560            # rows per batched get_traj_bwd call over the C^2*per_condition*k grid
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
@@ -412,15 +356,6 @@ oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before the sizer recalibrates
 batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and an INFEASIBLE conclusion re-probes. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
 batch_sizer_retest_steps: 1000    # steps a TARGET_MET ladder stands before it re-measures. Occupancy moves under a verdict -- the model grows, buffers fill, compile settles -- and until this existed the only re-arm was an OOM ceiling expiring, so a run that never took a train OOM never looked again. Only target_met is re-probed; infeasible has the ceiling clock, stood_down failed an audit, wallclock_cut is outranked. 0 = a satisfied ladder is final
-
-# SDE integration
-################################################################
-# MUST equal integrator.T -- enforced at config load. Drift and variance are
-# learned per step at one dt, and P_B's reference bridge is written in
-# accumulated-variance time, so a different dt integrates a different SDE.
-eval_T: 10  # todo a bit involved but should be in the SDE model params and should just equal eval T (one param) for our purposes always. We can re-add the flexibility later if we need it
-integrator:
-  T: 10                        # training diffusion length, and the only trajectory-length parameter -- the discretizer is always uniform over T
 
 # BASE DEFAULTS for the per-mode loss coefficients. The live values on any
 # given step are these blocks overlaid with the CURRENT protocol stage's
@@ -687,11 +622,11 @@ protocols:
   unconditional_tb:  # todo I know I'm mostly against it but a short prose summary of just a couple sentences that parses the below would be nice. Maybe it could be automatically generated when the protocol is altered. It then might also save us some of the truly massive amount of text in the protocol
     stages:  # comments in here need to be cleaned up again
       # -- MLE warm-start: build a broad, self-consistent policy on the dataset
-      #    prior (unconditional by design), then freeze it as THE prior model
+      #    prior (unconditional by design)
       - name: train_prior
         train_mode: bwd
         bwd_sampling_mode: dataset
-        skip_if: prior_loaded          # a prior loaded by path IS this stage's product
+        skip_if: weights_loaded        # skipped when this process loaded checkpoint_name with load_weights_only; its on_exit does not run then
         # "The LR is hot" sensor -- REPORT-ONLY, moves nothing. It fills a
         # measured gap: `lr_ctrl/divergences` was 0 across all 97 stage segments
         # swept, INCLUDING all 19 failures, so the hard tripwire does not fire on
@@ -714,8 +649,8 @@ protocols:
         # overshoot, so it stays report-only until 2x and 4x calibration arms run.
         hot_lr_sensor: { channel: bwd/mle, form: absolute, rows: 31, above: 5.0 }
         # NO `lr_sensor` BLOCK, and that is now the correct default rather than
-        # a trap. Learning rates come from the run-level brute-force bracket
-        # (lr_control), not from a per-stage sensor. `ray` survives here only as
+        # a trap. Learning rates come from the run-level lr_control schedule,
+        # not from a per-stage sensor. `ray` survives here only as
         # an opt-in DIAGNOSTIC that reaches no learning rate; declaring it on
         # this stage costs about 4.8% of step time at period 500, so it is a
         # purchase rather than a default.
@@ -732,7 +667,7 @@ protocols:
         exit:
           - { metric: gates/progress_done, above: 0.5, patience: 1 }
         max_steps: 50000               # bound: the stage exits at the first eval past this many steps if its exit has not fired
-        on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
+        on_exit: [ 'snapshot:phase1_exit' ]
 
       # -- ONE always-on terminal stage, straight off the MLE prior. No exit
       #    block: it runs to `epochs`. Each parameter group has exactly one
@@ -753,6 +688,7 @@ protocols:
         train_mode: fused
         bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
         coeff_schedule: {}             # {coefficient: {target, steps, kind: geometric|linear}}: ramps an energy_config coefficient from its config value to target over `steps` train steps, anchored at the stage's first tick (stage_ctrl.coeff_sched_entry, rides the checkpoint), then holds; any balance kind; a coefficient also named in balance.anneal_coeffs is refused. {} = none
+        lr_schedule: null              # [{to, steps, kind}, ...]: replaces lr_control.schedule for this stage, same segment rules; anchored at stage entry (stage_ctrl.lr_sched_entry). null = the run-level schedule
         # "The LR is hot" sensor -- REPORT-ONLY, moves nothing. It fills a
         # measured gap: `lr_ctrl/divergences` was 0 across all 97 stage segments
         # swept, INCLUDING all 19 failures, so the hard tripwire does not fire on
@@ -928,7 +864,7 @@ protocols:
       - name: train_prior
         train_mode: bwd
         bwd_sampling_mode: dataset
-        skip_if: prior_loaded
+        skip_if: weights_loaded
         # Drawdown sensor. Fires when the channel's current level sits `above`
         # the 10th percentile of its trailing window; `action` defaults to
         # report, which moves nothing. `form: absolute` is required because
@@ -953,7 +889,7 @@ protocols:
         exit:
           - { metric: gates/progress_done, above: 0.5, patience: 1 }
         max_steps: 50000               # bound: the stage exits at the first eval past this many steps if its exit has not fired
-        on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
+        on_exit: [ 'snapshot:phase1_exit' ]
 
       # REPLAY IN THE FORWARD BRANCH'S SEAT. The forward rollout is the only
       # step that calls the energy function; it runs on 1 step in
@@ -1159,16 +1095,6 @@ controller:  # todo this is basically not used now, right? Though we still have 
   lookahead_horizon: 5  # rules with lookahead: true -- controller ticks to extrapolate metrics ahead before thresholding
   lookahead_trend_alpha: 0.1  # EMA smoothing on the estimated per-tick trend
 
-# Cheap, periodic diagnostic on fused steps only (see _log_fused_gradient_geometry
-# in train.py) -- pairwise cosines between the active branches' raw (pre-weight)
-# DIAGNOSTIC. Pairwise cosines between the fused branches' gradients: are they
-# aligned, orthogonal, or in conflict. Costs one extra autograd.grad() per active
-# branch on armed steps only. Off by omission, or with every <= 0.
-grad_geometry:  # todo deprecate this here and in code, for now
-  enabled: false
-  every: 50
-
-
 buffers:
   fresh_on_switch: false       # true = when checkpoint_name belongs to ANOTHER run (its stored run_name differs from this run's), no buffer sidecar is restored: prior/anchor buffers seed from the re-analysed prior dataset, the replay buffer refills from live rollouts, every stored row scored by this run's energy function; a resume of the run's own checkpoint restores as usual. false = restore the sidecar whenever one is found
   # SLOW store: a representation of a DISTRIBUTION, churned on a rate the
@@ -1176,8 +1102,8 @@ buffers:
   # mean_lifetime * max_size / churn_batch_ref = 25,000 train steps here, i.e.
   # ~4 full turnovers in a 100k-step run -- against the replay buffer's 50, a
   # 500x separation that is the whole reason there are two of them.
-  prior_buffer:  # todo 'prior models' I think likely to be deprecated as a concept
-    source: 'anchors'       # 'anchors' | 'prior_model'. WHERE top-ups (and rebuild_prior_by_churn) come from. 'anchors' = noised anchor_buffer rows at anchor_buffer.noise_log_range, no prior MODEL in the loop (owner default 2026-09-18). Under 'anchors', snapshot_prior and prior_model_name are unnecessary and the resume gap they create (no prior_model after a restart) does not exist -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only. CONDITIONAL ARM: 'anchors' (it still sets prior_model_name, which is what fires train_prior's skip_if)
+  prior_buffer:
+    source: 'anchors'       # WHERE top-ups (and rebuild_prior_by_churn) come from: noised anchor_buffer rows at anchor_buffer.noise_log_range. 'anchors' is the only crystal source (crystal_prior_model_is_retired refuses 'prior_model' and absence); prior_buffer_prior_admit_rate reads nan, since no prior-sampler draw is made. CONDITIONAL ARM: 'anchors'
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
@@ -1214,7 +1140,7 @@ buffers:
     # Either max_size wants ~240k or mean_residence_steps comes down. docs/TODO.md #5
     admit_reward_min: -200  # hard exclusion, applied UPSTREAM of admission unconditionally: admission scores badness, so without a floor the energy distribution is unbounded above
     backstop_mult: 5.0      # hard age cap as a multiple of mean_residence_steps -- a MEMORY GUARD on the exponential hazard's tail, not a target. 0 = no cap. Rows it claims are excluded before the hazard budget is spent
-    admit_from_eval: true   # whether evaluation()'s rollout is admitted to REPLAY. manage_prior_buffer takes it either way -- this gates only the replay call beside it. What it admits is a DIFFERENT SAMPLE: the EMA model at eval_T over eval_num_samples, not the training policy at the training grid. Admission is capped at churn_rate, so at eval_num_samples 10000 with churn_rate = batch 1000 it admits 1000 rows per eval against a fwd intake of 1000 per fwd_rollout_every steps -- ~17% of the buffer at every 20. Those rows are born with NaN birth_log_pf and are excluded from the drift statistic, so they are visible ONLY as replay/policy_drift_covered_frac sitting at 0.84 rather than 1. true = the behaviour every route shipped with. CONDITIONAL ARM: false -- a different model on a different grid, on the one route where replay carries half the loss
+    admit_from_eval: true   # whether evaluation()'s rollout is admitted to REPLAY. manage_prior_buffer takes it either way -- this gates only the replay call beside it. What it admits is a DIFFERENT SAMPLE: the eval rollout over eval_num_samples (same grid, model.sde.T), not a training rollout. Admission is capped at churn_rate, so at eval_num_samples 10000 with churn_rate = batch 1000 it admits 1000 rows per eval against a fwd intake of 1000 per fwd_rollout_every steps -- ~17% of the buffer at every 20. Those rows are born with NaN birth_log_pf and are excluded from the drift statistic, so they are visible ONLY as replay/policy_drift_covered_frac sitting at 0.84 rather than 1. true = the behaviour every route shipped with. CONDITIONAL ARM: false -- a different sample, on the one route where replay carries half the loss
     # --- held-out split: the only direct read on replay MEMORISATION ---
     val_frac: 0.0           # fraction of each ADMISSION batch flagged held-out and never trained on. 0 = off, and every draw path is then bit-identical to before the split existed (no row is flagged, so no mask is built). CONDITIONAL ARM: 0
     val_min: 64             # fewer held-out rows than this and the measurement is skipped -- the mean would be noise, and writing it poisons the EMA it is read on

@@ -198,9 +198,8 @@ class HotSensor:
     # ------------------------------------------------------------------ state
 
     def reset(self):
-        """Drop the window. Called at stage entry, on resume, and at every
-        bracket trial restore -- each makes the trailing rows describe a regime
-        the run is no longer in."""
+        """Drop the window. Called after a `fire` action; a stage change
+        builds a new sensor (`train.py::Modeller.observe_hot_lr`)."""
         self.window = []
         self.last_written = None
 

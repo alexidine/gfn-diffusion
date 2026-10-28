@@ -31,7 +31,7 @@ def real():
 
 
 #: distinguishes "the key is absent" from "the key is None", which a config
-#: legitimately is (lr_control.fixed_scale on a bracket-mode config).
+#: legitimately is.
 _MISSING = object()
 
 
@@ -70,7 +70,7 @@ UNORDERED_KEYS = {'lr_servo_managed'}
 #: args keys the controllers read. DOTTED WHERE THE REAL CONFIG NESTS THEM: a
 #: top-level-only check cannot see a nested block go missing, because
 #: `lr_control` is present either way. `hard_failure` is the one that matters --
-#: without it the bracket falls back to bars that cannot fail a candidate.
+#: without it the controller falls back to its default bars.
 ARGS_SURFACE = [
     'lr_policy', 'lr_back', 'lr_replay', 'lr_fused', 'lr_flow', 'min_lr',
     'lr_servo_managed', 'lr_control',

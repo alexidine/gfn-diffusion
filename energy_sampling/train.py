@@ -65,10 +65,11 @@ from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
-    get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
-    cal_subtb_coef_matrix, per_condition_fraction
+    get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
+    cal_subtb_coef_matrix, per_condition_fraction, trajectory_T
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
+from progress_metrics import parse_heldout_gate, resolve_heldout_source, heldout_plateau, HELDOUT_AUTO_SOURCES
 from models import GFN
 from models.nf_policy import build_policy, resolve_policy_entry
 from models.crystal_force import CrystalDriftForce, TrunkForce
@@ -78,7 +79,7 @@ from energy_sampling.models.dead_latent_rows import (
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
-    update_ema, get_problem_definition, problem_hash, problem_slug
+    update_ema, keeps_ema_copy, get_problem_definition, problem_hash, problem_slug
 
 # bulky per-sample analysis artifacts (fingerprints, RDFs -- huge tensors) that
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
@@ -162,6 +163,16 @@ def _runs_grouped_vargrad(args, branch_coeffs) -> bool:
     return runs_grouped_vargrad(
         lambda k: float(getattr(branch_coeffs, k, 0) or 0),
         lambda k: float(getattr(fwd, k, 0) or 0))
+
+
+def eval_cadence_fires(step_ind, every_n_evals, eval_period) -> bool:
+    """An eval-relative cadence: True when `step_ind` is a multiple of
+    `every_n_evals * eval_period`. Read on the step grid rather than by counting
+    evaluations, so the phase survives a resume and the step-50, request_eval and
+    other off-grid evaluations do not advance it. `every_n_evals` null or 0, or
+    `eval_period` null or 0, is off."""
+    n, period = int(every_n_evals or 0), int(eval_period or 0)
+    return n > 0 and period > 0 and int(step_ind) % (n * period) == 0
 
 
 def safe_histogram(data, num_bins=32):
@@ -459,6 +470,8 @@ class Modeller:
             self.args.gradient_norm_clip, getattr(self.args, 'grad_clip_guard', None))
         self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
+        # cfg heldout_gate merged over progress_metrics._HELDOUT_GATE; raises here on a malformed block
+        self.heldout_gate_spec = parse_heldout_gate(getattr(self.args, 'heldout_gate', None))
         self.init_train_constants()
 
     #: Consecutive telemetry failures tolerated before the run is torn down. A
@@ -728,14 +741,14 @@ class Modeller:
     def _has_prior_sampler(self):
         """Is there anything to draw prior samples FROM?
 
-        On the crystal route the prior is a frozen GFN (``prior_model``), produced by
-        train_prior's snapshot_prior action or loaded by name. A route whose prior is not a
-        GFN at all -- a fitted analytic prior, say -- answers this differently, and
-        without the hook its phase-2 churn silently degrades to an anchor-only buffer:
-        _prior_churn_cycle's guard is a report, not a raise, because an anchor-only
-        composition is legal.
+        Not on the crystal route: it has no prior model, and its prior buffer fills from
+        anchors (buffers.prior_buffer.source 'anchors', enforced by
+        config_invariants.crystal_prior_model_is_retired). A route with a prior sampler
+        -- ConformerModeller's fitted InternalPrior -- overrides this and
+        sample_from_prior; grow_prior_buffer and _prior_churn_cycle's draw are reached
+        only there.
         """
-        return hasattr(self, 'prior_model')
+        return False
 
     def _noise_and_condition(self, batch, noise_log_range, anchor_inds=None):
         """Jitter a stored batch's state, then condition it. IN PLACE on `batch`.
@@ -1925,12 +1938,6 @@ class Modeller:
             if _st:
                 metrics.update({k: float(v) for k, v in _st.items()})
                 setattr(self.gfn_model, _slot, None)
-        # fused-branch gradient-geometry diagnostic (grad_geometry.enabled) --
-        # consume-on-read: it's computed far less often than every 10 steps,
-        # so once logged it must not repeat as a stale value on later reports
-        if getattr(self, '_fused_grad_geom_report', None):
-            metrics.update(self._fused_grad_geom_report)
-            self._fused_grad_geom_report = None
         # interspersed z-calibration telemetry, drained each report
         # (z_cal/steps is a count SINCE the last report, not a rate)
         if getattr(self, '_z_cal_report', None):
@@ -2138,10 +2145,9 @@ class Modeller:
         metrics['zmatch/fwd_level'] = levels['fwd']
         metrics['zmatch/bwd_level'] = levels['bwd']
 
-        # always logged, including on arms with no bracket-managed LR: a flat
-        # scale is itself the reading, and lr_bracket/phase plus
-        # lr_bracket/refused say WHY it is not moving. A silently absent block
-        # and a controller that is deliberately holding must not look the same.
+        # always logged, including on arms with no scale-managed LR: a flat
+        # scale is itself the reading, and lr_bracket/phase says which leg of
+        # the schedule it is on.
         metrics.update(self.lr_controller.report())
 
         if hasattr(self, 'condition_log_z'):
@@ -2205,9 +2211,8 @@ class Modeller:
         # (fwd_loss_coeffs.pooled_source picks fwd or replay). Those tensors carry
         # grad_fn, and the model is an nn.Module, so they sit in __dict__ beside
         # _parameters and _buffers -- where anything that walks the module finds
-        # them. `_snapshot_prior`'s deepcopy(ema_model) does exactly that and
-        # dies with "Only Tensors created explicitly by the user (graph leaves)
-        # support the deepcopy protocol", killing every phase-2 entry.
+        # them. Any deepcopy of the model then dies with "Only Tensors created
+        # explicitly by the user (graph leaves) support the deepcopy protocol".
         #
         # The stash is only ever CONSUMED when pooled_vg > 0 (fused_train_step),
         # so off that path it is pure liability. Gated here, once, rather than at
@@ -2256,7 +2261,7 @@ class Modeller:
                 cache = self._subtb_coeff_cache = {}
             for mode in ('fwd', 'bwd', 'replay'):
                 coeffs = getattr(self.args, f'{mode}_loss_coeffs')
-                key = (coeffs.subtb_lambda, self.args.integrator.T)
+                key = (coeffs.subtb_lambda, trajectory_T(self.args))
                 if key not in cache:
                     cache[key] = cal_subtb_coef_matrix(*key).to(self.gfn_model.device)
                 coeffs.coeff_matrix = cache[key]
@@ -2808,11 +2813,6 @@ class Modeller:
         # a marginal fit is still better to hand the next stage than a fresh random head
         if best_overall_state is not None:
             _restore(best_overall_state)
-        # keep ema_model's flow head in sync (a no-op when ema_decay is null and
-        # ema_model literally is gfn_model, but correct if EMA is ever re-enabled)
-        self.ema_model.flow_model.load_state_dict(self.gfn_model.flow_model.state_dict())
-        if conditioner is not None:
-            self.ema_model.conditions_embedding_model.load_state_dict(conditioner.state_dict())
 
         passed = best_cov <= coverage_tol
         holdout_msg = f", {int(is_val.sum())} held out" if is_val is not None \
@@ -3164,8 +3164,9 @@ class Modeller:
 
     def _resolve_dead_latent_rows(self, quiet: bool = False):
         """
-        Which latent rows are structurally dead and so held out of the SDE. Returns
-        None when the feature is off or does not apply. See decisions.md D33.
+        Which latent rows are structurally dead and so held out of the SDE. Always
+        on for a crystal (the model.hold_dead_latent_rows opt-out is retired); returns
+        None off a crystal. See decisions.md D33.
 
         Crystal-only. Toy energies carry `space_groups: [1]` as a PLACEHOLDER, and P1
         has all three aunit centroid axes free, so keying off the space group without
@@ -3188,15 +3189,13 @@ class Modeller:
         this into a crystal-system comparison -- that would silently serve one index set
         to space groups that need different ones.
         """
-        if not getattr(self.args.model, 'hold_dead_latent_rows', True):
-            return None
         if not self.energy_function.is_crystal:
             if not quiet:
                 print(describe_dead_rows(1, max(self.args.z_primes), is_crystal=False))
             return None
         if not len(self.args.space_groups):
             raise ValueError(
-                "hold_dead_latent_rows needs at least one entry in space_groups to know "
+                "holding dead latent rows needs at least one entry in space_groups to know "
                 "which latent rows are dead; got an empty list")
 
         zp = max(self.args.z_primes)
@@ -3205,12 +3204,10 @@ class Modeller:
         distinct = set(per_sg.values())
         if len(distinct) > 1:
             raise ValueError(
-                "hold_dead_latent_rows makes the model space-group specific, but the "
+                "holding dead latent rows makes the model space-group specific, but the "
                 f"configured space_groups disagree about which latent rows are dead: "
-                f"{per_sg}. One index set cannot serve them; split the run by crystal "
-                f"system, or set model.hold_dead_latent_rows: false to opt out (which "
-                f"restores the D33 defect -- prior rows pinned at the canonical value "
-                f"while the energy is flat there).")
+                f"{per_sg}. One index set cannot serve them; split the run by the "
+                f"resolved dead-row set.")
         rows = distinct.pop() if distinct else ()
         if not quiet:
             print(describe_dead_rows(int(self.args.space_groups[0]), max(self.args.z_primes)))
@@ -3227,8 +3224,6 @@ class Modeller:
         must not perturb the live prior batch.
         """
         if not self.energy_function.is_crystal:
-            return
-        if not getattr(self.args.model, 'hold_dead_latent_rows', True):
             return
         sg = int(self.args.space_groups[0])
         try:
@@ -3307,7 +3302,9 @@ class Modeller:
 
     def _build_latent_gfn_config(self, periodic_centroids: bool = True):
         """gfn_config on the latent chart. periodic_centroids False skips _resolve_periodic_centroid_axes (its checks
-        and its printout of the latent aunit axes) and passes periodic_centroid_axes None."""
+        and its printout of the latent aunit axes) and passes periodic_centroid_axes None. model.T (the trajectory
+        length, read through utils.trajectory_T) is not a GFN argument and is left out."""
+        model = {k: v for k, v in vars(self.args.model).items() if k != 'T'}
         return dict(
             state_features_dim=self._state_features_dim(),
             dim=self.energy_function.data_ndim,
@@ -3326,7 +3323,7 @@ class Modeller:
             device=self.device,
             max_z_prime=max(self.args.z_primes),
             do_periodic_angles=self.energy_function.is_crystal,
-            **vars(self.args.model),
+            **model,
         ) | self._policy_entry()
 
     def _policy_entry(self):
@@ -3351,8 +3348,8 @@ class Modeller:
     def fit_policy_data_scalers(self, chunk: int = 65536):
         """A policy fitted to data before training (models/nf_policy.py::NFPolicy.fit_data_scalers: the flow's
         standardisers) gets the prior's latents and, in vector conditioning, the conditions files' condition vectors;
-        the train and EMA models alike. Skipped for a policy without the hook (the SDE policy) and for one restored
-        already fitted from a checkpoint."""
+        Skipped for a policy without the hook (the SDE policy) and for one restored already fitted from a
+        checkpoint."""
         fit = getattr(self.gfn_model, 'fit_data_scalers', None)
         if fit is None or bool(getattr(self.gfn_model, 'scalers_fitted', False)):
             return
@@ -3370,8 +3367,7 @@ class Modeller:
                 sub = mb.subsample_new_batch(torch.arange(i, min(i + chunk, mb.num_graphs), device=mb.ptr.device))
                 cs.append(self.energy_function.condition_samples(sub)[2].float().cpu())
             conds = torch.cat(cs)
-        for model in (self.gfn_model, self.ema_model):
-            model.fit_data_scalers(lat, conds)
+        self.gfn_model.fit_data_scalers(lat, conds)
         print(f"policy data scalers fitted on {lat.shape[0]} prior rows"
               + (f" and {conds.shape[0]} condition vectors" if conds is not None else ""), flush=True)
 
@@ -3391,8 +3387,9 @@ class Modeller:
                          that trunk. Measured worst of the three
                          (configs/local_pb_freeze); kept for comparison runs.
           'full' / True  P_B evaluated on a snapshot of t_model+s_model+
-                         backward_policy, ONE object shared by the train and
-                         EMA models. P_B carries no gradient at all;
+                         backward_policy, ONE object shared by gfn_model and a
+                         separate EMA copy if one is kept (_policies). P_B
+                         carries no gradient at all;
                          gradnorm/backward_policy reads exactly 0.
 
         source_state: the snapshot a checkpoint carried (full mode only).
@@ -3407,7 +3404,7 @@ class Modeller:
             # a policy whose P_B is fixed by construction (models/nf_policy.py: log P_B = 0) has nothing to freeze
             print(f"freeze_backward_policy={mode}: this policy has no learned P_B -- nothing to freeze")
             return
-        models = (self.gfn_model, self.ema_model)
+        models = self._policies()
         if mode is None:
             for model in models:
                 model.unfreeze_backward_policy()
@@ -3434,7 +3431,17 @@ class Modeller:
             n = sum(p.numel() for p in frozen.parameters())
             print(f"freeze_backward_policy=full: P_B evaluated on a {n}-parameter snapshot "
                   f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
-        self.ema_model.install_pb_snapshot(frozen)
+        for model in models[1:]:
+            model.install_pb_snapshot(frozen)
+
+    def _policies(self):
+        """The policy modules a runtime setting is installed on: (gfn_model,), plus the
+        separate EMA copy the conformer route keeps (utils.keeps_ema_copy) while ema_model
+        is not gfn_model. On every other route ema_model IS gfn_model."""
+        ema = getattr(self, 'ema_model', None)
+        if ema is None or ema is self.gfn_model:
+            return (self.gfn_model,)
+        return (self.gfn_model, ema)
 
     DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call', 'partial')
 
@@ -3570,6 +3577,22 @@ class Modeller:
 
     def init_gfn(self):
         reload = False
+        decay = getattr(self.args, 'ema_decay', None)
+        if decay is not None and not keeps_ema_copy(self):
+            raise ValueError(
+                f"ema_decay={decay!r}: {type(self).__name__} has no EMA model (ema_model is "
+                f"gfn_model; only ConformerModeller keeps one, utils.keeps_ema_copy). Remove the key.")
+        from config_invariants import STEP_CADENCE_KEYS, retired_step_cadence_keys
+        stray = retired_step_cadence_keys(self.args)
+        if stray:
+            raise ValueError(
+                "retired step-unit cadence keys: " + ', '.join(
+                    f"{k} (use {STEP_CADENCE_KEYS[k]}, a count of eval periods; null or 0 is off)"
+                    for k in stray) + ". Remove them.")
+        from config_invariants import trajectory_length_problems
+        problems = trajectory_length_problems(self.args)
+        if problems:
+            raise ValueError("trajectory length: " + " ".join(problems))
 
         if self.args.checkpoint_name is not None:
             reload = True
@@ -3595,17 +3618,18 @@ class Modeller:
         if not reload:
             self.gfn_config = self._build_gfn_config()
             self.gfn_model = build_policy(self.gfn_config).to(self.device)
-            self.ema_model = deepcopy(self.gfn_model)
+            # a separate EMA copy on the conformer route only; elsewhere ema_model IS gfn_model
+            self.ema_model = deepcopy(self.gfn_model) if keeps_ema_copy(self) else self.gfn_model
             self.init_schedulers_optimizers()
 
         # the force provider of the kernels' force terms (None without one): runtime state
-        # like the flags below, installed on both models on every build and reload path
+        # like the flags below, installed on every policy module on every build and reload path
         self.drift_force = self._build_drift_force()
 
         # runtime flag like compile_policy, set on both fresh-build and reload
         # paths; deliberately not part of gfn_config (checkpoints/problem
         # hashing unaffected)
-        for model in (self.gfn_model, self.ema_model):
+        for model in self._policies():
             model.install_drift_force(self.drift_force)
             model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
             # WHICH BRANCHES checkpoint. Absent/empty = all of them, unchanged.
@@ -3646,7 +3670,7 @@ class Modeller:
         if prior_flow is not None:
             prior_flow.verify_against_policy(self.gfn_model.ang_mask,
                                              dead_rows=self.gfn_model.dead_rows,
-                                             traj_T=int(self.args.integrator.T))
+                                             traj_T=trajectory_T(self.args))
 
         self.maybe_compile_policy()
 
@@ -3717,34 +3741,25 @@ class Modeller:
             # dynamo's default recompile limit of 8 -- give it headroom so the
             # top rungs don't silently fall back to eager
             _dynamo.config.cache_size_limit = 24
-            # DONATED BUFFERS MUST BE OFF WHILE ANYTHING TAKES A SECOND BACKWARD.
-            # AOTAutograd donates (frees-and-reuses) intermediate buffers on the
-            # assumption each compiled backward runs exactly once, and then
-            # HARD-RAISES on any backward with retain_graph=True/create_graph=True.
-            # _log_fused_gradient_geometry does exactly that -- one
-            # torch.autograd.grad(retain_graph=True) per active branch -- so with
-            # the trunk compiled, the first armed fused step kills the run:
+            # DONATED BUFFERS OFF, so a second backward through the compiled trunk
+            # is legal. AOTAutograd donates (frees-and-reuses) intermediate
+            # buffers on the assumption each compiled backward runs exactly once,
+            # and then HARD-RAISES on any backward with retain_graph=True or
+            # create_graph=True through that graph:
             #   "This backward function was compiled with non-empty donated
             #    buffers which requires create_graph=False and retain_graph=False"
-            # Measured on the cluster 2026-08-16 (a100_stab_aug16 f3, step 320,
-            # ~50 steps after the first stage transition, i.e. the first armed
-            # fused step). It cannot reproduce on the dev box: compile_policy
-            # 'auto' resolves OFF on native Windows, so this whole failure mode
-            # is invisible locally and every local shakeout passed.
-            # Set here rather than at the diagnostic, because the choice is baked
-            # in when AOTAutograd traces -- flipping it after first forward is too
-            # late. Costs some activation-memory reuse; that is the price of
-            # keeping a diagnostic that reads gradients.
+            # The choice is baked in when AOTAutograd traces, so it is set here,
+            # before first forward. compile_policy 'auto' resolves OFF on native
+            # Windows, so this path only runs on the cluster. Costs some
+            # activation-memory reuse.
             import torch._functorch.config as _functorch_config
             _functorch_config.donated_buffer = False
-            for model in (self.gfn_model, self.ema_model):
-                for name in trunk:
-                    mod = getattr(model, name, None)
-                    if isinstance(mod, torch.nn.Module):
-                        mod.compile()  # default mode -- see docstring for why not reduce-overhead
+            for name in trunk:
+                mod = getattr(self.gfn_model, name, None)
+                if isinstance(mod, torch.nn.Module):
+                    mod.compile()  # default mode -- see docstring for why not reduce-overhead
             if step_mode:
-                for model in (self.gfn_model, self.ema_model):
-                    model.compile_step_kernels()
+                self.gfn_model.compile_step_kernels()
         except Exception as e:
             print(f"compile_policy: torch.compile unavailable here ({e}); continuing eager")
             return
@@ -3767,15 +3782,16 @@ class Modeller:
         step. init_policy_lrs/init_flow_lr below still matter for exactly the
         first train_step of a (re)build: it runs before step_lr_schedule's first
         call fires, so the optimizer needs a safe initial value to construct
-        with, and the burn-in scale is exactly that value.
+        with, and the schedule's entry value is exactly that value.
         """
-        # THE BURN-IN SCALE, not a warmup ratio. These values matter for exactly
-        # the first train_step of a (re)build -- it runs before the controller's
-        # first `step()` fires -- so the optimizer must be constructed at a rate
-        # that is safe on a freshly rebuilt surface. The burn-in scale IS that
-        # rate: it is the one the run is about to spend `burn_in_steps` at.
-        _burn = float(getattr(getattr(self.args, 'lr_control', None),
-                              'burn_in_scale', 1.0) or 1.0)
+        # THE SCHEDULE'S ENTRY VALUE (segment 0's `to`, LRController.entry_scale),
+        # not a warmup ratio. These values matter for exactly the first
+        # train_step of a (re)build -- it runs before the controller's first
+        # `step()` fires. 1.0 with no `lr_control` block.
+        _ctrl = getattr(self, 'lr_controller', None)
+        _burn = (float(_ctrl.entry_scale())
+                 if _ctrl is not None and getattr(self.args, 'lr_control', None) is not None
+                 else 1.0)
         init_flow_lr = self.args.lr_flow
         init_policy_lrs = {'fwd': self.args.lr_policy * _burn,
                            'bwd': self.args.lr_back * _burn,
@@ -3846,9 +3862,9 @@ class Modeller:
                                                    weight_decay=weight_decay, **adam_kw)
 
         # The ray probe -- DIAGNOSTIC ONLY, and off unless a stage declares
-        # `lr_sensor: {kind: ray}`. It has reached no learning rate since the
-        # bracket took over: alpha* was measured uncorrelated with the rate it
-        # steered (see controller.py). It is retained so a future claim about it
+        # `lr_sensor: {kind: ray}`. It reaches no learning rate: alpha* was
+        # measured uncorrelated with the rate it steered (utils._RETIRED_KEYS
+        # 'adaptive_lr'). It is retained so a future claim about it
         # can be measured, and it is not free -- about 4.8% of step time at
         # period 500 on `train_prior` -- so declaring it is a purchase.
         # Built over the same param list the fused optimizer's policy groups
@@ -4393,46 +4409,6 @@ class Modeller:
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
 
-        # The frozen prior model is named EXPLICITLY or it is not loaded. The
-        # old `reuse_prior` auto-discovery (this run identity's own *_prior.pt,
-        # then find_shared_prior over any matching problem_def) is deleted: it
-        # made "which prior did this arm train against" a function of what
-        # happened to be on disk, so a battery silently inherited a prior
-        # trained under a different scoring rule, and every generator script in
-        # the tree had to set `reuse_prior: false` defensively to stop it. A
-        # stage that needs a prior now either gets a path or trains one.
-        prior_path = None
-        if self.args.prior_model_name is not None:
-            prior_path = f'{self.args.checkpoints_dir}/{self.args.prior_model_name}'
-        if prior_path is not None:
-            checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
-            # a prior model from a different problem wouldn't crash, but it would
-            # silently grow the prior buffer with samples from the wrong target.
-            # The conditioning flags are exempt: the prior is a frozen
-            # sampling-only object, rebuilt below from its OWN stored
-            # gfn_config, so it may be any architecture/conditioning (an
-            # unconditional model just ignores the condition tensors it's
-            # handed at sampling time) -- only the TARGET has to match.
-            self.checkpointer.assert_problem_match(checkpoint, prior_path, 'prior_model_name',
-                                                   ignore_keys=('mol_cond', 'temp_cond', 'vec_cond'))
-            # the stored config stamps the device it was trained on; GFN uses
-            # its device arg internally at sampling time, so override it or a
-            # cross-device load breaks past .to()
-            gfn_config = {**checkpoint['gfn_config'], 'device': self.device}
-            self.prior_model = build_policy(gfn_config).to(self.device)   # either policy kind
-            self.prior_model.load_state_dict(checkpoint['model_eval'])
-            self.prior_model.eval()
-            # sample this reused prior at ITS OWN training T, not the consumer's
-            # eval_T (None on pre-2026-07-23 priors -> sample_from_prior falls
-            # back to the run's integrator.T)
-            self.prior_train_T = checkpoint.get('train_T')
-            # NB: grow_prior_buffer() is deliberately NOT called here. It samples
-            # from mol_dataset, whose batch only gains mol_id in init_identifiers()
-            # (which runs after this). Growing here would append a mol_id-less
-            # sample to a checkpoint-restored prior_buffer that already carries
-            # mol_id, and append_batch would reject the key mismatch. train()
-            # calls grow_prior_buffer() once init_identifiers() has run.
-
     @staticmethod
     def _load_condition_file(path):
         """Condition sets are saved as {'prior': batch} (see generate_toy_prior);
@@ -4722,18 +4698,14 @@ class Modeller:
             # mol_id on prior_dataset.batch; no sampling/energy involved). Runs
             # first so grow_prior_buffer's top-up sees the seeded fill level.
             self.init_prior_buffer_seed()
-            # THE ONE PATH THAT BYPASSES buffers.prior_buffer.source: an ungated fill
-            # from the prior MODEL whenever one is loaded and the buffer is under
-            # max_size. Under source 'anchors' the churn never draws from the prior
-            # model, so this fill is a composition the config forbids. It fired on a
-            # REQUEUE whose sbatch handed the leg its own *_prior.pt (p20_acr_n5 leg 2,
-            # 2026-09-23: 10k prior-model rows, anchor fraction 1.0 -> 0.2, backward
-            # and replay errors rising). Skipped there, loudly.
+            # An ungated fill from the prior SAMPLER while the buffer is under max_size,
+            # reached only on a route that has one (ConformerModeller's InternalPrior;
+            # the crystal route has none, _has_prior_sampler). Under source 'anchors'
+            # the churn never draws from the sampler, so this fill is skipped, loudly.
             _prior_src = getattr(self.args.buffers.prior_buffer, 'source', 'prior_model')
             if self._has_prior_sampler() and _prior_src == 'anchors':
-                print(f"grow_prior_buffer SKIPPED: buffers.prior_buffer.source is 'anchors' -- a prior model "
-                      f"is loaded ({getattr(self.args, 'prior_model_name', None)}) but must not fill the buffer",
-                      flush=True)
+                print("grow_prior_buffer SKIPPED: buffers.prior_buffer.source is 'anchors' -- the "
+                      "prior sampler must not fill the buffer", flush=True)
             elif self._has_prior_sampler():
                 self.grow_prior_buffer()
             self.init_condition_log_z()
@@ -4779,16 +4751,7 @@ class Modeller:
             self.gfn_model.train()
             self.set_detect_anomaly(do_anomaly_detection=self.args.anomaly_detection)
             init_step = self.step_ind * 1
-            # THE STEP CLOCK IS AN EXPLICIT ITERATOR, not a bare `for x in
-            # trange(...)`, so the LR bracket can SKIP it. A bracket promotes one
-            # candidate's end state, and that candidate really did train
-            # `trial_steps` steps -- so the run's logical clock has to jump by
-            # exactly that, and by nothing else. `iter()` matters: tqdm's
-            # `__iter__` is a generator function, so calling it twice would hand
-            # out two independent generators and the skip would advance a clock
-            # nothing was reading.
-            step_iter = iter(trange(init_step, self.args.epochs + 1))
-            for self.step_ind in step_iter:
+            for self.step_ind in trange(init_step, self.args.epochs + 1):
                 # THE ONLY PROFILING CALL IN THE HOT LOOP, and it is one boolean
                 # compare unless a trace window is configured AND still open.
                 # Once the window has written, `done` latches and this never
@@ -4886,29 +4849,19 @@ class Modeller:
                 # THE HARD TRIPWIRE, EVERY STEP. It used to ride `monitor_losses`
                 # on the 10-step reporting clock, which is fine for a bar at 1e9
                 # and useless for one derived from the run's own loss scale: a
-                # candidate rate detonates in tens of steps, so a 1-in-10 sampler
-                # both reacts late and -- because the bracket's bars are fitted to
-                # the burn-in window -- feeds that window one observation in ten.
+                # too-hot rate detonates in tens of steps, so a 1-in-10 sampler
+                # both reacts late and -- because the bars are fitted to the
+                # burn-in window -- feeds that window one observation in ten.
                 if current_loss is not None:
                     if self.lr_controller.observe(
                             step_type, current_loss,
                             getattr(self, 'last_grad_norm_pre_clip', None)) == 'diverged':
                         self.fire_loss_spike()
 
-                # The LR bracket's seat. PER ITERATION, and it is the only thing
-                # that moves a learning rate: burn in for a fixed number of steps,
-                # take a root, run the fixed-LR grid, promote, hold.
-                #
-                # The return value is the PROMOTED candidate's horizon -- the
-                # steps the winning trial really did train, which the run is
-                # keeping. Discarded trial compute is not in it, so a bracket that
-                # spent six rungs' worth of steps advances this clock by one
-                # rung's worth. Consuming the iterator is what makes tqdm, the
-                # eval grid and the checkpoint cadence all agree with step_ind.
-                skip = self.lr_controller.tick()
-                for _ in range(int(skip or 0)):
-                    if next(step_iter, None) is None:
-                        break
+                # The LR schedule's seat, PER ITERATION: sets the scale from the
+                # schedule, fits the bars at the end of its first segment and
+                # advances their refit.
+                self.lr_controller.tick()
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -5044,7 +4997,7 @@ class Modeller:
             # host loop. This method runs on the 10-step reporting clock, which is
             # adequate for a 1e9 numerical-death bar and not for a bar derived
             # from the run's own loss scale: a too-hot rate detonates in tens of
-            # steps, and the same window feeds the bracket's bars.
+            # steps, and the same window feeds the controller's bars.
             #
             # THE 'BEST' SCORE IS PHASE-DEPENDENT (owner decision 2026-08-25,
             # refining 2026-08-24's global tb_err_worst combo): each stage is
@@ -5367,8 +5320,8 @@ class Modeller:
                 # same for the trainable mask, which from_state_dict leaves unset
                 self._set_tracker_trainable()
 
-        # set_state_dict above restored lr_ctrl (the scale and the bracket's
-        # phase) from the healthy checkpoint, so the cut below compounds off
+        # set_state_dict above restored lr_ctrl (the scale and any ramp in
+        # flight) from the healthy checkpoint, so the cut below compounds off
         # the rate recorded THERE, not off the live one: the descent cannot
         # outrun the checkpoint cadence, because each fire re-inflates to the
         # target's scale before halving it. `on_divergence` both counts and
@@ -5378,8 +5331,14 @@ class Modeller:
         self.lr_controller.on_divergence()
 
     def update_ema_model(self):
-        if self.args.ema_decay is not None:
-            update_ema(self.gfn_model, self.ema_model, decay=self.args.ema_decay)
+        """The conformer route's separate EMA copy (utils.keeps_ema_copy): one EMA step toward
+        gfn_model while ema_decay is set; aliased to gfn_model while it is null. A no-op once
+        ema_model IS gfn_model, which on every other route it always is."""
+        if self.ema_model is self.gfn_model:
+            return
+        decay = getattr(self.args, 'ema_decay', None)
+        if decay is not None:
+            update_ema(self.gfn_model, self.ema_model, decay=decay)
         else:
             self.ema_model = self.gfn_model
 
@@ -5399,7 +5358,7 @@ class Modeller:
     def train_step(self,
                    step_type,  # 'fwd' | 'bwd' | 'replay' | 'fused'
                    ):
-        discretizer = get_discretizer(self.args.integrator)
+        discretizer = get_discretizer(trajectory_T(self.args))
 
         accum_target = self.args.fused_grad_accum_min_samples if step_type == 'fused' else 0
         # batch >= target degenerates to a plain unscaled step: accumulation
@@ -5564,7 +5523,7 @@ class Modeller:
             # the buffer is not drawn from empty for the first N steps either.
             #
             # `step_ind % every` looked equivalent only because the acceptance runs
-            # SKIP phase 1 (prior_loaded), which puts stage entry at step 0 where
+            # SKIP phase 1 (skip_if), which puts stage entry at step 0 where
             # 0 % every == 0. A run that actually trains phase 1 and transitions at,
             # say, step 5000 gets 5000 % 7 = 4: four steps of phase 2 trained
             # against an MLE-era log Z before anything pinned it.
@@ -5985,9 +5944,6 @@ class Modeller:
         self._probe_weights = {k: weights[k] / total_weight
                                for k in sub_losses if weights[k] > 0}
 
-        if self._fused_grad_diag_armed():
-            self._log_fused_gradient_geometry(sub_losses, weights, total_weight)
-
         if fwd_ran:
             # A Z-PIN ROLLOUT IS NOT INTAKE. Admitting it would put the extra
             # rollouts back into the buffer and re-couple pin frequency to buffer
@@ -6407,175 +6363,6 @@ class Modeller:
         return {f'gradnorm/{n}': v for n, v in
                 zip(names, torch.stack(norms).cpu().tolist())}
 
-    def _fused_grad_diag_armed(self) -> bool:
-        """Opt-in cadence gate for _log_fused_gradient_geometry.
-
-        grad_geometry.enabled defaults absent -> off (config generation is not
-        loading -- an omitted block must not silently start paying for extra
-        backward passes). every <= 0 also disables it. Ticks on fused_step_count,
-        which only advances inside fused_train_step, so this is a no-op outside
-        a fused stage.
-        """
-        cfg = getattr(self.args, 'grad_geometry', None)
-        if cfg is None or not getattr(cfg, 'enabled', False):
-            return False
-        if getattr(self, '_fused_grad_geom_dead', False):
-            return False  # self-disabled after a failure; see the handler
-        every = int(getattr(cfg, 'every', 0) or 0)
-        return every > 0 and self.fused_step_count % every == 0
-
-    def _log_fused_gradient_geometry(self, sub_losses, weights, total_weight):
-        """
-        Periodic, cheap diagnostic on a fused step's ACTIVE branches (weight >
-        0, i.e. carrying a graph -- a force-refresh-only branch is already
-        detached and has none): are their gradients COOPERATING (aligned --
-        higher batch/LR likely accelerates everyone), ORTHOGONAL (independent
-        -- optimization capacity/preconditioning may be the limiting factor),
-        or CONFLICTING (fighting -- the current slow thermalization may be the
-        unavoidable Pareto path, or benefit from conflict-aware geometry like
-        PCGrad)? Without this measurement any of those three stories is
-        speculation.
-
-        One torch.autograd.grad per active branch, retain_graph=True so the
-        real fused_loss.backward() downstream (in step_loss) is unaffected --
-        this only reads gradients, it never writes .grad or frees the graph.
-        The fused gradient itself is DERIVED from the branch grads (linearity
-        of d/dtheta) rather than measured with a second backward, so the cost
-        is exactly num_active_branches extra passes, on armed steps only
-        (_fused_grad_diag_armed).
-
-        WHICH PARAMETERS A PAIR ACTUALLY CONTENDS OVER IS THE FIRST QUESTION,
-        not a detail. Under mk_dev's equilibration stage `fwd` carries
-        freeze_policy and `bwd`/`replay` carry freeze_z, so fwd is Z-only and
-        the other two are policy-only: they are PARAMETER-DISJOINT (bench/
-        fused_stage.py:48 measures the Jacobian off-diagonals at exactly 0).
-        A whole-model cosine over such a pair is 0 no matter what either branch
-        is doing -- read as 'orthogonal regime' it would be a pure artifact of
-        the freeze flags. So every pair also reports `overlap_*`, the share of
-        the pair's gradient energy living in jointly-touched parameters:
-        overlap 0 means the cosine is structural and carries NO information
-        about cooperation, and `cos_*_shared` is omitted rather than emitted as
-        a NaN or a spurious 0. Under mk_dev the one pair that genuinely shares
-        the trunk is bwd-vs-replay.
-
-        Membership is by OBSERVED autograd touch (a non-None grad), not by
-        module name, so it follows freeze flags and arch changes for free.
-        There is deliberately NO branch-private COSINE: 'private' means at most
-        one of the pair touched the parameter, so at least one factor of every
-        term in that dot product is exactly zero and the cosine is identically
-        0 by construction -- a metric that cannot ever say anything. The
-        informative form of the same question is per-branch:
-        `{k}_uncontested_frac`, the share of branch k's own gradient energy in
-        parameters no other active branch touches at all (1.0 for fwd under
-        mk_dev, i.e. it contends with nobody).
-        """
-        active = [k for k in sub_losses if weights.get(k, 0.0) > 0]
-        if len(active) < 2:
-            return  # nothing to compare a single branch's gradient against
-
-        params = [p for p in self.gfn_model.parameters() if p.requires_grad]
-        if not params:
-            return
-
-        flat, touched = {}, {}
-        for k in active:
-            try:
-                raw = torch.autograd.grad(sub_losses[k][0], params,
-                                          retain_graph=True, allow_unused=True)
-            except RuntimeError as e:
-                # A DIAGNOSTIC MUST NEVER KILL A TRAINING RUN. This one reads a
-                # second backward through a possibly-compiled graph, which is a
-                # standing hazard: donated buffers are handled at the compile
-                # site above, but the next backend optimisation that assumes
-                # one-backward-per-graph would land here the same way -- 50
-                # steps into a stage, hours in, on the cluster only.
-                #
-                # DISABLED LOUDLY AND VISIBLY, not swallowed: the print says
-                # what died and why, and `fused_grad/disabled` is logged from
-                # here on, because a metric that merely STOPS APPEARING reads as
-                # "the diagnostic says nothing is wrong". Nothing else about the
-                # step changes -- the real fused backward downstream is
-                # untouched, and the run keeps its actual work.
-                self._fused_grad_geom_dead = True
-                self._fused_grad_geom_report = {'fused_grad/disabled': 1.0}
-                print(f"grad_geometry: DISABLED for the rest of this run -- the "
-                      f"branch-gradient probe raised on branch '{k}': {e}\n"
-                      f"  Training is unaffected (this reads gradients, it does not "
-                      f"write them). If the message mentions donated buffers, the "
-                      f"compiled trunk was built with donated_buffer on -- see "
-                      f"maybe_compile_policy.")
-                return
-            touched[k] = torch.cat([
-                torch.full((p.numel(),), g is not None, dtype=torch.bool, device=p.device)
-                for g, p in zip(raw, params)])
-            flat[k] = torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1)
-                                 for g, p in zip(raw, params)])
-
-        def cos(u, v):
-            nu, nv = float(u.norm()), float(v.norm())
-            return float(torch.dot(u, v) / (nu * nv)) if nu > 0 and nv > 0 else float('nan')
-
-        coef = {k: weights[k] / total_weight for k in active}
-        norms = {k: float(flat[k].norm()) for k in active}
-        report = {f'fused_grad/{k}_norm_raw': norms[k] for k in active}  # BEFORE weighting
-
-        # PER-SUBMODEL split of each branch's gradient. The whole-model
-        # gradnorm/backward_policy is the FUSED loss's norm, so it cannot say
-        # whether P_B is being moved by bwd (reparameterised path gradient,
-        # score term averaging to zero) or by replay (a straight regression
-        # gradient on a stored path). Same autograd.grad as above, sliced by
-        # the child module each parameter belongs to; norm over the slice.
-        pid_to_child = {id(p): name for name, mod in self.gfn_model.named_children()
-                        for p in mod.parameters(recurse=True)}
-        spans, offset = {}, 0
-        for p in params:
-            child = pid_to_child.get(id(p))
-            if child is not None:
-                spans.setdefault(child, []).append((offset, offset + p.numel()))
-            offset += p.numel()
-        for k in active:
-            for child, sp in spans.items():
-                e = sum(float(flat[k][a:b].norm()) ** 2 for a, b in sp)
-                report[f'fused_grad/{k}_norm_{child}'] = e ** 0.5
-
-        for k in active:
-            others = torch.zeros_like(touched[k])
-            for j in active:
-                if j != k:
-                    others |= touched[j]
-            mine = float((flat[k] * ~others).norm())
-            report[f'fused_grad/{k}_uncontested_frac'] = (
-                (mine / norms[k]) ** 2 if norms[k] > 0 else float('nan'))
-
-        for i, a in enumerate(active):
-            for b in active[i + 1:]:
-                report[f'fused_grad/cos_{a}_{b}'] = cos(flat[a], flat[b])
-                both = touched[a] & touched[b]
-                pair_energy = norms[a] ** 2 + norms[b] ** 2
-                shared_energy = float((flat[a] * both).norm()) ** 2 + float((flat[b] * both).norm()) ** 2
-                report[f'fused_grad/overlap_{a}_{b}'] = (
-                    shared_energy / pair_energy if pair_energy > 0 else float('nan'))
-                # parameter-disjoint pair: the cosine above is 0 by construction
-                # and a 'shared block' cosine would be a cosine of two empty
-                # vectors. Emit neither rather than a number that reads as a
-                # measurement of orthogonality.
-                if bool(both.any()):
-                    report[f'fused_grad/cos_{a}_{b}_shared'] = cos(flat[a][both], flat[b][both])
-
-        g_fused = sum(coef[k] * flat[k] for k in active)
-        fused_norm = float(g_fused.norm())
-        weighted_norm_sum = sum(coef[k] * norms[k] for k in active)
-        report['fused_grad/fused_norm'] = fused_norm
-        report['fused_grad/weighted_component_norm_sum'] = weighted_norm_sum
-        # 1.0 = fully aligned (triangle inequality tight); falls toward 0 as the
-        # weighted components cancel each other out (conflicting), and lands
-        # around 1/sqrt(n_active) for mutually orthogonal components of equal
-        # weighted size -- the ORTHOGONAL regime lives between the two poles.
-        report['fused_grad/fused_norm_ratio'] = (
-            fused_norm / weighted_norm_sum if weighted_norm_sum > 0 else float('nan'))
-
-        self._fused_grad_geom_report = report
-
     def _probe_dealer(self):
         """A `draw_fn` for RayCalibration over the larder.
 
@@ -6925,7 +6712,7 @@ class Modeller:
             # churn call's fwd_stats; return_exp=True for the crystal batch the
             # buffer stores (a D2H copy -- see the REVISIT note).
             loss, crystal_batch, loss_dict = self.fwd_train_step(
-                get_discretizer(self.args.integrator),
+                get_discretizer(trajectory_T(self.args)),
                 return_exp=True,
                 repeats=self.mode_repeats('fwd'),
                 report_losses=True)
@@ -7023,7 +6810,7 @@ class Modeller:
         self.args.replay_loss_coeffs = coeffs
         try:
             loss, loss_dict = self.replay_train_step(
-                get_discretizer(self.args.integrator),
+                get_discretizer(trajectory_T(self.args)),
                 repeats=self.mode_repeats('replay'),
                 report_losses=True,
                 # read-only on the buffer: see replay_train_step's docstring.
@@ -7347,7 +7134,6 @@ class Modeller:
         target = current + dz
         with torch.no_grad():
             self.gfn_model.flow_model.scalar.data.fill_(target)
-            self.ema_model.flow_model.scalar.data.fill_(target)
         if drop_moments:
             for name in ('fused', 'flow'):
                 opt = self.optimizers.get(name)
@@ -7407,7 +7193,7 @@ class Modeller:
         the first N steps.
         """
         n = int(n_samples or getattr(self.args, 'eval_num_samples', 0) or self.batch_size)
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        eval_discretizer = get_discretizer(trajectory_T(self.args))
         # side_effects False: this is a Z measurement, not an eval. It must not
         # write tracker Emin(c) or screen/admit anchors -- the anchor buffer is
         # frozen by config here, and a bootstrap that quietly moved it would be a
@@ -7431,7 +7217,7 @@ class Modeller:
         if self.protocol.flag('buffers_active'):
             # on_policy: the live gfn_model, so log_pf is the training policy's
             # own score. ORIGIN_BOOTSTRAP all the same -- this is a one-off
-            # entry draw at eval_num_samples on the eval_T grid, so a stage
+            # entry draw at eval_num_samples on the training grid, so a stage
             # whose buffer is mostly bootstrap rows is reading one instant.
             self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=True,
                                       origin=ORIGIN_BOOTSTRAP)
@@ -7446,8 +7232,8 @@ class Modeller:
         the same actuator (under fill_mode 'absorb' its precision sets its
         weight automatically). Refused, with the reason logged, when the eval
         batch is not a sample of the training policy at the training target:
-        temperature conditioning (a temperature sweep), a different eval grid,
-        or a separate EMA model.
+        temperature conditioning (a temperature sweep). Eval and training share
+        one grid (utils.trajectory_T).
         """
         cfg = getattr(self.args, 'z_calibration', None)
         mode = str(getattr(cfg, 'fill_from_eval', 'off') or 'off') if cfg is not None else 'off'
@@ -7461,10 +7247,6 @@ class Modeller:
             reason = 'head'
         elif getattr(self.args, 'temperature_conditioning', False):
             reason = 'temperature'
-        elif int(self.args.eval_T) != int(self.args.integrator.T):
-            reason = 'grid'
-        elif getattr(self.args, 'ema_decay', None) is not None:
-            reason = 'ema'
         if reason is not None:
             rep[f'z_fill/eval_refused_{reason}'] = rep.get(f'z_fill/eval_refused_{reason}', 0) + 1
             return
@@ -8344,7 +8126,7 @@ class Modeller:
         #
         # TRAIN STEPS ONLY. This function is the shared recovery path for eval too
         # (eval_bwd, eval_fwd, anchor_refresh), and eval has a different memory
-        # profile entirely: eval_num_samples per pass, the EMA model, no gradients.
+        # profile entirely: eval_num_samples per pass, no gradients.
         # Recording the TRAIN batch as a ceiling because an EVAL pass overflowed
         # installs a stage-lifetime cap that only a stage transition clears, on
         # evidence about a different allocation. Eval OOMs are self-limiting -- their
@@ -8425,9 +8207,9 @@ class Modeller:
     def eval_draw_size(self) -> int:
         """Batch size for EVAL draws, which shrinks independently of training.
 
-        Eval and training have different memory profiles -- eval runs the EMA
-        model over eval_num_samples with no gradients, training runs the live
-        model with them -- and on the MLIP routes they do not even call the same
+        Eval and training have different memory profiles -- eval runs the
+        policy over eval_num_samples with no gradients, training runs it with
+        them -- and on the MLIP routes they do not even call the same
         code (train_prior makes no energy call). One number for both means the
         cheaper one is capped by the more expensive one.
 
@@ -8459,7 +8241,7 @@ class Modeller:
                 else:
                     assert False
 
-                mol_batch = mol_batch.to(self.ema_model.device)
+                mol_batch = mol_batch.to(self.gfn_model.device)
                 terminal_state = self._batch_latents(mol_batch)
 
                 mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
@@ -8470,11 +8252,11 @@ class Modeller:
                 log_r = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                        temperature=10 ** log_T_tensor)
 
-                terminal_state = terminal_state.to(self.ema_model.device)
-                condition = condition.to(self.ema_model.device)
+                terminal_state = terminal_state.to(self.gfn_model.device)
+                condition = condition.to(self.gfn_model.device)
 
                 (backward_flow_states, b_log_pfs, b_log_pbs, log_flow,
-                 b_gauss_params) = self.ema_model.get_traj_bwd(
+                 b_gauss_params) = self.gfn_model.get_traj_bwd(
                     terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
                 log_z = log_flow[:, 0]
 
@@ -8502,7 +8284,7 @@ class Modeller:
 
         # deliberately NO tracker update() here (there used to be a phase-gated
         # one): same single-protocol principle as fwd_eval_sampling -- eval-time
-        # backward sampling (ema_model, fixed eval temperature) is a different
+        # backward sampling (fixed eval temperature) is a different
         # measurement protocol from the train-step bwd stream that feeds the
         # tracker, and mixing protocols inflates the tracker's second moment by
         # the between-stream mean shift, spiking the terminal stage's logw_std gate (and
@@ -8587,6 +8369,9 @@ class Modeller:
         A policy with an exact density (log_density; the NF) scores each cell once with
         eval/xcond.py::cross_condition_delta_exact and ignores k, which may be null; the
         SDE policy needs an even k and raises on k null.
+
+        Runs on evaluations whose step is a multiple of xcond_eval.every_n_evals eval
+        periods (eval_cadence_fires); null or 0 is off.
         """
         cfg = getattr(self.args, 'xcond_eval', None)
         if cfg is None or not getattr(cfg, 'enabled', False):
@@ -8597,15 +8382,15 @@ class Modeller:
         if not any(bool(getattr(self.args, k, False)) for k in
                    ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning')):
             return {}
-        exact = hasattr(self.ema_model, 'log_density')
+        exact = hasattr(self.gfn_model, 'log_density')
         k = getattr(cfg, 'k', 4)
         if not exact and k is None:
             raise ValueError(
                 "xcond_eval.k is null, but the SDE policy's cross-condition density is a "
                 "k-rollout estimate: set xcond_eval.k to an even integer >= 2 (k null is "
                 "accepted only under a policy with an exact density, model.kind nf)")
-        period = int(getattr(cfg, 'period', 0) or 0)
-        if period <= 0 or self.step_ind % period != 0:
+        if not eval_cadence_fires(self.step_ind, getattr(cfg, 'every_n_evals', None),
+                                  getattr(self.args, 'eval_period', None)):
             return {}
 
         from eval.xcond import cross_condition_delta, cross_condition_delta_exact, xcond_metrics
@@ -8623,16 +8408,16 @@ class Modeller:
             cond_vec = cols.conditions
             dim = self._batch_latents(cols).shape[1]
             tile = torch.arange(C, device=self.device).repeat_interleave(n)
-            states, *_ = self.ema_model.get_traj_fwd(
+            states, *_ = self.gfn_model.get_traj_fwd(
                 get_gfn_init_state(C * n, dim, self.device), eval_discretizer, None,
                 cond_vec[tile], cols.subsample_new_batch(tile))
             chunk_rows = int(getattr(cfg, 'chunk_rows', 2560))
             if exact:
                 delta, rep_a, rep_b = cross_condition_delta_exact(
-                    self.ema_model, cols, cond_vec, states[:, -1], chunk_rows=chunk_rows)
+                    self.gfn_model, cols, cond_vec, states[:, -1], chunk_rows=chunk_rows)
             else:
                 delta, rep_a, rep_b = cross_condition_delta(
-                    self.ema_model, cols, cond_vec, states[:, -1], eval_discretizer, int(k),
+                    self.gfn_model, cols, cond_vec, states[:, -1], eval_discretizer, int(k),
                     chunk_rows=chunk_rows)
         out = xcond_metrics(delta, rep_a, rep_b,
                             worst_quantile=float(self.args.conditional_worst_quantile))
@@ -8652,7 +8437,7 @@ class Modeller:
         prior-buffer churn, and nothing here feeds a gate, controller or loss.
         """
         n = getattr(self.args, 'test_eval_num_samples', None) or self.args.eval_num_samples
-        test_stats, test_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer,
+        test_stats, test_batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer,
                                                         override_num_samples=int(n),
                                                         dataset=self.test_mol_dataset,
                                                         side_effects=False)
@@ -9111,7 +8896,7 @@ class Modeller:
         metrics['log Z learned'] = val(log_Z_learned.mean())
         # 1 = the dead-row table was confirmed against the real crystal build at startup,
         # 0 = the probe could not run and the table is UNVERIFIED for this run,
-        # absent = not a crystal problem, or hold_dead_latent_rows is off. See D33.
+        # absent = not a crystal problem. See D33.
         _drv = getattr(self, '_dead_rows_verified', None)
         if _drv is not None:
             metrics['dead_rows/probe_verified'] = float(_drv)
@@ -9637,6 +9422,62 @@ class Modeller:
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref', '_gap'))), flush=True)
         return out
 
+    def update_heldout_gate(self, metrics):
+        """Held-out plateau gate, publishing gates/heldout_flat once per evaluation (cfg heldout_gate,
+        parsed by progress_metrics.parse_heldout_gate).
+
+        The source is resolved against this eval's `metrics` (progress_metrics.resolve_heldout_source; `auto`
+        takes the first density readout present) and pinned in the stage's gate_state('heldout') at its first
+        resolution. Each fresh value goes through progress_metrics.heldout_plateau (trailing median over
+        `smooth` evals, 1 when the best smoothed value of the last `evals` improves on the best before them by
+        at most `nats`), and the verdict, 0 included, goes through protocol.publish_gate. The state rides
+        stage_ctrl, so it is checkpointed and reset at every transition.
+
+        An absent source publishes nothing and prints, once per stage, that an exit on gates/heldout_flat
+        cannot fire; the stage's max_steps is then the only bound on such an exit. A non-finite value
+        publishes 0 and is not recorded. Returns loggable metrics."""
+        spec = getattr(self, 'heldout_gate_spec', None) or parse_heldout_gate(
+            getattr(self.args, 'heldout_gate', None))
+        gs = self.protocol.gate_state('heldout')
+        key = gs.get('source') or resolve_heldout_source(spec['source'], metrics)
+        value = metrics.get(key) if key is not None else None
+        if value is None:
+            stage = getattr(getattr(self.protocol, 'stage', None), 'name', '?')
+            why = (f"no density readout ({', '.join(HELDOUT_AUTO_SOURCES)}) in this eval"
+                   if spec['source'] == 'auto' and key is None else f'source {key or spec["source"]!r} absent')
+            seen = getattr(self, '_heldout_abstained', None)
+            if seen is None:
+                seen = self._heldout_abstained = set()
+            if (stage, why) not in seen:
+                seen.add((stage, why))
+                print(f"heldout_gate ABSTAINS ({why}) -- gates/heldout_flat will NOT be published this stage; "
+                      f"an exit conditioned on gates/heldout_flat cannot fire", flush=True)
+            return {}
+        gs['source'] = key
+        value = float(value)
+        if not math.isfinite(value):
+            self.protocol.publish_gate('heldout_flat', 0.0)
+            return {'heldout_gate/flat': 0.0}
+        out = heldout_plateau(gs, value, spec['evals'], spec['nats'], spec['smooth'])
+        self.protocol.publish_gate('heldout_flat', out['flat'])
+        res = {'heldout_gate/flat': out['flat']}
+        if out['smoothed'] is not None:
+            res['heldout_gate/smoothed'] = out['smoothed']   # nats, trailing median of the source
+        if out['gain'] is not None:
+            res['heldout_gate/gain'] = out['gain']           # nats; > 0 = the last `evals` improved on the best before
+        return res
+
+    def figs_due(self) -> bool:
+        """Whether this evaluation's step is on the figure cadence: `figs_every_n_evals`
+        eval periods (eval_cadence_fires). On `conformer_torsions`, whose configs set no
+        `figs_every_n_evals`, the step period `figs_period` (0 or absent is off)."""
+        from config_invariants import _CONFORMER_ENERGY_FUNCTIONS
+        n = getattr(self.args, 'figs_every_n_evals', None)
+        if n is None and getattr(self.args, 'energy_function', None) in _CONFORMER_ENERGY_FUNCTIONS:
+            period = int(getattr(self.args, 'figs_period', 0) or 0)
+            return period > 0 and self.step_ind % period == 0
+        return eval_cadence_fires(self.step_ind, n, getattr(self.args, 'eval_period', None))
+
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
         # close the TRAIN-phase VRAM window before eval allocates anything, so
@@ -9654,12 +9495,13 @@ class Modeller:
             self.times['inter_eval_start'] = self.times['eval_step_end']
             self.times['inter_eval_end'] = time()
         self.times['eval_step_start'] = time()
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        eval_discretizer = get_discretizer(trajectory_T(self.args))
 
-        do_figs = self.step_ind % self.args.figs_period == 0
+        # override_do_figs (a pulled-forward request_eval) builds AND logs figures off the cadence
+        do_figs = self.figs_due() or override_do_figs
 
         '''sampling and metrics analysis'''
-        fwd_stats, sample_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer)
+        fwd_stats, sample_batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         self._merge_metrics(metrics, self.log_metrics(fwd_stats, bwd_stats, sample_batch),
                             'log_metrics')
@@ -9672,7 +9514,7 @@ class Modeller:
 
         self.times['eval_figs_start'] = time()
         fig_dict = {}
-        if do_figs or override_do_figs:
+        if do_figs:
             # backstop on top of eval_figs' per-block guards: nothing in
             # figure land may interrupt a live run
             with fig_guard('eval figure generation'):
@@ -9707,6 +9549,7 @@ class Modeller:
             metrics.update(fig_dict)
 
         metrics.update(self.density_readouts())
+        metrics.update(self.update_heldout_gate(metrics))
         metrics.update({
             'Batch Size': self.batch_size,
             # NO LONGER THE SAME NUMBER. Eval draws shrink independently of the
@@ -9842,15 +9685,9 @@ class Modeller:
                 'prior_buffer_from_prior_model': churn['from_prior_model'],
                 'prior_buffer_from_anchors': churn['from_anchors'],
                 'prior_buffer_from_seed': churn['from_seed'],
-                # 1 while a prior sampler exists, 0 once it does not. `prior_model`
-                # is NOT in the checkpoint and only train_prior's snapshot_prior
-                # on_exit creates it, so an arm that RESUMES past that stage has
-                # none and _prior_churn_cycle returns at its guard -- the buffer
-                # then freezes at zero intake for the rest of the run. That was
-                # visible only as prior_admit_rate going NaN (0/0) and one stdout
-                # line per stage, which is how mip2/neh2 ran ~20k steps on a
-                # frozen prior buffer unnoticed (2026-09-02). A capability the
-                # run silently loses needs a channel of its own.
+                # 1 while a prior sampler exists (_has_prior_sampler: the conformer
+                # route's InternalPrior), else 0 -- always 0 on the crystal route,
+                # whose prior buffer fills from anchors.
                 'prior_buffer_has_sampler': float(self._has_prior_sampler()),
                 'prior_buffer_turnover': added / max(len(self.prior_buffer), 1),
                 # retained key: previously emitted from the standalone
@@ -9869,7 +9706,7 @@ class Modeller:
             # how much of what the prior model was ASKED to supply passed the
             # admission gate; the shortfall is what anchors backfilled. nan when no
             # draw was requested this window (budget consumed by headroom/eligible
-            # -drop caps, or no prior_model yet under the forward-first protocol)
+            # -drop caps, source 'anchors', or no prior sampler on this route)
             metrics['prior_buffer_prior_admit_rate'] = (
                 churn['from_prior_model'] / churn['budget'] if churn['budget'] > 0 else float('nan'))
         # Shaped anchor tile: the last shaped draw's displacement from x_min, drained
@@ -10314,10 +10151,11 @@ class Modeller:
         tracker sees better structures, so rows admitted under an older, looser
         gate stop clearing the current one.
 
-        That is the ONLY sense in which a prior row is stale. prior_model is a
-        frozen snapshot (snapshot_prior), so an old draw is still a perfectly
-        valid draw from it -- unlike a replay trajectory, which goes stale
-        because the policy that generated it moved. Nothing here needs a
+        That is the ONLY sense in which a prior row is stale. The prior source
+        (noised anchors, or a route's fixed prior sampler) does not move, so an
+        old draw is still a perfectly valid draw from it -- unlike a replay
+        trajectory, which goes stale because the policy that generated it
+        moved. Nothing here needs a
         rollout: the energy is already stored and Emin(c) is already tracked.
 
         Energy-intrinsic and policy-independent, so this channel does not
@@ -10393,19 +10231,20 @@ class Modeller:
 
     def _prior_churn_cycle(self, budget: int):
         """
-        One churn admission cycle: draw `budget` from the prior model, admit
-        what sits within ramp_floor of its own condition's best known energy,
-        and backfill the shortfall from the permanent anchor archive.
+        One churn admission cycle: under source 'anchors' (the only crystal
+        source) meet `budget` from noised anchors; otherwise draw `budget` from
+        the route's prior sampler, admit what sits within ramp_floor of its own
+        condition's best known energy, and backfill the shortfall from the
+        permanent anchor archive.
 
         Shared by manage_prior_buffer's eval-cadence churn and
         rebuild_prior_by_churn's from-zero fill, so a rebuilt buffer holds the
         same source mix the running churn would have produced rather than a
         composition that has to be ground out afterwards.
 
-        Before the warm-start stage's snapshot_prior action has run (or on a
-        run whose protocol never takes one) no prior model exists, so the draw
-        is skipped entirely and the caller's buffer is left to the anchor
-        top-up paths.
+        A route without a prior sampler (_has_prior_sampler False -- the
+        crystal route) skips the draw entirely, and the caller's buffer is left
+        to the anchor top-up paths.
         """
         if budget <= 0:
             return
@@ -10413,13 +10252,11 @@ class Modeller:
         # "noised buffer"): the churn budget is met by noising and re-scoring
         # rows drawn from the frozen anchor set -- top_up_prior_from_anchors,
         # the same path the shortfall backfill already uses -- so the prior
-        # buffer refreshes on `mean_lifetime` with no prior MODEL in the loop.
-        # Opt-in. The default keeps today's prior-model churn untouched, which
-        # matters because the prod_sep02 arms are running on it. Under this
-        # source `snapshot_prior` and `prior_model_name` are unnecessary, and
-        # the resume gap those create (no prior_model after a restart) does not
-        # exist; prior_buffer_prior_admit_rate reads nan, as it counts prior-
-        # MODEL admits only.
+        # buffer refreshes on `mean_lifetime` with no prior sampler in the loop.
+        # The only source on the crystal route (crystal_prior_model_is_retired);
+        # the code default 'prior_model' is the conformer route's InternalPrior
+        # draw. prior_buffer_prior_admit_rate reads nan here, as it counts
+        # prior-sampler admits only.
         if getattr(self.args.buffers.prior_buffer, 'source', 'prior_model') == 'anchors':
             self.top_up_prior_from_anchors(budget)
             return
@@ -10427,17 +10264,17 @@ class Modeller:
             # Silent here changes the buffer's SOURCE MIX to 100% anchor with no
             # error and no log line -- the only tell is prior_buffer_prior_admit_rate
             # going nan (0/0) instead of 0.0, because budget below is never
-            # incremented. Reached whenever a run resumes PAST train_prior's
-            # snapshot_prior on_exit action without prior_model_name set. Reports
-            # once per stage rather than raising: an anchor-only buffer is a legal
-            # composition, it just is not the one the config describes.
+            # incremented. Reached when source is not 'anchors' on a route with
+            # no prior sampler. Reports once per stage rather than raising: an
+            # anchor-only buffer is a legal composition, it just is not the one
+            # the config describes.
             stage_name = self.protocol.stage.name
-            if getattr(self, '_no_prior_model_warned_stage', None) != stage_name:
-                self._no_prior_model_warned_stage = stage_name
-                print(f"WARNING [stage '{stage_name}']: prior churn requested but no "
-                      f"prior_model exists -- the draw is SKIPPED and the prior buffer "
-                      f"fills 100% from anchors. Set prior_model_name to a *_prior.pt, "
-                      f"or run through train_prior's snapshot_prior, to restore it.")
+            if getattr(self, '_no_prior_sampler_warned_stage', None) != stage_name:
+                self._no_prior_sampler_warned_stage = stage_name
+                print(f"WARNING [stage '{stage_name}']: prior churn requested but this "
+                      f"route has no prior sampler -- the draw is SKIPPED and the prior "
+                      f"buffer fills from anchors only. Set buffers.prior_buffer.source "
+                      f"'anchors'.")
             return
 
         metrics, sample_batch = self.sample_from_prior(budget)
@@ -10904,7 +10741,7 @@ class Modeller:
         if not hasattr(self, 'anchor_buffer') or len(self.anchor_buffer) == 0:
             return
 
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        eval_discretizer = get_discretizer(trajectory_T(self.args))
         n = len(self.anchor_buffer)
         condition = self.anchor_buffer.batch.conditions.detach().to(self.device)
         latents = self.anchor_buffer.x.to(self.device)
@@ -10937,7 +10774,7 @@ class Modeller:
             idx = torch.arange(start, end, device=self.device)
             try:
                 chunk_batch = self.anchor_buffer.batch.subsample_new_batch(idx).to(self.device)
-                _, log_pfs, log_pbs, _ = self.ema_model.get_traj_bwd(
+                _, log_pfs, log_pbs, _ = self.gfn_model.get_traj_bwd(
                     latents[idx], eval_discretizer, condition[idx], chunk_batch)
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'anchor_refresh')
@@ -11212,9 +11049,8 @@ class Modeller:
         ADMISSION ALSO WRITES THE THREE PER-ROW COLUMNS, and this is the only
         place replay rows are born. `birth_log_pf` records the generating
         policy's own score for the row -- but only when `on_policy`: the
-        eval-site call scores with the EMA model on the eval grid, which is not
-        the training policy, so those rows are born NaN and are excluded from
-        the drift statistic rather than reading as permanent drift.
+        eval-site call passes on_policy=False, so those rows are born NaN and
+        are excluded from the drift statistic.
         `is_val` flags the held-out split (buffers.replay_buffer.val_frac); it
         is orthogonal to prioritisation because the flag is drawn uniformly and
         eviction is residual-independent, so p_survive still drops out of the
@@ -11471,7 +11307,7 @@ class Modeller:
         The REPLAY buffer takes it only under buffers.replay_buffer
         .admit_from_eval (default true = the behaviour every route shipped
         with). What it admits is a DIFFERENT SAMPLE from the fused step's: the
-        EMA model, at eval_T, at eval_num_samples. Admission is capped at
+        eval rollout, at model.sde.T, at eval_num_samples. Admission is capped at
         churn_rate, so at eval_num_samples 10000 with churn_rate = batch 1000 it
         admits 1000 rows per eval against a rollout intake of 1000 per
         fwd_rollout_every steps -- ~17% of the buffer at every 20. Those rows
@@ -11487,9 +11323,8 @@ class Modeller:
         self.manage_prior_buffer(sample_batch)
         if not bool(getattr(self.args.buffers.replay_buffer, 'admit_from_eval', True)):
             return
-        # on_policy=False: these fwd_stats come from the EMA model on the
-        # eval_T grid, so their log_pf is not comparable to a later
-        # get_traj_replay score under the training policy
+        # on_policy=False: these fwd_stats are the eval rollout's, so the rows
+        # are born with a NaN birth_log_pf
         self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=False,
                                   origin=ORIGIN_EVAL)
 
@@ -11901,10 +11736,10 @@ class Modeller:
         catch on the confirmed set, not a novelty judgement.
         """
         if not hasattr(self, 'condition_log_z'):
-            # init-time grow_prior_buffer() runs before init_condition_log_z()
-            # by contract (every condition_log_z use on that path is hasattr-
-            # gated, see train()); no tracker means no warmed-up log_Z(c) axis,
-            # which is exactly the all-False z_mask case -> nothing to screen
+            # no tracker yet (anything sampled before init_condition_log_z;
+            # every condition_log_z use on that path is hasattr-gated, see
+            # train()) means no warmed-up log_Z(c) axis, which is exactly the
+            # all-False z_mask case -> nothing to screen
             return
         if getattr(getattr(self, 'anchor_buffer', None), 'frozen', False):
             # buffers.anchor_buffer.frozen (set on the buffer by
@@ -12002,7 +11837,7 @@ class Modeller:
         if screen_idx.numel() == 0:
             return
 
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        eval_discretizer = get_discretizer(trajectory_T(self.args))
         latents = self._batch_latents(sample_batch)
 
         K = cfg.confirm_k
@@ -12014,7 +11849,7 @@ class Modeller:
         tile = torch.arange(n_cand, device=self.device).repeat_interleave(K)
         tiled_batch = sample_batch.subsample_new_batch(screen_idx[tile])
 
-        _, c_log_pfs, c_log_pbs, _ = self.ema_model.get_traj_bwd(
+        _, c_log_pfs, c_log_pbs, _ = self.gfn_model.get_traj_bwd(
             latents[screen_idx][tile], eval_discretizer,
             condition[screen_idx][tile], tiled_batch)
         log_w_k, log_p_hat = log_pf_estimate(c_log_pfs.sum(-1), c_log_pbs.sum(-1), K)
@@ -12065,20 +11900,14 @@ class Modeller:
             )
 
     def sample_from_prior(self, num_samples):
-        "sample from prior"
-        # a reused prior carries its own training T (checkpoint 'train_T'); a
-        # prior trained live in this run's warm-start stage does not, so fall back to the
-        # run's own rollout length. Either way, sample at the T the prior was
-        # TRAINED at -- not eval_T, which need not match it (a T=10 shared prior
-        # sampled at T=100 integrates 10x finer than it was fit to).
-        prior_T = getattr(self, 'prior_train_T', None) or self.args.integrator.T
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, prior_T)
-        metrics, sample_batch = self.fwd_eval_sampling(self.prior_model,
-                                                       eval_discretizer,
-                                                       override_num_samples=num_samples)
-        return metrics, sample_batch
+        """``(metrics, sample_batch)`` drawn from the route's prior sampler. The crystal
+        route has none (_has_prior_sampler is False), so nothing here calls this; a route
+        that has one (ConformerModeller) overrides both."""
+        raise NotImplementedError('this route has no prior sampler (_has_prior_sampler)')
 
     def grow_prior_buffer(self):
+        """Ungated init-time fill from the prior sampler up to prior_buffer.min_size rows.
+        Reached only where _has_prior_sampler() is True (train())."""
         if not hasattr(self, 'prior_buffer'):
             buffer_length = 0
         else:
@@ -12232,7 +12061,7 @@ class Modeller:
 
         # deliberately NO tracker update() or update_z_residual() here (both used
         # to be): this eval batch is a different measurement protocol on several
-        # axes at once -- ema_model weights, a fresh log-uniform temperature
+        # axes at once -- a fresh log-uniform temperature
         # sweep, uniform mol draws, ~eval_num_samples pooled rows -- while the
         # ConditionLogZTracker is a rolling estimate over the *train-step*
         # stream, and every training-facing consumer of it (the terminal logw_std
@@ -12263,10 +12092,8 @@ class Modeller:
             self.condition_log_z.update_best_energy(pooled['condition_id'], energy,
                                                     energy_phys=energy_phys)
 
-        # covers both evaluation()'s on-policy eval sampling and sample_from_prior's
-        # prior-model sampling (itself called from manage_prior_buffer's churn and
-        # grow_prior_buffer's init-time bootstrap) -- both are freshly generated,
-        # freshly scored batches, so both are valid anchor candidates.
+        # covers evaluation()'s on-policy eval sampling -- freshly generated,
+        # freshly scored batches, so valid anchor candidates.
         # log_pf_est = k=1 forward-path estimate of log_pf - log_pb; reused by
         # the screen stage (TB-residual axis built inside) so it spends no
         # backward rollouts pre-filtering.

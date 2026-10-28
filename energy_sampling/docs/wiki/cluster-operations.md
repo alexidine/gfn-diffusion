@@ -1,6 +1,6 @@
 # Cluster operations
 
-*Drift: **C** (code-bound). Verified against commit `78de930`, 2026-10-04. Sources at the end.*
+*Drift: **C** (code-bound). Verified against commit `78de930`, 2026-10-04; the figure-cadence paragraph verified 2026-10-28 against commit `03b94c74` with uncommitted working-tree changes. Sources at the end.*
 
 A *battery* is a directory under `configs/` holding one YAML file per *arm*, a tab-separated index, and one SLURM submission script. This page is about what that directory contains once written, how it reaches the cluster, and what the cluster does with it. How the YAMLs are derived from the canonical config is [battery-generation](battery-generation.md); what a checkpoint holds is [checkpoints-and-resume](checkpoints-and-resume.md).
 
@@ -57,7 +57,7 @@ Its seed block, `conformer_cond/make.py::SEED_FRESH`, sets `CK=null`, so a first
 
 `train.py::Modeller._log_metrics` catches every exception from `wandb.log`, prints on the first of each run of consecutive failures, publishes the cumulative count as `run/log_failures`, and raises after `train.py::Modeller._MAX_LOG_FAILURES` (200) consecutive failures. The comment beside the batch-controller series in `train.py::Modeller.ten_step_reporting` states that wandb uploads no console log at all for a run left in state `crashed`, while history series survive a hard kill.
 
-The evaluation block in `train.py::Modeller.train` runs when the step is a positive multiple of `cfg:eval_period`, at step 50, and when the stage controller's `request_eval` flag is set, and `cfg:figs_period` gates `do_figs` inside it; `configs/prod_sep20/p20_mip_n5.yaml` sets 500 and 1000 against the canonical config's 250 and 500, whose comment states that `figs_period` must be a multiple of `eval_period` or it will not fire. `config_invariants.py::figs_period_fires` raises that as an `ERROR` violation, and `utils.py::_report_config_invariants` prints violations at load without raising; its docstring records 47 of 2,244 configs in the tree with a non-multiple `figs_period`.
+The evaluation block in `train.py::Modeller.train` runs when the step is a positive multiple of `cfg:eval_period`, at step 50, and when the stage controller's `request_eval` flag is set, and `train.py::Modeller.figs_due` gates `do_figs` inside it: figures fire on an evaluation whose step is a multiple of `cfg:figs_every_n_evals` times `cfg:eval_period` (canonical 2 and 250), and on every pulled-forward evaluation. `configs/prod_sep20/p20_mip_n5.yaml` sets the step period `cfg:figs_period` 1000 against an `cfg:eval_period` of 500; off the conformer route that key is retired, `config_invariants.py::step_cadence_keys_are_retired` reports it as an `ERROR` and `train.py::Modeller.init_gfn` raises on it. `utils.py::_report_config_invariants` prints violations at load without raising; its docstring records 47 of 2,244 configs in the tree with a non-multiple `figs_period`.
 
 ## What a live log looks like
 
@@ -83,9 +83,9 @@ Resubmission is per array, not per arm: the same `--array=0-{last}` range re-ent
 
 ## Config keys
 
-`cfg:run_name`, `cfg:tag`, `cfg:epochs`, `cfg:eval_period`, `cfg:figs_period`, `cfg:checkpoints_dir`, `cfg:checkpoint_name`, `cfg:prior_model_name`, `cfg:load_weights_only`, `cfg:nonfinite_abort_streak`, `cfg:gpu_util_window_s`, `cfg:gpu_util_sample_period_s`, `cfg:gpu_util_policy_window_s`.
+`cfg:run_name`, `cfg:tag`, `cfg:epochs`, `cfg:eval_period`, `cfg:figs_period`, `cfg:figs_every_n_evals`, `cfg:checkpoints_dir`, `cfg:checkpoint_name`, `cfg:prior_model_name`, `cfg:load_weights_only`, `cfg:nonfinite_abort_streak`, `cfg:gpu_util_window_s`, `cfg:gpu_util_sample_period_s`, `cfg:gpu_util_policy_window_s`.
 
-Code: `train.py::Modeller.train`, `._log_metrics`, `._MAX_LOG_FAILURES`, `._start_gpu_util_thread`, `._sample_gpu_util`, `._gpu_util_mean`, `._gpu_util_capacity`, `._announce_gpu_util_source`, `.vram_ledger`, `.ten_step_reporting`; `train.py::_UTIL_MIN_SPAN_S`, `train.py::FrozenTrainingState`; `gpu_guard.py::_visible_index`; `utils.py::_report_config_invariants`; `config_invariants.py::check`, `::figs_period_fires`; `configs/final_sep19/make.py::SBATCH`, `::SEED_A`, `::SEED_B`, `::WALL`, `::committed_mk_dev`; `mxtaltools/common/sym_utils.py::MONO_CLASS`; `configs/conformer_cond/make.py::conformer_template`, `::render_sbatch`, `::DATA_GUARD`, `::SEED_FRESH`, `::arm_digest`; `configs/mle_w3_sep16/make.py::dirty_files`, `::_scan_local_paths`, `::CLUSTER_CKPTS`, `::CLUSTER_DATA`; `configs/prod_sep20/submit_prod_sep20.sbatch`, `configs/prod_sep20/INDEX_a.tsv`, `configs/prod_sep12/submit_prod_sep12.sbatch`.
+Code: `train.py::Modeller.train`, `._log_metrics`, `._MAX_LOG_FAILURES`, `._start_gpu_util_thread`, `._sample_gpu_util`, `._gpu_util_mean`, `._gpu_util_capacity`, `._announce_gpu_util_source`, `.vram_ledger`, `.ten_step_reporting`; `train.py::_UTIL_MIN_SPAN_S`, `train.py::FrozenTrainingState`; `gpu_guard.py::_visible_index`; `utils.py::_report_config_invariants`; `config_invariants.py::check`, `::figs_period_fires`, `::step_cadence_keys_are_retired`; `train.py::Modeller.figs_due`, `::Modeller.init_gfn`; `configs/final_sep19/make.py::SBATCH`, `::SEED_A`, `::SEED_B`, `::WALL`, `::committed_mk_dev`; `mxtaltools/common/sym_utils.py::MONO_CLASS`; `configs/conformer_cond/make.py::conformer_template`, `::render_sbatch`, `::DATA_GUARD`, `::SEED_FRESH`, `::arm_digest`; `configs/mle_w3_sep16/make.py::dirty_files`, `::_scan_local_paths`, `::CLUSTER_CKPTS`, `::CLUSTER_DATA`; `configs/prod_sep20/submit_prod_sep20.sbatch`, `configs/prod_sep20/INDEX_a.tsv`, `configs/prod_sep12/submit_prod_sep12.sbatch`.
 
 ## Could be tooling
 

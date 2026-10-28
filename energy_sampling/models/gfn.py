@@ -2162,9 +2162,10 @@ class GFN(nn.Module):  # todo add seeding
         something to assume while measuring something else.
 
         ⚠ DEEPCOPY. This installs compiled callables as INSTANCE attributes, so the
-        model must not be deepcopied afterwards. Safe as called: `ema_model` is
-        deepcopied inside init_gfn well before maybe_compile_policy runs at the end
-        of it, and checkpoints ride `state_dict`, which is untouched.
+        model must not be deepcopied afterwards. Safe as called: maybe_compile_policy
+        compiles gfn_model only, at the end of init_gfn, after Modeller.init_gfn's
+        EMA copy (conformer route only, utils.keeps_ema_copy) is taken; checkpoints
+        ride `state_dict`, which is untouched.
         `freeze_backward_policy(source_state=...)` does copy, so it is refused here
         rather than left to fail obscurely mid-run.
 

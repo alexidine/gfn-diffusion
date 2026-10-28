@@ -254,11 +254,9 @@ def test_scrambled_conditions_train_the_blocks_and_not_the_condition_encoder():
 
 
 def test_freezing_p_b_on_a_policy_without_one_is_a_no_op(capsys):
-    from copy import deepcopy
     from train import Modeller
     host = object.__new__(Modeller)
     host.gfn_model = flow_policy(True)
-    host.ema_model = deepcopy(host.gfn_model)
     for mode in ('full', 'head', None):
         host.set_pb_freeze(mode)
     assert 'no learned P_B' in capsys.readouterr().out
@@ -323,7 +321,7 @@ def test_mk_dev_resolves_to_the_unsectioned_keys_the_sde_code_reads():
     from utils import load_yaml
     cfg = load_yaml(str(ROOT / 'configs' / 'mk_dev.yaml'))
     assert cfg['policy']['kind'] == 'sde'
-    for key in ('hold_dead_latent_rows', 'periodic_centroids', 'dplr_rank', 's_emb_dim', 'full_flow'):
+    for key in ('periodic_centroids', 'dplr_rank', 's_emb_dim', 'full_flow'):
         assert key in cfg['model'], key
 
 

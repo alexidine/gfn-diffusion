@@ -445,10 +445,10 @@ def _screen_stub(t, sample, flow):
 
     m = SimpleNamespace(
         condition_log_z=t, device=CPU, buffer_device=CPU,
-        args=SimpleNamespace(buffers=SimpleNamespace(anchor_buffer=cfg), eval_T=10),
+        args=SimpleNamespace(buffers=SimpleNamespace(anchor_buffer=cfg), model=SimpleNamespace(T=10)),
         metric_tracker=SimpleNamespace(get=lambda *a: None),
         energy_function=SimpleNamespace(prior_flow=FLOW if flow else None, bounding_coeff=1.0),
-        ema_model=SimpleNamespace(get_traj_bwd=bwd),
+        gfn_model=SimpleNamespace(get_traj_bwd=bwd),
         anchor_buffer_cls=anchor_cls, _buffer_kwargs=lambda: {},
         _batch_latents=lambda b: torch.zeros(b.condition_id.shape[0], 4),
         apply_anchor_buffer_policy=lambda source: None)

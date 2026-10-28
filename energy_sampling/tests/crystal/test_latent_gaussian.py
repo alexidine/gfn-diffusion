@@ -57,7 +57,7 @@ T = 1.0
 WIDTH = 0.1
 MODE = 0.5
 K = 1.0          # bounding_coeff
-TRAJ = 10        # integrator.T, matching the battery arms
+TRAJ = 10        # model.sde.T, matching the battery arms
 DIM = 12
 SGS = (2, 14, 19, 4, 1)
 

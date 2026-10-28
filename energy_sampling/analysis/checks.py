@@ -1507,7 +1507,7 @@ _CONF_IDENTITY = frozenset(K.CFG_IDENTITY)
 # and still be incomparable to each other.
 _CONF_START_KEYS = (K.CFG_PRIOR_PATH, K.CFG_CONTINUE_FROM_CHECKPOINT,
                     K.CFG_SEED, K.CFG_ENERGY_FUNCTION,
-                    K.CFG_TRAIN_T, K.CFG_EVAL_T)
+                    K.CFG_TRAIN_T, K.CFG_EVAL_T, K.CFG_MODEL_T)
 
 # A key absent from the config and a key present holding null are DIFFERENT and
 # are rendered differently: the first is a config from another tree (the knob
@@ -1637,9 +1637,17 @@ def _conf_per_run(res: CheckResult, run, ctx: Optional[Context],
     # T)'. A config fact, so it is answerable on a run that logged nothing.
     p_t, t = _conf_get(cfg, K.CFG_TRAIN_T)
     p_e, e = _conf_get(cfg, K.CFG_EVAL_T)
-    ft, fe = as_float(t), as_float(e)
+    p_m, m = _conf_get(cfg, K.CFG_MODEL_T)
+    ft, fe, fm = as_float(t), as_float(e), as_float(m)
     subj = f'{label}/T'
-    if np.isnan(ft) or np.isnan(fe):
+    if p_m and not (p_t or p_e):
+        # one key trains and evaluates: nothing to disagree with
+        if np.isnan(fm):
+            res.add(Finding(_CONF_CHECK, subj, State.UNREADABLE,
+                            f'{K.CFG_MODEL_T}={_conf_show(p_m, m)}'))
+        else:
+            res.add(Finding(_CONF_CHECK, subj, State.OK, '', {K.CFG_MODEL_T: fm}))
+    elif np.isnan(ft) or np.isnan(fe):
         res.add(Finding(_CONF_CHECK, subj, State.UNREADABLE,
                         f'{K.CFG_TRAIN_T}={_conf_show(p_t, t)}  '
                         f'{K.CFG_EVAL_T}={_conf_show(p_e, e)}'))

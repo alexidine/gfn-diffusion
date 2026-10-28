@@ -241,8 +241,7 @@ def test_the_log_form_holds_rather_than_fires_on_a_non_positive_value():
 def test_a_reset_empties_the_window_so_a_floor_cannot_cross_a_regime():
     """A window carrying `train_prior` rows into `equilibration` has a floor from
     another regime -- and `fwd/scatter_err` is not even written during
-    `train_prior`, which is bwd-only. Reset also covers resume and every bracket
-    trial restore."""
+    `train_prior`, which is bwd-only. Reset also covers resume."""
     s = _sensor()
     _feed(s, [1.0] * 11)                    # a LOW-level regime
     assert s.armed

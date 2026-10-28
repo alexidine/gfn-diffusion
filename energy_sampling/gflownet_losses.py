@@ -459,7 +459,7 @@ def get_gfn_forward_loss(loss_coeffs,
     # OFF unless the cross-branch term is actually armed -- see the gate in
     # init_train_constants. These tensors carry grad_fn and the model is an
     # nn.Module, so while they are parked here anything that walks the module
-    # (deepcopy, in particular _snapshot_prior) hits a non-leaf tensor and
+    # (deepcopy) hits a non-leaf tensor and
     # raises. Not worth carrying that on every run for a term that is off.
     if getattr(gfn, '_stash_live_branches', False):
         gfn._live_fwd = {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,

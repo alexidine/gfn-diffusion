@@ -404,3 +404,82 @@ def progress_gate(history, spec, step):
         1 if (done and converged) else (3 if (done and degrading) else (2 if done else 0)))
     return out
 
+
+
+#: `heldout_gate` defaults (code defaults for an absent block or key). `auto` takes the first
+#: of HELDOUT_AUTO_SOURCES present in the eval's metrics; the keys are
+#: train.py::Modeller.density_readouts, which writes none of them under a policy without
+#: log_density.
+_HELDOUT_GATE = {'source': 'auto', 'evals': 6, 'nats': 0.25, 'smooth': 3}
+HELDOUT_AUTO_SOURCES = ('eval_test/mle_ref', 'eval_test/mle',
+                        'eval_bwd/mle_heldout_rows_ref', 'eval_bwd/mle_heldout_rows')
+
+
+def parse_heldout_gate(node) -> dict:
+    """The `heldout_gate` block, merged over _HELDOUT_GATE. Raises on unknown keys and on
+    values outside: source a non-empty string, evals and smooth integers >= 1, nats a
+    number >= 0."""
+    if node is None:
+        node = {}
+    if hasattr(node, '__dict__') and not isinstance(node, dict):
+        node = dict(node.__dict__)
+    if not isinstance(node, dict):
+        raise TypeError(f'heldout_gate must be a mapping, got {type(node).__name__}')
+    bad = sorted(set(node) - set(_HELDOUT_GATE))
+    if bad:
+        raise ValueError(f'heldout_gate has unknown key(s) {bad}; keys are {sorted(_HELDOUT_GATE)}')
+    spec = {**_HELDOUT_GATE, **node}
+    if not isinstance(spec['source'], str) or not spec['source']:
+        raise ValueError(f"heldout_gate.source must be 'auto' or a metric key, got {spec['source']!r}")
+    for k in ('evals', 'smooth'):
+        v = spec[k]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f'heldout_gate.{k} must be an integer >= 1, got {v!r}')
+    v = spec['nats']
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v) or v < 0:
+        raise ValueError(f'heldout_gate.nats must be a number >= 0, got {v!r}')
+    spec['nats'] = float(v)
+    return spec
+
+
+def resolve_heldout_source(source: str, metrics: dict):
+    """The metric key the gate reads from `metrics`, or None when it is absent. `auto` is
+    the first of HELDOUT_AUTO_SOURCES present; any other string names one key."""
+    keys = HELDOUT_AUTO_SOURCES if source == 'auto' else (source,)
+    for k in keys:
+        if metrics.get(k) is not None:
+            return k
+    return None
+
+
+def heldout_plateau(state: dict, value: float, evals: int, nats: float, smooth: int) -> dict:
+    """One eval of the held-out plateau gate. Lower `value` is better (a -log q).
+
+    `state` is mutated in place and stays bounded: `raw` holds the last `smooth` values,
+    `smoothed` the last `evals` trailing medians of `raw`, and `best_before` the minimum of
+    every smoothed value that has left `smoothed`. A smoothed value exists once `raw` is full.
+    The verdict `flat` is 1 when `best_before` exists and the best of `smoothed` improves on
+    it by at most `nats` (gain = best_before - min(smoothed) <= nats), else 0. A minimum
+    followed by a rise gives gain < 0, a plateau gain ~ 0; both fire. The first verdict that
+    can be 1 is at eval smooth + evals of the state's life."""
+    raw = state.setdefault('raw', [])
+    sm = state.setdefault('smoothed', [])
+    raw.append(float(value))
+    del raw[:-int(smooth)]
+    out = {'flat': 0.0, 'smoothed': None, 'gain': None}
+    if len(raw) < int(smooth):
+        return out
+    s = float(np.median(raw))
+    sm.append(s)
+    out['smoothed'] = s
+    while len(sm) > int(evals):
+        old = sm.pop(0)
+        bb = state.get('best_before')
+        state['best_before'] = old if bb is None else min(bb, old)
+    bb = state.get('best_before')
+    if bb is None:
+        return out
+    gain = float(bb) - min(sm)
+    out['gain'] = gain
+    out['flat'] = float(gain <= float(nats))
+    return out

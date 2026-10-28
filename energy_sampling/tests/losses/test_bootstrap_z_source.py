@@ -21,11 +21,9 @@ from protocol import StageProtocol
 
 def _stub(counts, logws, min_visits=1, conditional=False, full_flow=False):
     flow = types.SimpleNamespace(scalar=torch.zeros(1))
-    ema_flow = types.SimpleNamespace(scalar=torch.zeros(1))
     m = types.SimpleNamespace(
         gfn_model=types.SimpleNamespace(full_flow=full_flow, conditional=conditional,
                                         flow_model=flow),
-        ema_model=types.SimpleNamespace(flow_model=ema_flow),
         condition_log_z=types.SimpleNamespace(
             count=torch.tensor(counts, dtype=torch.long),
             ema_logw=torch.tensor(logws, dtype=torch.float64),
@@ -44,7 +42,6 @@ def test_prefers_forward_jensen_over_a_visited_tracker():
     proto, m = _stub([50], [46.1])
     StageProtocol._bootstrap_z(proto, {'eval_fwd/jensen_z': -29.3})
     assert m.gfn_model.flow_model.scalar.item() == pytest.approx(-29.3, abs=1e-3)
-    assert m.ema_model.flow_model.scalar.item() == pytest.approx(-29.3, abs=1e-3)
 
 
 def test_falls_back_to_the_tracker_when_there_is_no_eval_stream():

@@ -1149,16 +1149,14 @@ def _lift_lr_control(cfg: dict) -> None:
     # fails LATE: the config loads, and `LRBracket` then refuses the (absent)
     # candidate grid when the controller is constructed at run start.
     #
-    # `mode: fixed, fixed_scale: 1.0` with no burn-in is the FAITHFUL
+    # `mode: fixed` with the one-segment schedule [hold 1.0] is the FAITHFUL
     # translation. Under the retired controller nothing ever moved `peak_scale`
     # off 1.0 for such a config, so its rate was exactly `base_lr` from the first
     # step; that is what this says in the vocabulary that now exists. The same
     # reasoning as `tierc_smoke.pin_auto_lr_without_sensor`.
     if not any(_is_auto_value(cfg.get(k)) for k in _LR_AUTO_KEYS):
         new.setdefault('mode', 'fixed')
-        new.setdefault('fixed_scale', 1.0)
-        new.setdefault('burn_in_steps', 0)
-        new.setdefault('burn_in_scale', 1.0)
+        new.setdefault('schedule', [{'to': 1.0, 'steps': 0, 'kind': 'hold'}])
     else:
         new.setdefault('mode', 'bracket')
 

@@ -1,5 +1,10 @@
 # LR control — current behaviour
 
+> **HISTORY, NOT CURRENT (2026-10-28).** `lr_control.mode: bracket`, `lr_bracket.py`
+> and `lr_bracket_probe.py` were deleted; `mode: fixed` is the only mode. Current
+> behaviour: [`wiki/learning-rate.md`](wiki/learning-rate.md). The text below is
+> the bracket as it stood before the deletion.
+
 Spec of what the code does now. No history, no rationale beyond what is needed to
 read the numbers. Sources: `controller.py`, `lr_bracket.py`,
 `lr_bracket_probe.py`, `configs/mk_dev.yaml`.

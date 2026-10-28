@@ -1,13 +1,11 @@
-"""Phase-2 entry on a route with no prior model, and a bounded stage exit.
+"""Phase-2 entry from a weights-only warm start, and a bounded stage exit.
 
-`skip_if: weights_loaded`. The crystal phase-2 arm enters its conditional stage at step 0
-through `skip_if: prior_loaded`: prior_model_name loads a frozen GFN, begin() sees
-`prior_model`, skips the MLE stage, and advancing fires the next stage's on_enter
-(freeze_pb, rebuild_prior_by_churn, set_lr_flow). The conformer route can never hold a
-`prior_model` -- ConformerModeller.init_prior_dataset never builds one -- so the same arm
-there silently re-ran phase 1 from the loaded weights. `weights_loaded` holds iff this
-process loaded checkpoint_name with load_weights_only (Checkpointer.load_weights_only sets
-`weights_only_loaded`). Crystal configs never name it, and `prior_loaded` is unchanged.
+`skip_if: weights_loaded`. A phase-2 arm enters its stage at step 0 by skipping the MLE
+stage: `weights_loaded` holds iff this process loaded checkpoint_name with
+load_weights_only (Checkpointer.load_weights_only sets `weights_only_loaded`), begin()
+skips the stage, and advancing fires the next stage's on_enter (freeze_pb,
+rebuild_prior_by_churn, set_lr_flow). `prior_loaded` never holds: no route loads a prior
+model (crystal_prior_model_is_retired refuses it off the conformer route).
 
 `max_steps`. Stage exits are AND-lists with no step metric, so "exit on the gate OR after N
 steps" could not be written; and progress_gate reads 0 below its min_history, so an exit on
@@ -99,14 +97,13 @@ def test_a_full_load_is_not_a_weights_only_load():
     assert m.stage == 'train_prior' and calls == []
 
 
-def test_prior_loaded_is_unchanged():
-    crystal = {**PHASE1, 'skip_if': 'prior_loaded'}
-    p, m, _ = engine([crystal, PHASE2], weights_only_loaded=True)
-    p.begin()
-    assert m.stage == 'train_prior', 'a weights-only load must not trip prior_loaded'
-    p, m, _ = engine([crystal, PHASE2], prior_model=object())
-    p.begin()
-    assert m.stage == 'tb_conditioning'
+def test_prior_loaded_never_holds():
+    """No route loads a prior model, so the stage runs whatever the modeller carries."""
+    stage = {**PHASE1, 'skip_if': 'prior_loaded'}
+    for attrs in ({'weights_only_loaded': True}, {'prior_model': object()}, {}):
+        p, m, calls = engine([stage, PHASE2], **attrs)
+        p.begin()
+        assert m.stage == 'train_prior' and calls == [], attrs
 
 
 # ------------------------------------------------------------------ max_steps
