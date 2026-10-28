@@ -23,13 +23,12 @@
 #
 # Read: Excess Energy Nats P50/P90 and Reasonable Sample Fraction on training molecules against eval_test's, eval_fwd/
 # jensen_z, eval_bwd/mle (the clean training rows, the anchors -- not the noised rows stage 1 fits), E/noised_* (the
-# draws' energy marginal against the buffer's at start-up), eval_bwd/mle_heldout_rows, eval_test/mle, against steps, across fractions at one
+# draws' energy marginal against that of the displaced rows at start-up), eval_bwd/mle_heldout_rows, eval_test/mle, against steps, across fractions at one
 # size and across sizes at one fraction. Locally (one block, size S) the 1% subset reached a training-molecule excess
 # P50 of 6.0 kT at 10k steps and the full set plateaued at 32.6 kT (20k steps).
 #
-# Prior construction (both stages): the prior buffer (--stored_source buffer): the training rows as anchors, a Gaussian
-# kick calibrated to 6 kT mean excess over the anchor, admitted under Emin(c) + ramp_floor, ~450k rows in every
-# stage-1 arm, churned at train.py's rate at every eval.
+# Stage-1 rows: the arm's training rows of the prior file (--stored_source prior), each draw displaced afresh at every
+# step by a log10-uniform magnitude in [-2.5, -1.5] along a random direction (--mle_noise_log_range); no buffer.
 # Stage 2 is configs/inn_cap_s2_oct27 (job inncap27s2), chained by this directory's submit_all.sh.
 #
 # Flags are read when the job STARTS from this directory's common.args and the arms file (edit in place
