@@ -27,8 +27,8 @@ prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_data
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
 test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent  # todo make sure this is sympatico with our hold-out molecules & crystals methods
 prior_scan_cache: false      # true = reuse the init-time scoring of prior_path from <prior_path>.scan-<hash>.pt when its identity (file, row count, energy function, MLIP file, space groups, z_primes, eLJ coefficient, energy_config) matches and a re-score of 512 random rows agrees; otherwise score every row and write that file. false = score every row at every launch
-noised_prior:                # read only when prior_path is a pre-noised build (data_processing/build_noised_prior.py; noised_prior.py)
-  window_kT: 6.0             # rows kept within window_kT x energy_config.temperature of their condition's floor (seed energy: molecule + density + pressure terms). null = no energy window
+noised_prior:                # read only when prior_path is a pre-noised build (data_processing/build_noised_prior.py; noised_prior.py)  # todo how do we know / flag this?
+  window_kT: 6.0             # rows kept within window_kT x energy_config.temperature of their condition's floor (seed energy: molecule + density + pressure terms). null = no energy window  # todo does this also affect the noise scale or is that fixed
   packing_window: null       # [lo, hi] packing coefficients kept. null = density_penalty's unpenalised range (molecular_crystal.PACKING_COEFF_WINDOW)
   train_kinds: ['child']     # row kinds the run trains on: 'child' (iso-tile kicks) and/or 'anchor' (the source rows)
   check_rows: 512            # rows re-scored at load, stratified by kind, split, space group and Z'; a miss past tolerance raises
@@ -318,14 +318,14 @@ max_reloads_per_1k_steps: 1.0  # divergence-rewind budget, as a RATE: a run is a
 model:
   kind: sde                    # the model the trainer trains: 'sde' = models/gfn.py::GFN, the SDE policy; 'nf' = models/nf_policy.py::NFPolicy, a normalizing flow as a one-step policy (log P_B = 0). The loader resolves this block (config_invariants.canonical_model_section): the code reads shared + sde as `model` and {kind, nf} as `policy`
   shared:                      # read by both kinds: the latent geometry
-    hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system
+    hold_dead_latent_rows: true  # clamp the latent rows that carry no degree of freedom for this (space group, Z') to their fixed values. false = let the policy write them, which trains dimensions the energy cannot see. The index set is per space group, NOT per crystal system  # todo no reason to allow this at all, is there?
     # Wrap the aunit centroid dims whose aunit spans the full cell width (auv == 1)
     # so the SDE flows through the aunit face instead of piling up against the
     # bounding-energy wall. Resolved per space group and intersected over
     # `space_groups` (models/aunit_periodicity.py); wrap-safe in all 80 SGs with
     # defined aunit bounds. Changes expanded_dim, so NOT checkpoint compatible
     # with a run trained without it.
-    periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)
+    periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)  # todo this was coded for latent aunits. Does it work for FD? (are any FD simple periodic other than P1? How do we know?)
   sde:                         # the SDE policy's architecture; under kind nf it builds only the geometry probe
     full_flow: false           # true for subtb or db losses
     # shared dimensions
@@ -379,7 +379,7 @@ model:
     state_crystal_t_min: 0.0     # trajectory time in [0, 1) before which a state's atoms are described by the molecule alone (trunk state and energy columns zero; no pair list, no trunk call unless a force term reads the state); 0 = every state in its crystal. Read with state_atoms > 0
     state_atoms_t_min: 0.0       # trajectory time in [0, 1) before which the state encoder is given no atoms (it reads the state and the condition alone) and the trunk is not called for the state unless a force term reads it; 0 = atoms at every state. Read with state_atoms > 0; state_crystal_t_min, when set, must not be below it
     state_force_input: false     # true: the state encoder is also given the force on the state from the drift_force trunk (over the trunk's per-row scale, bounded in RMS, then its log magnitude; dim + 1 numbers), for states from force_drift_t_min on and zeros before. Independent of force_drift_fwd / force_drift_bwd and of state_atoms
-  nf:                          # the NF's settings, read only under kind nf (models/nf_policy.py NF_DEFAULTS: the same keys and values, inn_modeller.py's flag defaults)
+  nf:                          # the NF's settings, read only under kind nf (models/nf_policy.py NF_DEFAULTS: the same keys and values, inn_modeller.py's flag defaults)  # todo this is AR only, not the INN, right? Are they easy to combine / add, or no?
     conditioner: transformer   # 'transformer' (causal transformer) or 'made'
     n_blocks: 1
     n_bins: 32
@@ -409,7 +409,7 @@ model:
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
 ################################################################
-drift_force:
+drift_force:  # todo fine to keep as WiP code but not thoroughly tested
   checkpoint: null             # path of a pretrain_atom_trunk.py trunk checkpoint (plain or stacked); required when a force term or state_atoms is on
   chunk: 1000                  # crystal states per geometry build
   max_images: 2000             # image molecules one crystal may hold inside the trunk's reach; its nearest are kept
@@ -432,10 +432,10 @@ figs_period: 500             # how often to log custom figures EXPENSIVE # must 
 
 xcond_eval:                   # cross-conditional density matrix; fires inside eval, costs no energy calls
   enabled: true               # inert unless one of {embedding,molecule,vector}_conditioning is set
-  period: 2500                # steps between runs; must be a multiple of eval_period or it won't fire
+  period: 2500                # steps between runs; must be a multiple of eval_period or it won't fire  # todo can we enforce that? Maybe units of eval periods rather than steps
   conditions: 20              # matrix side C; needs C distinct condition_id in the eval batch or the pass skips
   per_condition: 4            # terminals rolled forward per condition; diagonal is averaged over C*per_condition cells
-  k: 4                        # backward rollouts per cell, split into two replicates; must be even
+  k: 4                        # backward rollouts per cell, split into two replicates; must be even # todo null for NF models, right?
   chunk_rows: 2560            # rows per batched get_traj_bwd call over the C^2*per_condition*k grid
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
@@ -464,7 +464,7 @@ batch_sizer_retest_steps: 1000    # steps a TARGET_MET ladder stands before it r
 # MUST equal integrator.T -- enforced at config load. Drift and variance are
 # learned per step at one dt, and P_B's reference bridge is written in
 # accumulated-variance time, so a different dt integrates a different SDE.
-eval_T: 10
+eval_T: 10  # todo a bit involved but should be in the SDE model params and should just equal eval T (one param) for our purposes always. We can re-add the flexibility later if we need it
 integrator:
   T: 10                        # training diffusion length, and the only trajectory-length parameter -- the discretizer is always uniform over T
 
@@ -554,7 +554,7 @@ integrator:
 # NUMERICS
 #   beta              Huber beta for the TB-style losses.
 #   loss_clip         absolute ceiling on the per-row loss.
-fwd_loss_coeffs:
+fwd_loss_coeffs:  # todo I'm fine with these being comprehensive as long as when composed in training phases they all work correctly (when applied correctly). One point is like, are we calling NF reverse KL 'TB'? I'm ok with it but it has to be clear
   exploration_std: 0.0     # > 0: additive per-step LOG-STD on the forward SAMPLING kernel only; the scored log P_F stays the policy's own density, so the rows are off-policy (VarGrad-safe, emp_z's Z fit is then biased). 0 = on-policy draw
   tb: 0.0
   z_level: 0.0
@@ -640,7 +640,7 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
 # are 'learned', emp_z_persistent is 0, z_calibration runs in rollout mode, and
 # no stage declares weighted_condition_sampling. Nothing below feeds a gradient
 # or a controller here -- it becomes load-bearing on the conditional route.
-condition_log_z:
+condition_log_z:  # todo kindof fine with this as long as its general / doesn't break on larger condition sets
   min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
   half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps. A "visit" is one update() call and a FUSED stage runs its branches together, so a two-branch stage burns two per train step -- 200 visits is ~100 steps there, ~200 on a single-branch unconditional run. A short half-life makes ema_logw little more than the last few batches, which destabilises the conditional route. Matches buffer.DEFAULT_HALF_LIFE_VISITS
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
@@ -729,7 +729,7 @@ protocol: unconditional_tb
 
 protocols:
   # -- UNCONDITIONAL: MLE warm start, then one always-on terminal stage.
-  unconditional_tb:
+  unconditional_tb:  # todo I know I'm mostly against it but a short prose summary of just a couple sentences that parses the below would be nice. Maybe it could be automatically generated when the protocol is altered. It then might also save us some of the truly massive amount of text in the protocol
     stages:  # comments in here need to be cleaned up again
       # -- MLE warm-start: build a broad, self-consistent policy on the dataset
       #    prior (unconditional by design), then freeze it as THE prior model
@@ -967,7 +967,7 @@ protocols:
   #    configs/qm9c_anneal/make.py. On mk_dev's own globals this protocol is
   #    REFUSED at step 0 (Modeller.set_loss_coeffs): buffers.replay_buffer
   #    .prioritise.enabled true beside pooled_source 'replay' and condition_draw.
-  conditional_vargrad:
+  conditional_vargrad:  # todo it's not really vargrad anymore. We can call it conditional TB. We do conditional MLE (no scrambling) followed by TB to either the pooled or forward ema per condition levels. Option for the learned level. Here and above we default to fixed large dataset in MLE and kept into phase 2. No dynamic noising. Grow buffers on forward rollouts and evals and so-on, following our buffer rules. No need for major rebuilds at stage boundaries except maybe to fill replay buffer when in use
     stages:
       - name: train_prior
         train_mode: bwd
@@ -1192,7 +1192,7 @@ protocols:
 #        on_exit: [ 'snapshot:var_conditioned' ]
 
 # shared balance/fused mechanics (per-stage thresholds live in the rules above)
-controller:
+controller:  # todo this is basically not used now, right? Though we still have tons of vestigial code for it connected to the protocols
   min_mode_frac: 0.001  # FALLBACK frac floor for modes a stage's min_fracs doesn't name
   beta: 0.025  # EMA rate of the lexicographic frac nudge. LIVE ONLY under kind: lexicographic -- the ratio/constraint kinds set fracs directly from their integrator state and never call _nudge_mode_fracs
   deactivate_threshold: 0.01  # FALLBACK for stages without their own. Fused loss only: skip computing a branch entirely if its frac falls below this. Keep < 1/3
@@ -1207,7 +1207,7 @@ controller:
 # DIAGNOSTIC. Pairwise cosines between the fused branches' gradients: are they
 # aligned, orthogonal, or in conflict. Costs one extra autograd.grad() per active
 # branch on armed steps only. Off by omission, or with every <= 0.
-grad_geometry:
+grad_geometry:  # todo deprecate this here and in code, for now
   enabled: false
   every: 50
 
@@ -1219,14 +1219,14 @@ buffers:
   # mean_lifetime * max_size / churn_batch_ref = 25,000 train steps here, i.e.
   # ~4 full turnovers in a 100k-step run -- against the replay buffer's 50, a
   # 500x separation that is the whole reason there are two of them.
-  prior_buffer:
+  prior_buffer:  # todo 'prior models' I think likely to be deprecated as a concept
     source: 'anchors'       # 'anchors' | 'prior_model'. WHERE top-ups (and rebuild_prior_by_churn) come from. 'anchors' = noised anchor_buffer rows at anchor_buffer.noise_log_range, no prior MODEL in the loop (owner default 2026-09-18). Under 'anchors', snapshot_prior and prior_model_name are unnecessary and the resume gap they create (no prior_model after a restart) does not exist -- and prior_buffer_prior_admit_rate reads nan, since it counts prior-MODEL admits only. CONDITIONAL ARM: 'anchors' (it still sets prior_model_name, which is what fires train_prior's skip_if)
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
     churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover
     min_size: 10000
-    max_size: 250000
+    max_size: 250000  # todo this needs to be re-tuned for our new 'single large dataset' approach, rather than churned & dynamically noised buffer. New samples added primarily by forward rollouts? Or maybe record-breaking forward samples go to anchors, though we would want them in here too eventually, and they would have to go in directly since we're not dynamically noising anymore
     init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
     expire_max_frac: 0.1  # per manage call, max fraction of the buffer purged for no longer clearing energy < Emin(c) + ramp_floor. 0 = channel off
     anchor_floor_frac: 0.1  # per churn cycle, minimum share of each condition's intake drawn from anchor_buffer. 0 = pooled shortfall backfill only
@@ -1266,18 +1266,18 @@ buffers:
     # Admission is unconditionally uniform (D5); purge is hazard+backstop only
     # (floor/stalled retired -- exactly redundant with hazard+backstop once
     # the draw itself is prioritised). This block controls the DRAW only.
-    prioritise:
+    prioritise:  # todo we should think carefully about when to use this and how the losses should be mixed
       enabled: true     # CONDITIONAL ARM: false. REFUSED beside fwd pooled_source 'replay' and a stage condition_draw: both take the replay rows unweighted
       kappa: 1.0        # draw p ~ d+^kappa. The practical ceiling: kappa=2 blew is_ess_frac to 0.07 with one row at 58x the mean weight, and kappa=0 was the worst arm
       floor_frac: 0.25  # relative floor on surviving d+ as a fraction of the median, so the weight range is bounded by (median/floor)^kappa. Measured ESS knee: 0.01 -> ESS/n 0.11, 0.25 -> 0.63, 0.50 -> 0.80
       symmetric: true  # draw on |delta|^kappa instead of delta_plus^kappa. ON here (the code default is off): under the one-sided draw a row that falls to delta <= 0 gets p = 0, so its ema_logw is never refreshed and it ratchets out of the eligible set permanently -- is_elig_frac drifted 0.74 -> 0.33, monotonic. |delta| leaves every row eligible and holds is_elig_frac at 1.0. Whether it also closes the forward-tail fit gap is NOT yet measured: that needs an on/off arm
-
+  # todo my general thought on these buffers is we need a simple, few-point, global theory of dataset management. It should simplify all this organization I imagine
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission, and tops up prior_buffer via noising + rescoring whenever a
   # prior-sampling churn cycle comes up short
   anchor_buffer:
     # --- anchor churn toggles. All three are independent; absence = today's behaviour ---
-    frozen: true              # CONDITIONAL ARM: false (growth back on). true = anchor MEMBERSHIP is fixed after seeding. Guards AnchorBuffer.admit/thin
+    frozen: true              # CONDITIONAL ARM: false (growth back on). true = anchor MEMBERSHIP is fixed after seeding. Guards AnchorBuffer.admit/thin  # todo could be grown maybe by new conditional minima? Though we don't want too much concentration
       # at the primitives, so all five mutation call sites are covered (eval-cadence thin,
       # screen_and_admit's admit+overflow thin, and top_up_prior_from_anchors' record-breaker
       # admit+overflow thin). Both constructors bypass them, so seeding still works.
@@ -1303,7 +1303,7 @@ buffers:
     # Gates on the CENTERED TB residual, in nats. -5 = the sample is e^5 ~ 150x
     # more probable under the reward than the policy says -- a mode the policy
     # under-weights by more than two orders of magnitude.
-    surprise_cutoff: -5       # cheap k=1 screen estimate
+    surprise_cutoff: -5       # cheap k=1 screen estimate  # todo I still like this surprise business but it has to be folded into our general dataset program
     confirm_cutoff: -5        # K-rollout logsumexp estimate
     confirm_k: 5              # backward rollouts for the confirmation pass. The IWAE bound's bias falls ~1/K, so K=5 is comfortably tighter than the 5-nat gate it feeds
     # Policy-health gate on the whole screen/confirm path: admissions pause
@@ -1314,7 +1314,7 @@ buffers:
     # never judged against a bad ruler. Two channels, both naming a fwd metric:
     # the FLOOR blocks when its metric falls below the bar, the CEILING when
     # |its metric| rises above. A cold channel abstains. floor_metric: null
-    # disables that channel.
+    # disables that channel.  # todo ditto above
     health_gate_floor_metric: null      # r2 retired here -- its denominator is the batch's own diversity, so it reads composition as much as fit
     health_gate_floor: null
     health_gate_ceiling_metric: tb_resid_clipped  # signed pooled TB residual, clipped at beta. 0.5 is the Z-currency bar z_calibration holds
