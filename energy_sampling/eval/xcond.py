@@ -30,6 +30,10 @@ codebase: the step is launch-overhead bound (profiled 2026-09-22), so the (termi
 replicate) grid is flattened and run in a few large batches rather than one call per column.
 log_pf_estimate's terminal-major contiguity contract does not survive that flattening, so its
 one line of math is reproduced explicitly over an [N, C, K] view.
+
+EXACT-DENSITY POLICIES. A one-step flow policy (models/nf_policy.py) has log P_B = 0, so each
+cell's K weights are one number and the estimate is exact at any K: cross_condition_delta_exact
+scores each cell once, without K, and its replicates are identical (noise floor zero).
 """
 import torch
 
@@ -71,6 +75,37 @@ def cross_condition_delta(model, cond_batch, cond_vectors, latents, discretizer,
     w = log_w.view(N, C, k)
     lse = lambda x: torch.logsumexp(x, dim=-1) - torch.log(torch.tensor(float(x.shape[-1]), device=dev))
     return lse(w).double(), lse(w[..., :half]).double(), lse(w[..., half:]).double()
+
+
+@torch.no_grad()
+def cross_condition_delta_exact(model, cond_batch, cond_vectors, latents, chunk_rows: int = 1024):
+    """
+    Delta [N, C] under a policy with an exact density (model.log_density; models/nf_policy.py).
+
+    Its backward path is deterministic, log P_B = 0, so every rollout cross_condition_delta draws
+    for a cell carries the same weight log q(x_i | c_j) and the log-mean-exp over k returns it:
+    this is cross_condition_delta at any k, scored once per cell. The two replicates are the
+    matrix itself, so xcond_metrics reads a noise floor of zero.
+
+    Arguments and layout as cross_condition_delta.
+    """
+    dev = latents.device
+    N, C = latents.shape[0], cond_vectors.shape[0]
+    assert N % C == 0, f'{N} terminals is not a whole number of blocks of {C} conditions'
+
+    # flat grid of (terminal, column)
+    t_idx = torch.arange(N, device=dev).repeat_interleave(C)
+    c_idx = torch.arange(C, device=dev).repeat(N)
+    total = t_idx.numel()
+
+    log_q = torch.empty(total, device=dev)
+    for s in range(0, total, chunk_rows):
+        e = min(s + chunk_rows, total)
+        cols = c_idx[s:e]
+        log_q[s:e] = model.log_density(latents[t_idx[s:e]], cond_vectors[cols],
+                                       cond_batch.subsample_new_batch(cols)).reshape(-1)
+    delta = log_q.view(N, C).double()
+    return delta, delta, delta
 
 
 def xcond_metrics(delta, rep_a, rep_b, worst_quantile: float = 0.9):

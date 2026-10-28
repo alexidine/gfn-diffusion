@@ -1,4 +1,3 @@
-import glob
 import os
 import re
 import shutil
@@ -12,6 +11,7 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, normalize_problem_def
 from models import GFN
+from models.nf_policy import PRECISION_ONLY_KEYS, resolve_policy_entry
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
@@ -343,36 +343,6 @@ class Checkpointer:
             return None
 
         return path
-
-    def find_shared_prior(self) -> Optional[str]:
-        """
-        Any *_prior.pt in checkpoints_dir - regardless of which run saved it -
-        whose stored problem_def matches the current config's exactly (the
-        same strict comparison as find_matching: no conditioning exemption).
-        problem_def carries only the target identity (energy function/config,
-        prior_path, space groups, z_primes, conditioning flags), never
-        architecture/T/lr, so one pretrained prior matches every run on the
-        same problem. Candidates are tried newest-mtime-first; ties in
-        content are the caller's responsibility to avoid (one shared prior
-        per problem per checkpoints_dir). The run's own path_for('prior') is
-        skipped here since find_matching already covers it.
-        """
-        m = self.modeller
-        own = os.path.abspath(self.path_for('prior'))
-        pattern = os.path.join(m.args.checkpoints_dir, '*_prior.pt')
-        candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-        for path in candidates:
-            if os.path.abspath(path) == own:
-                continue
-            try:
-                checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-            except Exception as e:
-                print(f"find_shared_prior: skipping unreadable candidate {path}: {e}")
-                continue
-            stored_def = checkpoint.get('problem_def')
-            if normalize_problem_def(stored_def) == normalize_problem_def(m.problem_def):
-                return path
-        return None
 
     def problem_mismatch_report(self, stored_def: Optional[dict], ignore_keys: tuple = ()) -> str:
         """Readable stored-vs-current problem_def comparison, one line per differing field."""
@@ -754,15 +724,34 @@ class Checkpointer:
         """
         config = dict(checkpoint['gfn_config'])
         # the policy is architecture: the stored entry decides what loads, so a run asking for another kind or other flow
-        # settings would silently train the checkpoint's (an SDE checkpoint carries no entry)
+        # settings would silently train the checkpoint's (an SDE checkpoint carries no entry). Both sides are compared
+        # resolved on the checkpoint's route and rows (a checkpoint written before gfn_config stored them resolved
+        # loads when its resolution matches); the seed and PRECISION_ONLY_KEYS are not compared, and the precision
+        # keys follow this run's config
         entry = getattr(self.modeller, '_policy_entry', None)
-        asked = (entry() if entry is not None else {}).get('policy')
-        held = config.get('policy')
-        strip = lambda e: None if e is None else {k: v for k, v in e.items() if k != 'seed'}
+        asked = resolve_policy_entry((entry() if entry is not None else {}).get('policy'), config)
+        held = resolve_policy_entry(config.get('policy'), config)
+
+        def strip(e):
+            if e is None:
+                return None
+            e = {k: v for k, v in e.items() if k != 'seed'}
+            if 'nf' in e:
+                e['nf'] = {k: v for k, v in e['nf'].items() if k not in PRECISION_ONLY_KEYS}
+            return e
+
         if strip(asked) != strip(held):
             raise ValueError(f"policy in this run's config {strip(asked) or {'kind': 'sde'}} differs from the "
                              f"checkpoint's {strip(held) or {'kind': 'sde'}}: the checkpoint's policy is what would "
                              f"load and train")
+        if held is not None and 'nf' in held:
+            nf = dict(held['nf'])
+            for key in PRECISION_ONLY_KEYS:
+                if nf.get(key) != asked['nf'].get(key):
+                    print(f"gfn_config['policy']['nf']['{key}']: checkpoint {nf.get(key)!r} -> "
+                          f"config {asked['nf'].get(key)!r}")
+                nf[key] = asked['nf'].get(key)
+            config['policy'] = {**held, 'nf': nf}
         current = vars(self.modeller.args.model)
         # the state encoder is architecture: the checkpoint's is the one that loads, so a run asking for
         # another would silently train as the checkpoint's arm

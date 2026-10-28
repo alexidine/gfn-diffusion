@@ -38,7 +38,7 @@ energy are then zero and, when no row of the call needs its crystal, nothing abo
 latent map is built.
 """
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import List, Optional
 
 import torch
@@ -92,9 +92,12 @@ class TrunkContext:
 
 
 def _slice_tables(tables: ImageTables, lo: int, hi: int, node_lo: int) -> ImageTables:
-    return replace(tables, p=tables.p[lo:hi], amask=tables.amask[lo:hi], z=tables.z[lo:hi], nat=tables.nat[lo:hi],
-                   W=tables.W[lo:hi], w=tables.w[lo:hi], kmask=tables.kmask[lo:hi], radius=tables.radius[lo:hi],
-                   ptr=tables.ptr[lo:hi] - node_lo)
+    """Crystals lo:hi of `tables`. Every field of `ImageTables` is per crystal (leading axis B) and is sliced
+    whatever its name (the molecule's extent field was `radius` before MXtalTools' 2026-10-23 builder change
+    and is `reach` after it); `ptr` is re-counted from atom `node_lo`."""
+    out = {f.name: getattr(tables, f.name)[lo:hi] for f in fields(tables)}
+    out['ptr'] = out['ptr'] - node_lo
+    return replace(tables, **out)
 
 
 class TrunkForce:

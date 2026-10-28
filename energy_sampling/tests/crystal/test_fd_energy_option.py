@@ -107,3 +107,35 @@ def test_fd_layout_sets_the_state_width(capsys):
     fd = _energy(capsys, crystal_coordinates='fd', space_groups=[14])
     assert fd.data_ndim == 10 and fd.fd_layout.dim == 10
     assert _energy(capsys).data_ndim == 12
+
+
+def _gfn_config_stub(fd_layout):
+    """A Modeller stand-in carrying what _build_gfn_config reads; the latent periodic-centroid resolution raises."""
+    import types
+    from types import SimpleNamespace
+    from energy_sampling.train import Modeller
+
+    def no_latent_axes():
+        raise AssertionError('latent periodic-centroid axes resolved')
+
+    m = SimpleNamespace(
+        energy_function=SimpleNamespace(fd_layout=fd_layout, data_ndim=12, is_crystal=True),
+        args=SimpleNamespace(molecule_conditioning=False, temperature_conditioning=False, sg_conditioning=False,
+                             zp_conditioning=False, z_primes=[1], model=SimpleNamespace(periodic_centroids=True)),
+        device='cpu', _state_features_dim=lambda: 0, get_conditioning_dim=lambda: 0, _policy_entry=lambda: {},
+        _resolve_dead_latent_rows=lambda: None, _resolve_periodic_centroid_axes=no_latent_axes)
+    for name in ('_build_gfn_config', '_build_latent_gfn_config'):
+        setattr(m, name, types.MethodType(getattr(Modeller, name), m))
+    return m
+
+
+def test_fd_gfn_config_uses_the_chart_wrap_rows_not_latent_centroid_axes(capsys):
+    from energies.fd_coordinates import FDCoordinates
+    layout = FDCoordinates(2, 4.0)
+    cfg = _gfn_config_stub(layout)._build_gfn_config()
+    assert cfg['periodic_centroid_axes'] is None and cfg['dead_latent_rows'] is None
+    assert cfg['dim'] == layout.dim and cfg['angular_mask'] == list(layout.wrap_mask)
+    out = capsys.readouterr().out
+    assert "['t_x', 't_y', 't_z', 'phi']" in out and 'periodic_centroids is not read' in out
+    with pytest.raises(AssertionError, match='latent periodic-centroid'):
+        _gfn_config_stub(None)._build_gfn_config()   # the latent route still resolves them

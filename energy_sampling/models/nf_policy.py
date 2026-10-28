@@ -69,6 +69,26 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
     return s
 
 
+# settings that set the flow's arithmetic precision and no parameter: a resume takes them from the run's config
+# (checkpointing.py::Checkpointer._gfn_config_from)
+PRECISION_ONLY_KEYS = ('tf_fp32',)
+
+
+def resolve_policy_entry(policy, gfn_config: dict):
+    """A gfn_config's `policy` entry with its nf settings as NFPolicy resolves them: NF_DEFAULTS under the entry's
+    settings, then resolve_flow_settings on gfn_config's route (conditional) and live rows (range(dim) less
+    dead_latent_rows, none when hold_dead_latent_rows is false, as models/gfn.py::GFN reads them). None and an SDE
+    entry are returned as given. Resolving a resolved entry returns it unchanged."""
+    if policy is None or policy.get('kind', 'sde') != 'nf':
+        return policy
+    held = gfn_config.get('hold_dead_latent_rows', True)
+    dead = {int(r) for r in (gfn_config.get('dead_latent_rows') or ())} if held else set()
+    live = [i for i in range(int(gfn_config['dim'])) if i not in dead]
+    nf = resolve_flow_settings({**NF_DEFAULTS, **dict(policy.get('nf') or {})}, bool(gfn_config.get('conditional')),
+                               live)
+    return {**policy, 'nf': nf}
+
+
 def build_policy(gfn_config: dict):
     """The policy a gfn_config describes: models/gfn.py::GFN unless the config carries a `policy` entry whose kind is
     'nf' (train.py writes that entry only for a non-SDE policy, so an SDE gfn_config, its checkpoints and problem

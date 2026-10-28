@@ -119,7 +119,10 @@ def _effective_coeffs(args, stage_name: str) -> dict[str, dict]:
     return {m: sp.coeffs(m) for m in MODES}
 
 
-def _stage_summary(spec: dict, index: int, args) -> dict:
+def _stage_summary(spec: dict, index: int, args, coeffs: Optional[dict] = None) -> dict:
+    """`coeffs` given ({mode: effective coefficients}) is used as is, in place of
+    the stub overlay -- the trainer passes its live StageProtocol.coeffs, since
+    by then args carries an overlay already applied."""
     import protocol as P
 
     st = P.Stage(spec, index)
@@ -147,6 +150,9 @@ def _stage_summary(spec: dict, index: int, args) -> dict:
         'exit': _to_plain(getattr(st, 'exit', None)),
         'balance': _to_plain(getattr(st, 'balance', None)),
     }
+    if coeffs is not None:
+        out['effective_loss_coeffs'] = {m: dict(coeffs.get(m) or {}) for m in MODES}
+        return out
     try:
         out['effective_loss_coeffs'] = _effective_coeffs(args, st.name)
     except Exception as e:
@@ -185,6 +191,22 @@ def _periodic_centroid_axes(args):
     return {f'axis_{i}': (i in axes) for i in range(3)}
 
 
+def _fd_wrap_rows(args):
+    """energy_config.crystal_coordinates 'fd': {chart row name: wrapped}, the FD chart's circle rows
+    (energies/fd_coordinates.py::FDCoordinates.wrap_mask) for the one space group; the trainer passes these as the
+    angular mask and does not read model.periodic_centroids. A string when the chart cannot be built."""
+    sgs = list(getattr(args, 'space_groups', []) or [])
+    if len(sgs) != 1:
+        return f'INVALID: needs exactly one space group, got {sgs}'
+    try:
+        from energy_sampling.energies.fd_coordinates import FDCoordinates
+        from energy_sampling.energies.molecular_crystal import FD_LAYOUT_RADIUS
+        fd = FDCoordinates(int(sgs[0]), FD_LAYOUT_RADIUS)
+    except Exception as e:
+        return f'UNRESOLVED: {type(e).__name__}: {e}'
+    return {name: bool(w) for name, w in zip(fd.names, fd.wrap_mask)}
+
+
 def snapshot(yaml_path: str) -> dict:
     """Resolve a config and capture everything it determines, GPU-free.
 
@@ -194,13 +216,19 @@ def snapshot(yaml_path: str) -> dict:
     tighten a rule is that the committed config violates it. A comparator that
     dies on "before" is useless in exactly the case it was built for -- so an
     unloadable config is a REPORTED state, not a crash."""
+    return _snapshot(yaml_path)[0]
+
+
+def _snapshot(yaml_path: str):
+    """`snapshot` plus the resolved args Namespace it was taken from (None when
+    the config does not load)."""
     try:
         import utils
         args = utils.resolve_derived_config(
             utils.preflight_config(utils.dict2namespace(utils.load_yaml(yaml_path))))
     except Exception as e:
         return {'source': str(yaml_path), 'config': {}, 'stages': [],
-                'load_error': f'{type(e).__name__}: {e}'}
+                'load_error': f'{type(e).__name__}: {e}'}, None
     resolved = _to_plain(args)
 
     # SERVO MANAGEMENT IS A PER-KEY PROPERTY, and it is recorded as one so the
@@ -231,7 +259,15 @@ def snapshot(yaml_path: str) -> dict:
     # Computed here rather than via the trainer's `_resolve_periodic_centroid_axes`
     # because that method needs a constructed energy function for an `is_crystal`
     # guard; the axes themselves are a pure function of the space group.
-    resolved['periodic_centroid_axes'] = _periodic_centroid_axes(args)
+    #
+    # On energy_config.crystal_coordinates 'fd' the state is the FD chart, whose
+    # own circle rows are wrapped and model.periodic_centroids is not read: the
+    # snapshot records those rows (fd_wrap_rows) and no periodic_centroid_axes.
+    energy_config = getattr(args, 'energy_config', None)
+    if getattr(energy_config, 'crystal_coordinates', 'latent') == 'fd':
+        resolved['fd_wrap_rows'] = _fd_wrap_rows(args)
+    else:
+        resolved['periodic_centroid_axes'] = _periodic_centroid_axes(args)
 
     # Stage specs come from the RESOLVED args, not from a second read of the
     # YAML: dict2namespace converts in place, so the loaded dict no longer holds
@@ -245,7 +281,7 @@ def snapshot(yaml_path: str) -> dict:
         stages.append(_stage_summary(spec, i, args))
     resolved['_active_protocol'] = active_protocol_name(resolved)
 
-    return {'source': str(yaml_path), 'config': resolved, 'stages': stages}
+    return {'source': str(yaml_path), 'config': resolved, 'stages': stages}, args
 
 
 def contract(yaml_path: str) -> tuple[dict, list[str]]:
@@ -258,11 +294,16 @@ def contract(yaml_path: str) -> tuple[dict, list[str]]:
     are failures here because this command is the canonical-control-surface
     check; experiment generation has its own path that reports them instead.
     """
-    snap = snapshot(yaml_path)
+    return _contract(yaml_path)[:2]
+
+
+def _contract(yaml_path: str):
+    """`contract` plus the resolved args Namespace (None when it does not load)."""
+    snap, args = _snapshot(yaml_path)
     issues = []
     if snap.get('load_error'):
         issues.append(f"load: {snap['load_error']}")
-        return snap, issues
+        return snap, issues, args
 
     try:
         import config_invariants
@@ -279,7 +320,272 @@ def contract(yaml_path: str) -> tuple[dict, list[str]]:
         coeffs = stage.get('effective_loss_coeffs')
         if isinstance(coeffs, str) and coeffs.startswith('ERROR:'):
             issues.append(f"stage {stage.get('name')!r} loss coefficients: {coeffs}")
-    return snap, issues
+    return snap, issues, args
+
+
+# ---------------------------------------------------------------------------
+# Prose summary of a protocol: a few plain sentences per stage, generated from
+# the parsed Stage and its effective loss coefficients. A stage key the
+# sentences do not phrase is listed verbatim in an 'also:' tail.
+
+# loss_coeffs keys that are loss-term weights: phrased when nonzero
+_LOSS_TERMS = ('tb', 'mle', 'tbc', 'z_level', 'vg_lb', 'vg_lme', 'vg_by_condition', 'db',
+               'subtb', 'emp_z', 'emp_z_persistent', 'level_gap', 'pf_boost')
+# loss_coeffs keys the sentences phrase; any other stage override goes in the tail
+_PHRASED_COEFFS = set(_LOSS_TERMS) | {'freeze_policy', 'freeze_z', 'pooled_vg',
+                                      'pooled_source', 'pooled_ratio'}
+# stage keys never phrased: listed in the tail whenever the stage declares them
+_TAIL_KEYS = ('hot_lr_sensor', 'lr_sensor', 'mle_gate', 'min_fracs', 'deactivate_threshold')
+_BRANCH_DATA = {'fwd': 'its own on-policy rollouts',
+                'replay': 'stored forward rollouts in the replay buffer'}
+_BWD_DATA = {'dataset': 'terminals drawn from the prior dataset',
+             'prior': 'terminals drawn from the prior_buffer'}
+
+
+def _num_text(v) -> str:
+    return f'{v:g}' if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+
+
+def _verbatim(v) -> str:
+    """One-line YAML flow form of a config value, keys in declared order."""
+    import yaml
+    if not isinstance(v, (dict, list)):
+        return _num_text(v)
+    return yaml.safe_dump(_to_plain(v), default_flow_style=True, sort_keys=False,
+                          width=10 ** 6).strip()
+
+
+def _trained_params(c: dict) -> str:
+    freeze_policy = float(c.get('freeze_policy', 0) or 0) > 0.5
+    freeze_z = float(c.get('freeze_z', 0) or 0) > 0.5
+    if freeze_policy and freeze_z:
+        return 'nothing (policy and log Z both frozen)'
+    if freeze_policy:
+        return 'log Z only'
+    if freeze_z:
+        return 'the policy only'
+    return 'the policy and log Z'
+
+
+def _terms_text(c: dict) -> str:
+    terms = [f'{k} {_num_text(c[k])}' for k in _LOSS_TERMS
+             if isinstance(c.get(k), (int, float)) and not isinstance(c.get(k), bool)
+             and float(c[k]) != 0.0]
+    return ', '.join(terms) if terms else 'no loss term of its own'
+
+
+def _exit_text(terms) -> str:
+    out = []
+    for t in terms:
+        side, sym = ('above', '>') if 'above' in t else ('below', '<')
+        metric = f"|{t['metric']}|" if t.get('abs') else t['metric']
+        out.append(f"{metric} {sym} {_num_text(t[side])} for {int(t.get('patience', 1))} "
+                   f"fresh measurement(s)")
+    return ' and '.join(out)
+
+
+def _balance_text(spec_bal: dict, parsed: dict) -> tuple[str, set]:
+    """(clause, the spec balance keys it phrases)."""
+    kind = parsed['kind']
+    if kind == 'lexicographic':
+        metrics = [r['metric'] for r in parsed.get('rules') or []]
+        text = (f"a lexicographic balance over {len(metrics)} rule(s)"
+                + (f" on {', '.join(metrics)}" if metrics else '')
+                + f", default boost {_verbatim(parsed['default_boost'])}")
+        ann = parsed.get('anneal_coeffs') or {}
+        if ann:
+            text += ('; each all-clean streak anneals '
+                     + ', '.join(f"{k} toward {_num_text(v['target'])}"
+                                 + (f" (rate {_num_text(v['rate'])})" if 'rate' in v else '')
+                                 for k, v in ann.items()))
+        if parsed.get('anneal_cooldown_steps'):
+            text += f", at least {parsed['anneal_cooldown_steps']} steps apart"
+        return text, {'kind', 'rules', 'default_boost', 'anneal_coeffs',
+                      'anneal_cooldown_steps'}
+    if kind == 'gated_ramp':
+        text = (f"a gated_ramp balance moves share to {parsed['ramp']} while "
+                f"{parsed['metric']} <= {_num_text(parsed['bar'])} and back to "
+                f"{parsed['guard']} otherwise")
+        if parsed.get('ratchet_metric'):
+            text += f", the ramp also held unless {parsed['ratchet_metric']} is near its stage best"
+        return text, {'kind', 'ramp', 'guard', 'metric', 'bar', 'ratchet_metric'}
+    metrics = parsed.get('metrics') or {}
+    text = (f"a {kind} balance splits the {'/'.join(metrics)} share on "
+            f"{', '.join(metrics.values())}")
+    if 'setpoint' in parsed:
+        text += f" at setpoint {_num_text(parsed['setpoint'])}"
+    return text, {'kind', 'metrics', 'setpoint'}
+
+
+def describe_stage(spec: dict, index: int, args=None, *, coeffs: Optional[dict] = None,
+                   successor: Optional[str] = None, n_stages: Optional[int] = None) -> str:
+    """Plain sentences for one stage: what trains which parameters on which data,
+    then cadence / draw / balance / flags, then how the stage starts and ends.
+
+    Fields come from `_stage_summary` (effective loss coefficients included) and
+    from the Stage attributes it does not carry. `coeffs` overrides the summary's
+    coefficients (see _stage_summary); `successor` is the next stage's name, None
+    on the last stage."""
+    import copy
+    import protocol as P
+
+    spec = copy.deepcopy(spec)
+    st = P.Stage(copy.deepcopy(spec), index)
+    summ = _stage_summary(copy.deepcopy(spec), index, args, coeffs=coeffs)
+    eff = summ['effective_loss_coeffs']
+    if isinstance(eff, str):
+        eff = {m: dict(st.loss_coeffs.get(m, {})) for m in MODES}
+        coeff_note = f' (base coefficients unavailable: {summ["effective_loss_coeffs"]})'
+    else:
+        coeff_note = ''
+    tail = []
+    for k in _TAIL_KEYS:
+        if spec.get(k) is not None:
+            tail.append(f'{k}={_verbatim(spec[k])}')
+    for mode, over in (spec.get('loss_coeffs') or {}).items():
+        for k, v in (over or {}).items():
+            if k not in _PHRASED_COEFFS:
+                tail.append(f'loss_coeffs.{mode}.{k}={_verbatim(v)}')
+
+    # -- sentence 1: who trains what on which data
+    data = dict(_BRANCH_DATA, bwd=_BWD_DATA[st.bwd_sampling_mode])
+    of_n = f'{index + 1}/{n_stages}' if n_stages else f'{index + 1}'
+    head = f"Stage {of_n} '{st.name}' ({st.train_mode})"
+    parts = []
+    if st.train_mode == 'bwd':
+        c = eff.get('bwd') or {}
+        parts.append(f"bwd alone trains {_trained_params(c)} on {data['bwd']} with "
+                     f"{_terms_text(c)}")
+    else:
+        total = float(sum(st.fracs.values())) if st.fracs else 0.0
+        # stage override, else controller.deactivate_threshold as train.py reads it;
+        # 0.01 only when no args are given
+        thr = st.deactivate_threshold
+        if thr is None:
+            thr = getattr(getattr(args, 'controller', None), 'deactivate_threshold', None)
+            thr = 0.01 if thr is None else float(thr)
+        for mode in MODES:
+            c = eff.get(mode) or {}
+            if mode == 'fwd' and st.fwd_z_sidecar:
+                parts.append(f"fwd trains {_trained_params(c)} on {data['fwd']} with "
+                             f"{_terms_text(c)}, as a weight-1 sidecar outside the frac mix")
+                continue
+            share = float(st.fracs.get(mode, 0.0)) / total if total > 0 else None
+            weighted = (share is None or share >= thr
+                        or float(st.min_fracs.get(mode, 0.0)) >= thr
+                        or st.balance_can_raise(mode, thr))
+            if not weighted:
+                parts.append(f"{mode} carries no loss weight")
+                continue
+            at = (f" at entry share {share:.2f}" if share is not None
+                  else ' at the share carried from the previous stage')
+            parts.append(f"{mode} trains {_trained_params(c)} on {data[mode]} with "
+                         f"{_terms_text(c)}{at}")
+        fc = eff.get('fwd') or {}
+        pv = fc.get('pooled_vg')
+        if isinstance(pv, (int, float)) and float(pv) > 0:
+            parts.append(f"a pooled VarGrad term (pooled_vg {_num_text(pv)}) pairs "
+                         f"{fc.get('pooled_source', 'fwd')} rows with bwd rows, bwd share "
+                         f"{_num_text(fc.get('pooled_ratio', 0.5))}")
+    sentences = [f"{head}: {'; '.join(parts)}{coeff_note}."]
+
+    # -- sentence 2: cadence, draw, balance, schedule, flags
+    mech = []
+    if st.train_mode == 'fused':
+        if st.fwd_rollout_every > 0:
+            r = f"forward rollouts run on 1 step in {st.fwd_rollout_every}"
+            trig = {k: v for k, v in st.fwd_rollout_triggers.items() if v > 0}
+            if trig:
+                r += ', or early on ' + ', '.join(f'{k} {_num_text(v)}' for k, v in trig.items())
+            if st.replay_warmup_rows:
+                r += (f", and on every step until the replay buffer holds "
+                      f"{st.replay_warmup_rows} trainable rows")
+            if st.z_pin_rollout_every:
+                r += f"; a z-pin rollout (log Z fill only) every {st.z_pin_rollout_every} steps"
+            mech.append(r)
+        else:
+            mech.append('forward rollouts run on every step')
+    if st.condition_draw is not None:
+        cd = st.condition_draw
+        cn = (cd['conditions'] or
+              f"batch_size // {max(cd['replay_rows'], cd['prior_rows'])}")
+        mech.append(f"each step draws {cn} conditions ({cd['pick']}) with exactly "
+                    f"{cd['replay_rows']} replay and {cd['prior_rows']} bwd rows each")
+    if st.balance is not None:
+        btext, phrased = _balance_text(spec.get('balance') or {}, st.balance)
+        mech.append(btext)
+        for k, v in (spec.get('balance') or {}).items():
+            if k not in phrased:
+                tail.append(f'balance.{k}={_verbatim(v)}')
+    for name, s in st.coeff_schedule.items():
+        mech.append(f"{name} ramps to {_num_text(s['target'])} over {s['steps']} steps "
+                    f"({s['kind']}" + (f", from step {s['from_step']}" if 'from_step' in s else '')
+                    + ')')
+    on = [k for k, v in st.flags.items() if v]
+    if on:
+        mech.append(f"flags on: {', '.join(on)}")
+    if mech:
+        sentences.append(mech[0][0].upper() + mech[0][1:]
+                         + ''.join(f'; {m}' for m in mech[1:]) + '.')
+
+    # -- sentence 3: how it starts and ends
+    start = []
+    if st.skip_if:
+        start.append(f"a fresh run skips it when {st.skip_if} holds")
+    actions = [f'{n}:{a}' if a else n for n, a in st.on_enter]
+    if actions:
+        if index == 0:
+            start.append(f"its on_enter ({', '.join(actions)}) never fires, since the first "
+                         f"stage is not entered by a transition")
+        else:
+            start.append(f"on entry it runs {', '.join(actions)}")
+    if not start:
+        start.append('it starts with no entry action' if index else 'a fresh run starts here')
+    exits = [f'{n}:{a}' if a else n for n, a in st.on_exit]
+    stops = 'stop' in [n for n, _ in st.on_exit]
+    if st.exit or st.max_steps is not None:
+        when = []
+        if st.exit:
+            when.append(f"when {_exit_text(st.exit)}")
+        if st.max_steps is not None:
+            when.append(f"after {st.max_steps} of its own steps")
+        end = f"it ends {' or '.join(when)}"
+        run = [a for a in exits if a != 'stop']
+        if run:
+            end += f", runs {', '.join(run)}"
+        if stops:
+            end += ' and ends the run'
+        elif successor:
+            end += f" and advances to '{successor}'"
+        else:
+            end += ' with no successor stage'
+    else:
+        end = "it has no exit and runs until the run's epochs are spent"
+    s3 = '; '.join(start) + '; ' + end + '.'
+    sentences.append(s3[0].upper() + s3[1:])
+
+    text = ' '.join(sentences)
+    if tail:
+        text += ' also: ' + '; '.join(tail)
+    return text
+
+
+def describe_protocol(args, name: str) -> str:
+    """`describe_stage` for every stage of the declared protocol `name`, one
+    paragraph per stage. Coefficients come from the trainer's overlay with `name`
+    selected, so an inactive protocol is described as it would run."""
+    from config_invariants import PROTOCOL_LIBRARY, PROTOCOL_SELECTOR
+    library = _to_plain(getattr(args, PROTOCOL_LIBRARY, None)) or {}
+    specs = list((library.get(name) or {}).get('stages') or [])
+    if not specs:
+        return f"protocol '{name}' declares no stages."
+    view = Namespace(**vars(args))
+    setattr(view, PROTOCOL_SELECTOR, name)
+    paras = []
+    for i, spec in enumerate(specs):
+        successor = specs[i + 1].get('name') if i + 1 < len(specs) else None
+        paras.append(describe_stage(spec, i, view, successor=successor, n_stages=len(specs)))
+    return '\n'.join(paras)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +727,8 @@ def _main():
         ap.error('--check cannot be combined with comparison or snapshot-output options')
 
     if a.check:
-        checked, issues = contract(a.config)
+        import textwrap
+        checked, issues, args = _contract(a.config)
         if issues:
             print(f'{a.config}: contract FAILED')
             for issue in issues:
@@ -437,6 +744,15 @@ def _main():
         print(f'  declared protocols: {declared}')
         print(f'  active stages: {stages}')
         print('  runtime services touched: none (GPU/data/checkpoint/W&B/model not constructed)')
+        for name in sorted((cfg.get('protocols') or {}).keys()):
+            print(f"\n  protocol '{name}'{' (active)' if name == active else ''}:")
+            try:
+                text = describe_protocol(args, name)
+            except Exception as e:
+                text = f'DESCRIPTION FAILED: {type(e).__name__}: {e}'
+            for para in text.split('\n'):
+                print(textwrap.fill(para, width=100, initial_indent='    ',
+                                    subsequent_indent='      '))
         return 0
 
     first = snapshot(a.config)

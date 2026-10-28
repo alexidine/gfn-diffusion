@@ -120,6 +120,27 @@ def test_context_does_not_touch_the_callers_batch(crystals, checkpoint):
         assert torch.equal(getattr(batch, k), v), k
 
 
+def test_chunk_tables_are_the_full_tables_sliced(crystals):
+    """A chunk's image tables are rows lo:hi of every per-crystal field of MXtalTools' `ImageTables`
+    (whatever the molecule-extent field is named), with atom pointers counted from the chunk's first atom."""
+    from dataclasses import fields
+    from mxtaltools.crystal_building.image_pairs import build_image_tables
+    from models.crystal_force import _slice_tables
+    batch = _batch(crystals)
+    tables = build_image_tables(batch)
+    lo, hi = 2, 5
+    node_lo = int(batch.ptr[lo])
+    sub = _slice_tables(tables, lo, hi, node_lo)
+    assert {f.name for f in fields(sub)} == {f.name for f in fields(tables)}
+    for f in fields(tables):
+        want = getattr(tables, f.name)[lo:hi]
+        if f.name == 'ptr':
+            want = want - node_lo
+        assert torch.equal(getattr(sub, f.name), want), f.name
+    assert torch.equal(sub.ptr, batch.ptr[lo:hi] - node_lo)
+    assert torch.equal(_slice_tables(tables, 0, batch.num_graphs, 0).ptr, tables.ptr)
+
+
 def test_refusals(crystals, checkpoint, tmp_path):
     provider = TrunkForce(checkpoint, 'cpu')
     provider.check_energy(6.9, 1.0)

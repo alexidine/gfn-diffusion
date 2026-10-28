@@ -44,6 +44,14 @@ def test_a_batch_without_identifiers_counts_no_molecules():
     assert sizes['data/prior_molecules'] == 0 and sizes['data/prior_rows'] == 6
 
 
+def test_the_prior_record_rides_along(capsys):
+    m = _modeller()
+    m.prior_data_record = {'data/prior_prenoised': 1, 'data/prior_noised_build_T': 2.5}
+    sizes = Modeller.publish_data_set_sizes(m)
+    assert sizes['data/prior_prenoised'] == 1 and sizes['data/prior_noised_build_T'] == 2.5
+    assert 'prior_noised_build_T 2.5' in capsys.readouterr().out
+
+
 def test_written_to_the_run_config_only_when_a_run_is_open(monkeypatch):
     got = []
     monkeypatch.setattr(wandb, 'config', SimpleNamespace(update=lambda d, allow_val_change=False: got.append(d)))

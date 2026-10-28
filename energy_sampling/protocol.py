@@ -2358,6 +2358,22 @@ class StageProtocol:
         print(f"protocol: stage '{new.name}' engaged (fwd {m.fwd_frac:.3f} / "
               f"bwd {m.bwd_frac:.4f} / replay {m.replay_frac:.3f}, "
               f"train_mode {new.train_mode}, bwd_sampling {new.bwd_sampling_mode})")
+        print(f"protocol: {self.describe_live()}")
+
+    def describe_live(self) -> str:
+        """config_snapshot.describe_stage for the live stage, on the live
+        coefficient overlay. Returns a FAILED line instead of raising: it only
+        prints, and runs mid-transition."""
+        try:
+            from config_invariants import active_stages
+            from config_snapshot import describe_stage
+            st = self.stage
+            nxt = self.stages[st.index + 1].name if st.index + 1 < len(self.stages) else None
+            return describe_stage(active_stages(self.m.args)[st.index], st.index, self.m.args,
+                                  coeffs={mode: self.coeffs(mode) for mode in MODES},
+                                  successor=nxt, n_stages=len(self.stages))
+        except Exception as e:
+            return f"stage description FAILED: {type(e).__name__}: {e}"
 
     def _run_action(self, name: str, arg: str, eval_metrics):
         if name == 'snapshot':

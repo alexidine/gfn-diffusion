@@ -215,6 +215,20 @@ def test_turning_periodic_centroids_off_is_distinguishable_from_no_axes(tmp_path
     assert any(p == 'config.periodic_centroid_axes' for p, _, _ in c.changed)
 
 
+def test_an_fd_config_records_the_chart_wrap_rows_not_latent_axes(tmp_path, raw, base_snap):
+    """energy_config.crystal_coordinates 'fd': the state is the FD chart, which wraps
+    its own circle rows; the latent periodic-centroid axes describe nothing the run
+    builds, so the snapshot records the chart's rows instead."""
+    new = copy.deepcopy(raw)
+    new['energy_config']['crystal_coordinates'] = 'fd'
+    cand = snap_of(tmp_path, 'fd.yaml', new)
+    assert 'load_error' not in cand, cand.get('load_error')
+    rows = cand['config']['fd_wrap_rows']
+    assert 'periodic_centroid_axes' not in cand['config']
+    assert {k for k, w in rows.items() if w} == {'t_x', 't_y', 't_z', 'phi'}   # SG 2
+    assert 'fd_wrap_rows' not in base_snap['config']
+
+
 def test_multiple_space_groups_are_recorded_not_raised(tmp_path, raw):
     """periodic_centroids makes the model space-group specific, so >1 is refused
     at construction. The snapshot records that rather than dying -- it exists to

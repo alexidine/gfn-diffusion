@@ -117,6 +117,43 @@ def test_identity_compares_the_current_definition_only():
     assert NP.identity_mismatch({'energy_function': 'elj'}, current) == ["lj_coeff: file None, run 1.0"]
 
 
+def _record_modeller(T=2.5, **block):
+    args = types.SimpleNamespace(energy_config=types.SimpleNamespace(temperature=T), prior_path='p.pt',
+                                 noised_prior=types.SimpleNamespace(**block))
+    return types.SimpleNamespace(args=args, NOISED_PRIOR_RECORD=_modeller_cls().NOISED_PRIOR_RECORD)
+
+
+def _modeller_cls():
+    from train import Modeller
+    return Modeller
+
+
+def test_a_block_on_a_plain_prior_is_inert_and_printed(capsys):
+    rec = _modeller_cls()._noised_prior_record(_record_modeller(window_kT=6.0), None)
+    assert rec == {'data/prior_prenoised': 0}
+    assert 'noised_prior block inert: prior_path is not a pre-noised build' in capsys.readouterr().out
+    m = _record_modeller()
+    del m.args.noised_prior
+    _modeller_cls()._noised_prior_record(m, None)
+    assert 'inert' not in capsys.readouterr().out
+
+
+def test_a_typo_in_the_block_refuses_a_plain_prior_too():
+    with pytest.raises(ValueError, match='unknown keys'):
+        _modeller_cls()._noised_prior_record(_record_modeller(window_kt=6.0), None)
+
+
+def test_a_build_records_its_manifest_and_warns_on_another_temperature(capsys):
+    manifest = dict(k=10, log_lo=-2.5, log_hi=-1.5, window_kT_target=6.0, temperature=2.5)
+    rec = _modeller_cls()._noised_prior_record(_record_modeller(T=2.5), manifest)
+    assert rec == {'data/prior_prenoised': 1, 'data/prior_noised_k': 10, 'data/prior_noised_log_lo': -2.5,
+                   'data/prior_noised_log_hi': -1.5, 'data/prior_noised_window_kT_target': 6.0,
+                   'data/prior_noised_build_T': 2.5}
+    assert 'WARNING' not in capsys.readouterr().out
+    _modeller_cls()._noised_prior_record(_record_modeller(T=6.9), manifest)
+    assert 'built at T 2.5' in capsys.readouterr().out
+
+
 def test_harvest_keeps_high_error_rows_and_records_and_drops_the_rest():
     resid = torch.tensor([0.2, -3.0, 0.1, float('nan'), 0.0])
     log_r = torch.tensor([-10.0, -10.0, -1.0, -10.0, float('-inf')])

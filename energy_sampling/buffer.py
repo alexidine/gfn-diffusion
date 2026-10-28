@@ -2923,9 +2923,32 @@ class ConditionLogZTracker:
         self.discovery_rate_ema = 0.0
         self.discovery_depth_rate_ema = 0.0
         self.discovery_last_step = -1
+        # [library_size] bool mask of the conditions the run trains on, or None for
+        # every condition. Set by set_trainable; delta_stats' quorum counts against
+        # it. Not in state_dict: the trainer re-derives it from its data on every build.
+        self.trainable = None
 
     def __len__(self):
         return self.library_size
+
+    def set_trainable(self, condition_id):
+        """Mark the conditions the run trains on. delta_stats' quorum then counts
+        characterised trainable conditions against the trainable count instead of
+        characterised conditions against library_size. None clears it (whole library).
+        Raises on an empty set or an id outside the library."""
+        if condition_id is None:
+            self.trainable = None
+            return
+        cid = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        if cid.numel() == 0:
+            raise ValueError("ConditionLogZTracker.set_trainable: empty condition set")
+        if int(cid.min()) < 0 or int(cid.max()) >= self.library_size:
+            raise ValueError(f"ConditionLogZTracker.set_trainable: condition ids span "
+                             f"[{int(cid.min())}, {int(cid.max())}], outside a library of "
+                             f"{self.library_size}")
+        mask = torch.zeros(self.library_size, dtype=torch.bool)
+        mask[cid] = True
+        self.trainable = mask
 
     @torch.no_grad()
     def update(self, condition_id, logw, step: int,
@@ -3365,15 +3388,23 @@ class ConditionLogZTracker:
         never-pass-on-ignorance convention as rms_logw_std (the exit gate fires
         on SMALL values), held until at least `min_trusted_frac` of the library
         is characterized on both streams, so a fresh/resumed run cannot exit
-        z_match before the level EMAs have saturated. 'mean' is the trusted mean
-        of |delta(c)|, 'n' the trusted-condition count.
+        z_match before the level EMAs have saturated. With a trainable mask set
+        (set_trainable), the quorum is characterised TRAINABLE conditions against
+        the trainable count, so never-visited held-out conditions do not hold it.
+        'mean' is the trusted mean of |delta(c)| and 'n' the trusted-condition
+        count, both over every characterised condition.
         """
         min_visits = self.min_visits if min_visits is None else min_visits
         mask = (~torch.isnan(self.fwd_level_ema)) & (~torch.isnan(self.bwd_level_ema)) \
                & (self.fwd_level_visits >= min_visits) \
                & (self.bwd_level_visits >= min_visits)
         n = int(mask.sum().item())
-        if n == 0 or n < min_trusted_frac * self.library_size:
+        if self.trainable is None:
+            n_quorum, n_total = n, self.library_size
+        else:
+            n_quorum = int((mask & self.trainable).sum().item())
+            n_total = int(self.trainable.sum().item())
+        if n == 0 or n_quorum < min_trusted_frac * n_total:
             return {'worst': float('inf'), 'mean': float('inf'), 'n': n}
         gap = (self.bwd_level_ema[mask] - self.fwd_level_ema[mask]).abs()
         worst = torch.quantile(gap, _upper_tail(quantile)).item()
@@ -4213,6 +4244,8 @@ class ConditionLogZTracker:
             state.get("global_half_life_updates", DEFAULT_GLOBAL_HALF_LIFE_UPDATES))
         obj.global_logw = float(state.get("global_logw", float("nan")))
         obj.global_effective_count = float(state.get("global_effective_count", 0.0))
+        # not stored: the trainer re-applies it (Modeller._set_tracker_trainable)
+        obj.trainable = None
         return obj
 
 

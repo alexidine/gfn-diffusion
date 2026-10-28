@@ -70,7 +70,7 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
-from models.nf_policy import build_policy
+from models.nf_policy import build_policy, resolve_policy_entry
 from models.crystal_force import CrystalDriftForce, TrunkForce
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
@@ -2410,6 +2410,7 @@ class Modeller:
                                  f"got {untrusted_z!r}")
             self.condition_log_z.untrusted_z = untrusted_z
             self.condition_log_z.global_half_life_updates = float(global_half_life_updates)
+            self._set_tracker_trainable()
             return
         min_visits = getattr(cfg, 'min_visits', 20) if cfg is not None else 20
         # ONE definition of the default, in buffer.py -- a second literal here is
@@ -2434,6 +2435,47 @@ class Modeller:
             global_half_life_updates=global_half_life_updates,
         )
         self._arm_phys_energy_guard()
+        self._set_tracker_trainable()
+
+    def _set_tracker_trainable(self):
+        """Hand condition_log_z the conditions this run trains on
+        (ConditionLogZTracker.set_trainable): every space-group/Z' member of each
+        mol_id on BOTH mol_dataset's and prior_dataset's batches (the intersection;
+        one batch's mol_ids when only it carries them), since training draws redraw
+        SG/Z' per batch. fwd rollouts draw conditions from mol_dataset and bwd from
+        the prior, and delta_stats counts a condition only once both level streams
+        are fed, so a molecule in one source alone is left out of the denominator,
+        as are test_mol_dataset's molecules. MolecularCrystal route only (not the
+        conformer route). Left unset, i.e. the whole-library quorum, when neither
+        batch carries mol_id, the intersection is empty, or the tracker's
+        library_size differs from the energy function's condition_library_size."""
+        ef = self.energy_function
+        tracker = getattr(self, 'condition_log_z', None)
+        if tracker is None or not isinstance(ef, MolecularCrystal):
+            return
+        lib = int(ef.condition_library_size)
+        if int(tracker.library_size) != lib:
+            print(f"condition_log_z: table holds {int(tracker.library_size)} conditions, the energy "
+                  f"function {lib}; trainable mask left unset (whole-library quorum)", flush=True)
+            return
+        mol_ids = [torch.as_tensor(m).detach().cpu().long().flatten()
+                   for m in (getattr(getattr(getattr(self, name, None), 'batch', None), 'mol_id', None)
+                             for name in ('mol_dataset', 'prior_dataset'))
+                   if m is not None]
+        if not mol_ids:
+            return
+        mols = torch.unique(mol_ids[0])
+        for m in mol_ids[1:]:
+            mols = mols[torch.isin(mols, m)]
+        if mols.numel() == 0:
+            print("condition_log_z: mol_dataset and prior_dataset share no molecule; trainable mask "
+                  "left unset (whole-library quorum)", flush=True)
+            return
+        n_combos = ef.n_sg * ef.n_zp
+        block = (mols[:, None] * n_combos + torch.arange(n_combos, dtype=torch.long)[None, :]).flatten()
+        tracker.set_trainable(block)
+        print(f"condition_log_z: {block.numel()} of {lib} conditions trainable "
+              f"(delta_stats quorum denominator)", flush=True)
 
     def _arm_restored_tracker(self):
         """The guard on a full resume, run straight after load_full and so BEFORE
@@ -3253,17 +3295,25 @@ class Modeller:
     def _build_gfn_config(self):
         fd = getattr(self.energy_function, 'fd_layout', None)
         if fd is not None:  # energy_config.crystal_coordinates 'fd': the chart's width and circle rows, no dead rows
-            return dict(self._build_latent_gfn_config(), dim=fd.dim, angular_mask=list(fd.wrap_mask),
-                        periodic_centroid_axes=None, dead_latent_rows=None)
-        return self._build_latent_gfn_config()
+            print(f"crystal_coordinates 'fd': the FD chart wraps its own circle rows "
+                  f"{[n for n, w in zip(fd.names, fd.wrap_mask) if w]}; model.periodic_centroids is not read")
+            cfg = dict(self._build_latent_gfn_config(periodic_centroids=False), dim=fd.dim,
+                       angular_mask=list(fd.wrap_mask), periodic_centroid_axes=None, dead_latent_rows=None)
+        else:
+            cfg = self._build_latent_gfn_config()
+        if 'policy' in cfg:   # the nf settings resolved on this config's route and rows, as the policy builds them
+            cfg['policy'] = resolve_policy_entry(cfg['policy'], cfg)
+        return cfg
 
-    def _build_latent_gfn_config(self):
+    def _build_latent_gfn_config(self, periodic_centroids: bool = True):
+        """gfn_config on the latent chart. periodic_centroids False skips _resolve_periodic_centroid_axes (its checks
+        and its printout of the latent aunit axes) and passes periodic_centroid_axes None."""
         return dict(
             state_features_dim=self._state_features_dim(),
             dim=self.energy_function.data_ndim,
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
-            periodic_centroid_axes=self._resolve_periodic_centroid_axes(),
+            periodic_centroid_axes=self._resolve_periodic_centroid_axes() if periodic_centroids else None,
             dead_latent_rows=self._resolve_dead_latent_rows(),
             conditional=any([
                 self.args.temperature_conditioning,
@@ -3282,7 +3332,9 @@ class Modeller:
     def _policy_entry(self):
         """gfn_config's `policy` entry: {} for the SDE policy (model.kind sde, or no kind), so its gfn_config,
         checkpoints and problem hashes are unchanged; else the kind, the NF's settings (model.nf, resolved to
-        args.policy.nf by the loader) and the run's seed, which models/nf_policy.py::build_policy reads."""
+        args.policy.nf by the loader) and the run's seed, which models/nf_policy.py::build_policy reads. The settings
+        are as configured here; _build_gfn_config replaces them with their resolution on the finished config's route
+        and rows (models/nf_policy.py::resolve_policy_entry), which is what gfn_config and checkpoints store."""
         pol = getattr(self.args, 'policy', None)
         kind = getattr(pol, 'kind', 'sde') if pol is not None else 'sde'
         if kind == 'sde':
@@ -4124,17 +4176,46 @@ class Modeller:
         self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
         print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
               f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} at "
-              f"10^U({manifest.get('log_lo')}, {manifest.get('log_hi')})); training on {int(keep.sum())} rows of kinds "
-              f"{list(s['train_kinds'])} within {s['window_kT']} kT (T {T:g}) of their condition floor and packing "
-              f"{s['packing_window']}; held-out anchor-group rows {int(masks['heldout'].sum())}, clean training "
-              f"anchors {int(masks['anchors'].sum())}; conditions {n_groups}, with no training row "
-              f"{int((kept_per == 0).sum())}, rows per condition min {int(kept_per.min())} median "
-              f"{float(kept_per.float().median()):.0f} max {int(kept_per.max())}", flush=True)
+              f"10^U({manifest.get('log_lo')}, {manifest.get('log_hi')}) and T {manifest.get('temperature')}); "
+              f"training on {int(keep.sum())} rows of kinds {list(s['train_kinds'])} within {s['window_kT']} kT "
+              f"(T {T:g}) of their condition floor and packing {s['packing_window']}; held-out anchor-group rows "
+              f"{int(masks['heldout'].sum())}, clean training anchors {int(masks['anchors'].sum())}; conditions "
+              f"{n_groups}, with no training row {int((kept_per == 0).sum())}, rows per condition min "
+              f"{int(kept_per.min())} median {float(kept_per.float().median()):.0f} max {int(kept_per.max())}",
+              flush=True)
         if not bool(keep.any()):
             raise ValueError("pre-noised prior: no row survives the load-time selection")
         batch = prior.subsample_new_batch(torch.nonzero(keep).flatten().to(dev))
         energy = (-log_r[keep] * T).float()
         return energy.to(self.device), batch.to(self.device)
+
+    # the manifest entries recorded under data/ for a pre-noised prior (manifest key -> data/ key)
+    NOISED_PRIOR_RECORD = (('k', 'data/prior_noised_k'), ('log_lo', 'data/prior_noised_log_lo'),
+                           ('log_hi', 'data/prior_noised_log_hi'),
+                           ('window_kT_target', 'data/prior_noised_window_kT_target'),
+                           ('temperature', 'data/prior_noised_build_T'))
+
+    def _noised_prior_record(self, manifest):
+        """The data/ keys publish_data_set_sizes records for prior_path: data/prior_prenoised 1 when the file carries
+        noised_prior.MANIFEST_KEY (manifest not None), else 0; for a build, the manifest entries of NOISED_PRIOR_RECORD
+        it holds. cfg:noised_prior is read through noised_prior.settings for every prior, so an unknown key raises on
+        either kind; on a prior that is not a build a present block prints that it is inert. A build whose manifest
+        temperature differs from energy_config.temperature prints a warning."""
+        noised_prior.settings(self.args)
+        if manifest is None:
+            if getattr(self.args, 'noised_prior', None) is not None:
+                print("noised_prior block inert: prior_path is not a pre-noised build", flush=True)
+            return {'data/prior_prenoised': 0}
+        record = {'data/prior_prenoised': 1}
+        for key, name in self.NOISED_PRIOR_RECORD:
+            if manifest.get(key) is not None:
+                record[name] = manifest[key] if isinstance(manifest[key], int) else float(manifest[key])
+        T, build_T = float(self.args.energy_config.temperature), manifest.get('temperature')
+        if build_T is not None and abs(float(build_T) - T) > 1e-9 * max(1.0, abs(T)):
+            print(f"WARNING: pre-noised prior {self.args.prior_path} was built at T {float(build_T):g} (its noise "
+                  f"radius calibrated to {manifest.get('window_kT_target')} kT there); this run's "
+                  f"energy_config.temperature is {T:g}", flush=True)
+        return record
 
     def init_prior_dataset(self):
 
@@ -4194,6 +4275,7 @@ class Modeller:
         # a pre-noised prior (data_processing/build_noised_prior.py) is read from its stored terms behind a sampled
         # check, and filtered (_load_noised_prior); any other prior is scored here, as always
         noised_manifest = prior_data.get(noised_prior.MANIFEST_KEY)
+        self.prior_data_record = self._noised_prior_record(noised_manifest)
         if True:  # not hasattr(prior, self.args.energy_function):
             # cfg:prior_scan_cache -- reuse an earlier launch's pass when its identity matches and a
             # sample of rows re-scores to the cached energies (prior_scan_cache.py); otherwise score
@@ -4424,6 +4506,7 @@ class Modeller:
                 identifiers.update(batch.identifier)
 
         self.identifier_registry = {ident: i for i, ident in enumerate(sorted(identifiers))}
+        self.check_held_out_molecules()
 
         for batch in batches:
             if hasattr(batch, 'identifier'):
@@ -4434,12 +4517,67 @@ class Modeller:
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
 
+    @staticmethod
+    def _molecule_keys(batch, smiles=True):
+        """(identifiers, canonical SMILES) of a batch, as sets. Identifiers are batch.identifier as given; SMILES are
+        batch.smiles in data_processing.smiles_mixture.canon's stereo-free canonical form, unparseable ones left out
+        (smiles=False skips them). Either set is empty when the batch (or None) does not carry that field."""
+        def strings(key):
+            value = getattr(batch, key, None) if batch is not None else None
+            if value is None:
+                return set()
+            return {value} if isinstance(value, str) else set(value)
+        canonical = set()
+        if smiles:
+            raw = {s for s in strings('smiles') if isinstance(s, str) and s}
+            if raw:
+                from data_processing.smiles_mixture import canon
+                canonical = {c for c in map(canon, raw) if c is not None}
+        return strings('identifier'), canonical
+
+    def check_held_out_molecules(self):
+        """Raises ValueError when a held-out molecule (test_mol_dataset) is also in a training source: mol_dataset
+        (molecules_path), prior_dataset, prior_heldout_batch or prior_anchor_batch (all prior_path). A molecule matches
+        by identifier, or by canonical SMILES (_molecule_keys) when both batches carry .smiles, so one molecule under
+        two identifiers is caught. The message names both files and the number of shared molecules per source.
+        Prints, without raising, when prior_dataset's identifiers differ from mol_dataset's."""
+        args = getattr(self, 'args', None)
+        mol_path, prior_path = getattr(args, 'molecules_path', None), getattr(args, 'prior_path', None)
+        mol_ids, _ = self._molecule_keys(getattr(getattr(self, 'mol_dataset', None), 'batch', None), smiles=False)
+        prior_ids, _ = self._molecule_keys(getattr(getattr(self, 'prior_dataset', None), 'batch', None), smiles=False)
+        if mol_ids and prior_ids and mol_ids != prior_ids:
+            only_prior, only_mol = sorted(prior_ids - mol_ids), sorted(mol_ids - prior_ids)
+            print(f"prior and condition molecule sets differ: {len(only_prior)} of {len(prior_ids)} prior_path "
+                  f"({prior_path}) molecules are not in molecules_path ({mol_path}) (e.g. {only_prior[:3]}); "
+                  f"{len(only_mol)} of {len(mol_ids)} molecules_path molecules are not in prior_path "
+                  f"(e.g. {only_mol[:3]})", flush=True)
+
+        test = getattr(self, 'test_mol_dataset', None)
+        if test is None:
+            return
+        test_ids, test_smiles = self._molecule_keys(test.batch)
+        sources = [('molecules_path', mol_path, getattr(self.mol_dataset, 'batch', None)),
+                   ('prior_path', prior_path, getattr(self.prior_dataset, 'batch', None)),
+                   ('prior_path held-out anchor groups', prior_path, getattr(self, 'prior_heldout_batch', None)),
+                   ('prior_path clean anchors', prior_path, getattr(self, 'prior_anchor_batch', None))]
+        leaks = []
+        for name, path, batch in sources:
+            ids, smiles = self._molecule_keys(batch, smiles=bool(test_smiles))
+            by_id, by_smiles = sorted(test_ids & ids), sorted(test_smiles & smiles)
+            if by_id or by_smiles:
+                leaks.append(f"{name} ({path}): {len(by_id)} by identifier (e.g. {by_id[:3]}), {len(by_smiles)} by "
+                             f"canonical SMILES (e.g. {by_smiles[:3]})")
+        if leaks:
+            raise ValueError(f"held-out molecules of test_molecules_path ({getattr(args, 'test_molecules_path', None)}) "
+                             f"are also training molecules: " + '; '.join(leaks))
+
     def publish_data_set_sizes(self, **extra):
         """The sizes of the run's data sets, measured after init_identifiers, into the wandb run config under data/
         when a run is open (printed always): train_molecules and test_molecules (distinct identifiers in molecules_path
         and test_molecules_path; 0 for no test file, or a batch without identifiers), prior_rows and prior_molecules
-        (prior_dataset as loaded), molecules (the identifier registry: the union of the three) and
-        condition_library_size (the energy function's). extra: a trainer's own data/ keys. Returns the dict."""
+        (prior_dataset as loaded), molecules (the identifier registry: the union of the three),
+        condition_library_size (the energy function's) and prior_data_record (init_prior_dataset's
+        _noised_prior_record, when set). extra: a trainer's own data/ keys. Returns the dict."""
         def molecules(ds):
             b = getattr(ds, 'batch', None)
             return len(set(b.identifier)) if b is not None and hasattr(b, 'identifier') else 0
@@ -4450,8 +4588,10 @@ class Modeller:
                  'data/prior_molecules': molecules(self.prior_dataset),
                  'data/molecules': len(self.identifier_registry),
                  'data/condition_library_size': int(self.energy_function.condition_library_size),
+                 **getattr(self, 'prior_data_record', {}),
                  **extra}
-        print('data sets: ' + ', '.join(f'{k[5:]} {v:,}' for k, v in sizes.items()), flush=True)
+        print('data sets: ' + ', '.join(f'{k[5:]} {v:g}' if isinstance(v, float) else f'{k[5:]} {v:,}'
+                                        for k, v in sizes.items()), flush=True)
         if wandb.run is not None:
             wandb.config.update(sizes, allow_val_change=True)
         return sizes
@@ -5224,6 +5364,8 @@ class Modeller:
                 # the False default, so without re-asserting it here the guard
                 # against an implicit physical alias would vanish on every rewind.
                 self._arm_phys_energy_guard()
+                # same for the trainable mask, which from_state_dict leaves unset
+                self._set_tracker_trainable()
 
         # set_state_dict above restored lr_ctrl (the scale and the bracket's
         # phase) from the healthy checkpoint, so the cut below compounds off
@@ -8441,6 +8583,10 @@ class Modeller:
         CONDITIONS COME FROM THE CALLER'S BATCH, not a fresh draw. fwd_eval_sampling
         advances the condition cycle, so drawing again here would shift which conditions
         the run trains on next -- a diagnostic that perturbs the run it observes.
+
+        A policy with an exact density (log_density; the NF) scores each cell once with
+        eval/xcond.py::cross_condition_delta_exact and ignores k, which may be null; the
+        SDE policy needs an even k and raises on k null.
         """
         cfg = getattr(self.args, 'xcond_eval', None)
         if cfg is None or not getattr(cfg, 'enabled', False):
@@ -8451,14 +8597,20 @@ class Modeller:
         if not any(bool(getattr(self.args, k, False)) for k in
                    ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning')):
             return {}
+        exact = hasattr(self.ema_model, 'log_density')
+        k = getattr(cfg, 'k', 4)
+        if not exact and k is None:
+            raise ValueError(
+                "xcond_eval.k is null, but the SDE policy's cross-condition density is a "
+                "k-rollout estimate: set xcond_eval.k to an even integer >= 2 (k null is "
+                "accepted only under a policy with an exact density, model.kind nf)")
         period = int(getattr(cfg, 'period', 0) or 0)
         if period <= 0 or self.step_ind % period != 0:
             return {}
 
-        from eval.xcond import cross_condition_delta, xcond_metrics
+        from eval.xcond import cross_condition_delta, cross_condition_delta_exact, xcond_metrics
         C = int(getattr(cfg, 'conditions', 20))
         n = int(getattr(cfg, 'per_condition', 4))
-        k = int(getattr(cfg, 'k', 4))
         batch = sample_batch.to(self.device)
         cid = getattr(batch, 'condition_id', None)
         if cid is None or batch.num_graphs < C or torch.unique(cid[:C]).numel() < C:
@@ -8474,9 +8626,14 @@ class Modeller:
             states, *_ = self.ema_model.get_traj_fwd(
                 get_gfn_init_state(C * n, dim, self.device), eval_discretizer, None,
                 cond_vec[tile], cols.subsample_new_batch(tile))
-            delta, rep_a, rep_b = cross_condition_delta(
-                self.ema_model, cols, cond_vec, states[:, -1], eval_discretizer, k,
-                chunk_rows=int(getattr(cfg, 'chunk_rows', 2560)))
+            chunk_rows = int(getattr(cfg, 'chunk_rows', 2560))
+            if exact:
+                delta, rep_a, rep_b = cross_condition_delta_exact(
+                    self.ema_model, cols, cond_vec, states[:, -1], chunk_rows=chunk_rows)
+            else:
+                delta, rep_a, rep_b = cross_condition_delta(
+                    self.ema_model, cols, cond_vec, states[:, -1], eval_discretizer, int(k),
+                    chunk_rows=chunk_rows)
         out = xcond_metrics(delta, rep_a, rep_b,
                             worst_quantile=float(self.args.conditional_worst_quantile))
         out['xcond/skipped'] = 0.0
@@ -11748,6 +11905,14 @@ class Modeller:
             # by contract (every condition_log_z use on that path is hasattr-
             # gated, see train()); no tracker means no warmed-up log_Z(c) axis,
             # which is exactly the all-False z_mask case -> nothing to screen
+            return
+        if getattr(getattr(self, 'anchor_buffer', None), 'frozen', False):
+            # buffers.anchor_buffer.frozen (set on the buffer by
+            # apply_anchor_buffer_policy): AnchorBuffer.admit returns 0 and thin
+            # returns without acting, so no screen and no confirm rollouts. The
+            # funnel, admitted count and confirm spread are never set, so
+            # log_buffer_stats publishes none of them. A buffer not yet built
+            # (seed_source 'generated') still takes the lazy-bootstrap constructor.
             return
         cfg = self.args.buffers.anchor_buffer
         # admission count accumulated since the last log_buffer_stats read

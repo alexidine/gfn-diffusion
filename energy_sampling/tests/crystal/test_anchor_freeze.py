@@ -197,3 +197,77 @@ def test_policy_is_backward_compatible_with_configs_lacking_the_keys():
 def test_online_loss_flow_refuses_loudly_rather_than_silently_doing_nothing():
     with pytest.raises(NotImplementedError, match="online_loss_flow"):
         _policy(_stub_modeller(_Buf(), online_loss_flow=True, refresh_every_n_evals=3))
+
+
+# ------------------------------- screen_and_admit_anchors on a frozen buffer
+
+def _screen_harness():
+    """test_anchor_currency.py's screen_and_admit_anchors stub (FakeBatch rows,
+    a warm condition 0 whose window admits row 0 of _screen_rows)."""
+    import importlib.util
+    import os
+    spec = importlib.util.spec_from_file_location(
+        'anchor_currency_harness',
+        os.path.join(os.path.dirname(__file__), 'test_anchor_currency.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Admits:
+    """A built anchor buffer recording admit calls, with the buffer's frozen flag."""
+
+    def __init__(self, frozen):
+        self.frozen = frozen
+        self.admitted = []
+
+    def admit(self, batch, reward, energy, **kw):
+        self.admitted.append(energy)
+        return int(energy.numel())
+
+    def __len__(self):
+        return 1
+
+
+def _frozen_screen_stub(buf, cfg_frozen=None):
+    A = _screen_harness()
+    t = A.tracker(min_visits=1)
+    A._warm(t)
+    t.update_best_energy(torch.tensor([0]), torch.tensor([0.0]))
+    m, made = A._screen_stub(t, A._screen_rows(), flow=False)
+    rollouts = []
+    bwd = m.ema_model.get_traj_bwd
+    m.ema_model.get_traj_bwd = lambda *a: rollouts.append(1) or bwd(*a)
+    if buf is not None:
+        m.anchor_buffer = buf
+    if cfg_frozen is not None:
+        m.args.buffers.anchor_buffer.frozen = cfg_frozen
+    from energy_sampling.train import Modeller
+    Modeller.screen_and_admit_anchors(m, A._screen_rows(), torch.full((2,), 100.0),
+                                      torch.tensor([0.5, 50.0]), torch.zeros(2))
+    return m, made, rollouts
+
+
+def test_a_frozen_buffer_skips_the_screen_and_the_confirm_rollouts():
+    buf = _Admits(frozen=True)
+    m, made, rollouts = _frozen_screen_stub(buf)
+    assert rollouts == [], "no backward confirm rollout on a frozen buffer"
+    assert buf.admitted == []
+    for attr in ('_anchor_funnel', 'last_anchor_admitted', 'last_anchor_confirm_spread'):
+        assert not hasattr(m, attr), f"{attr} set, so log_buffer_stats would publish it"
+
+
+def test_an_unfrozen_buffer_still_screens_confirms_and_admits():
+    buf = _Admits(frozen=False)
+    m, _, rollouts = _frozen_screen_stub(buf)
+    assert rollouts == [1]
+    assert [e.tolist() for e in buf.admitted] == [[0.5]]
+    assert m.last_anchor_admitted == 1 and m._anchor_funnel['confirmed'] == 1
+
+
+def test_frozen_config_with_no_buffer_built_still_bootstraps():
+    """seed_source 'generated': the buffer's frozen flag does not exist before the
+    lazy-bootstrap constructor, which a freeze does not reach."""
+    m, made, rollouts = _frozen_screen_stub(None, cfg_frozen=True)
+    assert rollouts == [1]
+    assert made['energy'].tolist() == [0.5]
