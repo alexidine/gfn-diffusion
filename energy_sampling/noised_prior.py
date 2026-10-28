@@ -6,7 +6,8 @@ A pre-noised prior file is an ordinary train.py prior file ({'prior', 'equalized
 whose rows are already scored through the run's analysis (energies stamped with the file's lj_coeff), carrying three
 graph attributes and a manifest under MANIFEST_KEY:
 
-  noised_kind    KIND_ANCHOR (a source row) or KIND_CHILD (an anchor kicked by the iso tile)
+  noised_kind    KIND_ANCHOR (a source row), KIND_CHILD (an anchor kicked by the iso tile), or KIND_HARVESTED
+                 (a row a run scored, merged in from its harvest shards, not kicked)
   noised_split   SPLIT_TRAIN, or SPLIT_HELDOUT (an anchor held out whole, with every child of it)
   noised_parent  the anchor row a child was kicked from (an anchor: itself)
 
@@ -20,8 +21,8 @@ import torch
 
 MANIFEST_KEY = 'noised_build'
 FORMAT_VERSION = 1
-KIND_ANCHOR, KIND_CHILD = 0, 1
-KIND_NAMES = {'anchor': KIND_ANCHOR, 'child': KIND_CHILD}
+KIND_ANCHOR, KIND_CHILD, KIND_HARVESTED = 0, 1, 2
+KIND_NAMES = {'anchor': KIND_ANCHOR, 'child': KIND_CHILD, 'harvested': KIND_HARVESTED}
 SPLIT_TRAIN, SPLIT_HELDOUT = 0, 1
 TAGS = ('noised_kind', 'noised_split', 'noised_parent')
 
@@ -55,8 +56,10 @@ def settings(args):
 def identity(args, energy_function):
     """What is baked into a stored row's energy terms, so a file is read only by runs that would score it the same:
     the energy function and its weights, the analysis settings as resolved (MolecularCrystal.analyze_crystal_batch's
-    defaults, then energy_config.analyze_kwargs), the state chart, the MLIP density guard, the legacy triclinic wall
-    switch, the space groups and Z' the run builds, and the eLJ coefficient the energies are scaled by."""
+    defaults, then energy_config.analyze_kwargs), the MLIP density guard, the legacy triclinic wall switch, the space
+    groups and Z' the run builds, and the eLJ coefficient the energies are scaled by. Not the state chart
+    (energy_config.crystal_coordinates): the stored terms are the crystal's, and the chart's Jacobian is recomputed from
+    the crystal whenever a reward is composed (prebuilt_sample_to_reward), so a latent-chart build serves an FD run."""
     analyze = dict(cutoff=10, supercell_size=10, std_orientation=False)
     analyze.update({k: v for k, v in dict(getattr(energy_function, 'analyze_kwargs', {}) or {}).items()
                     if k not in ('predictor', 'c', 'width')})
@@ -67,7 +70,6 @@ def identity(args, energy_function):
         'mlip': os.path.basename(str(mlip)) if mlip else None,
         'analyze_kwargs': {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
                            for k, v in sorted(analyze.items())},
-        'crystal_coordinates': str(getattr(ec, 'crystal_coordinates', 'latent')),
         'mlip_max_packing_coeff': getattr(ec, 'mlip_max_packing_coeff', None),
         'legacy_triclinic_walls': os.environ.get('MXT_LEGACY_TRICLINIC_WALLS'),
         'space_groups': [int(s) for s in args.space_groups],
@@ -78,8 +80,10 @@ def identity(args, energy_function):
 
 
 def identity_mismatch(stored, current):
-    """The identity keys on which a file and a run differ, as 'key: file X, run Y' strings (empty when they agree)."""
-    keys = sorted(set(stored) | set(current))
+    """The identity keys on which a file and a run differ, as 'key: file X, run Y' strings (empty when they agree).
+    The keys are the current definition's (identity): a key a file records that this code no longer counts as identity
+    does not refuse it; a key the file lacks does."""
+    keys = sorted(current)
     return [f"{k}: file {stored.get(k)!r}, run {current.get(k)!r}" for k in keys if stored.get(k) != current.get(k)]
 
 
@@ -174,3 +178,16 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s):
     return dict(floor_ok=floor_ok, train=(splits == SPLIT_TRAIN) & kind_ok & good,
                 heldout=(splits == SPLIT_HELDOUT) & kind_ok & good,
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
+
+
+def strip_analysis_helpers(b):
+    """Drop what the analysis leaves on a batch that is not row data: the lazy space-group tables, and its
+    dict-valued attributes (`computes` holds bound methods, which pickle the whole batch object they belong to, on
+    whatever device it was scored: a file saved with them is larger and does not load on a CPU-only host)."""
+    from energies.molecular_crystal import SG_LOOKUP_TABLES
+    for attr in SG_LOOKUP_TABLES:
+        if hasattr(b, attr):
+            delattr(b, attr)
+    for key in [k for k in b.keys() if isinstance(b[k], dict)]:
+        delattr(b, key)
+    return b

@@ -47,7 +47,7 @@ import profiling
 import wandb
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference
+from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
     DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, \
@@ -3925,6 +3925,36 @@ class Modeller:
             log_r.append(lr.double().flatten().cpu())
         return torch.cat(seed), torch.cat(log_r)
 
+    @torch.no_grad()
+    def _attach_fd_reference(self, batch):
+        """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
+        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows), attached as a
+        row attribute so it rides with every draw. Returns [n] bool: the rows that have an FD chart point (a row
+        that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
+        dropped; its reference is set to 0)."""
+        ef = self.energy_function
+        params = batch.full_cell_parameters().detach().cpu()
+        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+        sg = batch.sg_ind.reshape(-1).cpu().tolist()
+        radius = batch.radius.reshape(-1).detach().cpu().tolist()
+        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg, radius)]
+        by_key = defaultdict(list)
+        for i, k in enumerate(keys):
+            by_key[k].append(i)
+        ok = torch.zeros(len(keys), dtype=torch.bool)
+        log_ref = torch.zeros(len(keys), dtype=torch.float32)
+        for key, rows in by_key.items():
+            fc = ef.fd_coordinates_for(*key)
+            rows = torch.tensor(rows)
+            r = fc.from_params(params[rows], hand[rows])
+            good = rows[r.ok]
+            ok[good] = True
+            if good.numel():
+                _, _, lr = fc.to_params(r.s[r.ok].double())
+                log_ref[good] = lr.float()
+        batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
+        return ok
+
     def _load_noised_prior(self, prior, manifest):
         """(energy [n], batch) of a pre-noised prior file (data_processing/build_noised_prior.py) without scoring it:
         1. its identity (noised_prior.identity: the energy function, analysis settings, chart, eLJ coefficient) must
@@ -3946,7 +3976,14 @@ class Modeller:
             raise ValueError(f"pre-noised prior {self.args.prior_path} was scored under another energy definition; "
                              f"rebuild it for this run. Differences: " + '; '.join(bad))
 
+        fd_ok = None
+        if getattr(ef, 'crystal_coordinates', 'latent') == 'fd':
+            fd_ok = self._attach_fd_reference(prior)
+            print(f"pre-noised prior: FD chart points for {int(fd_ok.sum())} of {fd_ok.numel()} rows "
+                  f"(rows without one are dropped)", flush=True)
         idx = noised_prior.check_rows(prior, s['check_rows'], seed=int(self.args.seed))
+        if fd_ok is not None:
+            idx = idx[fd_ok[torch.as_tensor(idx)].numpy()]
         stored = prior.subsample_new_batch(torch.as_tensor(idx, device=prior.ptr.device))
         _, fresh = self._score_prior_rows(stored, announce=False)
         ratio, worst, per_term = noised_prior.compare_terms(stored, fresh, self.args.energy_function)
@@ -3958,6 +3995,8 @@ class Modeller:
                              f"terms (worst miss {worst:.3g}): the file is stale or was built by other code")
 
         seed_e, log_r = self._stored_reward_terms(prior)
+        if fd_ok is not None:
+            log_r = torch.where(fd_ok, log_r, torch.full_like(log_r, float('nan')))
         kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
         packing = torch.as_tensor(prior.packing_coeff).reshape(-1).double().cpu()
         groups = noised_prior.condition_groups(prior)
@@ -3967,6 +4006,7 @@ class Modeller:
         kept_per = torch.bincount(groups[keep], minlength=n_groups)
         dev = prior.ptr.device
         pick = lambda m: prior.subsample_new_batch(torch.nonzero(m).flatten().to(dev)) if bool(m.any()) else None
+        self.prior_is_prenoised = True   # the prior buffer is these rows: _prior_is_static
         self.prior_heldout_batch = pick(masks['heldout'] & torch.isfinite(log_r))
         self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
         print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
@@ -4721,6 +4761,7 @@ class Modeller:
                     # these bytes are frozen at zero write cost.
                     self.checkpointer.archive(self.step_ind)
 
+            self.flush_harvest()   # cfg:harvest: the rows still held in memory
             self.checkpointer.save('final', with_buffers=True)
             print("Finished Training!")
 
@@ -9832,7 +9873,22 @@ class Modeller:
             f'{prefix}_excess_energy_hist': safe_histogram(excess, num_bins=128),
         }
 
+    def _prior_is_static(self, what: str) -> bool:
+        """True when prior_path is a pre-noised build (_load_noised_prior): its rows are the prior buffer's whole content,
+        built offline, so the in-run noising, churn, top-up and expiry of that buffer do not run (docs/design/
+        prior_dataset_build.md). `what` names the skipped call, printed once."""
+        if not getattr(self, 'prior_is_prenoised', False):
+            return False
+        seen = self.__dict__.setdefault('_static_prior_skips', set())
+        if what not in seen:
+            seen.add(what)
+            print(f"pre-noised prior: {what} skipped -- the prior buffer is the file's filtered rows, built offline",
+                  flush=True)
+        return True
+
     def manage_prior_buffer(self, sample_batch):
+        if hasattr(self, 'prior_buffer') and self._prior_is_static('manage_prior_buffer (admission, churn, expiry)'):
+            return
         if not hasattr(self, 'prior_buffer'):
             self.prior_buffer = self.buffer_cls(
                 sample_batch,
@@ -10144,6 +10200,7 @@ class Modeller:
     @torch.no_grad()
     def rebuild_prior_by_churn(self, target_size: Optional[int] = None):
         """
+        (A pre-noised prior skips this: _prior_is_static.)
         Stage action ('rebuild_prior_by_churn[:N]'): discard prior_buffer and
         refill it from zero by repeating the ordinary churn admission cycle
         (_prior_churn_cycle) until it holds target_size rows.
@@ -10179,6 +10236,8 @@ class Modeller:
         containing this transition reports the rebuild's own source mix rather
         than a steady-state rate.
         """
+        if self._prior_is_static('rebuild_prior_by_churn'):
+            return
         cfg = self.args.buffers.prior_buffer
         if target_size is None:
             target_size = int(cfg.max_size * getattr(cfg, 'init_fraction', 0.25))
@@ -10322,6 +10381,8 @@ class Modeller:
         exact counts (_stratified_anchor_draw) so an anchor floor is guaranteed
         per condition rather than merely expected -- `n` must equal its sum.
         """
+        if self._prior_is_static('top_up_prior_from_anchors'):
+            return
         cfg = self.args.buffers.anchor_buffer
 
         if purge_worst and self._prior_buffer_len() > 0:
@@ -10723,6 +10784,81 @@ class Modeller:
         self.gfn_model._force_stats = stats
         return legs.to(self.buffer_device)
 
+    @torch.no_grad()
+    def harvest_scored_rows(self, fwd_stats, sample_batch, origin):
+        """cfg:harvest: keep a scored rollout's rows for the next prior build (docs/design/prior_dataset_build.md, Saving
+        every scored state). Kept: rows with a finite reward whose TB residual |log P_F - log P_B - log R + log Z| is at
+        least min_abs_resid nats (owner 2026-10-27: low-error rows are dropped), and rows at or below their condition's
+        best known energy. A kept row is the scored crystal itself (its energy terms already attached, the form a prior
+        file holds), with harvest_step, harvest_origin and harvest_resid. Rows collect in memory and go to disk as
+        one shard of at most shard_rows rows (flush_harvest), written whole under a name unique to the process."""
+        cfg = getattr(self.args, 'harvest', None)
+        if cfg is None or not bool(getattr(cfg, 'enabled', False)):
+            return
+        log_r = fwd_stats['log_r'].detach().flatten()
+        log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
+        resid = ((fwd_stats['log_pf'] - fwd_stats['log_pb']) - (fwd_stats['log_r'] - log_z)).detach().flatten().cpu()
+        log_r = log_r.cpu()
+        keep = torch.isfinite(log_r) & torch.isfinite(resid) & (resid.abs() >= float(cfg.min_abs_resid))
+        cid = fwd_stats.get('condition_id')
+        if cid is not None:
+            floor = self._condition_energy_floor(torch.as_tensor(cid).detach().cpu().long().flatten())
+            if floor is not None:
+                energy = -log_r * float(self.args.energy_config.temperature)
+                keep |= torch.isfinite(log_r) & (energy <= floor.cpu().flatten())
+        idx = torch.nonzero(keep).flatten()
+        self.harvest_seen = getattr(self, 'harvest_seen', 0) + int(log_r.numel())
+        if idx.numel() == 0:
+            return
+        rows = noised_prior.strip_analysis_helpers(
+            sample_batch.subsample_new_batch(idx.to(sample_batch.ptr.device)).detach().cpu())
+        n = int(idx.numel())
+        # the molecule key a rebuild matches on: rollout batches drop `identifier`, so it is restored from the run's
+        # registry through mol_id (a run-local index, not stable across runs, so never stored alone)
+        ident = getattr(rows, 'identifier', None)
+        if ident is None or len(ident) != n or any(i is None for i in ident):
+            mol_id = getattr(rows, 'mol_id', None)
+            if mol_id is None and cid is not None:
+                ef = self.energy_function
+                mol_id = torch.as_tensor(cid).detach().cpu().long().flatten()[idx] // (ef.n_sg * ef.n_zp)
+            if mol_id is None:
+                raise RuntimeError("harvest: a scored row carries neither identifier nor mol_id")
+            by_id = {v: k for k, v in self.identifier_registry.items()}
+            rows.identifier = [by_id[int(m)] for m in torch.as_tensor(mol_id).reshape(-1).tolist()]
+        rows.add_graph_attr(torch.full((n,), int(self.step_ind), dtype=torch.long), 'harvest_step')
+        rows.add_graph_attr(torch.full((n,), int(origin), dtype=torch.long), 'harvest_origin')
+        rows.add_graph_attr(resid[idx].float(), 'harvest_resid')
+        if not hasattr(self, '_harvest_parts'):
+            self._harvest_parts, self._harvest_rows, self.harvest_kept = [], 0, 0
+        self._harvest_parts.append(rows)
+        self._harvest_rows += n
+        self.harvest_kept += n
+        if self._harvest_rows >= int(cfg.shard_rows):
+            self.flush_harvest()
+
+    def flush_harvest(self):
+        """Write the harvested rows held in memory as one shard: <dir or checkpoints_dir/harvest>/<run_name>_
+        <pid>_<first step>_<sequence>.pt, through a temporary name then a rename, so a shard on disk is always whole. Each
+        shard carries the run's noised_prior identity, so a rebuild can refuse rows scored another way."""
+        parts = getattr(self, '_harvest_parts', None)
+        if not parts:
+            return None
+        cfg = self.args.harvest
+        root = getattr(cfg, 'dir', None) or os.path.join(self.args.checkpoints_dir, 'harvest')
+        os.makedirs(root, exist_ok=True)
+        batch = merge_batches(parts)
+        first = int(torch.as_tensor(batch.harvest_step).min())
+        self._harvest_seq = getattr(self, '_harvest_seq', -1) + 1   # two shards can open on one step
+        path = os.path.join(root, f"{self.run_name}_{os.getpid()}_{first:08d}_{self._harvest_seq:04d}.pt")
+        torch.save({'rows': batch, 'identity': noised_prior.identity(self.args, self.energy_function),
+                    'run_name': self.run_name, 'temperature': float(self.args.energy_config.temperature)},
+                   path + '.partial')
+        os.replace(path + '.partial', path)
+        print(f"harvest: wrote {int(batch.num_graphs)} rows to {path} (kept {self.harvest_kept} of "
+              f"{self.harvest_seen} scored rows so far)", flush=True)
+        self._harvest_parts, self._harvest_rows = [], 0
+        return path
+
     def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True,
                              origin: int = ORIGIN_ROLLOUT):
         """
@@ -10789,6 +10925,8 @@ class Modeller:
         plus a batch. It is a label, read only by the composition metrics, and
         changes no admission or eviction decision.
         """
+        # cfg:harvest -- every scored rollout reaches this call, in every stage; the shard writer keeps its share
+        self.harvest_scored_rows(fwd_stats, sample_batch, origin)
         in_play = self.replay_in_play()
         if in_play is not self._replay_managed:
             # announced on every flip (both directions) so the transition print

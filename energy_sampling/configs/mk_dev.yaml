@@ -32,6 +32,11 @@ noised_prior:                # read only when prior_path is a pre-noised build (
   packing_window: null       # [lo, hi] packing coefficients kept. null = density_penalty's unpenalised range (molecular_crystal.PACKING_COEFF_WINDOW)
   train_kinds: ['child']     # row kinds the run trains on: 'child' (iso-tile kicks) and/or 'anchor' (the source rows)
   check_rows: 512            # rows re-scored at load, stratified by kind, split, space group and Z'; a miss past tolerance raises
+harvest:                     # scored rollout rows kept for the next prior build (train.py::Modeller.harvest_scored_rows)
+  enabled: false
+  min_abs_resid: 1.0         # nats: rows whose |TB residual| is at least this are kept, and rows at or below their condition's best known energy
+  shard_rows: 20000          # rows per shard written to disk
+  dir: null                  # null = <checkpoints_dir>/harvest
 archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O  # todo on MLIP models set this to 1k
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
 override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR bracket re-stamps every rate on its next tick anyway

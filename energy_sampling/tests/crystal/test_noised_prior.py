@@ -109,3 +109,9 @@ def test_compare_terms_passes_float_noise_and_fails_a_real_miss():
     far = types.SimpleNamespace(**{**vars(near), 'elj': stored.elj + torch.tensor([0.0, 2.0])})
     ratio, worst, per = NP.compare_terms(stored, far, 'elj')
     assert ratio > 1.0 and abs(worst - 2.0) < 1e-6 and abs(per['elj'] - 2.0) < 1e-6
+
+
+def test_identity_compares_the_current_definition_only():
+    current = dict(energy_function='elj', lj_coeff=1.0)
+    assert NP.identity_mismatch({**current, 'crystal_coordinates': 'latent'}, current) == []
+    assert NP.identity_mismatch({'energy_function': 'elj'}, current) == ["lj_coeff: file None, run 1.0"]

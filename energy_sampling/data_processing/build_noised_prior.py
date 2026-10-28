@@ -68,6 +68,7 @@ def build_parser():
     p.add_argument('--chunk', type=int, default=4096, help='rows per scoring call')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--limit_anchors', type=int, default=None, help='the first N anchors only (tests)')
+    p.add_argument('--harvest', default=None, help='a glob of train.py harvest shards (cfg:harvest) to merge in')
     return p
 
 
@@ -81,13 +82,12 @@ def git_commit(path):
 def collate(batches):
     """One batch of every row of `batches`, in order, as batched_analyze_crystal_batch joins its own chunks
     (energies.molecular_crystal.merge_batches, after dropping the lazy space-group tables)."""
-    from energies.molecular_crystal import SG_LOOKUP_TABLES, merge_batches
+    from energies.molecular_crystal import merge_batches
     batches = list(batches)
     for b in batches:
-        for attr in SG_LOOKUP_TABLES:
-            if hasattr(b, attr):
-                delattr(b, attr)
+        NP.strip_analysis_helpers(b)
     return merge_batches(batches)
+
 
 
 def score(ef, batch, T, device, chunk):
@@ -118,6 +118,27 @@ def seed_energy(ef, batch, T, device, chunk=8192):
             _, ens = ef.prebuilt_sample_to_reward(c, T, return_ens_dict=True)
         out.append(ef.seed_energy_from(ens).double().cpu().flatten())
     return torch.cat(out)
+
+
+def load_harvest(pattern, identity, keys, molecules):
+    """(the rows of every harvest shard matching `pattern` whose molecule is among `molecules`, reduced to the attribute
+    names `keys` the source rows carry, or None; the files read). A shard scored under another energy definition
+    (noised_prior.identity) raises."""
+    import glob
+    files = sorted(glob.glob(pattern))
+    parts = []
+    for f in files:
+        d = torch.load(f, weights_only=False, map_location='cpu')
+        bad = NP.identity_mismatch(d['identity'], identity)
+        if bad:
+            raise SystemExit(f"harvest shard {f} was scored under another energy definition: " + '; '.join(bad))
+        b = NP.strip_analysis_helpers(d['rows'])
+        for key in [k for k in b.keys() if k not in keys and k not in ('batch', 'ptr')]:
+            delattr(b, key)
+        keep = [i for i, m in enumerate(b.identifier) if str(m) in molecules]
+        if keep:
+            parts.append(b.subsample_new_batch(torch.tensor(keep)))
+    return (collate(parts) if parts else None), files
 
 
 def kick(batch, lo, hi, device):
@@ -206,11 +227,37 @@ def main(argv=None):
     anchors['smiles'] = None
     print(f"anchors: {what}: {anchors.num_graphs} rows; T {T:g}, lj_coeff {ef.lj_coeff}", flush=True)
 
+    # HARVEST (cfg:harvest shards of earlier runs): rows of the source's molecules join the pool, are scored with it,
+    # and a harvested row below its condition's floor over the source anchors becomes an anchor (kicked like one);
+    # the rest are written once, kind KIND_HARVESTED, no children
+    n_src, harvest_files, rest = anchors.num_graphs, [], None
+    if args.harvest:
+        harvested, harvest_files = load_harvest(args.harvest, NP.identity(run_args, ef), set(anchors.keys()),
+                                                {str(m) for m in anchors.identifier})
+        if harvested is not None:
+            harvested['smiles'] = None
+            anchors = collate([anchors, harvested])
+        print(f"harvest: {0 if harvested is None else harvested.num_graphs} rows of these molecules from "
+              f"{len(harvest_files)} shard(s)", flush=True)
+
     t0 = time.time()
     anchors = collate(score(ef, anchors, T, args.device, args.chunk))
     e_anchor = seed_energy(ef, anchors, T, args.device)
     print(f"anchors scored in {time.time() - t0:.0f} s; seed energy min {float(e_anchor.min()):.2f} "
           f"P50 {float(e_anchor.median()):.2f} max {float(e_anchor.max()):.2f}", flush=True)
+    n_promoted = 0
+    if anchors.num_graphs > n_src:
+        groups0 = NP.condition_groups(anchors)
+        is_src = torch.arange(anchors.num_graphs) < n_src
+        floor0 = NP.condition_floor(e_anchor, groups0, is_src & torch.isfinite(e_anchor))
+        promote = ~is_src & torch.isfinite(e_anchor) & (e_anchor < floor0)
+        kick_rows = torch.nonzero(is_src | promote).flatten()
+        rest_rows = torch.nonzero(~is_src & ~promote).flatten()
+        n_promoted = int(promote.sum())
+        rest = anchors.subsample_new_batch(rest_rows) if rest_rows.numel() else None
+        anchors, e_anchor = anchors.subsample_new_batch(kick_rows), e_anchor[kick_rows]
+        print(f"harvest: {n_promoted} rows below their condition's floor become anchors; "
+              f"{rest_rows.numel()} are kept as harvested rows", flush=True)
 
     # held out whole, per condition, never a condition's lowest anchor
     groups = NP.condition_groups(anchors)
@@ -278,7 +325,15 @@ def main(argv=None):
     children.add_graph_attr(split[parents].long(), 'noised_split')
     children.add_graph_attr(parents.long(), 'noised_parent')
     children.add_graph_attr(mags.float(), 'noised_radius')
-    out = collate([anchors, children])
+    parts = [anchors, children]
+    n_h = 0 if rest is None else rest.num_graphs
+    if rest is not None:
+        rest.add_graph_attr(torch.full((n_h,), NP.KIND_HARVESTED, dtype=torch.long), 'noised_kind')
+        rest.add_graph_attr(torch.full((n_h,), NP.SPLIT_TRAIN, dtype=torch.long), 'noised_split')
+        rest.add_graph_attr(torch.full((n_h,), -1, dtype=torch.long), 'noised_parent')
+        rest.add_graph_attr(torch.zeros(n_h), 'noised_radius')
+        parts.append(rest)
+    out = collate(parts)
 
     # the build's own view of the load-time window, for the record
     e_all = seed_energy(ef, out, T, args.device)
@@ -288,7 +343,7 @@ def main(argv=None):
     du = (e_all - floor) / T
     child_tr = (kind == NP.KIND_CHILD) & (spl == NP.SPLIT_TRAIN) & torch.isfinite(du)
     inside = float((du[child_tr] <= args.window_kT).double().mean()) if child_tr.any() else math.nan
-    below_parent = ((e_all[n_a:] - e_anchor[parents]) / T < -args.window_kT)
+    below_parent = ((e_all[n_a:n_a + n_c] - e_anchor[parents]) / T < -args.window_kT)
     print(f"window check: {100 * inside:.1f}% of training children within {args.window_kT:g} kT of their condition "
           f"floor; {int(below_parent.sum())} children more than {args.window_kT:g} kT below their parent", flush=True)
 
@@ -298,7 +353,8 @@ def main(argv=None):
         source=os.path.abspath(args.source), anchors=args.anchors, molecule_fraction=args.molecule_fraction,
         k=args.k, log_lo=args.log_lo, log_hi=log_hi, calibration=table, window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
-        counts=dict(anchors=n_a, children=n_c, heldout_anchors=int(held.sum()), conditions=len(seen),
+        harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),
+        counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(seen),
                     children_within_window=inside, children_far_below_parent=int(below_parent.sum())),
         commits=dict(gfn=git_commit(HERE), mxtaltools=git_commit(os.path.dirname(os.path.dirname(
             __import__('mxtaltools').__file__)))),
