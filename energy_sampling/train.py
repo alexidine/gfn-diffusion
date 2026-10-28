@@ -3939,25 +3939,26 @@ class Modeller:
         ef = self.energy_function
         params = batch.full_cell_parameters().detach().cpu()
         hand = batch.aunit_handedness.reshape(-1).detach().cpu()
-        sg = batch.sg_ind.reshape(-1).cpu().tolist()
-        radius = batch.radius.reshape(-1).detach().cpu().tolist()
-        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg, radius)]
-        by_key = defaultdict(list)
-        for i, k in enumerate(keys):
-            by_key[k].append(i)
-        ok = torch.zeros(len(keys), dtype=torch.bool)
-        log_ref = torch.zeros(len(keys), dtype=torch.float32)
-        state = torch.zeros(len(keys), int(ef.data_ndim), dtype=torch.float32)
-        for key, rows in by_key.items():
-            fc = ef.fd_coordinates_for(*key)
-            rows = torch.tensor(rows)
-            r = fc.from_params(params[rows], hand[rows])
-            good = rows[r.ok]
-            ok[good] = True
-            state[good, :fc.dim] = r.s[r.ok].float()
-            if good.numel():
-                _, _, lr = fc.to_params(r.s[r.ok].double())
-                log_ref[good] = lr.float()
+        sg = batch.sg_ind.reshape(-1).cpu()
+        radius = batch.radius.reshape(-1).detach().cpu().double()
+        n = len(sg)
+        ok = torch.zeros(n, dtype=torch.bool)
+        log_ref = torch.zeros(n, dtype=torch.float32)
+        state = torch.zeros(n, int(ef.data_ndim), dtype=torch.float32)
+        for g in sorted(set(sg.tolist())):
+            for lo in range(0, n, 50000):   # one chart per space group and chunk, each row at its own radius
+                rows = torch.nonzero(sg == g).flatten()
+                rows = rows[(rows >= lo) & (rows < lo + 50000)]
+                if rows.numel() == 0:
+                    continue
+                fc = ef.fd_coordinates_rows(int(g), radius[rows])
+                r = fc.from_params(params[rows], hand[rows])
+                good = rows[r.ok]
+                ok[good] = True
+                state[good, :fc.dim] = r.s[r.ok].float()
+                if good.numel():
+                    _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
+                    log_ref[good] = lr.float()
         batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
         # the chart rows themselves, which _batch_latents reads instead of canonicalising every draw again
         batch.add_graph_attr(state.to(batch.ptr.device), 'fd_state')

@@ -591,6 +591,16 @@ class MolecularCrystal(BaseSet):
             self._fd_charts[key] = FDCoordinates(key[0], key[1])
         return self._fd_charts[key]
 
+    def fd_coordinates_rows(self, sg: int, radius):
+        """The FDCoordinates of space group ``sg`` for rows at molecule radii ``radius`` ([B], each rounded to 6
+        decimals as fd_coordinates_for keys them): the scalar, cached chart when every row shares one radius, else
+        one chart with a length box per row."""
+        r = torch.round(torch.as_tensor(radius, dtype=torch.float64).reshape(-1) * 1e6) / 1e6
+        if bool((r == r[0]).all()):
+            return self.fd_coordinates_for(sg, float(r[0]))
+        from energies.fd_coordinates import FDCoordinates
+        return FDCoordinates(int(sg), r)
+
     def fd_rows_to_params(self, x, crystal_batch):
         """crystal_coordinates 'fd': ([B, 12] cell parameters, [B] handedness, [B] log reference density on s) of
         rows x [B, d] in [-1, 1], each through the chart of its own (space group, molecule radius); differentiable
@@ -598,17 +608,19 @@ class MolecularCrystal(BaseSet):
         if self.max_z_prime != 1:
             raise NotImplementedError("crystal_coordinates 'fd' is Z' = 1 only")
         sg = crystal_batch.sg_ind.reshape(-1).cpu()
-        radius = crystal_batch.radius.reshape(-1).detach().cpu()
-        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg.tolist(), radius.tolist())]
+        radius = crystal_batch.radius.reshape(-1).detach().cpu().double()
         params = x.new_zeros(x.shape[0], 12)
         hand = x.new_ones(x.shape[0])
         log_ref = x.new_zeros(x.shape[0])
-        for key in sorted(set(keys)):
-            fc = self.fd_coordinates_for(*key)
-            rows = torch.tensor([i for i, k in enumerate(keys) if k == key], device=x.device)
+        for g in sorted(set(sg.tolist())):
+            # one chart for the space group's rows, each at its own molecule radius (bit-identical to a chart per
+            # radius; a batch of many molecules is one call, not one per molecule)
+            rows_cpu = torch.nonzero(sg == g).flatten()
+            fc = self.fd_coordinates_rows(int(g), radius[rows_cpu])
+            rows = rows_cpu.to(x.device)
             xs = x[rows]
             if xs.shape[1] < fc.dim or (xs.shape[1] > fc.dim and bool((xs[:, fc.dim:] != 0).any())):
-                raise ValueError(f'sg {key[0]}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
+                raise ValueError(f'sg {g}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
                                  f'{xs.shape[1]}')
             p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu())
             params = params.index_copy(0, rows, p.to(x))
@@ -623,18 +635,17 @@ class MolecularCrystal(BaseSet):
         canonical cell is outside the length box): filter such rows out of the file first."""
         params = batch.full_cell_parameters().detach().cpu()
         hand = batch.aunit_handedness.reshape(-1).detach().cpu()
-        sg = batch.sg_ind.reshape(-1).cpu().tolist()
-        radius = batch.radius.reshape(-1).detach().cpu().tolist()
-        keys = [(int(a), round(float(b), 6)) for a, b in zip(sg, radius)]
-        out = torch.zeros(len(keys), self.data_ndim, dtype=torch.float32)
-        for key in sorted(set(keys)):
-            fc = self.fd_coordinates_for(*key)
-            rows = torch.tensor([i for i, k in enumerate(keys) if k == key])
+        sg = batch.sg_ind.reshape(-1).cpu()
+        radius = batch.radius.reshape(-1).detach().cpu().double()
+        out = torch.zeros(len(sg), self.data_ndim, dtype=torch.float32)
+        for g in sorted(set(sg.tolist())):
+            rows = torch.nonzero(sg == g).flatten()
+            fc = self.fd_coordinates_rows(int(g), radius[rows])
             r = fc.from_params(params[rows], hand[rows])
             if not bool(r.ok.all()):
                 from collections import Counter
                 bad = Counter(st for st, ok in zip(r.status, r.ok.tolist()) if not ok)
-                raise ValueError(f'sg {key[0]}: {int((~r.ok).sum())} of {len(rows)} stored rows have no FD chart '
+                raise ValueError(f'sg {g}: {int((~r.ok).sum())} of {len(rows)} stored rows have no FD chart '
                                  f'point ({dict(bad)})')
             out[rows, :fc.dim] = r.s.float()
         return out

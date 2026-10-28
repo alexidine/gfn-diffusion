@@ -57,25 +57,34 @@ class FDCoordinates:
     Parameters
     ----------
     sg : int
-    radius : float
-        The molecule radius (Angstrom) that sets the trainer's length box (``charts.latent_v1_length_box``).
+    radius : float or [B] tensor
+        The molecule radius (Angstrom) that sets the trainer's length box (``charts.latent_v1_length_box``). A [B]
+        tensor charts B rows of different molecules at once (one length box per row): every method is then called
+        with exactly those B rows, in that order.
     cell_measure : str
         ``measure.CELL_MEASURES``; ``'latent_v1_lebesgue'`` (default) is the latent trainer's own cell measure, flat
         in its cell rows (owner decision O4).
     """
 
-    def __init__(self, sg: int, radius: float, cell_measure: str = 'latent_v1_lebesgue'):
+    def __init__(self, sg: int, radius, cell_measure: str = 'latent_v1_lebesgue'):
         self.sg = int(sg)
-        self.radius = float(radius)
+        r = torch.as_tensor(radius, dtype=F64).reshape(-1)
+        self.rows = None if r.numel() == 1 else int(r.numel())   # None: one radius for any number of rows
+        self.radius = float(r[0]) if self.rows is None else r
         self.cell_measure = cell_measure
-        self.chart = charts.CrystalChart.for_latent_v1(self.sg, torch.tensor([self.radius], dtype=F64), ORIENTATION)
+        self.chart = charts.CrystalChart.for_latent_v1(self.sg, r, ORIENTATION)
         self.dim = self.chart.ndim
         self.wrap_mask = [d.kind == 'circle' for d in self.chart.dims]
         self.names = [d.name for d in self.chart.dims]
         bad = [d.name for d in self.chart.dims if d.kind not in ('interval', 'circle')]
         if bad:
             raise NotImplementedError(f'sg {self.sg}: chart coordinates of kind other than interval/circle: {bad}')
-        self._check_circle_periods()
+        if self.rows is None:   # the check draws its own rows; per-row charts share the scalar chart's coordinates
+            self._check_circle_periods()
+
+    def _check_rows(self, n):
+        if self.rows is not None and int(n) != self.rows:
+            raise ValueError(f'this chart holds {self.rows} per-row length boxes, called with {int(n)} rows')
 
     def _check_circle_periods(self):
         """A circle coordinate must span exactly one period between its bounds, so that s = -1 and s = 1 are one
@@ -98,6 +107,7 @@ class FDCoordinates:
         s = torch.as_tensor(s, dtype=F64)
         if s.ndim != 2 or s.shape[1] != self.dim:
             raise ValueError(f'expected s of shape [B, {self.dim}], got {tuple(s.shape)}')
+        self._check_rows(s.shape[0])
         u = ((s + 1) / 2).clamp(0.0, 1.0)
         y, log_volume = charts.from_unit(self.chart, u)
         desc, _ = self.chart.forward(y)
@@ -118,6 +128,7 @@ class FDCoordinates:
         """s of stored rows ([B, 12] cell parameters, [B] handedness): canonicalised first (module docstring)."""
         params = torch.as_tensor(params)
         B = params.shape[0]
+        self._check_rows(B)
         p = params.to(F64)
         desc = CrystalDescription.from_crystal_params(self.sg, p[:, :3], p[:, 3:6], p[:, 6:9], p[:, 9:12],
                                                       torch.as_tensor(handedness).to(F64).reshape(-1, 1))
@@ -127,8 +138,11 @@ class FDCoordinates:
         s = torch.full((B, self.dim), float('nan'), dtype=F64)
         if bool(good.any()):
             gi = torch.nonzero(good).flatten()
-            y, _ = self.chart.inverse(c.desc[gi])
-            u = self._unit_of(y)
+            # per-row length boxes: the chart of the rows that canonicalised, in their order
+            chart = self.chart if self.rows is None else charts.CrystalChart.for_latent_v1(
+                self.sg, self.radius[gi], ORIENTATION)
+            y, _ = chart.inverse(c.desc[gi])
+            u = self._unit_of(y, chart)
             inside = ((u >= -S_TOL) & (u <= 1 + S_TOL)).all(1) & torch.isfinite(u).all(1)
             for k, j in enumerate(gi.tolist()):
                 if not bool(inside[k]):
@@ -137,14 +151,15 @@ class FDCoordinates:
             s[gi[inside]] = (2 * u[inside].clamp(0.0, 1.0) - 1)
         return FDRows(s=s, ok=good, status=status)
 
-    def _unit_of(self, y: torch.Tensor) -> torch.Tensor:
+    def _unit_of(self, y: torch.Tensor, chart=None) -> torch.Tensor:
         """The inverse of ``charts.from_unit``: u_i = (y_i - lo_i(y_<i)) / (hi_i - lo_i(y_<i)); circle coordinates
         are first wrapped into their [lo, hi) period."""
+        chart = self.chart if chart is None else chart
         u = torch.empty_like(y)
         for i in range(self.dim):
-            lo, hi = self.chart.bounds(y[:, :i], i)
+            lo, hi = chart.bounds(y[:, :i], i)
             yi = y[:, i]
-            d = self.chart.dims[i]
+            d = chart.dims[i]
             if d.kind == 'circle':
                 yi = lo + torch.remainder(yi - lo, float(d.period))
             u[:, i] = (yi - lo) / (hi - lo)

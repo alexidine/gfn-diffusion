@@ -138,3 +138,23 @@ def test_builder_builds_the_described_crystal(sg):
     desc, _ = fc.to_description(s)
     p, h, _ = fc.to_params(s)
     assert fd_starts.builder_deviation(sg, fd_starts.rows_from_params(mol, sg, p, h), desc) < 1e-3
+
+
+@pytest.mark.parametrize('sg', [2, 14])
+def test_a_chart_with_a_radius_per_row_equals_a_chart_per_radius(sg):
+    """MolecularCrystal.fd_coordinates_rows charts a batch of many molecules with one FDCoordinates holding a length
+    box per row; it must give exactly what one chart per radius gives, both ways."""
+    radii = torch.tensor([2.1, 2.7, 3.3, 2.1, 4.0, 2.9], dtype=torch.float64)
+    per_row = FDCoordinates(sg, radii)
+    s = torch.cat([_s(FDCoordinates(sg, float(r)), 1, seed=i) for i, r in enumerate(radii)])
+    p, h, lr = per_row.to_params(s)
+    for i, r in enumerate(radii):
+        p1, h1, lr1 = FDCoordinates(sg, float(r)).to_params(s[i:i + 1])
+        assert torch.equal(p[i:i + 1], p1) and torch.equal(h[i:i + 1], h1) and torch.equal(lr[i:i + 1], lr1)
+    back = per_row.from_params(p, h)
+    assert bool(back.ok.all())
+    for i, r in enumerate(radii):
+        one = FDCoordinates(sg, float(r)).from_params(p[i:i + 1], h[i:i + 1])
+        assert torch.equal(back.s[i:i + 1], one.s)
+    with pytest.raises(ValueError, match='per-row length boxes'):
+        per_row.to_params(s[:3])
