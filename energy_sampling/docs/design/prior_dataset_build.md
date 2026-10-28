@@ -3,6 +3,14 @@
 *Plan, 2026-10-27. Status: direction agreed by the owner (the Decisions below); everything else is a proposal,
 reviewed once against the code (2026-10-27) and to be checked again as it lands. Not policy.*
 
+*Built (2026-10-28), in the crystal-data format the owner chose over flat tensors for now: the builder
+(`data_processing/build_noised_prior.py`, `--harvest` merge-back), `noised_prior.py`, train.py's loader
+(`Modeller._load_noised_prior`: identity, sampled entry check, filters; FD chart references), the static prior buffer
+(`Modeller._prior_is_static`), the density readouts (`Modeller.density_readouts`) and the harvest writer
+(`Modeller.harvest_scored_rows`, cfg:harvest). Not built: the flat-tensor format (sections 1 and 6's per-row fields
+beyond the tags), carriers stored as rows (seed_min still analyses the conditions files at start-up), a vectorised
+near-duplicate pass, and the INN loader.*
+
 ## Why
 
 Stage 1 (likelihood) and the stage-2 backward data are built today by noising dataset rows inside the run. On the
