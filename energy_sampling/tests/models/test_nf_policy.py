@@ -44,7 +44,7 @@ def flow_policy(conditional=False, dead=None, **flow):
 # -- the interface -------------------------------------------------------------------------------------------------
 
 def _trainer_reads():
-    torch_names = set(dir(torch.nn.Module))
+    torch_names = set(dir(torch.nn.Module()))   # an instance: its own state (training) is set in __init__
     reads = set()
     for f in TRAINER_FILES:
         tree = ast.parse((ROOT / f).read_text(encoding='utf-8'))
@@ -404,3 +404,15 @@ def test_a_state_dict_round_trip_restores_the_flow_and_its_scalers(tmp_path):
     assert bool(fresh.scalers_fitted)
     with torch.no_grad():
         assert torch.allclose(fresh.sampler.log_prob(x, c), ref, atol=1e-5)
+
+
+@pytest.mark.parametrize('conditional', [False, True])
+def test_log_density_is_the_backward_steps_log_pf(conditional):
+    """train.py::Modeller.density_readouts reads policy.log_density: the same exact log q the backward step trains,
+    with no graph built."""
+    pol = flow_policy(conditional)
+    x = torch.rand(8, 12) * 2 - 1
+    c = torch.randn(8, 4) if conditional else None
+    _, lpf, _, _ = pol.get_traj_bwd(x, None, c, None)
+    lq = pol.log_density(x, c, None)
+    assert torch.allclose(lq, lpf[:, 0].detach(), atol=1e-5) and not lq.requires_grad

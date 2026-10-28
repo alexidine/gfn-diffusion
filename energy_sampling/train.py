@@ -56,6 +56,7 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling import prior_scan_cache
+from energy_sampling import noised_prior
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
     ROLLOUT_CONDITION_DRAWS
@@ -332,6 +333,27 @@ def row_dof_count(sample_batch, n_rows: int, n_dof) -> torch.Tensor:
         raise RuntimeError(f'state_mask has {mask.numel()} entries, which does not tile '
                            f'{n_rows} rows; the eval batch and the scored rows disagree')
     return mask.reshape(int(n_rows), -1).bool().sum(-1).long()
+
+
+def energy_function_kwargs(args, device):
+    """MolecularCrystal's constructor arguments for a run config: the trainer's, and an offline builder's that must
+    score rows exactly as the trainer would (data_processing/build_noised_prior.py)."""
+    energy_config = {
+        'device': device,
+        'energy_function': args.energy_function,
+        'mlip_path': args.mlip_path,
+        'space_groups': args.space_groups,
+        'z_primes': args.z_primes,
+        'sg_conditioning': args.sg_conditioning,
+        'temperature_conditioning': args.temperature_conditioning,
+        'zp_conditioning': args.zp_conditioning,
+        'vector_conditioning': getattr(args, 'vector_conditioning', False),
+        'vector_conditioning_dim': getattr(args, 'vector_conditioning_dim', None),
+        'embedding_conditioning': getattr(args, 'embedding_conditioning', False),
+        'embedding_conditioning_dim': getattr(args, 'embedding_conditioning_dim', None),
+    }
+    energy_config.update(args.energy_config.__dict__)
+    return energy_config
 
 
 class Modeller:
@@ -2264,22 +2286,7 @@ class Modeller:
         return conditions_dim
 
     def init_energy_function(self):
-        energy_config = {
-            'device': self.device,
-            'energy_function': self.args.energy_function,
-            'mlip_path': self.args.mlip_path,
-            'space_groups': self.args.space_groups,
-            'z_primes': self.args.z_primes,
-            'sg_conditioning': self.args.sg_conditioning,
-            'temperature_conditioning': self.args.temperature_conditioning,
-            'zp_conditioning': self.args.zp_conditioning,
-            'vector_conditioning': getattr(self.args, 'vector_conditioning', False),
-            'vector_conditioning_dim': getattr(self.args, 'vector_conditioning_dim', None),
-            'embedding_conditioning': getattr(self.args, 'embedding_conditioning', False),
-            'embedding_conditioning_dim': getattr(self.args, 'embedding_conditioning_dim', None),
-        }
-        energy_config.update(self.args.energy_config.__dict__)
-        self.energy_function = MolecularCrystal(**energy_config)
+        self.energy_function = MolecularCrystal(**energy_function_kwargs(self.args, self.device))
         # ONE ATTACHMENT POINT, and nothing else in the trainer changes. The
         # region timer lives on the energy function because log_reward is the
         # single funnel every energy evaluation goes through, so instrumenting
@@ -3904,6 +3911,78 @@ class Modeller:
         strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
         return energy.to(self.device), batch.to(self.device)
 
+    @torch.no_grad()
+    def _stored_reward_terms(self, batch, chunk: int = 8192):
+        """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
+        (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU."""
+        ef, T = self.energy_function, float(self.args.energy_config.temperature)
+        seed, log_r = [], []
+        for lo in range(0, int(batch.num_graphs), chunk):
+            sub = batch.subsample_new_batch(
+                torch.arange(lo, min(lo + chunk, int(batch.num_graphs)), device=batch.ptr.device)).to(self.device)
+            lr, ens = ef.prebuilt_sample_to_reward(sub, T, return_ens_dict=True)
+            seed.append(ef.seed_energy_from(ens).double().flatten().cpu())
+            log_r.append(lr.double().flatten().cpu())
+        return torch.cat(seed), torch.cat(log_r)
+
+    def _load_noised_prior(self, prior, manifest):
+        """(energy [n], batch) of a pre-noised prior file (data_processing/build_noised_prior.py) without scoring it:
+        1. its identity (noised_prior.identity: the energy function, analysis settings, chart, eLJ coefficient) must
+           equal this run's, else it raises;
+        2. a stratified sample of cfg:noised_prior.check_rows rows is scored afresh and must match the stored terms
+           (noised_prior.compare_terms), else it raises;
+        3. the rows kept for training are the training split's rows of cfg:noised_prior.train_kinds inside the packing
+           window and within window_kT x T of their condition's floor (noised_prior.select_rows). The held-out anchor
+           groups and the clean training anchors under the same windows are kept apart as prior_heldout_batch and
+           prior_anchor_batch, read only by density_readouts.
+        energy is -T log R from the stored terms, the quantity _score_prior_rows returns."""
+        ef, T = self.energy_function, float(self.args.energy_config.temperature)
+        s = noised_prior.settings(self.args)
+        if int(manifest.get('format_version', -1)) != noised_prior.FORMAT_VERSION:
+            raise ValueError(f"pre-noised prior {self.args.prior_path}: format_version "
+                             f"{manifest.get('format_version')!r}, this code reads {noised_prior.FORMAT_VERSION}")
+        bad = noised_prior.identity_mismatch(manifest['identity'], noised_prior.identity(self.args, ef))
+        if bad:
+            raise ValueError(f"pre-noised prior {self.args.prior_path} was scored under another energy definition; "
+                             f"rebuild it for this run. Differences: " + '; '.join(bad))
+
+        idx = noised_prior.check_rows(prior, s['check_rows'], seed=int(self.args.seed))
+        stored = prior.subsample_new_batch(torch.as_tensor(idx, device=prior.ptr.device))
+        _, fresh = self._score_prior_rows(stored, announce=False)
+        ratio, worst, per_term = noised_prior.compare_terms(stored, fresh, self.args.energy_function)
+        print(f"pre-noised prior: {len(idx)} rows re-scored (stratified by kind, split, space group, Z'); worst miss "
+              f"{worst:.3g} ({ratio:.2f} x the tolerance {noised_prior.ABS_TOL} + {noised_prior.REL_TOL} |x|); per "
+              f"term " + ', '.join(f"{k} {v:.3g}" for k, v in per_term.items()), flush=True)
+        if not ratio <= 1.0:
+            raise ValueError(f"pre-noised prior {self.args.prior_path}: a stored row does not re-score to its stored "
+                             f"terms (worst miss {worst:.3g}): the file is stale or was built by other code")
+
+        seed_e, log_r = self._stored_reward_terms(prior)
+        kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
+        packing = torch.as_tensor(prior.packing_coeff).reshape(-1).double().cpu()
+        groups = noised_prior.condition_groups(prior)
+        masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s)
+        keep = masks['train'] & torch.isfinite(log_r)
+        n_groups = int(groups.max()) + 1
+        kept_per = torch.bincount(groups[keep], minlength=n_groups)
+        dev = prior.ptr.device
+        pick = lambda m: prior.subsample_new_batch(torch.nonzero(m).flatten().to(dev)) if bool(m.any()) else None
+        self.prior_heldout_batch = pick(masks['heldout'] & torch.isfinite(log_r))
+        self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
+        print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
+              f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} at "
+              f"10^U({manifest.get('log_lo')}, {manifest.get('log_hi')})); training on {int(keep.sum())} rows of kinds "
+              f"{list(s['train_kinds'])} within {s['window_kT']} kT (T {T:g}) of their condition floor and packing "
+              f"{s['packing_window']}; held-out anchor-group rows {int(masks['heldout'].sum())}, clean training "
+              f"anchors {int(masks['anchors'].sum())}; conditions {n_groups}, with no training row "
+              f"{int((kept_per == 0).sum())}, rows per condition min {int(kept_per.min())} median "
+              f"{float(kept_per.float().median()):.0f} max {int(kept_per.max())}", flush=True)
+        if not bool(keep.any()):
+            raise ValueError("pre-noised prior: no row survives the load-time selection")
+        batch = prior.subsample_new_batch(torch.nonzero(keep).flatten().to(dev))
+        energy = (-log_r[keep] * T).float()
+        return energy.to(self.device), batch.to(self.device)
+
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
@@ -3957,13 +4036,18 @@ class Modeller:
                     f"temperature. Rebuild the prior with a unit factor, or run "
                     f"this prior on the elj route.")
             self.energy_function.lj_coeff = _tsf
+        # a pre-noised prior (data_processing/build_noised_prior.py) is read from its stored terms behind a sampled
+        # check, and filtered (_load_noised_prior); any other prior is scored here, as always
+        noised_manifest = prior_data.get(noised_prior.MANIFEST_KEY)
         if True:  # not hasattr(prior, self.args.energy_function):
             # cfg:prior_scan_cache -- reuse an earlier launch's pass when its identity matches and a
             # sample of rows re-scores to the cached energies (prior_scan_cache.py); otherwise score
             # every row, as always, and write the cache for the next launch.
-            use_scan_cache = bool(getattr(self.args, 'prior_scan_cache', False))
+            use_scan_cache = bool(getattr(self.args, 'prior_scan_cache', False)) and noised_manifest is None
             cached_scan = self._prior_scan_from_cache(prior) if use_scan_cache else None
-            if cached_scan is not None:
+            if noised_manifest is not None:
+                energy, prior = self._load_noised_prior(prior, noised_manifest)
+            elif cached_scan is not None:
                 energy, prior = cached_scan
             else:
                 energy, prior = self._score_prior_rows(prior)
@@ -4171,20 +4255,24 @@ class Modeller:
         datasets = [self.mol_dataset, self.prior_dataset]
         if self.test_mol_dataset is not None:
             datasets.append(self.test_mol_dataset)
+        batches = [d.batch for d in datasets]
+        # a pre-noised prior's held-out anchor groups and clean anchors (_load_noised_prior), read by density_readouts
+        batches += [b for b in (getattr(self, 'prior_heldout_batch', None), getattr(self, 'prior_anchor_batch', None))
+                    if b is not None]
 
         identifiers = set()
-        for dataset in datasets:
-            if hasattr(dataset.batch, 'identifier'):
-                identifiers.update(dataset.batch.identifier)
+        for batch in batches:
+            if hasattr(batch, 'identifier'):
+                identifiers.update(batch.identifier)
 
         self.identifier_registry = {ident: i for i, ident in enumerate(sorted(identifiers))}
 
-        for dataset in datasets:
-            if hasattr(dataset.batch, 'identifier'):
+        for batch in batches:
+            if hasattr(batch, 'identifier'):
                 mol_id = torch.tensor(
-                    [self.identifier_registry[ident] for ident in dataset.batch.identifier],
-                    dtype=torch.long, device=dataset.batch.device)  # match the (possibly GPU-resident) store
-                dataset.batch.add_graph_attr(mol_id, 'mol_id')
+                    [self.identifier_registry[ident] for ident in batch.identifier],
+                    dtype=torch.long, device=batch.device)  # match the (possibly GPU-resident) store
+                batch.add_graph_attr(mol_id, 'mol_id')
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
 
@@ -7634,8 +7722,11 @@ class Modeller:
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
         mol_batch = mol_batch.to(self.device)
+        # a stored row keeps its own space group and Z': its energy terms were scored on them, so neither is
+        # resampled (condition_samples draws both at random when not handed them)
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            mol_batch, repeats=repeats)
+            mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
+            z_primes=mol_batch.z_prime.reshape(-1).long())
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
@@ -9149,6 +9240,61 @@ class Modeller:
         metrics.update(new)
         return metrics
 
+    @torch.no_grad()
+    def density_readouts(self, n_rows: int = 4096, chunk: int = 1024):
+        """-log q of stored crystals under a policy with an exact density (policy.log_density; the NF), mean and P90
+        per set, under InnModeller's names so the two trainers' curves read alike:
+          eval_bwd/mle               the training rows (prior_dataset as loaded and filtered)
+          eval_bwd/mle_heldout_rows  a pre-noised prior's held-out anchor groups (training molecules, crystals never
+                                     trained on): their gap to eval_bwd/mle is memorisation within a molecule
+          eval_bwd/mle_anchors       a pre-noised prior's clean training anchors (its stage 1 trains on children)
+          eval_bwd/mle_mol_crystals  the molecules_path crystals (one per training molecule)
+          eval_test/mle              the test_molecules_path crystals (molecules never trained on)
+        Each set is read on the same up to n_rows rows at every eval (drawn once, seed + 3), through the backward
+        draw's own path (the stored latent, the condition built from the row's own space group and Z'). A policy
+        without an exact density reports nothing."""
+        policy = self.gfn_model
+        if not hasattr(policy, 'log_density'):
+            return {}
+        sets = {'eval_bwd/mle': self.prior_dataset.batch,
+                'eval_bwd/mle_heldout_rows': getattr(self, 'prior_heldout_batch', None),
+                'eval_bwd/mle_anchors': getattr(self, 'prior_anchor_batch', None),
+                'eval_bwd/mle_mol_crystals': self.mol_dataset.batch,
+                'eval_test/mle': getattr(getattr(self, 'test_mol_dataset', None), 'batch', None)}
+        if not hasattr(self, '_readout_rows'):
+            self._readout_rows = {}
+        was_training = policy.training
+        policy.eval()
+        out = {}
+        try:
+            for key, batch in sets.items():
+                if batch is None or int(batch.num_graphs) == 0:
+                    continue
+                if key not in self._readout_rows:
+                    g = torch.Generator().manual_seed(int(self.args.seed) + 3)
+                    n = int(batch.num_graphs)
+                    self._readout_rows[key] = torch.randperm(n, generator=g)[:min(n_rows, n)].sort().values
+                idx = self._readout_rows[key]
+                nll = []
+                for i in range(0, idx.numel(), chunk):
+                    sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device)).to(self.device)
+                    x = self._batch_latents(sub).to(self.device)
+                    sub, _, condition, _ = self.energy_function.condition_samples(
+                        sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
+                    nll.append(-policy.log_density(x, condition, sub).float().flatten().cpu())
+                nll = torch.cat(nll)
+                ok = torch.isfinite(nll)
+                if bool(ok.any()):
+                    out[key] = float(nll[ok].mean())
+                    out[f'{key}_p90'] = float(torch.quantile(nll[ok].double(), 0.9))
+                out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
+        finally:
+            policy.train(was_training)
+        print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
+              + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
+                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals'))), flush=True)
+        return out
+
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
         # close the TRAIN-phase VRAM window before eval allocates anything, so
@@ -9218,6 +9364,7 @@ class Modeller:
                 adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
 
+        metrics.update(self.density_readouts())
         metrics.update({
             'Batch Size': self.batch_size,
             # NO LONGER THE SAME NUMBER. Eval draws shrink independently of the

@@ -31,6 +31,9 @@ lower. Found against it (2026-10-27):
 - Save every state a run scores, compactly, per condition, in a form that instantiates on crystal batches.
 - Overfitting is answered by rebuilding (more noise samples, more molecules), not by in-run machinery.
 - The dataset may grow between builds by new conditional minima and by harvested states.
+- The energy window stays in kT at the run's temperature for now; that it moves with T is known and deferred.
+- Harvest retention: low-error rows are dropped. The writer keeps what the replay's error filter keeps, plus states
+  below their condition's minimum.
 
 ## Shape
 
@@ -150,9 +153,10 @@ gauge-fixed). Replay admissions are a subset of these rows and are not written t
 id, process id and first step, written atomically, with a shard manifest, since arms share a job and a reused run
 name overwrites.
 
-Rate: the conditional protocol scores about 140 rows per step (2,000 per 20 steps plus 10,000 per 250 steps). A long
-run can write tens of millions of rows (up to ~180 M, ~18 GB, for a 2,700-minute arm at the highest rates): the
-retention policy is an open question.
+Rate: the conditional protocol scores about 140 rows per step (2,000 per 20 steps plus 10,000 per 250 steps); kept
+unfiltered, a long run could write up to ~180 M rows (~18 GB) for a 2,700-minute arm. Retention (owner): low-error
+rows are dropped; the writer keeps the rows the replay's error filter keeps, plus states below their condition's
+minimum.
 
 A rebuild merges harvested rows in: rows enter the row table as kind harvested; a state below its condition's minimum
 becomes a new anchor and gets children. The build report gives each condition's change in kept rows.
@@ -210,14 +214,13 @@ The first runs read two held-out gaps:
 
 ## Open questions (owner)
 
-1. The energy window: N kT at the run's temperature changes the training set whenever T changes (the same children
-   are 2.76x further out in kT at mk_dev's T 2.5 than at 6.9, so a 10 kT window keeps under half at 2.5 against
-   90% at 6.9), and is undefined under temperature conditioning. Recommended: the window in energy units, part of
-   the run's settings, with its kT equivalent printed.
-2. The packing window's exact bounds.
-3. K and the radius range for the first build.
-4. Retention of harvested states (all, or within a wider energy window, or a cap per condition).
-5. The FD chart: a second latent column, or a separate build.
+1. The packing window's exact bounds.
+2. K and the radius range for the first build.
+3. The FD chart: a second latent column, or a separate build.
+
+Deferred (owner, 2026-10-27): the energy window in kT changes the training set whenever T changes (the same
+children are 2.76x further out in kT at mk_dev's T 2.5 than at 6.9; a 10 kT window keeps under half at 2.5 against
+90% at 6.9) and is undefined under temperature conditioning.
 
 ## Noted for the training recipe (item 4 of the owner's list, not this plan)
 

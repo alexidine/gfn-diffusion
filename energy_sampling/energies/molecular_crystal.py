@@ -30,18 +30,24 @@ CRYSTAL_COORDINATES = ('latent', 'fd')
 FD_LAYOUT_RADIUS = 4.0
 
 
+#: the packing-coefficient range density_penalty leaves unpenalised; also a pre-noised prior's default load window
+#: (noised_prior.packing_window)
+PACKING_COEFF_WINDOW = (0.55, 0.95)
+
+
 def density_penalty(packing_coeff, turnover = 1):
     """
     draw crystals into the physically reasonable region
     :param packing_coeff:
     :return:
     """
+    lo, hi = PACKING_COEFF_WINDOW
     cp = packing_coeff.clamp_min(1e-6)          # numerical guard only, NOT a gradient cap
-    u = F.relu(np.log(0.55) - torch.log(cp))    # >0 when too loose; 0 in the physical region
+    u = F.relu(np.log(lo) - torch.log(cp))      # >0 when too loose; 0 in the physical region
     # quadratic onset, linear tail: C1 at u == turnover
     loose = torch.where(u <= turnover, u ** 2,
                         turnover ** 2 + 2 * turnover * (u - turnover))
-    return loose + F.relu(cp - 0.95) ** 2
+    return loose + F.relu(cp - hi) ** 2
 
 def screen_implausible_energy(mol_energy, below: float):
     """(energy, flagged) for cfg:energy_config.implausible_energy_below. A row whose energy is under `below` is

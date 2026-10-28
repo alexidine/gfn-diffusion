@@ -181,7 +181,12 @@ class NFPolicy(nn.Module):
                 raise ValueError(f"flow min_bin_height {h0:g} must lie in (0, 1/n_bins)")
             for blk in blocks:
                 rows = blk.unit_base_rows() if s['min_bin_height_rows'] == 'uniform' else torch.ones_like(blk.is_wrap)
-                blk.min_height = torch.where(rows, torch.full_like(blk.bound, h0), torch.full_like(blk.bound, 1e-3))
+                floor = torch.where(rows, torch.full_like(blk.bound, h0), torch.full_like(blk.bound, 1e-3))
+                # a buffer, so it follows the policy's .to(device) (a plain attribute stayed on the CPU); not
+                # persistent: it is rebuilt from the settings, so checkpoints are unchanged
+                if 'min_height' in blk.__dict__:
+                    delattr(blk, 'min_height')
+                blk.register_buffer('min_height', floor, persistent=False)
         if s['tied_derivatives']:
             for blk in blocks:
                 blk.tied = float(s['tied_factor'])
@@ -290,6 +295,15 @@ class NFPolicy(nn.Module):
             gp = {k: torch.zeros(n, 1, device=x.device) for k in self.GAUSS_PARAM_KEYS}
             return states, log_pfs, log_pbs, log_flow, gp
         return states, log_pfs, log_pbs, log_flow
+
+    @torch.no_grad()
+    def log_density(self, x, condition, mol_batch):
+        """Exact log q(x | c) of terminal states x [N, dim] (the trainer's latents), as the backward step scores
+        them: angles wrapped and dead rows pinned first. Read by train.py::Modeller.density_readouts."""
+        n = x.shape[0]
+        x = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
+        c = self._context(condition, mol_batch, n)
+        return self.sampler.log_prob(x, c) if self.conditional else self.sampler.log_prob(x)
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True, freeze_policy: bool = False,
