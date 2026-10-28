@@ -799,7 +799,11 @@ class Modeller:
         real there -- the P1 delta-target fix, 2026-08-24).
         """
         if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd':
-            # energy_config.crystal_coordinates 'fd': the state is crystal_fd's chart row s, not the latent
+            # energy_config.crystal_coordinates 'fd': the state is crystal_fd's chart row s, not the latent; a stored
+            # row carries it once computed (_attach_fd_reference), a fresh one is canonicalised here
+            state = getattr(batch, 'fd_state', None)
+            if state is not None:
+                return state.reshape(int(batch.num_graphs), -1).to(batch.cell_lengths.device)
             return self.energy_function.fd_rows_of(batch).to(batch.cell_lengths.device)
         return batch.latent_params(
             gauge_fix_free_axes=self.energy_function.is_crystal)
@@ -3928,8 +3932,8 @@ class Modeller:
     @torch.no_grad()
     def _attach_fd_reference(self, batch):
         """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
-        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows), attached as a
-        row attribute so it rides with every draw. Returns [n] bool: the rows that have an FD chart point (a row
+        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
+        row (`fd_state`, read by _batch_latents), attached as row attributes so they ride with every draw. Returns [n] bool: the rows that have an FD chart point (a row
         that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
         dropped; its reference is set to 0)."""
         ef = self.energy_function
@@ -3943,16 +3947,20 @@ class Modeller:
             by_key[k].append(i)
         ok = torch.zeros(len(keys), dtype=torch.bool)
         log_ref = torch.zeros(len(keys), dtype=torch.float32)
+        state = torch.zeros(len(keys), int(ef.data_ndim), dtype=torch.float32)
         for key, rows in by_key.items():
             fc = ef.fd_coordinates_for(*key)
             rows = torch.tensor(rows)
             r = fc.from_params(params[rows], hand[rows])
             good = rows[r.ok]
             ok[good] = True
+            state[good, :fc.dim] = r.s[r.ok].float()
             if good.numel():
                 _, _, lr = fc.to_params(r.s[r.ok].double())
                 log_ref[good] = lr.float()
         batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
+        # the chart rows themselves, which _batch_latents reads instead of canonicalising every draw again
+        batch.add_graph_attr(state.to(batch.ptr.device), 'fd_state')
         return ok
 
     def _load_noised_prior(self, prior, manifest):
@@ -9293,7 +9301,10 @@ class Modeller:
           eval_test/mle              the test_molecules_path crystals (molecules never trained on)
         Each set is read on the same up to n_rows rows at every eval (drawn once, seed + 3), through the backward
         draw's own path (the stored latent, the condition built from the row's own space group and Z'). A policy
-        without an exact density reports nothing."""
+        without an exact density reports nothing.
+        `<key>_ref` is the same -log q against the common reference measure, -log q + log rho, with log rho the
+        chart's log reference density (-jacobian_energy / T, the term the reward composes: compute_jacobian on the
+        latent chart, fd_log_reference on the FD chart), so runs on different charts compare."""
         policy = self.gfn_model
         if not hasattr(policy, 'log_density'):
             return {}
@@ -9316,24 +9327,37 @@ class Modeller:
                     n = int(batch.num_graphs)
                     self._readout_rows[key] = torch.randperm(n, generator=g)[:min(n_rows, n)].sort().values
                 idx = self._readout_rows[key]
-                nll = []
+                ef, T = self.energy_function, float(self.args.energy_config.temperature)
+                fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+                nll, log_ref = [], []
                 for i in range(0, idx.numel(), chunk):
                     sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device)).to(self.device)
+                    if fd and not hasattr(sub, 'fd_state'):
+                        self._attach_fd_reference(sub)   # on this sub-batch only: a template must not carry it
                     x = self._batch_latents(sub).to(self.device)
-                    sub, _, condition, _ = self.energy_function.condition_samples(
+                    if fd:
+                        log_ref.append(sub.fd_log_reference.reshape(-1).float().cpu())
+                    else:
+                        jac, _ = ef.compute_jacobian(sub, torch.full((int(sub.num_graphs),), T, device=self.device))
+                        log_ref.append((-jac / T).reshape(-1).float().cpu())
+                    sub, _, condition, _ = ef.condition_samples(
                         sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
                     nll.append(-policy.log_density(x, condition, sub).float().flatten().cpu())
-                nll = torch.cat(nll)
+                nll, log_ref = torch.cat(nll), torch.cat(log_ref)
                 ok = torch.isfinite(nll)
                 if bool(ok.any()):
                     out[key] = float(nll[ok].mean())
                     out[f'{key}_p90'] = float(torch.quantile(nll[ok].double(), 0.9))
+                    ref = nll + log_ref
+                    ok_ref = torch.isfinite(ref)
+                    if bool(ok_ref.any()):
+                        out[f'{key}_ref'] = float(ref[ok_ref].mean())
                 out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
         finally:
             policy.train(was_training)
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
-                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals'))), flush=True)
+                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref'))), flush=True)
         return out
 
     def evaluation(self, override_do_figs: bool = False):

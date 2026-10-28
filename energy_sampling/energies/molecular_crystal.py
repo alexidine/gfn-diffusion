@@ -645,6 +645,8 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = mol_batch.clone()
         if self.crystal_coordinates == 'fd':  # canonical crystals by construction: no clamp, no crystal-system step
+            if 'fd_state' in crystal_batch.keys():   # a stored row's cached chart row (train.py) belongs to that row
+                delattr(crystal_batch, 'fd_state')
             params, hand, log_ref = self.fd_rows_to_params(x, crystal_batch)
             crystal_batch.set_cell_parameters(params)
             crystal_batch.aunit_handedness = hand.reshape(crystal_batch.aunit_handedness.shape).to(
