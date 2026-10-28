@@ -1154,6 +1154,19 @@ buffers:
       kappa: 1.0        # draw p ~ d+^kappa. The practical ceiling: kappa=2 blew is_ess_frac to 0.07 with one row at 58x the mean weight, and kappa=0 was the worst arm
       floor_frac: 0.25  # relative floor on surviving d+ as a fraction of the median, so the weight range is bounded by (median/floor)^kappa. Measured ESS knee: 0.01 -> ESS/n 0.11, 0.25 -> 0.63, 0.50 -> 0.80
       symmetric: true  # draw on |delta|^kappa instead of delta_plus^kappa. ON here (the code default is off): under the one-sided draw a row that falls to delta <= 0 gets p = 0, so its ema_logw is never refreshed and it ratchets out of the eligible set permanently -- is_elig_frac drifted 0.74 -> 0.33, monotonic. |delta| leaves every row eligible and holds is_elig_frac at 1.0. Whether it also closes the forward-tail fit gap is NOT yet measured: that needs an on/off arm
+  # ROW STORE, model.kind nf only (row_store.py; docs/wiki/row-store.md). Refused under sde (config_invariants.row_store_is_well_formed)
+  store:
+    enabled: false            # true = bwd draws its rows uniformly from the store's data rows; replay draws every drawable non-held-out row by priority with IS weights; fwd, eval and bootstrap rollouts are admitted to it
+    bar: 1.0                  # nats: a rollout row is admitted when |log R - log q - L(c)| >= bar, or when it raises its condition's best log R (a record, protected)
+    admit_reward_min: -200    # unreferenced log R below this is never admitted. null = off
+    cap_per_condition: 50000  # most unprotected rows per condition; the excess is evicted without replacement with probability ~ 1/(|r| + eps)
+    max_rows: 200000          # most unprotected rows in total; the excess is evicted by the same weight after the per-condition pass
+    eps: 0.1                  # nats added to |r| in the eviction weight
+    records_kept: 8           # most protected records per condition; the lowest-log R record past it loses protection. null = no limit
+    kappa: 1.0                # replay draw priority p ~ max(|r|, floor)^kappa
+    floor_frac: 0.25          # floor = floor_frac x the median |r| over drawable rows
+    uniform_frac: 0.1         # uniform share of the replay draw measure; IS weight 1/(n q) <= 1/uniform_frac
+    refresh_chunk: 65536      # rows per log q call in the eval refresh
   # todo my general thought on these buffers is we need a simple, few-point, global theory of dataset management. It should simplify all this organization I imagine
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission, and tops up prior_buffer via noising + rescoring whenever a

@@ -72,6 +72,7 @@ The rules in `config_invariants.py::RULES`, each against the config relation it 
 | `batch_root_forward_is_well_formed` | `tb_z_source: batch_root` on bwd or replay, with no cadence, or with the forward policy frozen |
 | `replay_seat_is_well_formed` | the replay-seat keys, an audit twin of `Modeller.set_loss_coeffs` |
 | `condition_draw_is_well_formed` | the two condition draws, likewise |
+| `row_store_is_well_formed` | an enabled `cfg:buffers.store` off `model.kind` nf or beside a setting it does not serve, an unknown or malformed store key; `records_kept` null (BASELINE). `train.py::Modeller.init_row_store` raises on its ERRORs ([row-store](row-store.md)) |
 | `crystal_prior_model_is_retired` | off the conformer route: a non-null `cfg:prior_model_name`; `cfg:buffers.prior_buffer.source` other than `anchors`, absence included (code default `prior_model`); `skip_if: prior_loaded` or a `snapshot_prior` action in an active stage |
 | `conformer_dplr_is_off_on_a_set` | DPLR under a set policy; DPLR under a flat policy over a `cfg:molecules_path` set (BASELINE) |
 | `conformer_set_policy_is_conditioned` | a set policy over a set without `cfg:embedding_conditioning`; under a conditional set policy, a `cfg:embedding_conditioning_dim` that is not a positive even integer |

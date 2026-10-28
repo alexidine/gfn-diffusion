@@ -82,6 +82,8 @@ When `cfg:prior_path` is a pre-noised build (`data_processing/build_noised_prior
 
 `train.py::Modeller._noised_prior_record`, called by `init_prior_dataset` on every prior, reads `cfg:noised_prior` through `noised_prior.py::settings`, so an unknown key in the block raises whichever kind the file is. On a file without `noised_prior.py::MANIFEST_KEY`, a present block prints once that it is inert. On a build, a manifest `temperature` other than `cfg:energy_config.temperature` prints a warning, and the load line shows the build temperature beside K and the radius range. The result records `data/prior_prenoised` and, for a build, the manifest's `k`, `log_lo`, `log_hi`, `window_kT_target` and `temperature` in the run config's `data/` block ([run-reading](run-reading.md)).
 
+Under `cfg:buffers.store.enabled` on `model.kind nf`, `draw_bwd_sample` returns `train.py::Modeller._store_draw` before any branch on this page: the backward branch draws uniformly from the row store's data rows, which are the same `prior_dataset` rows, and writes no `update_losses` priority. The prior buffer is still seeded and published under its `prior_buffer_*` keys and is not drawn ([row-store](row-store.md)).
+
 ## Telemetry
 
 `prior_churn` is a dict of counters drained on read at each eval: `prior_buffer_added` sums the three source tallies, `prior_buffer_expired` is the staleness subset of `prior_buffer_evicted`, and `prior_buffer_anchor_fraction` and `prior_buffer_prior_admit_rate` are NaN on a zero denominator. All are flows over one window, not a resident composition; no prior-buffer row records which source admitted it.

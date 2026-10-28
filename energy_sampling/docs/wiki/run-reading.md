@@ -22,6 +22,7 @@ The table below sets each published namespace against the quantities it holds an
 | `batch/` | `accum_target`, `med_step_s`, `sps_rung`, OOM counters, the sizer's phase | `ten_step_reporting` |
 | `tracker/` | cross-visit reductions over the condition library: `tb_err_rms`, `z_grad_worst`, `z_bias_var` | `buffer.py::ConditionLogZTracker` |
 | `zmatch/` | `delta_worst`, `delta_n_trusted`, `fwd_level` | `::ConditionLogZTracker.delta_stats`, `.pooled_levels` |
+| `store/` | the row store at each evaluation: rows by tag, per-condition occupancy, the window's admissions, evictions and demotions, $\lvert r \rvert$ against the live level, refresh seconds ([row-store](row-store.md)) | `row_store.py::RowStore.stats` via `Modeller.log_buffer_stats` |
 | `Cond <name> *` | per-condition breakdown of a per-sample 0/1 indicator: `Failing Frac`, `Worst`, `Bar` | `Modeller.log_condition_fraction` over `utils.py::per_condition_fraction` |
 
 `Cond` is a space-separated prefix, not a slash namespace, and takes an optional namespace in front of it (`eval_test/Cond Reasonable Worst`); its `Bar` key is unprefixed, so both streams score against one series. The same two writers also emit `pooled/`, `energy/`, `gradnorm/`, `gradclip/`, `raycal/`, `cond_draw/`, `run/`, and the settings blocks `energy_func/` and `loss_coeffs/`.

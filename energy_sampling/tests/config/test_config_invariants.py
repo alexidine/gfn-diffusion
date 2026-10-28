@@ -1147,6 +1147,18 @@ def test_an_nf_policy_refuses_sde_only_settings(canonical):
     assert _fires(cfg, 'nf_policy_refuses_sde_only_settings')
 
 
+def test_a_row_store_off_the_nf_route_is_an_error(canonical):
+    """buffers.store enabled under model.kind sde refuses; under nf it passes. Full coverage:
+    tests/config/test_row_store_invariants.py."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'row_store_is_well_formed')                 # store off
+    cfg['buffers']['store']['enabled'] = True
+    assert _fires(cfg, 'row_store_is_well_formed')                     # kind sde
+    cfg['policy']['kind'] = 'nf'
+    cfg['gradient_norm_clip'] = 10.0
+    assert not _fires(cfg, 'row_store_is_well_formed')
+
+
 def test_a_malformed_heldout_gate_is_an_error(canonical):
     """Full coverage: tests/protocol/test_heldout_gate.py."""
     cfg = copy.deepcopy(canonical)

@@ -1,6 +1,6 @@
 # GFN knowledge base
 
-Fifty-two pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
+Fifty-three pages, each drafted from the code and the derivation notes, verified against the code at the stamped commit, and reviewed against the writing protocol. Owner-choice sections are placeholders until the owner writes them. Not yet written: acridine-reference-system, experiment-design; dropped as retired: lr-selection-protocol, lr-sensors, controller-bench.
 
 ## Theory of the objective
 
@@ -37,6 +37,7 @@ Fifty-two pages, each drafted from the code and the derivation notes, verified a
 - [prior-buffer-row-geometry](prior-buffer-row-geometry.md) — theory page: where a stored row sits relative to the target's thermal shell, the isotropic and shaped jitter tiles, what a likelihood term on stored rows fits, and a floor-versus-shell contrast that needs no normaliser.
 - [anchor-buffer](anchor-buffer.md) — mixed page: the permanent archive of low-energy states, its anchor-energy currency, the six membership sites and the two frozen-guarded primitives, the restore policy hook, and the jitter seam out to the prior buffer.
 - [replay-buffer](replay-buffer.md) — mixed page: the store of forward trajectories, uniform admission, the hazard and backstop eviction arms, the prioritised draw and its importance weights, the held-out split and the intake baseline.
+- [row-store](row-store.md) — code page: the NF route's single flat store behind `buffers.store`, its seed rows, the live level and residual, the uniform MLE and prioritised TB draws with their weights, record admission, demotion and capped eviction, the refresh, the sidecar stamp and the `store/` keys.
 - [rollout-cadence-and-dose](rollout-cadence-and-dose.md) — mixed page: what a forward rollout buys, Little's-law identities, the dose variable, the Z-pinning invariants.
 
 ## Exact-density sampler

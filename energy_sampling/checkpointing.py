@@ -436,6 +436,9 @@ class Checkpointer:
             'prior_buffer': m.prior_buffer.state_dict() if hasattr(m, 'prior_buffer') else None,
             'replay_buffer': m.replay_buffer.state_dict() if hasattr(m, 'replay_buffer') else None,
             'anchor_buffer': m.anchor_buffer.state_dict() if hasattr(m, 'anchor_buffer') else None,
+            # buffers.store (row_store.py), stamped with what its rows depend on (Modeller._store_stamp)
+            'row_store': (m.row_store.state_dict(m._store_stamp())
+                          if getattr(m, 'row_store', None) is not None else None),
         }
 
     def save_buffers(self, tag: Optional[str] = None):
@@ -470,6 +473,9 @@ class Checkpointer:
             m.prior_buffer = buf_cls.from_state_dict(state['prior_buffer'], device=m.buffer_device)
         if state.get('replay_buffer') is not None:
             m.replay_buffer = buf_cls.from_state_dict(state['replay_buffer'], device=m.buffer_device)
+        # the row store is rebuilt by Modeller.init_row_store, which runs after the identifier registry and the
+        # energy reference exist and compares this state's stamp against the run's
+        m._row_store_state = state.get('row_store')
         if state.get('anchor_buffer') is not None:
             m.anchor_buffer = anchor_cls.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
             # CONFIG OWNS THE ANCHOR POLICY, the sidecar does not. from_state_dict

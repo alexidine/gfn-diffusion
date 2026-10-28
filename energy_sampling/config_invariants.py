@@ -1333,6 +1333,133 @@ def nf_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
     return out
 
 
+#: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
+#: An absent key reads its default; an unknown key is refused.
+ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
+                          eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, refresh_chunk=65536)
+#: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
+ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
+
+
+def row_store_settings(node) -> Optional[dict]:
+    """buffers.store merged over ROW_STORE_DEFAULTS when its `enabled` is true, else None. `node` is a raw config dict
+    or the trainer's Namespace. Raises on unknown keys."""
+    st = _member(_member(node, 'buffers'), 'store')
+    if st is None:
+        return None
+    st = dict(st) if isinstance(st, dict) else dict(vars(st))
+    unknown = sorted(set(st) - set(ROW_STORE_DEFAULTS))
+    if unknown:
+        raise ValueError(f"buffers.store: unknown keys {unknown} (known: {sorted(ROW_STORE_DEFAULTS)})")
+    s = {**ROW_STORE_DEFAULTS, **st}
+    return s if s['enabled'] is True else None
+
+
+def _real(v) -> bool:
+    return not isinstance(v, (bool, str)) and isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def _whole(v) -> bool:
+    return _real(v) and int(v) == v
+
+
+def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
+    """(severity, message) for every way an enabled buffers.store conflicts with the rest of the config. [] when the
+    store is absent or off."""
+    try:
+        s = row_store_settings(cfg)
+    except ValueError as e:
+        return [(ERROR, str(e))]
+    if s is None:
+        return []
+    out = []
+
+    def err(msg):
+        out.append((ERROR, msg))
+    if _get(cfg, 'policy.kind', 'sde') != 'nf':
+        err(f"buffers.store needs model.kind nf, got {_get(cfg, 'policy.kind', 'sde')!r}")
+    if _get(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
+        err('buffers.store is refused on the conformer route')
+    if _get(cfg, 'temperature_conditioning', False) is True:
+        err('buffers.store stores log R at one temperature: refused with temperature_conditioning')
+    if _get(cfg, 'energy_config.prior_flow_path') is not None:
+        err('buffers.store stores log R at admission: refused with energy_config.prior_flow_path (a lambda path)')
+    if _get(cfg, 'policy.nf.atom_tokens', False) is True:
+        err('buffers.store keeps no molecule graph per row: refused with model.nf.atom_tokens')
+    if _get(cfg, 'buffers.replay_buffer.prioritise.enabled', False) is True:
+        err('buffers.store draws replay by its own priority: set buffers.replay_buffer.prioritise.enabled false')
+    if (_num(_get(cfg, 'buffers.replay_buffer.val_frac')) or 0) > 0:
+        err('buffers.store holds no replay held-out split: set buffers.replay_buffer.val_frac 0')
+    if _get(cfg, 'buffers.anchor_buffer.frozen', False) is not True:
+        err('buffers.store seeds once from the prior: set buffers.anchor_buffer.frozen true')
+    if 'harvested' in list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()):
+        err("buffers.store seeds data tags anchor and child only: remove 'harvested' from noised_prior.train_kinds")
+    if _get(cfg, 'condition_log_z.rollout_condition_draw', 'iid') == 'under_drawn':
+        err("buffers.store: condition_log_z.rollout_condition_draw 'under_drawn' reads replay_buffer occupancy")
+
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        name = st.get('name', '?')
+        if st.get('condition_draw'):
+            err(f"stage {name!r}: condition_draw draws from prior_buffer and replay_buffer, not the store")
+        if (_num(st.get('replay_warmup_rows')) or 0) > 0:
+            err(f"stage {name!r}: replay_warmup_rows counts replay_buffer rows")
+        if (_coeff(cfg, st, 'replay', 'mle') or 0) > 0:
+            err(f"stage {name!r}: replay mle > 0 (the store's MLE rows are drawn by the bwd branch)")
+        if (_coeff(cfg, st, 'fwd', CROSS_BRANCH_VARGRAD_COEFF) or 0) > 0:
+            err(f"stage {name!r}: fwd {CROSS_BRANCH_VARGRAD_COEFF} > 0 (the store has no condition-blocked draw)")
+        for mode in ('bwd', 'replay'):
+            for key in BRANCH_VARGRAD_COEFFS:
+                if (_coeff(cfg, st, mode, key) or 0) > 0:
+                    err(f"stage {name!r}: {mode} {key} > 0 (the store has no condition-blocked draw)")
+        if (st.get('flags') or {}).get('weighted_bwd_sampling'):
+            err(f"stage {name!r}: flags.weighted_bwd_sampling reads prior_buffer losses")
+        if st.get('coeff_schedule'):
+            err(f"stage {name!r}: coeff_schedule moves the reward; the store keeps log R from admission")
+        if ((st.get('balance') or {}).get('anneal_coeffs')):
+            err(f"stage {name!r}: balance.anneal_coeffs moves the reward; the store keeps log R from admission")
+        trig = st.get('fwd_rollout_triggers') or {}
+        for k in ROW_STORE_REFUSED_TRIGGERS:
+            if isinstance(trig, dict) and (_num(trig.get(k)) or 0) > 0:
+                err(f"stage {name!r}: fwd_rollout_triggers.{k} reads a replay_buffer statistic the store never writes")
+        if (st.get('lr_sensor') or {}).get('kind') == 'ray':
+            err(f"stage {name!r}: lr_sensor kind ray draws from the larder, which keeps no store row")
+        if ((st.get('flags') or {}).get('z_calibration') is True
+                and _get(cfg, 'z_calibration.mode', 'rollout') == 'replay'):
+            err(f"stage {name!r}: z_calibration.mode replay draws from replay_buffer, which the store never fills "
+                f"(Modeller._z_replay_step returns without a step)")
+
+    if not (_real(s['kappa']) and s['kappa'] >= 0):
+        err(f"buffers.store.kappa must be a number >= 0, got {s['kappa']!r}")
+    for k in ('floor_frac', 'uniform_frac'):
+        if not (_real(s[k]) and 0 <= s[k] <= 1):
+            err(f"buffers.store.{k} must lie in [0, 1], got {s[k]!r}")
+    if not (_real(s['bar']) and s['bar'] >= 0):
+        err(f"buffers.store.bar must be a number >= 0, got {s['bar']!r}")
+    if not (_real(s['eps']) and s['eps'] > 0):
+        err(f"buffers.store.eps must be a number > 0, got {s['eps']!r}")
+    for k in ('cap_per_condition', 'max_rows'):
+        if not (_whole(s[k]) and s[k] >= 0):
+            err(f"buffers.store.{k} must be an integer >= 0, got {s[k]!r}")
+    if s['records_kept'] is not None and not (_whole(s['records_kept']) and s['records_kept'] >= 1):
+        err(f"buffers.store.records_kept must be an integer >= 1 or null, got {s['records_kept']!r}")
+    if not (_whole(s['refresh_chunk']) and s['refresh_chunk'] >= 1):
+        err(f"buffers.store.refresh_chunk must be an integer >= 1, got {s['refresh_chunk']!r}")
+    if s['admit_reward_min'] is not None and not _real(s['admit_reward_min']):
+        err(f"buffers.store.admit_reward_min must be a number or null, got {s['admit_reward_min']!r}")
+    if s['records_kept'] is None:
+        out.append((BASELINE, 'buffers.store.records_kept null: protected records are unbounded (one per condition '
+                              'per admission call at most)'))
+    return out
+
+
+def row_store_is_well_formed(cfg: dict) -> list[Violation]:
+    """buffers.store (row_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
+    ERRORs, since this module only reports at load."""
+    return [Violation(sev, 'row_store_is_well_formed', msg) for sev, msg in row_store_problems(canonical_model_section(cfg))]
+
+
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     """Three Z-side keys are documented as UNCONDITIONAL-route settings and must
     be switched when the route is conditional.
@@ -2439,6 +2566,8 @@ RULES = (
     replay_seat_is_well_formed,
     condition_draw_is_well_formed,
     nf_policy_refuses_sde_only_settings,
+    # returns [] when buffers.store is absent or off
+    row_store_is_well_formed,
     # every route but the conformer one; returns [] on energy_function conformer_torsions
     crystal_prior_model_is_retired,
     # the conformer route; each returns [] off energy_function conformer_torsions

@@ -1072,9 +1072,11 @@ def get_gfn_backward_loss(loss_coeffs,
         # loss scale -- and therefore the LR the run is tuned at -- is unchanged
         # by turning prioritisation on.
         #
-        # NB per B5b this belongs with a QUADRATIC branch loss. Combining it
-        # with an active Huber knee makes per-row push ~ beta/delta, so the
-        # deepest rows push LEAST; set beta inactive wherever this is used.
+        # The weights restore, up to the self-normalisation, the uniform-draw
+        # objective of whichever branch loss is active, Huber included: a row
+        # drawn p-times as often carries weight 1/p, so past the Huber knee its
+        # per-draw push is ~beta/(p delta) and its expected push is unchanged
+        # (docs/wiki/row-store.md).
         w = sample_weights.to(combined_losses.device, combined_losses.dtype).flatten()
         if w.numel() != combined_losses.numel():
             # K repeats are tiled over the batch: broadcast one weight per row
