@@ -10799,13 +10799,11 @@ class Modeller:
         log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
         resid = ((fwd_stats['log_pf'] - fwd_stats['log_pb']) - (fwd_stats['log_r'] - log_z)).detach().flatten().cpu()
         log_r = log_r.cpu()
-        keep = torch.isfinite(log_r) & torch.isfinite(resid) & (resid.abs() >= float(cfg.min_abs_resid))
         cid = fwd_stats.get('condition_id')
-        if cid is not None:
-            floor = self._condition_energy_floor(torch.as_tensor(cid).detach().cpu().long().flatten())
-            if floor is not None:
-                energy = -log_r * float(self.args.energy_config.temperature)
-                keep |= torch.isfinite(log_r) & (energy <= floor.cpu().flatten())
+        floor = (self._condition_energy_floor(torch.as_tensor(cid).detach().cpu().long().flatten())
+                 if cid is not None else None)
+        keep = noised_prior.harvest_mask(resid, log_r, float(self.args.energy_config.temperature),
+                                         float(cfg.min_abs_resid), None if floor is None else floor.cpu().flatten())
         idx = torch.nonzero(keep).flatten()
         self.harvest_seen = getattr(self, 'harvest_seen', 0) + int(log_r.numel())
         if idx.numel() == 0:

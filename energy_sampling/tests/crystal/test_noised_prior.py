@@ -115,3 +115,12 @@ def test_identity_compares_the_current_definition_only():
     current = dict(energy_function='elj', lj_coeff=1.0)
     assert NP.identity_mismatch({**current, 'crystal_coordinates': 'latent'}, current) == []
     assert NP.identity_mismatch({'energy_function': 'elj'}, current) == ["lj_coeff: file None, run 1.0"]
+
+
+def test_harvest_keeps_high_error_rows_and_records_and_drops_the_rest():
+    resid = torch.tensor([0.2, -3.0, 0.1, float('nan'), 0.0])
+    log_r = torch.tensor([-10.0, -10.0, -1.0, -10.0, float('-inf')])
+    floor = torch.tensor([0.0, 0.0, 3.0, 0.0, 0.0])          # row 2: energy 1 x T 2 = 2 <= 3, a record
+    keep = NP.harvest_mask(resid, log_r, 2.0, 1.0, floor)
+    assert keep.tolist() == [False, True, True, False, False]
+    assert NP.harvest_mask(resid, log_r, 2.0, 1.0).tolist() == [False, True, False, False, False]

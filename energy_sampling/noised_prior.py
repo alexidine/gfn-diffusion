@@ -191,3 +191,13 @@ def strip_analysis_helpers(b):
     for key in [k for k in b.keys() if isinstance(b[k], dict)]:
         delattr(b, key)
     return b
+
+
+def harvest_mask(resid, log_r, temperature, min_abs_resid, floor=None):
+    """[n] bool, the rows train.py::Modeller.harvest_scored_rows keeps: a finite reward and a finite TB residual of at
+    least min_abs_resid nats in magnitude, or (given each row's condition floor, energy units) a finite reward whose
+    energy -T log R is at or below it."""
+    keep = torch.isfinite(log_r) & torch.isfinite(resid) & (resid.abs() >= float(min_abs_resid))
+    if floor is not None:
+        keep |= torch.isfinite(log_r) & (-log_r * float(temperature) <= floor)
+    return keep
