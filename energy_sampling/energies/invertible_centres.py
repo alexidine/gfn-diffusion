@@ -4,7 +4,8 @@ WHAT THE TARGET HOLDS. At `dihedral` and above the chart reaches both sides of e
 centre: the two pyramids of a three-coordinate centre, and the two labelled parities of a
 four-coordinate centre (docs/wiki/conformer-chart-and-internal-coordinates.md, the chirality
 section). The stereo lock (energies/stereo_lock.py) pins every four-coordinate centre when
-`stereo_coeff` > 0 and leaves every three-coordinate centre free: an amine N, a near-planar
+`stereo_coeff` > 0 and leaves every three-coordinate centre free (but a stereo nitrogen locked
+under `lock_stereo_nitrogen`; LOCK AND SCOPE below): an amine N, a near-planar
 amide N (NON-PLANAR below), a planar sp2 C, whose two sides are one geometry, and also a
 sulfoxide S or a phosphine P, whose inversion is slow (QM9 has neither). The target holds both
 sides of a FREE centre wherever both are low-energy minima; the barrier between them does not
@@ -55,7 +56,14 @@ THE FLIP (`reflect_phi`), on the phi block in radians, by the centre's place in 
 Every atom below a flipped child, and every atom placed on a frame that holds one, moves with
 it as a rigid body turning about an axis through c (docs/design/internal_dof_ladder.md
 section 5). The flip moves periodic phi columns only, so no box clamp can bind on it; it is its
-own inverse, and |det| of the map is 1.
+own inverse, and |det| of the map is 1. That holds with `double_bond_box_deg` set: the one
+non-periodic dihedral column it makes drives a proper row about a locked double bond, which
+is held, in no group and no improper row, so no flip's `rows` hold it. And with
+`sibling_offset_box_deg` set: a group is carried as a rotation plus bounded offsets only at a
+centre the lock names (`ConformerTorsions.sibling_offset_census`), which is LOCKED here, so no
+centre the prior flips or the eval requires on both sides has an offset row. A flip there would
+take a follower's offset to its negative, about 240 degrees away and outside the box;
+`_build_table` raises if a free centre's flip ever holds such a row.
 
 QUALIFIED: a centre has an entry only when its flip is an EXACT INVERSION of c -- every bond
 length, bond angle and other centre's parity kept, and every stereo element's indicator but
@@ -120,6 +128,12 @@ every sp3 centre when `stereo_coeff` is 0, the labelled parities of a CH2 or CH3
 stays one-sided as before although the unlocked target holds both of its sides: a KNOWN
 LIMITATION, which the eval's parity metric still reads and the log Z check's label names. The
 eval counts an UNKNOWN centre as free; the prior does not flip it.
+A LOCKED THREE-COORDINATE CENTRE exists under `ConformerTorsions(lock_stereo_nitrogen=True)`
+only: a stereo nitrogen the condition's SMILES tags (energies/stereo_lock.py, STEREO
+NITROGENS) has a TETRAHEDRAL element keyed on it, so it reads LOCKED here like any named
+centre -- not flipped by the prior, not required on both sides by the eval, not named by the
+log Z check's label -- while every other three-coordinate centre of the same molecule stays
+FREE (tests/conformer/test_stereo_nitrogen.py).
 
 BITWISE WHERE NOTHING IS FLIPPED. Given [] from `invertible_centres`, the prior draw, its density
 and the oracle make no call on the generator and move no row: a molecule with no FREE
@@ -437,6 +451,9 @@ def _build_table(member) -> List[Centre]:
                           {b, kid(rows[0])}))
 
     coeff, named = _lock_names(member)
+    # rows carried as sibling offsets, and each one's leader row (ConformerTorsions block 5)
+    so_rows = np.asarray(getattr(member, 'sibling_offset_rows', np.zeros(0)), dtype=bool)
+    so_lead = np.asarray(getattr(member, 'sibling_leader_row', np.zeros(0)), dtype=np.int64)
     per_c: Dict[int, int] = {}
     for f in flips:
         per_c[f[0]] = per_c.get(f[0], 0) + 1
@@ -461,6 +478,15 @@ def _build_table(member) -> List[Centre]:
         u, v, w = ((ref[k] - ref[c]).numpy() for k in triple)
         lock = FREE if coeff <= 0.0 else (UNKNOWN if named is None
                                           else (LOCKED if c in named else FREE))
+        if lock != LOCKED and so_rows.any() and (
+                so_rows[list(rows)].any()
+                or (pivot is not None and bool((so_lead == pivot).any()))):
+            # a flip negates an offset, which a bounded offset column cannot hold: the
+            # sibling-offset chart converts a group only at a centre the lock names
+            raise RuntimeError(
+                f'{member.smiles}: the centre {sym.GetElementSymbol(int(z[c]))}{c} is not '
+                f'locked, but its flip moves rows {list(rows)} of a sibling group carried as '
+                f'bounded offsets (sibling_offset_box_deg); the box would cut its other side')
         out.append(Centre(slot=int(c), name=f'{sym.GetElementSymbol(int(z[c]))}{c}', kind=kind,
                           rows=tuple(int(j) for j in rows), pivot=pivot, frame=frame,
                           n_bonded=len(nb), planar=bool(planar), lock=lock, triple=triple,

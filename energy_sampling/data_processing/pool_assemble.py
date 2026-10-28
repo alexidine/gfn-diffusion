@@ -1,7 +1,7 @@
 """Assemble a shipped prior file from polished anchors and their capped-MC flood (pooled prior rebuild, 2026-10).
 
     python -m data_processing.pool_assemble ANCHORS.pt FLOOD_DIR OUT.pt --sg SG --key elj|uma --mol MOL.pt
-        [--dedupe 0.01] [--no-fold] [--target-rows N] [--check 2000] [--mlip_path P]
+        --radius R [--ceiling_kT C] [--no-fold] [--check 2000] [--mlip_path P]
 
 ANCHORS.pt   a prior-layout file from `pool_anchors export` (rows in the trainer's chart, handedness +1).
 FLOOD_DIR    a capped_mc output directory, or a directory of them (every shard_*.pt below it is read): each accepted
@@ -9,13 +9,15 @@ FLOOD_DIR    a capped_mc output directory, or a directory of them (every shard_*
 
 Steps
   1. candidates = the anchors, then every flood state, as rows on the anchors' molecule at handedness +1.
-  2. de-dupe in the trainer's latent (12-D; the chart's periodic coordinates wrapped, as capped_mc wraps them): greedy,
-     anchors first in ascending energy, then flood states in ascending energy; a row within --dedupe (Euclidean) of a
-     kept row is dropped. No anchor is dropped for a flood state; an anchor within --dedupe of a lower anchor is.
+  2. ceiling (--ceiling_kT C): a candidate more than C kT above the lowest anchor is left out (kT = 2.494 in the
+     training currency). Then thin in the trainer's latent (12-D; the chart's periodic coordinates wrapped, as
+     capped_mc wraps them): greedy, anchors first in ascending energy, then flood states in ascending energy; a row
+     within --radius (Euclidean) of a kept row is dropped. One radius for every pair, and no row budget: the file's
+     size is whatever the radius leaves. No anchor is dropped for a flood state; an anchor within --radius of a lower
+     anchor is.
   3. fold (unless --no-fold): every kept row is written with all its normaliser images the +1 chart holds
      (pool_anchors.Chart.images: sg 2 four, eight for a centre on an x face; sg 14 eight), images carrying the row's
-     energy. With --target-rows N the flood radius of step 2 is widened by x1.25 at a time (the anchors' stays at
-     --dedupe) until kept rows x images <= N: a coarser cover of the same flooded volume, not an energy cut.
+     energy.
   4. write {'prior': batch, 'equalized_prior': the same batch, 'thermal_scaling_factor', ['uma_energy_state']} plus
      provenance (source row, image id, anchor flag). Energies are stored in the file's raw currency under --key (eLJ:
      the flood's training-currency energy divided by the anchors file's thermal_scaling_factor).
@@ -23,9 +25,11 @@ Steps
      is left out before folding, with all its images; so is a state the trainer's density penalty touches
      (energies.molecular_crystal.density_penalty > 0); cached space-group lookup fields are dropped from the rows.
   6. check: --check rows drawn at random are re-scored the trainer's way against their stored energy (all asserted).
+  7. OUT.summary.json: rows, bytes, and the count at every step.
 """
 import argparse
 import glob
+import json
 import os
 import time
 
@@ -37,6 +41,8 @@ from data_processing.pool_anchors import Chart
 PHI, RMAG = 10, 11
 #: buffer._LAZY_SG_CACHES plus free_axis_lut, which the trainer does not strip at load
 LAZY_CACHES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
+#: kJ/mol at 300 K, the training currency's kT
+KT = 2.494
 
 
 def periodic_dims(sg):
@@ -120,10 +126,11 @@ def main(argv=None):
     ap.add_argument('--sg', type=int, required=True)
     ap.add_argument('--key', required=True, choices=['elj', 'uma'])
     ap.add_argument('--mol', required=True)
-    ap.add_argument('--dedupe', type=float, default=0.01)
+    ap.add_argument('--radius', type=float, required=True,
+                    help='thinning radius in the trainer latent (Euclidean), for anchors and flood states alike')
+    ap.add_argument('--ceiling_kT', type=float, default=None,
+                    help='leave out candidates more than this many kT above the lowest anchor (default: no ceiling)')
     ap.add_argument('--no-fold', action='store_true')
-    ap.add_argument('--target-rows', type=int, default=0,
-                    help='widen the flood radius until the file holds at most this many rows (0: no limit)')
     ap.add_argument('--check', type=int, default=2000)
     ap.add_argument('--mlip_path', default=None)
     a = ap.parse_args(argv)
@@ -136,6 +143,13 @@ def main(argv=None):
     cpA = anchors.full_cell_parameters().float()
     cpF, eF, n_files = load_flood(a.flood_dir)
     eF = eF / scale
+    n_anchor_in, n_flood_in = len(cpA), len(cpF)
+    if a.ceiling_kT is not None:
+        top = float(eA.min()) + a.ceiling_kT * KT / scale
+        okA, okF = eA <= top, eF <= top
+        print(f'ceiling {a.ceiling_kT:g} kT above the lowest anchor ({float(eA.min()):.3f} -> {top:.3f}): '
+              f'{int(okA.sum())} of {len(eA)} anchors and {int(okF.sum())} of {len(eF)} flood states under it', flush=True)
+        cpA, eA, cpF, eF = cpA[okA], eA[okA], cpF[okF], eF[okF]
     cp = torch.cat([cpA, cpF])
     E = torch.cat([eA, eF])
     is_anchor = torch.zeros(len(cp), dtype=torch.bool)
@@ -147,18 +161,12 @@ def main(argv=None):
     from scipy.spatial import cKDTree
     x, box = wrapped(lat, per)
     tree = cKDTree(x, boxsize=box)
-    n_img = 1 if a.no_fold else (4 if a.sg == 2 else 8)
-    r_flood = a.dedupe
-    while True:
-        kept, n_pairs = greedy_dedupe(x, box, tree, order, len(cpA), a.dedupe, r_flood)
-        ka = is_anchor[kept]
-        print(f'latent de-dupe (periodic dims {per}): anchors at {a.dedupe}, flood states at {r_flood:.4f} '
-              f'({n_pairs} close pairs): kept {int(ka.sum())} of {len(cpA)} anchors and {int((~ka).sum())} of '
-              f'{len(cpF)} flood states ({n_files} shard files) -> about {len(kept) * n_img} rows  '
-              f'({time.time() - t0:.0f} s)', flush=True)
-        if not a.target_rows or len(kept) * n_img <= a.target_rows or int((~ka).sum()) == 0:
-            break
-        r_flood *= 1.25
+    kept, n_pairs = greedy_dedupe(x, box, tree, order, len(cpA), a.radius, a.radius)
+    ka = is_anchor[kept]
+    n_anchor_thin, n_flood_thin = int(ka.sum()), int((~ka).sum())
+    print(f'latent thinning at radius {a.radius:g} (periodic dims {per}; {n_pairs} close pairs): kept {n_anchor_thin} '
+          f'of {len(cpA)} anchors and {n_flood_thin} of {len(cpF)} flood states ({n_files} shard files)  '
+          f'({time.time() - t0:.0f} s)', flush=True)
     kept = torch.from_numpy(np.sort(kept))
     ch = Chart(a.mol, a.sg, a.key)
     if a.key == 'uma':
@@ -214,7 +222,7 @@ def main(argv=None):
         idx = torch.randperm(out.num_graphs, generator=g)[:a.check]
         e, red = ch.read(out.subsample_new_batch(idx))
         d = (e - e_out[idx]).abs()
-        kT = 2.494 / scale
+        kT = KT / scale
         print(f'check on {len(idx)} rows: trainer-read energy vs stored: median |d| {float(d.median()):.4f}, max '
               f'{float(d.max()):.4f} ({float(d.max()) / kT:.3f} kT); reduction penalty max {float(red.max()):.3g}', flush=True)
         bad = torch.nonzero(d > 0.2 * kT).flatten()
@@ -227,7 +235,7 @@ def main(argv=None):
             raise SystemExit(f'refused: {len(bad)} of {len(idx)} checked rows do not read back at their stored energy')
     blob = {'prior': out, 'equalized_prior': out, 'thermal_scaling_factor': src.get('thermal_scaling_factor', 1),
             'source_row': kept[source], 'image_id': image, 'is_anchor': is_anchor[kept][source],
-            'n_anchors_in': len(cpA), 'n_flood_in': len(cpF), 'dedupe': a.dedupe, 'flood_radius': r_flood,
+            'n_anchors_in': n_anchor_in, 'n_flood_in': n_flood_in, 'radius': a.radius, 'ceiling_kT': a.ceiling_kT,
             'folded': not a.no_fold, 'out_of_box_states_dropped': n_outside, 'density_states_dropped': n_density,
             'anchors_file': os.path.abspath(a.anchors), 'flood_dir': os.path.abspath(a.flood_dir)}
     if 'uma_energy_state' in src:
@@ -236,7 +244,17 @@ def main(argv=None):
         if k in out.keys():
             delattr(out, k)
     torch.save(blob, a.out)
-    print(f'wrote {a.out} ({os.path.getsize(a.out) / 2 ** 20:.0f} MiB, {time.time() - t0:.0f} s)')
+    summary = {'file': os.path.basename(a.out), 'bytes': os.path.getsize(a.out), 'rows': int(out.num_graphs),
+               'radius': a.radius, 'ceiling_kT': a.ceiling_kT, 'folded': not a.no_fold,
+               'anchors_in': n_anchor_in, 'flood_states_in': n_flood_in,
+               'anchors_under_ceiling': len(cpA), 'flood_states_under_ceiling': len(cpF),
+               'anchors_after_thinning': n_anchor_thin, 'flood_states_after_thinning': n_flood_thin,
+               'states_outside_latent_box': n_outside, 'states_with_density_penalty': n_density,
+               'states_kept': len(kept), 'anchor_rows': int(is_anchor[kept][source].sum()),
+               'energy_min': float(e_out.min()), 'energy_max': float(e_out.max()), 'energy_key': a.key}
+    with open(a.out + '.summary.json', 'w') as fh:
+        json.dump(summary, fh, indent=1)
+    print(f'wrote {a.out} ({summary["bytes"]} bytes, {summary["rows"]} rows, {time.time() - t0:.0f} s)')
 
 
 if __name__ == '__main__':

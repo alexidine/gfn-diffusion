@@ -17,7 +17,11 @@ first row of a ``torsion_groups`` group) is replaced by ``e_g``, the RIGID ROTAT
 whole group about its central bond (the same angle on every row of the group, i.e. 1 / scale
 on each of its columns). The rotation is the soft torsional coordinate; moving one sibling
 alone changes the angle between siblings and is stiff. This is the leader-plus-followers
-structure ``sample_prior_states`` draws with.
+structure ``sample_prior_states`` draws with. In a group the chart carries as one rotation
+plus offsets (``ConformerTorsions(sibling_offset_box_deg=W)``) the leader's column IS the
+rigid rotation, so ``e_g`` is that column alone (1 / pi on it, 0 on the followers' offset
+columns); the directions and their widths in radians are those of the default chart, and a
+follower's width in state units is over its own scale, W, like every width here.
 
 THE WIDTH of each basis direction is ``sqrt(kT / kappa)``, kappa the second derivative of the
 member's potential (``potential_energy`` at T = 1: every force-field term, the stereo lock,
@@ -37,7 +41,9 @@ the force field states outright for that coordinate alone:
     components. MMFF's linear form 2k (1 + cos theta) is k rho^2 + O(rho^4) in rho = pi -
     theta, and rho^2 = u^2 + v^2, so each component has variance kT / 2k.
   - a HELD phi row (an improper, or a locked double bond: ``held_phi_rows``):
-    ``improper_phi_sigma(T)``, the width ``sample_prior_states`` holds it at.
+    ``improper_phi_sigma(T)``, the width ``sample_prior_states`` holds it at. In state units
+    it is divided by the column's own scale like every width here: pi, or the box half-width
+    when the double bond's dihedral is bounded (``double_bond_box_deg``).
   - a FOLLOWER phi row: ``sibling_jitter_sigma``, the width of the redundant angle between
     siblings.
 
@@ -138,10 +144,14 @@ def member_widths(member, temperature: float) -> Tuple[np.ndarray, np.ndarray]:
     s_sib = member.sibling_jitter_sigma(groups, T) if groups else []
     leaders = np.zeros(k, dtype=bool)
     directions = np.zeros((len(groups), k))
+    # a follower carried as an OFFSET (`sibling_offset_box_deg`) is turned by its leader's
+    # column already: the group's rotation is then that one column, and the follower's own
+    # axis moves it alone, as it did when its column was periodic
+    offset = np.asarray(getattr(member, 'sibling_offset_rows', np.zeros(0)), dtype=bool)
     for g, rows in enumerate(groups):
         for i, j in enumerate(rows):
             c = col_of_row[n_phi0 + j]
-            directions[g, c] = 1.0 / scale[c]
+            directions[g, c] = 0.0 if (offset.size and offset[j]) else 1.0 / scale[c]
             if i == 0:
                 leaders[c] = True
                 own[c], step[c] = 0.0, FD_STEP_ANGLE
@@ -216,6 +226,11 @@ class ThermalTile:
         if ident not in self._tables:
             member = self._member(ident)
             sigma, rot = member_widths(member, self.temperature)
+            # A SET MEMBER KEEPS NO BATCH CACHE: `curvatures` evaluated it at 2M + 1 points,
+            # and the set scores through its one-pass library, so that entry (1.7 MB a
+            # member, on the energy's device) would never be read again
+            if member is not self.energy:
+                member.release_batch_cache()
             layout = getattr(self.energy, 'carrier', None)
             if layout is not None:
                 cols = np.asarray(layout.cols[ident])

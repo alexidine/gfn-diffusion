@@ -125,6 +125,43 @@ def _num(v) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# THE MODEL SECTION. mk_dev writes it by kind: `model: {kind, shared, sde, nf}` -- the model the trainer trains, the
+# geometry both kinds read, the SDE policy's architecture, the normalizing flow's settings. The code reads the
+# resolved form: `model` = shared + sde (the SDE builds from it, and the NF's geometry probe needs it too) and
+# `policy` = {kind, nf}. utils.load_yaml resolves on load and `check` resolves before judging; a config already in the
+# resolved form (a generated battery file, an older config) passes through unchanged.
+# ---------------------------------------------------------------------------
+MODEL_KINDS = ('sde', 'nf')
+MODEL_SECTIONS = ('kind', 'shared', 'sde', 'nf')
+
+
+def canonical_model_section(cfg):
+    """The config with a sectioned `model:` block resolved (see above); anything else returned as it is."""
+    if not isinstance(cfg, dict):
+        return cfg
+    model = cfg.get('model')
+    if not isinstance(model, dict) or 'kind' not in model:
+        return cfg
+    unknown = set(model) - set(MODEL_SECTIONS)
+    if unknown:
+        raise ValueError(f"model: unknown sections {sorted(unknown)}; a sectioned model block holds "
+                         f"{list(MODEL_SECTIONS)}")
+    if model['kind'] not in MODEL_KINDS:
+        raise ValueError(f"model.kind {model['kind']!r}: one of {list(MODEL_KINDS)}")
+    if 'policy' in cfg:
+        raise ValueError("a `policy` block beside a sectioned `model:` block: the model section carries the kind "
+                         "and the NF settings")
+    shared, sde = dict(model.get('shared') or {}), dict(model.get('sde') or {})
+    both = sorted(set(shared) & set(sde))
+    if both:
+        raise ValueError(f"model.shared and model.sde both set {both}")
+    out = dict(cfg)
+    out['model'] = {**shared, **sde}
+    out['policy'] = {'kind': model['kind'], 'nf': dict(model.get('nf') or {})}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The rules. Each returns a list of Violations; an empty list means it passed OR
 # abstained, and abstention is reported separately by `check` so a rule that can
 # never fire is visible rather than reassuring.
@@ -1035,6 +1072,64 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
                     f"terminal, condition_block_m gives M same-condition terminals per "
                     f"block. With neither, every backward group is a singleton and the "
                     f"branch contributes no VarGrad gradient."))
+    return out
+
+
+# keys that act only through the SDE policy's machinery; under model.kind nf each is inert, raises mid-run, or
+# (gradient_norm_clip auto) derives a value from SDE quantities. key -> the values a flow run may carry
+FLOW_REFUSED_GLOBALS = {
+    'compile_policy': (False, None),
+    'traj_checkpoint': (False, None),
+    'model.full_flow': (False, None),
+    'model.force_drift_fwd': (False, None, 0),
+    'model.force_drift_bwd': (False, None, 0),
+    'model.state_atoms': (0, None, False),
+    'model.state_force_input': (False, None),
+}
+# per-branch loss coefficients an NF run must leave at 0 (or the stated value), resolved through each stage
+FLOW_ZERO_COEFFS = {'fwd': ('subtb', 'db', 'exploration_std', 'traj_grads', 'path_grad_last_k', 'reward_grads'),
+                    'bwd': ('subtb', 'db', 'tbc'),
+                    'replay': ('subtb', 'db', 'stored_force_k', 'resample_last_k', 'reward_grads')}
+FLOW_REFUSED_ACTIONS = ('set_traj_checkpoint',)
+
+
+def nf_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
+    """Under model.kind nf (models/nf_policy.py: a one-step policy, log P_B = 0, no time grid, no drift or
+    variance heads, no force terms) the SDE-only settings refuse at load: each would otherwise sit in the run's config
+    looking live while doing nothing (compile_policy, traj_checkpoint, the force and state-atom keys, full_flow, tbc,
+    backward repeats > 1, db as a second TB), raise at its first use mid-run (subtb, the forward path-gradient keys,
+    replay stored forces and resampling), or derive a value from SDE quantities (gradient_norm_clip auto: the (W, T)
+    rule fitted to SDE gradients). Absent policy block or kind sde: nothing to judge."""
+    cfg = canonical_model_section(cfg)
+    if _get(cfg, 'policy.kind', 'sde') != 'nf':
+        return []
+    out = []
+    for key, ok in FLOW_REFUSED_GLOBALS.items():
+        v = _get(cfg, key)
+        if v not in ok:
+            out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
+                                 f'{key} = {v!r} acts only through the SDE policy (allowed under model.kind nf: {ok})'))
+    if _is_auto(_get(cfg, 'gradient_norm_clip', 'auto')):
+        out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
+                             "gradient_norm_clip 'auto' is fitted to SDE gradients from (W, integrator.T): give the "
+                             "NF policy a number"))
+    for stage in active_stages(cfg) or [{}]:
+        name = stage.get('name', '(base)')
+        for mode, keys in FLOW_ZERO_COEFFS.items():
+            for key in keys:
+                v = _coeff(cfg, stage, mode, key)
+                if v not in (None, 0.0):
+                    out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
+                                         f"stage '{name}': {mode} {key} = {v:g} is SDE-only (0 under model.kind nf)"))
+        rep = _coeff(cfg, stage, 'bwd', 'repeats')
+        if rep is not None and rep > 1:
+            out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
+                                 f"stage '{name}': bwd repeats = {rep:g}: a one-step policy's backward copies are "
+                                 f"identical (1 under model.kind nf)"))
+        for act in list(stage.get('on_enter') or []) + list(stage.get('on_exit') or []):
+            if str(act).split(':')[0] in FLOW_REFUSED_ACTIONS:
+                out.append(Violation(ERROR, 'nf_policy_refuses_sde_only_settings',
+                                     f"stage '{name}': action {act!r} acts only on the SDE policy"))
     return out
 
 
@@ -2069,6 +2164,7 @@ RULES = (
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
     condition_draw_is_well_formed,
+    nf_policy_refuses_sde_only_settings,
     # the conformer route; each returns [] off energy_function conformer_torsions
     conformer_dplr_is_off_on_a_set,
     conformer_set_policy_is_conditioned,
@@ -2085,6 +2181,7 @@ RULES = (
 
 def check(cfg: dict) -> list[Violation]:
     """Every rule against one raw config dict, worst severity first."""
+    cfg = canonical_model_section(cfg)
     out = []
     for rule in RULES:
         out.extend(rule(cfg))

@@ -132,13 +132,21 @@ class StateEncoding(nn.Module):
                  s_emb_dim: int = 64,
                  dropout: Optional[float] = 0,
                  norm: Optional[str] = None,
-                 bias: Optional[bool] = True
+                 bias: Optional[bool] = True,
+                 extra_dim: int = 0,
                  ):
         super(StateEncoding, self).__init__()
 
+        # A second input block: features of the state computed outside the latent (GFN's
+        # state_features_dim). Projected and normalised per row before it joins the state and
+        # the condition, so its scale is its own business and no row depends on another.
+        self.extra_dim = extra_dim
+        if extra_dim > 0:
+            self.extra_in = nn.Sequential(nn.Linear(extra_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU())
+
         self.x_model = scalarMLP(
             layers=layers,
-            input_dim=s_dim + conditioning_dim,
+            input_dim=s_dim + conditioning_dim + (hidden_dim if extra_dim > 0 else 0),
             filters=hidden_dim,
             output_dim=s_emb_dim,
             dropout=dropout,
@@ -146,11 +154,15 @@ class StateEncoding(nn.Module):
             bias=bias,
         )
 
-    def forward(self, s, conditioning=None):
+    def forward(self, s, conditioning=None, extra=None):
         if conditioning is not None:
             model_inputs = torch.cat([s, conditioning], dim=-1)
         else:
             model_inputs = s
+        if self.extra_dim > 0:
+            if extra is None:
+                raise ValueError('this state encoder was built with extra_dim > 0 and was given no extra input')
+            model_inputs = torch.cat([model_inputs, self.extra_in(extra)], dim=-1)
         return self.x_model(model_inputs)
 
 
@@ -293,6 +305,39 @@ class FlowModel(nn.Module):
 
     def forward(self, z):
         return self.model(z)
+
+
+class ForceGate(nn.Module):
+    """Per-coordinate multiplier on a force term in a kernel mean, as a function of time.
+
+        gate(t) = init + net(t_emb)            [B, out_dim]
+
+    `net`'s output layer is zero at construction, so the gate starts at `init` for every
+    time and coordinate and moves only by training. `learned=False` builds no parameters
+    and holds the gate at `init`.
+    """
+
+    def __init__(self, t_dim: int, out_dim: int, init: float = 0.0, hidden_dim: int = 64,
+                 learned: bool = True):
+        super(ForceGate, self).__init__()
+        self.out_dim = out_dim
+        self.init = float(init)
+        self.learned = learned
+        if learned:
+            self.net = nn.Sequential(nn.Linear(t_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, out_dim))
+            self.net[-1].weight.data.fill_(0.0)
+            self.net[-1].bias.data.fill_(0.0)
+
+    def forward(self, t_emb):
+        if not self.learned:
+            return t_emb.new_full((t_emb.shape[0], self.out_dim), self.init)
+        return self.init + self.net(t_emb)
+
+    def restart(self):
+        """Back to `init` at every time: the output layer is zeroed, as at construction."""
+        if self.learned:
+            self.net[-1].weight.data.fill_(0.0)
+            self.net[-1].bias.data.fill_(0.0)
 
 
 class LangevinScalingModel(nn.Module):

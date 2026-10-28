@@ -50,7 +50,7 @@ from models.graph_encodings import (
     bond_features_from_smiles, cycle_rank, degree_histogram, diameter, eccentricity,
     graph_from_smiles, lap_pe, orbit_sizes, ring_membership, rwse, shortest_paths,
     smallest_ring_size, spectral_moments, to_dense_adjacency, wiener_index,
-    cip_codes, wl_colours, pi_degree, mol_for_labels, canonical_root,
+    cip_codes, wl_colours, pi_degree, mol_for_labels, canonical_root, bond_stereo_codes,
 )
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
@@ -63,7 +63,8 @@ MAX_DEGREE = 5
 
 # --------------------------------------------------------------------------- molecules
 
-def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
+def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40)),
+             source: Optional[str] = None) -> List[str]:
     """SMILES from the FULL QM9 dataset -- 133,728 molecules, every SMILES distinct.
 
     USE THE FULL SET, NOT THE ANCHOR CHUNKS. Until 2026-09-01 this read
@@ -88,6 +89,22 @@ def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
     the subset. Anything touching chirality must go through :func:`load_qm9_stereo`.
     """
     import torch as _t
+    if source:
+        # a (dataset_index, smiles) table, tab-separated with a header, optionally gzipped:
+        # configs/conformer_db_sep29/qm9_index.tsv.gz is the full set in the repository
+        import csv
+        import gzip
+        opener = gzip.open if str(source).endswith('.gz') else open
+        out, seen = [], set()
+        with opener(source, 'rt', newline='') as f:
+            for row in csv.DictReader(f, delimiter='\t'):
+                smi = row['smiles']
+                if smi and smi not in seen:
+                    seen.add(smi)
+                    out.append(smi)
+                    if len(out) >= n:
+                        return out
+        raise RuntimeError('asked for %d unique molecules, %s holds %d.' % (n, source, len(out)))
     if os.path.exists(QM9_FULL):
         out, seen = [], set()
         for s in _t.load(QM9_FULL, weights_only=False, map_location='cpu'):
@@ -122,8 +139,12 @@ def load_qm9(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
     return out
 
 
-def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[str]:
-    """QM9 with chirality ASSIGNED ARBITRARILY at every genuine tetrahedral centre.
+def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40)),
+                    double_bonds: bool = False, source: Optional[str] = None) -> List[str]:
+    """QM9 with chirality ASSIGNED ARBITRARILY at every genuine tetrahedral centre, and with
+    ``double_bonds`` E or Z likewise at every double bond `FindPotentialStereo` reports (bit
+    32 + j of the same per-molecule hash): raw QM9 carries no E/Z either, so without it the
+    bond-stereo column of stereo features 2 is identically zero in training.
 
     QM9 AS STORED HAS NO STEREOCHEMISTRY -- 0.0% of molecules carry a chiral tag, in the full
     133k set exactly as in the anchor subset -- so `graph_from_smiles`' parity column is
@@ -156,7 +177,7 @@ def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[st
     import hashlib
 
     out = []
-    for smi in load_qm9(n, chunks):
+    for smi in load_qm9(n, chunks, source=source):
         m = Chem.MolFromSmiles(smi)
         if m is None:
             continue
@@ -171,6 +192,21 @@ def load_qm9_stereo(n: int, chunks: Sequence[int] = tuple(range(40))) -> List[st
                         Chem.ChiralType.CHI_TETRAHEDRAL_CW if (bits >> (j % 64)) & 1
                         else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
                 Chem.AssignStereochemistry(m, cleanIt=True, force=True)
+            if double_bonds:
+                # AFTER the tetrahedral pass: AssignStereochemistry(cleanIt) drops a bond
+                # stereo set this way, and MolToSmiles alone writes it
+                bonds = [e for e in Chem.FindPotentialStereo(m) if str(e.type) == 'Bond_Double']
+                if bonds:
+                    bits = int.from_bytes(
+                        hashlib.blake2b(smi.encode(), digest_size=8).digest(), 'big')
+                    no = Chem.StereoInfo.NOATOM
+                    for j, e in enumerate(bonds):
+                        ca = list(e.controllingAtoms)
+                        b = m.GetBondWithIdx(e.centeredOn)
+                        b.SetStereoAtoms(int(next(a for a in ca[:2] if a != no)),
+                                         int(next(a for a in ca[2:] if a != no)))
+                        b.SetStereo(Chem.BondStereo.STEREOCIS if (bits >> (32 + j % 32)) & 1
+                                    else Chem.BondStereo.STEREOTRANS)
             out.append(Chem.MolToSmiles(m))
         except Exception:
             continue
@@ -320,8 +356,10 @@ PROBES: List[Probe] = [
     #: mean 2p-1 at sign accuracy p, so exact-match-after-rounding reports EXACTLY 0% until
     #: p > 0.75. Harmless for a tripwire that should sit at ~100%; do NOT reuse this scoring
     #: for a hard +/-1 target -- use classification.
+    #: the label IS the parity input column (`graph_from_smiles` at the sample's stereo
+    #: features), so at features 2 it carries r/s where the input does.
     Probe('cip_code', 'E', 1,
-          lambda ctx: cip_codes(ctx['mol']).astype(float)[:, None], True,
+          lambda ctx: ctx['parity'].astype(float)[:, None], True,
           nonzero_only=True),
     #: THE REAL CHIRALITY TEST now that `cip_code` is a tripwire: the sign is an input column
     #: but the WL weight is not, so no copy of a single input reproduces it.
@@ -346,11 +384,39 @@ PROBES: List[Probe] = [
     #: over 600 distinct stereoisomer pairs is 90.7% against the hash's 91.2%, and the model
     #: already computes this exact quantity at 100/100 on `spd_to_marked`.
     Probe('chiral_moment', 'E', 1,
-          lambda ctx: np.array([float((cip_codes(ctx['mol']) *
+          lambda ctx: np.array([float((ctx['parity'] *
                                        (1.0 + np.where(ctx['spd'][ctx['root']] < 0, 0,
                                                        ctx['spd'][ctx['root']]))).sum())]),
           False),
 ]
+
+#: DOUBLE-BOND GEOMETRY, the bond-feature column of stereo features 2. NOT in `PROBES`: at
+#: features 1 the column does not exist and both labels are identically zero, so `main`
+#: appends these only at features 2. `ez_code` is the tripwire, per ATOM: each end of a
+#: labelled bond carries that bond's E/Z code, so it is the edge input moved one hop -- under
+#: ~100% the column is not surviving the encoder. `ez_moment` is `chiral_moment`'s
+#: counterpart: each labelled bond's code weighted by 1 + its nearer end's distance to the
+#: marked atom, so no sum of one input column reproduces it.
+EZ_PROBES: List[Probe] = [
+    Probe('ez_code', 'E', 1,
+          lambda ctx: _ez_per_atom(ctx).astype(float)[:, None], True, nonzero_only=True),
+    Probe('ez_moment', 'E', 1,
+          lambda ctx: np.array([_ez_moment(ctx)]), False),
+]
+
+
+def _ez_per_atom(ctx) -> np.ndarray:
+    out = np.zeros(ctx['n'], dtype=np.float64)
+    for (a, b), c in zip(ctx['e'].T.tolist(), ctx['bond_stereo'].tolist()):
+        out[a] += c
+        out[b] += c
+    return out
+
+
+def _ez_moment(ctx) -> float:
+    d = np.where(ctx['spd'][ctx['root']] < 0, 0, ctx['spd'][ctx['root']])
+    return float(sum(c * (1.0 + min(d[a], d[b]))
+                     for (a, b), c in zip(ctx['e'].T.tolist(), ctx['bond_stereo'].tolist())))
 
 #: RETIRED 2026-08-31 after a task-design audit, with reasons:
 #:   n_atoms       exactly formula.sum() and degree_hist.sum() (100% agreement)
@@ -405,8 +471,9 @@ def atom_features(z, edge_index, parity, n, root: int = 0) -> np.ndarray:
     return np.concatenate([el, dg, parity.astype(float)[:, None], is_root], axis=1)
 
 
-def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Sample:
-    z, e1, parity = graph_from_smiles(smiles)
+def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0,
+                 stereo: int = 1) -> Sample:
+    z, e1, parity = graph_from_smiles(smiles, stereo=stereo)
     n = len(z)
     # CANONICAL RANK, so the root is a function of the molecule and is REPRODUCIBLE. Atom
     # index 0 was a serialisation property (20.7% label survival); resampling per call fixed
@@ -414,7 +481,7 @@ def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Samp
     # memorisation measure at all.
     mol = mol_for_labels(smiles)
     root = canonical_root(mol)
-    bf = bond_features_from_smiles(smiles)
+    bf = bond_features_from_smiles(smiles, stereo=stereo)
     edge_index = np.concatenate([e1, e1[::-1]], axis=1)
     edge_attr = np.concatenate([bf, bf], axis=0)
     spd = shortest_paths(e1, n)
@@ -424,7 +491,9 @@ def build_sample(smiles: str, encoding: str, k: int, root_seed: int = 0) -> Samp
     s = Sample(smiles, n, atom_features(z, e1, parity, n, root), struct,
                edge_index, edge_attr, spd)
     ctx = {'z': z, 'e': e1, 'n': n, 'spd': spd, 'root': root, 'parity': parity,
-           'mol': mol}
+           'mol': mol,
+           'bond_stereo': (bond_stereo_codes(mol) if stereo >= 2
+                           else np.zeros(e1.shape[1], dtype=np.int64))}
     for p in PROBES:
         v = np.asarray(p.fn(ctx), dtype=np.float64)
         s.labels[p.name] = v.reshape(n, p.dim) if p.per_node else v.reshape(1, p.dim)
@@ -704,7 +773,17 @@ def probe_tolerances(samples):
 
 
 def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device,
-        save_to: Optional[str] = None, weighting: str = 'none'):
+        save_to: Optional[str] = None, weighting: str = 'none', stereo: int = 1,
+        lr_schedule: str = 'constant', lr_final: float = 0.0, warmup: int = 0,
+        state_path: Optional[str] = None, save_every: int = 0, verbose: bool = False):
+    """One arm at one training-set size and seed.
+
+    ``lr_schedule`` 'cosine' takes the rate from ``lr`` to ``lr_final`` over the run, after
+    ``warmup`` linear steps from 0 ('constant' keeps ``lr`` after the warm-up). With
+    ``state_path`` and ``save_every`` the run writes its full training state there every
+    ``save_every`` steps and CONTINUES from that file when it exists, so a run longer than
+    one job is resubmitted unchanged; a state written by a different run is refused.
+    """
     cfg = ARMS[arm]
     torch.manual_seed(seed); np.random.seed(seed)
     mu, sd = target_stats(train, device)
@@ -713,10 +792,37 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
     model.weighting = weighting
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
+    if lr_schedule not in ('constant', 'cosine'):
+        raise ValueError(f"lr_schedule {lr_schedule!r}: 'constant' or 'cosine'")
+
+    def _lr(step):
+        if step < warmup:
+            return lr * (step + 1) / warmup
+        if lr_schedule == 'constant':
+            return lr
+        frac = (step - warmup) / max(1, steps - warmup)
+        return lr_final + 0.5 * (lr - lr_final) * (1.0 + np.cos(np.pi * min(1.0, frac)))
 
     model.train()
     curve = []
     best_ho, best_step, best_state = float('inf'), -1, None
+    identity = {'arm': arm, 'seed': seed, 'n_train': len(train), 'steps': steps,
+                'hidden': hidden, 'layers': layers, 'batch_mols': batch_mols, 'lr': lr,
+                'lr_schedule': lr_schedule, 'stereo': int(stereo),
+                'probes': [p.name for p in PROBES]}
+    step0 = 0
+    if state_path and os.path.exists(state_path):
+        st = torch.load(state_path, map_location=device, weights_only=False)
+        if st['identity'] != identity:
+            diff = {kk: (st['identity'].get(kk), v) for kk, v in identity.items()
+                    if st['identity'].get(kk) != v}
+            raise SystemExit(f'{state_path} was written by a different run (stored, this): {diff}')
+        model.load_state_dict(st['model'])
+        opt.load_state_dict(st['opt'])
+        rng.bit_generator.state = st['rng']
+        curve, best_ho, best_step = st['curve'], st['best_ho'], st['best_step']
+        best_state, step0 = st['best_state'], int(st['step'])
+        print(f'  RESUMED {state_path} at step {step0} of {steps}', flush=True)
     # HELD-OUT LOSS ALONG THE RUN, not just at the end. A train-only curve shows collapse and
     # under-training but is BLIND TO OVER-FITTING -- the one failure mode that looks perfectly
     # healthy from the training side, because train loss keeps falling while the model is
@@ -740,7 +846,11 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
         n = max(nb, 1)
         return tot / n, {kk: vv / n for kk, vv in acc.items()}
 
-    for step in range(steps):
+    scheduled = lr_schedule != 'constant' or warmup > 0
+    for step in range(step0, steps):
+        if scheduled:
+            for grp in opt.param_groups:
+                grp['lr'] = _lr(step)
         idx = rng.choice(len(train), size=min(batch_mols, len(train)), replace=False)
         b = collate([train[i] for i in idx], device, cfg['spd'])
         opt.zero_grad()
@@ -765,6 +875,18 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
                 best_ho = ho_total
                 best_step = step
                 best_state = {kk: v.detach().clone() for kk, v in model.state_dict().items()}
+            if verbose:
+                print(f'    step {step:>8d}  train loss {float(total.detach()):.4f}  held-out loss '
+                      f'{ho_total:.4f} (best {best_ho:.4f} at step {best_step})  lr '
+                      f'{opt.param_groups[0]["lr"]:.2e}', flush=True)
+        # the last step is written too, so resubmitting a finished run goes straight to scoring
+        if state_path and save_every and ((step + 1) % save_every == 0 or step + 1 == steps):
+            os.makedirs(os.path.dirname(state_path) or '.', exist_ok=True)
+            torch.save({'identity': identity, 'model': model.state_dict(),
+                        'opt': opt.state_dict(), 'rng': rng.bit_generator.state,
+                        'curve': curve, 'best_ho': best_ho, 'best_step': best_step,
+                        'best_state': best_state, 'step': step + 1}, state_path + '.tmp')
+            os.replace(state_path + '.tmp', state_path)
 
     # restore the best held-out state before SCORING, so the reported numbers and the saved
     # weights describe the same model. Scoring the last state and saving the best would be a
@@ -785,12 +907,37 @@ def run(arm, train, test, steps, hidden, layers, k, batch_mols, lr, seed, device
         torch.save({'state_dict': model.state_dict(), 'arm': arm, 'seed': seed,
                     'n_train': len(train), 'hidden': hidden, 'layers': layers, 'k': k,
                     'attention': cfg['attention'], 'best_step': best_step,
-                    'best_heldout': best_ho, 'steps_run': steps}, save_to)
+                    'best_heldout': best_ho, 'steps_run': steps,
+                    # models/encoder_cache.load_encoder builds its inputs at this level; a
+                    # checkpoint without the key is level 1
+                    'stereo_features': int(stereo)}, save_to)
     return {'arm': arm, 'seed': seed, 'n_train': len(train), 'steps': steps, 'curve': curve,
             'best_step': best_step, 'best_heldout': best_ho,
             'n_params': int(sum(p.numel() for p in model.parameters())),
             'train': fit, 'test': gen,
             'log_sigma': {p.name: float(model.log_sigma[p.name].detach()) for p in PROBES}}
+
+
+def degraded(result, factor: float = 5.0, early: float = 0.5) -> Optional[str]:
+    """A line saying the run got WORSE after its best point, or None.
+
+    `run` saves and scores the best held-out state, so a run that blows up at step 10,000 of
+    400,000 still prints a clean probe table -- of the step-10,000 model. Said when the best
+    state is from the first ``early`` of the run and the last held-out loss is more than
+    ``factor`` times the best (enc03_w256l6, 2026-10-03: best 0.05 at step 6,666 of 400,000,
+    last 18.2, with the train loss at 1.7).
+    """
+    curve = result.get('curve') or []
+    if not curve:
+        return None
+    last = curve[-1]
+    best, step, steps = result['best_heldout'], result['best_step'], result['steps']
+    if step < early * steps and last['test_total'] > factor * best:
+        return (f'TRAINING DEGRADED AFTER ITS BEST POINT. The saved and scored state is step '
+                f'{step} of {steps} (held-out loss {best:.4f}); at the last step the held-out '
+                f'loss is {last["test_total"]:.4f} and the train loss {last["total"]:.4f}. '
+                f'The table describes the step-{step} state, not a converged one.')
+    return None
 
 
 def report(agg, sizes, arms, baseline, tols, meta) -> str:
@@ -843,6 +990,31 @@ def report(agg, sizes, arms, baseline, tols, meta) -> str:
     return chr(10).join(L)
 
 
+def _set_probes(stereo_features: int, names=None):
+    """The probe list of a run: the E/Z probes join at stereo features 2, and ``names``
+    restricts it. Also the initializer of the sample-building worker processes, which under
+    the spawn start method import this module with the default list."""
+    global PROBES
+    if stereo_features >= 2:
+        PROBES = PROBES + [p for p in EZ_PROBES if p.name not in {q.name for q in PROBES}]
+    if names:
+        unknown = set(names) - {p.name for p in PROBES}
+        if unknown:
+            raise ValueError(f'unknown probes {sorted(unknown)}; '
+                             f'available: {[p.name for p in PROBES]}')
+        PROBES = [p for p in PROBES if p.name in set(names)]
+
+
+def _build_job(job):
+    """``(Sample, parent skeleton)`` for one ``(smiles, encoding, k, stereo)``; None when the
+    molecule cannot be built."""
+    smi, enc, k, stereo = job
+    try:
+        return build_sample(smi, enc, k, stereo=stereo), parent_skeleton(smi)
+    except Exception:
+        return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--arms', nargs='+', default=list(ARMS), choices=list(ARMS))
@@ -864,6 +1036,11 @@ def main(argv=None):
                     help='stereo-enumerated QM9. ON by default: raw QM9 has 0.0%% chiral '
                          'tags, so the parity channel is dead and chirality untestable')
     ap.add_argument('--no-stereo', dest='stereo', action='store_false')
+    ap.add_argument('--stereo-features', type=int, default=2, choices=[1, 2],
+                    help='models/graph_encodings.STEREO_FEATURES. 2 (default): r/s at '
+                         'pseudo-asymmetric centres in the parity column, an E/Z bond '
+                         'column, E/Z assigned on the training molecules, and the two '
+                         'ez probes. 1: the inputs of checkpoints written before the flag')
     ap.add_argument('--match-params', action='store_true', default=True,
                     help='size each arm to a common parameter budget')
     ap.add_argument('--no-match-params', dest='match_params', action='store_false')
@@ -882,39 +1059,56 @@ def main(argv=None):
                          'is positive feedback, and it collapses training.')
     ap.add_argument('--smoke', action='store_true')
     ap.add_argument('--out', default=os.path.join(RESULTS, 'encoder_probe.json'))
+    ap.add_argument('--source', default=None,
+                    help='(dataset_index, smiles) table, .tsv or .tsv.gz, read in place of '
+                         'the local QM9 file: configs/conformer_db_sep29/qm9_index.tsv.gz '
+                         'is all of QM9')
+    ap.add_argument('--build-workers', type=int, default=1,
+                    help='processes building the molecule samples (labels included)')
+    ap.add_argument('--lr-schedule', default='constant', choices=['constant', 'cosine'])
+    ap.add_argument('--lr-final', type=float, default=0.0, help='cosine floor')
+    ap.add_argument('--warmup-steps', type=int, default=0)
+    ap.add_argument('--save-every', type=int, default=0,
+                    help='with --resume: write the training state every this many steps')
+    ap.add_argument('--resume', action='store_true',
+                    help='keep each run\'s training state beside its checkpoint '
+                         '(<save-dir>/<arm>_n<size>_s<seed>_state.pt) and continue from it')
+    ap.add_argument('--verbose', action='store_true', help='print every curve point')
     a = ap.parse_args(argv)
     if a.smoke:
         a.sizes, a.n_test, a.steps = [60], 60, 40
         a.hidden, a.layers, a.k, a.seeds = 32, 2, 6, [0]
+    if a.resume and a.save_every <= 0:
+        raise SystemExit('--resume needs --save-every')
 
+    try:
+        _set_probes(a.stereo_features, a.probes)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     if a.probes:
-        global PROBES
-        unknown = set(a.probes) - {p.name for p in PROBES}
-        if unknown:
-            raise SystemExit(f'unknown probes {sorted(unknown)}; '
-                             f'available: {[p.name for p in PROBES]}')
-        PROBES = [p for p in PROBES if p.name in set(a.probes)]
         print(f'probes restricted to: {[p.name for p in PROBES]}')
 
     need = int((max(a.sizes) + a.n_test) * 1.1) + 64
     if a.ladder_only:
         smis = size_ladder()
     elif a.stereo:
-        smis = load_qm9_stereo(need)
+        smis = load_qm9_stereo(need, double_bonds=a.stereo_features >= 2, source=a.source)
     else:
-        smis = load_qm9(need)
-    print(f'{len(smis)} molecules; building samples per encoding ...')
+        smis = load_qm9(need, source=a.source)
+    print(f'{len(smis)} molecules; building samples per encoding ...', flush=True)
 
     cache, group_ids = {}, {}
     for enc in sorted({ARMS[arm]['encoding'] for arm in a.arms}):
-        built, skels = [], []
-        for smi in smis:
-            try:
-                sample = build_sample(smi, enc, a.k)
-            except Exception:
-                continue
-            built.append(sample)
-            skels.append(parent_skeleton(smi))
+        jobs = [(smi, enc, a.k, a.stereo_features) for smi in smis]
+        if a.build_workers > 1:
+            import multiprocessing as mp
+            with mp.Pool(a.build_workers, initializer=_set_probes,
+                         initargs=(a.stereo_features, a.probes)) as pool:
+                made = pool.map(_build_job, jobs, chunksize=256)
+        else:
+            made = [_build_job(j) for j in jobs]
+        built = [m[0] for m in made if m is not None]
+        skels = [m[1] for m in made if m is not None]
         # GROUP-CONTIGUOUS ORDER: shuffle the SKELETON GROUPS, then emit each group's members
         # together, so a prefix split can never put two stereoisomers of one parent on
         # opposite sides. Shuffling rows instead is what leaked 67.9% of the held-out set.
@@ -928,7 +1122,9 @@ def main(argv=None):
         cache[enc] = [built[i] for i in order]
         group_ids[enc] = [key_id[skels[i]] for i in order]
         n_chiral = sum(1 for b in cache[enc] if (b.labels['cip_code'] != 0).any())
-        print(f'  {enc}: {len(built)} usable, {n_chiral} with a stereocentre')
+        n_ez = sum(1 for b in cache[enc] if (b.edge_attr[:, 4:] != 0).any())
+        print(f'  {enc}: {len(built)} usable, {n_chiral} with a stereocentre, '
+              f'{n_ez} with a labelled double bond')
 
     ref = cache[ARMS[a.arms[0]]['encoding']]
     # SNAP THE HELD-OUT BOUNDARY TO A GROUP EDGE. Groups are contiguous, so advancing to the
@@ -974,7 +1170,11 @@ def main(argv=None):
                 ck = os.path.join(a.save_dir, f'{arm}_n{n}_s{seed}.pt')
                 r = run(arm, rest[:n], test, a.steps, hidden[arm], a.layers, a.k,
                         a.batch_mols, a.lr, seed, a.device, save_to=ck,
-                        weighting=a.loss_weighting)
+                        weighting=a.loss_weighting, stereo=a.stereo_features,
+                        lr_schedule=a.lr_schedule, lr_final=a.lr_final,
+                        warmup=a.warmup_steps,
+                        state_path=ck[:-3] + '_state.pt' if a.resume else None,
+                        save_every=a.save_every, verbose=a.verbose)
                 rows.append(r)
                 per_seed.append(r)
                 params = r['n_params']
@@ -982,6 +1182,9 @@ def main(argv=None):
                     f"{pr.name[:4]} {100*r['train'][pr.name]['exact']:.0f}"
                     f"/{100*r['test'][pr.name]['exact']:.0f}" for pr in PROBES[:3])
                 print(f'  {arm} n={n} s={seed}: {shown}')
+                warn = degraded(r)
+                if warn:
+                    print(f'  ** {arm} n={n} s={seed}: {warn}', flush=True)
             for pr in PROBES:
                 tr = np.array([x['train'][pr.name]['exact'] for x in per_seed])
                 te = np.array([x['test'][pr.name]['exact'] for x in per_seed])

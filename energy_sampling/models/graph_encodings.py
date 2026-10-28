@@ -360,8 +360,10 @@ def _mol(smiles: str, explicit_h: bool):
     return mol
 
 
-def bond_features_from_smiles(smiles: str, explicit_h: bool = True) -> np.ndarray:
-    """``[E, 4]`` aligned bond-for-bond with ``graph_from_smiles``' ``edge_index``.
+def bond_features_from_smiles(smiles: str, explicit_h: bool = True,
+                              stereo: int = 1) -> np.ndarray:
+    """``[E, 4]`` aligned bond-for-bond with ``graph_from_smiles``' ``edge_index``; ``[E, 5]``
+    at `STEREO_FEATURES` 2, the fifth column `bond_stereo_codes` (E = +1, Z = -1, else 0).
 
     Columns: single, aromatic, double, triple. Bond ORDER rather than bond type, so an
     aromatic bond is not silently a fifth unrelated category.
@@ -382,6 +384,8 @@ def bond_features_from_smiles(smiles: str, explicit_h: bool = True) -> np.ndarra
         if k is None:
             raise ValueError(f'unhandled bond type {b.GetBondType()} in {smiles!r}')
         out[i, k] = 1.0
+    if _check_stereo(stereo) >= 2:
+        out = np.concatenate([out, bond_stereo_codes(mol).astype(np.float64)[:, None]], axis=1)
     return out
 
 
@@ -450,8 +454,40 @@ def canonical_parity(mol) -> np.ndarray:
     return out
 
 
-def cip_codes(mol) -> np.ndarray:
+#: WHAT STEREOCHEMISTRY THE ENCODER'S INPUTS CARRY.
+#:   1  R/S at CIP tetrahedral centres only (`cip_codes`): the inputs of every checkpoint
+#:      written before the key existed. A pseudo-asymmetric centre (CIP r/s) reads 0 and a
+#:      double bond carries no E/Z, so ring cis/trans isomers and E/Z isomers are one input.
+#:   2  + r/s at pseudo-asymmetric centres (r = +1, s = -1, the same column) and one
+#:      bond-feature column of E/Z (`bond_stereo_codes`).
+STEREO_FEATURES = (1, 2)
+
+
+def _check_stereo(stereo: int) -> int:
+    if stereo not in STEREO_FEATURES:
+        raise ValueError(f'stereo features {stereo!r}: one of {STEREO_FEATURES}')
+    return int(stereo)
+
+
+def bond_stereo_codes(mol) -> np.ndarray:
+    """``[n_bonds]`` in {-1, 0, +1} -- CIP E/Z per bond, in bond order. E = +1, Z = -1,
+    unassigned = 0. The encoder's double-bond geometry input at stereo features 2, and the
+    label of its tripwire probe: the same quantity, as `cip_codes` is for handedness."""
+    from rdkit import Chem
+    from rdkit.Chem import rdCIPLabeler
+    m = Chem.Mol(mol)
+    try:
+        rdCIPLabeler.AssignCIPLabels(m)
+    except Exception:
+        return np.zeros(m.GetNumBonds(), dtype=np.int64)
+    c = {'E': 1, 'Z': -1}
+    return np.array([c.get(b.GetPropsAsDict().get('_CIPCode'), 0) for b in m.GetBonds()],
+                    dtype=np.int64)
+
+
+def cip_codes(mol, pseudo: bool = False) -> np.ndarray:
     """``[n]`` in {-1, 0, +1} -- CIP R/S per atom. R = +1, S = -1, unassigned = 0.
+    With ``pseudo`` a pseudo-asymmetric centre's r/s reads +1/-1 as well; without it, 0.
 
     THE ENCODER'S CHIRALITY INPUT, and also the tripwire probe's label -- deliberately the
     same quantity, so that reading handedness back out is TRIVIAL. If it is not ~100%, the
@@ -468,7 +504,7 @@ def cip_codes(mol) -> np.ndarray:
         rdCIPLabeler.AssignCIPLabels(m)
     except Exception:
         return np.zeros(m.GetNumAtoms(), dtype=np.int64)
-    c = {'R': 1, 'S': -1}
+    c = {'R': 1, 'S': -1, 'r': 1, 's': -1} if pseudo else {'R': 1, 'S': -1}
     return np.array([c.get(a.GetPropsAsDict().get('_CIPCode'), 0) for a in m.GetAtoms()],
                     dtype=np.int64)
 
@@ -511,9 +547,10 @@ def mol_for_labels(smiles: str, explicit_h: bool = True):
     return _mol(smiles, explicit_h)
 
 
-def graph_from_smiles(smiles: str, explicit_h: bool = True
+def graph_from_smiles(smiles: str, explicit_h: bool = True, stereo: int = 1
                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``smiles -> (z [n], edge_index [2, E], parity [n])``.
+    """``smiles -> (z [n], edge_index [2, E], parity [n])``. ``stereo`` is the
+    `STEREO_FEATURES` level: at 2 the parity column carries r/s as well as R/S.
 
     Hydrogens are EXPLICIT by default, because the conformer state includes hydrogen
     torsions -- an encoder trained on the heavy-atom skeleton would be blind to exactly the
@@ -530,7 +567,7 @@ def graph_from_smiles(smiles: str, explicit_h: bool = True
     z = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int64)
     # CIP-REFERENCED, and this is the ONE convention. See canonical_parity's docstring for
     # the two conventions this replaced and why mixing them was a design error.
-    parity = cip_codes(mol)
+    parity = cip_codes(mol, pseudo=_check_stereo(stereo) >= 2)
     bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
     edge_index = (np.array(bonds, dtype=np.int64).T if bonds
                   else np.zeros((2, 0), dtype=np.int64))

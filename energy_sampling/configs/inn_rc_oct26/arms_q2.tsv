@@ -1,0 +1,8 @@
+# inn_rc_oct26 job q2 (sbatch --export=ALL,ARMS_TSV=arms_q2.tsv submit_inn_rc_oct26.sbatch), read when the
+# job STARTS: stage-2 diagnostics of the conditional stall (J_f flat after ~1k updates, every stored-row residual
+# past the knee), on the qm9rc set from the stage-1 rcq best.pt, a 360-minute clock, two arms on one A100. Same
+# columns as arms.tsv.
+#   q_wdata01  stored-row term at a tenth
+#   q_knee1    stored-row knee 1: a saturated row pushes with 1, not 10
+12	q_wdata01	--prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_conditions.pt --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_rc24_rcq/best.pt --budget_minutes 360 --max_minutes 420 --w_data 0.1	0.45
+13	q_knee1	--prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_qm9rc_conditions.pt --init_from /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/artifacts/inn_proto/inn_rc24_rcq/best.pt --budget_minutes 360 --max_minutes 420 --beta_data 1	0.45

@@ -1,0 +1,7 @@
+# inn_cap_oct27 job s (sbatch --export=ALL,ARMS_TSV=arms_s.tsv submit_inn_cap27.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, flags (after common.args; later flags win), memory weight
+# (the arm's share of the card is 0.9 x weight / the job's sum), description.
+0	f001_s	--molecule_fraction 0.01 --tf_width 256 --tf_layers 4	0.7	size S (transformer 256 x 4, encoder 128 x 3; 6.0M parameters), 1,105 molecules, 10,785 rows
+1	f01_s	--molecule_fraction 0.1 --tf_width 256 --tf_layers 4	1	size S, 11,452 molecules, 111,732 rows
+2	f1_s	--molecule_fraction 1 --tf_width 256 --tf_layers 4	1	size S, 114,817 molecules, 1,120,750 rows (the local rc_qm9full_oct24 recipe, longer)
+3	f1_enc	--molecule_fraction 1 --tf_width 256 --tf_layers 4 --atom_node_dim 256 --atom_convs 5	1.3	size S with the wider, deeper molecule encoder (256 x 5), 114,817 molecules, 1,120,750 rows

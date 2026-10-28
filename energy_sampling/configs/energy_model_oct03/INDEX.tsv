@@ -1,0 +1,6 @@
+arm	flags
+em03_frozen	--encoder stored
+em03_frozen_big	--encoder stored --hidden 256 --mix-layers 4
+em03_e2e_pre	--encoder pretrained
+em03_e2e_scratch	--encoder scratch --stereo-features 2 --enc-hidden 128 --enc-layers 4
+em03_e2e_big	--encoder scratch --stereo-features 2 --enc-hidden 256 --enc-layers 6 --hidden 256 --mix-layers 4

@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, \
+from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     BufferCurrencyError
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, normalize_problem_def
@@ -157,6 +157,55 @@ def fresh_buffers_on_switch(modeller, checkpoint: dict, path: str) -> bool:
     return True
 
 
+def best_energy_from_anchors_on_switch(modeller, checkpoint: dict, path: str) -> bool:
+    """cfg:condition_log_z.best_energy_from_anchors_on_switch -- when THIS run loads ANOTHER run's checkpoint,
+    replace the restored tracker's per-condition best energy with the restored anchor buffer's per-condition minimum
+    (+inf, "never visited", for a condition that holds no anchor). A resume of the run's OWN checkpoint is untouched.
+    Off by default; prints when it fires.
+
+    Why it exists. The record is a running minimum over every energy the run has scored, forward-eval draws
+    included, and nothing stores the row that set it. One absurd evaluation therefore stays for good, and everything
+    measured as an excess above it breaks at once: the prior buffer's admission gate (energy < floor + ramp_floor)
+    admits no noised anchor, its staleness rule (excess >= ramp_floor) expires every row it holds, and the
+    excess-energy and nonthermal metrics read the offset. ppl_acr_n5 (2026-10-12) inherited -1.33e6 from its MLE
+    seed against an anchor minimum of -45.3: zero top-ups from step 86,660 on, and the prior buffer fell from 2.9M
+    rows to 43k in 37k steps.
+
+    The anchor buffer's energies are the anchor currency (best_energy_phys). On a run that never supplied a separate
+    physical energy the tracker's two minima are one stream and both are set; a run that has (lambda mixing) is
+    refused, since its mixture minimum cannot be read off the anchors. An absent or empty anchor buffer is refused
+    too (buffers.fresh_on_switch leaves none restored at this point): the key would otherwise do nothing, silently."""
+    cfg = getattr(modeller.args, 'condition_log_z', None)
+    if not bool(getattr(cfg, 'best_energy_from_anchors_on_switch', False)):
+        return False
+    src = checkpoint.get('run_name')
+    if src == modeller.run_name:
+        return False
+    tracker = modeller.condition_log_z
+    anchors = getattr(modeller, 'anchor_buffer', None)
+    if anchors is None or len(anchors) == 0:
+        raise ValueError(f"condition_log_z.best_energy_from_anchors_on_switch: {path} restored no anchor buffer to "
+                         f"read the minima from (is buffers.fresh_on_switch also set?)")
+    if not tracker.phys_is_alias:
+        raise ValueError("condition_log_z.best_energy_from_anchors_on_switch: the restored tracker carries a physical "
+                         "minimum separate from its mixture minimum; the anchors give only the physical one")
+    ids = torch.arange(tracker.best_energy.numel(), dtype=torch.long)
+    mins = _per_condition_min(anchors.condition_id.detach().cpu().long().flatten(),
+                              anchors.energy.detach().cpu().float().flatten(), ids)
+    old = tracker.best_energy.clone()
+    tracker.best_energy = mins.clone()
+    tracker.best_energy_phys = mins.clone()
+    seen = torch.isfinite(old) & torch.isfinite(mins)
+    moved = (old[seen] - mins[seen]).abs()
+    print(f"condition_log_z.best_energy_from_anchors_on_switch: {path} belongs to run {src!r}, this run is "
+          f"{modeller.run_name!r} -- best energy of {int(torch.isfinite(mins).sum())} condition(s) set to the anchor "
+          f"buffer's minimum ({len(anchors)} anchors); "
+          + (f"restored record {float(old[seen].min()):.6g} .. {float(old[seen].max()):.6g}, now "
+             f"{float(mins[seen].min()):.6g} .. {float(mins[seen].max()):.6g}, largest move {float(moved.max()):.6g}"
+             if bool(seen.any()) else "no condition had both a restored record and an anchor"), flush=True)
+    return True
+
+
 class Checkpointer:
     """
     Saves/restores a Modeller's full training state (model, EMA model,
@@ -248,6 +297,24 @@ class Checkpointer:
             print(f"batch_size: checkpoint restored {restored} -> using {m.batch_size} "
                   f"(config batch_size={args.batch_size}, max_batch_size={args.max_batch_size}, "
                   f"grow_batch_size={grow})")
+        # A PENDING S2 AUDIT DOES NOT SURVIVE A RESTART AS STORED. Its deadline
+        # (`audit_at`, train.select_batch_size) is a WALL-CLOCK time one policy
+        # window after the rung was selected, and what it judges is the occupancy
+        # LIVED over that window. A requeued leg starts hours past the deadline with
+        # an empty occupancy record, so the audit fired on its first step against
+        # start-up idle, failed, and stood the batch down to the base rung -- and
+        # `stood_down` is never re-probed, so the leg stayed there. mlepl_neh_lr2
+        # (2026-10-06) resumed holding 1600, read "a full policy window at 1600
+        # reads 0.7%", dropped to 1000 and ran 2.4 h at 51% occupancy until the
+        # cluster cancelled it for low usage. Give the audit a window this process
+        # has actually lived.
+        sizer = getattr(m, 'batch_sizer', None)
+        if isinstance(sizer, dict) and sizer.get('audit_at') is not None:
+            policy_s = float(getattr(args, 'gpu_util_policy_window_s', 7200) or 7200)
+            sizer['audit_at'] = float(m._now()) + policy_s
+            print(f"batch: resumed holding {m.batch_size} with an occupancy audit pending -- "
+                  f"re-armed for {policy_s:g} s from now (its stored deadline was a wall-clock "
+                  f"time in the previous process)")
 
     def path_for(self, tag: str) -> str:
         m = self.modeller
@@ -654,6 +721,13 @@ class Checkpointer:
     # resumed run may take them from its own config. Everything else fixes the
     # weight layout and has to come from the file.
     RECONFIGURABLE_GFN_KEYS = ('t_scale_ratio', 't_scale_power', 't_scale_preserve_budget')
+    # The force terms in the kernel means (GFN.init_force_drift) are this run's to decide as well:
+    # an arm that adds one to a shared checkpoint would otherwise run as the control. Unlike the
+    # keys above they can ADD parameters, the gates, which a checkpoint written without them does
+    # not carry; _load_state and _grown_optimizer_state are what let such a checkpoint load.
+    FORCE_DRIFT_GFN_KEYS = ('force_drift_fwd', 'force_drift_bwd', 'force_drift_learned',
+                            'force_drift_max_sigma', 'force_drift_t_min', 'force_drift_differentiable')
+    FORCE_GATE_KEY = '.force_gate.'
 
     def _build_gfn(self, config):
         """The model a checkpoint's gfn_config describes, BEFORE any weights load.
@@ -679,8 +753,36 @@ class Checkpointer:
         every arm as the control. Changes print, so a silent miss can't happen.
         """
         config = dict(checkpoint['gfn_config'])
+        # the policy is architecture: the stored entry decides what loads, so a run asking for another kind or other flow
+        # settings would silently train the checkpoint's (an SDE checkpoint carries no entry)
+        entry = getattr(self.modeller, '_policy_entry', None)
+        asked = (entry() if entry is not None else {}).get('policy')
+        held = config.get('policy')
+        strip = lambda e: None if e is None else {k: v for k, v in e.items() if k != 'seed'}
+        if strip(asked) != strip(held):
+            raise ValueError(f"policy in this run's config {strip(asked) or {'kind': 'sde'}} differs from the "
+                             f"checkpoint's {strip(held) or {'kind': 'sde'}}: the checkpoint's policy is what would "
+                             f"load and train")
         current = vars(self.modeller.args.model)
-        for key in self.RECONFIGURABLE_GFN_KEYS:
+        # the state encoder is architecture: the checkpoint's is the one that loads, so a run asking for
+        # another would silently train as the checkpoint's arm
+        asked, held = int(current.get('state_atoms', 0) or 0), int(config.get('state_atoms', 0) or 0)
+        if asked != held:
+            raise ValueError(f"model.state_atoms is {asked} in this run's config and {held} in the checkpoint: "
+                             f"the state encoder that reads atoms cannot be added to or taken from saved weights")
+        asked, held = bool(current.get('state_force_input', False)), bool(config.get('state_force_input', False))
+        if asked != held:
+            raise ValueError(f"model.state_force_input is {asked} in this run's config and {held} in the checkpoint: "
+                             f"the force input widens the state encoder's first layer, so it cannot be added to "
+                             f"or taken from saved weights")
+        # no parameters, but they decide what the state encoder is shown before those times: weights trained
+        # on one window read another's inputs as a different arm, so a change is refused rather than taken
+        for key in ('state_crystal_t_min', 'state_atoms_t_min'):
+            asked, held = (float(c.get(key, 0.0) or 0.0) for c in (current, config))
+            if asked != held:
+                raise ValueError(f"model.{key} is {asked:g} in this run's config and {held:g} in the "
+                                 f"checkpoint: the saved state encoder was trained on the checkpoint's window")
+        for key in self.RECONFIGURABLE_GFN_KEYS + self.FORCE_DRIFT_GFN_KEYS:
             if key not in current:
                 continue
             if current[key] != config.get(key):
@@ -688,6 +790,61 @@ class Checkpointer:
             config[key] = current[key]
         self._assert_dead_rows_match(config)
         return config
+
+    def _load_state(self, model, state, what, in_place: bool = False):
+        """load_state_dict, strict but for the force gates (FORCE_GATE_KEY) a checkpoint predates.
+
+        A model built with a force term has gate parameters; a checkpoint written without one
+        does not. They are left as constructed, at their starting values. `in_place` says the
+        model was not just built (a rewind): its gates may have trained, so they are put back
+        at their starting values, which is what the checkpoint's model had in effect. Any other
+        missing key, and any unexpected key, raises as a strict load would.
+        """
+        result = model.load_state_dict(state, strict=False)
+        gates = [k for k in result.missing_keys if self.FORCE_GATE_KEY in k]
+        missing = [k for k in result.missing_keys if self.FORCE_GATE_KEY not in k]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(f"{what}: the state dict does not fit the model. Missing keys: {missing}; "
+                               f"unexpected keys: {list(result.unexpected_keys)}")
+        if gates:
+            if in_place:
+                model.restart_force_gates()
+            print(f"{what}: written without this model's force gates ({len(gates)} tensors); they "
+                  f"{'go back to' if in_place else 'start at'} their configured starting values")
+
+    @staticmethod
+    def _grown_optimizer_state(opt, saved):
+        """`saved` re-indexed for `opt` when opt's parameter groups are the saved ones with
+        parameters ADDED AT THEIR ENDS: (state dict, number of added parameters), else None.
+
+        The case is a model that gained parameters inside existing groups, the force gates,
+        which sit after their policy's own parameters. `opt.load_state_dict(saved)` refuses a
+        group of another size, and the fallback starts the whole optimizer fresh: every
+        parameter loses its moments and its step count, and an arm that differs from its
+        control by one small module would also differ by a reset optimizer. Here each saved
+        parameter keeps its state under its new index and the added ones start without any,
+        which Adam initialises at their first step. Refused (None) unless the group count is
+        unchanged, no group shrank, and every carried parameter has the saved shape.
+        """
+        live, old = opt.param_groups, saved['param_groups']
+        if len(live) != len(old):
+            return None
+        sizes = [(len(g['params']), len(o['params'])) for g, o in zip(live, old)]
+        if all(n == o for n, o in sizes) or any(n < o for n, o in sizes):
+            return None
+        fresh = opt.state_dict()['param_groups']
+        state = {}
+        for g_live, g_new, g_old in zip(live, fresh, old):
+            for p, new_id, old_id in zip(g_live['params'], g_new['params'], g_old['params']):
+                entry = saved['state'].get(old_id)
+                if entry is None:
+                    continue
+                shaped = next((v for v in entry.values() if torch.is_tensor(v) and v.dim() > 0), None)
+                if shaped is not None and shaped.shape != p.shape:
+                    return None
+                state[new_id] = entry
+        groups = [dict(g_old, params=g_new['params']) for g_new, g_old in zip(fresh, old)]
+        return {'state': state, 'param_groups': groups}, sum(n - o for n, o in sizes)
 
     def _assert_dead_rows_match(self, config):
         """
@@ -728,9 +885,9 @@ class Checkpointer:
         self.assert_problem_match(checkpoint, path, 'checkpoint_name')
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
         m.ema_model = deepcopy(m.gfn_model)
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
@@ -759,6 +916,7 @@ class Checkpointer:
         if checkpoint.get('condition_log_z') is not None:
             m.condition_log_z = ConditionLogZTracker.from_state_dict(
                 checkpoint['condition_log_z'], current_step=m.step_ind)
+            best_energy_from_anchors_on_switch(m, checkpoint, path)
         # judged against the live config by Modeller.init_energy_reference once the
         # identifier registry exists; absent (older checkpoints) = trained unreferenced
         m._resumed_energy_reference = checkpoint.get('energy_reference') or {'mode': None, 'table': None}
@@ -856,9 +1014,9 @@ class Checkpointer:
         self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
         m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
         m.ema_model = deepcopy(m.gfn_model)
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)')
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
@@ -898,8 +1056,14 @@ class Checkpointer:
                         f"measures a rate that is not the one under test.")
                 print(f"No saved optimizer state for '{key}' - starting it fresh")
                 continue
+            saved = saved_optimizers[key]
+            grown = self._grown_optimizer_state(opt, saved)
+            if grown is not None:
+                saved, added = grown
+                print(f"optimizer '{key}': {added} parameters are new in this model and start without "
+                      f"optimizer state; every other parameter keeps its moments and step count")
             try:
-                opt.load_state_dict(saved_optimizers[key])
+                opt.load_state_dict(saved)
             except (ValueError, RuntimeError) as e:
                 # e.g. checkpoint predates flow params folding into the policy
                 # optimizers, so param group counts no longer line up
@@ -928,8 +1092,8 @@ class Checkpointer:
     def load_model_only(self, path, load_optimizers: bool = False):
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
-        m.gfn_model.load_state_dict(checkpoint['model_train'])
-        m.ema_model.load_state_dict(checkpoint['model_eval'])
+        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)', in_place=True)
+        self._load_state(m.ema_model, checkpoint['model_eval'], f'{path} (model_eval)', in_place=True)
         self._restore_pb_snapshot(checkpoint)
         m.gfn_model.train()
         m.ema_model.eval()

@@ -123,7 +123,14 @@ class MultiConformerTorsions(ConformerTorsions):
         # same kwargs, so they agree today; checked because one member that did not would be
         # scored against a wall that is not its own -- a plausible number, and the per-member
         # oracle would disagree silently.
-        for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff'):
+        # `double_bond_box_deg` joins them: it decides which of a member's columns are walled
+        # and their scale, and a member built under another box would sit in a layout, and
+        # under a chart constant, that are not the set's. `sibling_offset_box_deg` likewise,
+        # and it also decides which rows read a second column. `lock_stereo_nitrogen` decides
+        # which SMILES are members at all, so one member built under the other value means the
+        # set mixes two definitions of a condition.
+        for name in ('bounding_coeff', 'rho_wall', 'energy_clip', 'stereo_coeff',
+                     'double_bond_box_deg', 'sibling_offset_box_deg', 'lock_stereo_nitrogen'):
             want = getattr(self, name)
             off = [i for i, m in self._members.items() if getattr(m, name) != want]
             if off:
@@ -152,6 +159,34 @@ class MultiConformerTorsions(ConformerTorsions):
             self._log_jac_const_of_lib = torch.as_tensor(
                 np.asarray(consts, dtype=np.float64), device=self.device)
         self._lib_of_mol_id: Optional[torch.Tensor] = None
+        self._clip_floor_of_lib: Optional[torch.Tensor] = None
+        self._reference_potential_of_lib: Optional[torch.Tensor] = None
+
+    def install_clip_floor(self) -> torch.Tensor:
+        """`energy_clip_origin` 'reference' on the set: every member takes its own floor
+        (`ConformerTorsions.install_clip_floor`) and the one-pass energy reads them per row
+        from `_clip_floor_of_lib`, in `_members` order. Returns that table."""
+        floors = []
+        for m in self._members.values():
+            floors.append(ConformerTorsions.install_clip_floor(m))
+            m.release_batch_cache()
+        self._clip_floor_of_lib = torch.as_tensor(np.asarray(floors, dtype=np.float64),
+                                                  dtype=self.dtype, device=self.device)
+        self._reference_potential_of_lib = self._clip_floor_of_lib.detach().double().cpu()
+        self.energy_clip_origin = 'reference'
+        return self._clip_floor_of_lib
+
+    def reference_potentials(self) -> torch.Tensor:
+        """Every member's `reference_potential`, float64 on the CPU, in `_members` order.
+        Computed once."""
+        if getattr(self, '_reference_potential_of_lib', None) is None:
+            vals = []
+            for m in self._members.values():
+                vals.append(ConformerTorsions.reference_potential(m))
+                m.release_batch_cache()
+            self._reference_potential_of_lib = torch.as_tensor(
+                np.asarray(vals, dtype=np.float64))
+        return self._reference_potential_of_lib
 
     @property
     def is_carrier(self) -> bool:
@@ -373,6 +408,18 @@ class MultiConformerTorsions(ConformerTorsions):
         dmf = (torch.zeros_like(bad_z_atom) if dmf is None
                else dmf.reshape(-1).to(device=dev, dtype=torch.bool))
         bad_tv_atom = bad_tv_atom | (self._lib.dummy_frame.to(dev).index_select(0, z_at) != dmf)
+        # the SIBLING-OFFSET flag, likewise: on a flagged atom the dihedral is its own column
+        # plus its group's leader's (`sibling_offset_box_deg`), which the graph says with
+        # `ctree_ph_lead_col` >= 0. A graph built under the default chart has no such field
+        # and reads as flag-free, so it is refused by a member that carries offsets, and a
+        # graph built with offsets by a member that carries none. Skipped when neither side
+        # has a flag, which is every set of the default chart.
+        slc = getattr(mol_batch, 'ctree_ph_lead_col', None)
+        if slc is not None or bool(self._lib.sibling_offset.any()):
+            sof = (torch.zeros_like(bad_z_atom) if slc is None
+                   else slc.reshape(-1).to(dev) >= 0)
+            bad_tv_atom = bad_tv_atom | (
+                self._lib.sibling_offset.to(dev).index_select(0, z_at) != sof)
         # THE STEREO LOCK, compared only when it is ON: off, it adds no term, so a row carrying
         # another stereoisomer's table is scored exactly as its own would be. A batch without
         # the fields reads as lock-free and is refused against any member that has an element.
@@ -478,11 +525,13 @@ class MultiConformerTorsions(ConformerTorsions):
                 # differently from the member this run built
                 raise RuntimeError(
                     f'row {i}{mid_of(i)} resolves to {ident!r} and carries its atoms, but its '
-                    f'transverse flags (ctree_transverse) or dummy-frame flags '
-                    f'(ctree_dummy_frame) sit on different atoms from that member\'s chart: '
-                    f'the conditions file was built against another chart (a stale file). '
-                    f'Building it would read a (u, v) bend or a dummy-frame dihedral out of '
-                    f'the wrong atoms\' slots. Rebuild the conditions file.')
+                    f'transverse flags (ctree_transverse), dummy-frame flags '
+                    f'(ctree_dummy_frame) or sibling-offset rows (ctree_ph_lead_col, written '
+                    f'under sibling_offset_box_deg) sit on different atoms from that member\'s '
+                    f'chart: the conditions file was built against another chart (a stale '
+                    f'file, or another sibling_offset_box_deg setting). Building it would read '
+                    f'a (u, v) bend, a dummy-frame dihedral or a sibling offset out of the '
+                    f'wrong atoms\' slots. Rebuild the conditions file.')
             raise RuntimeError(
                 f'row {i}{mid_of(i)} resolves to {ident!r}, but its atoms (count or '
                 f'placement-order z) are not that molecule\'s: the mol_id registry, the '
@@ -559,7 +608,12 @@ class MultiConformerTorsions(ConformerTorsions):
             the stereo lock read off the rows' own ``ctree_stereo_*``
             (`stereo_lock.batch_lock_energy`), both before the clip;
           * the box wall over `_lin_free_idx`, the carrier's non-phi columns: pads are
-            exactly 0 (checked), so relu adds exactly 0 there and the wall is each member's;
+            exactly 0 (checked), so relu adds exactly 0 there and the wall is each member's.
+            A bounded double-bond dihedral sits in the theta region, so it is walled here
+            exactly as the member's `bounding_energy` walls it, and its scale is the graph's
+            per-atom ``ctree_ph_scale``. A sibling offset (`sibling_offset_box_deg`) sits
+            there too and is walled the same way; its dihedral is read as its own column
+            plus its leader's, the graph's ``ctree_ph_lead_col`` (`state_to_dof`);
           * the transverse DISC wall in rho, per ATOM off ``ctree_transverse`` (`_disc_wall`),
             added to the box before the T pre-multiplication exactly as the member's
             `bounding_energy` adds it -- so a pad, which owns no atom, cannot reach it;
@@ -568,7 +622,8 @@ class MultiConformerTorsions(ConformerTorsions):
             used (the member's `_log_jac`);
           * log|dq/dx| as the per-molecule CONSTANT from the library -- not the graph-derived
             sum of log|scale|, which overcounts at `torsion`, where one column drives
-            several dihedral rows.
+            several dihedral rows, and under `sibling_offset_box_deg`, where a leader's
+            column drives its whole group.
 
         With `return_exp` the baked potential is ``clip(U + lock) + wall`` at T = 1 from this
         same pass --
@@ -608,7 +663,12 @@ class MultiConformerTorsions(ConformerTorsions):
                 # the force field (and the lock) only, before the wall --
                 # ConformerTorsions.potential_energy
                 from mxtaltools.common.utils import log_rescale_positive
-                e = log_rescale_positive(e, self.energy_clip)
+                if self.energy_clip_origin == 'absolute':
+                    cutoff = self.energy_clip
+                else:
+                    # each row's own member's floor (install_clip_floor)
+                    cutoff = self._clip_floor_of_lib.index_select(0, lib_ids) + self.energy_clip
+                e = log_rescale_positive(e, cutoff)
             baked = e
             if self._lin_free_idx.numel():
                 xl = xs.index_select(-1, self._lin_free_idx)
@@ -772,7 +832,7 @@ _CHART_METHODS = (
     'dof_from_state', 'build_positions', 'bounding_energy', '_transverse_rho2',
     'transverse_crossings', 'state_from_dof', 'prior_dof_types', 'torsion_groups',
     'improper_phi_rows', 'held_phi_rows', 'improper_phi_sigma', 'sibling_jitter_sigma',
-    'ring_blocks',
+    'ring_blocks', 'sibling_offset_census',
     'ring_frame_groups', 'prior_log_prob', 'thermal_rtheta_sigma', 'sample_prior_states',
     'potential_energy', 'jacobian_energy', 'brute_force_log_z', 'sample', '_batch',
     '_log_jac', '_tiled_transverse', '_build', '_tiled_dummy', 'dummy_frame_crossings',

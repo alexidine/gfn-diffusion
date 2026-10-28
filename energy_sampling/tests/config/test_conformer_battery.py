@@ -525,7 +525,8 @@ def test_the_hand_picked_builder_writes_the_set_a_validation_rung_reads(inputs, 
 
 
 def test_buffer_caps_above_the_vram_budget_abort_generation(inputs, local, monkeypatch):
-    monkeypatch.setattr(make, 'BUFFER_CAPS', dict(make.BUFFER_CAPS, prior=400_000))
+    # compact rows: the replay cap is what can outgrow the card (a row holds its trajectory)
+    monkeypatch.setattr(make, 'BUFFER_CAPS', dict(make.BUFFER_CAPS, replay=5_000_000))
     _refused(lambda: _build(inputs, local, rungs=['r0']), 'cc_r0_n6', 'buffer budget')
 
 

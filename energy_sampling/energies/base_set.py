@@ -121,6 +121,14 @@ class BaseSet(abc.ABC, Dataset):
             if gpu_ms is not None:
                 out['energy/seconds_gpu'] = gpu_ms / 1e3
                 out['energy/gpu_over_wall'] = (gpu_ms / 1e3) / secs if secs > 0 else 0.0
+        if getattr(self, 'implausible_energy_below', None) is not None:
+            # rows the implausible-energy screen replaced in this window; absent = no screen configured
+            out['energy/implausible_rows'] = float(getattr(self, 'implausible_rows', 0))
+            self.implausible_rows = 0
+        if getattr(self, 'mlip_max_packing_coeff', None) is not None:
+            # cells the density guard kept from the MLIP in this window; absent = no guard configured
+            out['energy/mlip_guarded_rows'] = float(getattr(self, 'mlip_guarded_rows', 0))
+            self.mlip_guarded_rows = 0
         out.update({'energy/seconds': secs,
                 'energy/calls': calls,
                 # directly comparable across energies: uma measured ~5.5 ms/sample

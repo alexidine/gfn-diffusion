@@ -16,8 +16,10 @@ which is what a coverage prior wants. Stages, each an sbatch array here, chained
             chart the trainer reads, as <name>/anchors.pt (prior layout). For a system merged on the dev box the file
             is uploaded and the task only checks that it is there.
   flood     data_processing/capped_mc.py from anchors.pt, FLOOD settings below, into <name>/flood/shard_<k>.
-  assemble  data_processing/pool_assemble.py: anchors + flood states, latent de-dupe at DEDUPE, normaliser images,
-            written as <name>/<name>_pooled_oct02_prior.pt ('prior' and 'equalized_prior' hold the same rows).
+  assemble  data_processing/pool_assemble.py: anchors + flood states under CEILING, thinned in the trainer latent at
+            the system's radius (RADIUS_MULT x its KICK), out-of-box and density-penalised states left out, normaliser
+            images, written as <name>/<name>_pooled_oct05_prior.pt ('prior' and 'equalized_prior' hold the same rows)
+            with a .summary.json, both copied into conditional/priors/. `launch.sh assemble` runs this stage alone.
   polish, merge   not in the chain; kept for the converged-minima census (`launch.sh polish`): run_search in data mode
             over starts.pt (Rprop, lr 0.001 annealed, up to POLISH_STEPS steps, convergence_eps 1e-6), then a curate
             pass and an export of the polished basins (anchors_polished.pt).
@@ -37,7 +39,15 @@ LOCAL = 'D:/crystal_datasets/pooled_oct02'
 DATA = '/scratch/mk8347/data/crystal_datasets'
 UMA = '/scratch/mk8347/models/uma/esen_s.pt'
 POLISH_STEPS = 500
-DEDUPE = 0.01
+# assemble (owner 2026-10-05): no row budget; thin at a physical radius per system, the same for anchors and walk
+# states; leave out everything more than CEILING kT above the lowest anchor. KICK = the latent size of a hop-style kick
+# (log_noise_latent_parameters, keep_start_representable) that raises the energy of a minimum by a median 1 kT, the
+# median over 6 of the system's lowest minima > 0.25 apart in atomwise RDF, 32 kicks per size (measured 2026-10-05;
+# the eLJ minima re-relaxed to convergence first, the UMA ones campaign end states). Face states (a centre coordinate
+# on a wall of the latent box, 16-33% of the anchors, all from the old files) ship like any other row.
+CEILING = 10.0
+RADIUS_MULT = 1.0
+KICK = {'mipcas_elj': 0.0244, 'mipcas_uma': 0.0232, 'nehzor_elj': 0.0262, 'nehzor_uma': 0.0252}
 # capped_mc (owner 2026-10-03): the walkers' own distribution is the data. From every start, walk at the training
 # temperature and keep every accepted move: no burn-in, no claim of equilibrium. Why T x1: in 12 dimensions a walker
 # settles about 6 T above its floor and does not come back down (measured, MIPCAS eLJ: +5.6 kT at x1 from starts near
@@ -80,7 +90,7 @@ def write(name, text):
 # the ten columns are the layout the first launch's job scripts read (its merge is still queued): do not reorder
 pol = ['\t'.join(['task', 'name', 'sub', 'n_sub', 'num_samples', 'n_starts', 'sg', 'key', 'tsf', 'mol'])]
 fl = ['\t'.join(['task', 'name', 'shard', 'n_shards', 'key', 'cut', 'args'])]
-sy = ['\t'.join(['task', 'name', 'sg', 'key', 'tsf', 'mol', 'premerge', 'window'])]
+sy = ['\t'.join(['task', 'name', 'sg', 'key', 'tsf', 'mol', 'premerge', 'window', 'radius', 'ceiling'])]
 t = f = 0
 for k, (name, sg, key, mol, tsf, n_sub, bs, n_fl) in enumerate(SYSTEMS):
     d = os.path.join(HERE, name)
@@ -116,7 +126,8 @@ for k, (name, sg, key, mol, tsf, n_sub, bs, n_fl) in enumerate(SYSTEMS):
     for j in range(n_fl):
         fl.append('\t'.join(str(v) for v in (f, name, j, n_fl, key, pooled['identity_cut'], FLOOD)))
         f += 1
-    sy.append('\t'.join(str(v) for v in (k, name, sg, key, tsf, mol, int(name in PREMERGE), WINDOW)))
+    sy.append('\t'.join(str(v) for v in (k, name, sg, key, tsf, mol, int(name in PREMERGE), WINDOW,
+                                         round(RADIUS_MULT * KICK[name], 6), CEILING)))
     print(f'{name}: {n_sub} polish tasks, {n_fl} flood shards' + (', premerge on the cluster' if name in PREMERGE else ''))
 write('INDEX.tsv', '\n'.join(pol) + '\n')
 write('FLOOD.tsv', '\n'.join(fl) + '\n')
@@ -128,4 +139,5 @@ for fn, last in (('submit_polish.sbatch', t - 1), ('submit_flood.sbatch', f - 1)
     text = re.sub(r'#SBATCH --array=\S+', f'#SBATCH --array=0-{last}', open(p, encoding='utf8').read())
     assert_no_local_paths(text, fn)
     open(p, 'w', encoding='utf8', newline='\n').write(text)
-print(f'{t} polish tasks, {f} flood tasks, {len(SYSTEMS)} systems; dedupe {DEDUPE}')
+print(f'{t} polish tasks, {f} flood tasks, {len(SYSTEMS)} systems; ceiling {CEILING:g} kT, radius {RADIUS_MULT:g} x kick: '
+      + ', '.join(f'{n} {RADIUS_MULT * KICK[n]:g}' for n in KICK))

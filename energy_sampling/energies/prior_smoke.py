@@ -788,7 +788,9 @@ def draw_states(en, n, rng, ring_jitter=0.1):
             else:
                 gi = sorted(gids)[0]
                 jit = rng.normal(0.0, f * g_sigma[gi], n)
-                x[:, c] = (shared[gi] + jit) / scale[c]
+                # a sibling OFFSET column (block 5) holds follower minus leader: the jitter
+                # alone, the group's shared rotation being its leader's column
+                x[:, c] = (jit if blk[c] == 5 else shared[gi] + jit) / scale[c]
 
     per = blk == 2
     x[:, per] = (x[:, per] + 1.0) % 2.0 - 1.0                  # phi wraps, it does not clip

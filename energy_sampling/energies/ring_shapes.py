@@ -88,7 +88,8 @@ DEDUP_DEG = 10.0
 CLOSURE_TOL = 0.25
 #: trial draws per candidate embedding, in one sample_prior_states call per block
 TRIAL_DRAWS = 16
-#: seconds per embedding (RDKit EmbedParameters.timeout)
+#: seconds (RDKit EmbedParameters.timeout): the bound on one EmbedMultipleConfs call over all
+#: n_embed conformers, and on each one-at-a-time attempt after that call timed out (`_embed`)
 EMBED_TIMEOUT_S = 10
 #: RDKit MMFF94 iterations per embedding, as ConformerTorsions relaxes its reference
 MMFF_MAX_ITERS = 2000
@@ -151,12 +152,15 @@ def internal_extra_rows(member, extra, atoms, step: float = 0.3, tol: float = 1e
     return [kj for kj, mv in zip(cand, moved) if mv]
 
 
-def _embed(template, n: int, seed: int, timeout_s: int):
-    """``(positions [m, N, 3] RDKit order, mmff_energy [m], n_not_converged)``."""
-    from rdkit import Chem
+#: One-at-a-time embedding attempts that may run to the timeout before `_embed` stops trying
+#: (each is bounded by the timeout, so the fallback ends after at most this many of them plus
+#: the attempts that return in their own time).
+EMBED_MAX_TIMED_OUT = 3
+
+
+def _embed_params(seed: int, timeout_s: int):
     from rdkit.Chem import AllChem
 
-    m = Chem.Mol(template)
     p = AllChem.ETKDGv3()
     # THE KNOWLEDGE TERMS OFF: distance geometry alone, so the embedder does not steer the ring
     # toward the torsions its tables prefer. useMacrocycleTorsions acts on rings of nine or more
@@ -169,14 +173,57 @@ def _embed(template, n: int, seed: int, timeout_s: int):
     p.randomSeed = int(seed)
     p.timeout = int(timeout_s)
     p.numThreads = 1
-    cids = list(AllChem.EmbedMultipleConfs(m, numConfs=int(n), params=p))
-    if not cids:
-        return np.zeros((0, m.GetNumAtoms(), 3)), np.zeros(0), 0
+    return p
+
+
+def _embed(template, n: int, seed: int, timeout_s: int):
+    """``(positions [m, N, 3] RDKit order, mmff_energy [m], n_not_converged, info)``.
+
+    One ``EmbedMultipleConfs`` call for the ``n`` conformers. RDKit's ``timeout`` bounds that
+    WHOLE call, and a call that reaches it keeps nothing: it returns the id -1 and leaves the
+    molecule without conformers, whether every attempt was failing or all but the last had
+    succeeded. ``GetConformer(-1)`` then raises ``Bad Conformer Id``. So the conformers are read
+    off the molecule, never off the returned ids, and after a timed-out call the ``n`` attempts
+    are made one at a time (``EmbedMolecule``, seed ``(seed + i) mod (2**31 - 1)``, each under the
+    same timeout),
+    keeping those that embed and stopping once ``EMBED_MAX_TIMED_OUT`` of them have themselves
+    run to the timeout. ``info`` records ``embed_timed_out`` and, after one,
+    ``n_embed_one_at_a_time`` (attempts made) and ``n_embed_attempts_timed_out``.
+    """
+    import time
+
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    m = Chem.Mol(template)
+    cids = list(AllChem.EmbedMultipleConfs(m, numConfs=int(n), params=_embed_params(seed, timeout_s)))
+    info = {'embed_timed_out': bool(any(int(c) < 0 for c in cids))}
+    if info['embed_timed_out']:
+        m = Chem.Mol(template)
+        m.RemoveAllConformers()
+        attempts = stuck = 0
+        for i in range(int(n)):
+            if stuck >= EMBED_MAX_TIMED_OUT:
+                break
+            one = Chem.Mol(template)
+            t0 = time.monotonic()
+            cid = AllChem.EmbedMolecule(one, _embed_params((int(seed) + i) % (2 ** 31 - 1), timeout_s))
+            attempts += 1
+            if int(cid) >= 0 and one.GetNumConformers():
+                m.AddConformer(one.GetConformer(int(cid)), assignId=True)
+            elif time.monotonic() - t0 >= float(timeout_s):
+                stuck += 1
+        info.update(n_embed_one_at_a_time=attempts, n_embed_attempts_timed_out=stuck)
+    confs = list(m.GetConformers())
+    if not confs:
+        return np.zeros((0, m.GetNumAtoms(), 3)), np.zeros(0), 0, info
     res = AllChem.MMFFOptimizeMoleculeConfs(m, numThreads=1, maxIters=MMFF_MAX_ITERS)
-    pos = np.stack([m.GetConformer(c).GetPositions() for c in cids])
-    e = np.array([res[i][1] for i in range(len(cids))], dtype=np.float64)
-    n_nc = int(sum(int(res[i][0]) != 0 for i in range(len(cids))))
-    return pos, e, n_nc
+    if len(res) != len(confs):
+        raise RuntimeError(f'MMFF returned {len(res)} results for {len(confs)} conformers')
+    pos = np.stack([c.GetPositions() for c in confs])
+    e = np.array([r[1] for r in res], dtype=np.float64)
+    n_nc = int(sum(int(r[0]) != 0 for r in res))
+    return pos, e, n_nc, info
 
 
 def _wrap(a):
@@ -287,9 +334,10 @@ def ring_shapes(member, prior, n_embed: int = 64, seed: int = 0,
         return out
 
     pin = bcr.condition_stereo(member)
-    pos, energy, n_nc = _embed(pin['template'], n_embed, seed, EMBED_TIMEOUT_S)
+    pos, energy, n_nc, *embed_info = _embed(pin['template'], n_embed, seed, EMBED_TIMEOUT_S)
     mol_info = dict(n_embed=int(n_embed), seed=int(seed), n_embedded=int(len(pos)),
-                    n_mmff_not_converged=n_nc, n_other_stereo=0)
+                    n_mmff_not_converged=n_nc, n_other_stereo=0,
+                    **(embed_info[0] if embed_info else {}))
     keep = np.ones(len(pos), dtype=bool)
     xs = torch.zeros(0, int(member.ndim), dtype=member.dtype)
     if len(pos):

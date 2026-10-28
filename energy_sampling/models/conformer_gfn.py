@@ -35,6 +35,7 @@ from typing import Optional, Sequence
 import torch
 from mxtaltools.models.modules.components import scalarMLP
 
+from energy_sampling.utils import gaussian_params
 from models.gfn import GFN, logtwopi
 
 
@@ -88,6 +89,49 @@ class ConformerGFN(GFN):
     @property
     def _policy_wants_molecule(self) -> bool:
         return bool(getattr(self.forward_policy, 'wants_molecular_conditioning', False))
+
+    @property
+    def _pb_wants_molecule(self) -> bool:
+        """The BACKWARD policy is a per-coordinate set head too (`backward_policy_kind: set`),
+        so it takes the raw state and the molecule exactly as the forward policy does."""
+        return bool(getattr(self.backward_policy, 'wants_molecular_conditioning', False))
+
+    def _raw_from_expanded(self, expanded: torch.Tensor) -> torch.Tensor:
+        """The state `GFN.expand_state_for_policy` expanded: its exact inverse.
+
+        `_pb_net` is handed the expansion (non-periodic values, then sin and cos of pi * x per
+        periodic column), and a set head tokenises the raw columns. A periodic column comes
+        back as its representative in (-1, 1], which is the one P_B is conditioned on
+        (`_eval_pb_logprob` wraps before expanding). Columns in neither index set stay 0.
+        """
+        b = expanded.shape[0]
+        state = expanded.new_zeros(b, self.dim)
+        state = state.index_copy(1, self.lin_idx, expanded[:, :self.lin_dim])
+        if self.ang_dim:
+            orient = expanded[:, self.lin_dim:].reshape(b, self.ang_dim, 2)
+            ang = torch.atan2(orient[..., 0], orient[..., 1]) / torch.pi
+            state = state.index_copy(1, self.ang_idx, ang)
+        return state
+
+    def _pb_net(self, expanded_state, condition_embedding, t):
+        """As the parent with a flat backward policy. With a set backward policy: the head on
+        the raw state, the time embedding and the bound molecule -- the forward policy's own
+        inputs (`predict_next_state`) -- from the frozen snapshot under `no_grad` when
+        `freeze_backward_policy` holds one, as the parent does."""
+        if not self._pb_wants_molecule:
+            return super()._pb_net(expanded_state, condition_embedding, t)
+        if self._mol_cond is None:
+            raise RuntimeError(
+                'molecular conditioning was never bound, and the set backward policy reads '
+                'the molecule. Every trajectory entry point calls bind_molecular_conditioning.')
+        fr = getattr(self, '_pb_frozen', None)
+        if fr is not None:
+            with torch.no_grad():
+                out = fr['backward_policy'](self._raw_from_expanded(expanded_state.detach()),
+                                            fr['t_model'](t), **self._mol_cond)
+            return gaussian_params(out)
+        return gaussian_params(self.backward_policy(
+            self._raw_from_expanded(expanded_state), self.t_model(t), **self._mol_cond))
 
     def bind_molecular_conditioning(self, mol_batch) -> None:
         """Gather the per-sample conditioning tensors off the batch, once.
@@ -160,6 +204,11 @@ class ConformerGFN(GFN):
                 'flat_idx': flat,
                 'dof_batch': torch.div(flat, k, rounding_mode='floor'),
             })
+            if any(getattr(p, 'mix_layers', 0) for p in (self.forward_policy,
+                                                          self.backward_policy)):
+                # fixed for the trajectory, like the index vectors: computed once, not per step
+                from models.ragged_set_policy import shared_atom_relation
+                self._mol_cond['token_rel'] = shared_atom_relation(self._mol_cond['dof_atoms'])
 
     def _bind_state_mask(self, mol_batch) -> None:
         """Per-row carrier validity ``[B, K]``, or None on a non-carrier batch."""
@@ -293,7 +342,7 @@ class ConformerGFN(GFN):
         group, the z_calibration sidecars' clip) picks the new head up unchanged -- with a
         `MolEmbFlowHead` over the batch's pooled ``embedding`` (``mol_dim`` wide). With
         ``column_blocks`` (the energy's per-column block code, e.g. ``_free_block``: 0 r,
-        1 theta, 2 phi, 3 transverse) it also reads each row's count of VALID columns per block, because
+        1 theta, 2 phi, 3 transverse, 4 bounded double-bond dihedral) it also reads each row's count of VALID columns per block, because
         log Z(c) grows with the number of free coordinates of each kind and a carrier row's
         count is otherwise only implicit in the embedding. Depth, width, norm, dropout and
         activation are copied from the head it replaces, so an A/B differs in the input only.

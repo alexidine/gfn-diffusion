@@ -23,28 +23,41 @@ from torch.utils.checkpoint import checkpoint
 
 from energies.prior_flow import _SOFTPLUS_ONE
 
+#: the normalisation of every pre-norm slot and of the final one: LayerNorm, RMSNorm, or none (identity)
+NORMS = ('layer', 'rms', 'none')
+
+
+def _norm(kind, width):
+    if kind == 'layer':
+        return nn.LayerNorm(width)
+    if kind == 'rms':
+        return nn.RMSNorm(width)
+    if kind == 'none':
+        return nn.Identity()
+    raise ValueError(f"transformer norm {kind!r}: one of {NORMS}")
+
 
 class _CausalLayer(nn.Module):
     """Pre-norm causal self-attention and MLP; with `cross`, a cross-attention block between them in which every slot
-    attends to a memory of tokens (the molecule's atoms), all of which every slot may see."""
+    attends to a memory of tokens (the molecule's atoms), all of which every slot may see. `norm`: one of NORMS."""
 
-    def __init__(self, width, heads, mlp_ratio=4, cross=False):
+    def __init__(self, width, heads, mlp_ratio=4, cross=False, norm='layer'):
         super().__init__()
         if width % heads:
             raise ValueError(f"transformer width {width} is not a multiple of {heads} heads")
         self.heads = heads
-        self.ln1 = nn.LayerNorm(width)
+        self.ln1 = _norm(norm, width)
         self.qkv = nn.Linear(width, 3 * width)
         self.proj = nn.Linear(width, width)
         self.cross = bool(cross)
         if self.cross:
-            self.ln_x = nn.LayerNorm(width)
+            self.ln_x = _norm(norm, width)
             self.q_x = nn.Linear(width, width)
             self.kv_x = nn.Linear(width, 2 * width)
             self.proj_x = nn.Linear(width, width)
             nn.init.zeros_(self.proj_x.weight)  # a new cross block starts as the identity
             nn.init.zeros_(self.proj_x.bias)
-        self.ln2 = nn.LayerNorm(width)
+        self.ln2 = _norm(norm, width)
         self.mlp = nn.Sequential(nn.Linear(width, mlp_ratio * width), nn.SiLU(),
                                  nn.Linear(mlp_ratio * width, width))
 
@@ -73,7 +86,8 @@ def _cross_attend(q, kv, mem_mask, heads):
 class CausalTransformerConditioner(nn.Module):
     """Features of x in, spline parameters of every dim out (dim order), autoregressive in `order`."""
 
-    def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, context_dim=None, cross=False):
+    def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, norm='layer', context_dim=None,
+                 cross=False):
         super().__init__()
         # conditional runs: the condition's embedding, projected to the width, is added to every token; with `cross`,
         # every layer also cross-attends to a memory of tokens passed with it (forward's ctx = (vector, memory, mask))
@@ -88,8 +102,8 @@ class CausalTransformerConditioner(nn.Module):
         self.dim_emb = nn.Parameter(torch.zeros(d, width))           # which dim a value belongs to
         self.slot_emb = nn.Parameter(0.02 * torch.randn(d, width))   # which dim a slot predicts
         self.start = nn.Parameter(torch.zeros(width))
-        self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross) for _ in range(layers))
-        self.ln = nn.LayerNorm(width)
+        self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross, norm=norm) for _ in range(layers))
+        self.ln = _norm(norm, width)
         self.bf16 = True
         self.head = nn.Linear(width, self.n_params)
         # identity spline at step 0, as _MADE: zero weights, unit knot slopes, zero shift

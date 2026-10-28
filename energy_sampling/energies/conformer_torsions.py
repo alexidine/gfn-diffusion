@@ -28,6 +28,7 @@ discontinuity there. Everything public here takes and returns [-1, 1]; the conve
 to radians happens once, in ``build_positions``.
 """
 
+import contextlib
 from typing import Optional
 
 import networkx as nx
@@ -57,13 +58,15 @@ class ChartRefused(ValueError):
       * ``stereo_unspecified`` -- the SMILES leaves a lockable stereo element unassigned, so
         the isomer the lock would pin is whatever the embedding happened to realise;
       * ``stereo_unsupported`` -- a stereo element the lock does not enforce is tagged (a
-        tetrahedral N, an allene or atropisomer axis);
+        tetrahedral N, an allene or atropisomer axis; a stereo nitrogen is enforced, and so
+        not refused, under ``lock_stereo_nitrogen``);
       * ``stereo_verify_failed`` -- the reference embedding realised a different isomer
-        than the SMILES names;
+        than the SMILES names (for a locked stereo nitrogen: the other invertomer);
       * ``stereo_lock_in_band`` -- an element's best indicator is within ``MIN_MARGIN`` of
         zero at the reference, so the wrong configuration would pay too little to be locked
         out (build_conformer_conditions.py also records it when the lock fires on a thermal
-        sample of the correct isomer, `stereo_lock.thermal_check`);
+        sample of the correct isomer, `stereo_lock.thermal_check`); a locked stereo nitrogen
+        that is nearly planar at the reference is refused under this code;
       * ``stereo_torsion_double_bond`` -- at ``torsion`` a rotatable column turns a locked
         double bond, which the torsion prior draws into both E and Z.
     """
@@ -162,6 +165,67 @@ def stored_reference_mismatch(energy, pos, perm=None) -> str:
 
 
 class ConformerTorsions(BaseSet):
+    #: THE TRAINER'S ENERGY-REFERENCE SURFACE: train.py reads `energy_reference_mode`
+    #: (Modeller.init_energy_reference), `allow_unreferenced` (the prior intake in
+    #: Modeller.train) and `unreferenced_log_r` (its absolute reward floors) off whatever energy
+    #: the run holds. This route has no per-condition reference energy: the mode is None, which
+    #: energies/molecular_crystal.py::resolve_energy_reference reads as "install nothing".
+    energy_reference_mode = None
+
+    @contextlib.contextmanager
+    def allow_unreferenced(self):
+        """No-op: there is no energy reference on this route whose absence scoring could
+        refuse (MolecularCrystal.allow_unreferenced is the one that lifts a refusal)."""
+        yield
+
+    def unreferenced_log_r(self, log_r, condition_id=None):
+        """``log_r`` itself: no reference is ever installed on this route, so there is none
+        to undo (MolecularCrystal.unreferenced_log_r with no table installed)."""
+        return log_r
+
+    #: WHERE `energy_clip` IS MEASURED FROM. 'absolute': the cutoff is `energy_clip` itself.
+    #: 'reference': the cutoff is `energy_clip` above `energy_clip_floor`, this member's own
+    #: unclipped potential at its reference conformer (`install_clip_floor`). Not constructor
+    #: arguments: the floor needs the built chart, and a member built without it scores a row
+    #: under the cutoff identically under both.
+    CLIP_ORIGINS = ('absolute', 'reference')
+    energy_clip_origin = 'absolute'
+    energy_clip_floor = None
+
+    def reference_potential(self) -> float:
+        """Force field + stereo lock at this member's reference conformer (state 0), kcal/mol:
+        `potential_energy` there with the clip off. The box wall is zero at the origin."""
+        held = self.energy_clip
+        self.energy_clip = None
+        try:
+            x = torch.zeros(1, int(self.ndim), dtype=self.dtype, device=self.device)
+            one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
+            return float(self.potential_energy(x, one)[0])
+        finally:
+            self.energy_clip = held
+
+    def install_clip_floor(self) -> float:
+        """Switch this chart to `energy_clip_origin` 'reference' and return its floor."""
+        if self.energy_clip is None:
+            raise ValueError("energy_clip_origin 'reference' needs energy_clip: there is no "
+                             "clip to measure from the reference")
+        floor = self.reference_potential()
+        if not np.isfinite(floor):
+            raise ValueError(f'{self.smiles}: the potential at the reference conformer is '
+                             f'{floor!r}; no clip can be measured from it')
+        self.energy_clip_floor = floor
+        self.energy_clip_origin = 'reference'
+        return floor
+
+    @property
+    def clip_cutoff(self):
+        """The potential above which the soft clip compresses, or None when the clip is off."""
+        if self.energy_clip is None:
+            return None
+        if self.energy_clip_origin == 'absolute':
+            return self.energy_clip
+        return self.energy_clip_floor + self.energy_clip
+
     # Free-DoF levels, as freeze sets over InternalParams.CLASSES = ("r","theta","phi").
     # These are NOT a ladder of approximations: freezing a DoF at a constant gives
     # p_full(free | frozen = c0), a conditional slice, which differs from the
@@ -246,6 +310,41 @@ class ConformerTorsions(BaseSet):
                  # changes: the table is still built (condition graphs and the per-coordinate
                  # features carry it), but no term is added and nothing is refused.
                  stereo_coeff: float = 0.0,
+                 # THE BOX OF A LOCKED DOUBLE BOND'S DIHEDRAL, in degrees. None (the default)
+                 # leaves every column as it was: a phi column is periodic, one full turn
+                 # about its reference. A value W in (0, 90) makes each state column driving a
+                 # PROPER dihedral row about a double bond the stereo lock holds a BOUNDED
+                 # column instead -- reference +/- W degrees at x = +/-1, no wrap, the box
+                 # wall outside (block code 4; see the block-4 note below). Needs the lock
+                 # (stereo_coeff > 0): without it no double bond is held and the box would
+                 # cut a free rotor's support, so the pair is refused.
+                 double_bond_box_deg: Optional[float] = None,
+                 # SIBLING DIHEDRALS AS ONE ROTATION PLUS BOUNDED OFFSETS, in degrees. None
+                 # (the default) leaves every column as it was: each dihedral row of a
+                 # sibling group (`torsion_groups`) has its own periodic column. A value W in
+                 # (0, 180) changes each ELIGIBLE group of two or more rows
+                 # (`sibling_offset_census`): the leader's column, still periodic, turns
+                 # EVERY row of the group, and each follower's column is the follower's
+                 # dihedral minus the leader's, as a displacement from its reference value:
+                 # reference +/- W degrees at x = +/-1, no wrap, the box wall outside (block
+                 # code 5; see the block-5 note below). Needs the lock (stereo_coeff > 0):
+                 # a group is eligible only at a centre the lock names, where the lock
+                 # prices the configuration with the offsets negated; without the lock the
+                 # target holds both and the box would cut one, so the pair is refused.
+                 sibling_offset_box_deg: Optional[float] = None,
+                 # LOCK THE STEREO NITROGENS. False (the default) leaves every
+                 # three-coordinate centre free, as it was: a tag on one is stripped from the
+                 # condition's identity and refused when the lock is on. True makes a STEREO
+                 # NITROGEN (energies/stereo_lock.py: three single bonds to non-hydrogen
+                 # atoms, reported by RDKit as a tetrahedral element on the parsed SMILES --
+                 # an N in a three-membered ring or a bridgehead N) a stereo element: its tag
+                 # is part of the identity, an untagged stereogenic one is refused, a tagged
+                 # one gets a lock element whose sign is read off the reference and checked
+                 # against the tag, and the prior no longer reflects it. It CHANGES WHICH
+                 # CONDITIONS A MOLECULE HAS, so it is not a chart-only option: a member
+                 # whose SMILES has no N tag is the same under both values, every other one
+                 # exists under one value only. Needs the lock (stereo_coeff > 0).
+                 lock_stereo_nitrogen: bool = False,
                  # A STORED REFERENCE CONFORMER, [N, 3] Angstrom in the atom order of
                  # Chem.AddHs(Chem.MolFromSmiles(smiles)). None (the default) embeds one:
                  # seeded ETKDGv3, then MMFF94 relaxation when mmff_reference. Given, it IS the
@@ -481,7 +580,57 @@ class ConformerTorsions(BaseSet):
         # Off (stereo_coeff 0) it adds no term and refuses nothing; the table still exists so
         # a condition graph and the per-coordinate features are the same object either way.
         self.stereo_coeff = stereo_coeff             # validated by the property's setter
+        if not isinstance(lock_stereo_nitrogen, (bool, np.bool_)):
+            raise ValueError(f'lock_stereo_nitrogen must be true or false, got '
+                             f'{lock_stereo_nitrogen!r}')
+        if lock_stereo_nitrogen and self.stereo_coeff <= 0.0:
+            raise ValueError(
+                'lock_stereo_nitrogen with stereo_coeff 0: the option makes a stereo '
+                'nitrogen\'s configuration part of a condition\'s identity, and with the lock '
+                'off nothing holds it, so the condition would be named as one configuration '
+                'and hold both. Refused for every molecule, with or without such a nitrogen, '
+                'so a set fails on its first member. Set stereo_coeff > 0 or leave '
+                'lock_stereo_nitrogen false.')
+        #: whether a tagged stereo nitrogen is a locked stereo element (energies/stereo_lock.py)
+        self.lock_stereo_nitrogen = bool(lock_stereo_nitrogen)
         self._init_stereo(smiles, slot, pos_np, level)
+        if double_bond_box_deg is not None:
+            _w = float(double_bond_box_deg)
+            if not (np.isfinite(_w) and 0.0 < _w < 90.0):
+                raise ValueError(
+                    f'double_bond_box_deg must lie in (0, 90) degrees, got '
+                    f'{double_bond_box_deg!r}: at 90 and beyond the box reaches the plane '
+                    f'that separates E from Z, so the other isomer is inside it')
+            if self.stereo_coeff <= 0.0:
+                raise ValueError(
+                    f'double_bond_box_deg {_w:g} with stereo_coeff 0: the box bounds the '
+                    f'dihedrals about the double bonds the stereo lock holds, and with the '
+                    f'lock off none is held. Refused for every molecule, with or without a '
+                    f'double bond, so a set fails on its first member. Set stereo_coeff > 0 '
+                    f'or leave double_bond_box_deg unset.')
+            double_bond_box_deg = _w
+        #: half-width, in degrees, of the bounded column of a locked double bond's dihedral;
+        #: None = those columns are ordinary periodic phi columns
+        self.double_bond_box_deg = double_bond_box_deg
+        if sibling_offset_box_deg is not None:
+            _w = float(sibling_offset_box_deg)
+            if not (np.isfinite(_w) and 0.0 < _w < 180.0):
+                raise ValueError(
+                    f'sibling_offset_box_deg must lie in (0, 180) degrees, got '
+                    f'{sibling_offset_box_deg!r}: an offset is a displacement on the circle, '
+                    f'and at 180 the box is the whole of it')
+            if self.stereo_coeff <= 0.0:
+                raise ValueError(
+                    f'sibling_offset_box_deg {_w:g} with stereo_coeff 0: a sibling group is '
+                    f'carried as offsets only at a centre the stereo lock names, where the '
+                    f'lock prices the configuration with the offsets negated. With the lock '
+                    f'off the target holds both configurations of every centre and the box '
+                    f'would cut one. Refused for every molecule, so a set fails on its first '
+                    f'member. Set stereo_coeff > 0 or leave sibling_offset_box_deg unset.')
+            sibling_offset_box_deg = _w
+        #: half-width, in degrees, of a sibling OFFSET column's box; None = every dihedral
+        #: row of a sibling group has its own periodic column
+        self.sibling_offset_box_deg = sibling_offset_box_deg
         self.rotatable_cols = (np.argmax(mask_np, axis=0).astype(np.int64)
                                if mask_np.shape[1] else np.zeros(0, dtype=np.int64))
 
@@ -632,6 +781,72 @@ class ConformerTorsions(BaseSet):
             block[self.n_r + self.n_th + partner[_tv_rows]] = 3
             col_block = block[sel]
 
+        # BLOCK 4 = the BOUNDED dihedral of a LOCKED DOUBLE BOND (double_bond_box_deg). The
+        # rows are the ones `held_phi_rows` adds to the improper rows: proper dihedrals whose
+        # central bond the stereo lock holds. Every other stage already keeps such a row in
+        # its isomer's basin (the prior rattles it about the reference, the lock prices the
+        # other side); with the box the state column does too. A distinct code for the
+        # reasons block 3 has one: unlike phi the column does NOT wrap (`periodic_dims`
+        # reads `block == 2`) and takes the box wall (`_lin_free_idx` reads `block != 2`),
+        # and unlike theta its row is a dihedral -- never clamped, measured on the circle
+        # (`state_from_dof`), scaled by the box half-width rather than delta_theta_max. An
+        # improper row about the same bond is an angle between two substituents and keeps
+        # code 2, as does a row that is already a transverse v. Not at `torsion`: its
+        # columns are collective, and the lock refuses one that turns a locked double bond
+        # (stereo_torsion_double_bond), so none drives such a row there.
+        #: per TORSION ROW: a proper dihedral about a locked double bond, carried bounded
+        self.double_bond_rows = np.zeros(self.n_ph, dtype=bool)
+        if self.double_bond_box_deg is not None and level != 'torsion':
+            _db = np.array(sorted(set(self.held_phi_rows()) - set(self.improper_phi_rows())),
+                           dtype=np.int64)
+            _db = _db[block[self.n_r + self.n_th + _db] == 2]
+            if _db.size:
+                self.double_bond_rows[_db] = True
+                block[self.n_r + self.n_th + _db] = 4
+                col_block = block[sel]
+
+        # BLOCK 5 = a SIBLING OFFSET (sibling_offset_box_deg). A sibling group is the dihedral
+        # rows that place one atom's children on one frame (`torsion_groups`). A shift common
+        # to the group is a rigid rotation about the bond (soft); moving one member alone
+        # bends the angle between two substituents (stiff). In the default chart both are
+        # mixtures of the same periodic columns. With the option, in each ELIGIBLE group
+        # (`sibling_offset_census`) the leader's column -- the group's first row, unchanged
+        # in code, scale and periodicity -- drives every row of the group, and each
+        # follower's column is its OFFSET from the leader:
+        #
+        #     phi_leader   = ref_leader   + pi * x_leader
+        #     phi_follower = ref_follower + pi * x_leader + W * x_follower
+        #
+        # so the rotation and the spacings are separate columns. The map from the default
+        # columns is linear and unit-triangular (offset = follower - leader), so the
+        # internal-coordinate volume element is unchanged and only `log_chart_jacobian`
+        # moves, by log(W / 180) per offset column. A distinct code for the reasons blocks 3
+        # and 4 have one: the column does NOT wrap (`periodic_dims` reads `block == 2`) and
+        # takes the box wall (`_lin_free_idx` reads `block != 2`); its row is a dihedral,
+        # never clamped; and `state_from_dof` measures it as (follower - leader) on the
+        # circle, so a reference offset near +/-pi has no seam. The leader's extra entries in
+        # the map are written below, after `_sel_rows`, so every column keeps ONE own row
+        # and `collective` keeps meaning the `torsion` tier. Not at `torsion`: its columns
+        # already rotate whole bonds.
+        #: per TORSION ROW: a follower whose own column is its offset from its group's leader
+        self.sibling_offset_rows = np.zeros(self.n_ph, dtype=bool)
+        #: per TORSION ROW: the leader row whose column also drives this row, -1 = none
+        self.sibling_leader_row = np.full(self.n_ph, -1, dtype=np.int64)
+        #: the converted groups, ``[leader, follower, ...]`` in torsion-row numbering
+        self.sibling_offset_groups = []
+        if self.sibling_offset_box_deg is not None and level != 'torsion':
+            for _g in self.sibling_offset_census():
+                if _g['reason']:
+                    continue
+                _rows = np.asarray(_g['rows'], dtype=np.int64)
+                assert (block[self.n_r + self.n_th + _rows] == 2).all(), (smiles, _g)
+                self.sibling_offset_groups.append([int(j) for j in _rows])
+                self.sibling_offset_rows[_rows[1:]] = True
+                self.sibling_leader_row[_rows[1:]] = int(_rows[0])
+                block[self.n_r + self.n_th + _rows[1:]] = 5
+            if self.sibling_offset_groups:
+                col_block = block[sel]
+
         # A DoF sitting on a parameterisation singularity is HELD, not driven: log sin
         # theta diverges as theta -> pi and the dependent dihedral frame is undefined
         # there. Zeroing the ROW (not dropping the column) is what makes this uniform
@@ -741,8 +956,12 @@ class ConformerTorsions(BaseSet):
 
         #: per STATE COLUMN: 0=r 1=th 2=phi 3=TRANSVERSE (a (u, v) component of a linear
         #: bend -- non-periodic like r/theta, unclamped like neither; see the block-3 note)
+        #: 4=the BOUNDED dihedral of a locked double bond (the block-4 note)
+        #: 5=a sibling OFFSET, a follower's dihedral minus its leader's (the block-5 note)
         self._free_block = col_block
         self.free_mask = m_full.any(axis=1)                # per DoF ROW: is it driven
+        # a double-bond row held on a collinear frame lost its column above: not carried
+        self.double_bond_rows &= self.free_mask[self.n_r + self.n_th:]
 
         # A COLLECTIVE column drives more than one DoF row (a `torsion` column rotates a
         # whole bond). The state -> DoF map is then not invertible row-wise, so
@@ -755,11 +974,40 @@ class ConformerTorsions(BaseSet):
                                           device=self.device))
         self._driven_idx = torch.as_tensor(np.flatnonzero(self.free_mask),
                                            dtype=torch.long, device=self.device)
+        # THE LEADER'S COLUMN DRIVES ITS WHOLE GROUP (block 5). Written after `collective`
+        # and `_sel_rows` were read off the selection, so those two still say "one OWN row
+        # per column": a follower row then has two entries, its own column (the offset) and
+        # its leader's (the rotation), and `state_from_dof` inverts the pair exactly.
+        _so_cols = np.flatnonzero(col_block == 5)
+        _so_own = np.zeros(0, dtype=np.int64)
+        _so_lead = np.zeros(0, dtype=np.int64)
+        if self.sibling_offset_groups:
+            _n0 = self.n_r + self.n_th
+            _own_row = np.argmax(m_full, axis=0)           # state column -> its own DoF row
+            _col_of = {int(r): c for c, r in enumerate(_own_row)}
+            for _rows in self.sibling_offset_groups:
+                # an eligible group holds no singular row, so none lost its column above
+                assert all(self.free_mask[_n0 + j] and (_n0 + j) in _col_of for j in _rows), (
+                    f'{smiles}: sibling group {_rows} lost a column')
+                for _f in _rows[1:]:
+                    m_full[_n0 + _f, _col_of[_n0 + _rows[0]]] = 1.0
+            _so_own = _own_row[_so_cols]
+            _so_lead = _n0 + self.sibling_leader_row[_so_own - _n0]
+            assert self.sibling_offset_rows[_so_own - _n0].all() \
+                and len(_so_cols) == int(self.sibling_offset_rows.sum()), smiles
+        #: STATE COLUMNS that are sibling offsets (block 5), and per such column the DoF row
+        #: of its group's leader; both empty without the option
+        self._so_cols = torch.as_tensor(_so_cols, dtype=torch.long, device=self.device)
+        self._so_lead_rows = torch.as_tensor(_so_lead, dtype=torch.long, device=self.device)
         self._M = torch.as_tensor(m_full[self.free_mask], dtype=dtype, device=self.device)
 
         scale = np.select(
-            [col_block == 0, col_block == 1, col_block == 3],
-            [float(delta_r_max), float(delta_theta_max), float(delta_theta_max)],
+            [col_block == 0, col_block == 1, col_block == 3, col_block == 4, col_block == 5],
+            [float(delta_r_max), float(delta_theta_max), float(delta_theta_max),
+             (np.pi if self.double_bond_box_deg is None
+              else float(np.deg2rad(self.double_bond_box_deg))),
+             (np.pi if self.sibling_offset_box_deg is None
+              else float(np.deg2rad(self.sibling_offset_box_deg)))],
             default=np.pi)
 
         # THE REFERENCE IN CHART UNITS. A transverse row's stored reference is (u0, v0), not
@@ -830,9 +1078,19 @@ class ConformerTorsions(BaseSet):
         self._free_scale = torch.as_tensor(scale, dtype=dtype, device=self.device)
         # indexes the STATE, not the DoF vector: the box wall applies to the non-periodic
         # blocks only. Empty at `torsion` and `dihedral`, which is what keeps those levels
-        # bitwise identical to the pre-ladder code.
+        # bitwise identical to the pre-ladder code -- unless a locked double bond's dihedral
+        # is bounded (block 4) or a sibling group is carried as offsets (block 5), which are
+        # walled columns at `dihedral` too.
         self._lin_free_idx = torch.as_tensor(np.flatnonzero(col_block != 2),
                                              dtype=torch.long, device=self.device)
+        #: an r, theta or transverse column is free: the r/theta domain clamp applies and
+        #: log J moves with the state. Equal to "`_lin_free_idx` is non-empty" on every
+        #: chart without a block-4 or block-5 column; those are walled but are dihedrals, so
+        #: they switch on neither.
+        self._rtheta_free = bool(np.isin(col_block, (0, 1, 3)).any())
+        #: STATE COLUMNS that are bounded double-bond dihedrals (block 4); empty without
+        self._db_cols = torch.as_tensor(np.flatnonzero(col_block == 4), dtype=torch.long,
+                                        device=self.device)
         #: per ANGLE ROW, for `build` / `log_jacobian` / the theta clamp. None when no row
         #: is transverse, which keeps every molecule without a linear centre on exactly the
         #: code path it was on before.
@@ -962,7 +1220,7 @@ class ConformerTorsions(BaseSet):
         _pr, _pth, _pph = self.dof_from_state(_probe)
         self.log_jacobian_const = (
             float(self._log_jac(_tree, _pr, _pth, _pph, 1).item())
-            if self._lin_free_idx.numel() == 0 else None)
+            if not self._rtheta_free else None)
 
         # THE CHART VOLUME ELEMENT, log|dq/dx|. The sampler proposes x on [-1, 1]^d, but
         # the Boltzmann density lives on the internal coordinates q -- and dof_from_state
@@ -1031,26 +1289,62 @@ class ConformerTorsions(BaseSet):
         The signs are then read off the reference, not off the tags, so the reference must BE
         the tagged isomer: `realised_isomer` re-perceives it from 3D and it must equal the
         input's canonical isomeric SMILES.
+
+        STEREO NITROGENS (`lock_stereo_nitrogen`; energies/stereo_lock.py). With the option
+        on, each stereo nitrogen the SMILES tags is a locked element
+        (`stereo_nitrogen_atoms`); 3D perception returns nothing for it, so its element's sign
+        is checked against the sign its tag asks for (`stereo_lock.quad_sign_of_tag`), and a
+        near-planar one is refused before that comparison can read noise.
         """
         from energies import stereo_lock as sl
 
+        lock_n = bool(self.lock_stereo_nitrogen)
         #: the INPUT molecule's potential stereo elements (stereo_lock.tagged_elements), in
         #: `self.mol`'s atom indexing -- the condition side of the stereo contract
         self.stereo_elements = sl.tagged_elements(smiles)
+        #: the stereo nitrogens the lock holds, RDKit atom indices of `self.mol`, ascending:
+        #: the ones the SMILES tags, and none unless `lock_stereo_nitrogen`
+        self.stereo_nitrogen_atoms = tuple(sorted(
+            int(e['atoms'][0]) for e in self.stereo_elements
+            if lock_n and e['kind'] == sl.TETRAHEDRAL and e['stereo_nitrogen']
+            and e['specified']))
+        held_n = set(self.stereo_nitrogen_atoms)
+        if lock_n:
+            # A TAG ON A STEREO NITROGEN IS EITHER HELD OR THE BUILD STOPS. "Tagged" above is
+            # `tagged_elements`' `specified`, which unites two graphs' reports; the SMILES's
+            # own parse is the authority on whether the tag is there. A stereo nitrogen that
+            # carries a tag and is not held would be a condition named as one configuration
+            # with nothing holding it.
+            from rdkit import Chem
+            with sl.pinned_perception():
+                _parsed = Chem.MolFromSmiles(smiles)
+            _stray = sorted(
+                int(e['atoms'][0]) for e in self.stereo_elements
+                if e['kind'] == sl.TETRAHEDRAL and e['stereo_nitrogen']
+                and (sl.nitrogen_tag_sign(_parsed.GetAtomWithIdx(int(e['atoms'][0]))) != 0)
+                != (int(e['atoms'][0]) in held_n))
+            if _stray:
+                raise RuntimeError(
+                    f'{smiles}: stereo nitrogen(s) at atom(s) {_stray} are tagged in the '
+                    f'SMILES but not listed as specified stereo elements (or the reverse); '
+                    f'refusing to build a member whose nitrogen tag nothing holds')
         dbl = [tuple(int(slot[a]) for a in e['atoms']) for e in self.stereo_elements
                if e['kind'] == sl.DOUBLE_BOND]
         centres = [int(slot[e['atoms'][0]]) for e in self.stereo_elements
-                   if e['kind'] == sl.TETRAHEDRAL and e['specified'] and e['degree'] == 4]
-        self.stereo = sl.build_table(pos_slot, self.bond_index_slot, dbl, stereocentres=centres)
+                   if e['kind'] == sl.TETRAHEDRAL and e['specified']
+                   and (e['degree'] == 4 or int(e['atoms'][0]) in held_n)]
+        self.stereo = sl.build_table(pos_slot, self.bond_index_slot, dbl, stereocentres=centres,
+                                     nitrogens=[int(slot[a]) for a in self.stereo_nitrogen_atoms])
         #: the isomer the reference conformer REALISES (re-perceived from 3D), and the input's
-        self.stereo_isomer = sl.realised_isomer(self.mol)
-        self.stereo_input = sl.canonical_isomeric(smiles)
+        self.stereo_isomer = sl.realised_isomer(self.mol, lock_nitrogen=lock_n)
+        self.stereo_input = sl.canonical_isomeric(smiles, lock_nitrogen=lock_n)
         if self.stereo_coeff <= 0.0:
             return
 
         odd = [e for e in self.stereo_elements if e['kind'] == 0]
         inv = [e for e in self.stereo_elements
-               if e['kind'] == sl.TETRAHEDRAL and e['degree'] != 4 and e['specified']]
+               if e['kind'] == sl.TETRAHEDRAL and e['degree'] != 4 and e['specified']
+               and int(e['atoms'][0]) not in held_n]
         if odd or inv:
             what = ([f"{e['type']} at atom {e['atoms']}" for e in odd]
                     + [f"tetrahedral {e['element']}{e['atoms'][0]} (3-coordinate)" for e in inv])
@@ -1060,12 +1354,16 @@ class ConformerTorsions(BaseSet):
                 f"enforce them -- a three-coordinate centre (an amine N) is left to invert "
                 f"inside one condition (RDKit does not recover N stereo from 3D, so it could "
                 f"not be verified), and axial stereo has no indicator. Strip those tags, or run "
-                f"with stereo_coeff 0.")
-        isomers = sl.consistent_isomers(smiles)
+                f"with stereo_coeff 0."
+                + ("" if lock_n or not any(e['stereo_nitrogen'] for e in inv) else
+                   " A tagged stereo nitrogen (three-ring or bridgehead N) is locked under "
+                   "lock_stereo_nitrogen: true."))
+        isomers = sl.consistent_isomers(smiles, lock_nitrogen=lock_n)
         if len(isomers) != 1:
             loose = [(e['type'], e['atoms']) for e in self.stereo_elements
                      if not e['specified'] and not (e['kind'] == sl.TETRAHEDRAL
-                                                    and e['degree'] != 4)]
+                                                    and e['degree'] != 4
+                                                    and not (lock_n and e['stereo_nitrogen']))]
             raise ChartRefused(
                 'stereo_unspecified',
                 f"{smiles}: the tags are consistent with {len(isomers)} stereoisomers (e.g. "
@@ -1074,6 +1372,8 @@ class ConformerTorsions(BaseSet):
                 f"locked to whatever the ETKDG embedding realised ({self.stereo_isomer!r} "
                 f"this time), which the problem identity does not record. Pass a fully tagged "
                 f"stereoisomer.")
+        if held_n:
+            self._verify_stereo_nitrogens(smiles, slot)
         if self.stereo_isomer != self.stereo_input:
             raise ChartRefused(
                 'stereo_verify_failed',
@@ -1106,6 +1406,58 @@ class ConformerTorsions(BaseSet):
                     f"rotatable (no bond-order test) and its prior draws both E and Z, so the "
                     f"lock would reject a fixed share of every prior draw. Run it unlocked "
                     f"(stereo_coeff 0), or at dihedral/flex/full.")
+
+    def _verify_stereo_nitrogens(self, smiles: str, slot: np.ndarray):
+        """Refuse a reference that does not REALISE the tagged configuration of a locked
+        stereo nitrogen, or that is too flat there to say which it realises.
+
+        Per locked nitrogen, on a fresh parse of ``smiles`` (``self.mol``'s heavy atoms keep
+        its indices and its bond order about a hydrogen-free N): the tag's sign for the
+        neighbours in bond order (`stereo_lock.nitrogen_tag_sign`), carried to the lock
+        element's own neighbour order (`quad_sign_of_tag`), must be the sign the table read
+        off the reference. The margin is checked FIRST: below `MIN_MARGIN` the reference's
+        sign is not evidence of either configuration, and the condition is refused
+        (`stereo_lock_in_band`) rather than built with that nitrogen free, because its tag is
+        part of the condition's name.
+        """
+        from rdkit import Chem
+
+        from energies import stereo_lock as sl
+        with sl.pinned_perception():
+            parsed = Chem.MolFromSmiles(smiles)
+        flat, wrong = [], []
+        for a in self.stereo_nitrogen_atoms:
+            e = self.stereo.element_of(int(slot[a]))
+            atom = parsed.GetAtomWithIdx(int(a))
+            want = sl.quad_sign_of_tag(sl.nitrogen_tag_sign(atom),
+                                       [int(slot[k]) for k in sl.bond_order_neighbours(atom)])
+            if want == 0:
+                raise RuntimeError(f'{smiles}: stereo nitrogen at atom {a} is listed as tagged '
+                                   f'but its parse carries no tetrahedral tag')
+            if sorted(int(slot[k]) for k in sl.bond_order_neighbours(atom)) != [
+                    int(q) for q in self.stereo.quad[e][:3]]:
+                raise RuntimeError(f'{smiles}: the lock element of the stereo nitrogen at atom '
+                                   f'{a} is not on its three bonded neighbours')
+            if float(self.stereo.margin[e]) < sl.MIN_MARGIN:
+                flat.append((int(a), float(self.stereo.margin[e])))
+            elif int(self.stereo.sign[e]) != want:
+                wrong.append((int(a), float(self.stereo.margin[e])))
+        if flat:
+            raise ChartRefused(
+                'stereo_lock_in_band',
+                f"{smiles}: the tagged stereo nitrogen(s) at atom(s) {[a for a, _ in flat]} are "
+                f"nearly planar at the reference (|indicator| "
+                f"{[round(m, 4) for _, m in flat]}, below {sl.MIN_MARGIN}): the reference does "
+                f"not show which configuration it realises, and the mirror point would pay too "
+                f"little to be locked out (stereo_lock.MIN_MARGIN).")
+        if wrong:
+            raise ChartRefused(
+                'stereo_verify_failed',
+                f"{smiles}: the reference conformer realises the OTHER configuration of the "
+                f"tagged stereo nitrogen(s) at atom(s) {[a for a, _ in wrong]} (|indicator| "
+                f"{[round(m, 4) for _, m in wrong]}; 3D perception returns no N tag, so the "
+                f"lock element's sign is compared with the sign the tag asks for). The lock "
+                f"reads its signs off the reference, so it would pin the wrong invertomer.")
 
     def held_phi_rows(self):
         """phi rows the prior HOLDS at their reference: impropers, plus locked double bonds.
@@ -1187,6 +1539,7 @@ class ConformerTorsions(BaseSet):
         z = np.asarray(self.spec.z)
         name = lambda i: f"{sym.GetElementSymbol(int(z[i]))}{i}"
         n_free = [int((self._free_block == b).sum()) for b in (0, 1, 2, 3)]
+        n_db = int((self._free_block == 4).sum())
         lines = [f"{self.smiles}: {self.spec.n_atoms} atoms, {self.spec.n_dof} internal DoF",
                  f"   level {self.level!r}: {self.data_ndim} free "
                  f"(r {n_free[0]}/{self.n_r}, theta {n_free[1]}/{self.n_th}, "
@@ -1210,6 +1563,21 @@ class ConformerTorsions(BaseSet):
                 f"collinear real atom; min frame-angle sine over the box "
                 f"{self.dummy_frame_min_sin:.3f}. "
                 f"{int(np.asarray(self.held_frame_rows).sum())} collinear frame(s) held.")
+        if getattr(self, 'double_bond_box_deg', None) is not None:
+            lines.append(
+                f"   DOUBLE-BOND BOX: {n_db} column(s) drive a proper dihedral about a locked "
+                f"double bond, each BOUNDED to its reference +/-{self.double_bond_box_deg:g} "
+                f"deg (non-periodic, box wall {self.bounding_coeff}); they are not among the "
+                f"phi columns counted above")
+        if getattr(self, 'sibling_offset_box_deg', None) is not None:
+            _multi = [g for g in self.sibling_offset_census() if len(g['rows']) > 1]
+            lines.append(
+                f"   SIBLING OFFSETS: {len(self.sibling_offset_groups)} of {len(_multi)} "
+                f"sibling group(s) of two or more dihedrals carried as one rotation (the "
+                f"leader's column, periodic, turning the whole group) plus "
+                f"{int((self._free_block == 5).sum())} offset column(s), each BOUNDED to its "
+                f"reference +/-{self.sibling_offset_box_deg:g} deg (non-periodic, box wall "
+                f"{self.bounding_coeff}); they are not among the phi columns counted above")
         if getattr(self.spec, 'root_moved_from', -1) >= 0:
             lines.append(f"   ROOT moved off the sp carbon the default rule picks (input atom "
                          f"{self.spec.root_moved_from}); see topology.choose_root")
@@ -1238,6 +1606,12 @@ class ConformerTorsions(BaseSet):
                 f"   STEREO LOCK {state}: {n_t} tetrahedral centre(s) ({int(st.stereocentre.sum())} "
                 f"stereocentre(s), the rest labelled parity), {n_b} double bond(s); reference "
                 f"realises {self.stereo_isomer!r}")
+            if getattr(self, 'lock_stereo_nitrogen', False):
+                lines.append(
+                    f"   STEREO NITROGENS LOCKED (lock_stereo_nitrogen): "
+                    f"{len(self.stereo_nitrogen_atoms)} three-neighbour N among the "
+                    f"tetrahedral centres above, RDKit atom(s) "
+                    f"{list(self.stereo_nitrogen_atoms)}")
         if n_free[0] or n_free[1]:
             lines.append(f"   box: r +/-{self.delta_r_max} A, theta "
                          f"+/-{self.delta_theta_max} rad, wall {self.bounding_coeff}, "
@@ -1313,6 +1687,20 @@ class ConformerTorsions(BaseSet):
             self._ff_cache.pop(stale, None)
         return self._tree_cache[batch_size], self._ff_cache[batch_size]
 
+    def release_batch_cache(self) -> None:
+        """Drop the cached batched trees and force fields of ``_batch`` (all but batch size 1).
+
+        The cache keeps the last batch size evaluated, on the member's device, and nothing
+        but ``_batch`` reads it, so the next evaluation rebuilds what it needs. A member of a
+        set is evaluated on its own only now and then (a builder's checks, the thermal tile's
+        curvatures) while the set scores through its one-pass library, so an entry left on
+        each member is dead weight: measured 1.7 MB per member of 3,486 QM9 conditions after
+        the thermal tile's 2M + 1 point evaluation, against 41 KB for everything else the
+        member's tensors hold.
+        """
+        self._tree_cache = {k: v for k, v in self._tree_cache.items() if k == 1}
+        self._ff_cache = {k: v for k, v in self._ff_cache.items() if k == 1}
+
     def dof_from_state(self, x: torch.Tensor):
         """State ``[B, d]`` on [-1, 1] -> ``(r, theta, phi)``, each ``[B, n_block]``.
 
@@ -1344,7 +1732,7 @@ class ConformerTorsions(BaseSet):
         r = dof[:, :self.n_r]
         th = dof[:, self.n_r:self.n_r + self.n_th]
         ph = dof[:, self.n_r + self.n_th:]
-        if self._lin_free_idx.numel():
+        if self._rtheta_free:
             # only pay for the clamp where a linear block is actually free; at `torsion`
             # and `dihedral` r and th are the frozen reference and cannot leave the domain
             r = r.clamp_min(self.r_floor)
@@ -1529,6 +1917,11 @@ class ConformerTorsions(BaseSet):
         DoF rows and the map is not invertible row-wise; build_prior_states.draw_states is
         the torsion-specific path and it works by looking up one representative dihedral
         per bond rather than by inverting anything.
+
+        With `sibling_offset_box_deg` a leader's column also drives its followers' rows, but
+        every column still has one OWN row (`_sel_rows`) and the map is triangular: the
+        leader's column is read off the leader's row, each follower's off (follower minus
+        leader). `collective` stays False there and this is the exact inverse.
         """
         if self.collective:
             raise NotImplementedError(
@@ -1559,6 +1952,29 @@ class ConformerTorsions(BaseSet):
         sel = self._sel_rows
         x = ((dof.index_select(1, sel) - self._ref_dof.index_select(0, sel).unsqueeze(0))
              / self._free_scale)
+        if self._db_cols.numel():
+            # A BOUNDED double-bond column is a dihedral: its displacement is taken on the
+            # circle, in (-pi, pi], BEFORE the division -- a measured phi and its reference
+            # can sit either side of the +/-pi seam (a trans bond's reference is near pi).
+            # The column itself does not wrap: |x| > 1 is outside its box.
+            delta = (dof.index_select(1, sel.index_select(0, self._db_cols))
+                     - self._ref_dof.index_select(0, sel.index_select(0, self._db_cols)))
+            delta = np.pi - (np.pi - delta) % (2.0 * np.pi)
+            x = x.index_copy(1, self._db_cols,
+                             delta / self._free_scale.index_select(0, self._db_cols))
+        if self._so_cols.numel():
+            # A SIBLING OFFSET column holds (follower - leader), each as a displacement from
+            # its reference. The difference is taken on the circle, in (-pi, pi], BEFORE the
+            # division, so it reads the same whichever branch the two measured dihedrals and
+            # their references sit on (a reference offset is near +/-120 degrees, and a
+            # measured pair can straddle the seam). The column itself does not wrap.
+            own = sel.index_select(0, self._so_cols)
+            delta = ((dof.index_select(1, own) - self._ref_dof.index_select(0, own))
+                     - (dof.index_select(1, self._so_lead_rows)
+                        - self._ref_dof.index_select(0, self._so_lead_rows)))
+            delta = np.pi - (np.pi - delta) % (2.0 * np.pi)
+            x = x.index_copy(1, self._so_cols,
+                             delta / self._free_scale.index_select(0, self._so_cols))
         # phi columns are deltas on a circle: wrap, so a draw near the seam comes back as
         # a small latent instead of a large one the wall would then fight
         is_phi = torch.as_tensor(self._free_block == 2, dtype=torch.bool, device=x.device)
@@ -1640,6 +2056,86 @@ class ConformerTorsions(BaseSet):
                 continue
             g[(int(ti[j, 1]), int(ti[j, 2]))].append(j)
         return [sorted(rows) for rows in g.values()]
+
+    def _ring_atoms(self) -> set:
+        """Placement slots on a ring: RDKit's ring atoms (`atom_in_ring`) and both atoms of
+        every bond of the chart's own graph that lies on a cycle."""
+        b = np.asarray(self.bond_index_slot, dtype=np.int64).reshape(2, -1).T
+        g = nx.Graph([(int(u), int(v)) for u, v in b if u != v])
+        bridges = {frozenset(e) for e in nx.bridges(g)}
+        ring = {int(a) for a in np.flatnonzero(np.asarray(self.atom_in_ring, dtype=bool))}
+        for u, v in g.edges():
+            if frozenset((u, v)) not in bridges:
+                ring.update((int(u), int(v)))
+        return ring
+
+    def sibling_offset_census(self):
+        """Every sibling group (`torsion_groups`) and whether `sibling_offset_box_deg` carries
+        it as one rotation plus offsets: ``[{'rows', 'bond', 'centre', 'reason'}]``, ``reason``
+        ``''`` for an ELIGIBLE group, else the first rule below that it fails.
+
+        A group is the non-held dihedral rows about one bond (b, c): the rows placing the
+        children of ``centre`` c on the frame (a, b, c). Read off the chart's structure and
+        the lock's table alone, whatever `sibling_offset_box_deg` is, so a default chart can
+        be asked what the option would convert. ELIGIBLE means all of:
+
+          * two or more rows (``single_row``: one row has no offset to carry);
+          * not the `torsion` tier (``torsion_tier``: its columns already turn whole bonds);
+          * c is not a ring atom (``ring_atom``). A group at a ring atom holds ring-block
+            rows, a ring's rotation rows about its attaching bond, substituents led by a ring
+            member, or substituents hung off the ring frame (`ring_blocks`,
+            `ring_frame_groups`): the prior and the per-molecule ring shapes write those rows
+            from the ring's own geometry, and they stay as they are. A row that places a
+            ring's ENTRY atom on a non-ring c is an ordinary sibling and does not disqualify;
+          * the stereo lock is on and names c as a tetrahedral centre, i.e. c has four bonded
+            neighbours (``centre_not_locked``). Negating a group's offsets is the other
+            labelled configuration of c. At a locked centre the lock prices it out of the
+            target. At a three-coordinate centre the target holds both sides and
+            energies/invertible_centres.py flips between them, an offset going from about
+            +120 to -120 degrees, which a narrow box would cut: those groups keep periodic
+            followers, whether or not that module qualifies the centre. A LOCKED STEREO
+            NITROGEN (`lock_stereo_nitrogen`) is named by the lock and has three neighbours:
+            its group is NOT converted either. Every one RDKit reports is a ring atom, which
+            the rule above already excludes, and this rule does not count it as named, which
+            keeps it out should that ever change;
+          * no row is a transverse v, uses a dummy frame or is held on a collinear frame
+            (``linear_frame``).
+
+        Held rows (impropers, rows about a locked double bond) are in no group.
+        """
+        from energies.stereo_lock import TETRAHEDRAL
+        ti = np.asarray(self.spec.torsion_index)
+        named = set()
+        if self.stereo_coeff > 0.0 and self.stereo.n:
+            named = {int(k) for k, kd in zip(self.stereo.key, self.stereo.kind)
+                     if int(kd) == TETRAHEDRAL}
+            if getattr(self, 'stereo_nitrogen_atoms', ()):
+                _slot = np.empty(int(self.spec.n_atoms), dtype=np.int64)
+                _slot[np.asarray(self.spec.perm)] = np.arange(int(self.spec.n_atoms))
+                named -= {int(_slot[a]) for a in self.stereo_nitrogen_atoms}
+        ring = self._ring_atoms()
+        tv = {int(j) for j in np.asarray(self.transverse_partner)[
+            np.asarray(self.transverse_angles, dtype=bool)]}
+        odd = (np.asarray(self.dummy_frame_rows, dtype=bool)
+               | np.asarray(self.held_frame_rows, dtype=bool))
+        out = []
+        for rows in self.torsion_groups():
+            b, c = int(ti[rows[0], 1]), int(ti[rows[0], 2])
+            if len(rows) < 2:
+                why = 'single_row'
+            elif self.level == 'torsion':
+                why = 'torsion_tier'
+            elif c in ring:
+                why = 'ring_atom'
+            elif c not in named:
+                why = 'centre_not_locked'
+            elif any(j in tv or odd[j] for j in rows):
+                why = 'linear_frame'
+            else:
+                why = ''
+            out.append({'rows': [int(j) for j in rows], 'bond': (b, c), 'centre': c,
+                        'reason': why})
+        return out
 
     def improper_phi_rows(self):
         """phi rows that are LOCAL GEOMETRY, not rotatable torsions.
@@ -2550,6 +3046,15 @@ class ConformerTorsions(BaseSet):
             # clip rate that mixed the two would not say which box was too narrow.
             'transverse': float(outside[:, self._free_block == 3].to(self.dtype).mean()) if (self._free_block == 3).any() else 0.0,
         }
+        if (self._free_block == 4).any():
+            # a bounded double-bond column is walled too; its own key, present only on a
+            # chart that has one
+            stats['clip_frac']['double_bond'] = float(
+                outside[:, self._free_block == 4].to(self.dtype).mean())
+        if (self._free_block == 5).any():
+            # a sibling offset column is walled too; its own key, likewise
+            stats['clip_frac']['sibling_offset'] = float(
+                outside[:, self._free_block == 5].to(self.dtype).mean())
         x = x.clamp(-1.0, 1.0)
 
         # CLOSURE MONITOR. Ring closure is the one constraint the state cannot express --
@@ -2676,7 +3181,7 @@ class ConformerTorsions(BaseSet):
                 # element, log_chart_jacobian) are added later in energy(), so they are
                 # untouched here for the same reason.
                 from mxtaltools.common.utils import log_rescale_positive
-                e = log_rescale_positive(e, self.energy_clip)
+                e = log_rescale_positive(e, self.clip_cutoff)
             if self._lin_free_idx.numel():
                 # skipped, not added-as-zero, so the geometry path stays bitwise
                 e = e + self.bounding_energy(x, temperature)
@@ -2796,7 +3301,10 @@ class ConformerTorsions(BaseSet):
 
     @property
     def periodic_dims(self):
-        """Which state dims live on a circle: the phi block, and only it.
+        """Which state dims live on a circle: the phi block, and only it. A bounded
+        double-bond dihedral (block 4, `double_bond_box_deg`) is not in it: it has a box.
+        Nor is a sibling offset (block 5, `sibling_offset_box_deg`); the leader column that
+        turns its whole group is.
 
         The base GFN infers this from `is_crystal`, which conflates "not a crystal" with
         "not periodic" and hands a non-crystal state ZERO wrapped dims -- silently, since

@@ -249,6 +249,12 @@ def state_features(en, prior=None):
     Averaging is a real approximation and is why the count is carried: a policy that needs
     to tell "one dihedral" from "four dihedrals moving together" can read it directly rather
     than inferring it from a smeared feature vector.
+
+    The same holds above `torsion` under `sibling_offset_box_deg`: a sibling group's LEADER
+    column drives every row of its group, so it takes the mean of those rows' features and
+    their count, while each follower's OFFSET column drives its own row alone (count 1) and
+    takes that row's features unchanged. The leader's rows share their frame's first three
+    atoms and differ in the placed atom.
     """
     f = dof_features(en, prior)
     m = en._M.detach().cpu().numpy()                 # [n_driven, n_cols]
@@ -278,6 +284,12 @@ def free_dof_atom_index(en):
     about it. So a column owns SEVERAL rows, ``R`` is the widest such set in this molecule,
     and short columns are zero-padded with ``mask`` false. Atom indices are in SPEC (tree)
     numbering, which is the numbering `models.encoder_cache` stores embeddings in.
+
+    Under `sibling_offset_box_deg` a sibling group's LEADER column owns every row of its
+    group at the tiers above `torsion` too, so ``R`` is the largest converted group there
+    (3 at a methyl) instead of 1. Its rows are in ascending row order, so slot 0 is the
+    leader's own dihedral, the one row the column owned in the default chart; a follower's
+    offset column owns its own row alone.
     """
     spec = en.spec
     # 'phi' is the rows' FRAME (`torsion_frame_atoms`): on a dummy-frame row its first atom is
@@ -342,8 +354,11 @@ def atom_parity(en) -> np.ndarray:
     pseudo-asymmetric centres and runs under the pinned perception), so an untagged centre
     reads 0 -- the condition does not say which configuration it is. A three-coordinate
     centre (an amine N) is left at 0: its invertomers are one condition (stereo_lock's module
-    note). Read off the energy's own record; `en.mol` is not touched (this used to reassign
-    its stereo in place).
+    note). A stereo nitrogen the energy LOCKS (`ConformerTorsions.stereo_nitrogen_atoms`,
+    empty unless it was built under `lock_stereo_nitrogen`) is the exception: its two
+    configurations are two conditions over one graph, so it carries its parity like any
+    tagged centre, the sign of its three neighbours' triple product. Read off the energy's
+    own record; `en.mol` is not touched (this used to reassign its stereo in place).
 
     The sign is read off the reference conformer, which is legitimate here in a way it was
     NOT for the reference dihedral: the embedding respects the SMILES stereo tags, so parity
@@ -353,6 +368,7 @@ def atom_parity(en) -> np.ndarray:
     from energies.stereo_lock import TETRAHEDRAL
     centres = {int(e['atoms'][0]) for e in en.stereo_elements
                if e['kind'] == TETRAHEDRAL and e['specified'] and e['degree'] == 4}
+    centres |= {int(a) for a in getattr(en, 'stereo_nitrogen_atoms', ()) or ()}
     n = en.spec.n_atoms
     out = np.zeros(n)
     if not centres:

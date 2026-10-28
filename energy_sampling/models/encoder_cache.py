@@ -67,7 +67,7 @@ def _fingerprint(path: str) -> str:
     return h.hexdigest()
 
 
-def _features(smiles: str, encoding: str, k: int) -> Sample:
+def _features(smiles: str, encoding: str, k: int, stereo: int = 1) -> Sample:
     """`build_sample`'s feature half, without the probe labels.
 
     Deliberately mirrors it line for line rather than calling it: `build_sample` also
@@ -76,10 +76,10 @@ def _features(smiles: str, encoding: str, k: int) -> Sample:
     inputs only. Any drift between this and `build_sample` is a feature-parity bug, so they
     must be edited together.
     """
-    z, e1, parity = graph_from_smiles(smiles)
+    z, e1, parity = graph_from_smiles(smiles, stereo=stereo)
     n = len(z)
     root = canonical_root(mol_for_labels(smiles))
-    bf = bond_features_from_smiles(smiles)
+    bf = bond_features_from_smiles(smiles, stereo=stereo)
     spd = shortest_paths(e1, n)
     struct = {'none': lambda: np.zeros((n, k)),
               'rwse': lambda: rwse(e1, n, k=k)}[encoding]()
@@ -130,7 +130,10 @@ def load_encoder(ckpt_path: str = DEFAULT_CKPT, device='cpu') -> Dict:
     sd = ck['state_dict']
     arm = ck.get('arm', 'mp+attn+spd')
     cfg = ARMS[arm]
-    probe = _features('CCO', cfg['encoding'], ck['k'])
+    # the stereo level the checkpoint was trained at (models/graph_encodings.STEREO_FEATURES);
+    # one written before the key existed is level 1
+    stereo = int(ck.get('stereo_features', 1))
+    probe = _features('CCO', cfg['encoding'], ck['k'], stereo)
     node_dim, edge_dim = int(probe.x.shape[1]), int(probe.edge_attr.shape[1])
 
     n_heads, max_spd = 4, 8
@@ -149,6 +152,7 @@ def load_encoder(ckpt_path: str = DEFAULT_CKPT, device='cpu') -> Dict:
             'hidden': ck['hidden'], 'layers': ck['layers'], 'attention': ck['attention'],
             'n_heads': n_heads, 'max_spd': max_spd,
             'node_dim': node_dim, 'edge_dim': edge_dim, 'device': device,
+            'stereo_features': stereo,
             'ckpt_path': os.path.abspath(ckpt_path), 'sha256': _fingerprint(ckpt_path)}
 
 
@@ -162,13 +166,14 @@ def embed(bundle: Dict, smiles: str, perm: Optional[np.ndarray] = None,
     assertion is the only thing standing between a reordering upstream and a silently
     mis-conditioned policy.
     """
-    s = _features(smiles, bundle['cfg']['encoding'], bundle['k'])
+    s = _features(smiles, bundle['cfg']['encoding'], bundle['k'],
+                  bundle.get('stereo_features', 1))
     b = _batch([s], bundle['device'], bundle['cfg']['spd'], bundle['dtype'])
     with torch.no_grad():
         x = torch.cat([b['x'], b['struct']], dim=-1)
         h, g = bundle['encoder'](x, b['edge_index'], b['edge_attr'],
                                  b['batch'], b['n_graphs'], spd=b.get('spd'))
-    z_enc = np.asarray(graph_from_smiles(smiles)[0]).astype(int)
+    z_enc = np.asarray(graph_from_smiles(smiles)[0]).astype(int)   # z: the same at every level
     if perm is not None:
         perm = np.asarray(perm).astype(int)
         if perm.shape[0] != s.n:

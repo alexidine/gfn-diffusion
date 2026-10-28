@@ -47,7 +47,7 @@ import profiling
 import wandb
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference
+from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
     DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, \
@@ -55,6 +55,8 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
+from energy_sampling import prior_scan_cache
+from energy_sampling import noised_prior
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
     ROLLOUT_CONDITION_DRAWS
@@ -68,6 +70,8 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj)
 from models import GFN
+from models.nf_policy import build_policy
+from models.crystal_force import CrystalDriftForce, TrunkForce
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
     resolve_dead_rows, verify_dead_rows, describe as describe_dead_rows)
@@ -358,6 +362,27 @@ def row_dof_count(sample_batch, n_rows: int, n_dof) -> torch.Tensor:
         raise RuntimeError(f'state_mask has {mask.numel()} entries, which does not tile '
                            f'{n_rows} rows; the eval batch and the scored rows disagree')
     return mask.reshape(int(n_rows), -1).bool().sum(-1).long()
+
+
+def energy_function_kwargs(args, device):
+    """MolecularCrystal's constructor arguments for a run config: the trainer's, and an offline builder's that must
+    score rows exactly as the trainer would (data_processing/build_noised_prior.py)."""
+    energy_config = {
+        'device': device,
+        'energy_function': args.energy_function,
+        'mlip_path': args.mlip_path,
+        'space_groups': args.space_groups,
+        'z_primes': args.z_primes,
+        'sg_conditioning': args.sg_conditioning,
+        'temperature_conditioning': args.temperature_conditioning,
+        'zp_conditioning': args.zp_conditioning,
+        'vector_conditioning': getattr(args, 'vector_conditioning', False),
+        'vector_conditioning_dim': getattr(args, 'vector_conditioning_dim', None),
+        'embedding_conditioning': getattr(args, 'embedding_conditioning', False),
+        'embedding_conditioning_dim': getattr(args, 'embedding_conditioning_dim', None),
+    }
+    energy_config.update(args.energy_config.__dict__)
+    return energy_config
 
 
 class Modeller:
@@ -668,10 +693,14 @@ class Modeller:
         ``x_fn`` lives here because it IS the data model: how the GFN state is
         read off a stored graph. None = latent_params() with its crystal
         gauge-fix; toy routes read gauge-FREE (every latent dim is real there --
-        the fix for P1's delta-pinned u,v,w targets, 2026-08-24).
+        the fix for P1's delta-pinned u,v,w targets, 2026-08-24). On
+        crystal_coordinates 'fd' it is the row's FD chart point (_buffer_state), so
+        every buffer's x -- wass, the eval figures, anchor distances and the anchor
+        refresh -- is in the policy's chart.
         """
         return dict(max_z_prime=max(self.args.z_primes),
-                    x_fn=None if self.energy_function.is_crystal else toy_latent_params)
+                    x_fn=(self._buffer_state if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
+                          else None if self.energy_function.is_crystal else toy_latent_params))
 
     def _eval_extra_stats(self, mol_batch):
         """Per-sample columns the eval accumulator should carry beyond the TB family.
@@ -802,6 +831,13 @@ class Modeller:
         translation gauge, held dead in the SDE); toys must NOT (every dim is
         real there -- the P1 delta-target fix, 2026-08-24).
         """
+        if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd':
+            # energy_config.crystal_coordinates 'fd': the state is crystal_fd's chart row s, not the latent; a stored
+            # row carries it once computed (_attach_fd_reference), a fresh one is canonicalised here
+            state = getattr(batch, 'fd_state', None)
+            if state is not None:
+                return state.reshape(int(batch.num_graphs), -1).to(batch.cell_lengths.device)
+            return self.energy_function.fd_rows_of(batch).to(batch.cell_lengths.device)
         return batch.latent_params(
             gauge_fix_free_axes=self.energy_function.is_crystal)
 
@@ -2287,22 +2323,7 @@ class Modeller:
         return conditions_dim
 
     def init_energy_function(self):
-        energy_config = {
-            'device': self.device,
-            'energy_function': self.args.energy_function,
-            'mlip_path': self.args.mlip_path,
-            'space_groups': self.args.space_groups,
-            'z_primes': self.args.z_primes,
-            'sg_conditioning': self.args.sg_conditioning,
-            'temperature_conditioning': self.args.temperature_conditioning,
-            'zp_conditioning': self.args.zp_conditioning,
-            'vector_conditioning': getattr(self.args, 'vector_conditioning', False),
-            'vector_conditioning_dim': getattr(self.args, 'vector_conditioning_dim', None),
-            'embedding_conditioning': getattr(self.args, 'embedding_conditioning', False),
-            'embedding_conditioning_dim': getattr(self.args, 'embedding_conditioning_dim', None),
-        }
-        energy_config.update(self.args.energy_config.__dict__)
-        self.energy_function = MolecularCrystal(**energy_config)
+        self.energy_function = MolecularCrystal(**energy_function_kwargs(self.args, self.device))
         # ONE ATTACHMENT POINT, and nothing else in the trainer changes. The
         # region timer lives on the energy function because log_reward is the
         # single funnel every energy evaluation goes through, so instrumenting
@@ -3215,8 +3236,30 @@ class Modeller:
             print(f"WARNING: dead-row probe could not run ({type(e).__name__}: {e}); "
                   f"the tabulated rows for SG{sg} are UNVERIFIED this run")
 
+    def _state_features_dim(self):
+        """Width of the per-state features the sampler reads (GFN's state_features_dim): with
+        model.state_atoms > 0, that many atoms of what the drift_force.checkpoint trunk describes
+        an atom by, plus its element and a flag. 0 without."""
+        atoms = int(getattr(self.args.model, 'state_atoms', 0) or 0)
+        if atoms <= 0:
+            return 0
+        cfg = getattr(self.args, 'drift_force', None)
+        checkpoint = None if cfg is None else vars(cfg).get('checkpoint')
+        if checkpoint is None:
+            raise ValueError("model.state_atoms asks for per-atom state features, and drift_force.checkpoint "
+                             "names no trunk to compute them")
+        return atoms * (TrunkForce.atom_feature_dim(checkpoint) + 2)
+
     def _build_gfn_config(self):
+        fd = getattr(self.energy_function, 'fd_layout', None)
+        if fd is not None:  # energy_config.crystal_coordinates 'fd': the chart's width and circle rows, no dead rows
+            return dict(self._build_latent_gfn_config(), dim=fd.dim, angular_mask=list(fd.wrap_mask),
+                        periodic_centroid_axes=None, dead_latent_rows=None)
+        return self._build_latent_gfn_config()
+
+    def _build_latent_gfn_config(self):
         return dict(
+            state_features_dim=self._state_features_dim(),
             dim=self.energy_function.data_ndim,
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
@@ -3234,7 +3277,51 @@ class Modeller:
             max_z_prime=max(self.args.z_primes),
             do_periodic_angles=self.energy_function.is_crystal,
             **vars(self.args.model),
-        )
+        ) | self._policy_entry()
+
+    def _policy_entry(self):
+        """gfn_config's `policy` entry: {} for the SDE policy (model.kind sde, or no kind), so its gfn_config,
+        checkpoints and problem hashes are unchanged; else the kind, the NF's settings (model.nf, resolved to
+        args.policy.nf by the loader) and the run's seed, which models/nf_policy.py::build_policy reads."""
+        pol = getattr(self.args, 'policy', None)
+        kind = getattr(pol, 'kind', 'sde') if pol is not None else 'sde'
+        if kind == 'sde':
+            return {}
+        nf = getattr(pol, 'nf', None)
+        nf = dict(vars(nf)) if nf is not None and not isinstance(nf, dict) else dict(nf or {})
+        return {'policy': {'kind': kind, 'nf': nf, 'seed': int(self.args.seed)}}
+
+    def gfn_from_config(self, config):
+        """The policy a gfn_config describes (Checkpointer._build_gfn's seam): models/nf_policy.py::build_policy."""
+        return build_policy(config)
+
+    @torch.no_grad()
+    def fit_policy_data_scalers(self, chunk: int = 65536):
+        """A policy fitted to data before training (models/nf_policy.py::NFPolicy.fit_data_scalers: the flow's
+        standardisers) gets the prior's latents and, in vector conditioning, the conditions files' condition vectors;
+        the train and EMA models alike. Skipped for a policy without the hook (the SDE policy) and for one restored
+        already fitted from a checkpoint."""
+        fit = getattr(self.gfn_model, 'fit_data_scalers', None)
+        if fit is None or bool(getattr(self.gfn_model, 'scalers_fitted', False)):
+            return
+        batch = self.prior_dataset.batch
+        lat = []
+        for i in range(0, batch.num_graphs, chunk):
+            sub = batch.subsample_new_batch(torch.arange(i, min(i + chunk, batch.num_graphs), device=batch.ptr.device))
+            lat.append(self._batch_latents(sub).float().cpu())
+        lat = torch.cat(lat)
+        conds = None
+        if self.gfn_model.conditional and self.gfn_model.conditions_type == 'vector':
+            mb = self.mol_dataset.batch
+            cs = []
+            for i in range(0, mb.num_graphs, chunk):
+                sub = mb.subsample_new_batch(torch.arange(i, min(i + chunk, mb.num_graphs), device=mb.ptr.device))
+                cs.append(self.energy_function.condition_samples(sub)[2].float().cpu())
+            conds = torch.cat(cs)
+        for model in (self.gfn_model, self.ema_model):
+            model.fit_data_scalers(lat, conds)
+        print(f"policy data scalers fitted on {lat.shape[0]} prior rows"
+              + (f" and {conds.shape[0]} condition vectors" if conds is not None else ""), flush=True)
 
     def set_pb_freeze(self, mode, source_state=None):
         """
@@ -3264,6 +3351,10 @@ class Modeller:
         mode = {True: 'full', False: None}.get(mode, mode)
         if mode not in (None, 'head', 'full'):
             raise ValueError(f"freeze_backward_policy must be false, 'head' or 'full'/true, got {mode!r}")
+        if not any(True for _ in self.gfn_model.backward_policy.parameters()):
+            # a policy whose P_B is fixed by construction (models/nf_policy.py: log P_B = 0) has nothing to freeze
+            print(f"freeze_backward_policy={mode}: this policy has no learned P_B -- nothing to freeze")
+            return
         models = (self.gfn_model, self.ema_model)
         if mode is None:
             for model in models:
@@ -3293,6 +3384,138 @@ class Modeller:
                   f"of t_model+s_model+backward_policy ({src}); the live trunk trains P_F only")
         self.ema_model.install_pb_snapshot(frozen)
 
+    DRIFT_FORCE_KEYS = ('checkpoint', 'chunk', 'max_images', 'max_pairs', 'max_pairs_per_call', 'partial')
+
+    def _build_drift_force(self):
+        """The provider behind the model's force terms (model.force_drift_fwd / force_drift_bwd)
+        and its state features (model.state_atoms): the trunk named by drift_force.checkpoint,
+        with this run's energy function building the crystals it reads. None when the model has
+        neither.
+
+        Refused: a force term or state features without a checkpoint; a route the trunk does not
+        cover (not eLJ, Z' > 1, a conditioned temperature); in TrunkForce.check_energy, a run whose
+        temperature or lj_coeff is not the one the trunk was fitted at; a trunk whose fitting run
+        has not finished, unless drift_force.partial; and state features of another width than
+        the model was built for.
+        """
+        cfg = getattr(self.args, 'drift_force', None)
+        cfg = {} if cfg is None else dict(vars(cfg))
+        unknown = sorted(set(cfg) - set(self.DRIFT_FORCE_KEYS))
+        if unknown:
+            raise ValueError(f"drift_force: unknown keys {unknown}; it reads {list(self.DRIFT_FORCE_KEYS)}")
+        checkpoint = cfg.get('checkpoint')
+        if not (self.gfn_model.force_on or self.gfn_model.features_on):
+            if checkpoint is not None:
+                print(f"drift_force.checkpoint is set ({checkpoint}) but the model has no force term "
+                      f"(model.force_drift_fwd and model.force_drift_bwd are null) and reads no state "
+                      f"features (model.state_atoms): the trunk is not loaded")
+            return None
+        if checkpoint is None:
+            raise ValueError("model.force_drift_fwd / model.force_drift_bwd / model.state_atoms ask for a trunk, "
+                             "and drift_force.checkpoint names none")
+        if self.args.energy_function != 'elj' or max(self.args.z_primes) != 1 or self.args.temperature_conditioning:
+            raise ValueError(
+                f"the force term reads a trunk fitted to the eLJ energy of Z' = 1 crystals at one temperature; "
+                f"this run has energy_function {self.args.energy_function!r}, z_primes {list(self.args.z_primes)}, "
+                f"temperature_conditioning {self.args.temperature_conditioning}")
+        # an absent key takes TrunkForce's own default: the bound is on whether or not a config names it
+        m = self.gfn_model
+        trunk = TrunkForce(checkpoint, self.device, max_atoms=m.state_atoms,
+                           **{k: int(cfg[k]) for k in self.DRIFT_FORCE_KEYS[1:-1] if cfg.get(k) is not None})
+        trunk.check_energy(self.energy_function.temperature, self.energy_function.lj_coeff)
+        if not trunk.finished and not cfg.get('partial'):
+            # the fitting script writes its checkpoint at every evaluation: the file exists from the first one
+            raise ValueError(f"the trunk {checkpoint} is at step {trunk.step} of {trunk.planned_steps}: its fitting "
+                             f"run has not finished (drift_force.partial: true reads it anyway)")
+        if m.force_input_on:
+            print(f"force input: the state encoder is given the force on the state from the trunk {checkpoint} "
+                  f"(over the trunk's per-row scale, bounded, with its log magnitude: {m.force_input_dim} numbers), "
+                  f"for states from t = {m.force_drift_t_min:g} on; the trunk is frozen")
+        if m.features_on and trunk.features_dim != m.state_features_dim:
+            raise ValueError(f"the model was built for state features of width {m.state_features_dim}; the "
+                             f"trunk {checkpoint} hands out {trunk.features_dim} "
+                             f"({m.state_atoms} atoms of {trunk.atom_dim} + 2)")
+        if m.state_features_dim > 0:
+            print(f"state features: {m.state_atoms} atoms of {trunk.atom_dim} features from the "
+                  f"{'stacked ' if trunk.stacked else ''}trunk {checkpoint}, read by the state encoder at every "
+                  f"state of every trajectory; the trunk is frozen"
+                  + (f"; a state before t = {m.state_crystal_t_min:g} is described by its molecule alone "
+                     f"({trunk.crystal_dim} trunk-state columns and the energy zero, no crystal built)"
+                     if m.state_crystal_t_min > 0 else "")
+                  + (f"; a state before t = {m.state_atoms_t_min:g} is given no atoms and the trunk is not "
+                     f"called for it" if m.state_atoms_t_min > 0 else ""))
+        if not m.force_on:
+            return CrystalDriftForce(trunk, self.energy_function)
+        print(f"force term: trunk {checkpoint} (step {trunk.step}, {trunk.cutoff:g} A features, fitted at kT = "
+              f"{trunk.temperature:g}, lj_coeff {trunk.lj_coeff:g}); P_F gate starts at {m.force_drift_fwd}, "
+              f"P_B gate at {m.force_drift_bwd}, {'learned' if m.force_drift_learned else 'held fixed'}; cap "
+              f"{m.force_drift_max_sigma} noise std per step; acting from t = {m.force_drift_t_min:g}; at most "
+              f"{trunk.max_images} images and {trunk.max_pairs} pairs a crystal, {trunk.max_pairs_per_call} pairs a "
+              f"trunk call")
+        return CrystalDriftForce(trunk, self.energy_function)
+
+    @torch.no_grad()
+    def provider_counts(self, model):
+        """The trunk provider's running totals since start-up, for the eval log: states it was called
+        on, of those the states described by the molecule alone (model.state_crystal_t_min), states
+        whose image or pair list hit a cap, trunk calls split for memory, and rows whose force or
+        features came back non-finite. Logged for a force term and for state features alike."""
+        trunk = self.drift_force.trunk_force
+        return {'force/nonfinite_rows': float(model.force_nonfinite_rows()),
+                'force/trunk_states': float(trunk.rows),
+                'force/molecule_only_states': float(trunk.molecule_rows),
+                'force/capped_states': float(trunk.capped_rows),
+                'force/extra_trunk_calls': float(trunk.extra_calls)}
+
+    def force_agreement_stats(self, model, states, mol_batch, discretizer, max_rows: int = 256):
+        """The force model against its own target on rollout states, for the eval log.
+
+        `states` [B, T + 1, dim] are one eval batch's forward trajectories and `mol_batch` the
+        molecules they were rolled out for. At three times inside the force window (its first
+        state, its middle one and the last state a step leaves from), on up to `max_rows` rows:
+        the cosine between the trunk's force and its exact target (TrunkForce.target_force), the
+        target and the trunk's error as the displacement of one full-strength force step in that
+        step's noise standard deviations (TrunkForce.agreement), and the mean gate at that time.
+        'force/agreement_failed' is 0 when this ran and 1 when it raised, so a missing
+        measurement is never read as a good one.
+        """
+        stats = {'force/agreement_failed': 1.0}
+        try:
+            trunk = self.drift_force.trunk_force
+            rows = min(int(max_rows), mol_batch.num_graphs)
+            sub = mol_batch.subsample_new_batch(torch.arange(rows, device=mol_batch.device))
+            ctx = self.drift_force.context(sub)
+            ts = discretizer(1).to(self.device)[0]
+            T = ts.numel() - 1
+            window = [j for j in range(T) if float(ts[j]) >= model.force_drift_t_min]
+            picks = sorted({window[0], window[len(window) // 2], T - 1})
+            gate_f, gate_b = model.force_gate_values(ts[picks])
+            for n, j in enumerate(picks):
+                step_variance = float(model.accum_var(ts[j + 1:j + 2]) - model.accum_var(ts[j:j + 1]))
+                res = trunk.agreement(states[:rows, j].to(self.device), ctx, step_variance)
+                tag = f't{float(ts[j]):.2f}'
+                for k, v in res.items():
+                    stats[f'force/{k}_{tag}'] = v
+                if gate_f is not None:
+                    stats[f'force/gate_fwd_mean_{tag}'] = float(model._mean_over_live(gate_f[n:n + 1]))
+                    stats[f'force/gate_fwd_absmax_{tag}'] = float(gate_f[n].abs().max())
+                if gate_b is not None:
+                    stats[f'force/gate_bwd_mean_{tag}'] = float(model._mean_over_live(gate_b[n:n + 1]))
+            stats.update(self.provider_counts(model))
+            stats['force/agreement_failed'] = 0.0
+            tags = [f't{float(ts[j]):.2f}' for j in picks]
+            print(f"force model on {rows} rollout states per time (cosine with its target | error and target step, "
+                  f"noise std" + (" | mean P_F gate" if gate_f is not None else "") + "): " + "; ".join(
+                      f"{tag[1:]}: {stats[f'force/cosine_{tag}']:.4f} | {stats[f'force/err_sigma_{tag}']:.3f} of "
+                      f"{stats[f'force/target_sigma_{tag}']:.2f}"
+                      + (f" | {stats[f'force/gate_fwd_mean_{tag}']:+.5f}" if gate_f is not None else "")
+                      for tag in tags)
+                  + f". Capped so far: {trunk.capped_rows} of {trunk.rows} states; left out of this check for a cap: "
+                  + ", ".join(str(int(stats[f'force/capped_{tag}'])) for tag in tags))
+        except Exception as e:  # a diagnostic must not end a run; the flag above says it did not report
+            print(f"force_agreement_stats failed ({type(e).__name__}: {e}); logged as force/agreement_failed = 1")
+        return stats
+
     def init_gfn(self):
         reload = False
 
@@ -3319,14 +3542,19 @@ class Modeller:
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
-            self.gfn_model = GFN(**self.gfn_config).to(self.device)
+            self.gfn_model = build_policy(self.gfn_config).to(self.device)
             self.ema_model = deepcopy(self.gfn_model)
             self.init_schedulers_optimizers()
+
+        # the force provider of the kernels' force terms (None without one): runtime state
+        # like the flags below, installed on both models on every build and reload path
+        self.drift_force = self._build_drift_force()
 
         # runtime flag like compile_policy, set on both fresh-build and reload
         # paths; deliberately not part of gfn_config (checkpoints/problem
         # hashing unaffected)
         for model in (self.gfn_model, self.ema_model):
+            model.install_drift_force(self.drift_force)
             model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
             # WHICH BRANCHES checkpoint. Absent/empty = all of them, unchanged.
             # Only fwd shares a step with the energy function's footprint, and it
@@ -3710,11 +3938,210 @@ class Modeller:
                   f"the flag there too, so each such unit is read as its +1 description of the "
                   f"stored atoms (see _refuse_mirrored_rows).", flush=True)
 
+    def _score_prior_rows(self, prior, announce=True):
+        """(energy [n], analysed batch) of a prior batch through the run's energy function: the init-time pass
+        over prior_path, and (announce False) the row check of a cached pass (cfg:prior_scan_cache)."""
+        if announce:
+            print("Re-analyzing prior energies")
+        prior = prior.to(self.device)
+        # NO_GRAD, explicitly. keep_grads defaults False but that only DETACHES
+        # the output -- it does not stop the graph being built, and fairchem's
+        # _run_inference uses nullcontext (not no_grad) whenever direct_forces is
+        # False, which is what this predictor sets. So without this the whole
+        # ~176k-row scoring pass built an autograd graph nothing ever
+        # differentiates, holding activations for the entire scan. That is the
+        # pass whose MLIP chunk size collapsed to 144 on the uma arm.
+        with torch.no_grad():
+            energy, prior = self.energy_function.batched_analyze_crystal_batch(
+                self._batch_latents(prior),
+                prior,
+                self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
+                                                                 device=self.device),
+                return_batch=True,
+                internal_oom_recovery=True,
+                # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
+            )
+        return energy, prior
+
+    def _prior_scan_from_cache(self, prior):
+        """(energy, analysed batch) from the scan cache of prior_path, or None when there is none, its identity
+        differs, or a re-score of prior_scan_cache.CHECK_ROWS rows of `prior` disagrees with it (the caller then
+        scores every row and rewrites the cache). `prior` is the batch as loaded, before any scoring."""
+        identity = prior_scan_cache.scan_identity(self.args, prior.num_graphs,
+                                                  getattr(self.energy_function, 'lj_coeff', None))
+        path = prior_scan_cache.cache_path(self.args.prior_path, identity)
+        hit = prior_scan_cache.load(path, identity)
+        if hit is None:
+            return None
+        energy, batch = hit
+        if int(batch.num_graphs) != int(prior.num_graphs) or int(energy.numel()) != int(prior.num_graphs):
+            print(f"prior scan cache: {path} holds {int(batch.num_graphs)} rows, the prior {int(prior.num_graphs)}; "
+                  f"scoring the prior again")
+            return None
+        idx = prior_scan_cache.check_rows(prior.num_graphs)
+        fresh, _ = self._score_prior_rows(prior.subsample_new_batch(idx), announce=False)
+        ok, frac, med, mx = prior_scan_cache.agrees(energy.flatten()[idx], fresh)
+        print(f"prior scan cache: {path}: {len(idx)} rows re-scored, {100 * frac:.2f}% differ by more than "
+              f"{prior_scan_cache.ENERGY_TOL} (median |d| {med:.4g}, max {mx:.4g}) -> "
+              f"{'using the cache' if ok else 'STALE, scoring the prior again'}")
+        if not ok:
+            return None
+        # energy_config.implausible_energy_below is not in the cache identity (prior_scan_cache.SCREEN_KEYS): the
+        # cached pass and a screened one give the same rows unless a row's physical energy is under the floor, which
+        # the cached batch itself answers. A cache that cannot answer (no mol_energy on its rows) is not used.
+        floor = getattr(self.energy_function, 'implausible_energy_below', None)
+        if floor is not None:
+            mol_energy = getattr(batch, 'mol_energy', None)
+            n_under = None if mol_energy is None else int((torch.as_tensor(mol_energy).flatten() < floor).sum())
+            if n_under is None or n_under > 0:
+                print(f"prior scan cache: {path}: "
+                      + ("its rows carry no mol_energy" if n_under is None else
+                         f"{n_under} cached row(s) lie under energy_config.implausible_energy_below {floor:g}")
+                      + " -> scoring the prior again under the screen")
+                return None
+        strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
+        return energy.to(self.device), batch.to(self.device)
+
+    @torch.no_grad()
+    def _stored_reward_terms(self, batch, chunk: int = 8192):
+        """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
+        (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU."""
+        ef, T = self.energy_function, float(self.args.energy_config.temperature)
+        seed, log_r = [], []
+        for lo in range(0, int(batch.num_graphs), chunk):
+            sub = batch.subsample_new_batch(
+                torch.arange(lo, min(lo + chunk, int(batch.num_graphs)), device=batch.ptr.device)).to(self.device)
+            lr, ens = ef.prebuilt_sample_to_reward(sub, T, return_ens_dict=True)
+            seed.append(ef.seed_energy_from(ens).double().flatten().cpu())
+            log_r.append(lr.double().flatten().cpu())
+        return torch.cat(seed), torch.cat(log_r)
+
+    @torch.no_grad()
+    def _fd_chart_points(self, batch):
+        """crystal_coordinates 'fd': ([n] bool has a chart point, [n, data_ndim] chart rows s, zero where none, [n] log
+        reference density on s, zero where none) of the crystals of a stored batch, canonicalised through the chart of
+        each row's (space group, molecule radius)."""
+        ef = self.energy_function
+        params = batch.full_cell_parameters().detach().cpu()
+        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+        sg = batch.sg_ind.reshape(-1).cpu()
+        radius = batch.radius.reshape(-1).detach().cpu().double()
+        n = len(sg)
+        ok = torch.zeros(n, dtype=torch.bool)
+        log_ref = torch.zeros(n, dtype=torch.float32)
+        state = torch.zeros(n, int(ef.data_ndim), dtype=torch.float32)
+        for g in sorted(set(sg.tolist())):
+            for lo in range(0, n, 50000):   # one chart per space group and chunk, each row at its own radius
+                rows = torch.nonzero(sg == g).flatten()
+                rows = rows[(rows >= lo) & (rows < lo + 50000)]
+                if rows.numel() == 0:
+                    continue
+                fc = ef.fd_coordinates_rows(int(g), radius[rows])
+                r = fc.from_params(params[rows], hand[rows])
+                good = rows[r.ok]
+                ok[good] = True
+                state[good, :fc.dim] = r.s[r.ok].float()
+                if good.numel():
+                    _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
+                    log_ref[good] = lr.float()
+        return ok, state, log_ref
+
+    def _buffer_state(self, batch):
+        """A buffer's x on the FD chart (_buffer_kwargs): the row's chart point -- its cached fd_state (a stored prior
+        row, _attach_fd_reference; a generated crystal, MolecularCrystal.instantiate_crystals), else canonicalised
+        here, NaN for a crystal with no chart point (a conditions-file crystal outside the length box)."""
+        if 'fd_state' in batch.keys():
+            return batch.fd_state.reshape(int(batch.num_graphs), -1)
+        ok, state, _ = self._fd_chart_points(batch)
+        state[~ok] = float('nan')
+        return state
+
+    def _attach_fd_reference(self, batch):
+        """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
+        Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
+        row (`fd_state`, read by _batch_latents), attached as row attributes so they ride with every draw. Returns [n] bool: the rows that have an FD chart point (a row
+        that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
+        dropped; its reference is set to 0)."""
+        ok, state, log_ref = self._fd_chart_points(batch)
+        batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
+        # the chart rows themselves, which _batch_latents reads instead of canonicalising every draw again
+        batch.add_graph_attr(state.to(batch.ptr.device), 'fd_state')
+        return ok
+
+    def _load_noised_prior(self, prior, manifest):
+        """(energy [n], batch) of a pre-noised prior file (data_processing/build_noised_prior.py) without scoring it:
+        1. its identity (noised_prior.identity: the energy function, analysis settings, chart, eLJ coefficient) must
+           equal this run's, else it raises;
+        2. a stratified sample of cfg:noised_prior.check_rows rows is scored afresh and must match the stored terms
+           (noised_prior.compare_terms), else it raises;
+        3. the rows kept for training are the training split's rows of cfg:noised_prior.train_kinds inside the packing
+           window and within window_kT x T of their condition's floor (noised_prior.select_rows). The held-out anchor
+           groups and the clean training anchors under the same windows are kept apart as prior_heldout_batch and
+           prior_anchor_batch, read only by density_readouts.
+        energy is -T log R from the stored terms, the quantity _score_prior_rows returns."""
+        ef, T = self.energy_function, float(self.args.energy_config.temperature)
+        s = noised_prior.settings(self.args)
+        if int(manifest.get('format_version', -1)) != noised_prior.FORMAT_VERSION:
+            raise ValueError(f"pre-noised prior {self.args.prior_path}: format_version "
+                             f"{manifest.get('format_version')!r}, this code reads {noised_prior.FORMAT_VERSION}")
+        bad = noised_prior.identity_mismatch(manifest['identity'], noised_prior.identity(self.args, ef))
+        if bad:
+            raise ValueError(f"pre-noised prior {self.args.prior_path} was scored under another energy definition; "
+                             f"rebuild it for this run. Differences: " + '; '.join(bad))
+
+        fd_ok = None
+        if getattr(ef, 'crystal_coordinates', 'latent') == 'fd':
+            fd_ok = self._attach_fd_reference(prior)
+            print(f"pre-noised prior: FD chart points for {int(fd_ok.sum())} of {fd_ok.numel()} rows "
+                  f"(rows without one are dropped)", flush=True)
+        idx = noised_prior.check_rows(prior, s['check_rows'], seed=int(self.args.seed))
+        if fd_ok is not None:
+            idx = idx[fd_ok[torch.as_tensor(idx)].numpy()]
+        stored = prior.subsample_new_batch(torch.as_tensor(idx, device=prior.ptr.device))
+        _, fresh = self._score_prior_rows(stored, announce=False)
+        ratio, worst, per_term = noised_prior.compare_terms(stored, fresh, self.args.energy_function)
+        print(f"pre-noised prior: {len(idx)} rows re-scored (stratified by kind, split, space group, Z'); worst miss "
+              f"{worst:.3g} ({ratio:.2f} x the tolerance {noised_prior.ABS_TOL} + {noised_prior.REL_TOL} |x|); per "
+              f"term " + ', '.join(f"{k} {v:.3g}" for k, v in per_term.items()), flush=True)
+        if not ratio <= 1.0:
+            raise ValueError(f"pre-noised prior {self.args.prior_path}: a stored row does not re-score to its stored "
+                             f"terms (worst miss {worst:.3g}): the file is stale or was built by other code")
+
+        seed_e, log_r = self._stored_reward_terms(prior)
+        if fd_ok is not None:
+            log_r = torch.where(fd_ok, log_r, torch.full_like(log_r, float('nan')))
+        kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
+        packing = torch.as_tensor(prior.packing_coeff).reshape(-1).double().cpu()
+        groups = noised_prior.condition_groups(prior)
+        masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s)
+        keep = masks['train'] & torch.isfinite(log_r)
+        n_groups = int(groups.max()) + 1
+        kept_per = torch.bincount(groups[keep], minlength=n_groups)
+        dev = prior.ptr.device
+        pick = lambda m: prior.subsample_new_batch(torch.nonzero(m).flatten().to(dev)) if bool(m.any()) else None
+        self.prior_is_prenoised = True   # the prior buffer is these rows: _prior_is_static
+        self.prior_heldout_batch = pick(masks['heldout'] & torch.isfinite(log_r))
+        self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
+        print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
+              f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} at "
+              f"10^U({manifest.get('log_lo')}, {manifest.get('log_hi')})); training on {int(keep.sum())} rows of kinds "
+              f"{list(s['train_kinds'])} within {s['window_kT']} kT (T {T:g}) of their condition floor and packing "
+              f"{s['packing_window']}; held-out anchor-group rows {int(masks['heldout'].sum())}, clean training "
+              f"anchors {int(masks['anchors'].sum())}; conditions {n_groups}, with no training row "
+              f"{int((kept_per == 0).sum())}, rows per condition min {int(kept_per.min())} median "
+              f"{float(kept_per.float().median()):.0f} max {int(kept_per.max())}", flush=True)
+        if not bool(keep.any()):
+            raise ValueError("pre-noised prior: no row survives the load-time selection")
+        batch = prior.subsample_new_batch(torch.nonzero(keep).flatten().to(dev))
+        energy = (-log_r[keep] * T).float()
+        return energy.to(self.device), batch.to(self.device)
+
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
         prior = prior_data['equalized_prior']
         self._refuse_mirrored_rows(prior, self.args.prior_path, 'prior_path')
+        prior = self.subset_training_molecules(prior, 'prior_path')
         prior['smiles'] = None
         # identifier is NOT wiped (unlike smiles) -- init_identifiers() needs it
         # to build the mol_id registry, and since backward training draws
@@ -3764,26 +4191,27 @@ class Modeller:
                     f"temperature. Rebuild the prior with a unit factor, or run "
                     f"this prior on the elj route.")
             self.energy_function.lj_coeff = _tsf
+        # a pre-noised prior (data_processing/build_noised_prior.py) is read from its stored terms behind a sampled
+        # check, and filtered (_load_noised_prior); any other prior is scored here, as always
+        noised_manifest = prior_data.get(noised_prior.MANIFEST_KEY)
         if True:  # not hasattr(prior, self.args.energy_function):
-            print("Re-analyzing prior energies")
-            prior = prior.to(self.device)
-            # NO_GRAD, explicitly. keep_grads defaults False but that only DETACHES
-            # the output -- it does not stop the graph being built, and fairchem's
-            # _run_inference uses nullcontext (not no_grad) whenever direct_forces is
-            # False, which is what this predictor sets. So without this the whole
-            # ~176k-row scoring pass built an autograd graph nothing ever
-            # differentiates, holding activations for the entire scan. That is the
-            # pass whose MLIP chunk size collapsed to 144 on the uma arm.
-            with torch.no_grad():
-                energy, prior = self.energy_function.batched_analyze_crystal_batch(
-                    self._batch_latents(prior),
-                    prior,
-                    self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
-                                                                     device=self.device),
-                    return_batch=True,
-                    internal_oom_recovery=True,
-                    # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
-                )
+            # cfg:prior_scan_cache -- reuse an earlier launch's pass when its identity matches and a
+            # sample of rows re-scores to the cached energies (prior_scan_cache.py); otherwise score
+            # every row, as always, and write the cache for the next launch.
+            use_scan_cache = bool(getattr(self.args, 'prior_scan_cache', False)) and noised_manifest is None
+            cached_scan = self._prior_scan_from_cache(prior) if use_scan_cache else None
+            if noised_manifest is not None:
+                energy, prior = self._load_noised_prior(prior, noised_manifest)
+            elif cached_scan is not None:
+                energy, prior = cached_scan
+            else:
+                energy, prior = self._score_prior_rows(prior)
+                if use_scan_cache:
+                    identity = prior_scan_cache.scan_identity(self.args, prior.num_graphs,
+                                                              getattr(self.energy_function, 'lj_coeff', None))
+                    path = prior_scan_cache.cache_path(self.args.prior_path, identity)
+                    if prior_scan_cache.save(path, identity, energy, prior):
+                        print(f"prior scan cache: wrote {path}")
 
             # ARM THE SOFT ENERGY CLIP, from the distribution just measured.
             # `set_reward_clip` has had ZERO callers since it was written, so
@@ -3909,7 +4337,7 @@ class Modeller:
             # its device arg internally at sampling time, so override it or a
             # cross-device load breaks past .to()
             gfn_config = {**checkpoint['gfn_config'], 'device': self.device}
-            self.prior_model = GFN(**gfn_config).to(self.device)
+            self.prior_model = build_policy(gfn_config).to(self.device)   # either policy kind
             self.prior_model.load_state_dict(checkpoint['model_eval'])
             self.prior_model.eval()
             # sample this reused prior at ITS OWN training T, not the consumer's
@@ -3936,10 +4364,15 @@ class Modeller:
                     return value
         return data
 
+    def subset_training_molecules(self, batch, what):
+        """The rows of a training-molecule file (`what`: 'molecules_path' or 'prior_path') this run keeps: every row
+        here. inn_modeller.py's --molecule_fraction keeps a nested subset of the molecules, from both files alike."""
+        return batch
+
     def init_mol_dataset(self):
         mols = self._load_condition_file(self.args.molecules_path)
         self._refuse_mirrored_rows(mols, self.args.molecules_path, 'molecules_path')
-        self.mol_dataset = CrystalBuffer(mols,
+        self.mol_dataset = CrystalBuffer(self.subset_training_molecules(mols, 'molecules_path'),
                                          device=self.buffer_device,
                                          **self._buffer_kwargs(),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
@@ -3980,22 +4413,48 @@ class Modeller:
         datasets = [self.mol_dataset, self.prior_dataset]
         if self.test_mol_dataset is not None:
             datasets.append(self.test_mol_dataset)
+        batches = [d.batch for d in datasets]
+        # a pre-noised prior's held-out anchor groups and clean anchors (_load_noised_prior), read by density_readouts
+        batches += [b for b in (getattr(self, 'prior_heldout_batch', None), getattr(self, 'prior_anchor_batch', None))
+                    if b is not None]
 
         identifiers = set()
-        for dataset in datasets:
-            if hasattr(dataset.batch, 'identifier'):
-                identifiers.update(dataset.batch.identifier)
+        for batch in batches:
+            if hasattr(batch, 'identifier'):
+                identifiers.update(batch.identifier)
 
         self.identifier_registry = {ident: i for i, ident in enumerate(sorted(identifiers))}
 
-        for dataset in datasets:
-            if hasattr(dataset.batch, 'identifier'):
+        for batch in batches:
+            if hasattr(batch, 'identifier'):
                 mol_id = torch.tensor(
-                    [self.identifier_registry[ident] for ident in dataset.batch.identifier],
-                    dtype=torch.long, device=dataset.batch.device)  # match the (possibly GPU-resident) store
-                dataset.batch.add_graph_attr(mol_id, 'mol_id')
+                    [self.identifier_registry[ident] for ident in batch.identifier],
+                    dtype=torch.long, device=batch.device)  # match the (possibly GPU-resident) store
+                batch.add_graph_attr(mol_id, 'mol_id')
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
+
+    def publish_data_set_sizes(self, **extra):
+        """The sizes of the run's data sets, measured after init_identifiers, into the wandb run config under data/
+        when a run is open (printed always): train_molecules and test_molecules (distinct identifiers in molecules_path
+        and test_molecules_path; 0 for no test file, or a batch without identifiers), prior_rows and prior_molecules
+        (prior_dataset as loaded), molecules (the identifier registry: the union of the three) and
+        condition_library_size (the energy function's). extra: a trainer's own data/ keys. Returns the dict."""
+        def molecules(ds):
+            b = getattr(ds, 'batch', None)
+            return len(set(b.identifier)) if b is not None and hasattr(b, 'identifier') else 0
+
+        sizes = {'data/train_molecules': molecules(self.mol_dataset),
+                 'data/test_molecules': molecules(getattr(self, 'test_mol_dataset', None)),
+                 'data/prior_rows': int(self.prior_dataset.batch.num_graphs),
+                 'data/prior_molecules': molecules(self.prior_dataset),
+                 'data/molecules': len(self.identifier_registry),
+                 'data/condition_library_size': int(self.energy_function.condition_library_size),
+                 **extra}
+        print('data sets: ' + ', '.join(f'{k[5:]} {v:,}' for k, v in sizes.items()), flush=True)
+        if wandb.run is not None:
+            wandb.config.update(sizes, allow_val_change=True)
+        return sizes
 
     def init_energy_reference(self):
         """
@@ -4109,8 +4568,11 @@ class Modeller:
             # holding the card and every later OOM is downstream of this line.
             self.vram_ledger('prior_dataset (MLIP scan)')
             self.init_identifiers()
+            if getattr(self.energy_function, 'is_crystal', False):  # not the conformer route, which inherits train()
+                self.publish_data_set_sizes()
             # before ANY buffer is seeded: every reward from here on is in the run's currency
             self.init_energy_reference()
+            self.fit_policy_data_scalers()   # a flow policy's standardisers; a no-op for the SDE policy
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
             # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
@@ -4417,6 +4879,7 @@ class Modeller:
                     # these bytes are frozen at zero write cost.
                     self.checkpointer.archive(self.step_ind)
 
+            self.flush_harvest()   # cfg:harvest: the rows still held in memory
             self.checkpointer.save('final', with_buffers=True)
             print("Finished Training!")
 
@@ -7418,8 +7881,11 @@ class Modeller:
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
         mol_batch = mol_batch.to(self.device)
+        # a stored row keeps its own space group and Z': its energy terms were scored on them, so neither is
+        # resampled (condition_samples draws both at random when not handed them)
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            mol_batch, repeats=repeats)
+            mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
+            z_primes=mol_batch.z_prime.reshape(-1).long())
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
@@ -8190,6 +8656,8 @@ class Modeller:
         # a mostly-absent one.
         metrics.update({'pooled/%s' % k: v
                         for k, v in getattr(self, '_pooled_stats', {}).items()})
+        # the force model on this eval's rollout states (force_agreement_stats); empty without a force term
+        metrics.update(getattr(self, '_force_stats', {}))
 
         """Forward TB Stats"""
         log_r = fwd_stats['log_r']
@@ -8720,6 +9188,12 @@ class Modeller:
         metrics['Excess Energy Nats P99'] = q[2].item()
         metrics['Excess Energy Nats Max'] = u.max().item()
         metrics['Excess Energy Nats'] = arr(torch.log10(1.0 + u))  # log10 hist: u is non-negative and heavy-tailed
+        # the same u per degree of freedom of the row's own molecule (row_dof_count):
+        # equipartition puts the thermal mean at 1/2 whatever the molecule's size
+        k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
+        u_dof = u / k_row.to(u.dtype).clamp_min(1.0)
+        metrics['Excess Energy Nats Per DoF Mean'] = u_dof.mean().item()
+        metrics['Excess Energy Nats Per DoF P50'] = u_dof.median().item()
 
         # the bar itself, emitted only when it moves: a reading in nats is
         # uninterpretable later without the threshold it was scored against
@@ -8732,7 +9206,6 @@ class Modeller:
         if p_eq is None or float(p_eq) <= 0:
             return
         window = getattr(self.args, 'nonthermal_basin_window_kT', 10.0)
-        k_row = row_dof_count(sample_batch, int(seen.numel()), n_dof)[seen]
         u_star_row = equipartition_bar(k_row, float(p_eq),
                                        0.0 if window is None else float(window)).to(u.dtype)
         hot_eq = u > u_star_row
@@ -8926,6 +9399,87 @@ class Modeller:
         metrics.update(new)
         return metrics
 
+    @torch.no_grad()
+    def density_readouts(self, n_rows: int = 4096, chunk: int = 1024):
+        """-log q of stored crystals under a policy with an exact density (policy.log_density; the NF), mean and P90
+        per set, under InnModeller's names so the two trainers' curves read alike:
+          eval_bwd/mle               the training rows (prior_dataset as loaded and filtered)
+          eval_bwd/mle_heldout_rows  a pre-noised prior's held-out anchor groups (training molecules, crystals never
+                                     trained on): their gap to eval_bwd/mle is memorisation within a molecule
+          eval_bwd/mle_anchors       a pre-noised prior's clean training anchors (its stage 1 trains on children)
+          eval_bwd/mle_mol_crystals  the molecules_path crystals (one per training molecule)
+          eval_test/mle              the test_molecules_path crystals (molecules never trained on)
+        Each set is read on the same up to n_rows rows at every eval (drawn once, seed + 3), through the backward
+        draw's own path (the stored latent, the condition built from the row's own space group and Z'). A policy
+        without an exact density reports nothing.
+        `<key>_ref` is the same -log q against the common reference measure, -log q + log rho, with log rho the
+        chart's log reference density (-jacobian_energy / T, the term the reward composes: compute_jacobian on the
+        latent chart, fd_log_reference on the FD chart).
+        ⚠ NOT YET COMPARABLE ACROSS CHARTS. compute_jacobian is the latent's reference density only up to a constant
+        per space group, and the latent box holds k images of each crystal where the FD chart holds one, so a latent
+        row's `_ref` sits log k - c(sg) above the FD measure (sg 2: k 4, c -1.355, so latent `_ref` - 2.742 is the
+        comparable number; MXtalTools tests/fd/test_gate8_latent.py pins both). Within one chart it ranks runs."""
+        policy = self.gfn_model
+        if not hasattr(policy, 'log_density'):
+            return {}
+        sets = {'eval_bwd/mle': self.prior_dataset.batch,
+                'eval_bwd/mle_heldout_rows': getattr(self, 'prior_heldout_batch', None),
+                'eval_bwd/mle_anchors': getattr(self, 'prior_anchor_batch', None),
+                'eval_bwd/mle_mol_crystals': self.mol_dataset.batch,
+                'eval_test/mle': getattr(getattr(self, 'test_mol_dataset', None), 'batch', None)}
+        if not hasattr(self, '_readout_rows'):
+            self._readout_rows = {}
+        was_training = policy.training
+        policy.eval()
+        out = {}
+        try:
+            for key, batch in sets.items():
+                if batch is None or int(batch.num_graphs) == 0:
+                    continue
+                if key not in self._readout_rows:
+                    g = torch.Generator().manual_seed(int(self.args.seed) + 3)
+                    n = int(batch.num_graphs)
+                    self._readout_rows[key] = torch.randperm(n, generator=g)[:min(n_rows, n)].sort().values
+                idx = self._readout_rows[key]
+                ef, T = self.energy_function, float(self.args.energy_config.temperature)
+                fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+                nll, log_ref = [], []
+                for i in range(0, idx.numel(), chunk):
+                    sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device)).to(self.device)
+                    if fd and not hasattr(sub, 'fd_state'):
+                        self._attach_fd_reference(sub)   # on this sub-batch only: a template must not carry it
+                    x = self._batch_latents(sub).to(self.device)
+                    if fd:
+                        log_ref.append(sub.fd_log_reference.reshape(-1).float().cpu())
+                    else:
+                        jac, _ = ef.compute_jacobian(sub, torch.full((int(sub.num_graphs),), T, device=self.device))
+                        log_ref.append((-jac / T).reshape(-1).float().cpu())
+                    sub, _, condition, _ = ef.condition_samples(
+                        sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
+                    nll.append(-policy.log_density(x, condition, sub).float().flatten().cpu())
+                nll, log_ref = torch.cat(nll), torch.cat(log_ref)
+                ok = torch.isfinite(nll)
+                if bool(ok.any()):
+                    out[key] = float(nll[ok].mean())
+                    out[f'{key}_p90'] = float(torch.quantile(nll[ok].double(), 0.9))
+                    ref = nll + log_ref
+                    ok_ref = torch.isfinite(ref)
+                    if bool(ok_ref.any()):
+                        out[f'{key}_ref'] = float(ref[ok_ref].mean())
+                out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
+        finally:
+            policy.train(was_training)
+        # the generalisation gaps (nats; one chart, so no reference term): held-out molecules against the training
+        # molecules' crystals (inn_modeller.py's eval_test/mle_gap), and held-out anchor groups against training rows
+        for gap, (a, b) in {'eval_test/mle_gap': ('eval_test/mle', 'eval_bwd/mle_mol_crystals'),
+                            'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle')}.items():
+            if a in out and b in out:
+                out[gap] = out[a] - out[b]
+        print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
+              + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
+                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref', '_gap'))), flush=True)
+        return out
+
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
         # close the TRAIN-phase VRAM window before eval allocates anything, so
@@ -8995,6 +9549,7 @@ class Modeller:
                 adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
 
+        metrics.update(self.density_readouts())
         metrics.update({
             'Batch Size': self.batch_size,
             # NO LONGER THE SAME NUMBER. Eval draws shrink independently of the
@@ -9078,6 +9633,7 @@ class Modeller:
             f'{prefix}_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
         }
         metrics.update(self.energy_stats(prefix, energy=buff.y))
+        metrics.update(self.excess_energy_stats(prefix, buff.y, self._buffer_y_baseline(buff)))
         valid_losses = buff.ema_loss[~torch.isnan(buff.ema_loss)].cpu().numpy()
         if len(valid_losses) > 0:
             metrics[f'{prefix}_loss_hist'] = safe_histogram(
@@ -9434,7 +9990,49 @@ class Modeller:
             f'{prefix}_energy_hist': safe_histogram(energy_np, num_bins=128),
         }
 
+    def _buffer_y_baseline(self, buff):
+        """Per-row baseline for `buff.y`, in y's own currency, or None.
+
+        None here: on the crystal route `y` is the raw backend term (`_buffer_y_fn`) and
+        nothing in that currency is held per condition. A route that holds one returns it
+        and `_buffer_core_stats` adds the `*_excess_energy` family.
+        """
+        return None
+
+    def excess_energy_stats(self, prefix, energy, baseline):
+        """`energy - baseline` per row: mean, median, min/max and histogram, in energy
+        units. {} when there is no baseline or no row has a finite one."""
+        if baseline is None:
+            return {}
+        excess = (torch.as_tensor(energy).detach().cpu().flatten().double()
+                  - torch.as_tensor(baseline).detach().cpu().flatten().double())
+        excess = excess[torch.isfinite(excess)].numpy()
+        if excess.size == 0:
+            return {}
+        return {
+            f'{prefix}_mean_excess_energy': float(np.mean(excess)),
+            f'{prefix}_median_excess_energy': float(np.median(excess)),
+            f'{prefix}_min_excess_energy': float(np.min(excess)),
+            f'{prefix}_max_excess_energy': float(np.max(excess)),
+            f'{prefix}_excess_energy_hist': safe_histogram(excess, num_bins=128),
+        }
+
+    def _prior_is_static(self, what: str) -> bool:
+        """True when prior_path is a pre-noised build (_load_noised_prior): its rows are the prior buffer's whole content,
+        built offline, so the in-run noising, churn, top-up and expiry of that buffer do not run (docs/design/
+        prior_dataset_build.md). `what` names the skipped call, printed once."""
+        if not getattr(self, 'prior_is_prenoised', False):
+            return False
+        seen = self.__dict__.setdefault('_static_prior_skips', set())
+        if what not in seen:
+            seen.add(what)
+            print(f"pre-noised prior: {what} skipped -- the prior buffer is the file's filtered rows, built offline",
+                  flush=True)
+        return True
+
     def manage_prior_buffer(self, sample_batch):
+        if hasattr(self, 'prior_buffer') and self._prior_is_static('manage_prior_buffer (admission, churn, expiry)'):
+            return
         if not hasattr(self, 'prior_buffer'):
             self.prior_buffer = self.buffer_cls(
                 sample_batch,
@@ -9746,6 +10344,7 @@ class Modeller:
     @torch.no_grad()
     def rebuild_prior_by_churn(self, target_size: Optional[int] = None):
         """
+        (A pre-noised prior skips this: _prior_is_static.)
         Stage action ('rebuild_prior_by_churn[:N]'): discard prior_buffer and
         refill it from zero by repeating the ordinary churn admission cycle
         (_prior_churn_cycle) until it holds target_size rows.
@@ -9781,6 +10380,8 @@ class Modeller:
         containing this transition reports the rebuild's own source mix rather
         than a steady-state rate.
         """
+        if self._prior_is_static('rebuild_prior_by_churn'):
+            return
         cfg = self.args.buffers.prior_buffer
         if target_size is None:
             target_size = int(cfg.max_size * getattr(cfg, 'init_fraction', 0.25))
@@ -9924,6 +10525,8 @@ class Modeller:
         exact counts (_stratified_anchor_draw) so an anchor floor is guaranteed
         per condition rather than merely expected -- `n` must equal its sum.
         """
+        if self._prior_is_static('top_up_prior_from_anchors'):
+            return
         cfg = self.args.buffers.anchor_buffer
 
         if purge_worst and self._prior_buffer_len() > 0:
@@ -10325,6 +10928,79 @@ class Modeller:
         self.gfn_model._force_stats = stats
         return legs.to(self.buffer_device)
 
+    @torch.no_grad()
+    def harvest_scored_rows(self, fwd_stats, sample_batch, origin):
+        """cfg:harvest: keep a scored rollout's rows for the next prior build (docs/design/prior_dataset_build.md, Saving
+        every scored state). Kept: rows with a finite reward whose TB residual |log P_F - log P_B - log R + log Z| is at
+        least min_abs_resid nats (owner 2026-10-27: low-error rows are dropped), and rows at or below their condition's
+        best known energy. A kept row is the scored crystal itself (its energy terms already attached, the form a prior
+        file holds), with harvest_step, harvest_origin and harvest_resid. Rows collect in memory and go to disk as
+        one shard of at most shard_rows rows (flush_harvest), written whole under a name unique to the process."""
+        cfg = getattr(self.args, 'harvest', None)
+        if cfg is None or not bool(getattr(cfg, 'enabled', False)):
+            return
+        log_r = fwd_stats['log_r'].detach().flatten()
+        log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
+        resid = ((fwd_stats['log_pf'] - fwd_stats['log_pb']) - (fwd_stats['log_r'] - log_z)).detach().flatten().cpu()
+        log_r = log_r.cpu()
+        cid = fwd_stats.get('condition_id')
+        floor = (self._condition_energy_floor(torch.as_tensor(cid).detach().cpu().long().flatten())
+                 if cid is not None else None)
+        keep = noised_prior.harvest_mask(resid, log_r, float(self.args.energy_config.temperature),
+                                         float(cfg.min_abs_resid), None if floor is None else floor.cpu().flatten())
+        idx = torch.nonzero(keep).flatten()
+        self.harvest_seen = getattr(self, 'harvest_seen', 0) + int(log_r.numel())
+        if idx.numel() == 0:
+            return
+        rows = noised_prior.strip_analysis_helpers(
+            sample_batch.subsample_new_batch(idx.to(sample_batch.ptr.device)).detach().cpu())
+        n = int(idx.numel())
+        # the molecule key a rebuild matches on: rollout batches drop `identifier`, so it is restored from the run's
+        # registry through mol_id (a run-local index, not stable across runs, so never stored alone)
+        ident = getattr(rows, 'identifier', None)
+        if ident is None or len(ident) != n or any(i is None for i in ident):
+            mol_id = getattr(rows, 'mol_id', None)
+            if mol_id is None and cid is not None:
+                ef = self.energy_function
+                mol_id = torch.as_tensor(cid).detach().cpu().long().flatten()[idx] // (ef.n_sg * ef.n_zp)
+            if mol_id is None:
+                raise RuntimeError("harvest: a scored row carries neither identifier nor mol_id")
+            by_id = {v: k for k, v in self.identifier_registry.items()}
+            rows.identifier = [by_id[int(m)] for m in torch.as_tensor(mol_id).reshape(-1).tolist()]
+        rows.add_graph_attr(torch.full((n,), int(self.step_ind), dtype=torch.long), 'harvest_step')
+        rows.add_graph_attr(torch.full((n,), int(origin), dtype=torch.long), 'harvest_origin')
+        rows.add_graph_attr(resid[idx].float(), 'harvest_resid')
+        if not hasattr(self, '_harvest_parts'):
+            self._harvest_parts, self._harvest_rows, self.harvest_kept = [], 0, 0
+        self._harvest_parts.append(rows)
+        self._harvest_rows += n
+        self.harvest_kept += n
+        if self._harvest_rows >= int(cfg.shard_rows):
+            self.flush_harvest()
+
+    def flush_harvest(self):
+        """Write the harvested rows held in memory as one shard: <dir or checkpoints_dir/harvest>/<run_name>_
+        <pid>_<first step>_<sequence>.pt, through a temporary name then a rename, so a shard on disk is always whole. Each
+        shard carries the run's noised_prior identity, so a rebuild can refuse rows scored another way."""
+        parts = getattr(self, '_harvest_parts', None)
+        if not parts:
+            return None
+        cfg = self.args.harvest
+        root = getattr(cfg, 'dir', None) or os.path.join(self.args.checkpoints_dir, 'harvest')
+        os.makedirs(root, exist_ok=True)
+        batch = merge_batches(parts)
+        first = int(torch.as_tensor(batch.harvest_step).min())
+        self._harvest_seq = getattr(self, '_harvest_seq', -1) + 1   # two shards can open on one step
+        path = os.path.join(root, f"{self.run_name}_{os.getpid()}_{first:08d}_{self._harvest_seq:04d}.pt")
+        torch.save({'rows': batch, 'identity': noised_prior.identity(self.args, self.energy_function),
+                    'run_name': self.run_name, 'temperature': float(self.args.energy_config.temperature)},
+                   path + '.partial')
+        os.replace(path + '.partial', path)
+        print(f"harvest: wrote {int(batch.num_graphs)} rows to {path} (kept {self.harvest_kept} of "
+              f"{self.harvest_seen} scored rows so far)", flush=True)
+        self._harvest_parts, self._harvest_rows = [], 0
+        return path
+
     def manage_replay_buffer(self, fwd_stats, sample_batch, on_policy: bool = True,
                              origin: int = ORIGIN_ROLLOUT):
         """
@@ -10391,6 +11067,8 @@ class Modeller:
         plus a batch. It is a label, read only by the composition metrics, and
         changes no admission or eviction decision.
         """
+        # cfg:harvest -- every scored rollout reaches this call, in every stage; the shard writer keeps its share
+        self.harvest_scored_rows(fwd_stats, sample_batch, origin)
         in_play = self.replay_in_play()
         if in_play is not self._replay_managed:
             # announced on every flip (both directions) so the transition print
@@ -11326,6 +12004,15 @@ class Modeller:
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
+
+            if side_effects and n_collected == 0 and getattr(self, 'drift_force', None) is not None:
+                # the first eval batch of the training conditions: read by log_metrics. The agreement
+                # check belongs to a force term; state features alone log the provider's counters
+                if self.gfn_model.force_on:
+                    self._force_stats = self.force_agreement_stats(
+                        model, out['flow_states'], mol_batch, eval_discretizer)
+                else:
+                    self._force_stats = self.provider_counts(model)
 
             sample_batch_i = out.pop('sample_batch')
             sample_batch_i = sample_batch_i.detach().cpu()

@@ -502,7 +502,10 @@ class Stage:
         # coeff_schedule: energy_config coefficients RAMPED on a step clock -- {name: {target, steps, kind}},
         # kind 'geometric' (default: multiply from the base config value to target) or 'linear' (add). The
         # anchor is the stage's first energy_coeffs() evaluation (stage_ctrl['coeff_sched_entry'], rides the
-        # checkpoint), progress p = min(1, elapsed / steps), so it terminates at target and holds. Any balance
+        # checkpoint), progress p = min(1, elapsed / steps), so it terminates at target and holds. A coefficient
+        # may instead carry its own `from_step` (an absolute train step): its ramp starts there, the base value
+        # holding before it. That is how a coefficient is added to the schedule of a run already under way --
+        # against the stage's anchor, stamped when the stage began, its ramp would already read as done. Any balance
         # kind; balance.anneal_coeffs is the lexicographic controller's EVENT-driven ramp of the same
         # coefficients, so naming one coefficient in both is refused below.
         self.coeff_schedule = self._parse_coeff_schedule(spec.get('coeff_schedule'))
@@ -540,9 +543,9 @@ class Stage:
     # ------------------------------------------------------------ sub-parsers
 
     def _parse_coeff_schedule(self, node):
-        """{coefficient: {'target': float, 'steps': int >= 1, 'kind': 'geometric'|'linear'}}; {} when
-        absent. The coefficient must be a numeric energy_config key -- checked where the config is in
-        hand (StageProtocol.energy_coeffs), not here."""
+        """{coefficient: {'target': float, 'steps': int >= 1, 'kind': 'geometric'|'linear',
+        ['from_step': int >= 0]}}; {} when absent. The coefficient must be a numeric energy_config key --
+        checked where the config is in hand (StageProtocol.energy_coeffs), not here."""
         if not node:
             return {}
         if not isinstance(node, dict):
@@ -553,7 +556,7 @@ class Stage:
             where = f"stage '{self.name}': coeff_schedule.{name}"
             if not isinstance(spec, dict) or 'target' not in spec or 'steps' not in spec:
                 raise ValueError(f"{where} needs 'target' and 'steps'")
-            bad = set(spec) - {'target', 'steps', 'kind'}
+            bad = set(spec) - {'target', 'steps', 'kind', 'from_step'}
             if bad:
                 raise ValueError(f"{where} unknown keys {sorted(bad)}")
             target = float(_require_real(spec['target'], where + '.target'))
@@ -564,6 +567,8 @@ class Stage:
             if kind == 'geometric' and target <= 0:
                 raise ValueError(f"{where}: a geometric ramp needs target > 0, got {target}")
             out[str(name)] = {'target': target, 'steps': int(steps), 'kind': kind}
+            if spec.get('from_step') is not None:
+                out[str(name)]['from_step'] = int(_require_count(spec['from_step'], where + '.from_step', minimum=0))
         return out
 
     def _parse_replay_seat(self, spec):
@@ -1949,7 +1954,8 @@ class StageProtocol:
                     raise ValueError(f"stage '{self.stage.name}': coeff_schedule.{name} is not a "
                                      f"numeric energy_config key")
                 base = float(self._energy_coeff_defaults[name])
-                p = min(1.0, max(0.0, (step - int(entry)) / float(spec['steps'])))
+                start = int(spec['from_step']) if spec.get('from_step') is not None else int(entry)
+                p = min(1.0, max(0.0, (step - start) / float(spec['steps'])))
                 if spec['kind'] == 'geometric':
                     if base <= 0:
                         raise ValueError(f"stage '{self.stage.name}': coeff_schedule.{name}: a geometric "
@@ -3494,7 +3500,8 @@ class StageProtocol:
             if entry is not None:
                 step = int(getattr(self.m, 'step_ind', 0) or 0)
                 for name, spec in stage.coeff_schedule.items():
-                    out[f'protocol/coeff_sched_p_{name}'] = min(1.0, max(0.0, (step - int(entry)) / float(spec['steps'])))
+                    start = int(spec['from_step']) if spec.get('from_step') is not None else int(entry)
+                    out[f'protocol/coeff_sched_p_{name}'] = min(1.0, max(0.0, (step - start) / float(spec['steps'])))
         if stage.max_steps is not None and self.ctrl.get('max_steps_entry') is not None:
             # how much of the bound is spent, so a stage about to be FORCED out is
             # visible before it happens rather than only in the transition line

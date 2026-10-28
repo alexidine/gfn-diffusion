@@ -1,0 +1,4 @@
+# inn_cap_oct26 job l1 (sbatch --export=ALL,ARMS_TSV=arms_l1.tsv submit_inn_cap26.sbatch), read when the job
+# STARTS: size L on the full set, alone on its card. Columns (tab-separated, 5): index, arm, flags (after common.args; later flags win), memory
+# weight (the arm's share of the card is 0.9 x weight / the job's sum), description.
+9	f1_l	--molecule_fraction 1 --tf_width 512 --tf_layers 8 --atom_node_dim 256 --atom_convs 5	1	size L, 114,817 molecules, 1,120,750 rows

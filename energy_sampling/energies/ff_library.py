@@ -18,7 +18,7 @@ RDKit per pair, so it runs once per molecule, here, and never per step.
 WHAT IS STORED. Per term, the members' index rows (placement-slot numbering, as each
 member's `ff_single` holds them) and values concatenated, with a `ptr` saying which rows
 belong to which library entry; plus each entry's atom count, placement-order `z`, per-atom
-TRANSVERSE and DUMMY-FRAME flags and per-atom STEREO-LOCK code and quad (same order and `z_ptr`
+TRANSVERSE, DUMMY-FRAME and SIBLING-OFFSET flags and per-atom STEREO-LOCK code and quad (same order and `z_ptr`
 as `z`) and per-molecule chart constant `log_chart_jacobian`. `gather` is a ragged gather over those arrays -- a fixed number of
 tensor calls whatever the batch size or the molecule count.
 
@@ -74,7 +74,8 @@ class ForceFieldLibrary:
                  transverse: Optional[Sequence[Sequence[bool]]] = None,
                  dummy_frame: Optional[Sequence[Sequence[bool]]] = None,
                  stereo_code: Optional[Sequence[Sequence[int]]] = None,
-                 stereo_nbr: Optional[Sequence[np.ndarray]] = None):
+                 stereo_nbr: Optional[Sequence[np.ndarray]] = None,
+                 sibling_offset: Optional[Sequence[Sequence[bool]]] = None):
         ffs = list(ffs)
         if not ffs:
             raise ValueError('ForceFieldLibrary needs at least one force field')
@@ -110,8 +111,13 @@ class ForceFieldLibrary:
         # The DUMMY-FRAME flag (conformer_data.dummy_frame_atom_flags) is stored the same way
         # and for the same reason: it changes what an atom's phi slot means, so a file whose
         # flags sit on other atoms is a different chart with the same shapes.
+        # The SIBLING-OFFSET flag (conformer_data.sibling_offset_atom_flags) likewise: on a
+        # flagged atom the dihedral is its own column plus its group's leader's
+        # (`sibling_offset_box_deg`), so a graph built under the other chart reads another
+        # geometry out of the same state.
         per_atom = {}
-        for name, given in (('transverse', transverse), ('dummy_frame', dummy_frame)):
+        for name, given in (('transverse', transverse), ('dummy_frame', dummy_frame),
+                            ('sibling_offset', sibling_offset)):
             fl = ([np.zeros(int(na), dtype=bool) for na in n_atoms] if given is None
                   else [np.asarray(t, dtype=bool).reshape(-1) for t in given])
             if len(fl) != len(zs):
@@ -123,6 +129,7 @@ class ForceFieldLibrary:
                                              device=self.device)
         self.transverse = per_atom['transverse']
         self.dummy_frame = per_atom['dummy_frame']
+        self.sibling_offset = per_atom['sibling_offset']
         # PER ATOM, POSITIONAL, like z: the STEREO LOCK's element keyed on each atom, as
         # kind * sign (0 none, +-1 tetrahedral, +-2 double bond; energies/stereo_lock.py), and
         # its four indicator atoms as deltas. Stereoisomers share z, atom count and every
@@ -181,7 +188,8 @@ class ForceFieldLibrary:
         graph stores its atoms in, so it can be compared atom for atom against a batch; the
         transverse flags are the same function `condition_from_energy` writes them with.
         """
-        from energies.conformer_data import dummy_frame_atom_flags, transverse_atom_flags
+        from energies.conformer_data import (dummy_frame_atom_flags, sibling_offset_atom_flags,
+                                             transverse_atom_flags)
         from energies.stereo_lock import atom_codes
 
         ms = list(members.values())
@@ -195,7 +203,8 @@ class ForceFieldLibrary:
                    dtype=first.dtype if dtype is None else dtype,
                    transverse=[transverse_atom_flags(m).numpy() for m in ms],
                    dummy_frame=[dummy_frame_atom_flags(m).numpy() for m in ms],
-                   stereo_code=[c for c, _ in stereo], stereo_nbr=[q for _, q in stereo])
+                   stereo_code=[c for c, _ in stereo], stereo_nbr=[q for _, q in stereo],
+                   sibling_offset=[sibling_offset_atom_flags(m).numpy() for m in ms])
 
     @staticmethod
     def _check_single_copy(i, f, term, idx, batch, n_atoms):

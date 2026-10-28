@@ -10,7 +10,9 @@ writes into ``--out-dir``:
     conditions_heldout.pt   cfg:test_molecules_path  (same K, same block widths)
     prior_train.pt          cfg:prior_path, only with --prior-rows-per-condition > 0 (prior
                             draws) or --database DIR (each training condition's lowest
-                            --rows-per-condition-cap database rows, ``build_database_prior``)
+                            --rows-per-condition-cap database rows, ``build_database_prior``).
+                            Compact form: per row its state, energy and condition index
+                            (``energies.conformer_data.compact_prior``)
     prior_refusals.tsv      with --database: the training conditions that took no rows, and why
     split.tsv               every universe key: its side and its place in the walk order
     molecules.tsv           one row per kept CONDITION (stereoisomer)
@@ -81,6 +83,7 @@ import csv
 import hashlib
 import json
 import os
+import pickle
 import platform
 import subprocess
 import sys
@@ -366,8 +369,15 @@ class Built:
     mirror_of: Dict[str, str] = field(default_factory=dict)     # name -> its mirror's name
 
 
-def stereo_plan(key: str):
+def stereo_plan(key: str, lock_nitrogen: bool = False):
     """``(names, mirror_of, rejections-as-tuples)`` for one constitution.
+
+    ``lock_nitrogen`` (``energy_config.lock_stereo_nitrogen``) makes the two configurations
+    of a stereo nitrogen two names (``stereoisomer_classes``). The mirror of a name inverts
+    its N tags with the rest, so an invertomer's mirror image is its enantiomer, not its
+    other invertomer; the cap of ``--max-stereoisomers-per-molecule`` conditions is unchanged,
+    so at the default 2 a molecule keeps one pick and its mirror and its other invertomers
+    are not built.
 
     ``names`` are the enumerated stereoisomers (``stereoisomer_classes``), one per
     ``stereo_identity``. ``mirror_of[name]`` is the enumerated name whose identity is that of
@@ -379,12 +389,12 @@ def stereo_plan(key: str):
     """
     from models.encoder_probe import mirror_smiles
 
-    classes = stereoisomer_classes(key)
+    classes = stereoisomer_classes(key, lock_nitrogen=lock_nitrogen)
     names = [n for n, _, _ in classes]
     by_identity = {idt: n for n, idt, _ in classes}
     mirror_of = {}
     for n in names:
-        m = by_identity.get(smiles_identity(mirror_smiles(n)))
+        m = by_identity.get(smiles_identity(mirror_smiles(n), lock_nitrogen))
         if m is not None:
             mirror_of[n] = m
     rows = []
@@ -408,7 +418,8 @@ def build_molecule(entry: Entry, energy_kw: dict, *, bundle, cap: Optional[int],
     """
     rej = []
     try:
-        isos, mirror_of, extra = stereo_plan(entry.key)
+        isos, mirror_of, extra = stereo_plan(
+            entry.key, bool(energy_kw.get('lock_stereo_nitrogen', False)))
     except Exception as exc:                                   # noqa: BLE001 - recorded
         rej.append(_rej('molecule', entry.key, entry.index, entry.side, '',
                         'stereo_enumeration', f'{type(exc).__name__}: {exc}'))
@@ -540,11 +551,18 @@ def _worker_ready(_):
     return os.getpid()
 
 
-def _build_task(entry: Entry, references):
+def _build_task(entry: Entry, references) -> bytes:
+    """``build_molecule``'s result, PICKLED HERE. Returned as bytes because the executor's
+    own transport pickles with multiprocessing's ForkingPickler, for which torch registers
+    reducers that move every tensor through a shared-memory handle; a member holds about 80
+    small tensors, and the walk spent longer passing them than building them (measured: an
+    8-worker walk slower than the serial one). The plain pickle copies them by value.
+    """
     w = _WORKER
-    return build_molecule(entry, w['energy_kw'], bundle=w['bundle'], cap=w['cap'],
-                          stereo_salt=w['stereo_salt'], check=w['check'],
-                          references=references)
+    return pickle.dumps(build_molecule(entry, w['energy_kw'], bundle=w['bundle'], cap=w['cap'],
+                                       stereo_salt=w['stereo_salt'], check=w['check'],
+                                       references=references),
+                        protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _in_walk_order(executor, entries, refs, depth: int):
@@ -568,7 +586,7 @@ def _in_walk_order(executor, entries, refs, depth: int):
         while pending:
             f = pending.popleft()
             submit()
-            yield f.result()
+            yield pickle.loads(f.result())
     finally:
         for f in pending:
             f.cancel()
@@ -684,8 +702,12 @@ def rebuilt_layout(batch) -> Tuple[int, Dict[str, np.ndarray]]:
                         for i, ident in enumerate(list(batch.identifier))}
 
 
-#: the per-atom fields that name a STATE COLUMN, the ones ``carrier_pad_condition`` remaps
+#: the per-atom fields that name a STATE COLUMN, the ones ``carrier_pad_condition`` remaps.
+#: ``ctree_ph_lead_col`` (a sibling offset row's second column, the leader's) is on a graph
+#: only when the set was built under ``sibling_offset_box_deg``; checked where the member's
+#: own graph carries it, and then required of the written file.
 _COLUMN_MAP_FIELDS = ('ctree_r_col', 'ctree_th_col', 'ctree_ph_col')
+_OPTIONAL_COLUMN_MAP_FIELDS = ('ctree_ph_lead_col',)
 
 
 def verify_conditions_file(path, layout, members: List[dict], own: Dict[str, object], *,
@@ -748,7 +770,18 @@ def verify_conditions_file(path, layout, members: List[dict], own: Dict[str, obj
             continue
         at = slice(int(ptr[row_of[ident]]), int(ptr[row_of[ident] + 1]))
         to_carrier = torch.as_tensor(layout.cols[ident], dtype=torch.long)
-        for name in _COLUMN_MAP_FIELDS:
+        for name in _COLUMN_MAP_FIELDS + _OPTIONAL_COLUMN_MAP_FIELDS:
+            if name in _OPTIONAL_COLUMN_MAP_FIELDS:
+                has_own = getattr(own[ident], name, None) is not None
+                has_file = getattr(batch, name, None) is not None
+                if has_own != has_file:
+                    on, off = (('the member', 'the file') if has_own
+                               else ('the file', 'the member'))
+                    problems.append(f'{ident}: {name} is on {on} and not on {off} '
+                                    f'(sibling_offset_box_deg differs between them)')
+                    break
+                if not has_own:
+                    continue
             mine = torch.as_tensor(getattr(own[ident], name)).reshape(-1).long()
             expect = torch.where(mine >= 0, to_carrier[mine.clamp_min(0)], mine)
             got = torch.as_tensor(getattr(batch, name)).reshape(-1)[at].long()
@@ -789,45 +822,57 @@ def _cast_floats(batch, dtype):
     return batch
 
 
+def _compact_rows(padded, per_condition, dtype):
+    """``energies.conformer_data.compact_prior`` over ``per_condition`` =
+    ``[(identifier, carrier states [n, K], energies [n])]``, cast to the storage ``dtype``;
+    each condition's free-column mask and atom count are read off its padded graph."""
+    from energies.conformer_data import compact_prior
+
+    idents = [i for i, _, _ in per_condition]
+    return compact_prior(
+        idents, [int(x.shape[0]) for _, x, _ in per_condition],
+        torch.cat([x.detach().cpu().to(dtype) for _, x, _ in per_condition]),
+        torch.cat([e.detach().cpu().reshape(-1).to(dtype) for _, _, e in per_condition]),
+        torch.cat([torch.as_tensor(padded[i].state_mask).bool().reshape(1, -1)
+                   for i in idents]),
+        [int(padded[i].num_nodes) for i in idents])
+
+
 def build_prior(padded: Dict[str, object], members: Dict[str, Member], layout, n: int, *,
                 prior, relax_steps: int, seed: int, dtype):
-    """``(batch, stats)``: ``n`` prior rows per training condition, in carrier form.
+    """``(compact prior, stats)``: ``n`` prior rows per training condition, in carrier form,
+    as ``energies.conformer_data.compact_prior`` (state, energy and condition per row; no
+    per-condition graph).
 
     EQUAL ROWS PER CONDITION, so the buffer represents the set rather than whichever
     molecule drew first. Each state is rounded to the STORAGE dtype before it is scored, so
     the stored energy is the energy of the stored state, not of a neighbour that no longer
-    exists after the cast. One collate over every row, not an append loop.
+    exists after the cast.
     """
-    from energies.conformer_data import bake_energies, collate_conditions, wrap_state
+    from energies.conformer_data import bake_energies, wrap_state
     from energies.conformer_prior_draw import draw_member_prior, member_prior_seed
 
-    rows, stats = [], {}
+    per_condition, stats = [], {}
     periodic = [bool(b == 2) for b in layout.free_block]
-    for ident, pm in padded.items():
+    for ident in padded:
         en = members[ident].energy
         rng = np.random.default_rng(member_prior_seed(ident, seed))
         x, _, _ = draw_member_prior(en, n, rng, relax_steps=relax_steps, prior=prior)
         x = wrap_state(x, en.periodic_dims).to(dtype).to(en.dtype)
         with torch.no_grad():
             e = bake_energies(en, x)
-        xc = wrap_state(layout.to_carrier(ident, x), periodic)
-        for i in range(n):
-            row = pm.__copy__()
-            row.torsion_state = xc[i:i + 1]
-            row.conformer_energy = e[i:i + 1]
-            row.identifier = ident
-            rows.append(row)
+        per_condition.append((ident, wrap_state(layout.to_carrier(ident, x), periodic), e))
         stats[ident] = {'energy_median': float(e.median()),
                         'energy_p90': float(torch.quantile(e, 0.9)),
                         'relax_steps': int(relax_steps)}
-    batch = collate_conditions(rows, require_state=True)
-    return _cast_floats(batch, dtype), stats
+    return _compact_rows(padded, per_condition, dtype), stats
 
 
 def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], layout,
                          records: Dict[str, dict], cap: int, *, tol: float, dtype):
-    """``(batch or None, per-condition stats, refusals)``: each training condition's lowest
-    ``cap`` rows of the conformer DATABASE, in carrier form, instead of prior draws.
+    """``(compact prior or None, per-condition stats, refusals)``: each training condition's
+    lowest ``cap`` rows of the conformer DATABASE, in carrier form, instead of prior draws,
+    as ``energies.conformer_data.compact_prior``.
 
     Per condition ``build_conformer_database.match_rows``: the record found by identifier and
     member signature, its stored positions measured into THIS member's chart, every taken row
@@ -839,11 +884,11 @@ def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], 
     with the database's within ``tol``.
     """
     from build_conformer_database import match_rows
-    from energies.conformer_data import bake_energies, collate_conditions, wrap_state
+    from energies.conformer_data import bake_energies, wrap_state
 
-    rows, stats, refusals = [], {}, []
+    per_condition, stats, refusals = [], {}, []
     periodic = [bool(b == 2) for b in layout.free_block]
-    for ident, pm in padded.items():
+    for ident in padded:
         en = members[ident].energy
         x, stored, info = match_rows(en, ident, records.get(ident), cap, tol)
         if x is None:
@@ -853,31 +898,26 @@ def build_database_prior(padded: Dict[str, object], members: Dict[str, Member], 
         x = wrap_state(x, en.periodic_dims).to(dtype).to(en.dtype)
         with torch.no_grad():
             e = bake_energies(en, x)
-        xc = wrap_state(layout.to_carrier(ident, x), periodic)
-        for i in range(len(x)):
-            row = pm.__copy__()
-            row.torsion_state = xc[i:i + 1]
-            row.conformer_energy = e[i:i + 1]
-            row.identifier = ident
-            rows.append(row)
+        per_condition.append((ident, wrap_state(layout.to_carrier(ident, x), periodic), e))
         stats[ident] = {'rows': info['rows'], 'rows_available': info['rows_available'],
                         'e_min_database': info['e_min'],
                         'rescore_gap': info['rescore_gap'],
                         'stored_gap': float(np.max(np.abs(e.detach().cpu().double().numpy()
                                                           - stored))),
                         'ref_pos_gap': info['ref_pos_gap']}
-    if len(rows) < 2:
+    if sum(int(x.shape[0]) for _, x, _ in per_condition) < 2:
         return None, stats, refusals
-    batch = collate_conditions(rows, require_state=True)
-    return _cast_floats(batch, dtype), stats, refusals
+    return _compact_rows(padded, per_condition, dtype), stats, refusals
 
 
 def verify_prior_file(path, layout, members: Dict[str, Member], n):
-    """Refuse a prior file whose width, pads, row counts or stored energies are wrong.
+    """Refuse a prior file whose form, width, pads, row counts or stored energies are wrong.
 
+    The file must be the compact form (``energies.conformer_data.PRIOR_COMPACT_FORMAT``).
     ``n`` is the row count of every condition, or a ``{identifier: rows}`` map (a database
     prior, whose conditions hold up to its cap each); ``members`` are exactly the conditions
-    that must have rows. Width K; pad columns exactly 0; exactly ``n`` rows per condition; and EVERY row
+    that must have rows. Width K; pad columns exactly 0; each condition's mask the layout's
+    and its atom count the member's; exactly ``n`` rows per condition; and EVERY row
     re-scored through its member from the STORED state, the result cast to the storage
     dtype and required BIT-EQUAL to the stored energy. Bit-equal is attainable because
     ``build_prior`` scores the storage-rounded state in the same n-row batch this re-scores,
@@ -886,23 +926,46 @@ def verify_prior_file(path, layout, members: Dict[str, Member], n):
     yet changes the stored float32 value of 424 of 1,280 prior rows (5 molecules at `full`,
     mmff, 256 draws each; the largest shift 0.06 kcal/mol, on a clashing draw).
     """
-    from energies.conformer_data import bake_energies
+    from energies.conformer_data import (PRIOR_COMPACT_FORMAT, bake_energies,
+                                         check_compact_prior, is_compact_prior)
 
-    b = torch.load(path, weights_only=False, map_location='cpu')['equalized_prior']
-    x = torch.as_tensor(b.torsion_state)
-    e = torch.as_tensor(b.conformer_energy).reshape(-1)
-    rows_of: Dict[str, List[int]] = {}
-    for j, s in enumerate(b.identifier):
-        rows_of.setdefault(s, []).append(j)
+    b = torch.load(path, weights_only=False, map_location='cpu')
+    if not is_compact_prior(b):
+        raise SystemExit(f'{path}: prior file refused: prior_format '
+                         f'{b.get("prior_format") if isinstance(b, dict) else None!r}, not '
+                         f'{PRIOR_COMPACT_FORMAT!r}')
+    try:
+        check_compact_prior(b, path)
+    except ValueError as err:
+        raise SystemExit(f'{path}: prior file refused: {err}') from None
+    x = torch.as_tensor(b['torsion_state'])
+    e = torch.as_tensor(b['conformer_energy']).reshape(-1)
+    idents = list(b['identifiers'])
+    ci = b['condition_index'].long()
+    # rows of each condition, in file order, from one stable sort
+    order = torch.argsort(ci, stable=True)
+    counts = torch.bincount(ci, minlength=len(idents))
+    rows_of: Dict[str, List[int]] = {
+        ident: rows.tolist()
+        for ident, rows in zip(idents, torch.split(order, counts.tolist())) if len(rows)}
     problems = []
     if set(rows_of) != set(members):
         problems.append(f'identifiers {sorted(set(rows_of) ^ set(members))[:5]} are in only '
                         f'one of the prior file and the training conditions')
     if x.shape[1] != layout.K:
         problems.append(f'torsion_state width {x.shape[1]} != K {layout.K}')
-    sm = torch.as_tensor(b.state_mask).bool()
+    sm = b['state_mask'].bool()[ci]
     if sm.shape != x.shape or bool((x[~sm] != 0).any()):
         problems.append('non-zero pad columns (or a state_mask of another shape)')
+    for c, ident in enumerate(idents):
+        if ident not in members or x.shape[1] != layout.K:
+            continue
+        if not torch.equal(b['state_mask'][c].bool(), torch.as_tensor(layout.valid(ident))):
+            problems.append(f'{ident}: its state_mask is not the layout\'s free columns')
+        spec = getattr(members[ident].energy, 'spec', None)
+        if spec is not None and int(b['n_atoms'][c]) != int(spec.n_atoms):
+            problems.append(f'{ident}: {int(b["n_atoms"][c])} atoms recorded, the member '
+                            f'has {int(spec.n_atoms)}')
     for ident, en in ((i, m.energy) for i, m in members.items()):
         rows = rows_of.get(ident, [])
         want = n[ident] if isinstance(n, dict) else n
@@ -1077,8 +1140,19 @@ def main(argv=None):
                              'prior_train.pt; pass one')
         if int(args.rows_per_condition_cap) < 1:
             raise SystemExit('--rows-per-condition-cap must be >= 1')
-        from build_conformer_database import first_header, refuse_other_member_kwargs
-        refuse_other_member_kwargs(first_header(args.database), energy_kw, 'set builder')
+        from build_conformer_database import (first_header, other_identity_kwargs,
+                                              refuse_other_member_kwargs)
+        _db_head = first_header(args.database)
+        refuse_other_member_kwargs(_db_head, energy_kw, 'set builder')
+        # an argument that decides which identifiers a molecule has (IDENTITY_KWARGS) may
+        # differ: the conditions that exist only under this build's value are then absent
+        # from the database, embedded here, and take no database rows (db_absent)
+        db_identity = other_identity_kwargs(_db_head, energy_kw)
+        for _name, _v in db_identity.items():
+            print(f"NOTE: the database was built under {_name}={_v['database']!r}, this set "
+                  f"under {_v['consumer']!r}. Conditions that exist only under this value "
+                  f"have no database record: they are embedded here and take no database "
+                  f"rows (prior_refusals.tsv, db_absent).")
     if int(args.workers) < 1:
         raise SystemExit('--workers must be >= 1')
 
@@ -1126,8 +1200,11 @@ def main(argv=None):
     if args.database is not None:
         from build_conformer_database import read_references
         ref_info, references = read_references(args.database)
-        print(f'database references: {sum(len(v) for v in references.values())} condition(s) '
-              f'over {len(references)} key(s)')
+        n_refused = sum(isinstance(r, StoredRefusal) for v in references.values()
+                        for r in v.values())
+        print(f'database references: {sum(len(v) for v in references.values()) - n_refused} '
+              f'stored reference(s) and {n_refused} recorded isomer refusal(s) over '
+              f'{len(references)} key(s)')
 
     # ---- build
     check = not args.no_check
@@ -1296,7 +1373,8 @@ def main(argv=None):
             out / 'prior_train.pt',
             lambda p: verify_prior_file(p, run_layout, tmembers, n))
         files['prior_train.pt'] = out / 'prior_train.pt'
-        prior_info = {'path': str(Path(internal_prior).resolve()),
+        prior_info = {'prior_format': pbatch['prior_format'],
+                      'path': str(Path(internal_prior).resolve()),
                       'sha256': _sha256(internal_prior), 'rows_per_condition': n,
                       'relax_steps': relax, 'seed': args.prior_seed, 'dtype': args.prior_dtype,
                       'per_condition': pstats}
@@ -1327,7 +1405,8 @@ def main(argv=None):
                                         counts))
         files['prior_train.pt'] = out / 'prior_train.pt'
         gaps = [s['rescore_gap'] for s in pstats.values()]
-        prior_info = {'source': 'database', 'database': db_info,
+        prior_info = {'prior_format': pbatch['prior_format'],
+                      'source': 'database', 'database': db_info,
                       'rows_per_condition_cap': dcap, 'dtype': args.prior_dtype,
                       'rescore_tol_kcal': float(args.database_rescore_tol),
                       'rows': int(sum(counts.values())),
@@ -1394,6 +1473,10 @@ def main(argv=None):
         'references': {
             'source': 'database' if references is not None else 'embedded',
             'database_run_hash': ref_info['run_hash'] if ref_info else None,
+            # build_conformer_database.IDENTITY_KWARGS the database was built under another
+            # value of ({} when none): conditions that exist only under this build's value
+            # have no database record
+            'database_identity_kwargs': db_identity if args.database is not None else {},
             'reference': _count(r['reference'] for s in mrows for r in mrows[s]),
             'thermal_check': _count(r['thermal_check'] for s in mrows for r in mrows[s]),
             'refusals_from_database': sum(
@@ -1409,7 +1492,12 @@ def main(argv=None):
                    'salt': args.stereo_salt, 'perception': 'legacy (pinned)',
                    'identity': 'build_conformer_conditions.py::stereo_identity (fixed-H '
                                'InChI and CIP labels), never canonical SMILES equality',
-                   'tetrahedral_N': 'not a stereo element (working assumption)',
+                   'tetrahedral_N': (
+                       'a stereo nitrogen (energies/stereo_lock.py::stereo_nitrogens) is a '
+                       'stereo element, tagged in the identifier and locked '
+                       '(energy_config.lock_stereo_nitrogen); every other N is not'
+                       if energy_kw.get('lock_stereo_nitrogen', False)
+                       else 'not a stereo element (working assumption)'),
                    'mirror_pairs': sorted({tuple(sorted((r['identifier'], r['mirror'])))
                                            for r in mrows['train'] + mrows['heldout']
                                            if r['mirror']}),

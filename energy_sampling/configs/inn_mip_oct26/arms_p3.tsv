@@ -1,0 +1,10 @@
+# inn_mip_oct26 job p3 (sbatch --export=ALL,ARMS_TSV=arms_p3.tsv submit_inn_mip26.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, stage-1 key (stage1.tsv), stage-2 flags (later flags win;
+# '-' = none), description.
+13	base_p3	base	-	the recipe: job p3's own reference
+14	upb4	base	--updates_per_batch 4	each scored batch reused for 4 updates
+15	upb16	base	--updates_per_batch 16 --bank_min_gap 16	each scored batch reused for 16 updates (a banked draw is not replayed inside its own batch's reuse)
+16	upb4_b1000	base	--updates_per_batch 4 --batch 1000	4 updates per batch of 1,000 draws
+17	noise	base	--data_noise_log_range -3 -1.5	stored rows jittered and re-scored (4,096 more energy calls per scored batch)
+18	nobank	base	--bank_frac 0	no replay
+19	floor5	base	--min_bin_height 1e-5	stage-2 floor kept at the stage-1 1e-5

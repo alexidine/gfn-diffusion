@@ -1,0 +1,5 @@
+# inn_rc_oct25 arm of job 1 (sbatch submit_inn_rc_oct25.sbatch), read when the job STARTS. Columns (tab-separated,
+# 4): index, arm, flags beyond common.args (later flags win), the arm's share of the card's memory
+# (--cuda_memory_fraction). One arm on its own A100.
+#   rcall      every family of installment 1: qm9rc + csdrc + zincrc + gdbrc + pubrc
+1	rcall	--prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_prior.pt --molecules_path /scratch/mk8347/data/crystal_datasets/conditional/priors/rc_oct22/rcoct22i1_conditions.pt	0.9

@@ -1,0 +1,1 @@
+--steps 300 --adapt_end 90 --cov_updates 30,60 --tempers 1.0 --cap_local_kT 1e6 --cap_global_kT 15 --seed_window_kT 5 --replicas 1 --pc_max 100 --red_max 0 --rdf_mode atomwise

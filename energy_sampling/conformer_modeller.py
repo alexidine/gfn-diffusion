@@ -51,13 +51,21 @@ from train import BULKY_ATTR_EXCLUDE_KEYS, Modeller
 #: to ConformerTorsions, which takes no **kwargs and would raise on any of them.
 _NON_ENERGY_KEYS = ('internal_prior_path', 'prior_sample_size', 'reward_range',
                     'density_coeff', 'reduction_coeff', 'analyze_kwargs',
-                    'internal_oom_recovery', 'prior_relax_steps', 'prior_dataset_path')
+                    'internal_oom_recovery', 'prior_relax_steps', 'prior_dataset_path',
+                    'energy_clip_origin')
 
 
 #: Re-exported so existing imports and tests keep resolving; the definitions live in
 #: progress_metrics because nothing in them is conformer-specific.
 from progress_metrics import (_PROGRESS_GATE, _column_w1, _column_w1_ratio,  # noqa: F401
                               progress_gate)
+
+#: Angstrom. The largest |stored - rebuilt| reference coordinate a conditions or graph-form
+#: prior file may carry against the member this run rebuilds for its identifier
+#: (`_refuse_reference_mismatch`). A rebuild under the same RDKit reproduces the reference to
+#: float32 storage rounding (~1e-6 A); another RDKit re-embeds 45 of 88 small-rung members,
+#: by up to 3.6 A (2025.03.5 against 2025.09.4).
+REFERENCE_POS_TOL = 1e-3
 
 
 
@@ -132,6 +140,7 @@ class ConformerModeller(Modeller):
                 continue
             print(f'{name}: {buf.bind_statics(statics)} to the conditions table '
                   f'({len(buf)} rows)')
+        self._resolve_anchor_capacity('restored')
 
     def _buffer_y_fn(self):
         """``conformer_energy``, not the energy_function name.
@@ -162,7 +171,9 @@ class ConformerModeller(Modeller):
     #: angle (train_conformer.torsion_latent_figure, scaling problem 3).
     _DOF_CLASSES = ((0, 'r (bond length)', 1.0), (1, 'theta (angle)', 1.0),
                     (2, 'phi (torsion, deg)', 180.0),
-                    (3, 'transverse (linear bend u, v)', 1.0))
+                    (3, 'transverse (linear bend u, v)', 1.0),
+                    (4, 'double bond (bounded dihedral)', 1.0),
+                    (5, 'sibling offset (bounded dihedral difference)', 1.0))
 
     def _domain_figs(self, fig_dict, sample_batch, prior_latent_params, anchor_latents):
         """The 12 worst state columns, drawn with the CRYSTAL latent-parameter panel code.
@@ -198,7 +209,8 @@ class ConformerModeller(Modeller):
         anchors = host(anchor_latents)
         periodic = np.asarray(host(self.energy_function.periodic_dims)).astype(bool)
         block = host(self.energy_function._free_block)
-        cls_name = {0: 'r', 1: 'theta', 2: 'phi', 3: 'transverse'}
+        cls_name = {0: 'r', 1: 'theta', 2: 'phi', 3: 'transverse', 4: 'double_bond',
+                    5: 'sibling_offset'}
         # on a CARRIER `_free_block` is the REGION code, which files a linear bend's u and v
         # under theta; the layout's per-member kinds say what the column holds for whom
         carrier = getattr(self.energy_function, 'carrier', None)
@@ -539,6 +551,7 @@ class ConformerModeller(Modeller):
             self.energy_function = ConformerTorsions(
                 reference_positions=None if one is None else one[0], **cfg)
         self._check_stored_references(refs, time.perf_counter() - t0)
+        self._install_clip_origin()
         print(self.energy_function.describe())
         # THE BASE METHOD ALSO BUILDS THE TRACE WINDOW, and this override does not call
         # super(). Dropping it left profiling.trace silently INERT on the whole conformer
@@ -602,7 +615,25 @@ class ConformerModeller(Modeller):
     #: exist in the model block as the FLAT policy's own GFN arguments; popping either
     #: would silently unbuild the flat path.
     _SET_POLICY_KEYS = ('policy_kind', 'set_policy_hidden', 'set_policy_layers',
-                    'set_policy_corr_dim')
+                    'set_policy_corr_dim', 'backward_policy_kind', 'set_policy_mix_layers',
+                    'set_policy_mix_heads')
+
+    #: stamp fields added after checkpoints already existed, and what their absence means
+    _STAMP_ABSENT = {'backward_policy_kind': 'flat', 'set_policy_mix_layers': 0,
+                     'set_policy_mix_heads': 4}
+
+    #: `model.backward_policy_kind`. 'flat' (absent means flat): P_B is the base model's flat
+    #: network over the state encoding, for which a coordinate is its column index. 'set': P_B
+    #: is a second ragged set head of the forward policy's architecture, reading the same
+    #: per-coordinate tokens and molecule. Needs the ragged forward head.
+    _BACKWARD_KINDS = ('flat', 'set')
+
+    def _backward_policy_kind(self, spec) -> str:
+        kind = str(spec.get('backward_policy_kind', 'flat') or 'flat').lower()
+        if kind not in self._BACKWARD_KINDS:
+            raise ValueError(f"model.backward_policy_kind must be one of "
+                             f"{self._BACKWARD_KINDS}, got {spec.get('backward_policy_kind')!r}")
+        return kind
 
     #: the set head's sizes when the config omits them. ONE definition, read by the fresh
     #: build and by the reload check alike, so the two cannot disagree about a default and
@@ -618,9 +649,8 @@ class ConformerModeller(Modeller):
         mismatch discovered rows later.
 
         READ ONCE PER PATH: the lists, and each identifier's stored reference (`pos` and `z`
-        of its first graph, placement order), are kept on `_condition_set_cache`; a
-        3,486-condition file takes about 40 s to load here, and this is called more than once
-        at startup.
+        of its first graph, placement order), are kept on `_condition_set_cache`; this is
+        called more than once at startup.
         """
         path = getattr(self.args, 'molecules_path', None)
         if not path:
@@ -719,6 +749,56 @@ class ConformerModeller(Modeller):
         print(f'condition set: {len(refs)} of {n} member(s) built from the stored reference '
               f'(no embedding), {n - len(refs)} embedded; members built in {seconds:.1f} s')
 
+    def _install_clip_origin(self):
+        """`energy_config.energy_clip_origin`: 'absolute' (the default, and absent) leaves
+        `energy_clip` an absolute cutoff. 'reference' measures it from each member's own
+        potential at its reference conformer (`ConformerTorsions.install_clip_floor`).
+
+        Here, before any row of the run is scored: a stored `conformer_energy` is the clipped
+        potential and `prebuilt_sample_to_reward` never recomputes it.
+        """
+        origin = getattr(self.args.energy_config, 'energy_clip_origin', None) or 'absolute'
+        if origin not in ConformerTorsions.CLIP_ORIGINS:
+            raise SystemExit(f'energy_config.energy_clip_origin {origin!r}: one of '
+                             f'{ConformerTorsions.CLIP_ORIGINS}')
+        if origin == 'absolute':
+            return
+        en = self.energy_function
+        if en.energy_clip is None:
+            raise SystemExit("energy_config.energy_clip_origin 'reference' needs "
+                             "energy_config.energy_clip")
+        t0 = time.perf_counter()
+        floors = torch.as_tensor(en.install_clip_floor()).flatten().double().cpu()
+        q = torch.quantile(floors, torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64))
+        print(f"energy clip: {en.energy_clip:g} kcal/mol above each member's reference-conformer "
+              f"potential ({floors.numel()} member(s): min {float(q[0]):.1f}, median "
+              f"{float(q[1]):.1f}, max {float(q[2]):.1f} kcal/mol; "
+              f"{time.perf_counter() - t0:.1f} s)", flush=True)
+
+    def _reference_potential_table(self):
+        """Each molecule's unclipped potential at its reference conformer
+        (`ConformerTorsions.reference_potential`), indexed by mol_id, float64 on the CPU:
+        the baseline of the buffers' `*_excess_energy` statistics."""
+        en = self.energy_function
+        n = max(len(self.identifier_registry), 1)
+        lib_of = getattr(en, '_lib_of_mol_id', None)
+        if lib_of is None:                                  # one chart: every row is its
+            return torch.full((n,), en.reference_potential(), dtype=torch.float64)
+        lib_of = lib_of.detach().cpu().long()
+        held = lib_of >= 0                                  # -1: a mol_id with no member
+        table = torch.full((int(lib_of.numel()),), float('nan'), dtype=torch.float64)
+        table[held] = en.reference_potentials()[lib_of[held]]
+        return table
+
+    def _buffer_y_baseline(self, buff):
+        """The row's molecule's reference-conformer potential: `y` is `conformer_energy`,
+        the same raw potential. None for rows that carry no `mol_id`."""
+        table = getattr(self, '_reference_potential_of_mol_id', None)
+        mol_id = getattr(getattr(buff, 'batch', None), 'mol_id', None)
+        if table is None or mol_id is None:
+            return None
+        return table[torch.as_tensor(mol_id).detach().cpu().long().flatten()]
+
     def init_identifiers(self):
         """Base registry, checked against the stamped condition set, then handed to the energy.
 
@@ -732,6 +812,7 @@ class ConformerModeller(Modeller):
         binder = getattr(self.energy_function, 'bind_identifier_registry', None)
         if binder is not None:
             binder(self.identifier_registry)
+        self._reference_potential_of_mol_id = self._reference_potential_table()
         self._derive_condition_fields()
         self._bind_restored_stores()
 
@@ -845,7 +926,11 @@ class ConformerModeller(Modeller):
                 'n_static': len(state_feature_names()),
                 'enc_dim': mol_dim // 2, 'mol_dim': int(mol_dim),
                 'frame_size': int(MAX_FRAME), 'norm': None, 'dropout': 0,
-                'carrier': True, 'block_width': self._state_block_width()}
+                'carrier': True, 'block_width': self._state_block_width(),
+                'backward_policy_kind': self._backward_policy_kind(spec),
+                # attention among a molecule's coordinate tokens (TokenMixer); 0 = none
+                'set_policy_mix_layers': int(spec.get('set_policy_mix_layers', 0) or 0),
+                'set_policy_mix_heads': int(spec.get('set_policy_mix_heads', 4) or 4)}
 
     @staticmethod
     def _ragged_policy_from_stamp(stamp, angular_mask, t_dim, zero_init: bool = False):
@@ -859,7 +944,9 @@ class ConformerModeller(Modeller):
             corr_dim=int(stamp['set_policy_corr_dim']), frame_size=int(stamp['frame_size']),
             hidden_dim=int(stamp['set_policy_hidden']),
             layers=int(stamp['set_policy_layers']), out_per_token=2,
-            dropout=stamp['dropout'], norm=stamp['norm'], zero_init=bool(zero_init))
+            dropout=stamp['dropout'], norm=stamp['norm'], zero_init=bool(zero_init),
+            mix_layers=int(stamp.get('set_policy_mix_layers', 0)),
+            mix_heads=int(stamp.get('set_policy_mix_heads', 4)))
 
     def _set_policy_plan(self, spec):
         """`(head, stamp, mol_dim)` for a `policy_kind: set` config against THIS energy.
@@ -884,6 +971,10 @@ class ConformerModeller(Modeller):
                     'the set policy needs the width to build its context input')
         if ragged:
             return 'ragged', self._ragged_policy_stamp(spec, mol_dim), mol_dim
+        if self._backward_policy_kind(spec) == 'set':
+            raise NotImplementedError(
+                "model.backward_policy_kind 'set' needs the ragged set head (a carrier state "
+                "or a multi-molecule set): the dense heads bind one molecule's chart")
         sizes = {k: int(spec.get(k, d)) for k, d in self._SET_POLICY_DEFAULTS.items()}
         # the dense heads bind the energy's chart at construction, so there is nothing to
         # rebuild them from; the stamp names them so a reload is refused BY NAME
@@ -930,6 +1021,10 @@ class ConformerModeller(Modeller):
             model = ConformerGFN(**cfg)
             model.forward_policy = self._ragged_policy_from_stamp(
                 stamp, cfg['angular_mask'], cfg['t_dim'])
+            # a stamp written before the key existed holds the flat backward policy
+            if stamp.get('backward_policy_kind', 'flat') == 'set':
+                model.backward_policy = self._ragged_policy_from_stamp(
+                    stamp, cfg['angular_mask'], cfg['t_dim'])
             model._carrier = True
             return model
         raise NotImplementedError(
@@ -993,8 +1088,9 @@ class ConformerModeller(Modeller):
         Nothing is parsed, embedded or read from disk. The SMILES it was built from (the
         conditions file's string, stereo marks included) names the molecule where the
         identifier does not. Its per-column block codes in state order (`_free_block`, a
-        transverse u or v as 3) fix, with the stamped `block_width`, the carrier columns it
-        owns. Its placement-order atomic numbers (`spec.z`) are the atoms `_resolve_rows`
+        transverse u or v as 3, a bounded double-bond dihedral as 4, a sibling offset as 5)
+        fix, with the stamped
+        `block_width`, the carrier columns it owns. Its placement-order atomic numbers (`spec.z`) are the atoms `_resolve_rows`
         compares against every stored row. Another molecule under the same identifier, or the
         same SMILES built into another chart, changes the digest.
         """
@@ -1248,6 +1344,14 @@ class ConformerModeller(Modeller):
         else:
             policy = set_policy_for(self.energy_function, t_dim, **common).to(self.device)
         self.gfn_model.forward_policy = policy
+        pb_set = stamp.get('backward_policy_kind', 'flat') == 'set'
+        if pb_set:
+            # THE SAME ARCHITECTURE AND INPUTS AS THE FORWARD HEAD, its own weights. Its two
+            # outputs per coordinate are P_B's corrections to the reference bridge
+            # (GFN.fwd_get_back_correction); ConformerGFN._pb_net calls it
+            self.gfn_model.backward_policy = self._ragged_policy_from_stamp(
+                stamp, self.energy_function.periodic_dims, t_dim,
+                zero_init=zero_init).to(self.device)
 
         conditional = mol_dim is not None
         if conditional:
@@ -1280,6 +1384,11 @@ class ConformerModeller(Modeller):
         if conditional:
             print(f"        f_j is LEARNED from per-atom embeddings (DoFCorrelator); the "
                   f"pooled {mol_dim}-d molecular embedding joins rho's context")
+        print("backward policy: " + (
+            "SET head of the same architecture and inputs as the forward one, own weights"
+            if pb_set else
+            "FLAT network over the state encoding (a coordinate is its column index); "
+            "model.backward_policy_kind: set gives it the forward policy's tokens"))
 
     def _flat_on_carrier(self):
         """A flat policy on the carrier: refuse DPLR, then re-class both copies.
@@ -1336,6 +1445,8 @@ class ConformerModeller(Modeller):
         _, expected, _ = self._set_policy_plan(spec)
         for field, want in expected.items():
             got = stored.get(field, '<absent>')
+            if got == '<absent>' and field in self._STAMP_ABSENT:
+                got = self._STAMP_ABSENT[field]  # written before the key existed
             if got != want:
                 raise ValueError(
                     f"set policy field {field!r}: the checkpoint was built with {got!r}, "
@@ -1720,13 +1831,17 @@ class ConformerModeller(Modeller):
         return batch
 
     @staticmethod
-    def _read_graph_file(path, what):
-        blob = torch.load(path, weights_only=False, map_location='cpu')
+    def _require_graph_file(blob, path, what):
         if not isinstance(blob, dict) or 'prior' not in blob:
             raise SystemExit(
                 f'{path} is not a graph-form {what} file; expected a dict with a `prior` key '
                 f'as written by build_conformer_conditions.py')
         return blob
+
+    @staticmethod
+    def _read_graph_file(path, what):
+        blob = torch.load(path, weights_only=False, map_location='cpu')
+        return ConformerModeller._require_graph_file(blob, path, what)
 
     def _refuse_stereo_mismatch(self, batch, path, what):
         """SystemExit when any graph of a file was built under another stereo-lock coefficient.
@@ -1751,6 +1866,83 @@ class ConformerModeller(Modeller):
                 f'(energy_config.stereo_coeff). Their baked energies and per-coordinate features '
                 f'belong to the other target. Rebuild it with build_conformer_conditions.py '
                 f'--stereo-coeff {want:g}.')
+
+    def _refuse_reference_mismatch(self, batch, path, what):
+        """SystemExit when any graph's stored reference conformer (`pos`) is not the one this
+        run rebuilt for its identifier.
+
+        A stored state is a DELTA from its member's reference, and each member's reference is
+        re-embedded here from the SMILES (RDKit ETKDG + MMFF). Another RDKit embeds another
+        reference for many members, and the file's `z` and chart flags -- all
+        `MultiConformerTorsions._resolve_rows` compares -- still agree, so every stored state
+        would be read against a geometry it was not built from, with no error. Compared on
+        every graph, atom by atom in placement order (`condition_from_energy` writes
+        `pos = energy.ref_pos`), against REFERENCE_POS_TOL.
+        """
+        en = self.energy_function
+        members = getattr(en, '_members', None) or {}
+        pos = getattr(batch, 'pos', None)
+        idents = getattr(batch, 'identifier', None)
+        if pos is None:
+            raise SystemExit(f'{what} file {path}: its graphs carry no `pos`, so their reference '
+                             f'conformers cannot be checked against this run\'s members')
+        n_graphs = int(batch.num_graphs)
+        if idents is None:
+            if members:
+                raise SystemExit(f'{what} file {path}: its graphs carry no `identifier`, so '
+                                 f'their reference conformers cannot be matched to a member')
+            idents = [None] * n_graphs
+        idents = list(idents)
+        refs, lib_of = [], {}
+        missing = []
+        for ident in dict.fromkeys(idents):
+            member = members.get(ident) if members else en
+            if member is None:
+                missing.append(ident)
+                continue
+            lib_of[ident] = len(refs)
+            refs.append(member.ref_pos.detach().to('cpu', torch.float64).reshape(-1, 3))
+        if missing:
+            raise SystemExit(f'{what} file {path}: {len(missing)} identifier(s) have no member '
+                             f'in this run\'s energy, e.g. {ConformerModeller._name_some(missing)}')
+        n_ref = torch.tensor([r.shape[0] for r in refs], dtype=torch.long)
+        ref_ptr = torch.cat([torch.zeros(1, dtype=torch.long), n_ref.cumsum(0)])
+        ref_cat = torch.cat(refs)
+        lib = torch.tensor([lib_of[i] for i in idents], dtype=torch.long)
+        ptr = batch.ptr.detach().cpu().long()
+        n_atoms = ptr[1:] - ptr[:-1]
+        dev = torch.zeros(n_graphs, dtype=torch.float64)
+        bad_count = n_atoms != n_ref[lib]
+        dev[bad_count] = float('inf')
+        ok = ~bad_count
+        if bool(ok.any()):
+            graph = torch.repeat_interleave(torch.arange(n_graphs), n_atoms)
+            slot = torch.arange(int(ptr[-1])) - ptr[:-1][graph]
+            keep = ok[graph]
+            at = ref_ptr[lib[graph[keep]]] + slot[keep]
+            gap = (pos.detach().cpu().double().reshape(-1, 3)[keep]
+                   - ref_cat[at]).abs().amax(-1)
+            dev.scatter_reduce_(0, graph[keep], gap, reduce='amax')
+        bad = dev > REFERENCE_POS_TOL
+        if bool(bad.any()):
+            worst = {}
+            for g in torch.nonzero(bad).reshape(-1).tolist():
+                worst[idents[g]] = max(worst.get(idents[g], 0.0), float(dev[g]))
+            ranked = sorted(worst.items(), key=lambda kv: -kv[1])
+            listed = ', '.join(f'{i!r} ({"atom count differs" if d == float("inf") else f"{d:.3g} A"})'
+                               for i, d in ranked[:10])
+            raise SystemExit(
+                f'{what} file {path}: {len(worst)} of {len(lib_of)} condition(s) store a '
+                f'reference conformer that is not the one this run rebuilt (max deviation '
+                f'{ranked[0][1]:.3g} A, tolerance {REFERENCE_POS_TOL:g} A): {listed}'
+                f'{" ..." if len(ranked) > 10 else ""}. Every stored state is a delta from its '
+                f'member\'s reference, so these rows would be read against another geometry. '
+                f'The file was built under another RDKit or builder version than this '
+                f'environment; rebuild the rung IN THIS ENVIRONMENT (build_conformer_set.py, '
+                f'then build_conformer_references.py).')
+        print(f'{what} file {path}: reference conformers match the rebuilt members on all '
+              f'{n_graphs:,} graph(s) of {len(lib_of)} condition(s) (max deviation '
+              f'{float(dev.max()) if n_graphs else 0.0:.2g} A)')
 
     def _prior_row_energy(self):
         """The prior buffer's current per-row training energy, conformer currency.
@@ -1789,6 +1981,7 @@ class ConformerModeller(Modeller):
         if path:
             batch = self._as_run_dtype(self._read_graph_file(path, 'conditions')['prior'])
             self._refuse_stereo_mismatch(batch, path, 'conditions')
+            self._refuse_reference_mismatch(batch, path, 'conditions')
             self.mol_dataset = ConformerBuffer(batch,
                                                device=self.buffer_device,
                                                **self._buffer_kwargs(),
@@ -1855,6 +2048,15 @@ class ConformerModeller(Modeller):
         return self._prior_rng_state
 
     def init_anchor_buffer_seed(self):
+        """`_seed_anchor_buffer`, then the capacity resolved from what it seeded
+        (`_resolve_anchor_capacity`). A restored anchor buffer is not re-seeded; its capacity
+        is resolved in `_bind_restored_stores`."""
+        seeded = not hasattr(self, 'anchor_buffer')
+        self._seed_anchor_buffer()
+        if seeded:
+            self._resolve_anchor_capacity('config seed')
+
+    def _seed_anchor_buffer(self):
         """Seed the anchor buffer from HARDER-RELAXED prior draws, not the prior dataset.
 
         The base method's `seed_source: prior_dataset` calls that dataset "the real
@@ -1898,12 +2100,24 @@ class ConformerModeller(Modeller):
         cfg = self.args.buffers.anchor_buffer
         steps = int(getattr(cfg, 'seed_relax_steps', 0) or 0)
         if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset' or steps <= 0:
-            if raw is None or getattr(cfg, 'seed_source', 'generated') != 'prior_dataset':
+            if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset':
                 return super().init_anchor_buffer_seed()
-            # anchors mark where the good states are: seed them from the rows BEFORE the
-            # thermal noise, by the same stand-in as the relaxed seed below
+            # anchors mark where the good states are: under prior_dataset_noise they are
+            # seeded from the rows BEFORE the noise. A COMPACT source hands the base method
+            # its bounded selection (_anchor_seed_row_batches) through `row_batches`, which
+            # train.py::_dataset_row_batches reads; a graph batch is handed over whole. Both
+            # by the same stand-in as the relaxed seed below.
+            source = self.prior_dataset if raw is None else raw
+            if getattr(source, 'is_compact', False):
+                stand_in = types.SimpleNamespace(
+                    batch=source.batch,
+                    row_batches=lambda limit=None: self._anchor_seed_row_batches(source))
+            elif raw is None:
+                return super().init_anchor_buffer_seed()
+            else:
+                stand_in = types.SimpleNamespace(batch=raw)
             saved = self.prior_dataset
-            self.prior_dataset = types.SimpleNamespace(batch=raw)
+            self.prior_dataset = stand_in
             try:
                 return super().init_anchor_buffer_seed()
             finally:
@@ -2020,6 +2234,182 @@ class ConformerModeller(Modeller):
               f'{float(excess.median()):.1f} kT (the anchor seed keeps the unnoised rows)')
         return noised
 
+    def _prior_noise_mode(self):
+        mode = getattr(self.args, 'prior_dataset_noise', None) or 'none'
+        if mode not in ('none', 'thermal'):
+            raise ValueError(f"prior_dataset_noise must be 'none' or 'thermal', got {mode!r}")
+        return mode
+
+    def _compact_prior_store(self, keys, columns):
+        """A compact prior-dataset store from per-row columns and each row's slot in the
+        conditions table (buffer.py::ConformerCompactRows.from_columns)."""
+        from buffer import ConformerCompactRows
+
+        rows = ConformerCompactRows.from_columns(self.conformer_statics, keys, columns,
+                                                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
+        return ConformerBuffer(rows,
+                               device=self.buffer_device,
+                               **self._buffer_kwargs(),
+                               x_fn=None,
+                               y_fn=self._buffer_y_fn(),
+                               exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
+                               )
+
+    def _init_compact_prior_dataset(self, blob, path):
+        """The prior dataset from a COMPACT prior file (`energies/conformer_data.py::
+        compact_prior`): each row's state and energy, joined to the conditions table by its
+        condition's identifier. No graph is built per row; the steps that need graphs (the
+        thermal noise) take `COMPACT_CHUNK_ROWS` rows at a time.
+
+        Refused: a run without a conditions table (`molecules_path` unset or without
+        identifiers); an identifier the table lacks; a state width, a condition's
+        free-column mask or its atom count that is not the table's; a non-zero pad column.
+        The reference-conformer and stereo-lock checks the graph form runs per row are the
+        conditions file's own here (`init_mol_dataset`): a compact row has no graph of its
+        own to differ from its condition's.
+
+        Under `prior_dataset_noise: thermal` the rows as stored are kept as a second compact
+        store, `_prior_dataset_raw`, for the anchor seed, as `_maybe_noise_prior_rows` keeps
+        the graph form's.
+        """
+        from buffer import COMPACT_CHUNK_ROWS, chunk_bounds
+        from energies.conformer_data import (PRIOR_COMPACT_FORMAT, batch_states,
+                                             check_compact_prior, state_dim, wrap_state)
+
+        statics = getattr(self, 'conformer_statics', None)
+        if statics is None:
+            raise SystemExit(
+                f'{path} is a compact prior file ({PRIOR_COMPACT_FORMAT}): its rows carry a '
+                f'state, an energy and a condition, and read everything else from the '
+                f'conditions table, which this run does not have (molecules_path must name '
+                f'the conditions file the prior was built with, one identifier per graph)')
+        try:
+            check_compact_prior(blob, path)
+        except ValueError as err:
+            raise SystemExit(str(err)) from None
+        idents = list(blob['identifiers'])
+        missing = [i for i in idents if i not in statics.slot_of]
+        if missing:
+            raise SystemExit(
+                f'{path}: {len(missing)} of its {len(idents)} condition(s) are not in the '
+                f'conditions table ({self.args.molecules_path}), e.g. '
+                f'{self._name_some(missing)}. The prior file and the conditions file must '
+                f'come from one build_conformer_set.py run')
+        slots = torch.tensor([statics.slot_of[i] for i in idents], dtype=torch.long)
+        table = statics.batch
+        x, e = blob['torsion_state'], blob['conformer_energy'].reshape(-1)
+        ci = blob['condition_index'].long()
+        n, K = int(x.shape[0]), int(x.shape[1])
+        if n < 2:
+            raise SystemExit(f'{path}: {n} prior row(s); a prior dataset needs at least 2')
+        table_mask = table._store.get('state_mask', None)
+        if K != state_dim(table) or table_mask is None:
+            raise SystemExit(
+                f'{path}: states are {K} wide; the conditions table '
+                f'({self.args.molecules_path}) is {state_dim(table)} wide'
+                + ('' if table_mask is not None else ' and carries no state_mask'))
+        want_mask = table_mask.reshape(int(table.num_graphs), -1).bool()[
+            slots.to(table_mask.device)].cpu()
+        bad = (want_mask != blob['state_mask'].bool()).any(1) \
+            | (statics.atom_counts(slots) != blob['n_atoms'].long())
+        if bool(bad.any()):
+            raise SystemExit(
+                f'{path}: {int(bad.sum())} of its {len(idents)} condition(s) record a '
+                f'free-column mask or an atom count that is not the conditions table\'s '
+                f'({self.args.molecules_path}), e.g. '
+                f'{self._name_some([idents[j] for j in torch.nonzero(bad).reshape(-1).tolist()])}'
+                f'. The prior file and the conditions file must come from one '
+                f'build_conformer_set.py run')
+        mask = blob['state_mask'].bool()
+        for i in range(0, n, 16 * COMPACT_CHUNK_ROWS):
+            j = slice(i, i + 16 * COMPACT_CHUNK_ROWS)
+            if bool((x[j][~mask[ci[j]]] != 0).any()):
+                raise SystemExit(f'{path}: a prior row has a non-zero PAD column (rows '
+                                 f'{i}..{min(n, j.stop) - 1}); pads are 0 in every stored state')
+
+        # CAST TO THE RUN'S DTYPE, as the graph form is: states feed the policy
+        want = torch.get_default_dtype()
+        columns = {'torsion_state': x.to(want), 'conformer_energy': e.to(want)}
+        for name, val in (blob.get('rows') or {}).items():
+            columns[name] = val.to(want) if val.is_floating_point() else val
+        keys = slots[ci]
+        store = self._compact_prior_store(keys, columns)
+
+        if self._prior_noise_mode() == 'thermal':
+            # every row replaced by ONE noised copy, re-baked, a chunk of graphs at a time
+            self._prior_dataset_raw = store
+            periodic = self.energy_function.periodic_dims
+            xs, es = [], []
+            for i, j in chunk_bounds(n, COMPACT_CHUNK_ROWS):
+                sub = store.batch.subsample_new_batch(torch.arange(i, j))
+                state = batch_states(sub).to(self.device)
+                xn = wrap_state(self._thermal_displace(sub, state, c=1.0), periodic)
+                es.append(self._bake_rows(sub, xn).detach().cpu().reshape(-1).to(want))
+                xs.append(xn.detach().cpu().to(want))
+            noised = dict(columns, torsion_state=torch.cat(xs), conformer_energy=torch.cat(es))
+            raw_e = columns['conformer_energy'].double()
+            excess = (noised['conformer_energy'].double() - raw_e) \
+                / float(self.energy_function.temperature)
+            print(f'prior dataset: prior_dataset_noise THERMAL -- {n:,} rows replaced by '
+                  f'noised copies, median energy {float(raw_e.median()):.1f} -> '
+                  f'{float(noised["conformer_energy"].double().median()):.1f} kcal/mol, '
+                  f'median excess {float(excess.median()):.1f} kT (the anchor seed keeps the '
+                  f'unnoised rows)')
+            columns = noised
+            store = self._compact_prior_store(keys, columns)
+        self.prior_dataset = store
+
+        en = columns['conformer_energy'].double().numpy()
+        teff = 1 + 2 * (float(np.median(en)) - float(en.min())) / self.energy_function.ndim
+        print(f'prior dataset: {n:,} rows over {len(idents)} MOLECULES from {path} '
+              f'(compact form, {store.batch.nbytes() / max(n, 1):.0f} B per row) -- median '
+              f'{np.median(en):.1f}, p10 {np.percentile(en, 10):.1f}, '
+              f'p90 {np.percentile(en, 90):.1f} kcal/mol, T_eff/T = {teff:.2f}')
+        if 'embedding' in table._store:
+            print(f'               molecular embeddings present on the conditions table '
+                  f'({tuple(table.embedding.shape)}), so the backward branch is '
+                  f'condition-aware')
+
+    def _anchor_seed_row_batches(self, source):
+        """The anchor seed's rows from a COMPACT prior-dataset store `source`, a chunk of
+        graphs at a time: every row, or with `buffers.anchor_buffer.seed_rows_per_condition`
+        set, each condition's lowest-energy rows up to that count
+        (buffer.py::lowest_rows_per_condition). `buffers.anchor_buffer.max_size` does not
+        limit the seed; `_resolve_anchor_capacity` raises it to the rows seeded. A full
+        (graph-row) prior dataset does not come through here (`init_anchor_buffer_seed`): it
+        is handed over whole.
+        """
+        from buffer import COMPACT_CHUNK_ROWS, chunk_bounds, lowest_rows_per_condition
+
+        per_condition = getattr(self.args.buffers.anchor_buffer, 'seed_rows_per_condition', None)
+        keys = source.batch.keys
+        energy = torch.as_tensor(source.batch.conformer_energy).detach().reshape(-1).cpu()
+        try:
+            rows, k, n_cond = lowest_rows_per_condition(keys, energy, per_condition)
+        except ValueError as err:
+            raise SystemExit(f'anchor seed from the prior dataset ({len(source):,} rows): '
+                             f'{err} (buffers.anchor_buffer.seed_rows_per_condition)') from None
+        print(f'anchor seed: {len(rows):,} of {len(source):,} prior-dataset rows over '
+              f'{n_cond:,} condition(s)'
+              + (' (every row)' if per_condition is None else
+                 f', the lowest-energy {k} per condition (seed_rows_per_condition)'))
+        return (source.batch.subsample_new_batch(rows[i:j])
+                for i, j in chunk_bounds(int(rows.numel()), COMPACT_CHUNK_ROWS))
+
+    def _resolve_anchor_capacity(self, source):
+        """The anchor buffer's capacity on this route: the larger of the configured
+        `buffers.anchor_buffer.max_size` and the rows the buffer holds when it is seeded or
+        restored (owner decision 2026-10-01). Written back to `args.buffers.anchor_buffer.
+        max_size`, which is what train.py's admission and thin read; printed either way."""
+        buf = getattr(self, 'anchor_buffer', None)
+        if buf is None:
+            return
+        cfg = self.args.buffers.anchor_buffer
+        configured, held = int(cfg.max_size), len(buf)
+        cfg.max_size = max(configured, held)
+        print(f'anchor_buffer [{source}]: capacity {int(cfg.max_size):,} rows = max(configured '
+              f'buffers.anchor_buffer.max_size {configured:,}, {held:,} rows held)')
+
     def _bake_rows(self, batch, states, chunk: int = 2048):
         """Baked ``conformer_energy`` (T = 1) for ``states`` on ``batch``'s rows, ``[n]``.
 
@@ -2075,8 +2465,19 @@ class ConformerModeller(Modeller):
         # read by nothing.
         graph_prior = getattr(self.args, 'prior_path', None)
         if graph_prior:
-            blob = self._read_graph_file(graph_prior, 'prior')
+            from energies.conformer_data import PRIOR_GRAPH_FORMAT, is_compact_prior
+            blob = torch.load(graph_prior, weights_only=False, map_location='cpu')
+            if is_compact_prior(blob):
+                # COMPACT FORM: state, energy and condition per row. Joined to the conditions
+                # table without a graph per row ever being built.
+                self._init_compact_prior_dataset(blob, graph_prior)
+                return
+            self._require_graph_file(blob, graph_prior, 'prior')
             batch = blob.get('equalized_prior', None) or blob['prior']
+            print(f'prior file {graph_prior}: GRAPH form ({PRIOR_GRAPH_FORMAT}), one full '
+                  f'condition graph per row, read WHOLE ({batch.num_graphs:,} rows) before it '
+                  f'is compacted. build_conformer_set.py now writes the compact form, which '
+                  f'is joined to the conditions table without that.')
             # CAST TO THE RUN'S DTYPE. build_conformer_conditions runs under float64 for its
             # geometry checks, so every float tensor on the file is double while the run is
             # float32. Storage precision is only free where the tensor never meets a
@@ -2085,6 +2486,7 @@ class ConformerModeller(Modeller):
             # dtype` at the first matmul rather than merely wasting memory.
             batch = self._as_run_dtype(batch)
             self._refuse_stereo_mismatch(batch, graph_prior, 'prior')
+            self._refuse_reference_mismatch(batch, graph_prior, 'prior')
             e_t = getattr(batch, 'conformer_energy', None)
             if e_t is None:
                 raise SystemExit(

@@ -1,4 +1,4 @@
-"""pool_oct02: writes the five job scripts (submit_premerge / polish / merge / flood / assemble .sbatch) from one shared
+"""pool_oct02: writes the six job scripts (submit_premerge / export / polish / merge / flood / assemble .sbatch) from one shared
 header and container call, so the stages cannot drift apart. Run before make.py (which sets their --array lines).
 
     python configs/pool_oct02/make_sbatch.py
@@ -29,11 +29,12 @@ WORKDIR=${{PROJECT_ROOT}}/gfn-diffusion/energy_sampling
 ARMS=${{WORKDIR}}/configs/pool_oct02
 PYLIBS=/scratch/mk8347/pylibs
 DATA=/scratch/mk8347/data/crystal_datasets/pooled_oct02
+PRIORS=/scratch/mk8347/data/crystal_datasets/conditional/priors
 UMA=/scratch/mk8347/models/uma/esen_s.pt
 '''
 SYSROW = '''
 ROW=$((SLURM_ARRAY_TASK_ID + 2))
-read -r NAME SG KEY TSF MOL PRE WINDOW <<< "$(awk -F'\\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7, $8}' ${ARMS}/SYSTEMS.tsv)"
+read -r NAME SG KEY TSF MOL PRE WINDOW RADIUS CEILING <<< "$(awk -F'\\t' -v n=${ROW} 'NR==n {print $2, $3, $4, $5, $6, $7, $8, $9, $10}' ${ARMS}/SYSTEMS.tsv)"
 if [ -z "${NAME}" ]; then echo "no system at task ${SLURM_ARRAY_TASK_ID}" >&2; exit 1; fi
 '''
 RUN = '''
@@ -179,15 +180,19 @@ echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} flood ${NAME} shard ${SHA
 
 # ---------------------------------------------------------------- assemble
 w('submit_assemble.sbatch', HEAD.format(
-    time='04:00:00', gres=GPU, mem='96G', cpus=8, signal='', job='po_assemble', doc=
+    time='06:00:00', gres=GPU, mem='128G', cpus=8, signal='', job='po_assemble', doc=
     '''# pool_oct02 assemble: one task = one system of SYSTEMS.tsv: data_processing/pool_assemble.py on anchors.pt
-# and every flood shard -> <system>/<system>_pooled_oct02_prior.pt (anchors + flood, latent de-dupe, normaliser images;
-# 'prior' and 'equalized_prior' hold the same rows; a sample of rows re-scored). Environment: DEDUPE (default 0.01, the
-# latent radius), TARGET_ROWS (default 400000: the flood radius widens until the file holds at most that many rows).''') + SYSROW + '''
+# and every flood shard -> <system>/<system>_pooled_oct05_prior.pt and its .summary.json (anchors + flood states under
+# the system's ceiling, thinned in the trainer latent at the system's radius, normaliser images; 'prior' and
+# 'equalized_prior' hold the same rows; a sample of rows re-scored), then both files copied into ${PRIORS}. The radius
+# and the ceiling are the SYSTEMS.tsv columns (make.py: RADIUS_MULT x KICK, CEILING); there is no row budget.''') + SYSROW + '''
 if [ ! -d "${DATA}/${NAME}/flood" ]; then echo "${NAME}: no flood yet; nothing to assemble"; exit 0; fi
-echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} assemble ${NAME} start=$(date -Is)"
-''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors.pt ${DATA}/${NAME}/flood \\
-            ${DATA}/${NAME}/${NAME}_pooled_oct02_prior.pt --sg ${SG} --key ${KEY} --mol ${MOL} --mlip_path ${UMA} \\
-            --dedupe ${DEDUPE:-0.01} --target-rows ${TARGET_ROWS:-400000}
+if [ -z "${RADIUS}" ] || [ -z "${CEILING}" ]; then echo "FATAL: no radius/ceiling for ${NAME} in SYSTEMS.tsv" >&2; exit 1; fi
+OUT=${DATA}/${NAME}/${NAME}_pooled_oct05_prior.pt
+echo "JOB ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} assemble ${NAME} radius ${RADIUS} ceiling ${CEILING} kT start=$(date -Is)"
+''' + RUN.format(nv='--nv', pwd='${WORKDIR}', body='''        python -u -m data_processing.pool_assemble ${DATA}/${NAME}/anchors.pt ${DATA}/${NAME}/flood ${OUT} \\
+            --sg ${SG} --key ${KEY} --mol ${MOL} --mlip_path ${UMA} --radius ${RADIUS} --ceiling_kT ${CEILING} || exit 1
+        cp -v ${OUT} ${OUT}.summary.json ${PRIORS}/ || exit 1
+        cat ${OUT}.summary.json
     '''))
 print('wrote 6 sbatch files')

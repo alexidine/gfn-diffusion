@@ -1,0 +1,10 @@
+# inn_oct18f arms, read by submit_inn_oct18f.sbatch when each array task STARTS (edit a queued arm here, in place).
+# Columns (tab-separated, 6): index, arm, model flags (both stages), stage-1 flags, stage-2 flags, stage-2 start.
+# '-' in the stage-1 or stage-2 column means no extra flags; a start of '-' means the arm runs its own stage 1 and
+# stage 2 starts from its best.pt, any other start is a checkpoint path relative to energy_sampling/ and stage 1 is
+# skipped. The flags common to every arm are in common.args. Order 8.11.10.9.7.6.5.4.3.2.1.0 is the sharpness-rule order.
+# --min_bin_height 1e-5: the spline's bin heights floored at 1e-5 instead of 1e-3 on every row (default rows 'all').
+0	fl_s0	--n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0	-	--updates_per_batch 1 --min_bin_height 1e-5	artifacts/inn_proto/inn17_sharp1_nz_s0_mle/best.pt
+1	fl_upb2	--n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0	-	--updates_per_batch 2 --min_bin_height 1e-5 --energy_warmup 400 --z_half_life 40	artifacts/inn_proto/inn17_sharp1_nz_s0_mle/best.pt
+2	fl_long	--n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0	-	--updates_per_batch 1 --min_bin_height 1e-5 --budget_minutes 700 --max_minutes 740	artifacts/inn_proto/inn17_sharp1_nz_s0_mle/best.pt
+3	fl_lrhalf	--n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0	-	--updates_per_batch 1 --min_bin_height 1e-5 --lr_energy 1.5e-4	artifacts/inn_proto/inn17_sharp1_nz_s0_mle/best.pt

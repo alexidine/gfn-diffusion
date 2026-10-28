@@ -1,0 +1,57 @@
+{
+ "file": "acridine_mace_pooled_oct05_prior.pt",
+ "bytes": 3427422543,
+ "rows": 3203168,
+ "radius": 0.0312,
+ "ceiling_kT": 10.0,
+ "folded": true,
+ "anchors_in": 10986,
+ "flood_states_in": 1131800,
+ "anchors_under_ceiling": 10986,
+ "flood_states_under_ceiling": 815291,
+ "dropped_before_thinning": {
+  "anchors_outside_box": 64,
+  "flood_outside_box": 0,
+  "anchors_density": 374,
+  "flood_density": 318497
+ },
+ "anchors_after_thinning": 10433,
+ "flood_states_after_thinning": 389966,
+ "states_outside_latent_box": 0,
+ "states_with_density_penalty": 0,
+ "states_outside_latent_box_after_fold": 3,
+ "states_kept": 400396,
+ "anchor_rows": 83464,
+ "energy_min": -32.59843444824219,
+ "energy_max": -7.658614635467529,
+ "energy_key": "mace",
+ "kept_states_by_band_anchors_walk": {
+  "0 kT to 1 kT": [
+   106,
+   5
+  ],
+  "1 kT to 2 kT": [
+   642,
+   451
+  ],
+  "2 kT to 5 kT": [
+   9685,
+   70995
+  ],
+  "5 kT to 10 kT": [
+   0,
+   318512
+  ],
+  "10 kT to the ceiling": [
+   0,
+   0
+  ]
+ },
+ "check": {
+  "rows": 2000,
+  "median_abs": 0.00147247314453125,
+  "max_abs": 0.00736236572265625,
+  "reduction_max": 0.0
+ },
+ "commit": "2dfc11f353542ff86cfb43c61769d1d9c70608ca"
+}

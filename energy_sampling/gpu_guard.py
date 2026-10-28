@@ -312,9 +312,13 @@ def read_config(path):
     try:
         import yaml
         with open(path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            cfg = yaml.safe_load(f)
     except Exception:
         return None
+    # a sectioned `model: {kind, shared, sde, nf}` block resolved to the flat form the signature reads
+    # (config_invariants.canonical_model_section); outside the try, so a malformed model block fails loudly
+    from config_invariants import canonical_model_section
+    return canonical_model_section(cfg)
 
 
 def _get(cfg, key, default=None):

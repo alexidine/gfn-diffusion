@@ -1,0 +1,19 @@
+# inn_mip_oct26 stage-1 configurations, read when a job STARTS. Columns (tab-separated, 5): key, flags of both
+# stages (architecture and seed), flags of stage 2 only, memory weight (a run's share of the card is 0.9 x its
+# weight / the sum over the runs of its phase), description. A job runs one stage 1 per key its arms name, as
+# <key>_mle_<group>; '-' = none.
+base	-	--tf_fp32	1	the recipe
+base_s1	--set seed=1 --split_seed 12346	--tf_fp32	1	seed 1: other data and draw streams (the initial weights are base's: model building reseeds torch)
+nofloor	--min_bin_height none	--tf_fp32	1	no bin-height floor in either stage (the spline default 1e-3)
+bins16	--n_bins 16	--tf_fp32	0.9	16 bins
+bins64	--n_bins 64	--tf_fp32	1.2	64 bins
+unbounded	--bounded_rows none	--tf_fp32	1	linear rows with tails (no bounded rows)
+blocks2	--n_blocks 2 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0,0.1.2.3.4.5.6.7.9.10.11.8	--tf_fp32	2	two blocks, the second in the reversed order
+order_nat	--block_orders 0.1.2.3.4.5.6.7.8.9.10.11	--tf_fp32	1	one block in the natural row order
+untied	--no-tied_derivatives	--tf_fp32	1	free knot derivatives
+made	--conditioner made --hidden 512 --hidden_layers 2	-	0.6	MADE conditioner, 512 x 2
+tf_small	--tf_width 128 --tf_layers 2	--tf_fp32	0.5	transformer 128 x 2
+tf_large	--tf_width 384 --tf_layers 6	--tf_fp32	1.6	transformer 384 x 6
+tf_deep	--tf_layers 8	--tf_fp32	1.2	transformer 256 x 8
+norm_rms	--tf_norm rms	--tf_fp32	1	RMSNorm
+norm_none	--tf_norm none	--tf_fp32	1	no normalisation

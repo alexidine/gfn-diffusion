@@ -1,0 +1,4 @@
+arm	family	start	warm_src	prior	prior_bytes	src_step
+qf30_frc_ctl	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	150000
+qf30_frc_g0	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	150000
+qf30_frc_g1	qm9full	continued	qf30_fwdF_lr5	qm9full_prior.pt	2433322986	150000

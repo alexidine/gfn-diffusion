@@ -14,7 +14,11 @@ relaxation and takes the given geometry as the reference. What each test would c
   * a stored-reference build that runs the embedding (``seed`` must not matter);
   * ConformerModeller's energy init building a member from anything but the conditions file's
     stored reference, reading that file more than once, or accepting a member that does not
-    reproduce it.
+    reproduce it;
+  * the reference-table builder embedding its member where the conditions file stores one;
+  * ``release_batch_cache`` changing an energy, a built member or a thermal-tiled set member
+    keeping its batched force field (1 to 2 MB a member), and the conformer energy losing the
+    two names train.py's energy-reference path reads off it.
 
 The molecules cover an aromatic ring MMFF re-types (4-pyridone), a nitrile (transverse pair), an
 alkyne (dummy frame), a ring, and tagged stereocentres and a double bond under the stereo lock.
@@ -190,3 +194,84 @@ def test_the_modeller_builds_each_member_from_the_conditions_file(tmp_path, monk
     rd, perm, pos = refs[ident]
     with pytest.raises(SystemExit, match='do not reproduce'):
         m._check_stored_references({ident: (rd, np.roll(perm, 1), pos)}, 0.0)
+
+
+def test_the_reference_builder_builds_its_member_from_the_stored_reference():
+    """build_conformer_references.build_member(pos=, z=): a rigidly rotated stored reference,
+    which no embedding produces, comes back as the member's own."""
+    import build_conformer_references as bcr
+    from energies.conformer_torsions import ConformerTorsions
+    kw = {k: v for k, v in KW.items()}
+    for smiles in MOLECULES[:3]:
+        fresh = ConformerTorsions(smiles=smiles, device='cpu', **kw)
+        c, s = math.cos(0.7), math.sin(0.7)
+        rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        pos = fresh.ref_pos.numpy() @ rot.T
+        member = bcr.build_member(smiles, kw, pos=pos, z=np.asarray(fresh.spec.z))
+        assert member.reference_source == 'stored'
+        assert bcr.check_member_matches(member, np.asarray(fresh.spec.z), pos) == 0.0
+        assert bcr.build_member(smiles, kw).reference_source == 'embedded'
+
+
+# ------------------------------------------------------------------ the batch cache
+
+
+def _cache_sizes(member):
+    assert set(member._tree_cache) == set(member._ff_cache)
+    return set(member._tree_cache)
+
+
+def test_releasing_the_batch_cache_changes_no_energy():
+    """release_batch_cache drops every cached batch but size 1, and the next evaluation is
+    the one before it, bit for bit."""
+    from energies.conformer_data import bake_energies
+    from energies.conformer_torsions import ConformerTorsions
+    en = ConformerTorsions(smiles='C[C@@H](O)[C@H](N)CC', device='cpu', **KW)
+    x = torch.as_tensor(np.random.default_rng(1).uniform(-1, 1, (7, en.data_ndim)))
+    with torch.no_grad():
+        before = bake_energies(en, x)
+    assert 7 in _cache_sizes(en)
+    en.release_batch_cache()
+    assert _cache_sizes(en) <= {1}
+    with torch.no_grad():
+        assert torch.equal(bake_energies(en, x), before)
+
+
+def test_a_built_member_and_a_tiled_set_member_keep_no_batch_cache():
+    """What grows host (and device) memory by 1 to 2 MB a member: the batch build_member's
+    checks leave on the member, and the one the thermal tile's curvature evaluation leaves
+    on every member of a set."""
+    import build_conformer_conditions as bcc
+    from energies.multi_conformer import MultiConformerTorsions
+    from energies.thermal_tile import ThermalTile
+    mb = bcc.build_member('CCCO', 'CCCO', KW, carrier=True)
+    assert _cache_sizes(mb.energy) <= {1}
+    smis = ['CCCO', 'CCCCO', 'CC(C)CO']
+    en = MultiConformerTorsions(smis, identifiers=smis, device='cpu', **KW)
+    tile = ThermalTile(en)
+    for ident in smis:
+        sigma, _ = tile.widths(ident)
+        assert float(sigma.abs().sum()) > 0
+        member = en._members[ident]
+        if member is not en:
+            assert _cache_sizes(member) <= {1}, ident
+
+
+def test_the_conformer_energy_carries_the_trainers_energy_reference_surface():
+    """train.py::Modeller.train wraps the prior intake in energy_function.allow_unreferenced(),
+    init_energy_reference reads energy_function.energy_reference_mode, and the absolute reward
+    floors call energy_function.unreferenced_log_r; without them on this energy the conformer
+    route dies at startup or at its first floor. The mode is None: nothing is installed."""
+    from energies.conformer_torsions import ConformerTorsions
+    from energies.molecular_crystal import resolve_energy_reference
+    en = ConformerTorsions(smiles='CCCO', device='cpu', **KW)
+    with en.allow_unreferenced():
+        pass
+    log_r = torch.tensor([-3.0, 0.5])
+    assert en.unreferenced_log_r(log_r, torch.tensor([0, 1])) is log_r
+
+    def never():
+        raise AssertionError('a table was computed with no reference mode')
+    assert resolve_energy_reference(en.energy_reference_mode, None, never, 1.0) is None
+    assert resolve_energy_reference(en.energy_reference_mode, {'mode': None, 'table': None},
+                                    never, 1.0) is None

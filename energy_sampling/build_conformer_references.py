@@ -323,11 +323,23 @@ def _float64():
         torch.set_default_dtype(old)
 
 
-def build_member(smiles: str, kwargs: Mapping):
+def build_member(smiles: str, kwargs: Mapping, pos=None, z=None):
     """The member exactly as ``MultiConformerTorsions`` builds it (``ConformerTorsions(smiles=
-    ..., **kw)``), on the CPU in float64."""
-    from energies.conformer_torsions import ConformerTorsions
-    return ConformerTorsions(smiles=smiles, device='cpu', dtype=torch.float64, **dict(kwargs))
+    ..., **kw)``), on the CPU in float64.
+
+    With ``pos`` (and ``z``), the conditions file's stored reference in placement order, the
+    member is built FROM IT, as the run builds it (``ConformerModeller.init_energy_function``):
+    no embedding, so the member is the file's under any RDKit. A stored geometry that is not
+    this molecule in the derived placement order raises ``ValueError``.
+    """
+    from energies.conformer_torsions import ConformerTorsions, rdkit_order_reference
+    kwargs = dict(kwargs)
+    rd = None
+    if pos is not None:
+        rd, _ = rdkit_order_reference(smiles, np.asarray(pos, dtype=np.float64),
+                                      level=kwargs.get('level'), z=z)
+    return ConformerTorsions(smiles=smiles, device='cpu', dtype=torch.float64,
+                             reference_positions=rd, **kwargs)
 
 
 def check_member_matches(member, z, pos, tol: float = REF_POS_TOL) -> float:
@@ -367,13 +379,36 @@ def rdkit_positions(member, states) -> np.ndarray:
     return rd
 
 
-def _perceive(mol, rd_pos):
-    """A copy of ``mol`` at ``rd_pos`` with its stereo perceived from that geometry."""
+def _nitrogens(member) -> tuple:
+    """The stereo nitrogens ``member``'s lock holds (RDKit atom indices), () unless it was
+    built under ``lock_stereo_nitrogen`` (``ConformerTorsions.stereo_nitrogen_atoms``)."""
+    return tuple(getattr(member, 'stereo_nitrogen_atoms', ()) or ())
+
+
+def _perceive(mol, rd_pos, nitrogens=()):
+    """A copy of ``mol`` at ``rd_pos`` with its stereo perceived from that geometry.
+
+    ``nitrogens`` are the member's locked stereo nitrogens. RDKit's 3D perception writes no
+    tag on an N and, without it, drops a carbon that is a stereocentre only together with one
+    (energies/stereo_lock.py::perceive_with_nitrogens), so with any the perception runs as its
+    own three steps with those N tags written from the chiral volume before the assignment,
+    and written again after it: on this explicit-H graph the assignment can drop a stereo
+    nitrogen RDKit reports only on the hydrogen-free one, and the member's own rule has
+    already said these are stereo elements. Empty, this is RDKit's perception as before.
+    """
     from rdkit import Chem
 
     m = Chem.Mol(mol)
     m.GetConformer().SetPositions(np.ascontiguousarray(rd_pos, dtype=np.float64))
-    Chem.AssignStereochemistryFrom3D(m)
+    if not nitrogens:
+        Chem.AssignStereochemistryFrom3D(m)
+        return m
+    from energies.stereo_lock import assign_nitrogen_tags_from_3d
+    Chem.DetectBondStereochemistry(m)
+    Chem.AssignAtomChiralTagsFromStructure(m, replaceExistingTags=True)
+    assign_nitrogen_tags_from_3d(m, nitrogens)
+    Chem.AssignStereochemistry(m, cleanIt=True, force=True)
+    assign_nitrogen_tags_from_3d(m, nitrogens)
     return m
 
 
@@ -382,6 +417,19 @@ def _isomer_smiles(m) -> str:
     condition. RemoveHs keeps an H that defines double-bond stereo, so =NH E/Z survives."""
     from rdkit import Chem
     return Chem.MolToSmiles(Chem.RemoveHs(m))
+
+
+def _isomer_of(m, nitrogens=()) -> str:
+    """``_isomer_smiles(m)``; with locked stereo ``nitrogens`` the string is written instead
+    from the hydrogen-free view perceived with them
+    (``stereo_lock.perceive_with_nitrogens``), the graph on which their tags are part of the
+    canonical form."""
+    if not nitrogens:
+        return _isomer_smiles(m)
+    from rdkit import Chem
+
+    from energies.stereo_lock import perceive_with_nitrogens
+    return Chem.MolToSmiles(perceive_with_nitrogens(m))
 
 
 def _stereo_elements(m):
@@ -431,6 +479,9 @@ def condition_stereo(member) -> dict:
         no module here changes it, so this fires only if that default moves;
       * a reference conformer that does not realise the SMILES's configuration at a
         specified element, including an element 3D perception returns nothing for (N).
+
+    A member built under ``lock_stereo_nitrogen`` pins its tagged stereo nitrogens too: their
+    configuration on a geometry is the sign of the chiral volume (``_perceive``).
     """
     from rdkit import Chem
 
@@ -454,7 +505,8 @@ def condition_stereo(member) -> dict:
                          f'member\'s mol, so the SMILES\'s stereo tags cannot be placed on it')
     atoms, bonds = _stereo_elements(tmpl)
     k = int(member.ndim)
-    ref = _perceive(mol, rdkit_positions(member, torch.zeros(1, k))[0])
+    nit = _nitrogens(member)
+    ref = _perceive(mol, rdkit_positions(member, torch.zeros(1, k))[0], nit)
     target = _labels(ref, atoms, bonds)
     want = _labels(tmpl, atoms, bonds)
     if target != want:
@@ -464,12 +516,12 @@ def condition_stereo(member) -> dict:
                 for j, a, b in zip(bonds, target[len(atoms):], want[len(atoms):]) if a != b]
         raise ValueError(f'{member.smiles!r}: the member\'s reference conformer is not the '
                          f'condition\'s stereoisomer at {", ".join(bad)} (3D perception gives '
-                         f'{_isomer_smiles(ref)!r}; an element it returns no configuration for, '
-                         f'such as a tetrahedral N, cannot be pinned)')
+                         f'{_isomer_of(ref, nit)!r}; an element it returns no configuration '
+                         f'for, such as a tetrahedral N, cannot be pinned)')
     p_atoms, p_bonds = _stereo_elements(ref)
     open_atoms = [i for i in p_atoms if i not in atoms]
     open_bonds = [j for j in p_bonds if j not in bonds]
-    stereo = _isomer_smiles(ref)
+    stereo = _isomer_of(ref, nit)
     pin = 'none' if not (atoms or bonds) else ('partial' if open_atoms or open_bonds else 'full')
     if pin == 'full' and stereo != Chem.MolToSmiles(parsed):
         # every perceived element is specified and agrees, so the isomers must be one string
@@ -493,13 +545,16 @@ def stereo_signatures(member, states) -> List[str]:
     Two states of one member are the same stereoisomer exactly when these strings agree:
     the graph is fixed, so only the perceived tetrahedral and double-bond tags can differ.
     """
-    return [_isomer_smiles(_perceive(member.mol, p)) for p in rdkit_positions(member, states)]
+    nit = _nitrogens(member)
+    return [_isomer_of(_perceive(member.mol, p, nit), nit)
+            for p in rdkit_positions(member, states)]
 
 
 def stereo_labels(member, states, pin: Mapping) -> List[tuple]:
     """Each state's configuration at the PINNED elements; equal to ``pin['target']`` exactly
     when the state is the condition's stereoisomer there."""
-    return [_labels(_perceive(member.mol, p), pin['atoms'], pin['bonds'])
+    nit = _nitrogens(member)
+    return [_labels(_perceive(member.mol, p, nit), pin['atoms'], pin['bonds'])
             for p in rdkit_positions(member, states)]
 
 
@@ -574,8 +629,8 @@ def etkdg_starts(member, n_seeds: int, ref_seed: int, pin: Mapping, mmff: bool =
             if info['etkdg_failed'] >= ETKDG_MAX_FAILURES:
                 break
             continue
-        if _pinned(pin) and (_labels(_perceive(member.mol, rd), pin['atoms'], pin['bonds'])
-                             != pin['target']):
+        if _pinned(pin) and (_labels(_perceive(member.mol, rd, _nitrogens(member)),
+                                     pin['atoms'], pin['bonds']) != pin['target']):
             info['etkdg_other_stereo'] += 1
             continue
         x = _state_of_positions(member, tree, rd)
@@ -732,7 +787,7 @@ def compute_entry(identifier: str, smiles: str, z, pos, kwargs: Mapping, search:
     cost = {}
     with _float64():
         t = time.perf_counter()
-        member = build_member(smiles, kwargs)
+        member = build_member(smiles, kwargs, pos=pos, z=z)
         pos_gap = check_member_matches(member, z, pos)
         k = int(member.ndim)
         pin = condition_stereo(member)
@@ -1147,7 +1202,13 @@ def load_references(path, *, conditions_path, energy_kwargs,
                         f'table was built from {stamp["conditions"]["path"]} with '
                         f'{stamp["conditions"]["sha256"][:16]}...')
     want = defining_energy(member_kwargs(energy_kwargs))
-    have = stamp['energy']
+    # AN ARGUMENT THE STAMP DOES NOT NAME TAKES ITS CODE DEFAULT, the rule `defining_energy`
+    # applies to a config: a table stamped before an argument existed was built under what is
+    # now that argument's default (`double_bond_box_deg`, None), not under "absent".
+    have = dict(stamp['energy'])
+    for name, p in _ct_parameters().items():
+        if name in want and name not in have and p.default is not inspect.Parameter.empty:
+            have[name] = _plain(p.default)
     for k in sorted(set(want) | set(have)):
         if want.get(k, '<absent>') != have.get(k, '<absent>'):
             problems.append(f'energy {k}: run has {want.get(k, "<absent>")!r}, table has '

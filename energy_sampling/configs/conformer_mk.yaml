@@ -349,9 +349,12 @@ model:
   # (ConformerModeller._SET_POLICY_KEYS) and stamped into gfn_config['conformer'], which
   # the checkpointer rebuilds the head from.
   policy_kind: set             # 'flat' | 'set'. On a carrier or multi-molecule set, 'set' builds RaggedConditionalSetPolicy: tokens over each row's valid columns, conditioned on the molecule embedding
+  backward_policy_kind: set    # 'flat' | 'set'. flat: P_B is the flat network over the state encoding (a coordinate is its carrier column). set: P_B is a second RaggedConditionalSetPolicy of the forward head's sizes, on the raw state, the time embedding and the molecule (ConformerGFN._pb_net); needs the ragged forward head. Stored in the checkpoint's conformer block; absent there or here means flat
   set_policy_hidden: 128       # per-token width
   set_policy_layers: 4         # token-mixing layers
   set_policy_corr_dim: 32      # width of the learned per-column correlation features
+  set_policy_mix_layers: 2      # attention blocks among one molecule's coordinate tokens before pooling (models/ragged_set_policy.py::TokenMixer), biased per head by how many defining atoms two coordinates share; output projections start at zero, so a fresh block is the identity. 0 = none. Both policies. Stored in the checkpoint's conformer block; absent there means 0
+  set_policy_mix_heads: 4       # attention heads per mixing block; must divide set_policy_hidden
 
 # training params
 ################################################################
@@ -948,8 +951,9 @@ buffers:
     # at every construction and restore, and the anchor draw falls through to UNIFORM --
     seed_source: 'prior_dataset'   # domain rule (configs/problems.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
     seed_relax_steps: 0        # > 0 = seed from prior draws relaxed this many steps, stored as rows of the energy's own `smiles` condition (ConformerModeller.init_anchor_buffer_seed); 0 = seed from the prior dataset itself
-    max_size: 40000
-    dup_cutoff: 0.05          # state L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates
+    seed_rows_per_condition: null  # seed_source 'prior_dataset' on a compact prior dataset (a condition set): null = every row is seeded; N = each condition's lowest-energy N rows (ConformerModeller._anchor_seed_row_batches). Unread on a graph-row prior dataset (one molecule, or seed_relax_steps > 0), which seeds every row
+    max_size: 40000  # capacity = max(this, the rows the anchor buffer holds once seeded or restored): the seed is never cut to it (ConformerModeller._resolve_anchor_capacity). Admission and thin read the resolved value
+    dup_cutoff: 0.05         # state L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates
     # Energy windows above that condition's Emin(c), in the energy function's units
     # (kcal/mol on this route): screen spends confirm budget only inside its window;
     # thin discards what lies outside its looser one.
@@ -1020,7 +1024,11 @@ energy_config:
   temperature: 1.0            # not a ConformerTorsions parameter (dropped with a printed line); utils.problem_slug names the checkpoint from it
   log_temperature_range: [ 0.0, 0.0 ]  # read only under temperature_conditioning
   energy_clip: 300.0          # SOFT clip on the force-field potential, absolute kcal/mol: above it U -> clip + log1p(U - clip), identity below. Applied before the box wall and the measure terms. null = off
+  sibling_offset_box_deg: null   # sibling dihedrals (the rows placing one atom's children on one frame) as one rotation plus bounded offsets, degrees. null: each row has its own periodic column. W in (0, 180): in each eligible group of two or more rows (ConformerTorsions.sibling_offset_census: the centre is not a ring atom and is a four-neighbour centre the stereo lock names; no transverse, dummy-frame or held row) the first row's column, still periodic, turns the whole group, and every other row's column is its dihedral minus the first row's, reference +/- W at x = +/-1, non-periodic, with the box wall (ConformerTorsions block 5); needs stereo_coeff > 0. Changes the chart of every member with such a group: conditions, prior and reference files are built at one value
+  double_bond_box_deg: null   # box of the dihedral about a double bond the stereo lock holds, degrees. null: an ordinary periodic column, one full turn. W in (0, 90): a bounded, non-periodic column, reference +/- W at x = +/-1, with the box wall (ConformerTorsions block 4); needs stereo_coeff > 0. Changes the chart of every member with such a bond: conditions, prior and reference files are built at one value
+  energy_clip_origin: reference  # what energy_clip is measured from. absolute: the cutoff is energy_clip. reference: the cutoff is energy_clip above each member's own unclipped potential at its reference conformer (ConformerTorsions.install_clip_floor), installed at init before any row is scored. Read by ConformerModeller, not a ConformerTorsions argument
   stereo_coeff: 300.0         # STEREO LOCK stiffness, kcal/mol: adds stereo_coeff * sum_e relu(lo_e - s_e v_e)^2 over each member's four-coordinate atoms and stereo double bonds (energies/stereo_lock.py) to U before energy_clip. 0 = off. Nonzero: construction refuses a member it cannot pin (ChartRefused stereo_* codes, e.g. a SMILES leaving a stereo element unassigned), and the set builder refuses a member its thermal check fires on. Fixed for the run: a condition graph built under another value (ctree_stereo_coeff) is refused, and a coeff_schedule or anneal that changes it raises
+  lock_stereo_nitrogen: false  # false: every three-neighbour N is free; its tag is stripped from a condition's identity and refused when the lock is on. true: a stereo nitrogen (energies/stereo_lock.py::stereo_nitrogens: three single bonds to non-hydrogen atoms and a tetrahedral element by RDKit's rule on the parsed SMILES, i.e. an N in a three-membered ring or a bridgehead N) is a stereo element: its tag is part of the identifier, a SMILES leaving a stereogenic one untagged is refused (stereo_unspecified) and the set builder enumerates it, a tagged one gets a lock element whose sign is read off the reference and compared with the sign the tag asks for (stereo_verify_failed otherwise; stereo_lock_in_band below MIN_MARGIN), and the prior does not reflect it; needs stereo_coeff > 0. Changes which SMILES are conditions: a set, its prior and its reference table are built at one value; a database is read by identifier across both (build_conformer_database.py::IDENTITY_KWARGS)
   # the fitted InternalPrior, loaded at energy init; on a carrier set the prior dataset
   # is drawn from it per member. A path relative to the working directory
   # (energy_sampling/); the battery generator writes an absolute cluster path.

@@ -184,7 +184,7 @@ def energy_component_stats(en, x, prefix: str = 'E/', hist: bool = True) -> dict
             clipped = _host(en.potential_energy(
                 torch.as_tensor(x, dtype=en.dtype, device=en.device), one), np.float64)
         _quantiles(clipped, f'{prefix}clipped_total', out, hist=hist)
-        out[f'{prefix}clip_active_frac'] = float((total > en.energy_clip).mean())
+        out[f'{prefix}clip_active_frac'] = float((total > en.clip_cutoff).mean())
         out[f'{prefix}energy_clip'] = float(en.energy_clip)
     return out
 
@@ -323,9 +323,17 @@ def thermal_stats(en, energies, e_min: float, prefix: str = 'E/') -> dict:
 def _dof_class_columns(en):
     """State columns per DoF class, as ``{class_name: index array}``."""
     block = _host(en._free_block)
-    return {'r': np.flatnonzero(block == 0),
-            'theta': np.flatnonzero(block == 1),
-            'phi': np.flatnonzero(block == 2)}
+    out = {'r': np.flatnonzero(block == 0),
+           'theta': np.flatnonzero(block == 1),
+           'phi': np.flatnonzero(block == 2)}
+    # a bounded double-bond dihedral (block 4) is its own class, present only on a chart
+    # that has one, so every other chart's key set is unchanged
+    if (block == 4).any():
+        out['double_bond'] = np.flatnonzero(block == 4)
+    # a sibling offset (block 5) likewise; its group's leader column stays in 'phi'
+    if (block == 5).any():
+        out['sibling_offset'] = np.flatnonzero(block == 5)
+    return out
 
 
 def geometry_stats(en, x, prefix: str = 'geom/') -> dict:
@@ -497,7 +505,10 @@ def dof_element_stats(en, x, reference=None, prefix: str = 'dof_elem/') -> dict:
     out = {}
     # 'transverse' groups a linear bend's u and v by the element of its vertex; it appears
     # only on a molecule that has one, so every other molecule's key set is unchanged
-    for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi'), (3, 'transverse')):
+    # 'double_bond' likewise groups the bounded dihedrals of locked double bonds (block 4),
+    # and 'sibling_offset' the bounded offsets of sibling groups (block 5)
+    for cls, cname in ((0, 'r'), (1, 'theta'), (2, 'phi'), (3, 'transverse'),
+                       (4, 'double_bond'), (5, 'sibling_offset')):
         for zval in np.unique(owner):
             idx = np.flatnonzero((block == cls) & (owner == zval))
             if idx.size == 0:

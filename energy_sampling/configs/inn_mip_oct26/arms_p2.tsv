@@ -1,0 +1,10 @@
+# inn_mip_oct26 job p2 (sbatch --export=ALL,ARMS_TSV=arms_p2.tsv submit_inn_mip26.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, stage-1 key (stage1.tsv), stage-2 flags (later flags win;
+# '-' = none), description.
+6	base_p2	base	-	the recipe: job p2's own reference
+7	knee_fwd30	base	--beta 30 --bank_beta 10	fresh-branch Huber knee 30; --beta also moves the Huber root (the level); --bank_beta 10 keeps the replay knee at base
+8	knee_fwd_inf	base	--beta 1e6 --bank_beta 10	fresh branch quadratic (no knee); --beta also moves the Huber root (the level); --bank_beta 10 keeps the replay knee at base (at 1e6 the root is the plain mean of log w)
+9	knee_data10	base	--beta_data 10	stored-row knee 10
+10	knee_pos30	base	--beta_pos 30	positive fresh residuals knee 30
+11	mle01	base	--w_mle 0.1	likelihood term on the stored rows, weight 0.1
+12	iw	base	--w_iw 1	self-normalised importance-weighted likelihood of the draws (one group: the whole batch of 2,000)

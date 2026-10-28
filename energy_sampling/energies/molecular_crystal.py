@@ -24,18 +24,47 @@ from mxtaltools.mlip_interfaces.uma_utils import (init_uma_crystal_predictor,
                                                   drain_uma_phase_timing)
 
 
+#: MolecularCrystal(crystal_coordinates=...): the trainer latent, or crystal_fd's fundamental-domain chart
+CRYSTAL_COORDINATES = ('latent', 'fd')
+#: any radius: the FD chart's width and circle rows do not depend on it (only its length box does)
+FD_LAYOUT_RADIUS = 4.0
+
+
+#: crystal_coordinates 'fd': rows are clamped this far inside [-1, 1] before a crystal is built (fd_rows_to_params)
+FD_OPEN_EPS = 1e-6
+
+#: the packing-coefficient range density_penalty leaves unpenalised; also a pre-noised prior's default load window
+#: (noised_prior.packing_window)
+PACKING_COEFF_WINDOW = (0.55, 0.95)
+
+
 def density_penalty(packing_coeff, turnover = 1):
     """
     draw crystals into the physically reasonable region
     :param packing_coeff:
     :return:
     """
+    lo, hi = PACKING_COEFF_WINDOW
     cp = packing_coeff.clamp_min(1e-6)          # numerical guard only, NOT a gradient cap
-    u = F.relu(np.log(0.55) - torch.log(cp))    # >0 when too loose; 0 in the physical region
+    u = F.relu(np.log(lo) - torch.log(cp))      # >0 when too loose; 0 in the physical region
     # quadratic onset, linear tail: C1 at u == turnover
     loose = torch.where(u <= turnover, u ** 2,
                         turnover ** 2 + 2 * turnover * (u - turnover))
-    return loose + F.relu(cp - 0.95) ** 2
+    return loose + F.relu(cp - hi) ** 2
+
+def screen_implausible_energy(mol_energy, below: float):
+    """(energy, flagged) for cfg:energy_config.implausible_energy_below. A row whose energy is under `below` is
+    flagged and carries |below| instead: finite and far above any real structure, so the row is read everywhere as
+    a clash is (a reward at the clip, never a record, never admitted to a buffer). A non-finite energy is left as
+    it is; the MLIP routes have their own handling of those.
+
+    Why a screen and not trust in the function: an MLIP is fitted on sensible geometries and can return anything
+    on a senseless one. The acridine MLE run's step-500 eval scored one draw of the untrained model at -1,327,550
+    (the prior's best row is -45); the tracker kept it as the condition's best energy, and every gate measured from
+    that record failed for the rest of the run and the run seeded from it."""
+    flagged = mol_energy < below
+    return torch.where(flagged, torch.full_like(mol_energy, abs(float(below))), mol_energy), flagged
+
 
 def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
     # soften the repulsion
@@ -109,6 +138,29 @@ def is_crystal_energy(name: str) -> bool:
     return name not in TOY_ENERGY_FUNCTIONS
 
 
+#: the per-space-group tables MXtalTools builds lazily on a crystal batch (231 rows each) and rebuilds where absent.
+#: append_batch classifies a tensor by its length, so a table beside an operand of exactly 231 rows or atoms is joined
+#: as per-row or per-atom data and the next join fails; batched_analyze_crystal_batch drops them from each chunk.
+SG_LOOKUP_TABLES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
+
+
+def merge_batches(batches):
+    """One batch from a list, in order, by append_batch on adjacent pairs in a balanced tree: each row is copied about
+    log2(len) times, where appending one at a time copies the growing batch once per part (quadratic in the parts).
+    Consumes the list: each pair is released from it once joined."""
+    while len(batches) > 1:
+        joined = []
+        for i in range(0, len(batches), 2):
+            if i + 1 < len(batches):
+                joined.append(batches[i].append_batch(batches[i + 1]))
+                batches[i] = batches[i + 1] = None
+            else:
+                joined.append(batches[i])
+                batches[i] = None
+        batches[:] = joined
+    return batches.pop()
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -142,6 +194,8 @@ class MolecularCrystal(BaseSet):
                  mlip_compile: bool = False,
                  mlip_edge_chunk_size: Optional[int] = None,
                  mlip_activation_checkpointing: bool = True,
+                 implausible_energy_below: Optional[float] = None,  # a physical energy under this (run energy units, negative) is replaced by its magnitude: see screen_implausible_energy. None = no screen
+                 mlip_max_packing_coeff: Optional[float] = None,  # mace only: a cell denser than this is not handed to the MLIP and is scored as a clash: see analyze_density_guarded. None = every cell goes to the MLIP
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
                  prior_knn_path: Optional[str] = None,  # latent_knn only: reference draw written by build_prior_knn_reference.py
@@ -150,6 +204,7 @@ class MolecularCrystal(BaseSet):
                  prior_flow_path: Optional[str] = None,  # density proxy for the PRIOR POLICY, written by build_prior_flow.py
                  lambda_mix: float = 1.0,  # 1 = pure physical target; 0 = pure prior-flow target (the null test). Schedulable via balance.anneal_coeffs.
                  energy_reference: Optional[str] = None,  # 'seed_min': score the physical leg against each condition's lowest seed energy (set_energy_reference); None: no reference
+                 crystal_coordinates: str = 'latent',  # 'latent': x is the trainer latent; 'fd': x is crystal_fd's fundamental-domain chart in [-1, 1]^d (energies/fd_coordinates.py), Z' = 1 only
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -174,12 +229,41 @@ class MolecularCrystal(BaseSet):
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
 
         self.density_coeff = density_coeff
+        if implausible_energy_below is not None and not float(implausible_energy_below) < 0:
+            raise ValueError(f'energy_config.implausible_energy_below must be negative (an energy no real structure '
+                             f'reaches), got {implausible_energy_below!r}')
+        self.implausible_energy_below = (None if implausible_energy_below is None
+                                         else float(implausible_energy_below))
+        self.implausible_rows = 0          # rows the screen has replaced since the last drain_energy_timing
+        if mlip_max_packing_coeff is not None:
+            if energy_function != 'mace':
+                raise ValueError(f'energy_config.mlip_max_packing_coeff is for the mace route (uma guards its own dense '
+                                 f'cells inside MXtalTools), not {energy_function!r}')
+            if not float(mlip_max_packing_coeff) > 0:
+                raise ValueError(f'energy_config.mlip_max_packing_coeff must be positive, got {mlip_max_packing_coeff!r}')
+            if self.implausible_energy_below is None:
+                raise ValueError('energy_config.mlip_max_packing_coeff scores a guarded cell as a clash, at the magnitude '
+                                 'of energy_config.implausible_energy_below: set that too')
+        self.mlip_max_packing_coeff = None if mlip_max_packing_coeff is None else float(mlip_max_packing_coeff)
+        self.mlip_guarded_rows = 0         # cells the density guard kept from the MLIP since the last drain_energy_timing
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
         self.temperature_conditioning = temperature_conditioning
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
         self.reduction_coeff = reduction_coeff
+        if crystal_coordinates not in CRYSTAL_COORDINATES:
+            raise ValueError(f"crystal_coordinates must be one of {CRYSTAL_COORDINATES}, got {crystal_coordinates!r}")
+        self.crystal_coordinates = crystal_coordinates
+        self._fd_charts = {}  # (sg, radius) -> FDCoordinates, built on first use
+        self.fd_layout = None
+        if crystal_coordinates == 'fd':
+            # the state is the chart of ONE space group (its width and circle rows are the group's); Z' = 1
+            if len(space_groups) != 1 or max(z_primes) != 1:
+                raise NotImplementedError(f"crystal_coordinates 'fd' needs one space group and Z' = 1, got "
+                                          f"space_groups={list(space_groups)}, z_primes={list(z_primes)}")
+            self.fd_layout = self.fd_coordinates_for(int(space_groups[0]), FD_LAYOUT_RADIUS)
+            self.data_ndim = self.fd_layout.dim
         self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
         self.max_z_prime = max_z_prime
@@ -502,11 +586,92 @@ class MolecularCrystal(BaseSet):
             - min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
         self.reward_clip = min_allowed_reward
 
+    def fd_coordinates_for(self, sg: int, radius: float):
+        """The FDCoordinates of space group ``sg`` at molecule radius ``radius`` (cached per pair)."""
+        from energies.fd_coordinates import FDCoordinates
+        key = (int(sg), round(float(radius), 6))
+        if key not in self._fd_charts:
+            self._fd_charts[key] = FDCoordinates(key[0], key[1])
+        return self._fd_charts[key]
+
+    def fd_coordinates_rows(self, sg: int, radius):
+        """The FDCoordinates of space group ``sg`` for rows at molecule radii ``radius`` ([B], each rounded to 6
+        decimals as fd_coordinates_for keys them): the scalar, cached chart when every row shares one radius, else
+        one chart with a length box per row."""
+        r = torch.round(torch.as_tensor(radius, dtype=torch.float64).reshape(-1) * 1e6) / 1e6
+        if bool((r == r[0]).all()):
+            return self.fd_coordinates_for(sg, float(r[0]))
+        from energies.fd_coordinates import FDCoordinates
+        return FDCoordinates(int(sg), r)
+
+    def fd_rows_to_params(self, x, crystal_batch):
+        """crystal_coordinates 'fd': ([B, 12] cell parameters, [B] handedness, [B] log reference density on s) of
+        rows x [B, d] in [-1, 1], each through the chart of its own (space group, molecule radius); differentiable
+        in x. Raises for Z' > 1 or rows of different widths."""
+        if self.max_z_prime != 1:
+            raise NotImplementedError("crystal_coordinates 'fd' is Z' = 1 only")
+        sg = crystal_batch.sg_ind.reshape(-1).cpu()
+        radius = crystal_batch.radius.reshape(-1).detach().cpu().double()
+        params = x.new_zeros(x.shape[0], 12)
+        hand = x.new_ones(x.shape[0])
+        log_ref = x.new_zeros(x.shape[0])
+        for g in sorted(set(sg.tolist())):
+            # one chart for the space group's rows, each at its own molecule radius (bit-identical to a chart per
+            # radius; a batch of many molecules is one call, not one per molecule)
+            rows_cpu = torch.nonzero(sg == g).flatten()
+            fc = self.fd_coordinates_rows(int(g), radius[rows_cpu])
+            rows = rows_cpu.to(x.device)
+            xs = x[rows]
+            if xs.shape[1] < fc.dim or (xs.shape[1] > fc.dim and bool((xs[:, fc.dim:] != 0).any())):
+                raise ValueError(f'sg {g}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
+                                 f'{xs.shape[1]}')
+            # into the open box, as latent_to_cell_params clamps the latent: a policy whose rows are not bounded
+            # (the conditional flow) draws past the faces, and a chart face is a degenerate crystal (log reference -inf)
+            p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS))
+            params = params.index_copy(0, rows, p.to(x))
+            hand = hand.index_copy(0, rows, h.to(x))
+            log_ref = log_ref.index_copy(0, rows, lr.to(x))
+        return params, hand, log_ref
+
+    def fd_rows_of(self, batch) -> torch.Tensor:
+        """crystal_coordinates 'fd': [B, data_ndim] float32 chart rows s of a stored crystal batch (its cell
+        parameters and handedness; any description of each crystal), each through the chart of its own (space group,
+        molecule radius). Raises ValueError, with the statuses, if a row has no s (it does not canonicalise, or its
+        canonical cell is outside the length box): filter such rows out of the file first."""
+        params = batch.full_cell_parameters().detach().cpu()
+        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+        sg = batch.sg_ind.reshape(-1).cpu()
+        radius = batch.radius.reshape(-1).detach().cpu().double()
+        out = torch.zeros(len(sg), self.data_ndim, dtype=torch.float32)
+        for g in sorted(set(sg.tolist())):
+            rows = torch.nonzero(sg == g).flatten()
+            fc = self.fd_coordinates_rows(int(g), radius[rows])
+            r = fc.from_params(params[rows], hand[rows])
+            if not bool(r.ok.all()):
+                from collections import Counter
+                bad = Counter(st for st, ok in zip(r.status, r.ok.tolist()) if not ok)
+                raise ValueError(f'sg {g}: {int((~r.ok).sum())} of {len(rows)} stored rows have no FD chart '
+                                 f'point ({dict(bad)})')
+            out[rows, :fc.dim] = r.s.float()
+        return out
+
     def instantiate_crystals(self, x, mol_batch):
         if self.computes_require_cluster:
             crystal_batch = self.init_blank_crystal_batch(mol_batch)
         else:
             crystal_batch = mol_batch.clone()
+        if self.crystal_coordinates == 'fd':  # canonical crystals by construction: no clamp, no crystal-system step
+            if 'fd_state' in crystal_batch.keys():   # a stored row's cached chart row (train.py) belongs to that row
+                delattr(crystal_batch, 'fd_state')
+            params, hand, log_ref = self.fd_rows_to_params(x, crystal_batch)
+            crystal_batch.set_cell_parameters(params)
+            crystal_batch.aunit_handedness = hand.reshape(crystal_batch.aunit_handedness.shape).to(
+                crystal_batch.aunit_handedness.dtype)
+            crystal_batch.fd_log_reference = log_ref
+            # the chart row this crystal was built from (as clamped by fd_rows_to_params), so a stored draw is never
+            # canonicalised again (train.py _batch_latents reads it)
+            crystal_batch.add_graph_attr(x.detach().float().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS), 'fd_state')
+            return crystal_batch
         crystal_batch.latent_to_cell_params(x)
         if self.max_z_prime > 1:
             # Aunit labelling is a gauge: relabelling the z' units describes the same
@@ -736,6 +901,49 @@ class MolecularCrystal(BaseSet):
                 f'are stamped, so this is two energy currencies mixed in one '
                 f'batch, not a missing migration.')
 
+    def analyze_density_guarded(self, crystal_batch, analyze_kwargs):
+        """crystal_batch.analyze(self.computes), except that with cfg:energy_config.mlip_max_packing_coeff set, a cell
+        whose packing coefficient is above it is not handed to the MLIP: its energy key carries
+        |cfg:energy_config.implausible_energy_below|, so it is read downstream as the screen's rows are (a clash), and
+        its other computes (the reduction penalty) are evaluated as usual. The rows are counted in mlip_guarded_rows.
+
+        Why: MACE's neighbour list grows with the density, and one cell far denser than any crystal can run the card
+        out of memory on its own. A barely trained exact-density flow draws such cells: over acridine's sg 14 latent box
+        (inn_acr_oct23, 2026-10-23) 73% of cells have a packing coefficient above 1, the median 3.3 and the largest
+        ~600, and the untrained flow's first evaluation failed at one crystal per call. The density wall already puts
+        any such cell hundreds of kJ/mol above every crystal, so the guard moves no reward a sampler of the problem
+        should see."""
+        cap = self.mlip_max_packing_coeff
+        if cap is not None:
+            dense = crystal_batch.packing_coeff.flatten() > cap
+        if cap is None or not bool(dense.any()):
+            return crystal_batch.analyze(self.computes, **analyze_kwargs)
+        keep, drop = torch.nonzero(~dense).flatten(), torch.nonzero(dense).flatten()
+        if not hasattr(crystal_batch, 'computes'):
+            # analyze binds these on the batch it runs on; the sub-batches get them, so the batch itself must too, or
+            # it no longer appends to a batch analyze ran on (batched_analyze_crystal_batch's chunks)
+            crystal_batch._init_computes()
+        rest = [k for k in self.computes if k != self.energy_function]
+        parts = []  # (rows, outputs) per sub-batch
+        if len(keep):
+            parts.append((keep, crystal_batch.subsample_new_batch(keep).analyze(self.computes, **analyze_kwargs)))
+        guarded = crystal_batch.subsample_new_batch(drop).analyze(rest, **analyze_kwargs) if rest else {}
+        like = parts[0][1][self.energy_function] if parts else torch.zeros(0, dtype=torch.float32)
+        guarded[self.energy_function] = torch.full((len(drop),) + tuple(like.shape[1:]),
+                                                   abs(self.implausible_energy_below), dtype=like.dtype,
+                                                   device=crystal_batch.device)
+        parts.append((drop, guarded))
+        order = torch.cat([rows for rows, _ in parts])
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(len(order), device=order.device)
+        keys = set().union(*(o.keys() for _, o in parts))
+        missing = [k for k in keys if any(k not in o for _, o in parts)]
+        if missing:
+            raise RuntimeError(f'analyze_density_guarded: outputs {missing} came back from one sub-batch only')
+        self.mlip_guarded_rows += len(drop)
+        return {k: torch.cat([o[k].to(crystal_batch.device) for _, o in parts])[inverse.to(crystal_batch.device)]
+                for k in keys}
+
     def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
@@ -768,7 +976,7 @@ class MolecularCrystal(BaseSet):
                 analyze_kwargs['width'] = crystal_batch.width.to(x.device)
 
         with torch.set_grad_enabled(keep_grads):
-            out = crystal_batch.analyze(self.computes, **analyze_kwargs)
+            out = self.analyze_density_guarded(crystal_batch, analyze_kwargs)
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
@@ -873,6 +1081,10 @@ class MolecularCrystal(BaseSet):
                 # rescale functions with LJ-type minima to uma statistics
                 mol_energy = self.lj_rescale * mol_energy
 
+            if self.implausible_energy_below is not None:
+                mol_energy, flagged = screen_implausible_energy(mol_energy, self.implausible_energy_below)
+                self.implausible_rows += int(flagged.sum())
+
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
             # same temperature compensation as bounding_energy above -- this is a validity
             # constraint, not part of the target Boltzmann distribution, so it shouldn't soften at high T
@@ -946,6 +1158,11 @@ class MolecularCrystal(BaseSet):
         # stops being log 2 per dim.
         if not self.is_crystal or self.latent_energy:
             jacobian_energy = torch.zeros_like(bounding_energy)
+        elif self.crystal_coordinates == 'fd':
+            # the same change of measure, from Lebesgue on the FD chart's s to the reference measure (Haar
+            # orientation, fractional centre x Z' log V, the latent's cell measure): fd_coordinates.log_reference
+            jacobian_energy = -temperature * crystal_batch.fd_log_reference
+            ens_dict['jacobian_energy'] = jacobian_energy
         else:
             jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)
             ens_dict.update(jacobian_components)
@@ -1399,7 +1616,7 @@ class MolecularCrystal(BaseSet):
         n_samples = len(x)
         energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
         already_oomed = False
-        samples_batch = None
+        parts = []   # each chunk's analysed batch, merged once after the loop (merge_batches)
         while cursor < n_samples:  # todo get a single unified interface for all the places we do this
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
@@ -1415,11 +1632,10 @@ class MolecularCrystal(BaseSet):
 
                 if return_batch:
                     batch_i = outs[1].detach().cpu()
-
-                    if samples_batch is None:
-                        samples_batch = batch_i
-                    else:
-                        samples_batch = samples_batch.append_batch(batch_i)
+                    for attr in SG_LOOKUP_TABLES:
+                        if hasattr(batch_i, attr):
+                            delattr(batch_i, attr)
+                    parts.append(batch_i)
 
                 cursor += len(inds)
                 if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:
@@ -1450,6 +1666,8 @@ class MolecularCrystal(BaseSet):
                     raise e
 
         del outs
+        samples_batch = merge_batches(parts) if parts else None
+        del parts
         # RESTORED 2026-08-14. These were commented out; on the mace/uma route that
         # left the largest allocation the process ever makes -- the init pass over the
         # whole prior dataset, chunked at supercell_size 10 -- holding its blocks in

@@ -73,6 +73,8 @@ def test_parses_with_geometric_default():
     ({'bounding_coeff': {'target': '100', 'steps': 10}}, 'target'),
     ({'bounding_coeff': {'target': 100.0, 'steps': 10, 'kind': 'cosine'}}, "kind must be 'geometric' or 'linear'"),
     ({'bounding_coeff': {'target': 0.0, 'steps': 10}}, 'geometric ramp needs target > 0'),
+    ({'bounding_coeff': {'target': 100.0, 'steps': 10, 'from_step': -1}}, 'from_step'),
+    ({'bounding_coeff': {'target': 100.0, 'steps': 10, 'from_step': 2.5}}, 'from_step'),
     ('bounding_coeff', 'must be a mapping'),
 ])
 def test_malformed_schedules_are_refused_at_parse(bad, match):
@@ -126,6 +128,34 @@ def test_a_requeued_leg_continues_the_ramp_from_the_stamped_anchor():
     p3, m3 = _engine(GEO, step=7000, ctrl=old_ctrl)
     assert p3.energy_coeffs()['bounding_coeff'] == pytest.approx(10.0)
     assert p3.ctrl['coeff_sched_entry'] == 7000
+
+
+def test_a_coefficient_added_to_a_running_stage_ramps_from_its_own_from_step():
+    """The stage's anchor is stamped once, when the stage begins, and rides the checkpoint. A coefficient added to
+    the schedule later must not be measured from that anchor, or its ramp reads as done the moment it appears
+    (ppl_acr_dens_n5, 2026-10-16: stage begun near step 86,500, box and reduction ramps added at 130,000)."""
+    sched = {'density_coeff': {'target': 1000.0, 'steps': 2000},
+             'bounding_coeff': {'target': 1000.0, 'steps': 20000, 'from_step': 130000},
+             'reduction_coeff': {'target': 1000.0, 'steps': 20000, 'from_step': 130000, 'kind': 'linear'}}
+    ctrl = fresh_stage_ctrl()
+    ctrl['coeff_sched_entry'] = 86500                     # the restored anchor of a stage begun long ago
+    p, m = _engine(sched, step=129950, ctrl=ctrl)
+    m.args.energy_config.density_coeff = 10.0              # read at the first evaluation
+    v = p.energy_coeffs()
+    assert v['density_coeff'] == pytest.approx(1000.0), 'the old ramp, long finished, still holds'
+    assert v['bounding_coeff'] == pytest.approx(10.0) and v['reduction_coeff'] == pytest.approx(10.0), \
+        'before its from_step a coefficient holds its base value'
+    assert p.ctrl['coeff_sched_entry'] == 86500, 'the anchor is not moved'
+    m.step_ind = 140000
+    v = p.energy_coeffs()
+    assert v['bounding_coeff'] == pytest.approx(math.sqrt(10.0 * 1000.0)), 'halfway: the geometric mean'
+    assert v['reduction_coeff'] == pytest.approx(505.0), 'halfway, linear'
+    assert p.report()['protocol/coeff_sched_p_bounding_coeff'] == pytest.approx(0.5)
+    m.step_ind = 150000
+    assert p.energy_coeffs()['bounding_coeff'] == pytest.approx(1000.0)
+    assert p.report()['protocol/coeff_sched_p_density_coeff'] == pytest.approx(1.0)
+    assert _stage(sched).coeff_schedule['bounding_coeff']['from_step'] == 130000
+    assert 'from_step' not in _stage(sched).coeff_schedule['density_coeff'], 'absent stays absent'
 
 
 def test_a_name_that_is_not_a_numeric_energy_key_is_refused_at_first_evaluation():

@@ -58,3 +58,19 @@ def test_a_pre_mlip_exit_config_still_matches_a_post_mlip_run_config():
 # belong in the conformer problem's identity, because a conformer checkpoint is only
 # ever loaded by a config that has them. Distinguishing "route-specific" from "added
 # later" needs the route, not a count, and a guard that cries wolf gets ignored.
+
+
+def test_latent_crystal_coordinates_leave_the_identity_unchanged():
+    """energy_config.crystal_coordinates (latent | fd) arrived after every existing checkpoint. At its default
+    'latent' it must hash as if absent, or each of those checkpoints is refused at load; 'fd' is a different
+    state space, so it must change the identity."""
+    from types import SimpleNamespace
+
+    def problem(**ec):
+        args = SimpleNamespace(energy_function='elj', energy_config=dict(temperature=2.5, **ec), prior_path='p.pt',
+                               space_groups=[2], z_primes=[1], molecule_conditioning=False,
+                               temperature_conditioning=False)
+        return utils.problem_hash(utils.get_problem_definition(args))
+
+    assert problem(crystal_coordinates='latent') == problem()
+    assert problem(crystal_coordinates='fd') != problem()

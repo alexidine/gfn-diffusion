@@ -535,6 +535,12 @@ class ConfigIndex:
         if not isinstance(raw, dict):
             return
         self.keys |= _flatten(raw)
+        model = raw.get('model')
+        if isinstance(model, dict) and 'kind' in model:
+            # a sectioned model block also answers to the paths the code reads
+            # (config_invariants.canonical_model_section): model = shared + sde, policy = {kind, nf}
+            self.keys |= _flatten({'model': {**(model.get('shared') or {}), **(model.get('sde') or {})},
+                                   'policy': {'kind': model['kind'], 'nf': model.get('nf') or {}}})
         if not stages:
             return
         for name, proto in (raw.get('protocols') or {}).items():

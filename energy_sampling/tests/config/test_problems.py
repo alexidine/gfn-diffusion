@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+import config_invariants as ci
+
 HERE = Path(__file__).resolve().parents[2]   # tests/<area>/x.py -> energy_sampling/
 PROBLEMS = HERE / 'configs' / 'problems.yaml'
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
@@ -226,7 +228,8 @@ def test_only_conditional_problems_name_an_alternate_protocol(problems):
 
 @pytest.fixture(scope='module')
 def canonical():
-    return yaml.safe_load(CANONICAL.read_text(encoding='utf-8'))
+    # the sectioned model block resolved, as utils.load_yaml does
+    return ci.canonical_model_section(yaml.safe_load(CANONICAL.read_text(encoding='utf-8')))
 
 
 def test_canonical_config_matches_its_problem_entry(canonical, problems):

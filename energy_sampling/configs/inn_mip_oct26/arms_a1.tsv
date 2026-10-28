@@ -1,0 +1,8 @@
+# inn_mip_oct26 job a1 (sbatch --export=ALL,ARMS_TSV=arms_a1.tsv submit_inn_mip26.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, stage-1 key (stage1.tsv), stage-2 flags (later flags win;
+# '-' = none), description.
+20	nofloor	nofloor	-	no floor in either stage
+21	forces	nofloor	--w_path 0.1 --path_batch 512	pathwise reverse-KL term (the energy's force), no floor; its 512 energy calls per update are not in energy/samples_total; rewardgrad/force_norm_mean must be > 0
+22	bins16	bins16	-	16 bins
+23	bins64	bins64	-	64 bins
+24	unbounded	unbounded	-	no bounded rows

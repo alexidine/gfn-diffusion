@@ -1,0 +1,10 @@
+# inn_mip_oct26 flags, read when a job STARTS (edit in place while queued). Tab-separated: name, flags.
+# BOTH: every run of both stages (the inn_mps_oct21 recipe: MIPCAS eLJ pooled oct05 prior, box and reduction penalties
+# 1000, bounded linear rows, tied knot derivatives, one transformer block of 32 bins in the order 8.11.10.9.7.6.5.4.3.2.1.0).
+# MLE: stage 1, 10,000 steps. ENERGY: stage 2 on a 480-minute clock (--budget_minutes: the cosine from 3e-4 to 1e-5
+# follows the clock, so every arm finishes its decay whatever its speed; --max_minutes 540 is the hard stop), floor
+# 1e-7, replay 0.1, evals on 10,000 draws every 1,000 updates. A stage-1 configuration's flags (stage1.tsv) come after
+# BOTH and MLE / ENERGY, and an arm's flags (arms_*.tsv) after those: later flags win.
+BOTH	--config configs/mk_dev.yaml --tag inn_mip26 --prior_path /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_elj_pooled_oct05_prior.pt --conditioner transformer --tf_width 256 --tf_layers 4 --tf_heads 8 --n_bins 32 --n_blocks 1 --block_orders 8.11.10.9.7.6.5.4.3.2.1.0 --val_group_ignore_rows 6,7,8 --bounded_rows linear --tied_derivatives --tied_factor 2 --set energy_config.bounding_coeff=1000 --set energy_config.reduction_coeff=1000 --set checkpoints_dir=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints --set gpu_util_sample_period_s=10 --oom_retries 3 --log_every 50 --util_target 0
+MLE	--energy_steps 0 --mle_steps 10000 --lr_mle 1e-3 --mle_batch 8192 --mle_noise_log_range -1.6126 -1.6126 --eval_every 1000 --eval_samples 4000 --min_bin_height 1e-5 --bank_frac 0 --max_minutes 150
+ENERGY	--mle_steps 0 --budget_minutes 480 --max_minutes 540 --batch 2000 --stored_batch 4096 --lr_energy 3e-4 --lr_energy_final 1e-5 --energy_warmup 200 --beta_data 80 --fast_scoring --min_bin_height 1e-7 --bank_frac 0.1 --bank_additive --bank_admit 2 --bank_admit_top 1.0 --bank_max_excess 1e9 --bank_batch 256 --bank_alpha 1.0 --eval_every 1000 --eval_samples 10000

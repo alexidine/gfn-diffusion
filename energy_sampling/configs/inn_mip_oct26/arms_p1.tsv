@@ -1,0 +1,9 @@
+# inn_mip_oct26 job p1 (sbatch --export=ALL,ARMS_TSV=arms_p1.tsv submit_inn_mip26.sbatch), read when the job
+# STARTS. Columns (tab-separated, 5): index, arm, stage-1 key (stage1.tsv), stage-2 flags (later flags win;
+# '-' = none), description.
+0	base	base	-	the recipe
+1	base_s1	base_s1	-	seed 1 (data and draw streams only)
+2	lvl_is	base	--level_mode is	stored rows and replay scored against the damped, capped IS level
+3	lvl_slow	base	--z_half_life 200	tied level, 10x slower lag
+4	lvl_fast	base	--z_half_life 5	tied level, 4x faster lag
+5	lvl_blend	base	--level_mode blend --level_blend 0.5	level halfway between the tied one and the stored rows' root

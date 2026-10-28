@@ -1,0 +1,4 @@
+arm	flags
+ct06_e	--force-weight 0 --bridge-share 0
+ct06_ef	--force-weight 1 --bridge-share 0
+ct06_ef_br	--force-weight 1 --bridge-share 0.5

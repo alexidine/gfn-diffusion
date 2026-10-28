@@ -769,7 +769,9 @@ def load_yaml(path):
     with yaml_path.open("r", encoding="utf-8") as f:
         target_dict = yaml.safe_load(f)
 
-    return target_dict
+    # a sectioned `model: {kind, shared, sde, nf}` block resolved to the form the code reads (config_invariants)
+    from config_invariants import canonical_model_section
+    return canonical_model_section(target_dict)
 
 
 def dict2namespace(data_dict: dict):
@@ -830,6 +832,12 @@ def _to_plain(obj):
 # molecule set.
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
                                     'reward_range', 'internal_oom_recovery',
+                                    # a screen for evaluations no real structure reaches: it moves no
+                                    # energy a sampler of the problem should ever see
+                                    'implausible_energy_below',
+                                    # the same for cells far denser than any crystal, which the density
+                                    # wall already scores hundreds of kJ/mol above every crystal
+                                    'mlip_max_packing_coeff',
                                     'host_gas_phase_reference',
                                     # lambda_mix is SCHEDULABLE -- balance.anneal_coeffs moves it
                                     # during a run -- so it cannot be part of a static problem hash
@@ -849,6 +857,11 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
                                     # The cost is the same one reward_range already
                                     # carries -- log Z is NOT comparable across settings.
                                     'energy_clip',
+                                    # what energy_clip is measured from (the conformer
+                                    # route's absolute cutoff or one above each member's
+                                    # reference conformer): the same tail reshape, exempt
+                                    # with it
+                                    'energy_clip_origin',
                                     # THE MLIP EXECUTION KNOBS, exempt for exactly the
                                     # reason internal_oom_recovery is: they choose HOW the
                                     # energy is computed -- compiled or eager, edge dim
@@ -902,6 +915,10 @@ def get_problem_definition(args) -> dict:
     energy_config = _to_plain(args.energy_config)
     for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
         energy_config.pop(key, None)
+    # crystal_coordinates enters the identity only when off its default, as emb_cond below: the 'latent' state space
+    # is the one every existing run already has, and writing it would change their hash
+    if energy_config.get('crystal_coordinates', 'latent') == 'latent':
+        energy_config.pop('crystal_coordinates', None)
 
     definition = {
         # explicit schema version -- bump when adding/removing a field below

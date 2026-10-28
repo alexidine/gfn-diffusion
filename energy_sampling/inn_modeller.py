@@ -47,6 +47,7 @@ import math
 import os
 import re
 import time
+import types
 from collections import defaultdict
 
 import numpy as np
@@ -56,18 +57,22 @@ import torch.nn.functional as F
 import wandb
 import yaml
 
-from energies.ar_transformer import CausalTransformerConditioner
+from energies.ar_transformer import NORMS, CausalTransformerConditioner
+from data_processing.molecule_subset import keep_molecules
 from energies.prior_flow import _Block, _Flow, _MADE, _rq_spline, _wrap, invert_block, rq_spline_inverse
 from energy_sampling.eval.evaluations import (FUNNEL_MAX_POINTS, boltzmann_fig, flow_parity_plot, vargrad_error,
                                               xy_scatter_plot)
 from energy_sampling.eval.xcond import xcond_metrics
 from gflownet_losses import update_and_lookup_condition_log_z, update_condition_best_energy, winsorized_z_root
 from models.gfn import GFN
+from models.spline_flow import (  # noqa: F401 (re-exported: the flow classes lived here until 2026-10-27)
+    AtomEncoder, ConditionalLatentFlow, LatentFlow, _ContextBlock, _ContextFlow, _ContextMADE, _MixBlock, _ResMLP,
+    _MIX_EPS, _MIX_S, _mix_cdf, _mix_inverse, _mix_parts, invert_block_cached, invert_differentiable,
+    quat_to_rotmat)
 from paths import artifact
 from train import (Modeller, adjust_fig_filesize, condition_tracker_figs, equipartition_bar, fig_guard,
                    flatten_wandb_params, loggable_array, quick_tb_stats)
 from utils import get_train_args, is_cuda_oom
-
 
 ORIENTATION_ROWS = slice(9, 12)   # Z' = 1 latent: polar angle, azimuth and angle of the asymmetric unit's rotation
 
@@ -77,15 +82,6 @@ def random_frames(n, device, dtype=torch.float32):
     q = torch.randn(n, 4, device=device, dtype=dtype)
     q = q / q.norm(dim=1, keepdim=True)
     return torch.where(q[:, :1] < 0, -q, q)
-
-
-def quat_to_rotmat(q):
-    """Unit quaternions [..., 4] (w, x, y, z) -> rotation matrices [..., 3, 3]."""
-    w, x, y, z = q.unbind(-1)
-    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
-                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
-                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1
-                       ).reshape(q.shape[:-1] + (3, 3))
 
 
 def rotate_latent(x, R0):
@@ -105,575 +101,39 @@ def rotate_latent(x, R0):
     return y
 
 
-@torch.no_grad()
-def invert_block_cached(blk, y, ctx=None):
-    """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
-    per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
-    each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding; with
-    the layers in bf16 the decode's one-token path and forward's full pass round differently, and a trained map's
-    conditioning amplifies that (--tf_fp32 runs them in the input's precision).
-    ctx: a _ContextBlock's context, as its forward takes it (_ContextFlow.context_input's first output)."""
-    b = y.shape[0]
-    x = torch.zeros_like(y)
-    bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
-    mh = getattr(blk, 'min_height', None)
-    td = getattr(blk, 'tied', False)
-    nb = blk.n_bins
+# --stored_source buffer (InnModeller.init_inn_buffers): training rows per anchor-seed chunk; children requested per
+# prior-buffer fill call (pbuf_fill, at the start-up and every churn); calls a fill may make beyond 4 per cycle of
+# deficit; requested children with no admission before a condition leaves the quota; the gauss tile's calibration
+# pilot (rows, at most this many rounds, relative tolerance, relative miss that raises)
+ANCHOR_SEED_CHUNK = 131072
+PBUF_FILL_CYCLE = 20000
+PBUF_REFILL_ROUNDS = 4
+PBUF_STARVE_MISSES = 8
+GAUSS_PILOT_ROWS, GAUSS_PILOT_ROUNDS, GAUSS_TOL, GAUSS_FAIL = 2048, 6, 0.1, 0.5
+
+
+def calibrate_gauss_sigma(score, target, sigma0, rounds=GAUSS_PILOT_ROUNDS, tol=GAUSS_TOL, fail=GAUSS_FAIL):
+    """The gauss tile's scale: score(sigma) -> (m, se), the pilot's mean excess over the parent and its standard error.
+    Stops at the first sigma with |m - target| <= tol x target and se <= tol x target; otherwise moves sigma by
+    sqrt(target / m), clamped to [1/4, 4] (x 4 while m <= 0), since the excess is quadratic in sigma near a minimum.
+    At most `rounds` scores, which bounds the calibration. Returns (the sigma whose m came closest to the target, the
+    table of (sigma, m, se)); raises when that closest m misses the target by more than fail x target."""
+    sigma, table = float(sigma0), []
+    for _ in range(int(rounds)):
+        m, se = score(sigma)
+        if not (math.isfinite(m) and math.isfinite(se)):
+            raise RuntimeError(f"gauss tile: a non-finite pilot excess ({m}, se {se}) at sigma {sigma:.4g}")
+        table.append((sigma, float(m), float(se)))
+        if abs(m - target) <= tol * target and se <= tol * target:
+            break
+        sigma *= 4.0 if m <= 0 else min(4.0, max(0.25, math.sqrt(target / m)))
+    best = min(table, key=lambda r: abs(r[1] - target))
+    if abs(best[1] - target) > fail * target:
+        raise RuntimeError(f"gauss tile: no scale reached a mean excess of {target:g} kT within {fail:g} x it in "
+                           f"{len(table)} rounds; (sigma, mean excess kT, se): {table}")
+    return best[0], table
 
-    def solve_row(i, p):
-        shift, sp = p[:, -1:], p[:, :3 * nb].view(b, 1, 3, nb)
-        sl = slice(i, i + 1)
-        mhi = mh[sl] if mh is not None else None
-        if bnd is None:
-            z = rq_spline_inverse(y[:, sl], sp, blk.bound[sl], blk.is_wrap[sl], min_height=mhi, tied=td)
-        else:
-            z = rq_spline_inverse(y[:, sl], sp, blk.bound[sl], blk.is_wrap[sl], bnd[sl], shift, mhi, td)
-            shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
-        x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
 
-    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx)
-    return x
-
-
-def invert_differentiable(blk, y, ctx=None):
-    """A block's inverse at y with the autograd graph kept (prior_flow.invert_block and
-    _ContextBlock.invert run without one). After blk.d passes the result is the exact
-    preimage for any parameter value, so the graph through the passes carries its exact
-    derivative."""
-    x = torch.zeros_like(y)
-    bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
-    mh = getattr(blk, 'min_height', None)
-    td = getattr(blk, 'tied', False)
-    for _ in range(blk.d):
-        if ctx is None:
-            p = blk.made(blk._feats(x)).view(y.shape[0], blk.d, blk.n_params)
-            shift, sp = p[..., -1], p[..., :3 * blk.n_bins].view(y.shape[0], blk.d, 3, blk.n_bins)
-        else:
-            shift, sp = blk.spline_params(x, ctx)
-        if bnd is None:
-            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh, tied=td)
-        else:
-            z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, bnd, shift, mh, td)
-            shift = torch.where(bnd, torch.zeros_like(shift), shift)
-        x = torch.where(blk.is_wrap, _wrap(z - shift), z - shift)
-    return x
-
-
-# ---------------------------------------------------------------- mixture-CDF layer on the wrapped rows
-_MIX_EPS = 1e-6               # weight of a uniform component: keeps the map invertible and its log-det bounded
-_MIX_S = (0.002, 0.5)         # component scale range on the [-1, 1) circle
-
-
-def _mix_parts(mp, k):
-    """Mixture parameters from raw head outputs [.., 3k]: log weights, centres on [-1, 1), scales."""
-    logw = torch.log_softmax(mp[..., :k], dim=-1)
-    off = -1.0 + (2.0 * torch.arange(k, device=mp.device, dtype=mp.dtype) + 1.0) / k   # evenly spaced at init
-    c = _wrap(mp[..., k:2 * k] + off)
-    s = _MIX_S[0] + (_MIX_S[1] - _MIX_S[0]) * torch.sigmoid(mp[..., 2 * k:3 * k])
-    return logw, c, s
-
-
-def _mix_cdf(z, mp, k):
-    """u = 2 G(z) - 1 and log du/dz, for G the CDF on [-1, 1) of a mixture of k wrapped logistics (five periodic
-    images each) plus a uniform component of weight _MIX_EPS. z, u: [.., d]; mp: [.., d, 3k]. The density of the
-    mixture on [-1, 1) is dG/dz, so du/dz = 2 dG/dz."""
-    logw, c, s = _mix_parts(mp, k)
-    zz = z.unsqueeze(-1)
-    cdf = torch.zeros_like(c)
-    tot = torch.zeros_like(c)
-    lpdf = []
-    for n in (-4.0, -2.0, 0.0, 2.0, 4.0):   # five images: the density is periodic to < 1e-6 nats at scale 0.5
-        a, lo, hi = (zz - c + n) / s, (-1.0 - c + n) / s, (1.0 - c + n) / s
-        cdf = cdf + torch.sigmoid(a) - torch.sigmoid(lo)
-        tot = tot + torch.sigmoid(hi) - torch.sigmoid(lo)
-        lpdf.append(F.logsigmoid(a) + F.logsigmoid(-a) - torch.log(s))
-    cdf = cdf / tot
-    lpdf = torch.logsumexp(torch.stack(lpdf, -1), -1) - torch.log(tot)          # [.., d, k] component log densities
-    g = (1.0 - _MIX_EPS) * (torch.exp(logw) * cdf).sum(-1) + _MIX_EPS * 0.5 * (z + 1.0)
-    log_dens = torch.logaddexp(math.log(1.0 - _MIX_EPS) + torch.logsumexp(logw + lpdf, -1),
-                               torch.full_like(z, math.log(_MIX_EPS * 0.5)))
-    return (2.0 * g - 1.0).clamp(-1.0, 1.0), log_dens + math.log(2.0)
-
-
-def _mix_inverse(u, mp, k, iters=40):
-    """z with _mix_cdf(z) = u, by bisection on [-1, 1] (G is monotone)."""
-    lo, hi = torch.full_like(u, -1.0), torch.full_like(u, 1.0)
-    for _ in range(iters):
-        mid = 0.5 * (lo + hi)
-        below = _mix_cdf(mid, mp, k)[0] < u
-        lo, hi = torch.where(below, mid, lo), torch.where(below, hi, mid)
-    return 0.5 * (lo + hi)
-
-
-class _MixBlock(_Block):
-    """_Block with a mixture-CDF layer on its wrapped rows before the spline (data side): x -> rotate -> u = G(z) ->
-    spline -> y. The conditioner's head carries 3k extra outputs per row (weights, centres, scales). The density in a
-    gap between components falls like the logistic tail, with no learned bin height needed to empty it."""
-
-    def __init__(self, order, wrap_mask, n_bins, hidden, bound, bounded_mask=None, mix_k=8):
-        super().__init__(order, wrap_mask, n_bins, hidden, bound, bounded_mask)
-        if self.has_bounded:
-            raise NotImplementedError("--mix_k with --bounded_rows")
-        self.mix_k = int(mix_k)
-        self.n_out = self.n_params + 3 * self.mix_k
-
-    def widen_head(self):
-        """Give the transformer conditioner's head the 3k mixture outputs per row (zero weights, zero bias)."""
-        m = self.made
-        old = m.head
-        new = nn.Linear(old.in_features, self.n_out).to(old.weight.device, old.weight.dtype)
-        with torch.no_grad():
-            new.weight.zero_()
-            new.bias.zero_()
-            new.bias[:self.n_params] = old.bias
-        m.head, m.n_params = new, self.n_out
-
-    def _split(self, p):
-        b = p.shape[0]
-        p = p.view(b, self.d, self.n_out)
-        shift = p[..., self.n_params - 1]
-        sp = p[..., :3 * self.n_bins].view(b, self.d, 3, self.n_bins)
-        return shift, sp, p[..., self.n_params:]
-
-    def forward_per_dim(self, x):
-        shift, sp, mp = self._split(self.made(self._feats(x)))
-        z = torch.where(self.is_wrap, _wrap(x + shift), x + shift)
-        u, ldm = _mix_cdf(z, mp, self.mix_k)
-        u = torch.where(self.is_wrap, u, z)
-        ldm = torch.where(self.is_wrap, ldm, torch.zeros_like(ldm))
-        y, ld = _rq_spline(u, sp, self.bound, self.is_wrap, min_height=self.min_height)
-        return y, ld + ldm
-
-    def forward(self, x):
-        y, ld = self.forward_per_dim(x)
-        return y, ld.sum(-1)
-
-    def invert(self, y, d):
-        x = torch.zeros_like(y)
-        for _ in range(d):
-            shift, sp, mp = self._split(self.made(self._feats(x)))
-            u = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height)
-            z = torch.where(self.is_wrap, _mix_inverse(u, mp, self.mix_k), u)
-            x = torch.where(self.is_wrap, _wrap(z - shift), z - shift)
-        return x
-
-
-class LatentFlow(nn.Module):
-    """q(x) over the full latent: a spline flow on the live rows, dead rows pinned at 0."""
-
-    def __init__(self, dim, wrap_mask, dead_rows, n_blocks, n_bins, hidden, bound, seed, transformer=None,
-                 block_orders=None, half_rows=(), bounded_rows=(), mix_k=0):
-        super().__init__()
-        self.mix_k = int(mix_k)
-        dead = {int(d) for d in dead_rows}
-        live = [i for i in range(dim) if i not in dead]
-        # bounded rows: linear latent rows modelled on the closed interval [-1, 1] (a spline with no tails and a
-        # uniform base), so q has no mass outside the latent box on them
-        self.bounded_rows = [int(r) for r in bounded_rows]
-        if any(r not in live or wrap_mask[r] for r in self.bounded_rows):
-            raise ValueError(f"--bounded_rows {self.bounded_rows}: each must be a live linear (unwrapped) row")
-        live_bnd = [i in self.bounded_rows for i in live]
-        # rows whose distribution repeats every half period (x and x + 1 are images of one crystal): the
-        # flow models the folded row stretched back onto the full circle, u = 2 (((x + 1) mod 1) - 1) + 1,
-        # and a draw picks one of the two images uniformly. Two images at half the measure each leave the
-        # density unchanged, q(x) = q_flow(u), so log_prob needs no correction term.
-        self.half_rows = [int(r) for r in half_rows]
-        if any(r not in live or not wrap_mask[r] for r in self.half_rows):
-            raise ValueError(f"--fold_half_rows {self.half_rows}: each must be a live wrapped row")
-        self.dim = dim
-        self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
-        live_wrap = [bool(wrap_mask[i]) for i in live]
-        self.flow = _Flow(live_wrap, n_blocks=n_blocks, n_bins=n_bins, hidden=tuple(hidden), bound=bound, seed=seed,
-                          bounded_mask=live_bnd)
-        if block_orders is not None:  # one order per block, replacing _Flow's alternation
-            d = len(live)
-            if len(block_orders) != n_blocks:
-                raise ValueError(f"--block_orders needs {n_blocks} entries, got {block_orders}")
-            orders = []
-            for o in block_orders:
-                if o in ('id', 'rev'):
-                    orders.append(list(range(d)) if o == 'id' else list(range(d))[::-1])
-                    continue
-                # an explicit order: '.'-separated latent row indices, every live row once
-                rows = [int(r) for r in o.split('.')]
-                if sorted(rows) != sorted(live):
-                    raise ValueError(f"--block_orders entry {o!r} must list each live row {live} exactly once")
-                orders.append([live.index(r) for r in rows])
-            self.flow.orders = orders
-            self.flow.blocks = nn.ModuleList(
-                (_MixBlock(o, live_wrap, n_bins, tuple(hidden), bound, live_bnd, self.mix_k) if self.mix_k
-                 else _Block(o, live_wrap, n_bins, tuple(hidden), bound, live_bnd)) for o in self.flow.orders)
-        elif self.mix_k:
-            raise NotImplementedError("--mix_k needs --block_orders")
-        if transformer is not None:  # (width, layers, heads): each block's MADE replaced by a causal transformer
-            for blk, order in zip(self.flow.blocks, self.flow.orders):
-                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer)
-                if isinstance(blk, _MixBlock):
-                    blk.widen_head()
-        elif self.mix_k:
-            raise NotImplementedError("--mix_k needs --conditioner transformer")
-
-    def set_bf16(self, on: bool):
-        """The transformer conditioners' layers in bf16 (the default) or in the input's precision."""
-        for blk in self.flow.blocks:
-            if isinstance(blk.made, CausalTransformerConditioner):
-                blk.made.bf16 = bool(on)
-
-    def _fold(self, x):
-        if not self.half_rows:
-            return x
-        x = x.clone()
-        x[:, self.half_rows] = 2.0 * (torch.remainder(x[:, self.half_rows] + 1.0, 1.0) - 1.0) + 1.0
-        return x
-
-    def _unfold(self, x):
-        if not self.half_rows:
-            return x
-        x = x.clone()
-        image = torch.randint(0, 2, (x.shape[0], len(self.half_rows)), device=x.device).to(x.dtype)
-        x[:, self.half_rows] = (x[:, self.half_rows] - 1.0) / 2.0 + image
-        return x
-
-    def to_base(self, x, c=None):
-        """The base-space point of x, and log|det| of the map that takes it there."""
-        f = self.flow
-        x = self._fold(x)[:, self.live_idx]
-        z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
-        ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
-        for blk in f.blocks:
-            z, l = blk(z)
-            ld = ld + l
-        return z, ld
-
-    def log_prob(self, x, c=None):
-        return self.flow.log_prob(self._fold(x)[:, self.live_idx])
-
-    @torch.no_grad()
-    def sample(self, n, c=None, return_base: bool = False):
-        f = self.flow
-        dev, dtype = f.mu.device, f.mu.dtype
-        z0 = torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
-                         torch.randn(n, f.d, device=dev, dtype=dtype))
-        z = z0
-        for blk in reversed(list(f.blocks)):
-            if isinstance(blk, _MixBlock):
-                z = blk.invert(z, f.d)
-            elif isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z)       # one decode step per row, not d full passes
-            else:
-                z = invert_block(blk, z, f.d)
-        x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
-        x = self._unfold(x)
-        return (x, z0) if return_base else x
-
-    def rsample(self, z0, c=None):
-        """The draw sample() makes from base points z0, differentiable in the parameters."""
-        if self.half_rows:
-            raise NotImplementedError("rsample with --fold_half_rows: the image choice is not part of z0")
-        if self.mix_k:
-            raise NotImplementedError("rsample with --mix_k: the mixture inverse is a bisection")
-        f = self.flow
-        z = z0
-        for blk in reversed(list(f.blocks)):
-            z = invert_differentiable(blk, z)
-        x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
-        return x
-
-
-class _ContextMADE(_MADE):
-    """_MADE whose first hidden layer and whose output also read a context vector, unmasked."""
-
-    def __init__(self, order, wrap_mask, hidden, n_bins, context_dim):
-        super().__init__(order, wrap_mask, hidden, n_bins)
-        self.ctx_hidden = nn.Linear(context_dim, hidden[0], bias=False)
-        self.ctx_out = nn.Linear(context_dim, self.net[-1].out_features, bias=False)
-        nn.init.zeros_(self.ctx_out.weight)  # with the zero head, each block is still the identity at step 0
-
-    def forward(self, feats, ctx):
-        h = self.net[0](feats) + self.ctx_hidden(ctx)
-        for layer in self.net[1:]:
-            h = layer(h)
-        return h + self.ctx_out(ctx)
-
-
-class _ContextBlock(_Block):
-    """_Block whose conditioner is a _ContextMADE."""
-
-    def __init__(self, order, wrap_mask, n_bins, hidden, bound, context_dim):
-        super().__init__(order, wrap_mask, n_bins, hidden, bound)
-        self.made = _ContextMADE(order, wrap_mask, hidden, n_bins, context_dim)
-
-    def spline_params(self, x, ctx):
-        p = self.made(self._feats(x), ctx).view(x.shape[0], self.d, self.n_params)
-        return p[..., -1], p[..., :3 * self.n_bins].view(x.shape[0], self.d, 3, self.n_bins)
-
-    def forward(self, x, ctx):
-        shift, sp = self.spline_params(x, ctx)
-        z = x + shift
-        z = torch.where(self.is_wrap, _wrap(z), z)
-        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
-        return y, ld.sum(-1)
-
-    @torch.no_grad()
-    def invert(self, y, ctx):
-        """x with forward(x, ctx) == y: one more coordinate exact per pass, whatever the order."""
-        x = torch.zeros_like(y)
-        for _ in range(self.d):
-            shift, sp = self.spline_params(x, ctx)
-            z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
-            x = torch.where(self.is_wrap, _wrap(z - shift), z - shift)
-        return x
-
-
-class AtomEncoder(nn.Module):
-    """A molecule as tokens, one per atom, for the conditional flow to cross-attend to.
-
-    Node inputs are the atomic number and the atom's coordinates in the frame the latent's orientation rows rotate
-    from (the standard frame), PointNet style; mxtaltools' ScalarGNN runs radial-basis message passing over a radius
-    graph within each molecule. Each atom's token is its node embedding with an embedding of its coordinates
-    re-appended, projected to the transformer width; an attention pool gives one vector per molecule. Not
-    rotation-invariant by design: the condition and its orientation target share the frame. Norms see the batch index,
-    so a molecule's tokens do not depend on the molecules encoded with it."""
-
-    def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64):
-        super().__init__()
-        from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
-        self.cutoff, self.max_neighbors = float(cutoff), int(max_neighbors)
-        self.gnn = ScalarGNN(input_node_dim=4, node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2,
-                             embedding_dim=node_dim, num_convs=convs, num_radial=radial, cutoff=cutoff,
-                             max_num_neighbors=max_neighbors, atom_type_embedding_dim=16, norm='layer')
-        self.pos_emb = nn.Sequential(nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64))
-        self.tok = nn.Linear(node_dim + 64, width)
-        self.pool_q = nn.Parameter(torch.zeros(node_dim))
-        self.pool_out = nn.Linear(node_dim, pooled_dim)
-
-    def forward(self, z, pos, n):
-        """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> tokens [u, a, width],
-        mask [u, a] (True on atoms), pooled [u, pooled_dim]."""
-        from mxtaltools.models.functions.radial_graph import build_radial_graph
-        u, a = z.shape
-        mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
-        batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
-        zf, pf = z[mask], pos[mask]
-        ptr = F.pad(torch.cumsum(n, 0), (1, 0))
-        edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
-        h = self.gnn(torch.cat([zf.to(pf.dtype)[:, None], pf], -1), pf, batch, edges)       # [nodes, node_dim]
-        node = h.new_zeros(u, a, h.shape[-1])
-        node[mask] = h
-        tokens = self.tok(torch.cat([node, self.pos_emb(pos)], -1))
-        score = (node * self.pool_q).sum(-1).masked_fill(~mask, float('-inf'))
-        pooled = self.pool_out((torch.softmax(score, -1)[..., None] * node).sum(1))
-        return tokens, mask, pooled
-
-
-class _ResMLP(nn.Module):
-    """Linear in, residual blocks (LayerNorm, Linear, SiLU, Linear), then LayerNorm and linear out."""
-
-    def __init__(self, n_in, width, n_out, blocks=2):
-        super().__init__()
-        self.inp = nn.Linear(n_in, width)
-        self.blocks = nn.ModuleList(
-            nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width))
-            for _ in range(blocks))
-        self.out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, n_out))
-
-    def forward(self, x):
-        h = self.inp(x)
-        for blk in self.blocks:
-            h = h + blk(h)
-        return self.out(h)
-
-
-class _ContextFlow(nn.Module):
-    """The blocks of a conditional flow, the condition's embedding, and the level head."""
-
-    def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None, atoms=None, frames=False):
-        super().__init__()
-        d = len(wrap_mask)
-        # atoms: AtomEncoder settings (dict). The condition is then the molecule itself: column 0 of c is the condition
-        # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through.
-        # frames: columns 1-4 of c are a unit quaternion, the frame the row's molecule is presented in (its atoms are
-        # rotated by it before encoding)
-        self.atoms = atoms is not None
-        self.frames = bool(frames)
-        if self.frames and not self.atoms:
-            raise NotImplementedError("molecule frames need the atom-token condition")
-        self.d, self.bound = d, bound
-        self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
-        self.register_buffer('mu', torch.zeros(d))
-        self.register_buffer('sd', torch.ones(d))
-        self.register_buffer('c_mu', torch.zeros(cond_dim))
-        self.register_buffer('c_sd', torch.ones(cond_dim))
-
-        g = torch.Generator().manual_seed(seed)
-        orders = []
-        for b in range(n_blocks):  # the same alternation as _Flow
-            if b % 3 == 0:
-                orders.append(list(range(d)))
-            elif b % 3 == 1:
-                orders.append(list(range(d))[::-1])
-            else:
-                orders.append(torch.randperm(d, generator=g).tolist())
-        self.orders = orders
-        self.blocks = nn.ModuleList(
-            _ContextBlock(o, wrap_mask, n_bins, hidden, bound, context_dim) for o in orders)
-        if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
-            for blk, order in zip(self.blocks, orders):
-                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
-                                                        context_dim=context_dim, cross=self.atoms)
-        elif self.atoms:
-            raise NotImplementedError("atom tokens need --conditioner transformer (the MADE has no cross-attention)")
-        n_in = cond_dim
-        if self.atoms:
-            self.atom_encoder = AtomEncoder(transformer[0], **atoms)
-            # pooled molecule + the columns after the id (and after the frame)
-            n_in = self.atom_encoder.pool_out.out_features + cond_dim - 1 - 4 * int(self.frames)
-            for name in ('atom_z', 'atom_pos', 'atom_n'):
-                self.register_buffer(name, None, persistent=False)
-        self.context = _ResMLP(n_in, context_hidden, context_dim)
-        self.level = _ResMLP(n_in, 256, 1)
-        nn.init.zeros_(self.level.out[-1].weight)
-        nn.init.zeros_(self.level.out[-1].bias)
-        self._shared = None   # context_input's results by condition tensor while ConditionalLatentFlow.shared_context is open
-
-    def set_atom_table(self, z, pos, n):
-        """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
-        atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
-        self.atom_z, self.atom_pos, self.atom_n = z, pos, n
-
-    def context_input(self, c):
-        """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's
-        input in atom mode, else the embedded standardised condition and the standardised condition. While
-        ConditionalLatentFlow.shared_context is open, a repeat call on the same tensor with gradients enabled returns
-        the first such call's result (no-grad calls, the draws', are not kept)."""
-        memo = self._shared
-        if memo is None or not torch.is_grad_enabled():
-            return self._context_input(c)
-        hit = memo.get(id(c))
-        if hit is None or hit[0] is not c:
-            hit = memo[id(c)] = (c, self._context_input(c))   # c is held, so its id is not reused inside the block
-        return hit[1]
-
-    def _context_input(self, c):
-        if not self.atoms:
-            s = self.standardise(c)
-            return self.context(s), s
-        cid = c[:, 0].round().long()
-        if self.atom_z is None or bool((self.atom_n[cid] == 0).any()):
-            raise RuntimeError("a condition id with no atoms in the atom table")
-        dtype = self.c_mu.dtype   # the flow's own precision (a double copy for the round-trip check), as standardise
-        if self.frames:
-            # one encoding per (molecule, frame), the atoms rotated into the row's frame
-            uniq, inv = torch.unique(c[:, :5], dim=0, return_inverse=True)
-            mol = uniq[:, 0].round().long()
-            pos = self.atom_pos[mol].to(dtype) @ quat_to_rotmat(uniq[:, 1:5].to(dtype)).transpose(1, 2)
-            rest = c[:, 5:]
-        else:
-            mol, inv = torch.unique(cid, return_inverse=True)
-            pos = self.atom_pos[mol].to(dtype)
-            rest = c[:, 1:]
-        tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
-        s = torch.cat([pooled[inv], rest.to(dtype)], -1)
-        return (self.context(s), tokens[inv], mask[inv]), s
-
-    def set_scaler(self, x):
-        """Standardise the LINEAR dims only; wrapped dims must stay on the circle."""
-        mu, sd = x.mean(0), x.std(0).clamp_min(1e-4)
-        self.mu.copy_(torch.where(self.is_wrap, torch.zeros_like(mu), mu))
-        self.sd.copy_(torch.where(self.is_wrap, torch.ones_like(sd), sd))
-
-    def set_condition_scaler(self, c):
-        self.c_mu.copy_(c.mean(0))
-        self.c_sd.copy_(c.std(0).clamp_min(1e-4))
-
-    def standardise(self, c):
-        return (c.to(self.c_mu.dtype) - self.c_mu) / self.c_sd
-
-
-class ConditionalLatentFlow(nn.Module):
-    """q(x | c): LatentFlow with every block reading an embedding of the condition vector c."""
-
-    def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
-                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, frames=False):
-        super().__init__()
-        dead = {int(d) for d in dead_rows}
-        live = [i for i in range(dim) if i not in dead]
-        self.dim = dim
-        self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
-        self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
-                                 n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
-                                 frames=frames)
-
-    def to_base(self, x, c):
-        f = self.flow
-        ctx = f.context_input(c)[0]
-        x = x[:, self.live_idx]
-        z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
-        ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
-        for blk in f.blocks:
-            z, l = blk(z, ctx)
-            ld = ld + l
-        return z, ld
-
-    def log_prob(self, x, c):
-        f = self.flow
-        z, ld = self.to_base(x, c)
-        zl = z[:, ~f.is_wrap]
-        base = (-math.log(2.0) * int(f.is_wrap.sum())
-                - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])
-        return base + ld
-
-    @torch.no_grad()
-    def sample(self, n, c, return_base: bool = False):
-        f = self.flow
-        dev, dtype = f.mu.device, f.mu.dtype
-        ctx = f.context_input(c)[0]
-        z0 = torch.where(f.is_wrap, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
-                         torch.randn(n, f.d, device=dev, dtype=dtype))
-        z = z0
-        for blk in reversed(list(f.blocks)):
-            if isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z, ctx)       # one decode step per row, not d full passes
-            else:
-                z = blk.invert(z, ctx)
-        x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
-        return (x, z0) if return_base else x
-
-    def set_bf16(self, on: bool):
-        """The transformer conditioners' layers in bf16 (the default) or in the input's precision, as LatentFlow."""
-        for blk in self.flow.blocks:
-            if isinstance(blk.made, CausalTransformerConditioner):
-                blk.made.bf16 = bool(on)
-
-    @contextlib.contextmanager
-    def shared_context(self):
-        """Within the block each condition tensor's context (_ContextFlow.context_input: the atom encoder and the
-        context network) is computed once with gradients and reused, so an energy step that reads the same conditions
-        for log q and for the level head encodes them once. The parameters must not change inside the block."""
-        self.flow._shared = {}
-        try:
-            yield
-        finally:
-            self.flow._shared = None
-
-    def rsample(self, z0, c):
-        """The draw sample() makes from base points z0, differentiable in the parameters."""
-        f = self.flow
-        ctx = f.context_input(c)[0]
-        z = z0
-        for blk in reversed(list(f.blocks)):
-            z = invert_differentiable(blk, z, ctx)
-        x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
-        return x
-
-    def level(self, c):
-        """log Z(c) up to the batch's shared level: the head, zero at initialisation."""
-        return self.flow.level(self.flow.context_input(c)[1]).squeeze(-1)
 
 
 def tb_loss(resid, beta):
@@ -771,7 +231,8 @@ class InnModeller(Modeller):
         self.log_T0 = math.log10(float(self.args.energy_config.temperature))
         self.t_span = math.log10(inn.t_factor) if self.t_conditional else 1.0
         shape = (inn.n_blocks, inn.n_bins, (inn.hidden,) * inn.hidden_layers, inn.bound)
-        transformer = (inn.tf_width, inn.tf_layers, inn.tf_heads) if inn.conditioner == 'transformer' else None
+        transformer = ((inn.tf_width, inn.tf_layers, inn.tf_heads, inn.tf_norm) if inn.conditioner == 'transformer'
+                       else None)
         block_orders = inn.block_orders.split(',') if inn.block_orders else None
         half_rows = [int(r) for r in inn.fold_half_rows.split(',')] if inn.fold_half_rows else []
         if inn.mix_k and inn.w_path > 0:
@@ -849,10 +310,20 @@ class InnModeller(Modeller):
               + (f"half-period images folded on rows {half_rows}, " if half_rows else "")
               + (f"bounded (no-tail, uniform-base) rows {bounded_rows}, " if bounded_rows else "")
               + (f"causal transformer width {inn.tf_width} x {inn.tf_layers} layers, {inn.tf_heads} heads, "
-                 if transformer is not None else f"hidden {inn.hidden} x {inn.hidden_layers}, ")
+                 f"{inn.tf_norm} norm, " if transformer is not None else f"hidden {inn.hidden} x {inn.hidden_layers}, ")
               + (f"condition width {cond_dim} embedded to {inn.context_dim}, " if self.conditional else "")
               + (f"temperature-conditioned over T x [1, {inn.t_factor:g}], " if self.t_conditional else "")
               + f"{n_par / 1e6:.2f}M parameters", flush=True)
+
+    def subset_training_molecules(self, batch, what):
+        """--molecule_fraction: the rows of the molecules file or the prior whose molecule's molecule_u is below it."""
+        f = float(self.inn.molecule_fraction)
+        if f >= 1.0:
+            return batch
+        sub, n_mol = keep_molecules(batch, f)
+        print(f"molecule fraction {f:g} ({what}): {sub.num_graphs} of {batch.num_graphs} rows kept, {n_mol} molecules "
+              f"(molecule_u < {f:g})", flush=True)
+        return sub
 
     @torch.no_grad()
     def init_data_rows(self, chunk: int = 8192):
@@ -885,10 +356,16 @@ class InnModeller(Modeller):
         x, lr, cid = torch.cat(xs), torch.cat(lrs), torch.cat(cids)
         lr_hot = torch.cat(lrs_hot) if self.t_conditional else lr
         ok = torch.isfinite(lr) & torch.isfinite(lr_hot) & torch.isfinite(x).all(-1)
+        kept = torch.nonzero(ok).flatten()   # prior_dataset row of each row kept
         if not bool(ok.all()):
             print(f"data rows: dropping {int((~ok).sum())} of {ok.numel()} rows with a non-finite latent or reward")
             x, lr, lr_hot, cid = x[ok], lr[ok], lr_hot[ok], cid[ok]
-        self.condition_log_z.update_best_energy(cid, -lr * T)
+        if self.inn.stored_source != 'buffer':
+            # held-out rows included. On the buffer route the anchor seed folds in the training rows alone
+            # (init_anchor_buffer_seed), and fold_condition_crystals leaves the floors alone too (a training
+            # molecule's carrier is a copy of one of its prior rows, which the split may hold out), so no
+            # held-out row sets the admission gate's Emin(c)
+            self.condition_log_z.update_best_energy(cid, -lr * T)
 
         # the held-out split's seed: --split_seed, else the run's seed + 1 (so a second training seed can keep the
         # start checkpoint's split)
@@ -922,6 +399,7 @@ class InnModeller(Modeller):
             va, tr = perm[:n_val], perm[n_val:]
         self.x_val, self.lr_val, self.cid_val = x[va], lr[va], cid[va]
         self.x_train, self.lr_train, self.cid_train = x[tr], lr[tr], cid[tr]
+        self.prior_row_train = kept[tr]   # x_train[j] is prior_dataset row prior_row_train[j] (the anchor seed reads it)
         if self.t_conditional:
             # a stored row's reward energy is a + b T, so two temperatures give both parts
             self.a_train = (lr_hot[tr] - lr[tr]) * T / (1.0 - 1.0 / self.inn.t_factor)
@@ -940,6 +418,11 @@ class InnModeller(Modeller):
         if self.inn.level_mode in ('is', 'blend') and self.conditional:
             raise NotImplementedError(f"--level_mode {self.inn.level_mode} on a conditional run: one shared level "
                                       "does not fit rows centred on a per-condition head")
+        if self.inn.level_mode == 'ema' and self.inn.bank_frac > 0:
+            raise NotImplementedError("--level_mode ema with --bank_frac: the tail bank scores its rows against one "
+                                      "shared level, not a per-condition one")
+        if not 0.0 <= self.inn.level_mix <= 1.0:
+            raise ValueError(f"--level_mix must lie in [0, 1], got {self.inn.level_mix}")
         if self.inn.bank_frac > 0 and (self.conditional or not 0.0 < self.inn.bank_frac < 1.0):
             raise NotImplementedError("--bank_frac: unconditional runs only, and a share strictly between 0 and 1")
         if self.inn.mle_plateau_evals > 0 and (self.inn.energy_steps > 0 or self.inn.budget_minutes is not None):
@@ -964,7 +447,8 @@ class InnModeller(Modeller):
                                torch.zeros(n_cond, dtype=torch.long, device=self.device))
         if self.mol_conditional:
             # the conditions files' own crystals: one reference structure per molecule, held-out included
-            self.fold_condition_crystals(self.mol_dataset, held_out=False)
+            self.fold_condition_crystals(self.mol_dataset, held_out=False,
+                                         fold_floor=not getattr(self, 'pbuf_on', False))
             if getattr(self, 'test_mol_dataset', None) is not None:
                 self.fold_condition_crystals(self.test_mol_dataset, held_out=True)
         if self.inn.atom_tokens:
@@ -1039,10 +523,12 @@ class InnModeller(Modeller):
             self.cond_known[cid] = True
 
     @torch.no_grad()
-    def fold_condition_crystals(self, dataset, held_out: bool, chunk: int = 4096):
+    def fold_condition_crystals(self, dataset, held_out: bool, chunk: int = 4096, fold_floor: bool = True):
         """A conditions file's own crystals: their condition vectors into the table, and the
         reward energy of each, rebuilt from its latent, into its condition's floor (the
-        tracker's for training conditions, test_floor for held-out ones)."""
+        tracker's for training conditions, test_floor for held-out ones). fold_floor False (--stored_source
+        buffer) leaves the tracker's floors to the anchor seed: a training carrier is a copy of a prior row, and
+        the row split may hold that row out."""
         ef = self.energy_function
         T = float(self.args.energy_config.temperature)
         batch = dataset.batch
@@ -1061,7 +547,7 @@ class InnModeller(Modeller):
             ok = torch.isfinite(log_r)
             if held_out:
                 self.test_floor.scatter_reduce_(0, cid[ok], -log_r[ok] * T, reduce='amin')
-            else:
+            elif fold_floor:
                 self.condition_log_z.update_best_energy(cid[ok], -log_r[ok] * T)
             xs.append(x.to(self.device)[ok])
             cids.append(cid[ok])
@@ -1104,6 +590,66 @@ class InnModeller(Modeller):
 
     def level_of(self, c):
         return self.sampler.level(c) if self.conditional else 0.0
+
+    @torch.no_grad()
+    def ema_levels(self, cid, fallback_f, fallback_b):
+        """--level_mode ema: each row's level, from its condition's two level streams on the trainer's tracker
+        (buffer.py::ConditionLogZTracker.fwd_level_ema / bwd_level_ema, fed by note_step: the draws' log w and the
+        stored rows' log w, evidence-capped EMAs on one per-condition clock). --level_source fwd reads the forward
+        stream; pooled reads --level_mix x forward + (1 - --level_mix) x backward. A stream that has had fewer than
+        the tracker's min_visits updates for a condition, or none, gives that row its fallback instead (per row,
+        on the rows' device). Returns (level, forward trusted, backward trusted or None under fwd)."""
+        tr = self.condition_log_z
+        idx = cid.detach().long().cpu()
+
+        def stream(ema, visits, fallback):
+            v = ema[idx].to(device=fallback.device, dtype=fallback.dtype)
+            ok = ((visits[idx] >= tr.min_visits) & torch.isfinite(ema[idx])).to(fallback.device)
+            return torch.where(ok, v, fallback), ok
+
+        lf, ok_f = stream(tr.fwd_level_ema, tr.fwd_level_visits, fallback_f)
+        if self.inn.level_source == 'fwd':
+            return lf, ok_f, None
+        lb, ok_b = stream(tr.bwd_level_ema, tr.bwd_level_visits, fallback_b)
+        m = float(self.inn.level_mix)
+        return m * lf + (1.0 - m) * lb, ok_f, ok_b
+
+    @torch.no_grad()
+    def ema_stats(self, stats, root, root_d, lvl_f, lvl_d, okf_f, okb_d, ok, ok_d, log_q, log_r, log_q_d, lr_d,
+                  cid_d):
+        """--level_mode ema readouts (level/...): the share of rows whose stream is trusted, each branch's level and
+        mean residual against it, the share past each knee, the mean log q on each branch (the two rising in lockstep
+        is the failure the one-sided level_gap tether showed), and the stored-minus-draws gap where a condition is
+        trusted on both streams. The first call also prints the entry state."""
+        inn, tr = self.inn, self.condition_log_z
+        rf = (log_q - log_r + lvl_f)[ok].detach()
+        rd = (log_q_d - lr_d + lvl_d)[ok_d].detach()
+        stats.update({
+            'level/fwd_trusted_frac': float(okf_f[ok].float().mean()),
+            'level/fresh_mean': float(lvl_f[ok].mean()), 'level/stored_mean': float(lvl_d[ok_d].mean()),
+            'level/fresh_resid_mean': float(rf.mean()), 'level/stored_resid_mean': float(rd.mean()),
+            'level/fresh_clip_frac': float((rf.abs() > inn.beta).float().mean()),
+            'level/stored_clip_frac': float((rd.abs() > inn.beta_data).float().mean()),
+            'level/logq_fresh_mean': float(log_q.detach()[ok].mean()),
+            'level/logq_stored_mean': float(log_q_d.detach()[ok_d].mean()),
+            'level/root_fresh': float(root), 'level/root_stored': float(root_d)})
+        if okb_d is not None:
+            stats['level/bwd_trusted_frac'] = float(okb_d[ok_d].float().mean())
+        ic = cid_d.detach().long().cpu()
+        both = (tr.fwd_level_visits[ic] >= tr.min_visits) & (tr.bwd_level_visits[ic] >= tr.min_visits)
+        stats['level/both_trusted_frac'] = float(both.float().mean())
+        if bool(both.any()):
+            stats['level/delta_mean'] = float((tr.bwd_level_ema[ic] - tr.fwd_level_ema[ic])[both].mean())
+        if not getattr(self, '_ema_entry_printed', False):
+            self._ema_entry_printed = True
+            print(f"level_mode ema ({inn.level_source}"
+                  + (f", forward share {inn.level_mix:g}" if inn.level_source == 'pooled' else '')
+                  + f"; condition_log_z min_visits {tr.min_visits}, half_life_visits {tr.half_life_visits:g}): first "
+                  f"update: the draws' Huber root {float(root):.2f}, the stored rows' {float(root_d):.2f} (gap "
+                  f"{float(root_d) - float(root):.2f} nats, head-centred); residual means: draws "
+                  f"{float(rf.mean()):.2f}, stored {float(rd.mean()):.2f}; past the knee: draws "
+                  f"{stats['level/fresh_clip_frac']:.3f} (knee {inn.beta:g}), stored "
+                  f"{stats['level/stored_clip_frac']:.3f} (knee {inn.beta_data:g})", flush=True)
 
     def training_log_T(self, n, repeats: int = 1):
         """log10 T of n training rows: the run's own temperature, or under temperature
@@ -1186,11 +732,15 @@ class InnModeller(Modeller):
         """
         c = self.context_of(self.cid_train[torch.randint(0, self.cid_train.shape[0], (n,), device=self.device)])
 
-        def per_draw_error(sampler):
-            x, z0 = sampler.sample(n, c, return_base=True)
-            z1, _ = sampler.to_base(x, c)
-            f = sampler.flow
-            return torch.where(f.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values
+        def per_draw_error(sampler, chunk: int = 512):
+            # in chunks of draws: the double copy's atom encoder over 4096 molecules at once peaks above 7 GB
+            f, out = sampler.flow, []
+            for s in range(0, n, chunk):
+                cs = None if c is None else c[s:s + chunk]
+                x, z0 = sampler.sample(min(chunk, n - s), cs, return_base=True)
+                z1, _ = sampler.to_base(x, cs)
+                out.append(torch.where(f.is_wrap, _wrap(z1 - z0), z1 - z0).abs().max(-1).values)
+            return torch.cat(out)
 
         exact = float(per_draw_error(copy.deepcopy(self.sampler).double()).max())
         working = per_draw_error(self.sampler)
@@ -1249,6 +799,430 @@ class InnModeller(Modeller):
             raise RuntimeError("the energy function returned the same log R at another temperature: "
                                "it is not scoring at the temperature it is handed")
 
+    # -- stored rows from train.py's anchor -> prior buffers (--stored_source buffer) --------
+
+    def check_buffer_options(self):
+        """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on.
+        On this route both stages read the buffer: stage 1 fits its rows, stage 2 trains on them as stored rows."""
+        inn, args = self.inn, self.args
+        acfg = args.buffers.anchor_buffer
+        tile = getattr(acfg, 'tile', 'iso')
+        self.pbuf_on = inn.stored_source == 'buffer'
+        if tile not in ('iso', 'shaped', 'gauss'):
+            raise ValueError(f"buffers.anchor_buffer.tile must be iso, shaped or gauss on this route, got {tile!r}")
+        if tile != 'iso' and not self.pbuf_on:
+            raise ValueError(f"buffers.anchor_buffer.tile {tile!r} is read only by --stored_source buffer")
+        if (tile == 'gauss') != (inn.gauss_excess_kT is not None):
+            raise ValueError("--gauss_excess_kT goes with buffers.anchor_buffer.tile gauss, and only with it")
+        if not self.pbuf_on:
+            return
+        T = float(args.energy_config.temperature)
+        ramp_floor = float(args.buffers.prior_buffer.ramp_floor)
+        if tile == 'gauss' and not 0.0 < inn.gauss_excess_kT < ramp_floor / T:
+            raise ValueError(f"--gauss_excess_kT must lie in (0, ramp_floor / T = {ramp_floor / T:.3g}) kT, "
+                             f"got {inn.gauss_excess_kT}")
+        refusals = [
+            (not self.mol_conditional, "a run without molecule conditions (one condition: a two-row stored pool)"),
+            (self.t_conditional, "temperature conditioning (children are drawn and gated at the run's one T)"),
+            (inn.data_noise_log_range is not None, "--data_noise_log_range (the per-batch re-score it replaces)"),
+            (inn.grow_stored, "--grow_stored"),
+            (inn.rows_per_molecule > 1, "--rows_per_molecule > 1"),
+            (inn.w_mle > 0, "--w_mle (its term reads the rows as stored)"),
+            (inn.pbuf_rows_per_condition < 1, "--pbuf_rows_per_condition below 1"),
+            (inn.mle_noise_log_range is not None, "--mle_noise_log_range (stage 1 fits the buffer's rows)"),
+            (str(args.molecules_path) == str(args.prior_path),
+             "molecules_path == prior_path (the conditions would be the prior's rows, held-out ones included)"),
+            (getattr(acfg, 'seed_source', None) != 'prior_dataset', "buffers.anchor_buffer.seed_source other than "
+                                                                     "'prior_dataset'"),
+            (not bool(getattr(acfg, 'frozen', False)), "buffers.anchor_buffer.frozen false (the anchor index cache "
+                                                       "assumes fixed membership)"),
+        ]
+        for bad, why in refusals:
+            if bad:
+                raise NotImplementedError(f"--stored_source buffer with {why}")
+
+    @torch.no_grad()
+    def init_inn_buffers(self):
+        """The stored-row buffers. Anchors: train.py's init_anchor_buffer_seed over the TRAINING prior rows only
+        (prior_row_train; held-out rows never enter), checked row by row against x_train / lr_train / cid_train.
+        Children: per-condition quotas through top_up_prior_from_anchors (noise once by the tile, score once, admit
+        below Emin(c) + ramp_floor), up to --pbuf_rows_per_condition per training condition. The fill, the gauss
+        pilot and a currency check go to energy/startup_calls."""
+        ef, inn = self.energy_function, self.inn
+        T = float(self.args.energy_config.temperature)
+        n_cond = int(ef.condition_library_size)
+        self.energy_startup_calls = getattr(self, 'energy_startup_calls', 0)
+        self.pbuf_scored, self.pbuf_updates, self.pbuf_updates_churned = 0, 0, 0
+        self.pbuf_window = dict(drawn=0, retired=0, churn_scored=0)
+        self._pbuf_miss = torch.zeros(n_cond, dtype=torch.long)
+        self._pbuf_off = torch.zeros(n_cond, dtype=torch.bool)
+        self.pbuf_train_conds = torch.unique(self.cid_train).long().cpu()
+        if getattr(self, 'anchor_buffer', None) is not None or getattr(self, 'prior_buffer', None) is not None:
+            raise RuntimeError("init_inn_buffers: a buffer already exists")
+
+        # anchors: the training rows, in prior_dataset order, through train.py's own seed (energy-call free)
+        rows = torch.sort(self.prior_row_train.cpu()).values
+        full = self.prior_dataset
+        dev = full.batch.ptr.device if hasattr(full.batch, 'ptr') else self.device
+        self.prior_dataset = types.SimpleNamespace(row_batches=lambda limit=None: (
+            full.batch.subsample_new_batch(rows[i:i + ANCHOR_SEED_CHUNK].to(dev))
+            for i in range(0, rows.numel(), ANCHOR_SEED_CHUNK)))
+        try:
+            Modeller.init_anchor_buffer_seed(self)
+        finally:
+            self.prior_dataset = full
+        ab = self.anchor_buffer
+        perm = torch.argsort(self.prior_row_train.cpu())   # x_train[perm] is in anchor (sorted prior-row) order
+        dx = float((ab.x.detach().float().cpu() - self.x_train[perm.to(self.device)].float().cpu()).abs().max())
+        dr = float((ab.reward.detach().float().cpu().flatten() - self.lr_train.cpu()[perm]).abs().max())
+        same_cid = torch.equal(ab.condition_id.detach().long().cpu().flatten(), self.cid_train.cpu()[perm].long())
+        print(f"anchor buffer: {len(ab)} anchors from the {self.n_prior_rows} training rows (no held-out row); against "
+              f"x_train max |dx| {dx:.2e}, against lr_train max |d log R| {dr:.2e} nats, condition ids "
+              f"{'equal' if same_cid else 'DIFFER'}; frozen {ab.frozen}", flush=True)
+        if len(ab) != self.n_prior_rows or dx > 1e-3 or dr > 1e-2 or not same_cid or not ab.frozen:
+            raise RuntimeError("the anchor buffer is not the training rows: see the line above")
+
+        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'gauss':
+            self.gauss_sigma = self.calibrate_gauss()
+
+        self.pbuf_refresh_pool()
+        k = int(inn.pbuf_rows_per_condition)
+        self.pbuf_target = k * int(self.pbuf_train_conds.numel())
+        n0 = self.pbuf_scored
+        t = time.perf_counter()
+        self.pbuf_fill()
+        fill_calls = self.pbuf_scored - n0
+        self.energy_startup_calls += fill_calls
+        if self._prior_buffer_len() == 0:
+            raise RuntimeError("the prior buffer admitted no child: every child failed Emin(c) + ramp_floor")
+        pb = self.prior_buffer
+        counts = torch.as_tensor(pb.condition_row_counts(n_cond)).long()[self.pbuf_train_conds]
+        cid_pb = pb.batch.condition_id.detach().cpu().long()
+        u = (self._prior_row_energy() - self._condition_energy_floor(cid_pb).cpu().flatten()) / T
+        q = quantiles(u[torch.isfinite(u)], (0.1, 0.5, 0.9))
+        print(f"prior buffer: {len(pb)} rows of target {self.pbuf_target} ({k} per training condition) from "
+              f"{fill_calls} scored children (yield {len(pb) / max(fill_calls, 1):.3f}) in "
+              f"{time.perf_counter() - t:.0f} s; rows per training condition min {int(counts.min())} median "
+              f"{float(counts.float().median()):.0f}, none {float((counts == 0).float().mean()):.4f}; conditions "
+              f"with no anchor under the gate {int(self.pbuf_train_conds.numel() - self.pbuf_conds.numel())}, "
+              f"excluded {int(self._pbuf_off.sum())}; excess over Emin(c) P10 {q[0]:.2f} P50 {q[1]:.2f} P90 "
+              f"{q[2]:.2f} kT (tile {self.args.buffers.anchor_buffer.tile})", flush=True)
+        self.check_buffer_reward_currency()
+        ef.drain_energy_timing()   # the fill is start-up, not the first window's energy/*
+        for key in self.prior_churn:   # nor the first window's churn
+            self.prior_churn[key] = 0
+        for key in self.pbuf_window:
+            self.pbuf_window[key] = 0
+        self._pbuf_mark = self.pbuf_scored
+
+    @torch.no_grad()
+    def check_buffer_reward_currency(self, n: int = 512, bar: float = 0.05):
+        """A drawn buffer row's log R from its stored legs (prebuilt_sample_to_reward, what a stored-row update reads)
+        against its latent rebuilt on its condition's mol_dataset molecule (what a fresh draw at that latent would
+        score): one chart and one currency; and the rows' stored condition ids against condition_samples' (what
+        stage 1's tensor draw reads)."""
+        ef, pb = self.energy_function, self.prior_buffer
+        graphs, inds, _ = pb.sample_graphs(n, replace=True)
+        t = torch.as_tensor(inds, device=pb.x.device, dtype=torch.long)
+        x = pb.x[t].to(self.device, torch.float32)
+        graphs = graphs.to(self.device)
+        cid_stored = pb.batch.condition_id[t.to(pb.batch.condition_id.device)].long().flatten().cpu()
+        graphs, log_T, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
+        if not torch.equal(cid_stored, cid.long().flatten().cpu()):
+            raise RuntimeError(f"buffer rows' stored condition ids differ from condition_samples' on "
+                               f"{int((cid_stored != cid.long().flatten().cpu()).sum())} of {cid.numel()} rows: "
+                               f"stage 1's tensor draw would condition them wrongly")
+        stored = ef.prebuilt_sample_to_reward(graphs, 10 ** log_T).flatten().float().to(self.device)
+        mol_batch, log_T_r, _, _ = self.mol_batch_for(cid.long().to(self.device))
+        fresh = ef.log_reward(x, mol_batch, log_T_r, False, internal_oom_recovery=True).flatten().to(self.device)
+        self.energy_startup_calls += int(x.shape[0])
+        d = (fresh - stored).abs()
+        d = d[torch.isfinite(d)]
+        med, p99 = quantiles(d, (0.5, 0.99))
+        print(f"buffer reward currency: |log R rebuilt from the latent - stored legs| median {med:.2e}, P99 "
+              f"{p99:.2e} nats over {d.numel()} buffer rows (bar on the median {bar})", flush=True)
+        if not med < bar:
+            raise RuntimeError(f"a buffer row and the crystal rebuilt from its latent score differently (median "
+                               f"{med:.3g} nats): the stored rows and the draws are not in one currency")
+
+    @torch.no_grad()
+    def pbuf_refresh_pool(self):
+        """The anchors a child may be drawn from, by condition: those whose own energy is under Emin(c) + ramp_floor
+        (a child of an anchor already above the gate almost never clears it). Recomputed as Emin(c) moves."""
+        ab = self.anchor_buffer
+        n_cond = int(self.energy_function.condition_library_size)
+        cid = ab.condition_id.detach().long().cpu().flatten()
+        floor = self._condition_energy_floor(cid)
+        elig = (torch.ones_like(cid, dtype=torch.bool) if floor is None else
+                ab.energy.detach().cpu().flatten() < floor.cpu().flatten() + self._ramp_params()[0])
+        order = torch.argsort(cid, stable=True)
+        self._anc_order = order[elig[order]]
+        self._anc_count = torch.bincount(cid[self._anc_order], minlength=n_cond)
+        self._anc_start = torch.cumsum(self._anc_count, 0) - self._anc_count
+        self.pbuf_conds = self.pbuf_train_conds[self._anc_count[self.pbuf_train_conds] > 0]
+
+    @torch.no_grad()
+    def pbuf_top_up(self, budget):
+        """At most `budget` children, as per-condition quotas over the eligible training conditions' deficits below
+        --pbuf_rows_per_condition (a uniform pick over the missing slots), through top_up_prior_from_anchors. A
+        condition asked PBUF_STARVE_MISSES children with none admitted leaves the quota (printed) until pbuf_churn
+        clears the exclusion before its next refill. Returns the rows admitted."""
+        n_cond = int(self.energy_function.condition_library_size)
+        k = int(self.inn.pbuf_rows_per_condition)
+        conds = self.pbuf_conds[~self._pbuf_off[self.pbuf_conds]]
+        counts = (torch.as_tensor(self.prior_buffer.condition_row_counts(n_cond)).long()[:n_cond]
+                  if self._prior_buffer_len() else torch.zeros(n_cond, dtype=torch.long))
+        deficit = (k - counts[conds]).clamp(min=0)
+        want = min(int(budget), int(deficit.sum()))
+        if want <= 0 or conds.numel() == 0:
+            return 0
+        slots = conds.repeat_interleave(deficit)
+        q = torch.bincount(slots[torch.randperm(slots.numel())[:want]], minlength=n_cond)
+        a0 = self.prior_churn['from_anchors']
+        self.top_up_prior_from_anchors(int(q.sum()), per_condition=q)
+        after = (torch.as_tensor(self.prior_buffer.condition_row_counts(n_cond)).long()[:n_cond]
+                 if self._prior_buffer_len() else counts)
+        got = (after - counts).clamp(min=0)
+        asked = q > 0
+        self._pbuf_miss[asked & (got > 0)] = 0
+        miss = asked & (got == 0)
+        self._pbuf_miss[miss] += q[miss]
+        newly = (self._pbuf_miss >= PBUF_STARVE_MISSES) & ~self._pbuf_off
+        if bool(newly.any()):
+            self._pbuf_off |= newly
+            print(f"prior buffer: {int(newly.sum())} condition(s) left the quota after {PBUF_STARVE_MISSES} requested "
+                  f"children with none under the gate (e.g. {torch.nonzero(newly).flatten()[:5].tolist()}); "
+                  f"{int(self._pbuf_off.sum())} excluded in all", flush=True)
+        return self.prior_churn['from_anchors'] - a0
+
+    @torch.no_grad()
+    def pbuf_fill(self):
+        """Top up the deficits in calls of at most PBUF_FILL_CYCLE children (each scored as one batch), until none is
+        left or a call admits nothing. Bounded: at most 4 x ceil(deficit / PBUF_FILL_CYCLE) + PBUF_REFILL_ROUNDS calls,
+        the deficit counted against pbuf_target."""
+        deficit = max(0, int(self.pbuf_target) - self._prior_buffer_len())
+        for _ in range(4 * math.ceil(deficit / PBUF_FILL_CYCLE) + PBUF_REFILL_ROUNDS):
+            if self.pbuf_top_up(PBUF_FILL_CYCLE) == 0:
+                break
+
+    @torch.no_grad()
+    def pbuf_churn(self):
+        """At an eval: gate-staleness expiry (train.py's _expire_stale_prior_rows), then a uniform retirement of
+        churn_batch_ref / mean_lifetime rows per energy-stage update that stepped since the last churn, then a
+        per-condition refill (pbuf_fill), stopping at a call that admits nothing; the
+        starvation exclusion is cleared before each refill, so it binds within one refill and a condition is asked
+        again at the next. Safe to retry (yielding): the retirement runs once per window, the refill on every call,
+        and the children scored count once in energy/samples_total, a retried call's included."""
+        cfg = self.args.buffers.prior_buffer
+        n_upd = self.pbuf_updates - self.pbuf_updates_churned
+        if n_upd > 0 and self._prior_buffer_len() > 0:
+            self.pbuf_updates_churned = self.pbuf_updates
+            self._expire_stale_prior_rows()
+            self.pbuf_refresh_pool()
+            n_ret = min(self._prior_buffer_len(),
+                        max(1, int(round(n_upd * float(cfg.churn_batch_ref) / float(cfg.mean_lifetime)))))
+            drop = np.random.choice(self._prior_buffer_len(), n_ret, replace=False)
+            self.prior_buffer.purge_by_index(drop)
+            self.prior_churn['evicted'] += int(n_ret)
+            self.pbuf_window['retired'] += int(n_ret)
+        else:
+            self.pbuf_refresh_pool()   # Emin(c) moves with the draws
+        self._pbuf_off.zero_()
+        self._pbuf_miss.zero_()
+        self.pbuf_fill()   # the deficits: the retired, the expired, any left by an earlier refill
+        d = self.pbuf_scored - self._pbuf_mark
+        self._pbuf_mark = self.pbuf_scored
+        self.energy_samples_scored += d
+        self.pbuf_window['churn_scored'] += d
+
+    def pbuf_ref_energy(self, n):
+        """Stage 1's reachable energy marginal on the buffer route: the energies (-T log R, stored legs) of n buffer
+        rows drawn uniformly at start-up (seed + 7), the reference of E/noised_*. No energy call."""
+        e = self._prior_row_energy().flatten()
+        e = e[torch.isfinite(e)]
+        g = torch.Generator(device='cpu').manual_seed(int(self.args.seed) + 7)
+        return e[torch.randint(0, e.numel(), (int(n),), generator=g)].double().numpy()
+
+    def commit_pbuf_step(self):
+        """After an update that drew from the buffer and stepped: the update count the churn rate reads, and in the
+        energy stage its rows' ema_loss (CrystalBuffer.update_losses). A draw whose update did not step leaves
+        neither."""
+        if not getattr(self, '_pbuf_drawn', False):
+            return
+        self._pbuf_drawn = False
+        self.pbuf_updates += 1
+        pend = getattr(self, '_pbuf_pending', None)
+        self._pbuf_pending = None
+        if pend is not None:
+            self.prior_buffer.update_losses(*pend)
+
+    @torch.no_grad()
+    def pbuf_draw(self, n, reward: bool = True):
+        """n stored rows for an update, uniform over the prior buffer's training rows: latents from the buffer's x
+        (gauge-fixed latent_params, this trainer's chart), log R recomposed from the stored legs at each row's
+        training temperature, condition ids from the row's own space group. No energy call. reward False (stage 1)
+        takes the latents and the stored condition ids alone (CrystalBuffer.sample_tensors, no graph built; the
+        start-up currency check confirms those ids) and returns log R None."""
+        ef, pb = self.energy_function, self.prior_buffer
+        if not reward:
+            x, _, _, inds = pb.sample_tensors(n, replace=True)
+            self.pbuf_inds = np.asarray(inds, dtype=np.int64)
+            t = torch.as_tensor(self.pbuf_inds, device=pb.batch.condition_id.device, dtype=torch.long)
+            cid = pb.batch.condition_id[t].long().flatten().to(self.device)
+            self._pbuf_pending = None
+            self._pbuf_drawn = True
+            return x.to(self.device, torch.float32), cid, self.training_log_T(cid.numel()), None
+        graphs, inds, _ = pb.sample_graphs(n, replace=True)
+        self.pbuf_inds = np.asarray(inds, dtype=np.int64)
+        t = torch.as_tensor(self.pbuf_inds, device=pb.x.device, dtype=torch.long)
+        x = pb.x[t].to(self.device, torch.float32)
+        graphs = graphs.to(self.device)
+        graphs, _, _, cid = ef.condition_samples(graphs, sg_inds=graphs.sg_ind, z_primes=graphs.z_prime)
+        cid = cid.long().to(self.device)
+        log_T = self.training_log_T(cid.numel())
+        lr = (ef.prebuilt_sample_to_reward(graphs, 10 ** log_T.to(graphs.device)).flatten().float().to(self.device)
+              if reward else None)
+        self._pbuf_pending = None   # set by step_loss, committed by commit_pbuf_step once the update steps
+        self._pbuf_drawn = True
+        return x, cid, log_T, lr
+
+    def _stratified_anchor_draw(self, per_condition):
+        """train.py's per-condition quota (exact counts; a condition with no eligible anchor is printed and its quota
+        dropped, never reassigned), drawn uniformly WITH replacement over the cached pool of anchors under the gate
+        (pbuf_refresh_pool). train.py's own draw takes all of a condition's anchors, without replacement while the
+        pool allows, and weights by ema_loss when replay_beta < 1. Returns (graphs, inds) or (None, None)."""
+        if not getattr(self, 'pbuf_on', False):
+            return super()._stratified_anchor_draw(per_condition)
+        q = torch.as_tensor(per_condition).long().cpu().flatten()
+        c = torch.nonzero(q > 0).flatten()
+        empty = self._anc_count[c] == 0
+        if bool(empty.any()):
+            print(f"anchor draw: {int(empty.sum())} condition(s) with no anchor under the gate "
+                  f"(e.g. {c[empty][:5].tolist()}) -- quota dropped, never reassigned", flush=True)
+            c = c[~empty]
+        if c.numel() == 0:
+            return None, None
+        kc = q[c]
+        start = self._anc_start[c].repeat_interleave(kc)
+        count = self._anc_count[c].repeat_interleave(kc)
+        pick = torch.minimum((torch.rand(start.numel()) * count).long(), count - 1)
+        inds = self._anc_order[start + pick].numpy()
+        self.anchor_buffer._bump_counts(inds)
+        graphs = self.anchor_buffer.batch.subsample_new_batch(inds)
+        graphs = self.anchor_buffer._drop_keys(graphs, ("symmetry_operators", "smiles", "identifier"))
+        return graphs, inds
+
+    def _noise_and_condition(self, batch, noise_log_range, anchor_inds=None):
+        """train.py's anchor-noise seam, with the buffer's tally of scored children and the 'gauss' tile: an isotropic
+        Gaussian kick at the calibrated scale (_gauss_kick), read, clipped and decoded as the iso tile's primitive
+        is. 'iso' and 'shaped' are train.py's own."""
+        if getattr(self, 'pbuf_on', False):
+            self.pbuf_scored += int(batch.num_graphs)
+            self.pbuf_window['drawn'] += int(batch.num_graphs)
+        tile = getattr(self.args.buffers.anchor_buffer, 'tile', 'iso')
+        if tile in ('iso', 'shaped'):
+            return super()._noise_and_condition(batch, noise_log_range, anchor_inds=anchor_inds)
+        if tile != 'gauss':
+            raise ValueError(f"buffers.anchor_buffer.tile {tile!r}: iso, shaped or gauss")
+        self._gauss_kick(batch, self.gauss_sigma)
+        batch, log_T, condition, condition_id = self.energy_function.condition_samples(
+            batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)
+        batch.orient_molecule(mode='std')
+        return batch, log_T, condition, condition_id
+
+    @staticmethod
+    @torch.no_grad()
+    def _gauss_kick(batch, sigma, eps=None):
+        """In place: gauge-free latents + sigma x N(0, I), clipped to the open box, decoded and hard-cleaned -- the
+        iso primitive's sequence (MXtalTools log_noise_latent_parameters) with a Gaussian step in place of a unit
+        direction times 10^U."""
+        lat = batch.latent_params(gauge_fix_free_axes=False)
+        eps = torch.randn_like(lat) if eps is None else eps.to(lat)
+        batch.latent_to_cell_params((lat + float(sigma) * eps).clip(min=-1 + 1e-6, max=1 - 1e-6))
+        batch.clean_cell_parameters(mode='hard')
+
+    @torch.no_grad()
+    def calibrate_gauss(self):
+        """The gauss tile's sigma: a pilot of GAUSS_PILOT_ROWS anchors (one per uniformly drawn training condition,
+        through the churn's own draw), kicked with fixed noise (common random numbers), scored, and the mean excess
+        over the parent (E_child - E_anchor) / T, winsorised at the gate ramp_floor / T (a child with no finite
+        energy counts at the gate), brought to
+        --gauss_excess_kT (calibrate_gauss_sigma). At most GAUSS_PILOT_ROWS x GAUSS_PILOT_ROUNDS energy calls."""
+        ef, inn = self.energy_function, self.inn
+        T = float(self.args.energy_config.temperature)
+        u_gate = float(self._ramp_params()[0]) / T
+        self.pbuf_refresh_pool()
+        n_cond = int(ef.condition_library_size)
+        pick = self.pbuf_conds[torch.randint(0, self.pbuf_conds.numel(), (GAUSS_PILOT_ROWS,))]
+        graphs, inds = self._stratified_anchor_draw(torch.bincount(pick, minlength=n_cond))
+        e_anchor = self.anchor_buffer.energy.detach().cpu().flatten()[torch.as_tensor(inds)]
+        lat = graphs.latent_params(gauge_fix_free_axes=False)
+        eps = torch.randn(lat.shape, generator=torch.Generator().manual_seed(int(self.args.seed) + 11))
+
+        def score(sigma):
+            b = graphs.clone().to(self.device)
+            self._gauss_kick(b, sigma, eps=eps)
+            b, log_T, _, _ = ef.condition_samples(b, sg_inds=b.sg_ind, z_primes=b.z_prime)
+            b.orient_molecule(mode='std')
+            lr = ef.log_reward(self._batch_latents(b), b, log_T, False, internal_oom_recovery=True).flatten()
+            self.energy_startup_calls += int(lr.numel())
+            du = (-lr.detach().float().cpu() * T - e_anchor) / T
+            du = torch.where(torch.isfinite(du), du, torch.full_like(du, u_gate)).clamp(max=u_gate)   # unscorable = gate
+            return float(du.mean()), float(du.std() / max(du.numel(), 1) ** 0.5)
+
+        lo, hi = self.args.buffers.anchor_buffer.noise_log_range
+        sigma0 = 10 ** (0.5 * (float(lo) + float(hi))) / lat.shape[1] ** 0.5
+        sigma, table = calibrate_gauss_sigma(score, float(inn.gauss_excess_kT), sigma0)
+        print("gauss tile: (sigma, mean excess over the parent kT, se) per round "
+              + ', '.join(f"({s:.4g}, {m:.3g}, {e:.2g})" for s, m, e in table)
+              + f"; sigma {sigma:.4g} for a target of {inn.gauss_excess_kT:g} kT", flush=True)
+        inn.gauss_sigma = sigma
+        wandb.config.update({'inn/gauss_sigma': sigma}, allow_val_change=True)
+        return sigma
+
+    def _reward_ramp_kwargs(self, condition_id=None):
+        """The eval's under_coverage weighting stays the uniform form this trainer has always reported: train.py's
+        anchor-relative ramp switches on at the mere presence of an anchor buffer, which --stored_source buffer
+        builds."""
+        return dict(reward_floor=None, ramp_width=None)
+
+    @property
+    def bwd_sampling_mode(self):
+        """What the stored rows are drawn from, as train.py names it (there it is the stage protocol's): 'prior' on
+        --stored_source buffer, else 'dataset' (the prior's stored training rows). Read by Modeller.log_buffer_stats."""
+        return 'prior' if getattr(self, 'pbuf_on', False) else 'dataset'
+
+    def pbuf_stats(self):
+        """train.py's own buffer readout (Modeller.log_buffer_stats, read as the crystal trainer reads it while its
+        backward branch draws from the prior buffer): prior_buffer_* core stats, step and loss histograms, the
+        window's churn by source (drained there), anchor_buffer_* and the anchors' energy above their condition's
+        minimum. Then this route's own extras: rows retired by the churn, children scored, admission yield, the rows'
+        excess over Emin(c) in kT, and the per-condition coverage (pbuf/*); the window counts are drained here."""
+        pb, ch, w = self.prior_buffer, self.prior_churn, self.pbuf_window
+        T = float(self.args.energy_config.temperature)
+        n_cond = int(self.energy_function.condition_library_size)
+        extra = {'prior_buffer_retired': w['retired'], 'prior_buffer_drawn': w['drawn'],
+                 'energy/buffer_churn_calls': w['churn_scored'],
+                 'prior_buffer_admit_yield': ch['from_anchors'] / w['drawn'] if w['drawn'] else float('nan')}
+        e = self._prior_row_energy()
+        u = (e - self._condition_energy_floor(pb.batch.condition_id.detach().cpu()).cpu().flatten()) / T
+        u = u[torch.isfinite(u)]
+        if u.numel():
+            for qq, v in zip((10, 50, 90), quantiles(u, (0.1, 0.5, 0.9))):
+                extra[f'prior_buffer_excess_kT_p{qq}'] = v
+        counts = torch.as_tensor(pb.condition_row_counts(n_cond)).long()[self.pbuf_train_conds]
+        extra.update({'pbuf/cond_rows_min': int(counts.min()), 'pbuf/cond_rows_median': float(counts.float().median()),
+                      'pbuf/cond_zero_frac': float((counts == 0).float().mean()),
+                      'pbuf/eligible_conditions': int(self.pbuf_conds.numel()),
+                      'pbuf/excluded_conditions': int(self._pbuf_off.sum())})
+        if getattr(self, 'gauss_sigma', None) is not None:
+            extra['pbuf/gauss_sigma'] = float(self.gauss_sigma)
+        for key in w:
+            w[key] = 0
+        out = Modeller.log_buffer_stats(self)   # drains prior_churn
+        out.update(extra)
+        return out
+
     # -- the loop ---------------------------------------------------------------
 
     def train(self):
@@ -1258,6 +1232,7 @@ class InnModeller(Modeller):
             wandb.config.update({f'inn/{k}': v for k, v in vars(inn).items()})
             self.init_energy_function()
             self.init_gfn()
+            self.check_buffer_options()   # after init_gfn, which sets mol_conditional / t_conditional
             self.init_mol_dataset()
             with self.energy_function.allow_unreferenced():
                 self.init_prior_dataset()
@@ -1267,6 +1242,10 @@ class InnModeller(Modeller):
             # eval and figure code reads. Nothing in this loop's loss reads it.
             self.init_condition_log_z()
             self.init_data_rows()
+            # train.py's data/ keys, and this trainer's split of the prior rows: the stored training rows
+            # (prior_buffer_length) and the rows held out of training molecules (eval_bwd/mle_heldout_rows)
+            self.publish_data_set_sizes(**{'data/train_rows': int(self.n_prior_rows),
+                                           'data/val_rows': int(self.x_val.shape[0])})
             if inn.init_from is not None:
                 # after init_data_rows: the saved standardisation replaces the one just fitted
                 ck = torch.load(inn.init_from, map_location='cpu')
@@ -1320,6 +1299,10 @@ class InnModeller(Modeller):
             torch.manual_seed(int(self.args.seed) + 7919)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(self.args.seed) + 7919)
+            if self.pbuf_on:
+                self.init_inn_buffers()   # after the reseed: its draws follow the run's seed
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
             # with a budget the energy stage ends on the clock (energy_fraction), not on a step count
             total = inn.mle_steps + (10 ** 9 if inn.budget_minutes is not None else inn.energy_steps)
             opt = sched = None
@@ -1333,7 +1316,9 @@ class InnModeller(Modeller):
             self.stored_ema = torch.full((self.n_prior_rows,), float('nan'), device=self.device)
             self.mle_val_hist = []
             self.noised_ref_energy = (self.score_noised_reference(4 * int(inn.eval_samples))
-                                      if inn.mle_noise_log_range is not None and inn.mle_steps > 0 else None)
+                                      if inn.mle_noise_log_range is not None and inn.mle_steps > 0 else
+                                      self.pbuf_ref_energy(4 * int(inn.eval_samples))
+                                      if self.pbuf_on and inn.mle_steps > 0 else None)
             self.rows = self.scored = self.scored_d = None
             self.reset_window()
             t0 = self.t_loop0 = time.time()
@@ -1363,6 +1348,8 @@ class InnModeller(Modeller):
                     self.save('mle_exit.pt', step, log_z)
                 if step % inn.eval_every == 0 or step == inn.mle_steps or done:
                     self.save('latest.pt', step, log_z)
+                    if self.pbuf_on:   # before the eval reads the buffer, as train.py churns before its stats
+                        self.yielding(self.pbuf_churn, f'prior buffer churn at step {step}')
                     figs = inn.figs_every > 0 and (n_evals % inn.figs_every == 0 or done)
                     n_evals += 1
                     m = self.yielding(lambda: self.evaluate(figs), f'eval at step {step}')
@@ -1429,6 +1416,8 @@ class InnModeller(Modeller):
                         opt.zero_grad(set_to_none=True)
                         return stats, False, level
                     opt.step()
+                    if self.pbuf_on:
+                        self.commit_pbuf_step()
                     return stats, True, level
 
                 stats, stepped, log_z = self.yielding(update, f'step {step}')
@@ -1663,6 +1652,9 @@ class InnModeller(Modeller):
         added / evicted / expired are 0). replay_buffer_* and replay/*: the tail bank, the reused draws (stage 2 with
         --bank_frac); per-eval-window counts are drained here, as train.py drains its churn."""
         out = {}
+        if getattr(self, 'pbuf_on', False) and self._prior_buffer_len():
+            out.update(self.pbuf_stats())
+            return out
         n = int(self.n_prior_rows)
         T0 = 10 ** self.log_T0
         if not hasattr(self, '_stored_energy'):
@@ -1888,28 +1880,35 @@ class InnModeller(Modeller):
     def step_loss(self, stage, log_z):
         inn = self.inn
         stats = {}
-        if inn.rows_per_molecule > 1:
-            idx = self.molecule_grouped_rows(self.batch_now[stage], inn.rows_per_molecule)
+        buf = getattr(self, 'pbuf_on', False)
+        if buf:   # --stored_source buffer: both stages read the prior buffer's rows (log R from the stored legs, no
+            idx = None    # energy call; stage 1 reads no reward)
+            x_d, cid_d, log_T_d, lr_buf = self.pbuf_draw(self.batch_now[stage], reward=stage != 'mle')
+            src_all = torch.zeros_like(cid_d)
         else:
-            idx = torch.randint(0, self.x_train.shape[0],
-                                (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
-                                device=self.device)
-        x_d, cid_d, src_all = self.x_train[idx], self.cid_train[idx], self.src_train[idx]
-        log_T_d = self.training_log_T(idx.numel())
+            if inn.rows_per_molecule > 1:
+                idx = self.molecule_grouped_rows(self.batch_now[stage], inn.rows_per_molecule)
+            else:
+                idx = torch.randint(0, self.x_train.shape[0],
+                                    (self.batch_now['mle'] if stage == 'mle' else self.batch_now['energy'],),
+                                    device=self.device)
+            x_d, cid_d, src_all = self.x_train[idx], self.cid_train[idx], self.src_train[idx]
+            log_T_d = self.training_log_T(idx.numel())
         c_d = self.context_of(cid_d, log_T_d)
         if stage == 'mle':
             if inn.rotate_frames:
                 # the molecules in random frames, one per group of --rows_per_molecule rows (the rows of one molecule
                 # are consecutive), and their rows re-expressed for those frames before the noise
                 k = max(1, int(inn.rows_per_molecule))
-                q = random_frames(-(-idx.numel() // k), self.device).repeat_interleave(k, 0)[:idx.numel()]
+                n_d = x_d.shape[0]
+                q = random_frames(-(-n_d // k), self.device).repeat_interleave(k, 0)[:n_d]
                 x_d = rotate_latent(x_d, quat_to_rotmat(q))
                 c_d = self.context_of(cid_d, log_T_d, frames=q)
             if inn.mle_noise_log_range is not None:
                 x_d = self.jitter(x_d, inn.mle_noise_log_range)
             mle = -self.sampler.log_prob(x_d, c_d).mean()
             stats['bwd/mle'] = stats['bwd/loss'] = float(mle.detach())
-            self.win['samples'] += idx.numel()
+            self.win['samples'] += x_d.shape[0]
             return stats, mle, log_z
 
         # A SCORED BATCH -- the fresh draws, and with noise the displaced stored rows -- costs the
@@ -1941,7 +1940,7 @@ class InnModeller(Modeller):
             x_d, cid_d, log_T_d, c_d, lr_d = (self.scored_d[k] for k in ('x', 'cid', 'log_T', 'c', 'log_r'))
             log_q_d = self.sampler.log_prob(x_d, c_d)
         else:
-            lr_d, log_q_d = self.stored_log_r(idx, log_T_d), log_q_stored
+            lr_d, log_q_d = (lr_buf if buf else self.stored_log_r(idx, log_T_d)), log_q_stored
         ok_d = torch.isfinite(lr_d) & torch.isfinite(log_q_d.detach())
         stats['bwd/nonfinite_frac'] = 1.0 - float(ok_d.float().mean())
 
@@ -2010,16 +2009,33 @@ class InnModeller(Modeller):
             root_d = winsorized_z_root((lr_d - log_q_d.detach() - h_d_fixed)[ok_d], inn.beta_data)[0]
             level_now = inn.level_blend * log_z + (1.0 - inn.level_blend) * root_d
             stats['bwd/level_blend'], stats['bwd/root_stored'] = float(level_now), float(root_d)
-        resid_d = (log_q_d - lr_d + h_d_fixed + level_now)[ok_d]
+        elif inn.level_mode == 'ema':
+            # pooled TB: the draws and the stored rows of a condition are scored against ONE per-condition level
+            # (ema_levels). Where a condition's stream is not yet trusted, that branch's own Huber root plus the
+            # head's offset stands in. level_now is then per stored row, and the draws' loss is recomputed on it.
+            off_f = h_fixed if self.conditional else torch.zeros_like(log_r)
+            off_d = h_d_fixed if self.conditional else torch.zeros_like(lr_d)
+            root_d = winsorized_z_root((lr_d - log_q_d.detach() - off_d)[ok_d], inn.beta_data)[0]
+            lvl_f, okf_f, _ = self.ema_levels(cid, root + off_f, root_d + off_f)
+            lvl_d, _, okb_d = self.ema_levels(cid_d, root + off_d, root_d + off_d)
+            fwd = tb_loss_asym((log_q - log_r + lvl_f)[ok], inn.beta, inn.beta_pos).mean()
+            level_now = lvl_d
+            self.ema_stats(stats, root, root_d, lvl_f, lvl_d, okf_f, okb_d, ok, ok_d, log_q, log_r, log_q_d, lr_d,
+                           cid_d)
+        # the stored rows' residual: the head's offset plus the shared level, or (ema) the per-row level alone
+        resid_d = (log_q_d - lr_d + (level_now if inn.level_mode == 'ema' else h_d_fixed + level_now))[ok_d]
         data = tb_loss(resid_d, inn.beta_data).mean()
-        with torch.no_grad():  # train.py's per-row select_counts and ema_loss (beta 0.9) for the stored rows
-            rows_d = idx[ok_d]
-            prior_d = rows_d < self.n_prior_rows
-            if bool(prior_d.any()):
-                r_i, a_i = rows_d[prior_d], resid_d.detach().abs()[prior_d].float()
-                self.stored_counts.index_add_(0, r_i, torch.ones_like(r_i))
-                old = self.stored_ema[r_i]
-                self.stored_ema[r_i] = torch.where(torch.isnan(old), a_i, 0.9 * old + 0.1 * a_i)
+        if buf:   # the buffer's own per-row ema_loss, written once the update steps (the draw bumped select_counts)
+            self._pbuf_pending = (resid_d.detach().abs().float().cpu(), self.pbuf_inds[ok_d.cpu().numpy()])
+        else:
+            with torch.no_grad():  # train.py's per-row select_counts and ema_loss (beta 0.9) for the stored rows
+                rows_d = idx[ok_d]
+                prior_d = rows_d < self.n_prior_rows
+                if bool(prior_d.any()):
+                    r_i, a_i = rows_d[prior_d], resid_d.detach().abs()[prior_d].float()
+                    self.stored_counts.index_add_(0, r_i, torch.ones_like(r_i))
+                    old = self.stored_ema[r_i]
+                    self.stored_ema[r_i] = torch.where(torch.isnan(old), a_i, 0.9 * old + 0.1 * a_i)
         data_stored = data  # bwd/tb reports the stored rows alone, as runs without the bank did
         if inn.bank_frac > 0:
             # the tail bank: first-use draws whose residual against their own batch's root is large are kept and
@@ -2072,6 +2088,8 @@ class InnModeller(Modeller):
         level_d = ((h_d.detach() + log_z) if self.conditional else
                    torch.full_like(log_q_d.detach(),
                                    float(level_now) if inn.level_mode in ('is', 'blend') else log_z))
+        if inn.level_mode == 'ema':   # both branches report the per-row level they were trained against
+            level, level_d = lvl_f.detach(), lvl_d.detach()
         # the trainer's tracker and train-cadence series take rows at the run's own temperature;
         # stored rows go in as the branch trained on them, noised or not, as a GFN's backward
         # branch takes its noised anchors
@@ -2081,7 +2099,7 @@ class InnModeller(Modeller):
             cold_d = cold_d & (src_all == 0)
         self.note_step(cid[cold], log_r[cold], log_q.detach()[cold], level[cold], log_T.flatten()[cold],
                        cid_d[cold_d], lr_d[cold_d], log_q_d.detach()[cold_d], level_d[cold_d],
-                       x[cold], x_d[cold_d], feed_tracker=first)
+                       x[cold], x_d[cold_d], feed_tracker=first, feed_stored=first or not noised)
 
         # per-branch values under the trainer's names; rolling_stats smooths them with its own
         fwd_loss, bwd_loss = inn.w_fwd * fwd, inn.w_data * data + inn.w_mle * mle
@@ -2126,13 +2144,14 @@ class InnModeller(Modeller):
         return stats, loss, log_z
 
     def note_step(self, cid, log_r, log_q, level, log_T, cid_d, log_r_d, log_q_d, level_d, x, x_d,
-                  feed_tracker: bool = True):
+                  feed_tracker: bool = True, feed_stored=None):
         """This step's rows to the trainer's per-condition tracker, the way its losses feed it:
         the draws' log weights (level and level streams) and energies (the running minimum), and
         the stored rows' log weights (the backward level stream). Kept for rolling_stats too,
         with their latents. Either set may be empty (step_loss passes only rows at the run's own
         temperature). A reused scored batch (feed_tracker False) refreshes the kept rows only, so
-        the tracker counts each draw once."""
+        the tracker counts each draw once; feed_stored (default feed_tracker) does the same for the stored rows,
+        which are new every update unless they were displaced and scored once per scored batch."""
         cpu = lambda t: t.detach().cpu()
         cid, log_r, log_q, level, log_T, x = map(cpu, (cid, log_r, log_q, level, log_T, x))
         cid_d, log_r_d, log_q_d, level_d, x_d = map(cpu, (cid_d, log_r_d, log_q_d, level_d, x_d))
@@ -2141,7 +2160,7 @@ class InnModeller(Modeller):
             update_and_lookup_condition_log_z(tracker, cid, log_r, torch.zeros_like(log_q), log_q, 'cpu', step,
                                               log_Z_learned=level, mode_level_stream='fwd')
             update_condition_best_energy(tracker, cid, log_r, log_T)
-        if cid_d.numel() and feed_tracker:
+        if cid_d.numel() and (feed_tracker if feed_stored is None else feed_stored):
             tracker.update_mode_level('bwd', cid_d, log_r_d - log_q_d, step=step)
         self.rows = dict(step=step, cid=cid, log_r=log_r, log_q=log_q, level=level, x=x,
                          cid_d=cid_d, log_r_d=log_r_d, log_q_d=log_q_d, level_d=level_d, x_d=x_d)
@@ -2228,6 +2247,10 @@ class InnModeller(Modeller):
         out['log_pfs'] = a['log_q'].unsqueeze(-1)
         out['log_pbs'] = torch.zeros_like(out['log_pfs'])
         out['log_Z_learned'] = a['head'] + float(shared)
+        if self.inn.level_mode == 'ema' and a.get('condition_id') is not None:
+            # the per-condition level the energy stage trains against; untrusted conditions keep head + shared
+            fb = out['log_Z_learned']
+            out['log_Z_learned'] = self.ema_levels(torch.as_tensor(a['condition_id']), fb, fb)[0]
         return out
 
     @torch.no_grad()
@@ -2344,8 +2367,9 @@ class InnModeller(Modeller):
         mad = lambda v: float(1.4826 * (v - v.median()).abs().median())
         m.update(self.flow_buffer_stats())
         if self.noised_ref_energy is not None and self.step_ind <= self.inn.mle_steps:
-            # stage 1 fits the stored rows displaced by --mle_noise_log_range, so the reachable energy marginal is
-            # that of the displaced rows (scored once at start-up), not of the stored rows themselves
+            # stage 1 fits the stored rows displaced by --mle_noise_log_range (or, on the buffer route, the buffer's
+            # rows), so the reachable energy marginal is that of the rows it fits (taken once at start-up), not of
+            # the stored rows themselves
             from energies.conformer_eval_metrics import energy_marginal_overlap
             if not hasattr(self, '_w1_floor_cache'):
                 self._w1_floor_cache = {}
@@ -2627,6 +2651,11 @@ def build_parser():
                    help='--atom_tokens, likelihood stage: each molecule is presented in a random frame (uniform on '
                         'SO(3), one per --rows_per_molecule group), its stored rows re-expressed for that frame '
                         '(orientation R -> R R0^T); evaluation, sampling and the energy stage use the standard frame')
+    p.add_argument('--molecule_fraction', type=float, default=1.0,
+                   help='keep only the training molecules whose molecule_u (data_processing/molecule_subset.py: a '
+                        'fixed draw from the identifier) is below this, in --molecules_path and --prior_path alike, '
+                        'before the prior is scored; nested across fractions. The held-out conditions file is kept '
+                        'whole')
     p.add_argument('--rows_per_molecule', type=int, default=1,
                    help='draw each batch of stored rows as batch / k molecules with k rows each (molecules in '
                         'proportion to their rows, so each row is as likely as in a uniform draw), and in the energy '
@@ -2640,6 +2669,8 @@ def build_parser():
     p.add_argument('--tf_width', type=int, default=256)
     p.add_argument('--tf_layers', type=int, default=4)
     p.add_argument('--tf_heads', type=int, default=8)
+    p.add_argument('--tf_norm', choices=NORMS, default='layer',
+                   help="the transformer's pre-norm and final normalisation: LayerNorm, RMSNorm, or none")
     p.add_argument('--tf_fp32', action='store_true',
                    help="transformer layers in fp32 instead of bf16 (a trained stack of blocks can fail the "
                         "working-precision round trip in bf16)")
@@ -2694,16 +2725,42 @@ def build_parser():
     p.add_argument('--beta', type=float, default=10.0)
     p.add_argument('--beta_data', type=float, default=80.0)
     p.add_argument('--z_half_life', type=float, default=20.0)
-    p.add_argument('--level_mode', choices=['tied', 'union', 'is', 'blend'], default='tied',
+    p.add_argument('--level_mode', choices=['tied', 'union', 'is', 'blend', 'ema'], default='tied',
                    help="energy stage: 'tied' scores stored rows against a lagged copy of the draws' Huber root; "
                         "'union' scores both branches against one root refit every update over draws and stored "
                         "rows together; 'is' scores stored rows against an exponentially averaged importance "
                         "estimate of log Z from each scored batch's draws on first use, every log weight capped at "
                         "the previous level + --beta (see InnModeller.advance_is_level); 'blend' scores stored (and "
                         "bank) rows against --level_blend x the tied level + (1 - --level_blend) x the stored "
-                        "batch's own Huber root (knee --beta_data). Evaluation reads the tied level in every mode")
+                        "batch's own Huber root (knee --beta_data); 'ema' scores the draws AND the stored rows of a "
+                        "condition against one per-condition level read off the trainer's tracker "
+                        "(InnModeller.ema_levels: --level_source). Evaluation reads the tied level in every mode but "
+                        "'ema', where it reads the per-condition level")
     p.add_argument('--level_blend', type=float, default=0.5,
                    help="--level_mode blend: weight of the draws' (tied) level; the rest is the stored rows' own root")
+    p.add_argument('--level_source', choices=['fwd', 'pooled'], default='pooled',
+                   help="--level_mode ema: 'fwd' = each condition's forward level (the tracker's fwd_level_ema, the "
+                        "draws' log w); 'pooled' = --level_mix x that + (1 - --level_mix) x its backward level "
+                        "(bwd_level_ema, the stored rows' log w). Both streams are the tracker's per-condition "
+                        "evidence-capped EMAs on one per-condition clock (condition_log_z.half_life_visits and "
+                        "min_visits, set with --set)")
+    p.add_argument('--level_mix', type=float, default=0.5,
+                   help="--level_mode ema --level_source pooled: the forward level's share of the per-condition level")
+    p.add_argument('--stored_source', choices=['prior', 'buffer'], default='prior',
+                   help="energy stage: where the stored rows come from. 'prior' = the prior's training rows (as stored, "
+                        "or with --data_noise_log_range displaced and scored again each scored batch); 'buffer' = "
+                        "train.py's anchor -> prior buffers (InnModeller.init_inn_buffers): anchors seeded from the "
+                        "training rows only, each child noised once by buffers.anchor_buffer.tile (iso | shaped | "
+                        "gauss), scored once and admitted below Emin(c) + buffers.prior_buffer.ramp_floor, "
+                        "--pbuf_rows_per_condition children per training condition, refreshed at every eval by "
+                        "gate-staleness expiry plus a uniform retirement of churn_batch_ref / mean_lifetime rows per "
+                        "update, each refilled by condition. No energy call when a stored row is drawn")
+    p.add_argument('--pbuf_rows_per_condition', type=int, default=2,
+                   help='--stored_source buffer: prior-buffer rows kept per training condition')
+    p.add_argument('--gauss_excess_kT', type=float, default=None,
+                   help="buffers.anchor_buffer.tile gauss: the mean excess over the parent anchor, in kT, the "
+                        "isotropic Gaussian kick is calibrated to at start-up (calibrate_gauss_sigma, winsorised at "
+                        "the admission gate)")
     # the replay bank: first-use draws with a large residual, reused as stored-like rows
     p.add_argument('--bank_frac', type=float, default=None,
                    help='energy stage: weight of the replay bank (its own mean); 0 = off; unset = 0.1 on unconditional '
