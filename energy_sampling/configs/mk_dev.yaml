@@ -15,17 +15,17 @@ anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
-continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt
+continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt  # todo make sure this works for NF models
 mlip_path: null              # MLIP weights, for energy_function uma/mace only. Unused on elj and the toys. e.g. 'D:\crystal_datasets\esen_s.pt'
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
 checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
-prior_model_name: null       # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only
-load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
+prior_model_name: null       # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only  # todo flag this for possible deprecation
+load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh # todo make sure this works for NF models
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # seeds the prior buffer, and the anchor buffer on molecule routes
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # the condition set the run trains over. Same file as the prior here: one molecule, unconditional
-test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent
+test_molecules_path: null    # held-out conditions, scored as eval_test. null = no held-out eval, and every eval_test metric is absent  # todo make sure this is sympatico with our hold-out molecules & crystals methods
 prior_scan_cache: false      # true = reuse the init-time scoring of prior_path from <prior_path>.scan-<hash>.pt when its identity (file, row count, energy function, MLIP file, space groups, z_primes, eLJ coefficient, energy_config) matches and a re-score of 512 random rows agrees; otherwise score every row and write that file. false = score every row at every launch
 noised_prior:                # read only when prior_path is a pre-noised build (data_processing/build_noised_prior.py; noised_prior.py)
   window_kT: 6.0             # rows kept within window_kT x energy_config.temperature of their condition's floor (seed energy: molecule + density + pressure terms). null = no energy window
@@ -37,7 +37,7 @@ harvest:                     # scored rollout rows kept for the next prior build
   min_abs_resid: 1.0         # nats: rows whose |TB residual| is at least this are kept, and rows at or below their condition's best known energy
   shard_rows: 20000          # rows per shard written to disk
   dir: null                  # null = <checkpoints_dir>/harvest
-archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O  # todo on MLIP models set this to 1k
+archive_period: 5000         # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked, so it costs disk but no write I/O
 archive_buffers: true        # include the buffer sidecar in each archive; without it an archive can be inspected but not resumed
 override_learning_rates: false  # on resume, replace the LRs restored from the checkpoint's optimizers with this config's. Adam moments are left as they were, and the LR bracket re-stamps every rate on its next tick anyway
 checkpoint_read_only: false  # suppress ALL checkpoint WRITES ('running', 'best', archives, 'final'); loading stays active. For smoke tests and refactor validation, which resume real state but must not rewrite the run they resumed from
@@ -58,7 +58,7 @@ freeze_backward_policy: false  # freeze P_B from step 0 of THIS process. false |
 #          bracket's scale never touches it. Mixing is legal (lr_fused: auto,
 #          lr_back: 3e-4).
 # There is no (W, T) scaling rule here. lr_flow is neither -- see below.
-lr_policy: auto
+lr_policy: auto  # todo possibly this should be a dict and only relevant optimizers are called? That would need its own i/o though that might be annoying. Possibly they could be attached in the model architecture sections? Though some apply to groups of losses rather than models per se. We need a simple/uniform approach
 lr_back: auto
 lr_replay: auto
 lr_fused: auto
@@ -92,7 +92,7 @@ use_weight_decay: false
 #                            median 2 / worst 5  = incredibly good.
 # An absent channel BLOCKS the verdict, never passes by absence -- and
 # progress_metrics ABSTAINS loudly when it cannot run at all.
-progress_gate:
+progress_gate:  # todo fixed step count, sample stats levelling off, or MLE levelling off are probably better. the w1r are more like minimum reasonable bars, though they don't work equally well outside of the crystal latent problem. The 'worst' option actually is nice for noting lagging dims in high dim problems and flagging that we are still waiting for them.
   mode: level
   level_window: 2500       # trailing-median smoothing: one noisy eval dipping
                            # under a bar must not end a stage
@@ -121,7 +121,7 @@ progress_gate:
 # which is not a statistic and so cannot be uncorrelated with the rate.
 
 
-lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions it needs are in docs/TODO.md #1
+lr_control:  # todo we had old notes on this. I don't care much for more complicated approaches. I mostly want to be able to compose things like ramps, cool-downs (exponential, cosine), and cuts on blow-ups. I think we already mostly have this # OLD todo RIP OUT the whole bracket -- scope and the three decisions it needs are in docs/TODO.md #1
   mode: fixed              # bracket | fixed. `fixed` performs burn-in, then holds fixed_scale and runs no trials -- for batteries of related runs where the rate is already known
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to. THE CANDIDATE SCALES ARE MULTIPLIERS ON THIS, so a seed that is wrong by 10x moves the whole grid off the interesting region and the bracket reports unbracketed_high or all_failed rather than a boundary
   control_flow_lr: false     # true = the flow/Z groups also take the bracket's scale
@@ -154,7 +154,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # Exactly burn_in_steps at burn_in_scale, then the root checkpoint. Step count
   # only: it never waits on a learned metric to settle.
   #
-  # THIS IS WHERE THE LONG HORIZON BELONGS, and the reason is arithmetic.
+  # THIS IS WHERE THE LONG HORIZON BELONGS, and the reason is arithmetic.  # todo what is this for, just to figure out grad noise or something?
   # Optimizers are rebuilt at every stage transition, so Adam's step counter t
   # restarts, and Adam's update carries sqrt(1-beta2^t)/(1-beta1^t) relative to
   # steady state:  t=10 -> 0.153, t=100 -> 0.309, t=500 -> 0.627, t=1000 ->
@@ -173,7 +173,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # stage that never rebuilt its optimizers passes it trivially and correctly.
   min_root_bias_correction: 0.9   # at burn_in_steps 3000 the factor is ~0.975, so this cannot fire; lower burn_in_steps far enough and it does
 
-  # ---- 2. THE CANDIDATE GRID -------------------------------------------
+  # ---- 2. THE CANDIDATE GRID -------------------------------------------  # todo we're not doing this anymore at all - hard deprecate
   # todo goes with the bracket -- docs/TODO.md #1
   # Strictly ascending multipliers on seed_lr, i.e. 6.25e-6 .. 2.0e-4 here. WIDE
   # ENOUGH THAT THE TOP RUNGS ARE EXPECTED TO FAIL -- a grid that fits inside the
@@ -201,7 +201,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   # transition re-brackets regardless, because the optimizers were rebuilt.
   repeat_every: 20000
 
-  # ---- 3. CONFIRMING THE BOUNDARY ----------------------------------------
+  # ---- 3. CONFIRMING THE BOUNDARY ----------------------------------------  # todo way too much text - what are we doing here in very simple terms?
   # Hard failure is stochastic, so one unlucky low rung would otherwise bound the
   # whole search far below the real boundary. The re-run uses a DIFFERENT seed,
   # derived from the root: screen trials all restore an identical RNG state so
@@ -218,7 +218,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
   logz_detour_nats: 2.0      # a candidate FAILS if its batch-mean log_Z_learned falls more than this many nats BELOW the root's -- one-sided, so a dip-and-recover survives and a detour does not. Catches a minority-branch destabilization the frac-weighted composite bar is blind to under a dominant bwd frac. Judged outside the settle window; inert wherever Z does not train. null/0 = off
   verbose: true
 
-  # ---- 4. HARD FAILURE ----------------------------------------------------
+  # ---- 4. HARD FAILURE ----------------------------------------------------  # todo ditto the above
   # TWO JOBS, ONE SET OF BARS: they fail a trial candidate, AND they are the live
   # tripwire on ordinary steps, where a hit rewinds to the last checkpoint and
   # spends one of the max_reloads_per_1k_steps budget.
@@ -260,7 +260,7 @@ lr_control:  # todo RIP OUT the whole bracket -- scope and the three decisions i
 # energy/seconds_gpu beside the existing wall-clock energy/seconds, and their
 # RATIO (energy/gpu_over_wall) is the reading: ~1 means the call occupies the
 # device, >1 means work outlives the return, <1 means host-bound.
-profiling:
+profiling:  # todo do we use this at all anymore and is it even functional?
   enabled: false
   regions: null              # null = every region asked for; a list restricts it
   # Layer 2: a BOUNDED torch.profiler window -- op-level CPU and CUDA detail,
@@ -278,9 +278,11 @@ profiling:
     write_trace: false       # also write the chrome timeline JSON. OFF: measured 748 MB for 8 steps (~93 MB/step) on ELJ with shapes and stacks both off, which is unopenable and is what pins active_steps to single digits. The *_table.txt beside it is 9 KB and carries the op breakdown; turn this on only when a TIMELINE is the question
     record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
     with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
+
+# todo check whether this is still a valid option in current models
 compile_policy: false          # torch.compile the policy. false = eager; 'auto' = on for Linux+CUDA only (no inductor on native Windows); true forces it; 'step' compiles the whole per-timestep body instead of the trunk submodules. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream). Set TRUE by default under MACE or UMA
-# WHICH BRANCHES checkpoint. null = all of them. Only the forward branch holds
+# WHICH BRANCHES checkpoint. null = all of them. Only the forward branch holds  # todo an absurd amount of text
 # the energy function's footprint, so under rare rollouts the bwd/replay steps
 # pay the recompute while sitting on headroom nothing uses -- [fwd] buys the
 # step time back there. fwd is usually MOOT in the list either way: checkpointing
@@ -299,7 +301,7 @@ traj_checkpoint_modes: [fwd]   # null = every branch | a list from [fwd, bwd, re
 gradient_norm_clip: auto     # explicit number overrides
 # The policy's actual clip while enabled. Per branch, because an MLE gradient and
 # a TB gradient are different distributions. See grad_clip_guard.py.
-grad_clip_guard:             # per-branch quantile bar on pre-clip policy grad norms
+grad_clip_guard:             # per-branch quantile bar on pre-clip policy grad norms  # todo is this used while gradient_norm_clip=auto?
   enabled: true                # false -> the bar is gradient_norm_clip, unchanged
   p: 0.99                      # target quantile; the bar binds on 1-p of steps
   eta: 0.01                    # log-space step of the bar per observation
@@ -307,7 +309,7 @@ grad_clip_guard:             # per-branch quantile bar on pre-clip policy grad n
   warmup_clip: static          # bar until then: static = gradient_norm_clip, off = no clip
   max_ratio: 100.0             # furthest the bar may travel from its last calibration, either direction
   refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live meanwhile
-ema_decay: null                # set to null for no ema # NOTE this breaks some important statistics - leave as null for now
+ema_decay: null                # set to null for no ema # NOTE this breaks some important statistics - leave as null for now  # todo we're just not doing this at all and it complicates the code. I would rip out the functionality altogether
 max_reloads_per_1k_steps: 1.0  # divergence-rewind budget, as a RATE: a run is aborted once total rewinds exceed this x steps/1000 (floor 3). A rate rather than a count so a long run is not aborted for the same per-step behaviour as a short one
 
 # model parameters
