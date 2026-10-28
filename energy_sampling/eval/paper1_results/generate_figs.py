@@ -178,7 +178,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         combo_en = torch.cat([elj_en, uma_en])
         fig_dict['density_contours'] = plot_dual_density_contour(elj_cp, elj_en.clip(max=0), uma_cp, uma_en.clip(max=0),
                                                                  label_a="LJ",
-                                                                 label_b="UMA",
+                                                                 label_b="eSEN",
                                                                  ncontours=8,
                                                                  max_y_quantile=0.99,
                                                                  x_min=0.55, x_max=0.9,
@@ -192,8 +192,8 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
 
         '''Energy marginals'''
         fig_dict['energy_marginal'] = dual_energy_marginal_fig(elj_en, uma_en,
-                                                               "LJ"
-                                                               "UMA"
+                                                               "LJ",
+                                                               "eSEN"
                                                                )
 
         '''12 marginals'''
@@ -204,7 +204,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
             return_fig=True,
             show=False
         )
-        marginals_fig.data[1].name = "UMA Model"
+        marginals_fig.data[1].name = "eSEN Model"
         marginals_fig.data[0].name = "LJ Model"
         marginals_fig.data[2].name = "Experimental"
         subplot_labels = [
@@ -630,7 +630,7 @@ def _duo_plot(uma_embed, lj_embed, poly_xy):
     lj_colors = [f'rgba(220,20,60,{a:.3f})' for a in lj_a]
     fig = go.Figure()
     ms = 6 if len(uma_embed) + len(lj_embed) < 20000 else 2.5
-    fig.add_scatter(x=uma_embed[:, 0], y=uma_embed[:, 1], mode='markers', name='UMA', marker_color=uma_colors,
+    fig.add_scatter(x=uma_embed[:, 0], y=uma_embed[:, 1], mode='markers', name='eSEN', marker_color=uma_colors,
                     marker_size=ms)
     fig.add_scatter(x=lj_embed[:, 0], y=lj_embed[:, 1], mode='markers', name='LJ', marker_color=lj_colors,
                     marker_size=ms)

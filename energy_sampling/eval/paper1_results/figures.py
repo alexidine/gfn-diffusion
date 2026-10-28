@@ -1225,7 +1225,7 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
 
     fig = make_subplots(
         rows=1, cols=2,
-        subplot_titles=(f'LJ', f'UMA')  # ,
+        subplot_titles=(f'LJ', f'eSEN')  # ,
         # f'{label2} – P(E)', f'{label2} – log P(E)'),
     )
     process(sample_energy1, colors['1'], label1, fig, row=1, col=1)
@@ -1234,7 +1234,7 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
     fig.update_layout(template='plotly_white', font_size=20)
     for row in [1]:
         for col in [1, 2]:
-            en = 'UMA' if col == 2 else 'LJ'
+            en = 'eSEN' if col == 2 else 'LJ'
             fig.update_xaxes(title_text=f'Lattice Energy (kJ/mol)', row=row, col=col)
             fig.update_yaxes(title_text='P(E)', row=row, col=col)
             # fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=2)
@@ -1971,7 +1971,8 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     # A single-run figure has only ONE density: stats['elj_density'] is then a copy of
     # stats['density'], so showing it as a second 'LJ' row reports the same number twice under
     # the wrong name. Paired figures (generate_figs.py) keep both rows.
-    ENERGY_LABELS = {'uma': 'UMA', 'elj': 'LJ', 'lj': 'LJ', 'qlj': 'LJ', 'mace': 'MACE'}
+    # 'uma' is the code route; the paper's checkpoint on it (esen_s.pt) is eSEN-S trained on OMC25, not a UMA model
+    ENERGY_LABELS = {'uma': 'eSEN', 'elj': 'LJ', 'lj': 'LJ', 'qlj': 'LJ', 'mace': 'MACE'}
     ef = stats.get('energy_function')
     primary = ENERGY_LABELS.get(ef, (ef or 'model').upper())
     paired = stats.get('paired_density', True)
@@ -1990,16 +1991,16 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
         below = stats['below_resolution']
         f_pct = stats['density_pct_floor']
         psym = lambda s: "P" + (f"<sup>{s}</sup>" if s else "") + "(x*) percentile"   # P^{10/20}(x*) percentile
-        row_labels.append(f"{'UMA' if paired else primary} {psym(stats.get('scale_label'))}")
+        row_labels.append(f"{'eSEN' if paired else primary} {psym(stats.get('scale_label'))}")
         raw_values.append(["<LOD" if b else pct_text(v)
                            for v, b in zip(stats['density_pct'], below)])
         formatters.append(str)
         for ex in stats.get('extra_scales') or []:   # the same points at another kernel width
-            row_labels.append(f"{'UMA' if paired else primary} {psym(ex['label'])}")
+            row_labels.append(f"{'eSEN' if paired else primary} {psym(ex['label'])}")
             raw_values.append(["<LOD" if b else pct_text(v) for v, b in zip(ex['uma_pct'], ex['uma_below'])])
             formatters.append(str)
     else:
-        row_labels.append(f"Normed {'UMA' if paired else primary} P(x*)")
+        row_labels.append(f"Normed {'eSEN' if paired else primary} P(x*)")
         raw_values.append(p)
         formatters.append(fmt2)
     if paired:
@@ -2440,7 +2441,7 @@ def fused_duo_embedding_fig(panels, callout='EXP'):
         uma, lj, poly = np.asarray(pan['uma']), np.asarray(pan['lj']), np.atleast_2d(pan['poly'])
         pts = np.concatenate([uma, lj])
         ms = 5 if len(pts) < 20000 else 2.5
-        fig.add_scatter(x=uma[:, 0], y=uma[:, 1], mode='markers', name='UMA', legendgroup='UMA', showlegend=k == 0,
+        fig.add_scatter(x=uma[:, 0], y=uma[:, 1], mode='markers', name='eSEN', legendgroup='eSEN', showlegend=k == 0,
                         marker=dict(size=ms, color=[f'rgba(65,105,225,{a:.3f})' for a in pan['uma_alpha']]),
                         row=1, col=col)
         fig.add_scatter(x=lj[:, 0], y=lj[:, 1], mode='markers', name='LJ', legendgroup='LJ', showlegend=k == 0,
