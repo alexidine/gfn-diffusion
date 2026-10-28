@@ -493,10 +493,10 @@ def lr_control_is_well_formed(cfg: dict) -> list[Violation]:
 # holds. Evaluated by controller.py::lr_schedule_value.
 # ---------------------------------------------------------------------------
 
-#: hold = `to` throughout; linear = a + (b - a) p; geometric and exp =
+#: hold = `to` throughout; linear = a + (b - a) p; geometric =
 #: a (b / a)^p; cosine = b + (a - b)(1 + cos(pi p)) / 2, for a segment from a to
 #: b at progress p in [0, 1].
-LR_SCHEDULE_KINDS = ('hold', 'linear', 'geometric', 'cosine', 'exp')
+LR_SCHEDULE_KINDS = ('hold', 'linear', 'geometric', 'cosine')
 
 #: The `lr_control` keys `schedule` replaced (2026-10-28). Refused off the
 #: conformer route (lr_schedule_replaces_burn_in_keys, LRController); on

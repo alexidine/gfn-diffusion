@@ -60,7 +60,7 @@ def _interp(kind, a, b, p):
         return a + (b - a) * p
     if kind == 'cosine':
         return b + (a - b) * 0.5 * (1.0 + math.cos(math.pi * p))
-    return a * (b / a) ** p          # geometric, exp
+    return a * (b / a) ** p          # geometric
 
 
 def lr_schedule_ends(segments, max_steps=None) -> list:

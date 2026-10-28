@@ -147,7 +147,7 @@ lr_control:  # ramps and cool-downs compose as lr_control.schedule segments (per
   # transition (the optimizers are rebuilt there) and run on steps since stage
   # entry. `to` is the multiplier on seed_lr a segment ends at; `steps` its
   # length (0 = a jump; null = to the stage's max_steps, last segment only);
-  # kind hold | linear | geometric | cosine | exp (exp = geometric). Segment 0
+  # kind hold | linear | geometric | cosine. Segment 0
   # starts at its own `to` and must be a hold; each later segment moves from the
   # previous `to`; past the last the value holds. The last hard_failure.root_window
   # steps of segment 0 are the window the blow-up bars (section 2) are fitted on.

@@ -331,7 +331,7 @@ def test_fixed_mode_without_a_schedule_is_an_error(canonical):
     ({'to': 0.2, 'steps': 10, 'kind': 'ramp'}, "kind is 'ramp'"),
     ({'to': 0.0, 'steps': 10, 'kind': 'linear'}, 'to is 0.0'),
     ({'to': -0.2, 'steps': 10, 'kind': 'cosine'}, 'to is -0.2'),
-    ({'to': 0.2, 'steps': 1.5, 'kind': 'exp'}, 'steps is 1.5'),
+    ({'to': 0.2, 'steps': 1.5, 'kind': 'geometric'}, 'steps is 1.5'),
 ])
 def test_a_malformed_schedule_segment_is_an_error(canonical, segment, detail):
     cfg = copy.deepcopy(canonical)

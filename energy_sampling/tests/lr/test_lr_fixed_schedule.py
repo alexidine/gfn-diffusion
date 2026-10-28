@@ -261,7 +261,6 @@ def test_no_lr_control_block_runs_the_float_base_rates():
     ('hold', lambda a, b, p: b),
     ('linear', lambda a, b, p: a + (b - a) * p),
     ('geometric', lambda a, b, p: a * (b / a) ** p),
-    ('exp', lambda a, b, p: a * (b / a) ** p),
     ('cosine', lambda a, b, p: b + (a - b) * 0.5 * (1 + math.cos(math.pi * p))),
 ])
 def test_each_kind_moves_from_the_previous_to_its_own_to(kind, expect):
@@ -405,7 +404,7 @@ def test_the_stage_parser_normalizes_and_judges_an_lr_schedule():
     st = Stage(dict(spec, lr_schedule=[{'to': 1, 'steps': 5, 'kind': 'hold'}]), 0)
     assert st.lr_schedule == [{'to': 1.0, 'steps': 5, 'kind': 'hold'}]
     open_ended = [{'to': 1, 'steps': 5, 'kind': 'hold'},
-                  {'to': 0.1, 'steps': None, 'kind': 'exp'}]
+                  {'to': 0.1, 'steps': None, 'kind': 'geometric'}]
     with pytest.raises(ValueError, match='no max_steps'):
         Stage(dict(spec, lr_schedule=open_ended), 0)
     assert Stage(dict(spec, lr_schedule=open_ended, max_steps=50), 0).lr_schedule[1]['steps'] is None
