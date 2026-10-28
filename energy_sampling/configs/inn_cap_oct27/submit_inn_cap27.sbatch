@@ -119,7 +119,7 @@ done
 for F in inn_modeller.py energies/ar_transformer.py energies/prior_flow.py tests/models/test_inn_atom_tokens.py data_processing/molecule_subset.py; do
     if [ ! -f ${WORKDIR}/${F} ]; then echo "FATAL: ${WORKDIR}/${F} is missing -- git pull gfn-diffusion" >&2; exit 1; fi
 done
-if ! grep -q 'class AtomEncoder' ${WORKDIR}/inn_modeller.py || ! grep -q 'def shared_context' ${WORKDIR}/inn_modeller.py; then
+if ! grep -q 'class AtomEncoder' ${WORKDIR}/inn_modeller.py ${WORKDIR}/models/spline_flow.py 2>/dev/null || ! grep -q 'def shared_context' ${WORKDIR}/inn_modeller.py ${WORKDIR}/models/spline_flow.py 2>/dev/null; then   # the flow classes live in models/spline_flow.py since 37af0ce0
     echo "FATAL: gfn-diffusion predates the atom-token condition -- git pull gfn-diffusion" >&2; exit 1
 fi
 if ! grep -q "add_argument('--molecule_fraction'" ${WORKDIR}/inn_modeller.py || ! grep -q 'def subset_training_molecules' ${WORKDIR}/train.py; then
