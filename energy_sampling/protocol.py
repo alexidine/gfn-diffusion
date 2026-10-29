@@ -2605,8 +2605,10 @@ class StageProtocol:
             #                  and EMA'd over an evidence half-life. NOT the same
             #                  estimand unless the same sampler feeds it: the
             #                  tracker is updated by whichever branches ran, so
-            #                  after a bwd-only MLE phase 1 its ema_logw is the
-            #                  ANCHOR level, and anchoring there hands phase 2 the
+            #                  after a bwd-only MLE phase 1 under condition_log_z
+            #                  .z_feed 'mixed' its ema_logw is the ANCHOR level
+            #                  ('forward': the evals' forward level), and anchoring
+            #                  there hands phase 2 the
             #                  full anchor-to-policy gap as an opening transient.
             #                  Kept as the fallback for a transition with no eval
             #                  stream.

@@ -50,7 +50,7 @@ from tqdm import trange
 from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
-    DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, \
+    DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, Z_FEED_MODES, DEFAULT_EVAL_HALF_LIFE_VISITS, \
     ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
@@ -2410,6 +2410,17 @@ class Modeller:
                 "condition_log_z.untrusted_z 'global' needs energy_config.energy_reference: without a "
                 "per-condition reference the conditions' log Z differ by their depth, and one "
                 "all-condition level is no stand-in for any of them")
+        # which rows write ema_logw (buffer.Z_FEED_MODES); read on a resume too, the config owns behaviour
+        z_feed = getattr(cfg, 'z_feed', 'mixed') if cfg is not None else 'mixed'
+        eval_half_life = (getattr(cfg, 'eval_half_life_visits', DEFAULT_EVAL_HALF_LIFE_VISITS)
+                          if cfg is not None else DEFAULT_EVAL_HALF_LIFE_VISITS)
+        if z_feed not in Z_FEED_MODES:
+            raise ValueError(f"condition_log_z.z_feed must be one of {Z_FEED_MODES}, got {z_feed!r}")
+        if (isinstance(eval_half_life, bool) or not isinstance(eval_half_life, (int, float))
+                or not math.isfinite(eval_half_life) or eval_half_life <= 0):
+            raise ValueError(f"condition_log_z.eval_half_life_visits must be a finite number > 0, "
+                             f"got {eval_half_life!r}")
+        self.z_feed, self.eval_half_life_visits = z_feed, float(eval_half_life)
         if hasattr(self, 'condition_log_z'):
             # restored by load_full, whose from_state_dict rebuilds the tracker
             # with the guard OFF -- so a full resume must re-arm it here too
@@ -2446,6 +2457,25 @@ class Modeller:
         )
         self._arm_phys_energy_guard()
         self._set_tracker_trainable()
+
+    def _offpolicy_feeds_log_z(self) -> bool:
+        """Whether this step's backward and replay rows write the tracker's ema_logw: the stage flag update_log_z
+        under condition_log_z.z_feed 'mixed', never under 'forward'. Their level streams are fed either way."""
+        return bool(self.protocol.flag('update_log_z')) and getattr(self, 'z_feed', 'mixed') == 'mixed'
+
+    def _eval_feed_log_z(self, condition_id, log_weight) -> bool:
+        """Under condition_log_z.z_feed 'forward', in a stage with no forward branch (train_mode 'bwd') that sets
+        update_log_z, the eval's forward draws write ema_logw: one update() call, at half-life
+        condition_log_z.eval_half_life_visits calls. Non-finite rows are left out. Returns whether it wrote."""
+        if (getattr(self, 'z_feed', 'mixed') != 'forward' or not self.protocol.flag('update_log_z')
+                or self.protocol.stage.train_mode != 'bwd'):
+            return False
+        ok = torch.isfinite(log_weight)
+        if not bool(ok.any()):
+            return False
+        self.condition_log_z.update(condition_id[ok], log_weight[ok], step=self.step_ind,
+                                    half_life_visits=self.eval_half_life_visits)
+        return True
 
     def _set_tracker_trainable(self):
         """Hand condition_log_z the conditions this run trains on
@@ -7369,7 +7399,7 @@ class Modeller:
                                                 condition_log_z=self.condition_log_z,
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('bwd'),
-                                                update_log_z=self.protocol.flag('update_log_z'),
+                                                update_log_z=self._offpolicy_feeds_log_z(),
                                                 step=self.step_ind,
                                                 # J_B side of the z_match delta gate; a scrambled
                                                 # embedding's log_pf is not the conditional
@@ -7468,7 +7498,7 @@ class Modeller:
                                                 # the probe reads the per-condition
                                                 # Z target the training call just
                                                 # used; it must not write one
-                                                update_log_z=(self.protocol.flag('update_log_z')
+                                                update_log_z=(self._offpolicy_feeds_log_z()
                                                               and not val_rows),
                                                 step=self.step_ind,
                                                 sample_weights=(None if val_rows
@@ -12348,6 +12378,9 @@ class Modeller:
             _, energy_phys = self._anchor_energy(sample_batch, energy)
             self.condition_log_z.update_best_energy(pooled['condition_id'], energy,
                                                     energy_phys=energy_phys)
+            # the exception to the above: under condition_log_z.z_feed 'forward' a stage with no forward
+            # branch has no train stream to mix with, and these draws are its only forward level
+            self._eval_feed_log_z(pooled['condition_id'], log_weight)
 
         # covers evaluation()'s on-policy eval sampling -- freshly generated,
         # freshly scored batches, so valid anchor candidates.

@@ -2516,6 +2516,27 @@ def energy_reference_is_consistent(cfg: dict) -> list[Violation]:
     return out
 
 
+#: buffer.Z_FEED_MODES and the code defaults Modeller.init_condition_log_z reads (buffer imports torch, this module
+#: does not; tests/config/test_z_feed_invariants.py pins the two copies equal)
+Z_FEED_MODES = ('mixed', 'forward')
+Z_FEED_DEFAULTS = dict(z_feed='mixed', eval_half_life_visits=2.0)
+
+
+def z_feed_is_well_formed(cfg: dict) -> list[Violation]:
+    """condition_log_z.z_feed is one of buffer.Z_FEED_MODES and condition_log_z.eval_half_life_visits is a finite
+    number > 0 (Modeller.init_condition_log_z raises on either; this reports them before a launch). Absence is
+    judged: unset keys are the code defaults 'mixed' and buffer.DEFAULT_EVAL_HALF_LIFE_VISITS."""
+    out = []
+    feed = _get(cfg, 'condition_log_z.z_feed', Z_FEED_DEFAULTS['z_feed'])
+    hl = _get(cfg, 'condition_log_z.eval_half_life_visits', Z_FEED_DEFAULTS['eval_half_life_visits'])
+    if feed not in Z_FEED_MODES:
+        out.append(Violation(ERROR, 'z_feed_is_well_formed',
+                             f"condition_log_z.z_feed {feed!r} is not one of {Z_FEED_MODES}"))
+    if isinstance(hl, bool) or not isinstance(hl, (int, float)) or not math.isfinite(hl) or hl <= 0:
+        out.append(Violation(ERROR, 'z_feed_is_well_formed',
+                             f"condition_log_z.eval_half_life_visits {hl!r} is not a finite number > 0"))
+    return out
+
 def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
     """`heldout_gate` parses through progress_metrics.parse_heldout_gate, the parser
     Modeller.__init__ runs (absent = the code defaults, progress_metrics._HELDOUT_GATE)."""
@@ -2533,6 +2554,7 @@ RULES = (
     vargrad_needs_groups,
     conditional_z_settings_are_conditional,
     energy_reference_is_consistent,
+    z_feed_is_well_formed,
     heldout_gate_is_well_formed,
     auto_lr_requires_lr_control,
     lr_control_is_well_formed,

@@ -40,6 +40,12 @@ DEFAULT_HALF_LIFE_VISITS = 200.0
 # below min_visits -- the learned flow head, or the tracker's all-condition level
 UNTRUSTED_Z_MODES = ('head', 'global')
 DEFAULT_GLOBAL_HALF_LIFE_UPDATES = 50.0
+# condition_log_z.z_feed: which rows write ema_logw. 'mixed': forward training rollouts, and backward and replay rows
+# under the stage flag update_log_z. 'forward': forward draws only -- forward training rollouts, and in a stage with
+# no forward branch (train_mode 'bwd') under update_log_z the eval's forward draws, one update() call per eval at
+# half-life condition_log_z.eval_half_life_visits calls. The level streams are fed the same way under both.
+Z_FEED_MODES = ('mixed', 'forward')
+DEFAULT_EVAL_HALF_LIFE_VISITS = 2.0
 
 # Space-group lookup tables (indexed 0..230) that data_classes builds lazily the
 # first time a batch runs a latent transform. They are deterministic globals, not

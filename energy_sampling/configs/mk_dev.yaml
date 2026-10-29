@@ -538,6 +538,8 @@ condition_log_z:  # todo kindof fine with this as long as its general / doesn't 
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
   untrusted_z: head  # the Z a TB residual uses for a condition below min_visits: head = the learned flow head; global = the all-condition EMA of the log w that feeds ema_logw (requires energy_config.energy_reference)
   global_half_life_updates: 50.0  # half-life, in update() calls, of that all-condition EMA
+  z_feed: forward  # which rows write ema_logw (the per-condition level: persistent TB target, bootstrap_z's target). forward = forward draws only: forward training rollouts, and in a stage with no forward branch (train_mode bwd) that sets update_log_z, the eval's forward draws; backward and replay rows never. mixed = forward rollouts, plus backward and replay rows under update_log_z; evals never. The level streams (zmatch J_F/J_B) are fed the same under both. Code default mixed
+  eval_half_life_visits: 2.0  # z_feed forward only: half-life, in update() calls (one per eval), of the eval feed
   best_energy_from_anchors_on_switch: false  # true = when checkpoint_name belongs to ANOTHER run (its stored run_name differs from this run's), each condition's restored best energy is replaced by the restored anchor buffer's minimum for that condition (+inf where it holds no anchor); a resume of the run's own checkpoint is untouched. Raises when no anchor buffer was restored or the tracker carries a separate physical minimum. Prints when it fires (checkpointing.best_energy_from_anchors_on_switch)
   # {fwd,bwd,replay}_tb_z_source MOVED -> {fwd,bwd,replay}_loss_coeffs.tb_z_source.
   # It is a property of what a branch's loss does, and loss_coeffs is the one place
@@ -655,7 +657,7 @@ protocols:
         # this stage costs about 4.8% of step time at period 500, so it is a
         # purchase rather than a default.
         flags:
-          update_log_z: true           # accumulate ema_logw / best_energy evidence
+          update_log_z: true           # under condition_log_z.z_feed forward, this stage's evals write ema_logw
           scramble_conditions: true    # intent flag; applies only on conditional problems
         loss_coeffs:
           bwd: { mle: 1.0, tbc: 0.0, repeats: 1.0 }
@@ -936,10 +938,10 @@ protocols:
         # frozen, condition-blind bridge is the natural backward kernel and P_F
         # learns the conditioning onto it.
         # bootstrap_z: fits the Z(c) head to condition_log_z's per-condition
-        # ema_logw, which train_prior fed from the data rows (log R - log q; no
-        # rollouts, no energy calls). The head is the Z a condition below
-        # min_visits reads (untrusted_z: head); emp_z on the Z sidecar trains
-        # it from the first rollout on.
+        # ema_logw, which train_prior's evals wrote from their forward draws
+        # (condition_log_z.z_feed forward; no extra rollouts or energy calls).
+        # The head is the Z a condition below min_visits reads (untrusted_z:
+        # head); emp_z on the Z sidecar trains it from the first rollout on.
         on_enter: [ 'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb', 'bootstrap_z' ]
         # fwd HAS NO FRAC: its loss enters only as the Z sidecar below, outside
         # the frac mix. min_fracs.fwd 0 holds it at exactly 0 (the
