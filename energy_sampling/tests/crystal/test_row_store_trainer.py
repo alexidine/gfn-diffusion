@@ -6,6 +6,8 @@ Modeller built without __init__ around a hand-built RowStore and a stub policy. 
   * the level table not being the replay branch's TB level (the head, or the persistent target where trusted);
   * a rollout on a condition the store has never held being refused for want of a level;
   * the admission floor judged on the referenced log R;
+  * records judged on anything but the rollout batch's mol_energy, or a batch without it admitted silently;
+  * seed rows given any energy but the stored rows' mol_energy, or best_energy read off held-out rows;
   * replay availability and the occupancy trigger not reading the store.
 
 CPU, synthetic rows, no energy computed.
@@ -17,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from energy_sampling.row_store import RowStore, TAG_CHILD, TAG_ONPOLICY
+from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY
 from energy_sampling.train import Modeller
 
 pytestmark = pytest.mark.fast
@@ -74,7 +76,9 @@ def _modeller(tb_z_source='learned', tracker=None, **store_over):
     cid = torch.arange(n) % 2                          # conditions 0 and 1 only
     held = torch.arange(n) >= 30
     st.set_conditions(cid, (cid.float() * 0.1)[:, None])
-    st.seed(cid, torch.randn(n, DIM, generator=g), torch.randn(n, generator=g), TAG_CHILD, held)
+    x = torch.randn(n, DIM, generator=g)
+    log_r = torch.randn(n, generator=g)
+    st.seed(cid, x, log_r, TAG_CHILD, held, energy=torch.full((n,), -1.0))   # best physical energy -1 on c0, c1
     m.row_store = st
     m._store_refresh()
     return m
@@ -130,12 +134,14 @@ def test_refresh_writes_log_q_under_eval_mode_and_restores_training():
     assert torch.allclose(st.log_q, want) and m.gfn_model.training
 
 
-def _rollout(cid, log_r, x=None):
+def _rollout(cid, log_r, x=None, mol_energy=None):
     n = len(cid)
     x = torch.zeros(n, DIM) if x is None else x
     fwd = {'condition_id': torch.as_tensor(cid), 'log_r': torch.as_tensor(log_r, dtype=torch.float32),
            'flow_states': torch.stack([torch.zeros_like(x), x], 1), 'log_pf': torch.zeros(n)}
-    batch = SimpleNamespace(conditions=(torch.as_tensor(cid).float() * 0.1)[:, None])
+    mol_energy = -torch.as_tensor(log_r, dtype=torch.float32) if mol_energy is None else mol_energy
+    batch = SimpleNamespace(conditions=(torch.as_tensor(cid).float() * 0.1)[:, None],
+                            mol_energy=torch.as_tensor(mol_energy, dtype=torch.float32)[:, None])
     return fwd, batch
 
 
@@ -146,7 +152,84 @@ def test_admission_on_a_condition_the_store_never_held():
     st = m.row_store
     assert res['admitted'] == 2 and res['records'] == 1
     assert torch.allclose(st.cond_table[3], torch.tensor([0.3]))
-    assert int((st.tag == TAG_ONPOLICY).sum()) == 2 and float(st.best_log_r[3]) == 50.0
+    assert int((st.tag == TAG_ONPOLICY).sum()) == 2 and float(st.best_energy[3]) == -50.0
+
+
+def test_records_are_judged_on_the_batch_mol_energy_not_log_r():
+    m = _modeller(bar=1e6)                              # only records are admitted
+    # c0 (seed best -1): row 0 has the higher log R but energy 5; row 1 the lower log R and energy -3 -> the record
+    fwd, batch = _rollout([0, 0], [30.0, -20.0], mol_energy=[5.0, -3.0])
+    res = m._store_admit(fwd, batch, origin=0)
+    st = m.row_store
+    assert res['records'] == 1 and res['admitted'] == 1
+    assert float(st.log_r[-1]) == -20.0 and float(st.energy[-1]) == -3.0 and bool(st.protected[-1])
+    assert float(st.best_energy[0]) == -3.0 and float(st.best_energy[1]) == -1.0
+
+
+def test_admission_refuses_a_batch_without_matching_mol_energy():
+    m = _modeller()
+    fwd, batch = _rollout([0, 0], [1.0, 2.0])
+    del batch.mol_energy
+    with pytest.raises(RuntimeError, match='mol_energy'):
+        m._store_admit(fwd, batch, origin=0)
+    fwd, batch = _rollout([0, 0], [1.0, 2.0], mol_energy=[1.0, 2.0, 3.0])
+    with pytest.raises(RuntimeError, match='mol_energy'):
+        m._store_admit(fwd, batch, origin=0)
+    assert len(m.row_store) == 40
+
+
+class _PriorRows:
+    """A stored prior batch: per-row noised_kind, space group (read as the condition id), log R and mol_energy."""
+
+    def __init__(self, kind, sg, log_r, mol_energy, x):
+        self.noised_kind, self.sg_ind = torch.as_tensor(kind), torch.as_tensor(sg)
+        self.log_r, self.mol_energy, self.x = torch.as_tensor(log_r), torch.as_tensor(mol_energy), torch.as_tensor(x)
+        self.num_graphs = len(self.sg_ind)
+        self.z_prime = torch.ones(self.num_graphs, dtype=torch.long)
+        self.ptr = torch.arange(self.num_graphs + 1)
+
+    def subsample_new_batch(self, idx):
+        return _PriorRows(self.noised_kind[idx], self.sg_ind[idx], self.log_r[idx], self.mol_energy[idx], self.x[idx])
+
+    def to(self, device):
+        return self
+
+
+class _SeedEf:
+    """seed_energy_from differs from mol_energy by 1000, so a seed taking it is caught."""
+    condition_library_size = N_COND
+
+    def prebuilt_sample_to_reward(self, sub, T, return_ens_dict=False):
+        return sub.log_r, {'mol_energy': sub.mol_energy}
+
+    def seed_energy_from(self, ens):
+        return ens['mol_energy'] + 1000.0
+
+    def condition_samples(self, sub, sg_inds, z_primes):
+        return sub, None, sg_inds.float()[:, None] * 0.1, sg_inds
+
+
+def test_seeding_stores_mol_energy_and_best_energy_from_the_drawable_rows():
+    m = Modeller.__new__(Modeller)
+    m.args = SimpleNamespace(energy_config=SimpleNamespace(temperature=1.0), buffer_device='cpu')
+    m.device = torch.device('cpu')
+    m.energy_function = _SeedEf()
+    m._batch_latents = lambda sub: sub.x
+    n = 7
+    m.prior_dataset = SimpleNamespace(batch=_PriorRows(
+        [TAG_ANCHOR, TAG_CHILD, TAG_CHILD, TAG_CHILD, TAG_ANCHOR, TAG_CHILD, TAG_CHILD],
+        [0, 0, 0, 1, 1, 1, 1], [1.0, 9.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [-2.0, 7.0, -5.0, -1.0, -3.0, 4.0, 0.5], torch.arange(n * DIM, dtype=torch.float32).reshape(n, DIM)))
+    m.prior_heldout_batch = _PriorRows([TAG_ANCHOR, TAG_ANCHOR], [0, 1], [50.0, 60.0], [-90.0, -80.0],
+                                       -torch.ones(2, DIM))
+    settings = {k: v for k, v in STORE.items() if k != 'refresh_chunk'}
+    m._store_seed(settings, chunk=3)
+    st = m.row_store
+    assert st.n_mle == 7 and st.n_seed == 9 and bool(st.held_out[7:].all())
+    assert st.energy.tolist() == [-2.0, 7.0, -5.0, -1.0, -3.0, 4.0, 0.5, -90.0, -80.0]   # mol_energy rides its row
+    assert st.log_r.tolist() == [1.0, 9.0, 2.0, 3.0, 4.0, 5.0, 6.0, 50.0, 60.0]
+    assert st.best_energy.tolist()[:2] == [-5.0, -3.0]                       # the held-out -90 and -80 do not count
+    assert Modeller._stored_reward_terms(m, m.prior_dataset.batch).__len__() == 2   # the default call is unchanged
 
 
 def test_admission_floor_is_judged_on_the_unreferenced_log_r():
@@ -219,7 +302,8 @@ def test_store_residual_and_is_weights_match_the_replay_tb_loss_on_a_real_flow_p
     n = 40
     cid = torch.arange(n) % 3
     st.set_conditions(cid, torch.randn(3, 4)[cid])
-    st.seed(cid, torch.rand(n, 12) * 2 - 1, torch.randn(n) * 5, TAG_CHILD, torch.arange(n) >= 35)
+    st.seed(cid, torch.rand(n, 12) * 2 - 1, torch.randn(n) * 5, TAG_CHILD, torch.arange(n) >= 35,
+            energy=torch.zeros(n))
     m.row_store = st
     m._store_refresh()
     lv = m._store_level_table()

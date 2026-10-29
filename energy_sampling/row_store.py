@@ -5,6 +5,7 @@ Rows are plain tensors of equal length n, rebuilt by `index_select` / `cat`:
     cid        int64        condition id
     x          f32 [n,dim]  chart state the policy scores
     log_r      f32          log R at admission, run currency, referenced
+    energy     f32          physical energy per molecule, unreferenced (the record currency)
     log_q      f32          log q at the last refresh or touch; NaN = never scored
     q_step     int64        training step of that write; -1 = never scored
     tag        int8         TAG_ANCHOR / TAG_CHILD / TAG_ONPOLICY / TAG_GENERATED
@@ -21,6 +22,9 @@ live by the caller on every draw, admission, refresh and stats call; it is never
 stored per row. NaN in the table means "no level": rows of that condition have a
 non-finite r, are not drawable for TB and are not admitted.
 
+Records: a candidate is a record when it strictly lowers its condition's best_energy
+(the lowest finite `energy` among that condition's non-held-out seed rows and records).
+
 This module imports torch, math and time only.
 """
 import math
@@ -31,11 +35,11 @@ import torch
 TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY, TAG_GENERATED = 0, 1, 2, 3
 TAG_NAMES = ('anchor', 'child', 'onpolicy', 'generated')
 DATA_TAGS = (TAG_ANCHOR, TAG_CHILD)
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 _SETTINGS = ('bar', 'eps', 'cap_per_condition', 'max_rows', 'records_kept', 'kappa',
-             'floor_frac', 'uniform_frac', 'admit_reward_min')
-_COLUMNS = ('cid', 'x', 'log_r', 'log_q', 'q_step', 'tag', 'protected', 'held_out', 'born_eval')
+             'floor_frac', 'uniform_frac', 'admit_reward_min', 'is_exponent')
+_COLUMNS = ('cid', 'x', 'log_r', 'energy', 'log_q', 'q_step', 'tag', 'protected', 'held_out', 'born_eval')
 _COND_TOL = 1e-6
 _FLOOR_MIN = 1e-12
 
@@ -78,7 +82,7 @@ def _whole(v):
 def _check_settings(s):
     if not (_real(s['kappa']) and s['kappa'] >= 0):
         raise RowStoreError(f"kappa must be >= 0, got {s['kappa']}")
-    for k in ('floor_frac', 'uniform_frac'):
+    for k in ('floor_frac', 'uniform_frac', 'is_exponent'):
         if not (_real(s[k]) and 0.0 <= s[k] <= 1.0):
             raise RowStoreError(f'{k} must lie in [0, 1], got {s[k]}')
     if not (_real(s['bar']) and s['bar'] >= 0):
@@ -98,7 +102,7 @@ def _check_settings(s):
 
 class RowStore:
     def __init__(self, dim, n_cond, cond_dim, device, *, bar, eps, cap_per_condition, max_rows,
-                 records_kept, kappa, floor_frac, uniform_frac, admit_reward_min=None):
+                 records_kept, kappa, floor_frac, uniform_frac, admit_reward_min=None, is_exponent=1.0):
         self.dim, self.n_cond, self.cond_dim = int(dim), int(n_cond), int(cond_dim)
         if self.n_cond < 1:
             raise RowStoreError(f'n_cond must be >= 1, got {n_cond}')
@@ -107,6 +111,7 @@ class RowStore:
         self.cid = torch.zeros(0, dtype=torch.int64, device=d)
         self.x = torch.zeros(0, self.dim, dtype=torch.float32, device=d)
         self.log_r = torch.zeros(0, dtype=torch.float32, device=d)
+        self.energy = torch.zeros(0, dtype=torch.float32, device=d)
         self.log_q = torch.zeros(0, dtype=torch.float32, device=d)
         self.q_step = torch.zeros(0, dtype=torch.int64, device=d)
         self.tag = torch.zeros(0, dtype=torch.int8, device=d)
@@ -114,18 +119,19 @@ class RowStore:
         self.held_out = torch.zeros(0, dtype=torch.bool, device=d)
         self.born_eval = torch.zeros(0, dtype=torch.int32, device=d)
         self.cond_table = torch.full((self.n_cond, self.cond_dim), math.nan, dtype=torch.float32, device=d)
-        self.best_log_r = torch.full((self.n_cond,), -math.inf, dtype=torch.float32, device=d)
+        self.best_energy = torch.full((self.n_cond,), math.inf, dtype=torch.float32, device=d)
         self.n_mle = 0
         self.n_seed = 0
         self.eval_idx = 0
         self.version = 0
         self.last_refresh = None
+        self.chunk_cap = None       # largest refresh chunk since an OOM halved it; not saved
         self._reset_window()
         for k in _SETTINGS:
             setattr(self, k, None)
         self.configure(bar=bar, eps=eps, cap_per_condition=cap_per_condition, max_rows=max_rows,
                        records_kept=records_kept, kappa=kappa, floor_frac=floor_frac,
-                       uniform_frac=uniform_frac, admit_reward_min=admit_reward_min)
+                       uniform_frac=uniform_frac, admit_reward_min=admit_reward_min, is_exponent=is_exponent)
 
     # ---- settings and shape helpers -------------------------------------------------
 
@@ -186,14 +192,16 @@ class RowStore:
 
     # ---- seeding and conditions -----------------------------------------------------
 
-    def seed(self, cid, x, log_r, tag, held_out):
-        """Load the data rows once, into an empty store. Every row is protected; held-out rows go last."""
+    def seed(self, cid, x, log_r, tag, held_out, *, energy):
+        """Load the data rows once, into an empty store. Every row is protected; held-out rows go last.
+        energy: physical energy per row; best_energy starts as its minimum over the finite non-held-out rows."""
         if len(self):
             raise RowStoreError('seed() is only allowed on an empty store')
         cid = self._cids(cid)
         n = cid.numel()
         x = self._states(x, n)
         log_r = self._vec(log_r, n, torch.float32, 'log_r')
+        energy = self._vec(energy, n, torch.float32, 'energy')
         tag = self._vec(tag, n, torch.int8, 'tag')
         held_out = self._vec(held_out, n, torch.bool, 'held_out')
         is_data = (tag == TAG_ANCHOR) | (tag == TAG_CHILD)
@@ -201,7 +209,7 @@ class RowStore:
             raise RowStoreError('seed() takes data tags only (anchor, child)')
         order = torch.argsort(held_out.to(torch.int8), stable=True)
         self._set_columns({
-            'cid': cid[order], 'x': x[order], 'log_r': log_r[order],
+            'cid': cid[order], 'x': x[order], 'log_r': log_r[order], 'energy': energy[order],
             'log_q': torch.full((n,), math.nan, dtype=torch.float32, device=self.device),
             'q_step': torch.full((n,), -1, dtype=torch.int64, device=self.device),
             'tag': tag[order],
@@ -210,9 +218,9 @@ class RowStore:
             'born_eval': torch.zeros(n, dtype=torch.int32, device=self.device)})
         self.n_mle = int((~held_out).sum())
         self.n_seed = n
-        keep = (~self.held_out) & torch.isfinite(self.log_r)
-        self.best_log_r = self.best_log_r.scatter_reduce(
-            0, self.cid[keep], self.log_r[keep], reduce='amax', include_self=True)
+        keep = (~self.held_out) & torch.isfinite(self.energy)
+        self.best_energy = self.best_energy.scatter_reduce(
+            0, self.cid[keep], self.energy[keep], reduce='amin', include_self=True)
 
     def set_conditions(self, cid, cond):
         """Fill unset rows of cond_table; raise when a condition id maps to two different conditions."""
@@ -277,7 +285,7 @@ class RowStore:
         return rows, (1.0 - u) * P + u / n_E
 
     def draw_tb(self, B, level_table, generator=None):
-        """B i.i.d. rows by priority with IS weights w = (1/n_E)/q; None when nothing is drawable."""
+        """B i.i.d. rows by priority with IS weights w = ((1/n_E)/q)^is_exponent; None when nothing is drawable."""
         B = int(B)
         if B < 1:
             raise RowStoreError(f'draw size must be >= 1, got {B}')
@@ -289,6 +297,9 @@ class RowStore:
         dev = generator.device if generator is not None else q.device
         pick = torch.multinomial(q.to(dev), B, replacement=True, generator=generator).to(self.device)
         w = (1.0 / n_E) / q[pick]
+        a = float(self.is_exponent)
+        if a != 1.0:
+            w = w.pow(a)
         n_elig = int((~self.held_out).sum())
         stats = {'replay/is_ess_frac': float(w.sum() ** 2 / (B * (w * w).sum())),
                  'replay/is_w_max_ratio': float(w.max() / w.mean()),
@@ -314,22 +325,37 @@ class RowStore:
         self.log_q[idx] = log_q
         self.q_step[idx] = int(step)
 
-    def refresh(self, log_q_fn, level_table=None, step=0, chunk=65536):
-        """Recompute log q of every row, `chunk` rows per call of log_q_fn(x, cid); increments eval_idx."""
+    def refresh(self, log_q_fn, level_table=None, step=0, chunk=8192):
+        """Recompute log q of every row, `chunk` rows per call of log_q_fn(x, cid); increments eval_idx.
+
+        A CUDA out-of-memory error in a call halves the chunk and redoes that call; the halved size is
+        kept for later refreshes (`chunk_cap`). An OOM at chunk 1 is raised."""
         chunk = int(chunk)
         if chunk < 1:
             raise RowStoreError(f'refresh chunk must be >= 1, got {chunk}')
+        if self.chunk_cap is not None:
+            chunk = min(chunk, self.chunk_cap)
         t0 = time.perf_counter()
         n = len(self)
+        s = 0
         with torch.no_grad():
-            for s in range(0, n, chunk):
+            while s < n:
                 e = min(n, s + chunk)
-                lq = log_q_fn(self.x[s:e], self.cid[s:e])
+                try:
+                    lq = log_q_fn(self.x[s:e], self.cid[s:e])
+                except torch.cuda.OutOfMemoryError:
+                    if chunk == 1:
+                        raise
+                    chunk = max(1, chunk // 2)
+                    self.chunk_cap = chunk
+                    torch.cuda.empty_cache()
+                    continue
                 self.log_q[s:e] = self._vec(lq, e - s, torch.float32, 'refreshed log_q')
+                s = e
         self.q_step.fill_(int(step))
         self.eval_idx += 1
         nonfinite = int((~torch.isfinite(self.log_q)).sum())
-        out = {'rows': n, 'seconds': time.perf_counter() - t0, 'nonfinite': nonfinite}
+        out = {'rows': n, 'seconds': time.perf_counter() - t0, 'nonfinite': nonfinite, 'chunk': chunk}
         if level_table is not None:
             E, s_all, _ = self._drawable(level_table)
             out['resid_med'] = _median(s_all[E])
@@ -338,16 +364,19 @@ class RowStore:
 
     # ---- admission, demotion, eviction ----------------------------------------------
 
-    def admit(self, cid, x, log_r, log_q, ok, tag, step, level_table, cond, generator=None):
+    def admit(self, cid, x, log_r, log_q, ok, tag, step, level_table, cond, generator=None, *, energy):
         """Admit candidates with |r| >= bar or a strict per-condition record, then demote and evict.
 
         ok: bool per candidate (the admit_reward_min floor, applied by the caller) or None.
         generator: optional torch.Generator for the eviction keys.
+        energy: physical energy per candidate. A record has the lowest finite energy of its condition among this
+        call's finite candidates (lowest index on ties), strictly below best_energy.
         """
         cid = self._cids(cid)
         B = cid.numel()
         x = self._states(x, B)
         log_r = self._vec(log_r, B, torch.float32, 'log_r')
+        energy = self._vec(energy, B, torch.float32, 'energy')
         log_q = self._vec(log_q, B, torch.float32, 'log_q')
         ok = (torch.ones(B, dtype=torch.bool, device=self.device) if ok is None
               else self._vec(ok, B, torch.bool, 'ok'))
@@ -362,14 +391,15 @@ class RowStore:
         finite = torch.isfinite(log_r) & torch.isfinite(log_q) & torch.isfinite(L)
         fin = finite & ok
         ar = torch.arange(B, device=self.device)
-        M = torch.full((self.n_cond,), -math.inf, dtype=torch.float32, device=self.device).scatter_reduce(
-            0, cid, torch.where(fin, log_r, torch.full_like(log_r, -math.inf)), reduce='amax', include_self=True)
-        at_max = fin & (log_r == M[cid]) & (M[cid] > self.best_log_r[cid])
+        fin_e = fin & torch.isfinite(energy)
+        M = torch.full((self.n_cond,), math.inf, dtype=torch.float32, device=self.device).scatter_reduce(
+            0, cid, torch.where(fin_e, energy, torch.full_like(energy, math.inf)), reduce='amin', include_self=True)
+        at_min = fin_e & (energy == M[cid]) & (M[cid] < self.best_energy[cid])
         first = torch.full((self.n_cond,), B, dtype=torch.int64, device=self.device).scatter_reduce(
-            0, cid[at_max], ar[at_max], reduce='amin', include_self=True)
-        record = at_max & (ar == first[cid])
+            0, cid[at_min], ar[at_min], reduce='amin', include_self=True)
+        record = at_min & (ar == first[cid])
         take = fin & ((r.abs() >= self.bar) | record)
-        self.best_log_r[cid[record]] = log_r[record]
+        self.best_energy[cid[record]] = energy[record]
 
         a = torch.nonzero(take).squeeze(1)
         n_old = len(self)
@@ -378,6 +408,7 @@ class RowStore:
             'cid': torch.cat([self.cid, cid[a]]),
             'x': torch.cat([self.x, x[a]]),
             'log_r': torch.cat([self.log_r, log_r[a]]),
+            'energy': torch.cat([self.energy, energy[a]]),
             'log_q': torch.cat([self.log_q, log_q[a]]),
             'q_step': torch.cat([self.q_step, torch.full((na,), int(step), dtype=torch.int64, device=self.device)]),
             'tag': torch.cat([self.tag, tag[a]]),
@@ -409,7 +440,7 @@ class RowStore:
                 'evicted_cap': n_cap, 'evicted_global': n_glob, 'demoted': n_dem, 'rows': len(self)}
 
     def _demote(self):
-        """Per condition, protected non-data rows ranked by log R (highest first, ties by position):
+        """Per condition, protected non-data rows ranked by energy (lowest first, ties by position):
         ranks >= records_kept lose protection."""
         if self.records_kept is None:
             return 0
@@ -417,7 +448,7 @@ class RowStore:
         cand = torch.nonzero(self.protected & ~is_data).squeeze(1)
         if cand.numel() <= self.records_kept:
             return 0
-        c1 = cand[torch.argsort(self.log_r[cand], descending=True, stable=True)]
+        c1 = cand[torch.argsort(self.energy[cand], stable=True)]
         c2 = c1[torch.argsort(self.cid[c1], stable=True)]
         dem = c2[_within_group_rank(self.cid[c2]) >= self.records_kept]
         self.protected[dem] = False
@@ -471,6 +502,10 @@ class RowStore:
 
         Per-condition occupancy is over conditions with at least one non-held-out row;
         `conds` counts conditions holding any row; protected_above_bar excludes held-out rows.
+        Energies: seed_best(c) is the minimum energy over c's finite non-held-out seed rows (+inf when none);
+        best_energy_{min,med} are over conditions with a finite best_energy; record_conds counts conditions whose
+        best_energy is below seed_best; record_gain_med is the median of seed_best - best_energy over those with a
+        finite seed_best; records_energy_{min,med} are over protected non-data rows.
         """
         out = {}
         out['rows'] = len(self)
@@ -511,6 +546,22 @@ class RowStore:
         sE = s[E].double()
         out['resid_med'] = _median(sE)
         out['resid_p90'] = float(torch.quantile(sE, 0.9)) if sE.numel() else math.nan
+        sk = (torch.arange(len(self), device=self.device) < self.n_seed) & nh & torch.isfinite(self.energy)
+        seed_best = torch.full((self.n_cond,), math.inf, dtype=torch.float32, device=self.device).scatter_reduce(
+            0, self.cid[sk], self.energy[sk], reduce='amin', include_self=True)
+        be = self.best_energy
+        bf = torch.isfinite(be)
+        sf = torch.isfinite(seed_best)
+        out['best_energy_min'] = float(be[bf].min()) if bool(bf.any()) else math.nan
+        out['best_energy_med'] = _median(be[bf].double())
+        out['seed_best_energy_min'] = float(seed_best[sf].min()) if bool(sf.any()) else math.nan
+        below = bf & (be < seed_best)
+        out['record_conds'] = int(below.sum())
+        gain = below & sf
+        out['record_gain_med'] = _median((seed_best[gain] - be[gain]).double())
+        re = self.energy[self.protected & ~is_data].double()
+        out['records_energy_min'] = float(re.min()) if re.numel() else math.nan
+        out['records_energy_med'] = _median(re)
         lr = self.last_refresh
         out['refresh_seconds'] = float(lr['seconds']) if lr else math.nan
         out['refresh_nonfinite'] = int(lr['nonfinite']) if lr else math.nan
@@ -525,7 +576,7 @@ class RowStore:
                 'dim': self.dim, 'n_cond': self.n_cond, 'cond_dim': self.cond_dim,
                 'columns': {c: getattr(self, c).detach().cpu().clone() for c in _COLUMNS},
                 'cond_table': self.cond_table.detach().cpu().clone(),
-                'best_log_r': self.best_log_r.detach().cpu().clone(),
+                'best_energy': self.best_energy.detach().cpu().clone(),
                 'n_mle': self.n_mle, 'n_seed': self.n_seed,
                 'eval_idx': self.eval_idx, 'version': self.version}
 
@@ -545,7 +596,7 @@ class RowStore:
             raise RowStoreError(f"row store column x has shape {tuple(cols['x'].shape)}, expected (n, {st.dim})")
         st._set_columns({c: cols[c].to(st.device) for c in _COLUMNS})
         st.cond_table = state['cond_table'].to(st.device, torch.float32)
-        st.best_log_r = state['best_log_r'].to(st.device, torch.float32)
+        st.best_energy = state['best_energy'].to(st.device, torch.float32)
         st.n_mle, st.n_seed = int(state['n_mle']), int(state['n_seed'])
         st.eval_idx, st.version = int(state['eval_idx']), int(state['version'])
         return st

@@ -58,6 +58,7 @@ from energy_sampling.controller import LRController
 from energy_sampling import prior_scan_cache
 from energy_sampling import noised_prior
 from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY
+from energy_sampling.row_store import FORMAT_VERSION as ROW_STORE_FORMAT
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
     ROLLOUT_CONDITION_DRAWS
@@ -4075,17 +4076,22 @@ class Modeller:
         return energy.to(self.device), batch.to(self.device)
 
     @torch.no_grad()
-    def _stored_reward_terms(self, batch, chunk: int = 8192):
+    def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False):
         """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
-        (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU."""
+        (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU. with_mol_energy adds a
+        third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced)."""
         ef, T = self.energy_function, float(self.args.energy_config.temperature)
-        seed, log_r = [], []
+        seed, log_r, mol = [], [], []
         for lo in range(0, int(batch.num_graphs), chunk):
             sub = batch.subsample_new_batch(
                 torch.arange(lo, min(lo + chunk, int(batch.num_graphs)), device=batch.ptr.device)).to(self.device)
             lr, ens = ef.prebuilt_sample_to_reward(sub, T, return_ens_dict=True)
             seed.append(ef.seed_energy_from(ens).double().flatten().cpu())
             log_r.append(lr.double().flatten().cpu())
+            if with_mol_energy:
+                mol.append(torch.as_tensor(ens['mol_energy']).double().flatten().cpu())
+        if with_mol_energy:
+            return torch.cat(seed), torch.cat(log_r), torch.cat(mol)
         return torch.cat(seed), torch.cat(log_r)
 
     @torch.no_grad()
@@ -7868,8 +7874,8 @@ class Modeller:
         return row_store_settings(self.args)
 
     def _store_stamp(self):
-        """What the stored rows' x, log R and condition ids depend on. A sidecar store whose stamp differs is not
-        loaded (init_row_store seeds afresh)."""
+        """What the stored rows' x, log R, energy and condition ids depend on, and the store's format version. A
+        sidecar store whose stamp differs is not loaded (init_row_store seeds afresh)."""
         from utils import _to_plain
         ef = self.energy_function
         ec = dict(_to_plain(self.args.energy_config))
@@ -7879,6 +7885,7 @@ class Modeller:
         reg = getattr(self, 'identifier_registry', {}) or {}
         path = str(self.args.prior_path)
         return {
+            'store_format': ROW_STORE_FORMAT,
             'noised_prior_identity': noised_prior.identity(self.args, ef),
             'noised_prior_settings': {k: (list(v) if isinstance(v, tuple) else v)
                                       for k, v in noised_prior.settings(self.args).items()},
@@ -7913,7 +7920,7 @@ class Modeller:
         if not getattr(self, 'prior_is_prenoised', False):
             raise ValueError("buffers.store seeds from a pre-noised prior (noised_prior.py): prior_path is not one")
         settings = {k: s[k] for k in ('bar', 'eps', 'cap_per_condition', 'max_rows', 'records_kept', 'kappa',
-                                      'floor_frac', 'uniform_frac', 'admit_reward_min')}
+                                      'floor_frac', 'uniform_frac', 'admit_reward_min', 'is_exponent')}
         state = getattr(self, '_row_store_state', None)
         self._row_store_state = None
         if state is not None:
@@ -7936,7 +7943,7 @@ class Modeller:
             if batch is None or int(batch.num_graphs) == 0:
                 continue
             tag = noised_prior.tag(batch, 'noised_kind')
-            _, log_r = self._stored_reward_terms(batch)
+            _, log_r, energy = self._stored_reward_terms(batch, with_mol_energy=True)
             xs, cids, conds = [], [], []
             for lo in range(0, int(batch.num_graphs), chunk):
                 sub = batch.subsample_new_batch(
@@ -7946,20 +7953,23 @@ class Modeller:
                     sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
                 cids.append(cid.long().cpu())
                 conds.append(cond.float().cpu())
-            parts.append((torch.cat(cids), torch.cat(xs), log_r.float(), tag,
+            parts.append((torch.cat(cids), torch.cat(xs), log_r.float(), energy.float(), tag,
                           torch.full((int(batch.num_graphs),), held), torch.cat(conds)))
-        cid, x, log_r, tag, held, cond = (torch.cat(t) for t in zip(*parts))
+        cid, x, log_r, energy, tag, held, cond = (torch.cat(t) for t in zip(*parts))
         if bool(((tag != TAG_ANCHOR) & (tag != TAG_CHILD)).any()):
             raise ValueError("buffers.store: a seed row is neither an anchor nor a child (noised_kind); "
                              "noised_prior.train_kinds must not include 'harvested'")
         store = RowStore(int(x.shape[1]), int(ef.condition_library_size), int(cond.shape[1]), self.buffer_device,
                          **settings)
         store.set_conditions(cid, cond)
-        store.seed(cid, x, log_r, tag, held)
+        store.seed(cid, x, log_r, tag, held, energy=energy)
         self.row_store = store
+        be = store.best_energy[torch.isfinite(store.best_energy)]
         print(f"row store seeded: {store.n_mle} drawable data rows ({int((tag[~held] == TAG_ANCHOR).sum())} "
               f"anchors, {int((tag[~held] == TAG_CHILD).sum())} children) and {store.n_seed - store.n_mle} held-out "
-              f"rows over {int(torch.unique(cid).numel())} conditions", flush=True)
+              f"rows over {int(torch.unique(cid).numel())} conditions; best physical energy (mol_energy) per "
+              f"condition min {float(be.min()) if be.numel() else float('nan'):.4g} over {be.numel()} conditions",
+              flush=True)
 
     @torch.no_grad()
     def _store_level_table(self):
@@ -8052,13 +8062,21 @@ class Modeller:
                   "stored condition vector have no level and are not admitted (printed once)", flush=True)
         st.set_conditions(cid, cond)
         log_r = fwd_stats['log_r'].detach().float().flatten().cpu()
+        # physical energy per molecule, unreferenced: generator_energy's ens_dict mol_energy on the analysed batch
+        mol_energy = getattr(sample_batch, 'mol_energy', None)
+        if mol_energy is None:
+            raise RuntimeError("row store admission: the rollout batch carries no mol_energy (the record currency)")
+        energy = torch.as_tensor(mol_energy).detach().float().flatten().cpu()
+        if energy.numel() != cid.numel():
+            raise RuntimeError(f"row store admission: mol_energy has {energy.numel()} rows, the rollout "
+                               f"{cid.numel()}")
         floor = self.store_settings()['admit_reward_min']
         ok = None
         if floor is not None:
             ok = self.energy_function.unreferenced_log_r(log_r, cid) >= float(floor)
         res = st.admit(cid, fwd_stats['flow_states'][:, -1].detach().float().cpu(), log_r,
                        fwd_stats['log_pf'].detach().float().flatten().cpu(), ok, TAG_ONPOLICY,
-                       int(getattr(self, 'step_ind', 0)), self._store_level_table(), cond)
+                       int(getattr(self, 'step_ind', 0)), self._store_level_table(), cond, energy=energy)
         return res
 
     def _replay_rows(self):

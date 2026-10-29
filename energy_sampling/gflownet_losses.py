@@ -1076,7 +1076,9 @@ def get_gfn_backward_loss(loss_coeffs,
         # objective of whichever branch loss is active, Huber included: a row
         # drawn p-times as often carries weight 1/p, so past the Huber knee its
         # per-draw push is ~beta/(p delta) and its expected push is unchanged
-        # (docs/wiki/row-store.md).
+        # (docs/wiki/row-store.md). This holds for weights 1/p; the row store's
+        # buffers.store.is_exponent a < 1 passes (1/p)^a, which leaves the
+        # objective between the drawn measure (a = 0) and the uniform one (a = 1).
         w = sample_weights.to(combined_losses.device, combined_losses.dtype).flatten()
         if w.numel() != combined_losses.numel():
             # K repeats are tiled over the batch: broadcast one weight per row

@@ -37,8 +37,14 @@ def _msgs(cfg, severity=ci.ERROR):
     return [v.detail for v in ci.check(cfg) if v.rule == RULE and v.severity == severity]
 
 
+#: the store keys whose mk_dev value is not the code default
+MK_DEV_OVERRIDES = {'is_exponent': 0.5}
+
+
 def test_mk_dev_carries_every_store_key_with_the_code_default(mk_dev):
-    assert mk_dev['buffers']['store'] == ci.ROW_STORE_DEFAULTS
+    assert set(mk_dev['buffers']['store']) == set(ci.ROW_STORE_DEFAULTS)
+    assert mk_dev['buffers']['store'] == {**ci.ROW_STORE_DEFAULTS, **MK_DEV_OVERRIDES}
+    assert ci.ROW_STORE_DEFAULTS['is_exponent'] == 1.0
 
 
 def test_shipped_config_is_clean(mk_dev):
@@ -150,7 +156,8 @@ def test_occupancy_trigger_is_allowed(mk_dev):
 MALFORMED = [('kappa', -0.1), ('kappa', 'x'), ('floor_frac', 1.5), ('uniform_frac', -0.1), ('bar', -1.0),
              ('eps', 0.0), ('cap_per_condition', -1), ('cap_per_condition', 2.5), ('max_rows', -5),
              ('records_kept', 0), ('records_kept', True), ('refresh_chunk', 0), ('admit_reward_min', 'low'),
-             ('kappa', float('nan'))]
+             ('kappa', float('nan')), ('is_exponent', 1.5), ('is_exponent', -0.5), ('is_exponent', float('nan')),
+             ('is_exponent', None), ('is_exponent', 'half'), ('is_exponent', True)]
 
 
 @pytest.mark.parametrize('key,value', MALFORMED, ids=[f'{k}={v}' for k, v in MALFORMED])
@@ -158,6 +165,13 @@ def test_malformed_values_are_refused(mk_dev, key, value):
     cfg = _on(mk_dev)
     cfg['buffers']['store'][key] = value
     assert any(f'buffers.store.{key}' in m for m in _msgs(cfg)), _msgs(cfg)
+
+
+@pytest.mark.parametrize('value', [0, 0.0, 0.5, 1, 1.0])
+def test_is_exponent_accepts_the_closed_unit_interval(mk_dev, value):
+    cfg = _on(mk_dev)
+    cfg['buffers']['store']['is_exponent'] = value
+    assert _msgs(cfg) == []
 
 
 def test_records_kept_null_is_a_baseline_not_an_error(mk_dev):

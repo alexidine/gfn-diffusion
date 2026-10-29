@@ -48,13 +48,19 @@ def marked_x(ids, dim=3):
     return torch.cat([ids, torch.zeros(ids.shape[0], dim - 1)], 1)
 
 
-def seeded(log_r, cid=None, held_out=None, tag=TAG_CHILD, n_cond=2, **kw):
-    """A store seeded with the given rows, refreshed once with log q = 0."""
+def mirror(log_r):
+    """A physical energy that orders rows as log R does: -log R."""
+    return -torch.as_tensor(log_r, dtype=torch.float32)
+
+
+def seeded(log_r, cid=None, held_out=None, tag=TAG_CHILD, n_cond=2, energy=None, **kw):
+    """A store seeded with the given rows (energy -log R unless given), refreshed once with log q = 0."""
     n = len(log_r)
     st = make(n_cond=n_cond, **kw)
     cid = torch.zeros(n, dtype=torch.int64) if cid is None else torch.as_tensor(cid)
     st.seed(cid, marked_x(range(n)), torch.tensor(log_r, dtype=torch.float32), tag,
-            torch.zeros(n, dtype=torch.bool) if held_out is None else torch.as_tensor(held_out))
+            torch.zeros(n, dtype=torch.bool) if held_out is None else torch.as_tensor(held_out),
+            energy=mirror(log_r) if energy is None else torch.as_tensor(energy, dtype=torch.float32))
     st.set_conditions(cid, cond_of(cid))
     st.refresh(zero_q, None, step=0, chunk=4)
     return st
@@ -81,29 +87,30 @@ def test_seed_puts_held_out_last_protects_everything_and_ignores_held_out_for_re
     st = make()
     held = torch.tensor([True, False, True, False, False])
     st.seed(torch.tensor([0, 0, 1, 1, 0]), marked_x(range(5)), torch.tensor([50., 1., 60., 2., 3.]),
-            torch.tensor([TAG_CHILD, TAG_ANCHOR, TAG_CHILD, TAG_CHILD, TAG_ANCHOR]), held)
+            torch.tensor([TAG_CHILD, TAG_ANCHOR, TAG_CHILD, TAG_CHILD, TAG_ANCHOR]), held, energy=mirror(torch.tensor([50., 1., 60., 2., 3.])))
     assert st.n_mle == 3 and st.n_seed == 5 and len(st) == 5
     assert st.x[:, 0].tolist() == [1., 3., 4., 0., 2.]          # stable, held-out last
     assert st.held_out.tolist() == [False, False, False, True, True]
     assert bool(st.protected.all())
     assert bool(torch.isnan(st.log_q).all()) and st.q_step.tolist() == [-1] * 5
-    assert st.best_log_r.tolist() == [3.0, 2.0]                 # 50 and 60 are held out
+    assert st.best_energy.tolist() == [-3.0, -2.0]              # 50 and 60 are held out
+    assert st.energy.tolist() == [-1., -2., -3., -50., -60.]    # energy rides with its row
 
 
 def test_seed_refuses_non_data_tags_and_a_second_seed():
     st = make()
     with pytest.raises(RowStoreError):
-        st.seed([0], marked_x([0]), [1.0], TAG_ONPOLICY, False)
-    st.seed([0], marked_x([0]), [1.0], TAG_ANCHOR, False)
+        st.seed([0], marked_x([0]), [1.0], TAG_ONPOLICY, False, energy=mirror([1.0]))
+    st.seed([0], marked_x([0]), [1.0], TAG_ANCHOR, False, energy=mirror([1.0]))
     with pytest.raises(RowStoreError):
-        st.seed([0], marked_x([1]), [1.0], TAG_ANCHOR, False)
+        st.seed([0], marked_x([1]), [1.0], TAG_ANCHOR, False, energy=mirror([1.0]))
 
 
 def test_admit_refuses_data_tags():
     st = seeded([1.0, 2.0])
     for t in DATA_TAGS:
         with pytest.raises(RowStoreError):
-            st.admit([0], marked_x([9]), [50.], [0.], None, t, 1, torch.zeros(2), None)
+            st.admit([0], marked_x([9]), [50.], [0.], None, t, 1, torch.zeros(2), None, energy=mirror([50.]))
     assert len(st) == 2
 
 
@@ -111,7 +118,7 @@ def test_unscored_and_held_out_rows_are_never_drawn_for_training():
     st = make()
     held = torch.tensor([False, False, False, True, True])
     st.seed(torch.zeros(5, dtype=torch.int64), marked_x(range(5)), torch.tensor([1., 2., 3., 40., 80.]),
-            TAG_CHILD, held)
+            TAG_CHILD, held, energy=mirror(torch.tensor([1., 2., 3., 40., 80.])))
     lv = torch.zeros(2)
     assert st.draw_tb(10, lv) is None                           # never scored: log q NaN
     st.refresh(zero_q, lv, step=3, chunk=2)
@@ -126,7 +133,7 @@ def test_unscored_and_held_out_rows_are_never_drawn_for_training():
 def test_mle_draw_is_uniform_over_data_rows_only():
     st = seeded([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], held_out=[False, False, False, False, True, True])
     st.admit([0, 0, 0], marked_x([10, 11, 12]), [50., 60., -40.], [0., 0., 0.], None,
-             TAG_ONPOLICY, 1, torch.zeros(2), None)
+             TAG_ONPOLICY, 1, torch.zeros(2), None, energy=mirror([50., 60., -40.]))
     assert len(st) == 9 and st.n_mle == 4
     idx = st.draw_mle(40000, generator=torch.Generator().manual_seed(1))
     assert bool(((st.tag[idx] == TAG_ANCHOR) | (st.tag[idx] == TAG_CHILD)).all())
@@ -159,6 +166,32 @@ def test_priority_draw_frequencies_and_is_weights_match_the_spec():
     assert stats['replay/is_ess_frac'] == pytest.approx(wn.sum() ** 2 / (N * (wn ** 2).sum()), rel=1e-9)
     assert 0.0 < stats['replay/is_ess_frac'] <= 1.0
     assert stats['replay/is_w_max_ratio'] == pytest.approx(wn.max() / wn.mean(), rel=1e-9)
+
+
+def test_is_exponent_one_reproduces_the_exact_weights_and_a_half_takes_their_square_root():
+    log_r = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]
+    q = spec_q(np.abs(log_r), 0.25, 0.1, 1.0)
+    lv = torch.zeros(2)
+    draws = {}
+    for a in (1.0, 0.5, 0.0):
+        st = seeded(log_r, is_exponent=a)
+        draws[a] = st.draw_tb(5000, lv, generator=torch.Generator().manual_seed(11))
+    idx1, w1, s1 = draws[1.0]
+    rows, q_mod = seeded(log_r).draw_probs(lv)
+    assert np.allclose(q_mod.numpy(), q, rtol=0, atol=1e-12)
+    assert torch.equal(w1, (1.0 / 6) / q_mod[idx1])                     # bit-identical to 1/(n q)
+    for a in (0.5, 0.0):
+        idx, w, s = draws[a]
+        assert torch.equal(idx, idx1)                                    # the draw itself does not move
+        assert torch.allclose(w, w1.pow(a), rtol=0, atol=1e-15)
+        wn = w.numpy()
+        assert s['replay/is_w_max_ratio'] == pytest.approx(wn.max() / wn.mean(), rel=1e-12)
+        assert s['replay/is_ess_frac'] == pytest.approx(wn.sum() ** 2 / (5000 * (wn ** 2).sum()), rel=1e-12)
+    # self-normalised as the loss does: w^0.5 / sum w^0.5
+    wn = draws[0.5][1]
+    assert torch.allclose(wn / wn.sum(), w1.sqrt() / w1.sqrt().sum(), rtol=1e-12)
+    assert torch.equal(draws[0.0][1], torch.ones(5000, dtype=draws[0.0][1].dtype))
+    assert draws[0.5][2]['replay/is_w_max_ratio'] < s1['replay/is_w_max_ratio']
 
 
 def test_floor_and_uniform_share_keep_every_drawable_row_drawable_and_bound_w():
@@ -199,7 +232,7 @@ def test_priority_follows_a_live_level_shift():
 def test_refresh_recomputes_log_q_in_chunks_and_residuals_follow_the_supplied_level():
     st = make(n_cond=3)
     cid = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0])
-    st.seed(cid, marked_x(range(10)), torch.arange(10, dtype=torch.float32), TAG_CHILD, False)
+    st.seed(cid, marked_x(range(10)), torch.arange(10, dtype=torch.float32), TAG_CHILD, False, energy=mirror(torch.arange(10, dtype=torch.float32)))
     calls = []
 
     def fn(x, c):
@@ -220,6 +253,33 @@ def test_refresh_recomputes_log_q_in_chunks_and_residuals_follow_the_supplied_le
         st.refresh(zero_q, lv, 0, chunk=0)
 
 
+def test_refresh_halves_its_chunk_on_cuda_oom_keeps_the_halved_size_and_raises_at_one_row():
+    st = make(n_cond=3)
+    cid = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0])
+    st.seed(cid, marked_x(range(10)), torch.arange(10, dtype=torch.float32), TAG_CHILD, False, energy=mirror(torch.arange(10, dtype=torch.float32)))
+    calls = []
+
+    def fits_three(x, c):
+        calls.append(x.shape[0])
+        if x.shape[0] > 3:
+            raise torch.cuda.OutOfMemoryError('test')
+        return 2.0 * x[:, 0]
+
+    out = st.refresh(fits_three, None, step=1, chunk=8)
+    assert calls == [8, 4, 2, 2, 2, 2, 2] and out['chunk'] == 2 and st.chunk_cap == 2
+    assert torch.equal(st.log_q, 2.0 * st.x[:, 0])
+    calls.clear()
+    st.refresh(fits_three, None, step=2, chunk=8)                # starts at the kept size
+    assert calls == [2] * 5
+
+    def never_fits(x, c):
+        raise torch.cuda.OutOfMemoryError('test')
+
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        st.refresh(never_fits, None, step=3, chunk=4)
+    assert st.chunk_cap == 1
+
+
 def test_touch_writes_log_q_and_refuses_a_stale_version():
     st = seeded([1.0, 2.0, 3.0])
     lv = torch.zeros(2)
@@ -227,10 +287,10 @@ def test_touch_writes_log_q_and_refuses_a_stale_version():
     st.touch(idx, st.version, torch.full((4,), 0.25), step=9)
     assert bool((st.log_q[idx] == 0.25).all()) and bool((st.q_step[idx] == 9).all())
     v0 = st.version
-    st.admit([0], marked_x([10]), [-20.0], [0.0], None, TAG_ONPOLICY, 10, lv, None)   # append only
+    st.admit([0], marked_x([10]), [-20.0], [0.0], None, TAG_ONPOLICY, 10, lv, None, energy=mirror([-20.0]))   # append only
     assert st.version == v0
     st.configure(cap_per_condition=0)
-    st.admit([0], marked_x([11]), [-30.0], [0.0], None, TAG_ONPOLICY, 11, lv, None)   # evicts row 3
+    st.admit([0], marked_x([11]), [-30.0], [0.0], None, TAG_ONPOLICY, 11, lv, None, energy=mirror([-30.0]))   # evicts row 3
     assert st.version == v0 + 1
     with pytest.raises(RowStoreError):
         st.touch(idx, v0, torch.zeros(4), step=12)
@@ -241,7 +301,7 @@ def test_evicting_only_this_calls_candidates_keeps_the_version():
     lv = torch.zeros(2)
     idx, _, _ = st.draw_tb(4, lv, generator=torch.Generator().manual_seed(4))
     v0 = st.version
-    out = st.admit([0, 0], marked_x([10, 11]), [-20.0, -30.0], [0.0, 0.0], None, TAG_ONPOLICY, 1, lv, None)
+    out = st.admit([0, 0], marked_x([10, 11]), [-20.0, -30.0], [0.0, 0.0], None, TAG_ONPOLICY, 1, lv, None, energy=mirror([-20.0, -30.0]))
     assert out['admitted'] == 2 and out['evicted_cap'] == 2 and len(st) == 3
     assert st.version == v0                                         # no stored row moved
     st.touch(idx, v0, torch.zeros(4), step=2)
@@ -256,23 +316,64 @@ def test_admission_bar_record_strictness_ties_floor_and_non_finite():
     log_q = torch.tensor([0.0, 0.0, 0.0, 3.5, float('nan'), 8.5, 0.0, 2.5, 2.8])
     cid = torch.tensor([0, 0, 0, 0, 0, 0, 0, 1, 1])
     ok = torch.tensor([True, True, True, True, True, True, False, True, True])
-    out = st.admit(cid, marked_x(range(100, 109)), log_r, log_q, ok, TAG_ONPOLICY, 1, lv, cond_of(cid))
+    out = st.admit(cid, marked_x(range(100, 109)), log_r, log_q, ok, TAG_ONPOLICY, 1, lv, cond_of(cid), energy=mirror(log_r))
     added = {int(v): bool(p) for v, p in zip(st.x[st.n_seed:, 0].tolist(), st.protected[st.n_seed:])}
     # 100: |r| 0.5 < bar, no record -> out; 101: |r| 2 -> in; 102: log R 5 == best, |r| 5 -> in, not a record;
     # 103: |r| 0.5, 4 < best -> out; 104: log q NaN -> out; 105: record (9 > 5, finite) with |r| 0.5 -> in, protected;
     # 106: 9.5 fails the floor -> out and not a record; 107/108: tie at 3 > 1 for c1 -> only 107 is the record
     assert added == {101: False, 102: False, 105: True, 107: True}
     assert out['admitted'] == 4 and out['records'] == 2 and out['rejected_floor'] == 1
-    assert st.best_log_r.tolist() == [9.0, 3.0]
-    st.admit([0], marked_x([200]), [9.0], [8.5], None, TAG_ONPOLICY, 2, lv, None)   # equal, not strict
-    assert len(st) == 6 and st.best_log_r.tolist() == [9.0, 3.0]
+    assert st.best_energy.tolist() == [-9.0, -3.0]
+    st.admit([0], marked_x([200]), [9.0], [8.5], None, TAG_ONPOLICY, 2, lv, None, energy=mirror([9.0]))   # equal, not strict
+    assert len(st) == 6 and st.best_energy.tolist() == [-9.0, -3.0]
 
 
 def test_admission_bar_is_inclusive():
     st = seeded([5.0, 1.0], cid=[0, 1], bar=1.0)
     out = st.admit([0, 0], marked_x([100, 101]), [1.0, 0.75], [0.0, 0.0], None, TAG_ONPOLICY, 1,
-                   torch.zeros(2), None)
+                   torch.zeros(2), None, energy=mirror([1.0, 0.75]))
     assert out['admitted'] == 1 and out['records'] == 0 and st.x[-1, 0] == 100.0   # |r| == bar is admitted
+
+
+def test_records_are_judged_on_physical_energy_not_log_r():
+    # seed: c0 log R 5 at energy -10; c1 log R 1 at energy -4
+    st = seeded([5.0, 1.0], cid=[0, 1], energy=[-10.0, -4.0], bar=100.0)
+    lv = torch.zeros(2)
+    # 100: lower log R than the seed but lower energy -> the c0 record; 101: higher log R, higher energy -> not;
+    # 102: lowest energy of c1 but non-finite -> never a record; 103: c1 finite energy -4 == best, not strict
+    cid = torch.tensor([0, 0, 1, 1])
+    log_r = torch.tensor([-3.0, 40.0, 2.0, 30.0])
+    energy = torch.tensor([-11.0, -9.0, float('nan'), -4.0])
+    out = st.admit(cid, marked_x(range(100, 104)), log_r, torch.zeros(4), None, TAG_ONPOLICY, 1, lv, None,
+                   energy=energy)
+    assert out['records'] == 1 and out['admitted'] == 1
+    assert st.x[st.n_seed:, 0].tolist() == [100.0] and bool(st.protected[-1])
+    assert st.energy[-1] == -11.0 and st.log_r[-1] == -3.0
+    assert st.best_energy.tolist() == [-11.0, -4.0]
+    st.admit([1], marked_x([104]), [-50.0], [0.0], None, TAG_ONPOLICY, 2, lv, None, energy=[float('inf')])
+    assert st.best_energy.tolist() == [-11.0, -4.0] and len(st) == 3
+    st.admit([1], marked_x([105]), [-50.0], [0.0], None, TAG_ONPOLICY, 3, lv, None, energy=[-float('inf')])
+    assert st.best_energy.tolist() == [-11.0, -4.0] and len(st) == 3
+
+
+def test_record_energy_ties_go_to_the_lowest_index_and_the_floor_blocks_a_record():
+    st = seeded([0.0], n_cond=1, energy=[0.0], bar=100.0)
+    ok = torch.tensor([False, True, True])
+    out = st.admit([0, 0, 0], marked_x([10, 11, 12]), [9.0, 1.0, 2.0], [0.0, 0.0, 0.0], ok, TAG_ONPOLICY, 1,
+                   torch.zeros(1), None, energy=[-7.0, -5.0, -5.0])
+    # 10 has the lowest energy but fails ok; 11 and 12 tie at -5 -> 11
+    assert out['records'] == 1 and out['rejected_floor'] == 1 and st.x[-1, 0] == 11.0
+    assert st.best_energy.tolist() == [-5.0]
+
+
+def test_demotion_drops_the_highest_energy_record():
+    st = seeded([0.0], n_cond=1, energy=[0.0], records_kept=2, cap_per_condition=0, bar=100.0)
+    lv = torch.zeros(1)
+    for k, e in enumerate([-1.0, -2.0, -3.0]):          # each a record; log R falls as energy falls
+        st.admit([0], marked_x([10 + k]), [-10.0 * (k + 1)], [0.0], None, TAG_ONPOLICY, k, lv, None, energy=[e])
+    # three records, two kept: the -1 record (highest energy, lowest index) lost protection and the cap took it
+    assert st.x[st.n_seed:, 0].tolist() == [11., 12.] and st.energy[st.n_seed:].tolist() == [-2.0, -3.0]
+    assert bool(st.protected.all())
 
 
 def test_condition_mismatch_raises_before_any_row_moves():
@@ -283,7 +384,7 @@ def test_condition_mismatch_raises_before_any_row_moves():
         st.set_conditions([1, 1], torch.tensor([[1.0, 2.0], [1.0, 2.5]]))
     with pytest.raises(RowStoreError):
         st.admit([0], marked_x([5]), [50.], [0.], None, TAG_ONPOLICY, 1, torch.zeros(2),
-                 torch.tensor([[3.0, 3.0]]))
+                 torch.tensor([[3.0, 3.0]]), energy=mirror([50.]))
     assert len(st) == 2
 
 
@@ -291,10 +392,10 @@ def test_records_survive_a_zero_cap_and_demotion_drops_the_oldest():
     st = seeded([1.0, 1.5], records_kept=2, cap_per_condition=0, bar=0.0)
     lv = torch.zeros(2)
     for k, lr in enumerate([6.0, 7.0]):
-        out = st.admit([0, 0], marked_x([10 + k, 20 + k]), [lr, -5.0], [0.0, 0.0], None, TAG_ONPOLICY, k, lv, None)
+        out = st.admit([0, 0], marked_x([10 + k, 20 + k]), [lr, -5.0], [0.0, 0.0], None, TAG_ONPOLICY, k, lv, None, energy=mirror([lr, -5.0]))
         assert out['records'] == 1 and out['evicted_cap'] == 1      # the non-record goes, the record stays
     assert st.x[st.n_seed:, 0].tolist() == [10., 11.] and bool(st.protected.all())
-    out = st.admit([0], marked_x([12]), [8.0], [0.0], None, TAG_ONPOLICY, 2, lv, None)
+    out = st.admit([0], marked_x([12]), [8.0], [0.0], None, TAG_ONPOLICY, 2, lv, None, energy=mirror([8.0]))
     assert out['demoted'] == 1 and out['evicted_cap'] == 1         # record 6 lost protection, then the cap took it
     assert st.x[st.n_seed:, 0].tolist() == [11., 12.]
     assert bool(st.protected[:st.n_seed].all())                     # data rows are never demoted
@@ -314,7 +415,7 @@ def test_caps_hold_and_admission_never_stalls_when_caps_sum_past_max_rows():
         if k % 7 == 0:
             log_r[0] = 100.0 + k                                    # a record now and then
         out = st.admit(cid, marked_x(torch.arange(20) + 1000 * k), log_r, torch.zeros(20), None,
-                       TAG_ONPOLICY, k, lv, None, generator=g)
+                       TAG_ONPOLICY, k, lv, None, generator=g, energy=mirror(log_r))
         assert out['admitted'] >= 19
         unprot = (~st.protected) & (~st.held_out)
         per = torch.bincount(st.cid[unprot], minlength=n_cond)
@@ -328,7 +429,7 @@ def test_global_pass_runs_after_the_per_condition_pass():
     st = seeded([100.0, 100.0], cid=[0, 1], cap_per_condition=3, max_rows=4, bar=0.0)
     cid = torch.tensor([0, 0, 0, 0, 1, 1])
     out = st.admit(cid, marked_x(range(10, 16)), -torch.arange(1.0, 7.0), torch.zeros(6), None,
-                   TAG_ONPOLICY, 1, torch.zeros(2), None, generator=torch.Generator().manual_seed(6))
+                   TAG_ONPOLICY, 1, torch.zeros(2), None, generator=torch.Generator().manual_seed(6), energy=mirror(-torch.arange(1.0, 7.0)))
     assert out['admitted'] == 6 and out['evicted_cap'] == 1 and out['evicted_global'] == 1
     assert len(st) == 2 + 4
 
@@ -343,7 +444,7 @@ def test_eviction_frequency_is_proportional_to_inverse_residual_plus_eps():
         st = seeded([100.0], n_cond=1, cap_per_condition=3, bar=0.0, eps=eps)
         st.admit(torch.zeros(4, dtype=torch.int64), marked_x(range(4)), torch.tensor(-r, dtype=torch.float32),
                  torch.zeros(4), None, TAG_ONPOLICY, 1, torch.zeros(1), None,
-                 generator=torch.Generator().manual_seed(1000 + t))
+                 generator=torch.Generator().manual_seed(1000 + t), energy=mirror(torch.tensor(-r, dtype=torch.float32)))
         kept = set(st.x[st.n_seed:, 0].long().tolist())
         gone = ({0, 1, 2, 3} - kept)
         assert len(gone) == 1
@@ -357,11 +458,11 @@ def test_stats_on_a_hand_built_store():
     st = make(n_cond=2, bar=1.2, cap_per_condition=1)
     st.seed(torch.tensor([0, 0, 1, 1]), marked_x(range(4)), torch.tensor([3.0, 1.0, 2.0, 10.0]),
             torch.tensor([TAG_ANCHOR, TAG_ANCHOR, TAG_CHILD, TAG_CHILD]),
-            torch.tensor([False, False, False, True]))
+            torch.tensor([False, False, False, True]), energy=mirror(torch.tensor([3.0, 1.0, 2.0, 10.0])))
     st.refresh(zero_q, None, step=0, chunk=8)
     lv = torch.tensor([0.0, 0.5])
     st.admit([0, 0, 0], marked_x([10, 11, 12]), [4.0, 0.2, -2.0], [0.0, 0.0, 0.0], None,
-             TAG_ONPOLICY, 1, lv, None)
+             TAG_ONPOLICY, 1, lv, None, energy=mirror([4.0, 0.2, -2.0]))
     s = st.stats(lv)
     expect = {
         'store/rows': 6, 'store/rows_anchor': 2, 'store/rows_child': 2, 'store/rows_onpolicy': 2,
@@ -377,6 +478,10 @@ def test_stats_on_a_hand_built_store():
         'store/protected_above_bar': 3, 'store/protected_above_bar_conds': 2,
         'store/protected_above_bar_cond_max': 2,
         'store/refresh_nonfinite': 0,
+        # energies (-log R here): seed best c0 -3, c1 -2 (held-out -10 excluded); the c0 record at -4
+        'store/best_energy_min': -4.0, 'store/best_energy_med': -4.0, 'store/seed_best_energy_min': -3.0,
+        'store/record_conds': 1, 'store/record_gain_med': 1.0,
+        'store/records_energy_min': -4.0, 'store/records_energy_med': -4.0,
     }
     for k, v in expect.items():
         assert s[k] == pytest.approx(v), k
@@ -387,15 +492,26 @@ def test_stats_on_a_hand_built_store():
     assert s2['x/admitted'] == 0 and math.isnan(s2['x/admitted_resid_med'])   # window drained
 
 
+def test_energy_stats_count_a_record_on_a_condition_with_no_seed_rows_but_take_no_gain_from_it():
+    st = seeded([2.0], cid=[0], n_cond=2, energy=[-2.0], bar=100.0)
+    lv = torch.zeros(2)
+    st.admit([1], marked_x([10]), [1.0], [0.0], None, TAG_ONPOLICY, 1, lv, cond_of([1]), energy=[-7.0])
+    s = st.stats(lv)
+    assert st.best_energy.tolist() == [-2.0, -7.0]
+    assert s['store/record_conds'] == 1 and math.isnan(s['store/record_gain_med'])
+    assert s['store/seed_best_energy_min'] == -2.0 and s['store/best_energy_min'] == -7.0
+    assert s['store/records_energy_min'] == -7.0
+
+
 def test_stats_report_evicted_residuals_and_ages_in_evals():
     st = seeded([100.0], n_cond=1, bar=0.0)                     # refreshed once: eval_idx 1
     lv = torch.zeros(1)
-    st.admit([0, 0], marked_x([10, 11]), [-3.0, -5.0], [0.0, 0.0], None, TAG_GENERATED, 1, lv, None)
+    st.admit([0, 0], marked_x([10, 11]), [-3.0, -5.0], [0.0, 0.0], None, TAG_GENERATED, 1, lv, None, energy=mirror([-3.0, -5.0]))
     st.refresh(zero_q, lv, 2, 8)
     st.refresh(zero_q, lv, 3, 8)                                # eval_idx 3
     st.stats(lv)
     st.configure(cap_per_condition=0)
-    st.admit([0], marked_x([12]), [-7.0], [0.0], None, TAG_ONPOLICY, 4, lv, None)
+    st.admit([0], marked_x([12]), [-7.0], [0.0], None, TAG_ONPOLICY, 4, lv, None, energy=mirror([-7.0]))
     s = st.stats(lv)
     assert s['store/evicted_cap'] == 3 and s['store/admitted'] == 1
     assert s['store/evicted_resid_med'] == 5.0                  # lower median of 3, 5, 7
@@ -410,7 +526,9 @@ def test_stats_report_evicted_residuals_and_ages_in_evals():
                                  dict(max_rows=-1), dict(records_kept=0), dict(nonsense=1),
                                  dict(kappa=math.nan), dict(bar=math.nan), dict(max_rows=math.inf),
                                  dict(cap_per_condition=2.5), dict(records_kept=True),
-                                 dict(admit_reward_min=math.nan), dict(uniform_frac='0.1')])
+                                 dict(admit_reward_min=math.nan), dict(uniform_frac='0.1'),
+                                 dict(is_exponent=1.5), dict(is_exponent=-0.1), dict(is_exponent=math.nan),
+                                 dict(is_exponent=None), dict(is_exponent=True)])
 def test_configure_refuses_malformed_settings(bad):
     st = make()
     with pytest.raises(RowStoreError):
@@ -422,7 +540,7 @@ def test_state_dict_round_trip():
     st = seeded([5.0, 1.0, 2.0, 30.0], cid=[0, 1, 1, 0], held_out=[False, False, False, True])
     lv = torch.tensor([0.0, 0.25])
     st.admit([0, 1, 1], marked_x([10, 11, 12]), [9.0, -3.0, 0.1], [0.0, 0.0, 0.0], None,
-             TAG_ONPOLICY, 4, lv, cond_of([0, 1, 1]))
+             TAG_ONPOLICY, 4, lv, cond_of([0, 1, 1]), energy=mirror([9.0, -3.0, 0.1]))
     st.refresh(lambda x, c: 0.1 * x[:, 0], lv, 5, 3)
     buf = io.BytesIO()
     torch.save(st.state_dict(stamp={'prior': 'abc'}), buf)
@@ -431,17 +549,18 @@ def test_state_dict_round_trip():
     assert state['stamp'] == {'prior': 'abc'} and state['format_version'] == FORMAT_VERSION
     back = RowStore.from_state_dict(state, 'cpu', **SET)
     assert len(back) == len(st)
-    for c in ('cid', 'x', 'log_r', 'log_q', 'q_step', 'tag', 'protected', 'held_out', 'born_eval'):
+    for c in ('cid', 'x', 'log_r', 'energy', 'log_q', 'q_step', 'tag', 'protected', 'held_out', 'born_eval'):
         a, b = getattr(st, c), getattr(back, c)
         assert a.dtype == b.dtype, c
         assert torch.equal(torch.nan_to_num(a.float(), nan=-999.0), torch.nan_to_num(b.float(), nan=-999.0)), c
     assert torch.equal(torch.nan_to_num(st.cond_table, nan=-1.0), torch.nan_to_num(back.cond_table, nan=-1.0))
-    assert torch.equal(st.best_log_r, back.best_log_r)
+    assert torch.equal(st.best_energy, back.best_energy)
     assert (back.n_mle, back.n_seed, back.eval_idx, back.version) == (st.n_mle, st.n_seed, st.eval_idx, st.version)
     g1, g2 = torch.Generator().manual_seed(7), torch.Generator().manual_seed(7)
     a, b = st.draw_tb(64, lv, generator=g1), back.draw_tb(64, lv, generator=g2)
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     back.touch(b[0], st.version, torch.zeros(64), 6)
+    assert FORMAT_VERSION == 2 and 'best_energy' in state and 'energy' in state['columns']
     state['format_version'] = FORMAT_VERSION + 1
     with pytest.raises(RowStoreError):
         RowStore.from_state_dict(state, 'cpu', **SET)

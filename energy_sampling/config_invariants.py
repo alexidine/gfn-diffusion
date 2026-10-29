@@ -1336,7 +1336,8 @@ def nf_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
 #: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
 #: An absent key reads its default; an unknown key is refused.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
-                          eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, refresh_chunk=65536)
+                          eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, is_exponent=1.0,
+                          refresh_chunk=8192)
 #: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
 ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
 
@@ -1432,7 +1433,7 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
 
     if not (_real(s['kappa']) and s['kappa'] >= 0):
         err(f"buffers.store.kappa must be a number >= 0, got {s['kappa']!r}")
-    for k in ('floor_frac', 'uniform_frac'):
+    for k in ('floor_frac', 'uniform_frac', 'is_exponent'):
         if not (_real(s[k]) and 0 <= s[k] <= 1):
             err(f"buffers.store.{k} must lie in [0, 1], got {s[k]!r}")
     if not (_real(s['bar']) and s['bar'] >= 0):
