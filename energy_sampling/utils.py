@@ -1746,7 +1746,7 @@ def atomic_save(state_dict, path):
         torch.save(state_dict, tmp_path)
         os.replace(tmp_path, path)
     except Exception as e:
-        print("Save failed to", path)
+        print(f"Save failed to {path}: {type(e).__name__}: {e}")
 
 
 def trajectory_T(args):

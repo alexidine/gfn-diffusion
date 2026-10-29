@@ -445,7 +445,9 @@ class Checkpointer:
         """Write the buffer sidecar. Called only at eval cadence -- see BUFFER_SUFFIX."""
         if self.read_only:
             return
-        atomic_save(self.buffer_state(), self.buffers_path(tag))
+        path = self.buffers_path(tag)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        atomic_save(self.buffer_state(), path)
 
     def restore_buffers(self, state: dict, source: str):
         m = self.modeller
@@ -584,6 +586,7 @@ class Checkpointer:
             # the conformer route's EMA copy (ema_model, aliased to gfn_model under a null ema_decay)
             checkpoint['model_eval'] = m.ema_model.state_dict()
         path = self.path_for(tag)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         atomic_save(checkpoint, path)
         if with_buffers:
             self.save_buffers(tag)

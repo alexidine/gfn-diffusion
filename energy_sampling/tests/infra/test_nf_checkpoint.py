@@ -200,3 +200,11 @@ def test_resolution_reads_the_live_rows_as_the_gfn_does():
     assert resolve_policy_entry(entry, cfg)['nf']['block_orders'] == Z1_ORDER
     assert resolve_policy_entry(entry, dict(cfg, hold_dead_latent_rows=False))['nf']['block_orders'] is None
     assert resolve_policy_entry(None, cfg) is None and resolve_policy_entry({'kind': 'sde'}, cfg) == {'kind': 'sde'}
+
+
+def test_save_creates_a_missing_checkpoints_dir(tmp_path):
+    """A writable run pointed at a directory that does not exist yet writes its checkpoint there (atomic_save
+    swallows a write error, so a missing directory used to leave the run with no checkpoint and no rewind target)."""
+    saved = _fresh_run(tmp_path / 'not' / 'yet', False)
+    saved.checkpointer.save('running')
+    assert (tmp_path / 'not' / 'yet' / 'nf_ck_probe-abc123_running.pt').is_file()

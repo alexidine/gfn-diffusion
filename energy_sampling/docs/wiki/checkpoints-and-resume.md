@@ -27,7 +27,7 @@ Checkpoints carry position and the config carries behaviour. A checkpoint record
 
 ## The files a run writes
 
-Every path is `{checkpoints_dir}/{run_name}_{problem_slug}_{tag}.pt`, the slug being a human-readable tag that is never parsed back (`checkpointing.py::Checkpointer.path_for`, `utils.py::problem_slug`).
+Every path is `{checkpoints_dir}/{run_name}_{problem_slug}_{tag}.pt`, the slug being a human-readable tag that is never parsed back (`checkpointing.py::Checkpointer.path_for`, `utils.py::problem_slug`). `Checkpointer.save` and `.save_buffers` create the directory before writing; `utils.py::atomic_save` catches any write error and prints the path and the error, and the run continues without that file.
 
 - **`running`**: every 50 steps, unconditionally. After an eval-time transition that entered a stage, `protocol.py::StageProtocol._persist_entered_stage` also rewrites the rolling sidecar and then `running`.
 - **`best`**: hardlinked off `running` when the combo-loss record sets a new minimum; `utils.py::atomic_save` swaps the directory entry, so the link freezes those bytes.
