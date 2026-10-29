@@ -935,9 +935,12 @@ protocols:
         # P_B(tau|x) p_lambda(x|c): c enters through the terminal only, so the
         # frozen, condition-blind bridge is the natural backward kernel and P_F
         # learns the conditioning onto it.
-        # No bootstrap_z: emp_z on the Z sidecar trains Z(c) on every rollout,
-        # from the first.
-        on_enter: [ 'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb' ]
+        # bootstrap_z: fits the Z(c) head to condition_log_z's per-condition
+        # ema_logw, which train_prior fed from the data rows (log R - log q; no
+        # rollouts, no energy calls). The head is the Z a condition below
+        # min_visits reads (untrusted_z: head); emp_z on the Z sidecar trains
+        # it from the first rollout on.
+        on_enter: [ 'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb', 'bootstrap_z' ]
         # fwd HAS NO FRAC: its loss enters only as the Z sidecar below, outside
         # the frac mix. min_fracs.fwd 0 holds it at exactly 0 (the
         # controller.min_mode_frac fallback would lift it to 0.001 on the first
