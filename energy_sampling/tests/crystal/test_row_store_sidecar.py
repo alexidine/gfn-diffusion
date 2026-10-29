@@ -105,10 +105,10 @@ def test_a_mismatched_stamp_reseeds(capsys):
 def test_settings_come_from_the_config_not_the_sidecar():
     src = _modeller({'prior': 'a'})
     src.row_store = _store()
-    dst = _modeller({'prior': 'a'}, bar=3.5)
+    dst = _modeller({'prior': 'a'}, bar=3.5, is_exponent=0.5)
     Checkpointer(dst).restore_buffers(Checkpointer(src).buffer_state(), 'x_buffers.pt')
     dst.init_row_store()
-    assert dst.row_store.bar == 3.5 and dst.row_store.is_exponent == 0.5      # mk_dev's is_exponent, not the default
+    assert dst.row_store.bar == 3.5 and dst.row_store.is_exponent == 0.5      # the config's, not the sidecar store's 1.0
 
 
 def test_seeding_is_handed_every_store_setting_from_the_config():

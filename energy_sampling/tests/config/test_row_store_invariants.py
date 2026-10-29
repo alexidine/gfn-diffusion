@@ -38,7 +38,7 @@ def _msgs(cfg, severity=ci.ERROR):
 
 
 #: the store keys whose mk_dev value is not the code default
-MK_DEV_OVERRIDES = {'is_exponent': 0.5}
+MK_DEV_OVERRIDES = {'uniform_frac': 0.5}
 
 
 def test_mk_dev_carries_every_store_key_with_the_code_default(mk_dev):

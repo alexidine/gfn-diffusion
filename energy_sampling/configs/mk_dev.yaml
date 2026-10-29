@@ -1165,8 +1165,8 @@ buffers:
     records_kept: 8           # most protected records per condition; the highest-energy record past it loses protection. null = no limit
     kappa: 1.0                # replay draw priority p ~ max(|r|, floor)^kappa
     floor_frac: 0.25          # floor = floor_frac x the median |r| over drawable rows
-    uniform_frac: 0.1         # uniform share of the replay draw measure; IS weight 1/(n q) <= 1/uniform_frac
-    is_exponent: 0.5          # replay IS weight w = (1/(n q))^is_exponent, then self-normalised in the loss; 1 = exact, 0 = unweighted. Code default 1.0
+    uniform_frac: 0.5         # uniform share of the replay draw measure; IS weight 1/(n q) <= 1/uniform_frac. Code default 0.1
+    is_exponent: 1.0          # replay IS weight w = (1/(n q))^is_exponent, then self-normalised in the loss; 1 = exact, 0 = unweighted
     refresh_chunk: 8192       # rows per log q call in the eval refresh; a CUDA OOM halves it for the rest of the run
   # todo my general thought on these buffers is we need a simple, few-point, global theory of dataset management. It should simplify all this organization I imagine
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
