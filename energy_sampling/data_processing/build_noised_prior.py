@@ -185,6 +185,16 @@ def choose_images(batch, rng):
     return int(face.sum())
 
 
+def refuse_unscored_chart(run_args):
+    """score() hands the analysis each row's trainer latent (latent_params) as x, which a run on
+    energy_config.crystal_coordinates 'fd' would decode as an FD chart row: every row mis-built (seen 2026-10-30:
+    packing coefficients 2.6-14). Build on the latent chart; the trainer's FD loader re-describes the rows."""
+    chart = getattr(run_args.energy_config, 'crystal_coordinates', 'latent')
+    if chart != 'latent':
+        raise SystemExit(f"build_noised_prior scores rows on the latent chart only; got energy_config.crystal_coordinates "
+                         f"{chart!r}. Build without it: an FD run loads a latent-scored build")
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     from inn_modeller import apply_overrides
@@ -198,6 +208,7 @@ def main(argv=None):
     run_args = get_train_args(['--config', args.config])
     apply_overrides(run_args, args.overrides)
     T = float(run_args.energy_config.temperature)
+    refuse_unscored_chart(run_args)
     ef = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
 
     src = torch.load(args.source, weights_only=False, map_location='cpu')

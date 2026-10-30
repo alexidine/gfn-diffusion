@@ -161,3 +161,13 @@ def test_harvest_keeps_high_error_rows_and_records_and_drops_the_rest():
     keep = NP.harvest_mask(resid, log_r, 2.0, 1.0, floor)
     assert keep.tolist() == [False, True, True, False, False]
     assert NP.harvest_mask(resid, log_r, 2.0, 1.0).tolist() == [False, True, False, False, False]
+
+
+def test_the_builder_refuses_a_non_latent_chart():
+    """build_noised_prior.score feeds latent_params as x; on the FD chart that would mis-build every row."""
+    from types import SimpleNamespace
+    from energy_sampling.data_processing.build_noised_prior import refuse_unscored_chart
+    refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace(crystal_coordinates='latent')))
+    refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace()))
+    with pytest.raises(SystemExit, match="crystal_coordinates 'fd'"):
+        refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace(crystal_coordinates='fd')))
