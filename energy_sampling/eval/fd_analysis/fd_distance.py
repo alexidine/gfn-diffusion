@@ -173,9 +173,11 @@ class FDMetric:
 
     def pairs(self, A, ia, B, ib, chunk=4096, parts=False):
         """d for pairs (A[ia[k]], B[ib[k]]); with parts also (D_cell, D_cent, D_rot, element) at the minimum."""
-        ia, ib = torch.as_tensor(ia, dtype=torch.long), torch.as_tensor(ib, dtype=torch.long)
-        out = torch.empty(len(ia), dtype=F64)
-        P = torch.empty(len(ia), 4, dtype=F64) if parts else None
+        dev, dt = A['cell'].device, A['cell'].dtype
+        ia = torch.as_tensor(ia, dtype=torch.long, device=dev)
+        ib = torch.as_tensor(ib, dtype=torch.long, device=dev)
+        out = torch.empty(len(ia), dtype=dt, device=dev)
+        P = torch.empty(len(ia), 4, dtype=dt, device=dev) if parts else None
         for lo in range(0, len(ia), chunk):
             a, b = ia[lo:lo + chunk], ib[lo:lo + chunk]
             c2 = self.cell2(A['cell'][a], B['cell'][b])
@@ -185,8 +187,8 @@ class FDMetric:
             v, k = tot.min(1)
             out[lo:lo + chunk] = v.sqrt()
             if parts:
-                r = torch.arange(len(a))
-                P[lo:lo + chunk] = torch.stack([c2.sqrt(), ce[r, k], self.rg * th[r, k], k.to(F64)], 1)
+                r = torch.arange(len(a), device=dev)
+                P[lo:lo + chunk] = torch.stack([c2.sqrt(), ce[r, k], self.rg * th[r, k], k.to(dt)], 1)
         return (out, P) if parts else out
 
     def lower_bound(self, A, ia, B, ib):
@@ -229,6 +231,176 @@ class FDMetric:
             ex[cand] = True
             exact[rows] = ex.reshape(len(rows), n)
         return D, exact
+
+
+def _setting_candidates(sg, max_entry=2):
+    """Integer det +1 matrices with entries in [-max_entry, max_entry], identity first, whose rotational action maps
+    the point operations of SYM_OPS[sg] onto themselves (N^-1 W N in the set): the candidates for ``setting_shift``.
+
+    A setting group of sg 3-15 is a proper subgroup of GL(3, Z), and its cell domain's faces can be glued by matrices
+    with an entry of 2 (P2_1/c: c -> c + 2a keeps the c glide, c -> c + a does not), which entries in {-1, 0, 1} miss.
+    Triclinic groups take every unimodular matrix, and the Niggli faces are glued within {-1, 0, 1}."""
+    from mxtaltools.crystal_search.standardize import _ops
+    r = np.arange(-max_entry, max_entry + 1)
+    allm = np.array(np.meshgrid(*[r] * 9, indexing='ij')).reshape(9, -1).T.reshape(-1, 3, 3)
+    allm = allm[np.round(np.linalg.det(allm.astype(float))).astype(np.int64) == 1]
+    W = np.round(_ops(sg)[0]).astype(np.int64)
+    Wset = {w.tobytes() for w in W}
+    keep = np.ones(len(allm), dtype=bool)
+    inv = np.round(np.linalg.inv(allm.astype(float))).astype(np.int64)
+    for w in np.unique(W, axis=0):
+        conj = inv @ w[None] @ allm
+        keep &= np.array([c.tobytes() in Wset for c in conj])
+    m = allm[keep]
+    eye = np.eye(3, dtype=np.int64)
+    return np.concatenate([eye[None], m[~(m == eye).all(axis=(1, 2))]])
+
+
+class GluedFDMetric(FDMetric):
+    """``FDMetric`` with the faces of the cell domain glued (sg 1-15): d(A, B) is also minimised over B's near-minimal
+    bases, so two crystals on opposite sides of a reduction face are as close as their atoms are.
+
+    The cell domain's faces are glued by lattice basis changes N (integer, det +1, in the space group's setting group).
+    Near a face, the reduced basis of a crystal is one of several bases of nearly the same total edge length, and a
+    nearby crystal reduces to another of them. So each crystal B is expanded into its alternatives: every N of
+    ``crystal_fd.ops._neighbourhood`` (entries in {-1, 0, 1}, det +1, 3480) for sg 1-2, of ``_setting_candidates``
+    (entries in {-2, ..., 2}) for sg 3-15 -- the setting group's only, with its origin shift -- whose basis has
+    a + b + c within ``margin`` A of the reduced one, applied jointly to cell, centre and
+    orientation (``ops.change_basis``); the identity is always one. d(A, B) = min over B's alternatives of FDMetric's
+    d(A, alternative). One side suffices: if A is near B, some basis of B is near A's reduced basis, and its edge sum
+    is within O(d) of B's minimum.
+
+    Exactness is local, a working assumption to be checked empirically: the minimum is the quotient distance for
+    pairs whose nearest images lie within the expanded set -- lattice shifts in {-1, 0, 1}^3, Gamma+ elements, and
+    basis changes of the candidate set within ``margin``. (With {-1, 0, 1} only on sg 14, five NEHZOR pairs that
+    COMPACK matches at 0.02-0.09 A sat at 2.5-3.5 A: their cells lie on the face |c cos beta| = a, glued by
+    c -> c + 2a; 2026-10-28.) For pairs farther apart it is an upper bound. sg >= 16
+    (snapped cells, canonical axis order) gets the identity only: axis-order faces are not glued here.
+
+    ``device``: tensors live there; CUDA runs float32 (distances to ~1e-5 A), CPU float64.
+    """
+
+    def __init__(self, sg, rg, margin=1.0, device='cpu'):
+        super().__init__(sg, rg)
+        self.margin = float(margin)
+        self.device = torch.device(device)
+        self.dtype = torch.float32 if self.device.type == 'cuda' else F64
+        from mxtaltools.crystal_fd import ops
+        from mxtaltools.crystal_search.standardize import setting_shift
+        if sg <= 15:
+            Ns, ss = [], []
+            for N in (ops._neighbourhood().numpy() if sg <= 2 else _setting_candidates(sg)):
+                o = setting_shift(N, sg)
+                if o is not None:
+                    Ns.append(N)
+                    ss.append(o)
+            self.N = torch.as_tensor(np.stack(Ns), dtype=F64)
+            self.s = torch.as_tensor(np.stack(ss), dtype=F64)
+        else:
+            self.N = torch.eye(3, dtype=F64)[None]
+            self.s = torch.zeros(1, 3, dtype=F64)
+        if not torch.equal(self.N[0], torch.eye(3, dtype=F64)):
+            raise RuntimeError('the identity must be the first basis change')
+        self.W, self.w, self.n27 = (x.to(self.device, self.dtype) for x in (self.W, self.w, self.n27))
+
+    def alternatives(self, can, chunk=2048):
+        """B's near-minimal descriptions: dict(cell, t, R, h, owner [K], ptr [n + 1]) with rows ptr[j]:ptr[j+1] the
+        alternatives of crystal j, its own description first."""
+        from mxtaltools.crystal_fd import ops
+        from mxtaltools.crystal_fd.description import CrystalDescription
+        cell = can['cell'].to(F64)
+        T = ops.cell_matrices(cell)
+        owner, which = [], []
+        for lo in range(0, len(cell), chunk):
+            Tb = T[lo:lo + chunk]
+            L = (Tb[:, None] @ self.N[None]).norm(dim=2).sum(-1)  # [b, K] a + b + c of each basis
+            keep = L <= L[:, :1] + self.margin
+            r, k = torch.nonzero(keep, as_tuple=True)
+            owner.append(r + lo)
+            which.append(k)
+        owner, which = torch.cat(owner), torch.cat(which)
+        order = torch.argsort(owner * len(self.N) + which)  # grouped by owner, identity first
+        owner, which = owner[order], which[order]
+        h = can['h'] if 'h' in can else torch.ones(len(cell), dtype=torch.long)
+        base = CrystalDescription.from_parts(self.sg, cell[owner], can['t'].to(F64)[owner], can['R'].to(F64)[owner],
+                                             h[owner])
+        alt = ops.change_basis(base, self.N[which], self.s[which])
+        counts = torch.bincount(owner, minlength=len(cell))
+        ptr = torch.zeros(len(cell) + 1, dtype=torch.long)
+        ptr[1:] = torch.cumsum(counts, 0)
+        return dict(cell=alt.cell.double(), t=alt.t[:, 0].double(), R=alt.R[:, 0].double(), h=alt.h[:, 0],
+                    owner=owner, ptr=ptr)
+
+    def prepare(self, can):
+        P = super().prepare(can)  # float64 on the CPU (crystal_fd's frame helpers)
+        out = {k: v.to(self.device, self.dtype) for k, v in P.items()}
+        for k in ('owner', 'ptr'):
+            if k in can:
+                out[k] = can[k].to(self.device)
+        return out
+
+    def prepare_glued(self, can):
+        """(A, Balt): the crystals prepared as themselves (the A side) and with their alternatives (the B side)."""
+        return self.prepare(can), self.prepare(self.alternatives(can))
+
+    def _expand(self, B, ib):
+        """Pair index -> alternative rows of B: (rep [E], alt [E]) over all alternatives of every ib."""
+        ptr = B['ptr']
+        start, cnt = ptr[ib], ptr[ib + 1] - ptr[ib]
+        rep = torch.repeat_interleave(torch.arange(len(ib), device=ib.device), cnt)
+        first = torch.repeat_interleave(torch.cumsum(cnt, 0) - cnt, cnt)
+        alt = torch.repeat_interleave(start, cnt) + torch.arange(len(rep), device=ib.device) - first
+        return rep, alt
+
+    def distance(self, P, ia, ib, cut=None, chunk=8192):
+        """Symmetric glued distance between crystals ia[k] and ib[k] of one prepared set P = ``prepare_glued(can)``:
+        the smaller of the two one-sided minima (each expands one side's bases; the two differ by up to ~0.03 A on
+        MIPCAS through the mean-cell centre term). With ``cut``, pairs farther than cut come back as inf."""
+        A, B = P
+        d1 = self.pairs(A, ia, B, ib, chunk=chunk, cut=cut)
+        d2 = self.pairs(A, ib, B, ia, chunk=chunk, cut=cut)
+        return torch.minimum(d1, d2)
+
+    def pairs(self, A, ia, B, ib, chunk=8192, parts=False, cut=None):
+        """d for pairs (A[ia[k]], crystal ib[k] of the glued set B); ``parts`` also gives (D_cell, D_cent, D_rot,
+        element, alternative row) at the minimum. With ``cut``: pairs whose distance is >= cut return inf, and
+        alternatives whose cell term alone reaches cut are never evaluated."""
+        if 'ptr' not in B:
+            return super().pairs(A, ia, B, ib, chunk=chunk, parts=parts)
+        dev = self.device
+        ia = torch.as_tensor(ia, dtype=torch.long, device=dev)
+        ib = torch.as_tensor(ib, dtype=torch.long, device=dev)
+        rep, alt = self._expand(B, ib)
+        # exact pruning: D_cell <= d for every alternative, so (1) the full d through each pair's cell-closest
+        # alternative is an upper bound, and (2) only alternatives whose D_cell is below it can lower the minimum
+        c2 = torch.cat([self.cell2(A['cell'][ia[rep[lo:lo + chunk]]], B['cell'][alt[lo:lo + chunk]])
+                        for lo in range(0, len(rep), chunk)]) if len(rep) else torch.zeros(0, dtype=self.dtype, device=dev)
+        min_c2 = torch.full((len(ia),), float('inf'), dtype=self.dtype, device=dev)
+        min_c2.scatter_reduce_(0, rep, c2, reduce='amin')
+        at_min = c2 <= min_c2[rep]
+        arg = torch.zeros(len(ia), dtype=torch.long, device=dev)
+        arg[rep[at_min]] = alt[at_min]
+        best = torch.full((len(ia),), float('inf'), dtype=self.dtype, device=dev)
+        live = torch.ones(len(ia), dtype=torch.bool, device=dev) if cut is None else min_c2 < cut * cut
+        li = torch.nonzero(live).flatten()
+        if len(li):
+            best[li] = FDMetric.pairs(self, A, ia[li], B, arg[li], chunk=chunk)
+        bound = best[rep] ** 2 if cut is None else torch.minimum(best[rep] ** 2, torch.full_like(c2, cut * cut))
+        cand = torch.nonzero((c2 < bound) & (alt != arg[rep])).flatten()
+        for lo in range(0, len(cand), chunk):
+            e = cand[lo:lo + chunk]
+            r, a = rep[e], alt[e]
+            v = FDMetric.pairs(self, A, ia[r], B, a, chunk=chunk)
+            best.scatter_reduce_(0, r, v, reduce='amin')
+            hit = v <= best[r]
+            arg[r[hit]] = a[hit]
+        self.last_full_evals = int(len(li) + len(cand))  # full distances computed (vs len(rep) without pruning)
+        if cut is not None:
+            best = torch.where(best < cut, best, torch.full_like(best, float('inf')))
+        if parts:
+            _, P = FDMetric.pairs(self, A, ia, B, arg, chunk=chunk, parts=True)
+            return best, torch.cat([P, arg[:, None].to(P.dtype)], 1)
+        return best
 
 
 def merge_twin(A, At):
