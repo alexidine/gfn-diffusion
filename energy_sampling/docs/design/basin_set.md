@@ -2,8 +2,16 @@
 
 *Plan, 2026-10-30. Status: the direction is the owner's (Decisions below); every section after it elaborates that
 direction and is a proposal, checked against both repositories on 2026-10-30 by two reviewers and to be checked again
-as each piece lands. Not policy. Built so far: the guard that refuses a non-latent chart in
-`data_processing/build_noised_prior.py` (`refuse_unscored_chart`, with a test in `tests/crystal/test_noised_prior.py`).*
+as each piece lands. Not policy.*
+
+*Built (2026-10-30): the guard that refuses a non-latent chart in `build_noised_prior.py` (`refuse_unscored_chart`);
+the writer and reader `mxtaltools/crystal_search/basin_set.py` (`write_basin_set`, `read_basin_set`, `live_mask`;
+committed locally in MXtalTools); `build_noised_prior.py --basins` (anchors only or with iso children, basin tags on
+every row, off-chart basins dropped and counted); `noised_prior.live_kernel: 'basin'` on the FD chart with a rolling
+bank (`train.py::Modeller._basin_kernel_table`, `._basin_fresh`, `._basin_kernel_draw`). Not built: the latent
+chart's composed canonicaliser (so `'basin'` refuses the latent chart), children drawn by the basin kernel, the
+`log_mass_laplace` column, the conditions file, the molecule coordinate match, the flat-molecule twin map (section
+2), and `FORMAT_VERSION` 2 (the basin tags are optional row attributes of version 1).*
 
 ## Why
 
@@ -97,24 +105,26 @@ Identity at reduced-cell faces: the glued-FD merge in `minima.py` merges a Z' = 
 in uncommitted `minima.py` with the untracked `crystal_fd/metric.py` (2026-10-30), capture still uses the ellipsoid
 alone, and Z' > 1 is never glued.
 
-## 2. Sheets, stated per molecule
+## 2. Sheets
 
-The header records, per molecule, the sheet policy in crystal_fd's existing vocabulary (`io_mxt.OFF_SHEET_MODES`:
-`mirror_reference`, `enantiomorph`, `keep`), not a new one. Defaults follow standing owner decisions: energies are
-mirror-invariant and a Z' = 1 Sohncke row off the +1 sheet is stored as its mirror crystal (2026-10-21); an optional
-per-molecule flag marks flat or effectively flat molecules, for which only the effective positive sheet is searched
-(2026-10-26).
+Owner (2026-10-30): the default is "FD with both sheets"; the sheet question matters "mostly to comparisons between
+latent and FD parameterizations, or specific studies of symmetric molecules"; in Sohncke groups "the two sheets are
+identical for our purposes".
 
-Stated limits, not to be discovered later:
-
-- No chart holds a row on the -1 sheet today. `FDCoordinates.from_params` canonicalises onto +1 and gives an
-  off-sheet Sohncke row the status `off_sheet`; the latent trainer reads no handedness (`std_orientation=False`) and
-  `train.py::Modeller._refuse_mirrored_rows` refuses Z' = 1 rows at -1.
-- The search has no sheet switch: `identity_description` moves a row to +1 only through an improper element.
-- The latent chart covers half of space group 14 for a molecule on the +1 sheet (crystal_fd `fd_tables_v1.json`,
-  trainer box).
-
-For the owner: which molecules, if any, are searched on both sheets and kept as distinct basins (`keep`).
+- In every group with an improper element the FD chart, fixed to handedness +1, covers both sheets' crystals once:
+  its centroid domain is the fundamental domain of the handedness-preserving part of the group (crystal_fd
+  `fd_tables_v1.json`, `gamma_plus`), so a description on -1 is moved onto +1 by an improper element and kept. This
+  is the default and needs no setting.
+- Sohncke groups: a -1 row is stored as its mirror crystal (`io_mxt` `off_sheet='enantiomorph'`, owner 2026-10-21;
+  energies are mirror-invariant). The writer uses this mode.
+- The latent chart is a comparison chart with stated limits: in the groups whose trainer box has coverage below 1
+  (sg 14, 8-9 and others, `fd_tables_v1.json` `trainer_box.coverage`) it reaches half of a chiral molecule's
+  crystals. MIPCAS (sg 2) is covered fully by both charts.
+- A flat or effectively flat molecule's crystal has two FD points (the pose and its mirror-equivalent through the
+  molecule's own symmetry). A prior that puts each crystal at one of them leaves the other half of the domain without
+  data. The owner's fixes (2026-10-30): duplicate each row at its twin, or use only half the chart. Both need the twin
+  map from the molecule's point symmetry, which is not built (crystal_fd leaves molecular point symmetry out, owner
+  2026-10-26). Until it exists, a flat molecule (NEHZOR) on the FD chart carries this gap.
 
 ## 3. The constructor
 

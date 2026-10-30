@@ -870,6 +870,8 @@ class Modeller:
         excess spread evenly over directions. Rows are scored here once; the draws are never scored."""
         s = self._noised_prior_settings
         ds = self.prior_dataset
+        if s['live_kernel'] == 'basin':
+            return self._basin_kernel_table()
         live = self.gfn_model.live_idx.to(self.device)
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
@@ -901,12 +903,111 @@ class Modeller:
               f"widths median {float(torch.linalg.norm(L, dim=1).median()):.3g}", flush=True)
         return L.float()
 
-    def _live_kernel_draw(self, latents, inds):
+    def _basin_kernel_table(self):
+        """noised_prior.live_kernel 'basin': per prior row, its basin's draw centre p [12] and handedness, and the
+        factor L [12, 12] of the draw x = p + L z in p's own cell parameters (docs/design/basin_set.md section 4), from
+        the basin's stored Hessian of the physical energy in run units (basin_H, written by build_noised_prior
+        --basins): L L^T = live_tau kT (H on basin_live)^-1, with |lambda| per mode and each mode's width capped at 1
+        in coordinates scaled by noised_prior.live_caps (Angstrom, radian, fraction, radian per block). No energy
+        call."""
+        s = self._noised_prior_settings
+        b = self.prior_dataset.batch
+        if getattr(self.energy_function, 'crystal_coordinates', 'latent') != 'fd':
+            raise NotImplementedError("live_kernel 'basin' runs on crystal_coordinates 'fd' only: the latent chart's "
+                                      "canonicaliser with trainer-box images is not built (docs/design/basin_set.md)")
+        missing = [k for k in ('basin_p', 'basin_hand', 'basin_H', 'basin_live') if not hasattr(b, k)]
+        if missing:
+            raise ValueError(f"noised_prior.live_kernel 'basin' needs a basin-set build (build_noised_prior --basins); "
+                             f"the prior rows lack {missing}")
+        p = torch.as_tensor(b.basin_p, dtype=torch.float64).reshape(-1, 12).cpu()
+        H = torch.as_tensor(b.basin_H, dtype=torch.float64).reshape(-1, 12, 12).cpu()
+        live = torch.as_tensor(b.basin_live).reshape(-1, 12).bool().cpu()
+        caps = torch.tensor(list(s['live_caps']), dtype=torch.float64).repeat_interleave(3)
+        kT, tau = float(self.energy_function.temperature), float(s['live_tau'])
+        Dg = torch.diag(caps)
+        L = torch.zeros_like(H)
+        for i in range(H.shape[0]):
+            m = live[i].nonzero().flatten()
+            Hs = (Dg @ H[i] @ Dg)[m][:, m] / kT
+            lam, V = torch.linalg.eigh(0.5 * (Hs + Hs.T))
+            w = torch.sqrt(tau / lam.abs().clamp_min(tau)).clamp(max=1.0)
+            Li = torch.zeros(12, 12, dtype=torch.float64)
+            Li[m[:, None], m] = V * w[None, :]
+            L[i] = Dg @ Li
+        self._basin = dict(p=p, hand=torch.as_tensor(b.basin_hand, dtype=torch.float64).reshape(-1).cpu(), L=L,
+                           sg=b.sg_ind.reshape(-1).cpu(), radius=b.radius.reshape(-1).detach().cpu().double(),
+                           s0=self._batch_latents(b).detach().cpu().float(), draws=0, misses=0)
+        widths = torch.linalg.norm(L, dim=1)
+        k = int(s['live_bank'])
+        if k > 0:
+            # the bank: k chart points per prior row, refreshed live_fresh_frac of each batch at a time
+            rows = torch.arange(L.shape[0]).repeat_interleave(k)
+            self._basin['bank'] = self._basin_fresh(rows).reshape(L.shape[0], k, -1)
+        print(f"live kernel 'basin' (tau {tau:g}, caps {list(s['live_caps'])}) over {L.shape[0]} prior rows: width "
+              f"medians per block (A, rad, frac, rad) "
+              f"{[round(float(widths[:, 3 * k:3 * k + 3].median()), 4) for k in range(4)]}; bank {k} per row, "
+              f"misses {self._basin['misses']} of {self._basin['draws']} draws", flush=True)
+        return L
+
+    def _basin_fresh(self, rows):
+        """[len(rows), data_ndim] chart points of fresh draws around the prior rows' basin centres
+        (_basin_kernel_table): each draw built in the basin's own cell parameters and canonicalised into the FD chart
+        (FDCoordinates.from_params). A draw with no chart point is redrawn up to noised_prior.live_redraws times; a
+        row still without one gets its stored chart point, counted in self._basin['misses']."""
+        if getattr(self.energy_function, 'crystal_coordinates', 'latent') != 'fd':
+            raise NotImplementedError("live_kernel 'basin' runs on crystal_coordinates 'fd' only: the latent chart's "
+                                      "canonicaliser with trainer-box images is not built (docs/design/basin_set.md)")
+        B = self._basin
+        rows = torch.as_tensor(rows).long().flatten().cpu()
+        out = B['s0'][rows].clone()
+        pending = torch.ones(len(rows), dtype=torch.bool)
+        for _ in range(int(self._noised_prior_settings['live_redraws']) + 1):
+            idx = torch.nonzero(pending).flatten()
+            if idx.numel() == 0:
+                break
+            r = rows[idx]
+            params = B['p'][r] + torch.einsum('nij,nj->ni', B['L'][r], torch.randn(len(r), 12, dtype=torch.float64))
+            for g in sorted(set(B['sg'][r].tolist())):
+                sel = (B['sg'][r] == g).nonzero().flatten()
+                fc = self.energy_function.fd_coordinates_rows(int(g), B['radius'][r[sel]])
+                res = fc.from_params(params[sel], B['hand'][r[sel]])
+                ok = res.ok & torch.isfinite(res.s).all(1)
+                done = idx[sel[ok]]
+                out[done, :fc.dim] = res.s[ok].float()
+                pending[done] = False
+        B['draws'] += len(rows)
+        B['misses'] += int(pending.sum())
+        return out
+
+    def _basin_kernel_draw(self, latents, inds, mol_batch):
+        """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
+        With noised_prior.live_bank > 0, a uniformly chosen point of the row's bank, a share live_fresh_frac of the
+        batch drawn fresh (_basin_fresh) and written into the slots it used; with 0, every draw fresh. The
+        canonicalisation, not an energy call, is the cost: about 0.55 s per 1000 fresh MIPCAS draws on CPU
+        (2026-10-30, crystal_fd's triclinic reduction)."""
+        B = self._basin
+        rows = torch.as_tensor(inds).long().flatten().cpu()
+        if 'bank' not in B:
+            return self._basin_fresh(rows).to(latents)
+        k = B['bank'].shape[1]
+        slot = torch.randint(k, (len(rows),))
+        out = B['bank'][rows, slot].clone()
+        n_fresh = int(math.ceil(float(self._noised_prior_settings['live_fresh_frac']) * len(rows)))
+        if n_fresh:
+            pick = torch.randperm(len(rows))[:n_fresh]
+            fresh = self._basin_fresh(rows[pick])
+            out[pick] = fresh
+            B['bank'][rows[pick], slot[pick]] = fresh
+        return out.to(latents)
+
+    def _live_kernel_draw(self, latents, inds, mol_batch=None):
         """noised_prior.live_kernel: each drawn row moved by L z in its live chart rows, z standard normal; wrapped
         rows folded onto their period, every other live row reflected into [-1, 1] (a stand-in for re-canonicalising
-        across a face); dead rows untouched."""
+        across a face); dead rows untouched. 'basin' draws in cell parameters instead (_basin_kernel_draw)."""
         if getattr(self, '_live_L', None) is None:
             self._live_L = self._live_kernel_table()
+        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'basin':
+            return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
         rows = torch.as_tensor(inds, device=latents.device).long().flatten()
         L = self._live_L.to(latents.device)[rows]
@@ -7883,7 +7984,7 @@ class Modeller:
             latents = latents.to(self.device)
             if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
                 # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
-                latents = self._live_kernel_draw(latents, inds)
+                latents = self._live_kernel_draw(latents, inds, mol_batch)
 
         elif self.bwd_sampling_mode == 'prior':
             # condition-blocked draws (C conditions x up to M distinct terminals

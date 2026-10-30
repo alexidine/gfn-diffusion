@@ -171,3 +171,18 @@ def test_the_builder_refuses_a_non_latent_chart():
     refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace()))
     with pytest.raises(SystemExit, match="crystal_coordinates 'fd'"):
         refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace(crystal_coordinates='fd')))
+
+
+def test_basin_rows_that_do_not_rescore_are_dropped_and_too_many_refuse():
+    """build_noised_prior --basins: a row whose rescored energy misses its basin's converted energy has no faithful
+    chart point (the latent clip rebuilds another crystal); it is dropped, and more than 20% such rows refuse."""
+    from types import SimpleNamespace
+    from energy_sampling.data_processing.build_noised_prior import check_basin_energies
+    want = torch.arange(10, dtype=torch.float64)
+    got = want.clone()
+    got[3] += 50.0
+    keep = check_basin_energies(SimpleNamespace(mol_energy=got), {'tags': {'basin_E': want}}, 0.05)
+    assert keep.tolist() == [i != 3 for i in range(10)]
+    got[:3] += 1.0
+    with pytest.raises(SystemExit, match='does not rescore'):
+        check_basin_energies(SimpleNamespace(mol_energy=got), {'tags': {'basin_E': want}}, 0.05)

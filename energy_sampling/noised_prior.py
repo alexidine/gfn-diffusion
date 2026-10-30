@@ -34,9 +34,10 @@ ABS_TOL, REL_TOL = 0.1, 1e-4   # energy units: two scorings of one crystal diffe
 CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
-                live_kernel=None, live_tau=1.0, live_width_cap=0.25)
+                live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
+                live_bank=64, live_fresh_frac=0.1)
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw)
-LIVE_KERNELS = (None, 'iso', 'hessian')
+LIVE_KERNELS = (None, 'iso', 'hessian', 'basin')
 
 
 def settings(args):
@@ -60,6 +61,19 @@ def settings(args):
         v = s[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ValueError(f"noised_prior.{k} must be a finite number > 0, got {v!r}")
+    caps = s['live_caps']
+    if (not isinstance(caps, (list, tuple)) or len(caps) != 4 or any(
+            isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c) or c <= 0 for c in caps)):
+        raise ValueError(f"noised_prior.live_caps must be 4 finite numbers > 0 (A, rad, fraction, rad), got {caps!r}")
+    r = s['live_redraws']
+    if isinstance(r, bool) or not isinstance(r, int) or r < 0:
+        raise ValueError(f"noised_prior.live_redraws must be an integer >= 0, got {r!r}")
+    k = s['live_bank']
+    if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+        raise ValueError(f"noised_prior.live_bank must be an integer >= 0, got {k!r}")
+    f = s['live_fresh_frac']
+    if isinstance(f, bool) or not isinstance(f, (int, float)) or not 0 <= f <= 1:
+        raise ValueError(f"noised_prior.live_fresh_frac must be a number in [0, 1], got {f!r}")
     return s
 
 

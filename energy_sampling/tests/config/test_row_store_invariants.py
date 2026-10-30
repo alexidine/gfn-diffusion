@@ -121,7 +121,7 @@ STAGE_REFUSALS = [
     ('weighted_bwd_sampling', lambda s: s['flags'].update(weighted_bwd_sampling=True), 'weighted_bwd_sampling'),
     ('coeff_schedule', lambda s: s.update(coeff_schedule={'bounding_coeff': {'target': 1.0, 'steps': 10,
                                                                              'kind': 'linear'}}), 'coeff_schedule'),
-    ('anneal_coeffs', lambda s: s['balance'].update(anneal_coeffs={'bounding_coeff': {'target': 1.0}}),
+    ('anneal_coeffs', lambda s: s.setdefault('balance', {}).update(anneal_coeffs={'bounding_coeff': {'target': 1.0}}),
      'anneal_coeffs'),
     ('drift_std_max', lambda s: s['fwd_rollout_triggers'].update(drift_std_max=1.0), 'drift_std_max'),
     ('ess_min', lambda s: s['fwd_rollout_triggers'].update(ess_min=0.5), 'ess_min'),

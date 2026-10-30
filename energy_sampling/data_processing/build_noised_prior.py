@@ -53,7 +53,13 @@ PILOT_GRID = tuple(-2.5 + 0.125 * i for i in range(17))   # 10^-2.5 .. 10^-0.5
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     p.add_argument('--config', required=True)
-    p.add_argument('--source', required=True, help='a train.py prior file (its equalized_prior rows are the anchors)')
+    p.add_argument('--source', default=None, help='a train.py prior file (its equalized_prior rows are the anchors)')
+    p.add_argument('--basins', default=None, help='a basin set (mxtaltools crystal_search.basin_set, '
+                   'docs/design/basin_set.md): its rows are the anchors, each tagged with its basin; exclusive of --source')
+    p.add_argument('--thermal_scaling_factor', type=float, default=None,
+                   help="with --basins on eLJ: the run's lj scale (a --source prior carries its own)")
+    p.add_argument('--energy_tol', type=float, default=0.05,
+                   help='with --basins: largest |rescored - converted basin energy| (run units) before a row counts as off')
     p.add_argument('--out', required=True)
     p.add_argument('--set', action='append', default=[], dest='overrides', metavar='KEY=VALUE')
     p.add_argument('--k', type=int, default=10, help='children per anchor')
@@ -195,22 +201,9 @@ def refuse_unscored_chart(run_args):
                          f"{chart!r}. Build without it: an FD run loads a latent-scored build")
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    from inn_modeller import apply_overrides
-    from train import energy_function_kwargs
-    from energies.molecular_crystal import MolecularCrystal
-    from utils import get_train_args
-
-    t_start = time.time()
-    rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed)
-    run_args = get_train_args(['--config', args.config])
-    apply_overrides(run_args, args.overrides)
-    T = float(run_args.energy_config.temperature)
-    refuse_unscored_chart(run_args)
-    ef = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
-
+def load_source_anchors(args, run_args, ef):
+    """(anchors, thermal_scaling_factor or None, description) of a train.py prior file: its equalized_prior rows (or
+    its anchor image-0 rows), sets ef.lj_coeff from the file's thermal_scaling_factor."""
     src = torch.load(args.source, weights_only=False, map_location='cpu')
     if NP.MANIFEST_KEY in src:
         raise SystemExit(f"{args.source} is already a pre-noised build")
@@ -236,6 +229,90 @@ def main(argv=None):
         anchors = anchors.subsample_new_batch(torch.arange(args.limit_anchors))
         what += f", first {args.limit_anchors}"
     anchors['smiles'] = None
+    return anchors, tsf, what
+
+
+def load_basin_anchors(args, run_args):
+    """(anchors, thermal_scaling_factor or None, description, basin tags) of a basin set (docs/design/basin_set.md):
+    one anchor per usable basin, built as the set describes it (crystal_fd ``to_mol_crystal_data``, mode 'body', the
+    trainer's convention); the tags carry each basin's draw centre p, its handedness, its Hessian and energy in the
+    run's currency, and its live coordinates. Refuses a set whose energy is not the run's."""
+    from mxtaltools.crystal_search.basin_set import read_basin_set
+    from mxtaltools.dataset_utils.utils import collate_data_list
+    if args.harvest:
+        raise SystemExit('--harvest is not a basin-set input (owner 2026-10-30)')
+    if args.anchors != 'all' or args.molecule_fraction < 1.0:
+        raise SystemExit('--anchors and --molecule_fraction apply to --source only')
+    ds, header = read_basin_set(args.basins)
+    energy = header['energy']
+    if energy.get('target') != run_args.energy_function:
+        raise SystemExit(f"basin set energy {energy.get('target')!r} is not the run's {run_args.energy_function!r}: "
+                         f"transfer first (a seeded streaming search under the run's energy)")
+    if getattr(run_args.energy_config, 'lj_rescale', None) is not None:
+        raise SystemExit('--basins does not convert lj_rescale; build without it')
+    tsf = args.thermal_scaling_factor
+    if run_args.energy_function == 'elj':
+        if tsf is None:
+            raise SystemExit("--basins on eLJ needs --thermal_scaling_factor (the run's lj scale)")
+        if energy.get('per') != 'asymmetric_unit':
+            raise SystemExit(f"eLJ basin energies are per asymmetric unit, the set says {energy.get('per')!r}")
+        factor = float(tsf)
+    else:
+        if tsf is not None:
+            raise SystemExit('--thermal_scaling_factor is for eLJ only')
+        factor = 1.0
+    usable = torch.tensor([ds.status_names[int(c)] in ('canonical', 'special_metric') for c in ds.status])
+    ds = ds.select(usable)
+    rows = ds.to_mol_crystal_data(mode='body')
+    anchors = collate_data_list(rows)
+    anchors['smiles'] = None
+    c = ds.columns
+    tags = dict(basin_id=c['basin_id'].long(), basin_p=c['p'].double(), basin_hand=c['p_handedness'].double(),
+                basin_H=c['H'].double() * factor, basin_live=c['live_mask'].bool(), basin_E=c['E'].double() * factor)
+    what = (f"basin set {args.basins}: {len(ds)} usable of {int(usable.numel())} rows "
+            f"({energy.get('target')}, x {factor:g} to run units, search kT {header['search'].get('kT')})")
+    return anchors, tsf, what, dict(tags=tags, header=header, factor=factor, path=os.path.abspath(args.basins))
+
+
+def check_basin_energies(anchors, basins, tol):
+    """[B] bool, the anchors that rescore to their basin's converted search energy within ``tol`` (run units). A row
+    that does not has no faithful chart point: score() builds from the trainer latent, which clips a cell outside the
+    trainer's length box into another crystal. Such rows are dropped and counted, never kept clipped; more than 20%
+    of rows off refuses the set (frame, chart or energy definition differs)."""
+    got = torch.as_tensor(anchors.mol_energy, dtype=torch.float64).reshape(-1)
+    want = basins['tags']['basin_E'].reshape(-1)
+    off = (got - want).abs()
+    keep = off <= tol
+    print(f"basin energies: rescored vs converted |diff| median {float(off.median()):.3g}, max {float(off.max()):.3g}; "
+          f"{int((~keep).sum())} of {off.numel()} rows past {tol:g} dropped (no faithful chart point)", flush=True)
+    if float((~keep).double().mean()) > 0.2:
+        raise SystemExit('basin set does not rescore to its stored energies: frame, chart or energy definition differs')
+    return keep
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    from inn_modeller import apply_overrides
+    from train import energy_function_kwargs
+    from energies.molecular_crystal import MolecularCrystal
+    from utils import get_train_args
+
+    t_start = time.time()
+    rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    run_args = get_train_args(['--config', args.config])
+    apply_overrides(run_args, args.overrides)
+    T = float(run_args.energy_config.temperature)
+    refuse_unscored_chart(run_args)
+    ef = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
+
+    if (args.source is None) == (args.basins is None):
+        raise SystemExit('give exactly one of --source and --basins')
+    basins = None
+    if args.basins is not None:
+        anchors, tsf, what, basins = load_basin_anchors(args, run_args)
+        ef.lj_coeff = 1.0 if tsf is None else float(tsf)
+    else:
+        anchors, tsf, what = load_source_anchors(args, run_args, ef)
     print(f"anchors: {what}: {anchors.num_graphs} rows; T {T:g}, lj_coeff {ef.lj_coeff}", flush=True)
 
     # HARVEST (cfg:harvest shards of earlier runs): rows of the source's molecules join the pool, are scored with it,
@@ -254,6 +331,15 @@ def main(argv=None):
     t0 = time.time()
     anchors = collate(score(ef, anchors, T, args.device, args.chunk))
     e_anchor = seed_energy(ef, anchors, T, args.device)
+    if basins is not None:
+        keep = check_basin_energies(anchors, basins, args.energy_tol)
+        basins['dropped_off_chart'] = int((~keep).sum())
+        if not bool(keep.all()):
+            rows_kept = torch.nonzero(keep).flatten()
+            anchors, e_anchor = anchors.subsample_new_batch(rows_kept), e_anchor[rows_kept]
+            basins['tags'] = {k: v[rows_kept] for k, v in basins['tags'].items()}
+        for k, v in basins['tags'].items():
+            anchors.add_graph_attr(v, k)
     print(f"anchors scored in {time.time() - t0:.0f} s; seed energy min {float(e_anchor.min()):.2f} "
           f"P50 {float(e_anchor.median()):.2f} max {float(e_anchor.max()):.2f}", flush=True)
     n_promoted = 0
@@ -305,8 +391,8 @@ def main(argv=None):
     t0 = time.time()
     torch.manual_seed(args.seed + 1)
     children, parents, mags, n_face = [], [], [], 0
-    per_call = max(1, args.chunk // args.k)
-    for lo in range(0, anchors.num_graphs, per_call):
+    per_call = max(1, args.chunk // max(args.k, 1))
+    for lo in range(0, anchors.num_graphs if args.k > 0 else 0, per_call):
         ia = torch.arange(lo, min(lo + per_call, anchors.num_graphs))
         rep = ia.repeat_interleave(args.k)
         b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device)
@@ -320,10 +406,10 @@ def main(argv=None):
         if (lo // per_call) % 20 == 0:
             done = min(lo + per_call, anchors.num_graphs)
             print(f"  children of {done} / {anchors.num_graphs} anchors, {time.time() - t0:.0f} s", flush=True)
-    children = collate(children)
-    parents = torch.cat(parents)
-    mags = torch.cat(mags)
-    print(f"children scored in {time.time() - t0:.0f} s: {children.num_graphs} rows"
+    children = collate(children) if children else None
+    parents = torch.cat(parents) if parents else torch.zeros(0, dtype=torch.long)
+    mags = torch.cat(mags) if mags else torch.zeros(0)
+    print(f"children scored in {time.time() - t0:.0f} s: {0 if children is None else children.num_graphs} rows"
           + (f", images drawn ({n_face} on an x face)" if images else ""), flush=True)
 
     n_a = anchors.num_graphs
@@ -331,12 +417,17 @@ def main(argv=None):
     anchors.add_graph_attr(split.long(), 'noised_split')
     anchors.add_graph_attr(torch.arange(n_a, dtype=torch.long), 'noised_parent')
     anchors.add_graph_attr(torch.zeros(n_a), 'noised_radius')
-    n_c = children.num_graphs
-    children.add_graph_attr(torch.full((n_c,), NP.KIND_CHILD, dtype=torch.long), 'noised_kind')
-    children.add_graph_attr(split[parents].long(), 'noised_split')
-    children.add_graph_attr(parents.long(), 'noised_parent')
-    children.add_graph_attr(mags.float(), 'noised_radius')
-    parts = [anchors, children]
+    n_c = 0 if children is None else children.num_graphs
+    parts = [anchors]
+    if children is not None:
+        children.add_graph_attr(torch.full((n_c,), NP.KIND_CHILD, dtype=torch.long), 'noised_kind')
+        children.add_graph_attr(split[parents].long(), 'noised_split')
+        children.add_graph_attr(parents.long(), 'noised_parent')
+        children.add_graph_attr(mags.float(), 'noised_radius')
+        if basins is not None:   # a child's basin is its parent's
+            for k, v in basins['tags'].items():
+                children.add_graph_attr(v[parents], k)
+        parts.append(children)
     n_h = 0 if rest is None else rest.num_graphs
     if rest is not None:
         rest.add_graph_attr(torch.full((n_h,), NP.KIND_HARVESTED, dtype=torch.long), 'noised_kind')
@@ -361,7 +452,11 @@ def main(argv=None):
     manifest = dict(
         format_version=NP.FORMAT_VERSION,
         identity=NP.identity(run_args, ef),
-        source=os.path.abspath(args.source), anchors=args.anchors, molecule_fraction=args.molecule_fraction,
+        source=os.path.abspath(args.source) if args.source else None, anchors=args.anchors,
+        molecule_fraction=args.molecule_fraction,
+        basin_set=None if basins is None else dict(path=basins['path'], header=basins['header'],
+                                                   to_run_units=basins['factor'],
+                                                   dropped_off_chart=basins['dropped_off_chart']),
         k=args.k, log_lo=args.log_lo, log_hi=log_hi, calibration=table, window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),

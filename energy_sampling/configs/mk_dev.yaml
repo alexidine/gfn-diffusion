@@ -29,9 +29,13 @@ noised_prior:                # read only when prior_path is a pre-noised build (
   packing_window: null       # [lo, hi] packing coefficients kept. null = density_penalty's unpenalised range (molecular_crystal.PACKING_COEFF_WINDOW)
   train_kinds: ['child']     # row kinds the run trains on: 'child' (iso-tile kicks) and/or 'anchor' (the source rows)
   check_rows: 512            # rows re-scored at load, stratified by kind, split, space group and Z'; a miss past tolerance raises
-  live_kernel: null          # MLE draws a fresh Gaussian around each drawn row, in the run's chart, no energy call: 'hessian' = per-row covariance live_tau x |H|^-1 of -log R at the row (eigen widths capped), 'iso' = one width matched to the same mean excess; null = the stored rows as they are
+  live_kernel: null          # MLE draws a fresh Gaussian around each drawn row, no energy call: 'basin' = around the row's basin centre from its stored physical Hessian, in cell parameters, canonicalised into the chart (FD only; needs a build_noised_prior --basins prior); 'hessian' = per-row covariance live_tau x |H|^-1 of -log R at the row, in the chart (prototype); 'iso' = one chart width matched to the same mean excess (prototype); null = the stored rows as they are
   live_tau: 1.0              # live_kernel's temperature, a multiple of energy_config.temperature (live_tau / 2 nats per mode in the quadratic model)
   live_width_cap: 0.25       # live_kernel: largest width per direction, in chart units
+  live_caps: [1.0, 0.2, 0.1, 0.5]  # live_kernel 'basin': largest width per mode in each block of the cell parameters (Angstrom, radian, fraction, radian)
+  live_redraws: 4            # live_kernel 'basin': redraws of a draw with no chart point before the row keeps its stored point (counted)
+  live_bank: 64              # live_kernel 'basin': chart points kept per prior row (0 = every draw fresh)
+  live_fresh_frac: 0.1       # live_kernel 'basin': share of each batch drawn fresh and written into the bank
 harvest:                     # scored rollout rows kept for the next prior build (train.py::Modeller.harvest_scored_rows)
   enabled: false
   min_abs_resid: 1.0         # nats: rows whose |TB residual| is at least this are kept, and rows at or below their condition's best known energy
