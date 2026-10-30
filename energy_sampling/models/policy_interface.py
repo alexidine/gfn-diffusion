@@ -14,8 +14,8 @@ POLICY_ATTRIBUTES = (
     # the trajectory calls and the condition
     'get_traj_fwd', 'get_traj_bwd', 'get_traj_replay', 'get_condition_embedding',
     # geometry and switches
-    'device', 'conditional', 'conditions_type', 'ang_mask', 'dead_rows', 'full_flow', 'force_on', 'features_on',
-    '_wrap_ang', '_mean_over_live',
+    'device', 'conditional', 'conditions_type', 'ang_mask', 'dead_rows', 'live_idx', 'full_flow', 'force_on',
+    'features_on', '_wrap_ang', '_mean_over_live',
     # parameter groups
     't_model', 's_model', 'forward_policy', 'backward_policy', 'conditions_embedding_model', 'flow_model',
     # P_B freeze and snapshots
