@@ -186,3 +186,48 @@ def test_basin_rows_that_do_not_rescore_are_dropped_and_too_many_refuse():
     got[:3] += 1.0
     with pytest.raises(SystemExit, match='does not rescore'):
         check_basin_energies(SimpleNamespace(mol_energy=got), {'tags': {'basin_E': want}}, 0.05)
+
+
+def test_basin_kernel_children_are_windowed_by_their_basin():
+    """A basin-kernel build (manifest child_kernel 'basin') windows each child on its basin's anchor's energy, keyed on
+    (condition group, basin_id) so a subset of the file's rows still finds its anchors; any other build windows each row
+    on its own energy; a child whose basin has no anchor among the rows raises."""
+    seed = torch.tensor([0.0, 10.0, 3.0, 20.0, 12.0], dtype=torch.float64)   # anchors of basins 7, 9; children 7, 7, 9
+    kinds = torch.tensor([0, 0, 1, 1, 1])
+    zeros = torch.zeros(5, dtype=torch.long)
+    bid = torch.tensor([7, 9, 7, 7, 9])
+    assert torch.equal(NP.window_energy(seed, kinds, zeros, bid, {'child_kernel': 'iso'}), seed)
+    assert torch.equal(NP.window_energy(seed, kinds, zeros, None, None), seed)
+    we = NP.window_energy(seed, kinds, zeros, bid, {'child_kernel': 'basin'})
+    assert we.tolist() == [0.0, 10.0, 0.0, 0.0, 10.0]
+    # the same rows reordered and subset (anchor of basin 9 and its child only): still found by basin_id
+    sub = torch.tensor([4, 1])
+    assert NP.window_energy(seed[sub], kinds[sub], zeros[:2], bid[sub], {'child_kernel': 'basin'}).tolist() == [10.0, 10.0]
+    with pytest.raises(ValueError, match='no anchor'):
+        NP.window_energy(seed[2:], kinds[2:], zeros[2:], bid[2:], {'child_kernel': 'basin'})
+    packing = torch.full((5,), 0.7, dtype=torch.float64)
+    s = _settings(window_kT=2.0)
+    by_basin, floor = NP.select_rows(seed, packing, kinds, zeros, zeros, 1.0, s, window_e=we)
+    assert by_basin['train'].tolist() == [False, False, True, True, False]
+    assert floor.tolist() == [0.0] * 5
+    by_row, _ = NP.select_rows(seed, packing, kinds, zeros, zeros, 1.0, s)
+    assert by_row['train'].tolist() == [False] * 5
+
+
+def test_the_builder_refuses_kernel_flags_its_child_kernel_does_not_read():
+    from data_processing.build_noised_prior import build_parser, check_child_kernel_args
+    base = ['--config', 'c.yaml', '--out', 'o.pt']
+    for extra, msg in ((['--basins', 'b', '--tau', '0.5'], 'basin only'),
+                       (['--basins', 'b', '--child_kernel', 'basin', '--log_lo', '-2'], 'takes no'),
+                       (['--source', 's', '--child_kernel', 'basin'], 'needs --basins'),
+                       (['--basins', 'b', '--child_kernel', 'basin', '--tau', '0'], 'finite and > 0'),
+                       (['--basins', 'b', '--child_kernel', 'basin', '--redraws', '-1'], '>= 0')):
+        with pytest.raises(SystemExit, match=msg):
+            check_child_kernel_args(build_parser().parse_args(base + extra))
+    a = build_parser().parse_args(base + ['--basins', 'b', '--child_kernel', 'basin'])
+    check_child_kernel_args(a)
+    assert (a.tau, a.shape, a.caps, a.redraws) == (1.0, 'hessian', list(NP.DEFAULTS['live_caps']),
+                                                    NP.DEFAULTS['live_redraws'])
+    a = build_parser().parse_args(base + ['--source', 's'])
+    check_child_kernel_args(a)
+    assert a.log_lo == -2.5

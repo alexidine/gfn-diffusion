@@ -903,83 +903,60 @@ class Modeller:
               f"widths median {float(torch.linalg.norm(L, dim=1).median()):.3g}", flush=True)
         return L.float()
 
+    def _basin_rows(self, b, what):
+        """The basin tags of the rows of batch b as CPU tensors (p [n, 12], hand [n], H [n, 12, 12], live [n, 12],
+        sg [n], radius [n]); raises naming `what` when b is not a basin-set build's."""
+        missing = [k for k in ('basin_p', 'basin_hand', 'basin_H', 'basin_live') if not hasattr(b, k)]
+        if missing:
+            raise ValueError(f"{what} needs a basin-set build (build_noised_prior --basins); the prior rows lack "
+                             f"{missing}")
+        return dict(p=torch.as_tensor(b.basin_p, dtype=torch.float64).reshape(-1, 12).cpu(),
+                    hand=torch.as_tensor(b.basin_hand, dtype=torch.float64).reshape(-1).cpu(),
+                    H=torch.as_tensor(b.basin_H, dtype=torch.float64).reshape(-1, 12, 12).cpu(),
+                    live=torch.as_tensor(b.basin_live).reshape(-1, 12).bool().cpu(),
+                    sg=b.sg_ind.reshape(-1).cpu(), radius=b.radius.reshape(-1).detach().cpu().double())
+
     def _basin_kernel_table(self):
         """noised_prior.live_kernel 'basin': per prior row, its basin's draw centre p [12] and handedness, and the
         factor L [12, 12] of the draw x = p + L z in p's own cell parameters (docs/design/basin_set.md section 4), from
         the basin's stored Hessian of the physical energy in run units (basin_H, written by build_noised_prior
-        --basins): L L^T = live_tau kT (H on basin_live)^-1, with |lambda| per mode and each mode's width capped at 1
-        in coordinates scaled by noised_prior.live_caps (Angstrom, radian, fraction, radian per block). No energy
-        call."""
+        --basins), shaped by noised_prior.live_shape (noised_prior.basin_factors: 'hessian' L L^T = live_tau kT
+        (H on basin_live)^-1, 'iso' the same expected excess spread evenly; modes held at width 1 in coordinates
+        scaled by noised_prior.live_caps). No energy call."""
         s = self._noised_prior_settings
         b = self.prior_dataset.batch
-        missing = [k for k in ('basin_p', 'basin_hand', 'basin_H', 'basin_live') if not hasattr(b, k)]
-        if missing:
-            raise ValueError(f"noised_prior.live_kernel 'basin' needs a basin-set build (build_noised_prior --basins); "
-                             f"the prior rows lack {missing}")
-        p = torch.as_tensor(b.basin_p, dtype=torch.float64).reshape(-1, 12).cpu()
-        H = torch.as_tensor(b.basin_H, dtype=torch.float64).reshape(-1, 12, 12).cpu()
-        live = torch.as_tensor(b.basin_live).reshape(-1, 12).bool().cpu()
-        caps = torch.tensor(list(s['live_caps']), dtype=torch.float64).repeat_interleave(3)
+        B = self._basin_rows(b, "noised_prior.live_kernel 'basin'")
         kT, tau = float(self.energy_function.temperature), float(s['live_tau'])
-        Dg = torch.diag(caps)
-        L = torch.zeros_like(H)
-        for i in range(H.shape[0]):
-            m = live[i].nonzero().flatten()
-            Hs = (Dg @ H[i] @ Dg)[m][:, m] / kT
-            lam, V = torch.linalg.eigh(0.5 * (Hs + Hs.T))
-            w = torch.sqrt(tau / lam.abs().clamp_min(tau)).clamp(max=1.0)
-            Li = torch.zeros(12, 12, dtype=torch.float64)
-            Li[m[:, None], m] = V * w[None, :]
-            L[i] = Dg @ Li
-        self._basin = dict(p=p, hand=torch.as_tensor(b.basin_hand, dtype=torch.float64).reshape(-1).cpu(), L=L,
-                           sg=b.sg_ind.reshape(-1).cpu(), radius=b.radius.reshape(-1).detach().cpu().double(),
+        L = noised_prior.basin_factors(B['H'], B['live'], s['live_caps'], kT, tau, s['live_shape'])
+        self._basin = dict(p=B['p'], hand=B['hand'], L=L, sg=B['sg'], radius=B['radius'],
                            s0=self._batch_latents(b).detach().cpu().float(), draws=0, misses=0)
-        widths = torch.linalg.norm(L, dim=1)
+        widths = torch.linalg.norm(L, dim=2)   # per coordinate: the std of (L z)_i
         k = int(s['live_bank'])
         if k > 0:
             # the bank: k chart points per prior row, refreshed live_fresh_frac of each batch at a time
             rows = torch.arange(L.shape[0]).repeat_interleave(k)
             self._basin['bank'] = self._basin_fresh(rows).reshape(L.shape[0], k, -1)
-        print(f"live kernel 'basin' (tau {tau:g}, caps {list(s['live_caps'])}) over {L.shape[0]} prior rows: width "
-              f"medians per block (A, rad, frac, rad) "
+        print(f"live kernel 'basin' (shape {s['live_shape']}, tau {tau:g}, caps {list(s['live_caps'])}) over "
+              f"{L.shape[0]} prior rows: width medians per block (A, rad, frac, rad) "
               f"{[round(float(widths[:, 3 * k:3 * k + 3].median()), 4) for k in range(4)]}; bank {k} per row, "
               f"misses {self._basin['misses']} of {self._basin['draws']} draws", flush=True)
         return L
 
     def _basin_fresh(self, rows):
         """[len(rows), data_ndim] chart points of fresh draws around the prior rows' basin centres
-        (_basin_kernel_table): each draw built in the basin's own cell parameters and canonicalised into the FD chart
-        (FDCoordinates.from_params), or into the trainer latent at a uniformly drawn trainer-box image
-        (energies/molecular_crystal.py::latent_rows_from_params). A draw with no chart point is redrawn up to
-        noised_prior.live_redraws times; a row still without one gets its stored chart point, counted in
+        (_basin_kernel_table) in the run's chart (noised_prior.basin_draw). A draw with no chart point is redrawn up
+        to noised_prior.live_redraws times; a row still without one gets its stored chart point, counted in
         self._basin['misses']."""
-        from energies.molecular_crystal import latent_rows_from_params
-        fd = getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
         B = self._basin
         rows = torch.as_tensor(rows).long().flatten().cpu()
-        out = B['s0'][rows].clone()
-        pending = torch.ones(len(rows), dtype=torch.bool)
-        for _ in range(int(self._noised_prior_settings['live_redraws']) + 1):
-            idx = torch.nonzero(pending).flatten()
-            if idx.numel() == 0:
-                break
-            r = rows[idx]
-            params = B['p'][r] + torch.einsum('nij,nj->ni', B['L'][r], torch.randn(len(r), 12, dtype=torch.float64))
-            for g in sorted(set(B['sg'][r].tolist())):
-                sel = (B['sg'][r] == g).nonzero().flatten()
-                if fd:
-                    fc = self.energy_function.fd_coordinates_rows(int(g), B['radius'][r[sel]])
-                    res = fc.from_params(params[sel], B['hand'][r[sel]])
-                    ok = res.ok & torch.isfinite(res.s).all(1)
-                    pts = res.s[ok].float()
-                else:
-                    lat, ok = latent_rows_from_params(params[sel], B['hand'][r[sel]], int(g), B['radius'][r[sel]])
-                    pts = lat[ok]
-                done = idx[sel[ok]]
-                out[done, :pts.shape[1]] = pts
-                pending[done] = False
+        chart = 'fd' if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd' else 'latent'
+        pts, ok = noised_prior.basin_draw(B['p'], B['hand'], B['L'], B['sg'], B['radius'], rows, chart,
+                                          fd_coordinates=getattr(self.energy_function, 'fd_coordinates_rows', None),
+                                          redraws=int(self._noised_prior_settings['live_redraws']),
+                                          width=B['s0'].shape[1])
+        out = torch.where(ok[:, None], pts, B['s0'][rows])
         B['draws'] += len(rows)
-        B['misses'] += int(pending.sum())
+        B['misses'] += int((~ok).sum())
         return out
 
     def _basin_kernel_draw(self, latents, inds, mol_batch):
@@ -4386,7 +4363,9 @@ class Modeller:
         kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
         packing = torch.as_tensor(prior.packing_coeff).reshape(-1).double().cpu()
         groups = noised_prior.condition_groups(prior)
-        masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s)
+        window_e = noised_prior.window_energy(seed_e, kinds, groups, getattr(prior, 'basin_id', None), manifest)
+        self._noised_prior_manifest = manifest   # read by the kernel readouts' fresh gap (_kernel_readouts)
+        masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s, window_e=window_e)
         keep = masks['train'] & torch.isfinite(log_r)
         n_groups = int(groups.max()) + 1
         kept_per = torch.bincount(groups[keep], minlength=n_groups)
@@ -4396,8 +4375,11 @@ class Modeller:
         self.prior_heldout_batch = pick(masks['heldout'] & torch.isfinite(log_r))
         self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
         print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
-              f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} at "
-              f"10^U({manifest.get('log_lo')}, {manifest.get('log_hi')}) and T {manifest.get('temperature')}); "
+              f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} "
+              + (f"basin-kernel children ({manifest.get('basin_kernel')}, windowed by their basin)"
+                 if manifest.get('child_kernel') == 'basin' else
+                 f"at 10^U({manifest.get('log_lo')}, {manifest.get('log_hi')})")
+              + f" and T {manifest.get('temperature')}); "
               f"training on {int(keep.sum())} rows of kinds {list(s['train_kinds'])} within {s['window_kT']} kT "
               f"(T {T:g}) of their condition floor and packing {s['packing_window']}; held-out anchor-group rows "
               f"{int(masks['heldout'].sum())}, clean training anchors {int(masks['anchors'].sum())}; conditions "
@@ -9857,18 +9839,122 @@ class Modeller:
                     if bool(ok_ref.any()):
                         out[f'{key}_ref'] = float(ref[ok_ref].mean())
                 out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
+            out.update(self._kernel_readouts(n_rows, chunk))
         finally:
             policy.train(was_training)
         # the generalisation gaps (nats; one chart, so no reference term): held-out molecules against the training
-        # molecules' crystals (inn_modeller.py's eval_test/mle_gap), and held-out anchor groups against training rows
-        for gap, (a, b) in {'eval_test/mle_gap': ('eval_test/mle', 'eval_bwd/mle_mol_crystals'),
-                            'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle')}.items():
+        # molecules' crystals (inn_modeller.py's eval_test/mle_gap), held-out anchor groups against training rows,
+        # held-out basins' kernel draws against the training basins', and fresh kernel draws against the points
+        # trained on (only where those are draws of the readout kernel itself: _fresh_gap_source)
+        gaps = {'eval_test/mle_gap': ('eval_test/mle', 'eval_bwd/mle_mol_crystals'),
+                'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle'),
+                'eval_bwd/mle_kernel_heldout_gap': ('eval_bwd/mle_kernel_heldout', 'eval_bwd/mle_kernel')}
+        trained = self._fresh_gap_source()
+        if trained is not None:
+            gaps['eval_bwd/mle_fresh_gap'] = ('eval_bwd/mle_kernel', trained)
+        for gap, (a, b) in gaps.items():
             if a in out and b in out:
                 out[gap] = out[a] - out[b]
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
-                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', '_ref', '_gap'))), flush=True)
+                  ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',
+                   'mle_bank', '_ref', '_gap'))), flush=True)
         return out
+
+    #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature
+    KERNEL_READOUT_TAU = 1.0
+
+    def _kernel_readouts(self, n_rows, chunk):
+        """density_readouts' sets on basin-kernel draws, for a basin-set build (rows carrying basin tags):
+          eval_bwd/mle_kernel           fresh draws around the training rows' basins
+          eval_bwd/mle_kernel_heldout   fresh draws around the held-out basins (prior_heldout_batch)
+          eval_bwd/mle_bank             points of the live kernel's bank (noised_prior.live_bank), what the MLE
+                                        draw reads; the bank's current values at fixed slots
+        each with `<key>_nonfinite_frac`. density_readouts takes the gaps. The kernel draws are the 'hessian' shape at
+        tau KERNEL_READOUT_TAU with the run's live_caps whatever the run's own live kernel (noised_prior.basin_factors,
+        basin_draw, factored for the drawn basins only): up to n_rows draws per set, the rows drawn uniformly with
+        replacement, drawn once (seed + 5) and read at every eval; draws with no chart point are dropped. -log q only:
+        the points are not stored rows, so no reference term."""
+        b = self.prior_dataset.batch
+        if not hasattr(b, 'basin_p'):
+            return {}
+        s = getattr(self, '_noised_prior_settings', None) or noised_prior.DEFAULTS
+        ef = self.energy_function
+        chart = 'fd' if getattr(ef, 'crystal_coordinates', 'latent') == 'fd' else 'latent'
+        out = {}
+        for key, batch in (('eval_bwd/mle_kernel', b),
+                           ('eval_bwd/mle_kernel_heldout', getattr(self, 'prior_heldout_batch', None))):
+            if batch is None or int(batch.num_graphs) == 0:
+                continue
+            if key not in self._readout_rows:
+                g = torch.Generator().manual_seed(int(self.args.seed) + 5)
+                rows = torch.randint(int(batch.num_graphs), (n_rows,), generator=g)
+                u, inv = torch.unique(rows, return_inverse=True)
+                B = self._basin_rows(batch.subsample_new_batch(u.to(batch.ptr.device)), f'density readout {key}')
+                L = noised_prior.basin_factors(B['H'], B['live'], s['live_caps'], float(ef.temperature),
+                                               self.KERNEL_READOUT_TAU, 'hessian')
+                width = int(self._batch_latents(batch.subsample_new_batch(u[:1].to(batch.ptr.device))).shape[1])
+                pts, ok = noised_prior.basin_draw(B['p'], B['hand'], L, B['sg'], B['radius'], inv, chart,
+                                                  fd_coordinates=getattr(ef, 'fd_coordinates_rows', None),
+                                                  redraws=int(s['live_redraws']), width=width, generator=g)
+                self._readout_rows[key] = (rows[ok], pts[ok])
+            rows, pts = self._readout_rows[key]
+            self._put_nll(out, key, self._nll_at(batch, rows, lambda i, j: pts[i:j], chunk))
+        bank = (getattr(self, '_basin', None) or {}).get('bank')
+        if bank is not None:
+            if 'eval_bwd/mle_bank' not in self._readout_rows:
+                g = torch.Generator().manual_seed(int(self.args.seed) + 6)
+                self._readout_rows['eval_bwd/mle_bank'] = (torch.randint(bank.shape[0], (n_rows,), generator=g),
+                                                           torch.randint(bank.shape[1], (n_rows,), generator=g))
+            rows, slots = self._readout_rows['eval_bwd/mle_bank']
+            self._put_nll(out, 'eval_bwd/mle_bank', self._nll_at(b, rows, lambda i, j: bank[rows[i:j], slots[i:j]],
+                                                                 chunk))
+        return out
+
+    def _fresh_gap_source(self):
+        """The density readout eval_bwd/mle_fresh_gap subtracts from eval_bwd/mle_kernel, or None: the points the run
+        trains on, when they are draws of the readout kernel itself ('hessian', tau KERNEL_READOUT_TAU, the run's
+        live_caps), so the gap is memorisation of the draws within the trained basins and nothing else. The live
+        kernel's bank under live_kernel 'basin'; the stored rows when live_kernel is off and the run trains on the
+        children of a basin-kernel build drawn with that kernel (manifest child_kernel 'basin')."""
+        s = getattr(self, '_noised_prior_settings', None)
+        if s is None:
+            return None
+        if s['live_kernel'] == 'basin':
+            same = s['live_shape'] == 'hessian' and float(s['live_tau']) == self.KERNEL_READOUT_TAU
+            return 'eval_bwd/mle_bank' if same and int(s['live_bank']) > 0 else None
+        if s['live_kernel'] is not None:
+            return None
+        m = getattr(self, '_noised_prior_manifest', None) or {}
+        k = m.get('basin_kernel') or {}
+        same = (m.get('child_kernel') == 'basin' and k.get('shape') == 'hessian'
+                and float(k.get('tau', -1)) == self.KERNEL_READOUT_TAU
+                and [float(c) for c in k.get('caps', [])] == [float(c) for c in s['live_caps']])
+        return 'eval_bwd/mle' if same and list(s['train_kinds']) == ['child'] else None
+
+    @staticmethod
+    def _put_nll(out, key, value):
+        """Write _nll_at's (mean, nonfinite share) under key and key_nonfinite_frac."""
+        mean, frac = value
+        if mean is not None:
+            out[key] = mean
+        out[f'{key}_nonfinite_frac'] = frac
+
+    def _nll_at(self, batch, rows, points, chunk):
+        """(mean -log q in nats over the finite values or None, share of non-finite values) of the policy at chart
+        points points(i, j) (rows i..j) conditioned on batch's rows `rows`."""
+        ef = self.energy_function
+        nll = []
+        for i in range(0, rows.numel(), chunk):
+            sub = batch.subsample_new_batch(rows[i:i + chunk].to(batch.ptr.device)).to(self.device)
+            x = points(i, i + chunk).to(self.device)
+            sub, _, condition, _ = ef.condition_samples(
+                sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
+            nll.append(-self.gfn_model.log_density(x, condition, sub).float().flatten().cpu())
+        nll = torch.cat(nll) if nll else torch.zeros(0)
+        ok = torch.isfinite(nll)
+        frac = float((~ok).float().mean()) if nll.numel() else 1.0
+        return (float(nll[ok].mean()) if bool(ok.any()) else None), frac
 
     def update_heldout_gate(self, metrics):
         """Held-out plateau gate, publishing gates/heldout_flat once per evaluation (cfg heldout_gate,

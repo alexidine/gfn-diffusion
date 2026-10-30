@@ -20,6 +20,11 @@ direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded,
 10^h for h in PILOT_GRID, and log_hi is the h whose median seed-energy excess over the parent
 (MolecularCrystal.seed_energy_from, in kT at the run's temperature) lies nearest --window_kT; the table goes in the
 manifest. Every finite child is kept whatever its energy: the energy and packing windows are load-time settings.
+With --basins and --child_kernel basin, the K children of a basin are instead draws of its kernel
+(noised_prior.basin_factors at --shape, --tau, --caps; noised_prior.basin_draw into the trainer latent at a uniformly
+drawn trainer-box image; basin_kick): no calibration, no image step, a draw with no chart point after --redraws
+redraws dropped and counted (manifest basin_kernel.misses). The manifest's child_kernel 'basin' makes the loader's energy
+window read each child at its basin's energy (noised_prior.window_energy); the packing window still cuts draws one by one.
 
 IMAGES (owner rule 2026-09-28: noise first, then the normaliser images). On space group 2, Z' 1, handedness +1
 (data_processing/symmetrize_prior.py's scope), each child is written as one of its valid descriptions drawn
@@ -47,6 +52,8 @@ from data_processing.molecule_subset import keep_molecules  # noqa: E402
 from data_processing.symmetrize_prior import ROWS_PER_SOURCE, image_centroids  # noqa: E402
 
 PILOT_ROWS = 2048
+BASIN_ROUND_TRIP_TOL = 1e-3   # latent units: a decoded basin draw's latent_params against the latent it was decoded from
+PHI_LATENT = 10               # Z' = 1 latent row of the orientation's azimuth, periodic on [-1, 1]
 PILOT_GRID = tuple(-2.5 + 0.125 * i for i in range(17))   # 10^-2.5 .. 10^-0.5
 
 
@@ -63,7 +70,8 @@ def build_parser():
     p.add_argument('--out', required=True)
     p.add_argument('--set', action='append', default=[], dest='overrides', metavar='KEY=VALUE')
     p.add_argument('--k', type=int, default=10, help='children per anchor')
-    p.add_argument('--log_lo', type=float, default=-2.5)
+    p.add_argument('--log_lo', type=float, default=None, help="--child_kernel iso: the iso tile's lowest log10 radius "
+                   "(default -2.5)")
     p.add_argument('--log_hi', default='auto', help="'auto' (pilot calibration) or a number")
     p.add_argument('--window_kT', type=float, default=6.0, help='the calibration target, the load-time window')
     p.add_argument('--heldout_frac', type=float, default=0.05)
@@ -73,6 +81,17 @@ def build_parser():
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--chunk', type=int, default=4096, help='rows per scoring call')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--child_kernel', choices=['iso', 'basin'], default='iso',
+                   help="'iso': the latent iso tile (--log_lo/--log_hi); 'basin' (with --basins): draws of each "
+                        "basin's kernel (noised_prior.basin_factors/basin_draw)")
+    p.add_argument('--tau', type=float, default=None, help="--child_kernel basin: the kernel's tau (default 1: the "
+                   "basin's thermal ellipsoid at the run's T)")
+    p.add_argument('--shape', choices=list(NP.LIVE_SHAPES), default=None,
+                   help='--child_kernel basin: its shape (default hessian)')
+    p.add_argument('--caps', type=float, nargs=4, default=None,
+                   help='--child_kernel basin: the width caps per block (A, rad, fraction, rad)')
+    p.add_argument('--redraws', type=int, default=None,
+                   help='--child_kernel basin: redraws of a draw with no chart point before it is dropped')
     p.add_argument('--limit_anchors', type=int, default=None, help='the first N anchors only (tests)')
     p.add_argument('--harvest', default=None, help='a glob of train.py harvest shards (cfg:harvest) to merge in')
     return p
@@ -151,6 +170,54 @@ def kick(batch, lo, hi, device):
     b = batch.to(device)
     mag = b.log_noise_latent_parameters(lo, hi)
     return b, mag
+
+
+def check_child_kernel_args(args):
+    """Refuse flags the chosen --child_kernel does not read, fill the defaults of those it does, and validate the basin
+    kernel's (as noised_prior.settings does the trainer's)."""
+    kernel_flags = {k: getattr(args, k) for k in ('tau', 'shape', 'caps', 'redraws') if getattr(args, k) is not None}
+    if args.child_kernel == 'basin':
+        if args.basins is None or str(args.log_hi) != 'auto' or args.images != 'auto' or args.log_lo is not None:
+            raise SystemExit("--child_kernel basin needs --basins, and takes no --log_lo, --log_hi or --images (its "
+                             "draws are the basin kernel's, each at a uniformly drawn trainer-box image)")
+        args.tau = 1.0 if args.tau is None else args.tau
+        args.shape = 'hessian' if args.shape is None else args.shape
+        args.caps = list(NP.DEFAULTS['live_caps']) if args.caps is None else list(args.caps)
+        args.redraws = NP.DEFAULTS['live_redraws'] if args.redraws is None else args.redraws
+        if not (math.isfinite(args.tau) and args.tau > 0) or not all(math.isfinite(c) and c > 0 for c in args.caps):
+            raise SystemExit(f"--tau and every --caps entry must be finite and > 0, got {args.tau}, {args.caps}")
+        if args.redraws < 0:
+            raise SystemExit(f"--redraws must be >= 0, got {args.redraws}")
+    else:
+        if kernel_flags:
+            raise SystemExit(f"{sorted('--' + k for k in kernel_flags)} are read by --child_kernel basin only")
+        args.log_lo = -2.5 if args.log_lo is None else args.log_lo
+
+
+def basin_kick(anchors, rep, L, args, generator):
+    """(batch, rows, misses) for --child_kernel basin: one draw of the basin kernel (noised_prior.basin_draw, factor L
+    from noised_prior.basin_factors) per entry of rep (anchor indices), canonicalised into the trainer latent at a
+    uniformly drawn trainer-box image and decoded onto a copy of its anchor (latent_to_cell_params; the latent lies
+    inside the decode clamp, so the crystal is the draw). A draw with no latent after --redraws redraws is dropped:
+    rows are the anchor index of each kept draw, misses [n_anchors] the dropped draws per anchor."""
+    p = torch.as_tensor(anchors.basin_p, dtype=torch.float64).reshape(-1, 12).cpu()
+    hand = torch.as_tensor(anchors.basin_hand, dtype=torch.float64).reshape(-1).cpu()
+    sg = torch.as_tensor(anchors.sg_ind).reshape(-1).cpu()
+    radius = torch.as_tensor(anchors.radius).reshape(-1).double().cpu()
+    lat, ok = NP.basin_draw(p, hand, L, sg, radius, rep, 'latent', redraws=args.redraws, generator=generator)
+    misses = torch.bincount(rep[~ok], minlength=anchors.num_graphs)
+    rows = rep[ok]
+    b = anchors.subsample_new_batch(rows).to(args.device)
+    b.latent_to_cell_params(lat[ok].to(args.device))
+    # score() builds from latent_params: it must read back the draw, or the scored crystal is another one
+    back = b.latent_params(gauge_fix_free_axes=True).detach().float().cpu()
+    d = (back - lat[ok]).abs()
+    d[:, PHI_LATENT] = torch.minimum(d[:, PHI_LATENT], 2.0 - d[:, PHI_LATENT])   # the azimuth is periodic: -1 is +1
+    off = d.max(1).values if len(rows) else torch.zeros(0)
+    if bool((off > BASIN_ROUND_TRIP_TOL).any()):
+        raise SystemExit(f"basin children: {int((off > BASIN_ROUND_TRIP_TOL).sum())} decoded draws do not read back "
+                         f"their latent (worst {float(off.max()):.3g} > {BASIN_ROUND_TRIP_TOL})")
+    return b, rows, misses
 
 
 def calibrate(ef, anchors, e_anchor, train_idx, T, args, rng):
@@ -307,6 +374,8 @@ def main(argv=None):
 
     if (args.source is None) == (args.basins is None):
         raise SystemExit('give exactly one of --source and --basins')
+    basin_children = args.child_kernel == 'basin'
+    check_child_kernel_args(args)
     basins = None
     if args.basins is not None:
         anchors, tsf, what, basins = load_basin_anchors(args, run_args)
@@ -372,30 +441,47 @@ def main(argv=None):
     train_idx = torch.nonzero(~held).flatten().numpy()
     print(f"held out: {int(held.sum())} of {anchors.num_graphs} anchors over {len(seen)} conditions", flush=True)
 
-    if str(args.log_hi) == 'auto':
+    kernel = None
+    if basin_children:
+        log_hi, table = None, None
+        kernel = dict(shape=args.shape, tau=args.tau, caps=list(args.caps), redraws=args.redraws)
+        L = NP.basin_factors(anchors.basin_H, anchors.basin_live, args.caps, T, args.tau, args.shape)
+        widths = torch.linalg.norm(L, dim=2)   # per coordinate: the std of (L z)_i
+        print(f"children: K {args.k} per basin from its kernel ({args.shape}, tau {args.tau:g}, caps "
+              f"{list(args.caps)}): width medians per block (A, rad, frac, rad) "
+              f"{[round(float(widths[:, 3 * j:3 * j + 3].median()), 4) for j in range(4)]}", flush=True)
+    elif str(args.log_hi) == 'auto':
         print(f"calibrating log_hi on {min(PILOT_ROWS, len(train_idx))} training anchors (target median excess "
               f"{args.window_kT:g} kT at T {T:g})", flush=True)
         log_hi, table = calibrate(ef, anchors, e_anchor, train_idx, T, args, rng)
     else:
         log_hi, table = float(args.log_hi), None
-    print(f"children: K {args.k} per anchor at 10^U({args.log_lo:g}, {log_hi:g})", flush=True)
+    if not basin_children:
+        print(f"children: K {args.k} per anchor at 10^U({args.log_lo:g}, {log_hi:g})", flush=True)
 
     sg = set(torch.as_tensor(anchors.sg_ind).reshape(-1).tolist())
     zp = set(torch.as_tensor(anchors.z_prime).reshape(-1).tolist())
     hand = set(torch.as_tensor(anchors.aunit_handedness).reshape(-1).tolist())
-    images = args.images == 'auto' and sg == {2} and zp == {1} and hand == {1.0}
-    if args.images == 'auto' and not images:
+    images = not basin_children and args.images == 'auto' and sg == {2} and zp == {1} and hand == {1.0}
+    if args.images == 'auto' and not images and not basin_children:
         print(f"images: not applied (space groups {sorted(sg)}, Z' {sorted(zp)}, handedness {sorted(hand)}: outside "
               f"symmetrize_prior's scope)", flush=True)
 
     t0 = time.time()
     torch.manual_seed(args.seed + 1)
+    gen = torch.Generator().manual_seed(args.seed + 1)
     children, parents, mags, n_face = [], [], [], 0
+    misses = torch.zeros(anchors.num_graphs, dtype=torch.long)
     per_call = max(1, args.chunk // max(args.k, 1))
     for lo in range(0, anchors.num_graphs if args.k > 0 else 0, per_call):
         ia = torch.arange(lo, min(lo + per_call, anchors.num_graphs))
         rep = ia.repeat_interleave(args.k)
-        b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device)
+        if basin_children:
+            b, rep, miss = basin_kick(anchors, rep, L, args, gen)
+            misses += miss
+            mag = torch.zeros(len(rep))
+        else:
+            b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device)
         scored = score(ef, b, T, args.device, args.chunk)
         for s in scored:
             if images:
@@ -410,7 +496,11 @@ def main(argv=None):
     parents = torch.cat(parents) if parents else torch.zeros(0, dtype=torch.long)
     mags = torch.cat(mags) if mags else torch.zeros(0)
     print(f"children scored in {time.time() - t0:.0f} s: {0 if children is None else children.num_graphs} rows"
-          + (f", images drawn ({n_face} on an x face)" if images else ""), flush=True)
+          + (f", images drawn ({n_face} on an x face)" if images else "")
+          + (f"; {int(misses.sum())} draws with no chart point dropped (most of one basin: {int(misses.max())})"
+             if basin_children and anchors.num_graphs else ""), flush=True)
+    if kernel is not None:
+        kernel.update(misses=int(misses.sum()), misses_max_per_basin=int(misses.max()) if misses.numel() else 0)
 
     n_a = anchors.num_graphs
     anchors.add_graph_attr(torch.full((n_a,), NP.KIND_ANCHOR, dtype=torch.long), 'noised_kind')
@@ -441,8 +531,9 @@ def main(argv=None):
     e_all = seed_energy(ef, out, T, args.device)
     groups_all = NP.condition_groups(out)
     kind, spl = NP.tag(out, 'noised_kind'), NP.tag(out, 'noised_split')
-    floor = NP.condition_floor(e_all, groups_all, (spl == NP.SPLIT_TRAIN) & torch.isfinite(e_all))
-    du = (e_all - floor) / T
+    we = NP.window_energy(e_all, kind, groups_all, getattr(out, 'basin_id', None), {'child_kernel': args.child_kernel})
+    floor = NP.condition_floor(we, groups_all, (spl == NP.SPLIT_TRAIN) & torch.isfinite(we))
+    du = (we - floor) / T
     child_tr = (kind == NP.KIND_CHILD) & (spl == NP.SPLIT_TRAIN) & torch.isfinite(du)
     inside = float((du[child_tr] <= args.window_kT).double().mean()) if child_tr.any() else math.nan
     below_parent = ((e_all[n_a:n_a + n_c] - e_anchor[parents]) / T < -args.window_kT)
@@ -457,7 +548,9 @@ def main(argv=None):
         basin_set=None if basins is None else dict(path=basins['path'], header=basins['header'],
                                                    to_run_units=basins['factor'],
                                                    dropped_off_chart=basins['dropped_off_chart']),
-        k=args.k, log_lo=args.log_lo, log_hi=log_hi, calibration=table, window_kT_target=args.window_kT,
+        child_kernel=args.child_kernel, basin_kernel=kernel,
+        k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
+        window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),
         counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(seen),

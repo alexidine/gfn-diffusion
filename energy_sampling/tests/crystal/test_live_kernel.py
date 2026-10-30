@@ -172,3 +172,103 @@ def test_latent_rows_refuse_a_cell_outside_the_length_box():
     x, ok = latent_rows_from_params(torch.cat([torch.tensor([P_MIPCAS], dtype=torch.float64), far]),
                                     torch.ones(2), 2, torch.full((2,), RADIUS))
     assert ok.tolist() == [True, False] and bool((x[1] == 0).all())
+
+
+def _pd_hessians(n=4, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    M = torch.randn(n, 12, 12, generator=g, dtype=torch.float64)
+    return M @ M.transpose(1, 2) * 50 + 5 * torch.eye(12, dtype=torch.float64)
+
+
+def test_the_hessian_shape_is_the_thermal_ellipsoid_where_no_mode_is_held():
+    H = 1e2 * _pd_hessians()
+    L = noised_prior.basin_factors(H, torch.ones(4, 12, dtype=torch.bool), (1.0, 0.2, 0.1, 0.5), 2.5, 1.0, 'hessian')
+    assert torch.allclose(L @ L.transpose(1, 2), 2.5 * torch.linalg.inv(H), rtol=1e-8, atol=1e-12)
+
+
+def test_the_iso_shape_spends_the_hessian_shapes_expected_excess_evenly():
+    """'iso' = sigma I in cap-scaled coordinates, sigma chosen so the quadratic model's expected excess
+    1/2 tr(L^T H L) / kT equals the 'hessian' shape's, held modes included; sigma <= 1 (its cap)."""
+    H, caps, kT = _pd_hessians(), (1.0, 0.2, 0.1, 0.5), 2.5
+    live = torch.ones(4, 12, dtype=torch.bool)
+    Lh = noised_prior.basin_factors(H, live, caps, kT, 1.0, 'hessian')
+    Li = noised_prior.basin_factors(H, live, caps, kT, 1.0, 'iso')
+    excess = lambda L: 0.5 * torch.einsum('nji,njk,nkl->nil', L, H / kT, L).diagonal(dim1=1, dim2=2).sum(1)
+    assert torch.allclose(excess(Lh), excess(Li), rtol=1e-9)
+    D = torch.tensor(caps, dtype=torch.float64).repeat_interleave(3)
+    scaled = Li / D[None, :, None]
+    sigma = scaled[:, 0, 0]
+    assert torch.allclose(scaled, sigma[:, None, None] * torch.eye(12, dtype=torch.float64), atol=1e-12)
+    assert bool((sigma > 0).all() & (sigma <= 1).all())
+    # an indefinite Hessian (a saddle): the match is on |Hs|, the quadratic model both shapes spend tau / 2 nats in
+    D_ = torch.diag(D)
+    Hs = D_ @ H[0] @ D_ / kT
+    lam, V = torch.linalg.eigh(Hs)
+    lam[:2] = -torch.tensor([50.0, 0.2], dtype=torch.float64)
+    Hi = (torch.linalg.inv(D_) @ (V * lam) @ V.T @ torch.linalg.inv(D_) * kT)[None]
+    absH = (torch.linalg.inv(D_) @ (V * lam.abs()) @ V.T @ torch.linalg.inv(D_))[None]   # |H| / kT
+    ex = lambda L: 0.5 * torch.einsum('nji,njk,nkl->nil', L, absH, L).diagonal(dim1=1, dim2=2).sum(1)
+    Lh1 = noised_prior.basin_factors(Hi, live[:1], caps, kT, 1.0, 'hessian')
+    Li1 = noised_prior.basin_factors(Hi, live[:1], caps, kT, 1.0, 'iso')
+    assert torch.allclose(ex(Lh1), ex(Li1), rtol=1e-9)
+    dead = live.clone()
+    dead[:, 3] = False
+    Ld = noised_prior.basin_factors(H, dead, caps, kT, 1.0, 'iso')
+    assert bool((Ld[:, 3] == 0).all() & (Ld[:, :, 3] == 0).all())
+
+
+def test_live_shape_is_refused_unless_the_basin_kernel_reads_it():
+    with pytest.raises(ValueError, match='live_shape must be one of'):
+        noised_prior.settings(_args(live_kernel='basin', live_shape='round'))
+    with pytest.raises(ValueError, match="live_kernel 'basin' only"):
+        noised_prior.settings(_args(live_shape='iso'))
+    assert noised_prior.settings(_args(live_kernel='basin', live_shape='iso'))['live_shape'] == 'iso'
+
+
+def test_iso_basin_draws_land_on_chart_points_too():
+    torch.manual_seed(0)
+    m, s0 = _basin_modeller(H_scale=1e4)
+    m._noised_prior_settings['live_shape'] = 'iso'
+    m._basin_kernel_table()
+    x = m._basin_fresh(torch.zeros(100, dtype=torch.long))
+    assert m._basin['misses'] == 0 and bool((x.abs() <= 1).all())
+    assert float((x - s0[0]).abs().max()) > 0
+
+
+def test_basin_draw_is_reproducible_under_a_generator_and_drops_nothing_silently():
+    pytest.importorskip('mxtaltools.crystal_fd')
+    from energy_sampling.energies.fd_coordinates import FDCoordinates
+    p = torch.tensor([P_MIPCAS] * 2, dtype=torch.float64)
+    L = noised_prior.basin_factors(1e4 * torch.eye(12).expand(2, 12, 12), torch.ones(2, 12, dtype=torch.bool),
+                                   (1.0, 0.2, 0.1, 0.5), 2.5, 1.0)
+    args = (p, torch.ones(2), L, torch.full((2,), 2), torch.full((2,), RADIUS, dtype=torch.float64),
+            torch.tensor([0, 1, 1, 0]))
+    fdc = lambda sg, r: FDCoordinates(int(sg), float(r[0]))
+    for chart in ('fd', 'latent'):
+        a, ok_a = noised_prior.basin_draw(*args, chart, fd_coordinates=fdc, generator=torch.Generator().manual_seed(3))
+        b, ok_b = noised_prior.basin_draw(*args, chart, fd_coordinates=fdc, generator=torch.Generator().manual_seed(3))
+        assert torch.equal(a, b) and torch.equal(ok_a, ok_b) and bool(ok_a.all())
+    with pytest.raises(ValueError, match="'fd' or 'latent'"):
+        noised_prior.basin_draw(*args, 'asu')
+
+
+def test_the_fresh_gap_is_published_only_against_draws_of_the_readout_kernel():
+    m = Modeller.__new__(Modeller)
+    assert m._fresh_gap_source() is None                              # not a pre-noised prior
+    m._noised_prior_settings = noised_prior.settings(_args(live_kernel='basin'))
+    assert m._fresh_gap_source() == 'eval_bwd/mle_bank'
+    for block in (dict(live_kernel='basin', live_shape='iso'), dict(live_kernel='basin', live_tau=0.5),
+                  dict(live_kernel='basin', live_bank=0), dict(live_kernel='hessian')):
+        m._noised_prior_settings = noised_prior.settings(_args(**block))
+        assert m._fresh_gap_source() is None, block
+    m._noised_prior_settings = noised_prior.settings(_args(train_kinds=['child']))
+    caps = list(noised_prior.DEFAULTS['live_caps'])
+    m._noised_prior_manifest = dict(child_kernel='basin', basin_kernel=dict(shape='hessian', tau=1.0, caps=caps))
+    assert m._fresh_gap_source() == 'eval_bwd/mle'
+    for man in (dict(child_kernel='iso'), dict(child_kernel='basin', basin_kernel=dict(shape='iso', tau=1.0, caps=caps)),
+                dict(child_kernel='basin', basin_kernel=dict(shape='hessian', tau=1.0, caps=[2.0] + caps[1:]))):
+        m._noised_prior_manifest = man
+        assert m._fresh_gap_source() is None, man
+    m._noised_prior_manifest = dict(child_kernel='basin', basin_kernel=dict(shape='hessian', tau=1.0, caps=caps))
+    m._noised_prior_settings = noised_prior.settings(_args(train_kinds=['child', 'anchor']))
+    assert m._fresh_gap_source() is None

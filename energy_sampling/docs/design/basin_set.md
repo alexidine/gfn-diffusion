@@ -10,7 +10,11 @@ committed locally in MXtalTools); `build_noised_prior.py --basins` (anchors only
 every row, off-chart basins dropped and counted); `noised_prior.live_kernel: 'basin'` on both charts with a rolling
 bank (`train.py::Modeller._basin_kernel_table`, `._basin_fresh`, `._basin_kernel_draw`; the latent chart through
 `energies/molecular_crystal.py::latent_rows_from_params`, composed of crystal_fd's canonicaliser, trainer-box images
-and `LatentV1Chart.latents`). Not built: children drawn by the basin kernel, the
+and `LatentV1Chart.latents`); the kernel shared by trainer and builder (`noised_prior.py::basin_factors`,
+`::basin_draw`) with the shape `cfg:noised_prior.live_shape` (`'hessian'` or `'iso'`, the same expected excess);
+children drawn by the basin kernel (`build_noised_prior.py --child_kernel basin`, `basin_kick`), windowed by their
+basin (`noised_prior.py::window_energy`); readouts on kernel draws (`train.py::Modeller._kernel_readouts`). Not
+built: the
 `log_mass_laplace` column, the conditions file, the molecule coordinate match, the flat-molecule twin map (section
 2), and `FORMAT_VERSION` 2 (the basin tags are optional row attributes of version 1).*
 
