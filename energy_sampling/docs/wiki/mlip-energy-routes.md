@@ -2,7 +2,7 @@
 
 *Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04. Sources at the end.*
 
-Two of the `cfg:energy_function` values name a machine-learned interatomic potential as the crystal energy: `uma` (fairchem UMA, loaded through `pretrained_mlip.load_predict_unit`) and `mace` (a MACE checkpoint loaded by `AL_mace_utils.py::load_mace_model`). This page covers how a batch of sampled crystals becomes a number on those two routes: the dispatch, the graph each backend is handed, the lattice energy's definition, and how the call fails. The reward built on top of that number is [reward-construction](reward-construction.md); the force field behind `elj` is [crystal-force-fields](crystal-force-fields.md); the occupancy sensors the timers feed are [gpu-occupancy](gpu-occupancy.md).
+Two of the `cfg:energy_function` values name a machine-learned interatomic potential as the crystal energy: `uma` (a fairchem checkpoint loaded through `pretrained_mlip.load_predict_unit`; the one this repository's configs name is eSEN-S, not UMA: see "The checkpoint behind `uma`" below) and `mace` (a MACE checkpoint loaded by `AL_mace_utils.py::load_mace_model`). This page covers how a batch of sampled crystals becomes a number on those two routes: the dispatch, the graph each backend is handed, the lattice energy's definition, and how the call fails. The reward built on top of that number is [reward-construction](reward-construction.md); the force field behind `elj` is [crystal-force-fields](crystal-force-fields.md); the occupancy sensors the timers feed are [gpu-occupancy](gpu-occupancy.md).
 
 ## Dispatch
 
@@ -17,6 +17,22 @@ The crystal leg reaches `uma_utils.py::compute_crystal_uma_on_mxt_batch`. That f
 The neighbour list is external by default. `crystal_inference_settings` sets `external_graph_gen` from `USE_UMA_EXTERNAL_GRAPH` (`MXT_UMA_EXTERNAL_GRAPH`, default on), and the call site reads the predictor's own setting through `_predictor_wants_external_graph` rather than the module flag. When it is on, `attach_external_graph` fills `edge_index`, `cell_offsets` and `nedges` from `pbc_neighbours.py::batched_pbc_neighbour_list` at the radius read off the backbone, remapping index order and offset ownership to fairchem's convention and sorting edges by graph. When it is off, the model runs its own `otf_graph` inside the forward. The rest of the settings object is `tf32=True`, `merge_mole=False`, `internal_graph_gen_version=2`, and `activation_checkpointing`, `compile` and `edge_chunk_size` from the three `cfg:energy_config.mlip_*` keys. `_build_uma_crystal_predictor` overrides `direct_forces`, `regress_forces` and `regress_stress` to `False` and pops the `omc_forces` and `omc_stress` tasks. The three `mlip_*` keys are read on the `uma` branch of `MolecularCrystal.__init__` only, and setting any of them off its default prints a one-line notice there.
 
 `drain_uma_phase_timing` reports the seconds accumulated since the last drain under `guard`, `build`, `forward` and `ext_graph`, plus the crash counters as zero when nothing crashed, and returns an empty dict when `compute_crystal_uma_on_mxt_batch` completed no call since the last drain. A `graph` phase, nested inside `forward` and excluded from the total, is reported only when `MXT_UMA_GRAPH_TIMER` (default off) installed the wrapper on fairchem's two `generate_graph` bindings and it fired.
+
+## The checkpoint behind `uma`
+
+The `uma` route loads whatever checkpoint `cfg:mlip_path` names; `_build_uma_crystal_predictor` does not check which model it is. Every tracked config and analysis script in this repository that names a checkpoint for the route names `esen_s.pt` (`/scratch/mk8347/models/uma/esen_s.pt` on the cluster, `D:/crystal_datasets/esen_s.pt` locally), and none names a UMA checkpoint. Among them are the production generators `configs/prod_aug26/make.py` and `configs/prod_t100_p2/make.py`, the paper scoring under `eval/paper1_results/`, and the example in the `cfg:mlip_path` comment of `configs/mk_dev.yaml`.
+
+`esen_s.pt` is not UMA. It is eSEN-S, the baseline model released with the OMC25 molecular-crystal dataset (Hugging Face `facebook/OMC25`, file `checkpoints/esen_s.pt`). Its stored `model_config` and that of UMA-s 1.1 (`uma-s-1p1.pt`) name the same backbone class, `eSCNMDMoeBackbone`, with identical settings: 4 blocks; 128 sphere, hidden and edge channels; lmax = mmax = 2; 64 Gaussian distance functions; a 6 Å cutoff; at most 300 neighbours; energy-gradient forces and stress. Every weight tensor the two share has the same shape. They differ here:
+
+| stored setting | `esen_s.pt` (eSEN-S) | `uma-s-1p1.pt` (UMA-s 1.1) |
+|---|---|---|
+| `num_experts` | 0 | 32 |
+| `dataset_list` (training datasets) | `omc` | `oc20`, `omol`, `omat`, `odac`, `omc` |
+| parameters (count) | 6,349,348 | 146,566,852 |
+
+*Read from each checkpoint's stored `model_config` and `model_state_dict` on 2026-10-28; the parameter count is the sum of the state-dict tensor sizes.*
+
+UMA-s holds 32 copies of each of its 24 SO(2)-convolution weight matrices: two convolutions, three orders m and four blocks. A routing MLP turns a composition embedding and a dataset embedding into 32 mixing weights per system. eSEN-S holds one copy of each matrix and has no router. For crystals of one composition scored on one task, the mixing weights are the same for every row, so UMA-s then evaluates one dense network of eSEN-S's dimensions. What separates the two models' energies is their training data (OMC25 alone, against five datasets) and the expert capacity, not the representation. A result produced with `esen_s.pt` is an eSEN-S result, whatever a run or figure calls it.
 
 ## The MACE route
 
@@ -77,4 +93,4 @@ Two checks are mechanical. The first is an execution audit at construction: reso
 
 ## Sources
 
-The code above, read at the stamped commit, and the energy block of the canonical config. Repo: `docs/mlip_validation.md`, `docs/design/dependency_validation_protocol.md`, `docs/design/benchmarks.md`, `docs/findings.md` (F-053 to F-057). Memory files on the UMA and MACE routes located the code and were not used as evidence.
+The code above, read at the stamped commit, and the energy block of the canonical config. Repo: `docs/mlip_validation.md`, `docs/design/dependency_validation_protocol.md`, `docs/design/benchmarks.md`, `docs/findings.md` (F-053 to F-057). Memory files on the UMA and MACE routes located the code and were not used as evidence. The checkpoint identity rests on the stored configs and state dicts of `esen_s.pt` and `uma-s-1p1.pt`, on the `facebook/OMC25` file listing on Hugging Face (file name and byte size, 51,215,914) and on the Windows download record of `esen_s.pt`, which names that repository; the file hash was not compared, because the repository is gated. The configs naming the checkpoint were found by `git grep` on 2026-10-28.

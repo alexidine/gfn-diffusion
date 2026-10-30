@@ -45,8 +45,10 @@ includes the load, not merely the forward. The `ase.Atoms` handed to them are
 constructed from `unit_cell_pos` and `T_fc` directly — not through our fairchem
 or MACE converters — so a converter bug cannot cancel.
 
-Same checkpoints in both stacks: `esen_s.pt` (UMA),
-`acr_112025_mh1_stagetwo.model` (MACE).
+Same checkpoints in both stacks: `esen_s.pt` on the UMA route,
+`acr_112025_mh1_stagetwo.model` (MACE). `esen_s.pt` is not UMA: it is eSEN-S, the
+OMC25 baseline model (no experts, trained on OMC25 only), which the UMA route loads
+unchanged. See the wiki page `mlip-energy-routes`, section "The checkpoint behind `uma`".
 
 ## 3. Why the comparison is fair
 
@@ -284,8 +286,12 @@ checkpoint set and no GPU touched.
 
 ## 8. What would invalidate this
 
-- A checkpoint change. Both results are per-checkpoint; `uma-s-1p1.pt` and
-  `uma-m-1p1.pt` do not even load through our interface (`KeyError: 'oc20_forces'`).
+- A checkpoint change. Both results are per-checkpoint, and the UMA-route result is
+  for eSEN-S, not for any UMA model. `uma-s-1p1.pt` and `uma-m-1p1.pt` did not load
+  through our interface (`KeyError: 'oc20_forces'`) until MXtalTools af651c1e
+  (2026-10-27), which keeps the energy tasks only; that commit passes a CPU check of
+  UMA-s 1.1 and 1.2 against stock fairchem (`tests/test_uma_cpu_route.py`), not this
+  gate.
 - A fairchem or mace-torch version bump, particularly anything touching
   `AtomicData.from_ase`'s wrapping or `get_neighborhood`. The fairness argument in
   §3 is version-specific (fairchem-core 2.16.0, mace-torch 0.3.15).
