@@ -1134,6 +1134,13 @@ def test_an_energy_reference_with_temperature_conditioning_is_an_error(canonical
     assert _fires(cfg, 'energy_reference_is_consistent')
 
 
+def test_an_unknown_z_feed_or_a_non_positive_eval_half_life_is_an_error(canonical):
+    # full coverage: tests/config/test_z_feed_invariants.py
+    assert _fires(broken(canonical, condition_log_z__z_feed='eval'), 'z_feed_is_well_formed')
+    assert _fires(broken(canonical, condition_log_z__eval_half_life_visits=0.0), 'z_feed_is_well_formed')
+    assert not _fires(canonical, 'z_feed_is_well_formed')
+
+
 def test_an_nf_policy_refuses_sde_only_settings(canonical):
     """Under model.kind nf an SDE-only setting refuses at load; the canonical keys pass once the auto clip (fitted
     to SDE gradients) is given a number. Full coverage: tests/models/test_nf_policy.py."""
