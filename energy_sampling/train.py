@@ -874,17 +874,18 @@ class Modeller:
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
         H = torch.zeros(n, d, d, device=self.device, dtype=torch.float64)
-        for lo in range(0, n, 256):
-            idx = torch.arange(lo, min(lo + 256, n))
-            mol = ds.batch.subsample_new_batch(idx).to(self.device)
-            x0 = self._batch_latents(mol).to(self.device, torch.float32)
-            z = x0[:, live].clone().requires_grad_(True)
-            x = x0.index_copy(1, live, z)
-            temps = T * torch.ones(len(idx), device=self.device)
-            e, _ = self.energy_function.analyze_crystal_batch(x, mol, temps, keep_grads=True)
-            g = torch.autograd.grad((e / T).sum(), z, create_graph=True)[0]
-            for j in range(d):
-                H[lo:lo + len(idx), j] = torch.autograd.grad(g[:, j].sum(), z, retain_graph=j < d - 1)[0].double()
+        with torch.enable_grad():   # the MLE draw that builds this runs under no_grad
+            for lo in range(0, n, 256):
+                idx = torch.arange(lo, min(lo + 256, n))
+                mol = ds.batch.subsample_new_batch(idx).to(self.device)
+                x0 = self._batch_latents(mol).to(self.device, torch.float32).detach()
+                z = x0[:, live].clone().requires_grad_(True)
+                x = x0.index_copy(1, live, z)
+                temps = T * torch.ones(len(idx), device=self.device)
+                e, _ = self.energy_function.analyze_crystal_batch(x, mol, temps, keep_grads=True)
+                g = torch.autograd.grad((e / T).sum(), z, create_graph=True)[0]
+                for j in range(d):
+                    H[lo:lo + len(idx), j] = torch.autograd.grad(g[:, j].sum(), z, retain_graph=j < d - 1)[0].double()
         H = 0.5 * (H + H.transpose(1, 2))
         lam, V = torch.linalg.eigh(H)
         cap, tau = float(s['live_width_cap']), float(s['live_tau'])
