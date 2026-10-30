@@ -9,34 +9,6 @@
    ],
    "hash": "74c1dac915cd"
   },
-  "cfg:@equilibration.balance": {
-   "value": {
-    "bar": 0.0,
-    "bounds": {
-     "bwd": [
-      0.25,
-      0.9
-     ],
-     "replay": [
-      0.1,
-      0.75
-     ]
-    },
-    "down": 0.006,
-    "guard": "bwd",
-    "kind": "gated_ramp",
-    "metric": "bwd/under_coverage_rise150",
-    "pinned": {
-     "fwd": 0.0
-    },
-    "ramp": "replay",
-    "ratchet_cooldown_steps": 500,
-    "ratchet_metric": "bwd/under_coverage",
-    "ratchet_release_tol": 0.25,
-    "ratchet_tol": 0.5,
-    "up": 0.004
-   }
-  },
   "cfg:@equilibration.deactivate_threshold": {
    "value": 0.01
   },
@@ -45,24 +17,6 @@
     "bwd": 0.9,
     "fwd": 0.0,
     "replay": 0.1
-   }
-  },
-  "cfg:@equilibration.fwd_rollout_every": {
-   "value": 20
-  },
-  "cfg:@equilibration.fwd_rollout_triggers": {
-   "value": {
-    "drift_std_max": 0.0,
-    "ess_min": 0.0,
-    "occupancy_min_batches": 2.0,
-    "val_gap_max": 0.0
-   }
-  },
-  "cfg:@equilibration.hot_lr_sensor": {
-   "value": {
-    "above": 2.0,
-    "channel": "fwd/scatter_err",
-    "rows": 11
    }
   },
   "cfg:@equilibration.loss_coeffs": {
@@ -81,57 +35,6 @@
     }
    }
   },
-  "cfg:@equilibration.on_enter": {
-   "value": [
-    "rebuild_prior_by_churn",
-    "bootstrap_z:rollout:4000"
-   ]
-  },
-  "cfg:@train_prior": {
-   "value": {
-    "bwd_sampling_mode": "dataset",
-    "exit": [
-     {
-      "above": 0.5,
-      "metric": "gates/progress_done",
-      "patience": 1
-     }
-    ],
-    "flags": {
-     "scramble_conditions": true,
-     "update_log_z": true
-    },
-    "hot_lr_sensor": {
-     "above": 5.0,
-     "channel": "bwd/mle",
-     "form": "absolute",
-     "rows": 31
-    },
-    "loss_coeffs": {
-     "bwd": {
-      "mle": 1.0,
-      "repeats": 1.0,
-      "tbc": 0.0
-     }
-    },
-    "max_steps": 50000,
-    "name": "train_prior",
-    "on_exit": [
-     "snapshot:phase1_exit"
-    ],
-    "skip_if": "weights_loaded",
-    "train_mode": "bwd"
-   }
-  },
-  "cfg:@train_prior.exit": {
-   "value": [
-    {
-     "above": 0.5,
-     "metric": "gates/progress_done",
-     "patience": 1
-    }
-   ]
-  },
   "cfg:@train_prior.loss_coeffs": {
    "value": {
     "bwd": {
@@ -141,46 +44,8 @@
     }
    }
   },
-  "cfg:@train_prior.max_steps": {
-   "value": 50000
-  },
-  "cfg:@train_prior.on_exit": {
-   "value": [
-    "snapshot:phase1_exit"
-   ]
-  },
-  "cfg:archive_period": {
-   "value": 5000
-  },
-  "cfg:batch_size": {
-   "value": 1000
-  },
-  "cfg:buffers.anchor_buffer.frozen": {
-   "value": true
-  },
-  "cfg:buffers.prior_buffer.ramp_floor": {
-   "value": 100
-  },
-  "cfg:buffers.prior_buffer.ramp_width": {
-   "value": 50
-  },
   "cfg:buffers.replay_buffer.admit_from_eval": {
    "value": true
-  },
-  "cfg:buffers.replay_buffer.admit_reward_min": {
-   "value": -200
-  },
-  "cfg:buffers.replay_buffer.backstop_mult": {
-   "value": 5.0
-  },
-  "cfg:buffers.replay_buffer.churn_rate": {
-   "value": 0
-  },
-  "cfg:buffers.replay_buffer.max_size": {
-   "value": 50000
-  },
-  "cfg:buffers.replay_buffer.mean_residence_steps": {
-   "value": 240
   },
   "cfg:buffers.replay_buffer.prioritise": {
    "value": {
@@ -196,32 +61,11 @@
   "cfg:bwd_loss_coeffs.traj_grads": {
    "value": 1.0
   },
-  "cfg:condition_log_z.half_life_visits": {
-   "value": 200.0
+  "cfg:condition_log_z.eval_half_life_visits": {
+   "value": 2.0
   },
-  "cfg:energy_config.bounding_coeff": {
-   "value": 10.0
-  },
-  "cfg:energy_config.crystal_coordinates": {
-   "value": "latent"
-  },
-  "cfg:energy_config.density_coeff": {
-   "value": 10.0
-  },
-  "cfg:energy_config.lj_coeff": {
-   "value": 1.0
-  },
-  "cfg:energy_config.reduction_coeff": {
-   "value": 10.0
-  },
-  "cfg:energy_config.reward_range": {
-   "value": 250
-  },
-  "cfg:energy_config.temperature": {
-   "value": 2.5
-  },
-  "cfg:epochs": {
-   "value": 100000
+  "cfg:condition_log_z.z_feed": {
+   "value": "forward"
   },
   "cfg:eval_num_samples": {
    "value": 10000
@@ -229,25 +73,8 @@
   "cfg:eval_period": {
    "value": 250
   },
-  "cfg:fused_grad_accum_min_samples": {
-   "value": 1000
-  },
-  "cfg:fwd_loss_coeffs.beta": {
-   "value": 10.0
-  },
   "cfg:fwd_loss_coeffs.exploration_std": {
    "value": 0.0
-  },
-  "cfg:grad_clip_guard": {
-   "value": {
-    "enabled": true,
-    "eta": 0.01,
-    "max_ratio": 100.0,
-    "p": 0.99,
-    "refresh_on_stage": true,
-    "warmup_clip": "static",
-    "warmup_steps": 100
-   }
   },
   "cfg:gradient_norm_clip": {
    "value": 10.0
@@ -260,43 +87,11 @@
     "source": "auto"
    }
   },
-  "cfg:lr_control.fire_cut_factor": {
-   "value": 1.0
-  },
-  "cfg:lr_control.hard_failure": {
-   "value": {
-    "cruise_rederive": true,
-    "cruise_settle_steps": 200,
-    "grad_abs": 1000000.0,
-    "grad_excursion_x": 100.0,
-    "loss_abs": 1000000.0,
-    "loss_excursion_k": 10.0,
-    "min_observations": 20,
-    "root_window": 200
-   }
-  },
-  "cfg:lr_control.schedule": {
-   "value": [
-    {
-     "kind": "hold",
-     "steps": 3000,
-     "to": 0.05
-    },
-    {
-     "kind": "geometric",
-     "steps": 1000,
-     "to": 0.2
-    }
-   ]
-  },
   "cfg:lr_control.seed_lr": {
    "value": 0.000125
   },
   "cfg:lr_flow": {
    "value": 0.1
-  },
-  "cfg:max_reloads_per_1k_steps": {
-   "value": 1.0
   },
   "cfg:model.kind": {
    "value": "nf"
@@ -340,93 +135,11 @@
   "cfg:model.shared.periodic_centroids": {
    "value": true
   },
-  "cfg:noised_prior": {
-   "value": {
-    "check_rows": 512,
-    "packing_window": null,
-    "train_kinds": [
-     "child"
-    ],
-    "window_kT": 6.0
-   }
-  },
-  "cfg:prior_path": {
-   "value": "D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt"
-  },
-  "cfg:progress_gate": {
-   "value": {
-    "level_window": 2500,
-    "metrics": [
-     {
-      "bar": 5.0,
-      "key": "w1r/median"
-     },
-     {
-      "bar": 10.0,
-      "key": "w1r/worst"
-     }
-    ],
-    "min_history": 2000,
-    "mode": "level"
-   }
-  },
-  "cfg:space_groups": {
-   "value": [
-    2
-   ]
-  },
   "cfg:use_weight_decay": {
    "value": false
   },
   "cfg:z_calibration.fill_from_eval": {
    "value": "fill"
-  },
-  "cfg:z_calibration.fill_mode": {
-   "value": "absorb"
-  },
-  "cfg:z_calibration.fill_threshold": {
-   "value": 0.5
-  },
-  "checkpointing.py::Checkpointer._gfn_config_from": {
-   "calls": [
-    "ValueError",
-    "bool",
-    "dict",
-    "entry",
-    "float",
-    "getattr",
-    "int",
-    "print",
-    "resolve_policy_entry",
-    "self._assert_dead_rows_match",
-    "strip",
-    "vars"
-   ],
-   "hash": "d76e1541f1eb"
-  },
-  "checkpointing.py::Checkpointer.archive": {
-   "calls": [
-    "getattr",
-    "int",
-    "print",
-    "self.buffers_path",
-    "self.link",
-    "self.path_for"
-   ],
-   "hash": "1f8a78b3a48f"
-  },
-  "checkpointing.py::Checkpointer.save": {
-   "calls": [
-    "atomic_save",
-    "getattr",
-    "hasattr",
-    "keeps_ema_copy",
-    "self.get_state_dict",
-    "self.path_for",
-    "self.save_buffers",
-    "trajectory_T"
-   ],
-   "hash": "6ec026fcc327"
   },
   "config_invariants.py::nf_policy_refuses_sde_only_settings": {
    "calls": [
@@ -440,74 +153,6 @@
     "str"
    ],
    "hash": "93e82ceec8ad"
-  },
-  "controller.py::LRController.observe": {
-   "calls": [
-    "float",
-    "getattr",
-    "int",
-    "print",
-    "self._cfg",
-    "self._grad_history.append",
-    "self.bars.judge"
-   ],
-   "hash": "ee7b49dd3720"
-  },
-  "controller.py::LRController.on_divergence": {
-   "calls": [
-    "float",
-    "int",
-    "max",
-    "print",
-    "self._cfg",
-    "self._state",
-    "self.set_scale"
-   ],
-   "hash": "93b20df51b90"
-  },
-  "controller.py::LRController.on_stage_change": {
-   "calls": [
-    "int",
-    "print",
-    "self._describe",
-    "self._grad_history.clear",
-    "self._loss_history.values",
-    "self._sched_store",
-    "self._schedule",
-    "self._state",
-    "self.set_scale"
-   ],
-   "hash": "df368128dc02"
-  },
-  "controller.py::LRController.tick": {
-   "calls": [
-    "float",
-    "getattr",
-    "int",
-    "lr_schedule_value",
-    "print",
-    "self._arm_cruise_bar",
-    "self._bars_ready",
-    "self._elapsed",
-    "self._fit_warmup_bars",
-    "self._schedule",
-    "self._state",
-    "self._tick_cruise_bar",
-    "self.bars.derive",
-    "self.set_scale"
-   ],
-   "hash": "185b8913d248"
-  },
-  "data_processing/build_noised_prior.py::choose_images": {
-   "calls": [
-    "image_centroids",
-    "int"
-   ],
-   "hash": "6652e923c5c6"
-  },
-  "data_processing/build_noised_prior.py::kick": {
-   "calls": [],
-   "hash": "46960b67717b"
   },
   "energies/ar_transformer.py::CausalTransformerConditioner": {
    "calls": [
@@ -535,53 +180,6 @@
     "super"
    ],
    "hash": "ad813109ccfc"
-  },
-  "energies/base_set.py::BaseSet.log_reward": {
-   "calls": [
-    "getattr",
-    "int",
-    "len",
-    "self.energy"
-   ],
-   "hash": "c7017e3e9bae"
-  },
-  "energies/molecular_crystal.py::MolecularCrystal.compute_jacobian": {
-   "calls": [
-    "lat2sph_rotvec"
-   ],
-   "hash": "59d36629e4b8"
-  },
-  "energies/molecular_crystal.py::MolecularCrystal.generator_energy": {
-   "calls": [
-    "RuntimeError",
-    "ValueError",
-    "density_penalty",
-    "float",
-    "getattr",
-    "int",
-    "log_rescale_positive",
-    "screen_implausible_energy",
-    "self._assert_finite_energy",
-    "self.assert_lj_coeff_stamped",
-    "self.compute_jacobian",
-    "self.compute_zp_order_penalty",
-    "self.condition_ids_of",
-    "self.energy_reference_for",
-    "self.prior_flow.energy",
-    "self.prior_knn.energy"
-   ],
-   "hash": "e30c51a949c4"
-  },
-  "energies/molecular_crystal.py::MolecularCrystal.set_reward_clip": {
-   "calls": [
-    "float",
-    "max"
-   ],
-   "hash": "21ca2882d31d"
-  },
-  "energies/molecular_crystal.py::density_penalty": {
-   "calls": [],
-   "hash": "a1cf1e80be13"
   },
   "energies/prior_flow.py::_Block": {
    "calls": [
@@ -714,107 +312,11 @@
    ],
    "hash": "c2354e920cd6"
   },
-  "gflownet_losses.py::winsorized_z_root": {
-   "calls": [
-    "ValueError",
-    "float",
-    "range"
-   ],
-   "hash": "1a68332d8753"
-  },
-  "grad_clip_guard.py::GradClipGuard._accumulate": {
-   "calls": [
-    "max",
-    "print"
-   ],
-   "hash": "51f88aa1d38a"
-  },
-  "grad_clip_guard.py::GradClipGuard._apply_cap": {
-   "calls": [],
-   "hash": "a480bd47ff33"
-  },
-  "grad_clip_guard.py::GradClipGuard.observe": {
-   "calls": [
-    "float",
-    "self._accumulate",
-    "self._apply_cap",
-    "self._branch",
-    "self.threshold"
-   ],
-   "hash": "b42ecd44c83f"
-  },
-  "grad_clip_guard.py::GradClipGuard.refresh": {
-   "calls": [
-    "print",
-    "self._branches.values"
-   ],
-   "hash": "ba771c49f0f9"
-  },
-  "grad_clip_guard.py::GradClipGuard.threshold": {
-   "calls": [
-    "float",
-    "self._branch"
-   ],
-   "hash": "5bee20b143ce"
-  },
-  "hard_failure_bars.py::HardFailureBars.derive": {
-   "calls": [
-    "abs",
-    "len",
-    "list",
-    "max",
-    "min"
-   ],
-   "hash": "da0d85bc0789"
-  },
-  "hard_failure_bars.py::HardFailureBars.judge": {
-   "calls": [
-    "abs",
-    "self.loss_bar.get"
-   ],
-   "hash": "94610342f48b"
-  },
-  "lr_hot_sensor.py::HotSensor.observe": {
-   "calls": [
-    "bool",
-    "float",
-    "int",
-    "len",
-    "self._drawdown",
-    "self._floor",
-    "self.window.append"
-   ],
-   "hash": "3b69ec051b5d"
-  },
   "models/architectures.py::LearnableScalar": {
    "calls": [
     "super"
    ],
    "hash": "22710903e701"
-  },
-  "models/aunit_periodicity.py::sg_periodic_centroid_axes": {
-   "calls": [
-    "float",
-    "int",
-    "range",
-    "str",
-    "tuple"
-   ],
-   "hash": "72feb4441435"
-  },
-  "models/gfn.py::GFN.get_periodic_dimensions": {
-   "calls": [
-    "ValueError",
-    "any",
-    "bool",
-    "len",
-    "range",
-    "self._finalize_dim_partition",
-    "set",
-    "sorted",
-    "tuple"
-   ],
-   "hash": "140e2fbadc40"
   },
   "models/nf_policy.py::NFPolicy": {
    "calls": [
@@ -990,35 +492,6 @@
    ],
    "hash": "032b1b8d14a7"
   },
-  "mxtaltools/common/geometry_utils.py::lat2sph_rotvec": {
-   "calls": [],
-   "hash": "1da912b80e05"
-  },
-  "mxtaltools/dataset_utils/data_class_methods/crystal_ops.py::MolCrystalOps.latent_to_cell_params": {
-   "calls": [
-    "enforce_crystal_system",
-    "range",
-    "self.box_analysis",
-    "self.inv_latent_transform",
-    "self.set_cell_parameters"
-   ],
-   "hash": "45ecb1f56e25"
-  },
-  "noised_prior.py::check_rows": {
-   "calls": [
-    "len",
-    "max",
-    "tag"
-   ],
-   "hash": "c85e06fd0c7f"
-  },
-  "noised_prior.py::select_rows": {
-   "calls": [
-    "condition_floor",
-    "dict"
-   ],
-   "hash": "c6c4053dc6c3"
-  },
   "progress_metrics.py::_column_w1_ratio": {
    "calls": [
     "_column_w1",
@@ -1038,72 +511,6 @@
    ],
    "hash": "4d0f34f20d77"
   },
-  "protocol.py::StageProtocol.__init__": {
-   "calls": [],
-   "hash": "f60d942d7f00"
-  },
-  "protocol.py::StageProtocol._gated_ramp_tick": {
-   "calls": [
-    "bool",
-    "float",
-    "getattr",
-    "int",
-    "max",
-    "min",
-    "self._resolve",
-    "self.ctrl.get",
-    "setattr"
-   ],
-   "hash": "74c37fd6e08b"
-  },
-  "protocol.py::StageProtocol._step_cap_reached": {
-   "calls": [
-    "self._stage_steps"
-   ],
-   "hash": "cb4690464d91"
-  },
-  "protocol.py::StageProtocol.advance": {
-   "calls": [
-    "bool",
-    "float",
-    "fresh_stage_ctrl",
-    "getattr",
-    "int",
-    "min",
-    "print",
-    "self._run_action",
-    "self.describe_live",
-    "setattr",
-    "sum"
-   ],
-   "hash": "18e8ef0b3d9b"
-  },
-  "protocol.py::StageProtocol.begin": {
-   "calls": [
-    "getattr",
-    "int",
-    "len",
-    "print",
-    "self.advance",
-    "self.ctrl.get"
-   ],
-   "hash": "081ced068350"
-  },
-  "protocol.py::StageProtocol.maybe_advance": {
-   "calls": [
-    "dict",
-    "enumerate",
-    "getattr",
-    "print",
-    "self._advance_term",
-    "self._exit_satisfied",
-    "self._persist_entered_stage",
-    "self._stage_steps",
-    "self._step_cap_reached",
-    "self.advance"
-   ],
-   "hash": "f4788966e601"
-  },
   "train.py::Modeller._admit_eval_rollout": {
    "calls": [
     "bool",
@@ -1113,12 +520,26 @@
    ],
    "hash": "cf10cc6c2bb7"
   },
-  "train.py::Modeller._bwd_retention_priority": {
+  "train.py::Modeller._build_gfn_config": {
    "calls": [
-    "hasattr",
-    "self.condition_log_z.lookup"
+    "dict",
+    "getattr",
+    "list",
+    "print",
+    "resolve_policy_entry",
+    "self._build_latent_gfn_config",
+    "zip"
    ],
-   "hash": "526d8b63b199"
+   "hash": "c844cdebb794"
+  },
+  "train.py::Modeller._eval_feed_log_z": {
+   "calls": [
+    "bool",
+    "getattr",
+    "self.condition_log_z.update",
+    "self.protocol.flag"
+   ],
+   "hash": "e702177ef61b"
   },
   "train.py::Modeller._eval_z_fill": {
    "calls": [
@@ -1144,137 +565,13 @@
    ],
    "hash": "3869f36d20a6"
   },
-  "train.py::Modeller._forgetting_sensor": {
-   "calls": [
-    "float",
-    "getattr",
-    "int",
-    "isinstance",
-    "min",
-    "zip"
-   ],
-   "hash": "b61227e996a9"
-  },
-  "train.py::Modeller._fwd_gates": {
+  "train.py::Modeller._offpolicy_feeds_log_z": {
    "calls": [
     "bool",
     "getattr",
-    "int",
-    "len",
-    "print",
-    "self._rollout_trigger_fires",
-    "self.protocol.mode_dormant"
+    "self.protocol.flag"
    ],
-   "hash": "331c42ba5813"
-  },
-  "train.py::Modeller._load_noised_prior": {
-   "calls": [
-    "ValueError",
-    "bool",
-    "float",
-    "getattr",
-    "int",
-    "len",
-    "list",
-    "pick",
-    "print",
-    "self._attach_fd_reference",
-    "self._score_prior_rows",
-    "self._stored_reward_terms"
-   ],
-   "hash": "216a4e502c40"
-  },
-  "train.py::Modeller._prior_is_static": {
-   "calls": [
-    "getattr",
-    "print",
-    "self.__dict__.setdefault",
-    "set"
-   ],
-   "hash": "b3fb327ae175"
-  },
-  "train.py::Modeller._replay_rows": {
-   "calls": [
-    "getattr",
-    "len",
-    "self._store_level_table",
-    "self.row_store.n_drawable"
-   ],
-   "hash": "619396c0e8ba"
-  },
-  "train.py::Modeller._resolve_periodic_centroid_axes": {
-   "calls": [
-    "ValueError",
-    "describe",
-    "getattr",
-    "int",
-    "len",
-    "list",
-    "print",
-    "sg_periodic_centroid_axes"
-   ],
-   "hash": "26687a75b730"
-  },
-  "train.py::Modeller._reward_ramp_kwargs": {
-   "calls": [
-    "_per_condition_max",
-    "dict",
-    "getattr",
-    "len",
-    "self._ramp_params"
-   ],
-   "hash": "1548ef266141"
-  },
-  "train.py::Modeller._rollout_trigger_fires": {
-   "calls": [
-    "float",
-    "getattr",
-    "print",
-    "self._rollout_trigger_reading"
-   ],
-   "hash": "c918dfe83c18"
-  },
-  "train.py::Modeller._stash_z_fill_logw": {
-   "calls": [
-    "all",
-    "self._z_fill_head_is_fillable"
-   ],
-   "hash": "7057be3437ab"
-  },
-  "train.py::Modeller._stored_reward_terms": {
-   "calls": [
-    "float",
-    "int",
-    "min",
-    "range"
-   ],
-   "hash": "edd3d7315f16"
-  },
-  "train.py::Modeller._z_fill_head_is_fillable": {
-   "calls": [
-    "float",
-    "getattr",
-    "hasattr",
-    "int",
-    "self.tb_z_source"
-   ],
-   "hash": "a366ee852ad5"
-  },
-  "train.py::Modeller.bootstrap_z_by_rollout": {
-   "calls": [
-    "float",
-    "get_discretizer",
-    "getattr",
-    "int",
-    "print",
-    "self.fwd_eval_sampling",
-    "self.gfn_model.flow_model.scalar.detach",
-    "self.manage_replay_buffer",
-    "self.protocol.flag",
-    "self.z_level_fill",
-    "trajectory_T"
-   ],
-   "hash": "6b007b64c306"
+   "hash": "7e812fd54dad"
   },
   "train.py::Modeller.bwd_eval_sampling": {
    "calls": [
@@ -1298,6 +595,7 @@
     "get_gfn_backward_loss",
     "self._bwd_retention_priority",
     "self._larder_harvest",
+    "self._offpolicy_feeds_log_z",
     "self._store_touch",
     "self.draw_bwd_sample",
     "self.prior_buffer.update_losses",
@@ -1306,7 +604,7 @@
     "self.scramble_applicable",
     "self.tb_z_source"
    ],
-   "hash": "842e7c5aa9ad"
+   "hash": "fb723f92d052"
   },
   "train.py::Modeller.density_readouts": {
    "calls": [
@@ -1407,28 +705,6 @@
    ],
    "hash": "c136ba11785a"
   },
-  "train.py::Modeller.fire_loss_spike": {
-   "calls": [
-    "FrozenTrainingState",
-    "any",
-    "deepcopy",
-    "float",
-    "getattr",
-    "max",
-    "print",
-    "self._arm_phys_energy_guard",
-    "self._rewind_checkpoint_path",
-    "self._set_tracker_trainable",
-    "self._store_refresh",
-    "self.checkpointer.load_model_only",
-    "self.checkpointer.restore_buffers",
-    "self.checkpointer.set_state_dict",
-    "self.lr_controller.on_divergence",
-    "self.metric_tracker.load_state_dict",
-    "setattr"
-   ],
-   "hash": "5dd3d5b7de42"
-  },
   "train.py::Modeller.fit_policy_data_scalers": {
    "calls": [
     "bool",
@@ -1484,6 +760,7 @@
     "print",
     "sample_eval_fwd_trajs",
     "self._anchor_energy",
+    "self._eval_feed_log_z",
     "self.condition_log_z.update_best_energy",
     "self.eval_draw_size",
     "self.force_agreement_stats",
@@ -1492,7 +769,7 @@
     "self.screen_and_admit_anchors",
     "time"
    ],
-   "hash": "dd2d28f101de"
+   "hash": "b4644a338ee2"
   },
   "train.py::Modeller.fwd_train_step": {
    "calls": [
@@ -1506,55 +783,6 @@
     "self.tb_z_source"
    ],
    "hash": "3d2801ff37f0"
-  },
-  "train.py::Modeller.init_anchor_buffer_seed": {
-   "calls": [
-    "KeyError",
-    "_dataset_row_batches",
-    "collate_data_list",
-    "getattr",
-    "hasattr",
-    "isinstance",
-    "len",
-    "max",
-    "self._anchor_energy",
-    "self._batch_latents",
-    "self._buffer_kwargs",
-    "self._refuse_mirrored_rows",
-    "self.anchor_buffer.add",
-    "self.anchor_buffer_cls",
-    "self.apply_anchor_buffer_policy",
-    "self.condition_log_z.update_best_energy",
-    "self.energy_function.batched_analyze_crystal_batch",
-    "self.energy_function.condition_samples",
-    "self.energy_function.prebuilt_sample_to_reward",
-    "setattr",
-    "sorted",
-    "strip_lazy_sg_caches"
-   ],
-   "hash": "e4f0b8e2c1db"
-  },
-  "train.py::Modeller.init_condition_log_z": {
-   "calls": [
-    "ConditionLogZTracker",
-    "ValueError",
-    "float",
-    "getattr",
-    "hasattr",
-    "self._arm_phys_energy_guard",
-    "self._set_tracker_trainable"
-   ],
-   "hash": "627b9de07efb"
-  },
-  "train.py::Modeller.init_energy_function": {
-   "calls": [
-    "MolecularCrystal",
-    "energy_function_kwargs",
-    "getattr",
-    "print",
-    "str"
-   ],
-   "hash": "45ec8cb5e7a2"
   },
   "train.py::Modeller.init_gfn": {
    "calls": [
@@ -1583,40 +811,15 @@
    ],
    "hash": "a8478dd79a4c"
   },
-  "train.py::Modeller.init_prior_buffer_seed": {
-   "calls": [
-    "getattr",
-    "hasattr",
-    "len",
-    "print",
-    "self._fresh_prior_buffer",
-    "self._prior_dataset_seed_batches",
-    "self.prior_buffer.add"
-   ],
-   "hash": "1e16448276fe"
-  },
-  "train.py::Modeller.init_prior_dataset": {
+  "train.py::Modeller.init_mol_dataset": {
    "calls": [
     "CrystalBuffer",
-    "ValueError",
-    "abs",
-    "bool",
-    "float",
-    "getattr",
-    "print",
     "self._buffer_kwargs",
-    "self._buffer_y_fn",
-    "self._load_noised_prior",
-    "self._noised_prior_record",
-    "self._prior_scan_from_cache",
+    "self._load_condition_file",
     "self._refuse_mirrored_rows",
-    "self._score_prior_rows",
-    "self._verify_dead_latent_rows",
-    "self.energy_function.set_reward_clip",
-    "self.subset_training_molecules",
-    "strip_lazy_sg_caches"
+    "self.subset_training_molecules"
    ],
-   "hash": "f7364ab7b723"
+   "hash": "decfccd9a886"
   },
   "train.py::Modeller.init_schedulers_optimizers": {
    "calls": [
@@ -1639,72 +842,6 @@
    ],
    "hash": "3edc1c037e2c"
   },
-  "train.py::Modeller.manage_prior_buffer": {
-   "calls": [
-    "float",
-    "getattr",
-    "hasattr",
-    "int",
-    "len",
-    "max",
-    "min",
-    "self._buffer_kwargs",
-    "self._buffer_y_fn",
-    "self._condition_energy_floor",
-    "self._expire_stale_prior_rows",
-    "self._prior_churn_cycle",
-    "self._prior_is_static",
-    "self._prior_row_energy",
-    "self._ramp_params",
-    "self.buffer_cls",
-    "self.bwd_step_delta",
-    "self.prior_buffer.batch.condition_id.detach",
-    "self.prior_buffer.get_elig_drop_count",
-    "self.prior_buffer.purge_lowest",
-    "self.top_up_prior_from_anchors"
-   ],
-   "hash": "ae350757abe2"
-  },
-  "train.py::Modeller.manage_replay_buffer": {
-   "calls": [
-    "_force_rows",
-    "_uniform_draw",
-    "_val_flags",
-    "float",
-    "getattr",
-    "hasattr",
-    "int",
-    "len",
-    "max",
-    "min",
-    "print",
-    "round",
-    "self._admission_force_legs",
-    "self._buffer_kwargs",
-    "self._buffer_y_fn",
-    "self._replay_val_frac",
-    "self._store_admit",
-    "self.buffer_cls",
-    "self.energy_function.unreferenced_log_r",
-    "self.harvest_scored_rows",
-    "self.replay_buffer.add",
-    "self.replay_buffer.purge_by_index",
-    "self.replay_in_play"
-   ],
-   "hash": "6b5e2bcd881c"
-  },
-  "train.py::Modeller.observe_hot_lr": {
-   "calls": [
-    "HotSensor",
-    "getattr",
-    "int",
-    "print",
-    "self.fire_loss_spike",
-    "self.metric_tracker.get",
-    "self.metric_tracker.written_step"
-   ],
-   "hash": "f86e4ec99855"
-  },
   "train.py::Modeller.progress_metrics": {
    "calls": [
     "_column_w1_ratio",
@@ -1724,76 +861,24 @@
    ],
    "hash": "4a978e286c0d"
   },
-  "train.py::Modeller.rebuild_prior_by_churn": {
-   "calls": [
-    "getattr",
-    "hasattr",
-    "int",
-    "max",
-    "min",
-    "print",
-    "self._prior_buffer_len",
-    "self._prior_churn_cycle",
-    "self._prior_is_static"
-   ],
-   "hash": "b28b9baafc19"
-  },
   "train.py::Modeller.replay_train_step": {
    "calls": [
     "float",
     "get_gfn_backward_loss",
     "getattr",
     "self._larder_harvest",
+    "self._offpolicy_feeds_log_z",
     "self._policy_drift_stats",
     "self._replay_val_stats",
     "self._store_touch",
     "self.draw_replay_sample",
     "self.metric_tracker.update",
-    "self.protocol.flag",
     "self.replay_buffer.absorption_stats",
     "self.replay_buffer.update_logw_stats",
     "self.replay_buffer.update_losses",
     "self.tb_z_source"
    ],
-   "hash": "050bb1a3698d"
-  },
-  "train.py::Modeller.step_loss": {
-   "calls": [
-    "FrozenTrainingState",
-    "float",
-    "getattr",
-    "int",
-    "print",
-    "self._submodel_grad_norms",
-    "self.gfn_model.parameters",
-    "self.grad_guard.observe",
-    "self.grad_guard.threshold"
-   ],
-   "hash": "6babdae71b15"
-  },
-  "train.py::Modeller.train_step": {
-   "calls": [
-    "get_discretizer",
-    "getattr",
-    "int",
-    "self._probe_dealer",
-    "self._probe_loss",
-    "self._ray_probe_armed",
-    "self._update_rolling",
-    "self.bwd_train_step",
-    "self.fused_train_step",
-    "self.fwd_train_step",
-    "self.lr_controller.on_calibration",
-    "self.manage_replay_buffer",
-    "self.mode_repeats",
-    "self.ray_cal.measure",
-    "self.record_fused_substep_losses",
-    "self.replay_train_step",
-    "self.step_loss",
-    "self.update_ema_model",
-    "trajectory_T"
-   ],
-   "hash": "1598f076ad0b"
+   "hash": "659b435b7717"
   },
   "train.py::Modeller.update_heldout_gate": {
    "calls": [
@@ -1808,34 +893,6 @@
     "set"
    ],
    "hash": "285b3ef3920d"
-  },
-  "train.py::Modeller.z_level_fill": {
-   "calls": [
-    "ValueError",
-    "abs",
-    "float",
-    "getattr",
-    "int",
-    "max",
-    "print",
-    "self.gfn_model.flow_model.parameters",
-    "self.gfn_model.flow_model.scalar.data.fill_",
-    "self.gfn_model.flow_model.scalar.detach",
-    "self.optimizers.get",
-    "str",
-    "winsorized_z_root"
-   ],
-   "hash": "4f704765e594"
-  },
-  "utils.py::quick_tb_stats": {
-   "calls": [
-    "bool",
-    "float",
-    "max",
-    "min",
-    "winsorized_z_root"
-   ],
-   "hash": "0f3be007cc6f"
   },
   "utils.py::resolve_derived_config": {
    "calls": [
@@ -1855,7 +912,8 @@
    "hash": "31fe2cb8a4da"
   }
  },
- "commit": "696f746f",
- "date": "2026-10-29",
- "dirty": []
+ "commit": "a264b41b",
+ "date": "2026-10-30",
+ "dirty": [],
+ "mxt_commit": "cf163800"
 }

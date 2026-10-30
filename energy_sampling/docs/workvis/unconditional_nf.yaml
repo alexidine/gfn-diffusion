@@ -1,10 +1,13 @@
 # Workflow diagram source: unconditional crystal training on the NF policy.
+# A VARIANT of unconditional.yaml (diagram.py): only the boxes and edges that differ
+# live here; every other box is the base's, edited, audited and stamped there.
 # Edited by /workvis; rendered by render.py; anchors checked by scan.py.
 # A DERIVED VIEW of current behaviour: the code is the authority.
 # Math between single dollars is TeX. Single-quoted strings keep backslashes literal
 # (a literal ' is written '').
 
 workflow: unconditional_nf
+extends: unconditional
 title: Unconditional crystal training · NF policy
 subtitle: 'committed mk_dev + model.kind nf · protocol unconditional_tb · MIPCAS, ELJ'
 route:
@@ -21,45 +24,15 @@ route:
     model.kind: nf
     gradient_norm_clip: 10.0     # 'auto' (fitted to SDE gradients) is refused under nf; 10.0 as the oct28 NF runs
 stamp:
-  commit: 696f746f
-  date: 2026-10-29
-  audited: 'not audited'
+  commit: a264b41b
+  date: 2026-10-30
+  audited: 'audited 2026-10-29 at 7f21f9f8, all nodes; corrections applied, not re-audited'
 
-groups:
-  - {id: init, title: 'Launch · prior initialization', style: init}
-  - {id: mle, title: 'Stage 1 · MLE warm start', style: mle}
-  - {id: mlestep, parent: mle, title: 'One step $n$ · $B = 1000$', style: step}
-  - {id: eq, title: 'Stage 2 · Equilibration', style: eq}
-  - {id: eqstep, parent: eq, title: 'One step $n$ · $B = 1000$', style: step}
+triage:                          # read by scan.py --triage
+  swaps: [models/gfn.py::GFN, models/nf_policy.py::NFPolicy]
+  terms: ['P_F', 'P_B', '\sum_i', 'trajector', 'path', 'bridge', 'grid', 'wall', 'clamp', '\pm 200']
 
 nodes:
-  # ---------------------------------------------------------------- launch
-  - id: target
-    group: init
-    kind: once
-    title: Target · MIPCAS in $P\bar 1$, $Z' = 1$, one condition
-    lines:
-      - 'state $x \in \mathbb{R}^{12}$, nominal box $[-1, 1]^{12}$: cell lengths (3), cell angles (3), centroid (3), orientation (3)'
-      - 'lengths $L_d = 2R\,\exp\!\big(\ln lo_d + (x_d/2 + 1/2)\ln(hi_d/lo_d)\big)/a_d$, $\ lo = (0.075, 0.075, 0.1)$, $hi = (3, 3, 4)$, $R$ = molecule radius'
-      - 'angles $(x/2 + 1/2)\,0.6\pi + 0.2\pi$ · centroid $(x/2 + 1/2)\,a_d$, $\ a = (0.5, 1, 1)$'
-      - 'orientation $\theta = \tfrac{\pi}{4}(x + 1),\ \phi = \pi x,\ r = \pi(x + 1)$ → rotation vector'
-      - 'periodic, wrapped with period 2: centroid $y, z$ and $\phi, r$'
-      - 'decode clamps to the box → unit cell → cluster (cutoff 10) → ELJ'
-    anchors: [models/gfn.py::GFN.get_periodic_dimensions, train.py::Modeller._resolve_periodic_centroid_axes,
-              models/aunit_periodicity.py::sg_periodic_centroid_axes,
-              mxtaltools/dataset_utils/data_class_methods/crystal_ops.py::MolCrystalOps.latent_to_cell_params,
-              mxtaltools/common/geometry_utils.py::lat2sph_rotvec,
-              'cfg:energy_config.crystal_coordinates', 'cfg:model.shared.periodic_centroids', 'cfg:space_groups']
-
-  - id: energy_fn
-    group: init
-    kind: once
-    title: Energy function · ELJ at $kT = 2.5$
-    lines:
-      - 'computes the reduction energy and ELJ'
-      - 'its ELJ coefficient and clip level are set later, by the prior load'
-    anchors: [train.py::Modeller.init_energy_function, 'cfg:energy_config.temperature']
-
   - id: model
     group: init
     kind: once
@@ -74,7 +47,7 @@ nodes:
       - '$q_\theta(x) = \prod_{j=1}^{12} q_j(x_{o_j} \mid x_{o_{<j}})$, $\ \log q_\theta(x) = -12\ln 2 + \sum_j \log\big|\partial y_{o_j}/\partial x_{o_j}\big|$, $\ y = f_\theta(x)$: exact (triangular Jacobian)'
       - 'a draw: $u \sim \mathcal{U}[-1, 1]^{12}$, $\ x = f_\theta^{-1}(u)$ row by row, cached; in bf16 it rounds differently from the full pass that scores $\log q_\theta(x)$'
       - 'conditioner: causal transformer, width 256, 4 layers, 8 heads, pre-LayerNorm, MLP 256 → 1024 → 256; slot $j$ reads row $o_{j-1}$ ($x$, or $\sin, \cos\,\pi x$ if wrapped)'
-      - 'head → 97 numbers per row, zero-initialised: $q_\theta$ starts uniform, $\log q_\theta = -12\ln 2$'
+      - 'head → 97 numbers per row: weights and biases zero, except the knot-slope biases at $\mathrm{softplus}^{-1}(1)$, so bins are equal and slopes 1: $q_\theta$ starts uniform, $\log q_\theta = -12\ln 2$'
       - 'layers in bf16 on CUDA, head and spline in fp32, each layer recomputed in backward · unconditional: no context'
       - '$\log Z$: one scalar, initialised to 0'
       - 'weights ignore the run seed: the geometry probe resets the torch seed to 0 first'
@@ -98,6 +71,7 @@ nodes:
               'cfg:lr_control.seed_lr', 'cfg:gradient_norm_clip', 'cfg:lr_flow', 'cfg:use_weight_decay']
 
   - id: fit_scalers
+    after: optim_init
     group: init
     kind: inert
     title: Fit the flow's standardisers · no effect here
@@ -108,78 +82,13 @@ nodes:
     anchors: [train.py::Modeller.fit_policy_data_scalers, models/nf_policy.py::NFPolicy.fit_data_scalers,
               energies/prior_flow.py::_Flow.set_scaler]
 
-  - id: prior_file
-    group: init
-    kind: store
-    title: Prior file · pre-noised build, 44,132 rows
-    lines:
-      - '4,012 anchors (3,799 train, 213 held out), 10 children each, built at $kT = 2.5$'
-      - 'child $= \mathrm{clip}(x_a + \rho\,\hat u)$, $\ \hat u$ uniform on $S^{11}$, $\ \log_{10}\rho \sim U(-2.5,\ -1.125)$'
-      - 'then written as a random $P\bar 1$ normaliser image'
-    anchors: [data_processing/build_noised_prior.py::kick, data_processing/build_noised_prior.py::choose_images,
-              'cfg:prior_path']
-
-  - id: load
-    group: init
-    kind: once
-    title: Load and filter the prior file
-    lines:
-      - 'sets the ELJ coefficient $\lambda = 0.364$ from the file (replaces the config''s 1.0): effective $kT = 6.88$ in raw ELJ units'
-      - '512 stratified rows rebuilt and re-scored against their stored terms (tolerance $0.1 + 10^{-4}|E|$)'
-      - 'every row''s reward from its stored energy terms, no rebuild'
-      - 'keep: train split, children only, packing $\in [0.55,\ 0.95]$, seed energy (no Jacobian) $\le$ floor $+ 6\,kT$'
-      - 'floor $= -141.04$, the best training-split row (an anchor) · 30,827 kept, 7,163 children fail the energy window'
-      - 'arms the clip: $c_1 = \min_i E_i + 250\,kT = -152.08 + 625 = 472.9$; kept energies span $[-152, -132]$, so it binds on none'
-    anchors: [train.py::Modeller.init_prior_dataset, train.py::Modeller._load_noised_prior, train.py::Modeller._stored_reward_terms,
-              noised_prior.py::check_rows, noised_prior.py::select_rows,
-              energies/molecular_crystal.py::MolecularCrystal.set_reward_clip,
-              'cfg:noised_prior', 'cfg:energy_config.lj_coeff', 'cfg:energy_config.reward_range']
-
-  - id: seed_stores
-    group: init
-    kind: once
-    title: Seed the buffers from the MLE dataset
-    lines:
-      - 'prior buffer: a static copy · anchor buffer: a frozen copy (children, not anchors)'
-      - 'replay buffer: none until the first admission'
-    anchors: [train.py::Modeller.init_prior_buffer_seed, train.py::Modeller.init_anchor_buffer_seed,
-              train.py::Modeller.init_condition_log_z, 'cfg:buffers.anchor_buffer.frozen']
-
-  # ---------------------------------------------------------------- stage 1
-  - id: mle_entry
-    group: mle
-    kind: once
-    title: Stage entry
-    lines:
-      - 'first stage: no entry actions · optimizers as built at launch'
-      - 'LR clock $m$ = steps since stage entry: $\ \alpha = 0.05$ for $m < 3000$, $\times 4$ geometric to $0.2$ by $m = 4000$, then held'
-      - '$\log Z = 0$'
-    anchors: [protocol.py::StageProtocol.begin, controller.py::LRController.tick, 'cfg:@train_prior', 'cfg:lr_control.schedule']
-
-  - id: mle_data
-    group: mle
-    kind: store
-    title: MLE dataset
-    lines:
-      - 'the 30,827 kept children'
-    anchors: [train.py::Modeller.init_prior_dataset]
-
-  - id: mle_draw
-    group: mlestep
-    title: Draw 1000 rows, uniform, from the MLE dataset
-    lines:
-      - '$\log R$ rebuilt from stored energy terms: no energy call'
-      - 'writes a per-row priority that only the eval report reads'
-    anchors: [train.py::Modeller.draw_bwd_sample, train.py::Modeller.bwd_train_step,
-              train.py::Modeller._bwd_retention_priority, 'cfg:batch_size']
-
   - id: mle_bwd
     group: mlestep
     title: Backward step · deterministic, to $x_0 = 0$
     lines:
       - 'one step $x \to x_0 = 0$, $\log P_B = 0$: no path is sampled, nothing reparameterised (traj_grads 1 has nothing to act on)'
       - 'the stored terminal, detached, wrapped rows folded onto $[-1, 1)$, scored in one conditioner pass: $\log P_F = \log q_\theta(x)$'
-      - 'every kept row lies in the closed box (1,262 of 30,827 exactly on a face, rows 6 and 9), so $\log q_\theta$ is finite on all'
+      - 'every kept row lies in the closed box (1,262 of 30,827 exactly on a face, all on row 6: 554 at $+1$, 708 at $-1$), so $\log q_\theta$ is finite on all'
     anchors: [models/nf_policy.py::NFPolicy.get_traj_bwd, models/nf_policy.py::NFPolicy._one_step,
               models/spline_flow.py::LatentFlow.log_prob, 'cfg:bwd_loss_coeffs.traj_grads']
 
@@ -190,20 +99,10 @@ nodes:
       - '$L = -\langle \log q_\theta(x) \rangle$: the Jensen bound $\langle \log P_B - \log P_F \rangle$ on one deterministic path, so it is tight'
       - 'at initialisation $L = 12\ln 2 = 8.318$ nats ($q_\theta$ uniform on the box)'
       - 'gradient to the conditioner only; none to $\log Z$'
-      - 'a tracker EMA of $\log w = \log R - \log q_\theta(x)$ is updated (half-life 200 visits); $\log Z$ never moves'
+      - 'these rows do not write the tracker''s EMA of $\log w$ (z-feed forward: only forward draws do) · $\log Z$ never moves'
     anchors: [gflownet_losses.py::get_gfn_backward_loss, gflownet_losses.py::terminal_mle,
-              buffer.py::ConditionLogZTracker.update, 'cfg:@train_prior.loss_coeffs',
-              'cfg:condition_log_z.half_life_visits', 'cfg:bwd_loss_coeffs.freeze_z']
-
-  - id: mle_optim
-    group: mlestep
-    title: Optimizer step · tripwire
-    lines:
-      - 'same Adam, LR clock, clip and tripwire rules as equilibration'
-      - 'tripwire bars fit at $m = 3000$, refit at $m \approx 4400$'
-    anchors: [train.py::Modeller.step_loss, controller.py::LRController.observe, grad_clip_guard.py::GradClipGuard.threshold,
-              grad_clip_guard.py::GradClipGuard.observe, hard_failure_bars.py::HardFailureBars.derive,
-              'cfg:grad_clip_guard', 'cfg:lr_control.hard_failure']
+              buffer.py::ConditionLogZTracker.update, train.py::Modeller._offpolicy_feeds_log_z, 'cfg:@train_prior.loss_coeffs',
+              'cfg:condition_log_z.z_feed', 'cfg:bwd_loss_coeffs.freeze_z']
 
   - id: mle_eval
     group: mle
@@ -212,64 +111,25 @@ nodes:
     lines:
       - '10,000 one-step draws from $q_\theta$ at $kT = 2.5$, scored with ELJ (the training step itself makes no energy call); every draw lies in the box, so the wall term is 0'
       - '10,000 dataset rows scored by exact $\log q_\theta$, no gradient'
-      - 'w1r per latent column: $W_1(\text{samples}, \text{MLE dataset})$ ÷ median $W_1$ of 4 reference self-draws'
-      - 'density readouts: mean and P90 of $-\log q_\theta$ on fixed rows ($\le 4096$ per set): training rows, held-out anchor groups (1,732), clean training anchors (3,799), molecule crystals (count unconfirmed)'
+      - 'w1r (per latent column, $W_1$ to the MLE dataset over the median of 4 reference self-draws) is not computed: it needs $\ge 4 \times 10{,}000$ reference rows (exit gate)'
+      - 'density readouts: mean and P90 of $-\log q_\theta$ on fixed rows ($\le 4096$ per set): training rows, held-out anchor groups (1,732), clean training anchors (3,799), molecule crystals (4,096 of all 44,132 prior-file rows: the molecule source is the prior file)'
       - 'each also against the reference measure, $-\log q_\theta + \log\rho$ with $\log\rho = -E_{\mathrm{jac}}/kT$ · held-out gap $=$ held-out $-$ training'
       - 'a held-out plateau gate on the held-out reference reading (6 evals, 0.25 nats, median of 3) is published; the stage exit does not read it'
-      - 'no rows enter any buffer'
-    anchors: [train.py::Modeller.evaluation, train.py::Modeller.fwd_eval_sampling, train.py::Modeller.bwd_eval_sampling,
+      - 'its forward draws write the tracker''s EMA of $\log w$: one update per eval, half-life 2 updates (z-feed forward, update_log_z on)'
+      - 'no rows enter any buffer, except from the hand-off eval at $n = 50{,}000$, run after the switch to stage 2: $\le 1000$ rows to replay'
+    anchors: [train.py::Modeller.evaluation, train.py::Modeller._admit_eval_rollout, train.py::Modeller.fwd_eval_sampling, train.py::Modeller.bwd_eval_sampling,
+              train.py::Modeller._eval_feed_log_z, 'cfg:condition_log_z.z_feed', 'cfg:condition_log_z.eval_half_life_visits',
               train.py::Modeller.progress_metrics, progress_metrics.py::_column_w1_ratio,
               train.py::Modeller.density_readouts, train.py::Modeller.update_heldout_gate, progress_metrics.py::heldout_plateau,
+              train.py::Modeller.init_mol_dataset,
               models/nf_policy.py::NFPolicy.get_traj_fwd, models/nf_policy.py::NFPolicy.log_density,
               'cfg:eval_num_samples', 'cfg:eval_period', 'cfg:heldout_gate']
 
-  - id: mle_gate
-    group: mle
-    kind: warn
-    title: Exit gate · never fires on this config
-    lines:
-      - 'rule: $n \ge 2000$ and trailing medians (2500 steps) of w1r median $\le 5$, worst $\le 10$'
-      - 'w1r needs $\ge 4 \times 10{,}000$ reference rows; the MLE dataset has 30,827, so w1r is never published, silently'
-      - 'so the stage always runs to its bound, max_steps $= 50{,}000$'
-    anchors: [progress_metrics.py::_column_w1_ratio, protocol.py::StageProtocol.maybe_advance,
-              protocol.py::StageProtocol._step_cap_reached,
-              'cfg:progress_gate', 'cfg:eval_num_samples', 'cfg:@train_prior.exit', 'cfg:@train_prior.max_steps']
-
-  - id: mle_exit
-    group: mle
-    kind: once
-    title: Hand-off at $n = 50{,}000$
-    lines:
-      - 'snapshot: weights, Adam state, tracker, buffers'
-      - 'carried: weights, $\log Z = 0$, tracker, global step $n$'
-      - 'reset: optimizer moments, LR clock, tripwire bars, clip guard'
-    anchors: [protocol.py::StageProtocol.advance, controller.py::LRController.on_stage_change,
-              grad_clip_guard.py::GradClipGuard.refresh, 'cfg:@train_prior.on_exit']
-
-  # ---------------------------------------------------------------- stage 2
   - id: eq_entry
-    group: eq
-    kind: once
-    title: Stage entry
-    lines:
-      - 'optimizer moments rebuilt · LR and tripwire clocks restart: $m = n - n_0$'
-      - 'prior rebuild skipped: the prior buffer stays the pre-noised file''s kept rows'
-      - 'bootstrap: 4000 draws $x \sim q_\theta$, $\ \log w = \log R - \log q_\theta(x)$, $\ \log Z \leftarrow z^*(\log w)$ with gain $K = 1$'
-      - 'replay opens with those rows ($\le 4000$: finite $\log R \ge -200$) plus $\le 1000$ rows of the hand-off evaluation'
-    anchors: [train.py::Modeller.bootstrap_z_by_rollout, train.py::Modeller.z_level_fill, protocol.py::StageProtocol.advance,
-              train.py::Modeller.rebuild_prior_by_churn, train.py::Modeller._prior_is_static,
-              controller.py::LRController.on_stage_change, train.py::Modeller.manage_replay_buffer,
-              'cfg:@equilibration.on_enter']
-
-  - id: gate
-    group: eqstep
-    kind: gate
-    title: Rollout this step?
-    lines:
-      - '$(n - n_0)\ \mathrm{mod}\ 20 = 0$'
-      - 'or replay rows $/\,B < 2$, at least 2 steps after the last rollout'
-    anchors: [train.py::Modeller._fwd_gates, train.py::Modeller._rollout_trigger_fires, train.py::Modeller._replay_rows,
-              'cfg:@equilibration.fwd_rollout_every', 'cfg:@equilibration.fwd_rollout_triggers', 'cfg:batch_size']
+    patch:
+      replace:
+        - ['bootstrap: 4000 poli',
+           'bootstrap: 4000 draws $x \sim q_\theta$, $\ \log w = \log R - \log q_\theta(x)$, $\ \log Z \leftarrow z^*(\log w)$ with gain $K = 1$']
 
   - id: fwd
     group: eqstep
@@ -285,20 +145,11 @@ nodes:
               'cfg:fwd_loss_coeffs.exploration_std']
 
   - id: reward
-    group: eqstep
-    title: Reward
-    lines:
-      - '$\log R = -E/kT,\quad kT = 2.5$'
-      - '$E = \mathrm{cap}_2\big(\mathrm{cap}_1(\lambda E_{\mathrm{ELJ}}/Z'' + 10\,\phi_{\mathrm{pack}} + E_{PV}) + 10kT\sum_d \mathrm{relu}(|x_d| - 1)^2 + 10kT\,\mathrm{relu}(E_{\mathrm{red}})\big) + E_{\mathrm{jac}}$'
-      - 'drawn and replayed states lie in the box: the decode clamp is the identity and the wall term is 0'
-      - '$\lambda = 0.364$ · $\phi_{\mathrm{pack}}$: penalty on packing coefficient outside $[0.55,\ 0.95]$ · $E_{PV}$ at 1 atm'
-      - '$\mathrm{cap}_c(y) = c + \log(1 + y - c)$ above $c$; $\ c_1 = 472.9$, $\ c_2 = c_1 + 0.1\,|c_1|$'
-      - '$E_{\mathrm{jac}} = -kT\big(2\ln\sin(r/2) + \ln\sin\theta + Z''\ln(V/n_{\mathrm{sym}})\big)$'
-    anchors: [energies/molecular_crystal.py::MolecularCrystal.generator_energy, energies/molecular_crystal.py::MolecularCrystal.compute_jacobian,
-              energies/molecular_crystal.py::density_penalty, energies/base_set.py::BaseSet.log_reward,
-              models/nf_policy.py::NFPolicy.get_traj_fwd, 'cfg:model.nf.bounded_rows',
-              'cfg:energy_config.temperature', 'cfg:energy_config.density_coeff', 'cfg:energy_config.bounding_coeff',
-              'cfg:energy_config.reduction_coeff']
+    patch:
+      replace:
+        - ['the crystal is built',
+           'drawn and replayed states lie in the box, so the wall term is 0; the decode clamp still moves draws inside its bands (see Target)']
+      anchors_add: [models/nf_policy.py::NFPolicy.get_traj_fwd, 'cfg:model.nf.bounded_rows']
 
   - id: fwd_tb
     group: eqstep
@@ -309,19 +160,13 @@ nodes:
       - 'forward share pinned at 0: no gradient from this branch'
       - 'still updates the tracker EMA of $\log w = \log R - \log q_\theta(x)$ and the best energy'
     anchors: [gflownet_losses.py::get_gfn_forward_loss, gflownet_losses.py::get_tb_loss, train.py::Modeller.fused_train_step,
-              'cfg:@equilibration.fracs', 'cfg:@equilibration.deactivate_threshold']
+              'cfg:@equilibration.fracs', 'cfg:@equilibration.deactivate_threshold', 'cfg:condition_log_z.z_feed']
 
   - id: zfill
-    group: eqstep
-    title: Set $\log Z$ from this rollout
-    lines:
-      - '$\log w_j = \log R_j - \log q_\theta(x_j)$ over $j = 1..1000$'
-      - '$z^*$ solves $\frac{1}{B}\sum_j \mathrm{clip}(z - \log w_j,\ \pm 10) = 0$'
-      - 'Kalman: $\log Z \mathrel{+}= K\,(z^* - \log Z),\ K = P/(P + \mathrm{se}^2)$, $P$ grows $0.01$ per step'
-      - 'knee 10 is the forward $\beta$, not the 80 the losses use'
-    anchors: [train.py::Modeller.z_level_fill, train.py::Modeller._stash_z_fill_logw, train.py::Modeller._z_fill_head_is_fillable,
-              gflownet_losses.py::winsorized_z_root, 'cfg:fwd_loss_coeffs.beta', 'cfg:z_calibration.fill_mode',
-              'cfg:z_calibration.fill_threshold']
+    patch:
+      replace:
+        - ['$\log w_j = \log R_j',
+           '$\log w_j = \log R_j - \log q_\theta(x_j)$ over $j = 1..1000$']
 
   - id: bwd
     group: eqstep
@@ -345,112 +190,12 @@ nodes:
     anchors: [train.py::Modeller.replay_train_step, train.py::Modeller.draw_replay_sample, train.py::Modeller._finish_replay_draw,
               models/nf_policy.py::NFPolicy.get_traj_replay, 'cfg:buffers.replay_buffer.prioritise']
 
-  - id: fused
-    group: eqstep
-    title: Fused loss
-    lines:
-      - '$L = (1 - s)\,L_b + s\,L_r$, $\ s$ = replay share'
-      - '$L = L_b$ while the replay buffer is empty'
-    anchors: [train.py::Modeller.fused_train_step, train.py::Modeller.train_step, 'cfg:@equilibration.fracs',
-              'cfg:fused_grad_accum_min_samples']
-
-  - id: admit
-    group: eqstep
-    title: Admit this rollout to replay (rollout steps only)
-    lines:
-      - 'rows with finite $\log R \ge -200$, at most 1000 per call'
-    anchors: [train.py::Modeller.manage_replay_buffer, train.py::Modeller.fused_train_step,
-              'cfg:buffers.replay_buffer.admit_reward_min', 'cfg:buffers.replay_buffer.churn_rate']
-
-  - id: logz
-    group: eq
-    kind: param
-    title: $\log Z$
-    lines:
-      - 'one scalar, initialised 0 · never receives gradient on this route'
-      - 'still 0 at the end of the MLE stage'
-      - 'moved only by the equilibration fill, or restored by a tripwire rewind'
-    anchors: [models/architectures.py::LearnableScalar, train.py::Modeller.z_level_fill, 'cfg:z_calibration.fill_from_eval']
-
-  - id: prior_buf
-    group: eq
-    kind: store
-    title: Prior buffer · static
-    lines:
-      - 'a copy of the MLE dataset: the 30,827 kept children'
-      - 'no admission, churn or expiry on a pre-noised prior'
-      - 'bwd writes a per-row priority that only the eval report reads'
-    anchors: [train.py::Modeller._prior_is_static, train.py::Modeller.manage_prior_buffer,
-              train.py::Modeller.init_prior_buffer_seed, train.py::Modeller._bwd_retention_priority]
-
-  - id: anchor_buf
-    group: eq
-    kind: store
-    title: Anchor buffer · frozen
-    lines:
-      - 'a copy of the same 30,827 children'
-      - 'supplies $M$ to every branch''s under-coverage statistic'
-    anchors: [train.py::Modeller.init_anchor_buffer_seed, train.py::Modeller._reward_ramp_kwargs,
-              'cfg:buffers.anchor_buffer.frozen']
-
-  - id: replay_buf
-    group: eq
-    kind: store
-    title: Replay buffer · $\le 50{,}000$ rows
-    lines:
-      - 'mean residence 240 steps · max age 1200'
-      - '$\approx 13$ batches at steady state (derived: $(50 + 4)$ rows/step × 240 steps; not measured)'
-    anchors: [train.py::Modeller.manage_replay_buffer, 'cfg:buffers.replay_buffer.max_size',
-              'cfg:buffers.replay_buffer.mean_residence_steps', 'cfg:buffers.replay_buffer.backstop_mult',
-              'cfg:buffers.replay_buffer.admit_from_eval', 'cfg:@equilibration.fwd_rollout_every']
-
   - id: optim
-    group: eq
-    title: Optimizer step · Adam $\beta = (0.9,\ 0.999)$, no weight decay
-    lines:
-      - 'policy LR $= 1.25\times10^{-4}\cdot\alpha(m)$: $\ \alpha = 0.05$ for $m < 3000$, $\times 4$ geometric to $0.2$ by $m = 4000$, then held'
-      - 'clip $\|g\| \le \tau$: $\ \tau = 10$ (route override) for the stage''s first 100 steps, then a lognormal fit to those norms, $\tau_1 = e^{\mu + 2.326\sigma}$'
-      - 'then $\tau \leftarrow \tau\, e^{0.01(\mathbb{1}[\|g\| > \tau] - 0.01)}$, held within $[\tau_1/100,\ 100\,\tau_1]$ of the fitted bar'
-    anchors: [train.py::Modeller.step_loss, grad_clip_guard.py::GradClipGuard.threshold, grad_clip_guard.py::GradClipGuard.observe,
-              grad_clip_guard.py::GradClipGuard._accumulate, grad_clip_guard.py::GradClipGuard._apply_cap,
-              controller.py::LRController.tick, 'cfg:lr_control.seed_lr', 'cfg:lr_control.schedule',
-              'cfg:grad_clip_guard', 'cfg:gradient_norm_clip']
-
-  - id: trip
-    group: eq
-    title: Tripwire · every step → rewind
-    lines:
-      - 'fires on $|\mathrm{loss}| \ge 10^6$ or $\|g\| \ge 10^6$'
-      - 'from $m = 3000$: loss $\ge hi + 10\,(hi - lo)$ or $\|g\| \ge 100\times$ the largest pre-clip norm, over a 200-step window; refit at $m \approx 4400$'
-      - 'a non-finite gradient skips the step; its rewind fires on the 10-step clock; 50 in a row abort'
-      - 'a rewind restores weights, Adam state and trackers from the last good checkpoint and keeps the buffers'
-      - 'a rewind scales the LR by fire_cut_factor $= 1$: no cut on this config'
-      - 'more than $\max(3,\ n/1000)$ rewinds abort the run'
-    anchors: [controller.py::LRController.observe, controller.py::LRController.on_divergence, hard_failure_bars.py::HardFailureBars.judge,
-              hard_failure_bars.py::HardFailureBars.derive, train.py::Modeller.fire_loss_spike,
-              'cfg:lr_control.hard_failure', 'cfg:lr_control.fire_cut_factor', 'cfg:max_reloads_per_1k_steps']
-
-  - id: hot_lr
-    group: eq
-    kind: periodic
-    title: Every 10 steps · hot-LR sensor, report only
-    lines:
-      - 'reads the EMA of the forward residual spread (std of $r$ over a rollout batch)'
-      - 'flags when $\ln(\text{latest} / \text{10th percentile of the last 11 readings}) > 2$'
-      - 'action report: logs the flag, moves nothing'
-    anchors: [train.py::Modeller.observe_hot_lr, lr_hot_sensor.py::HotSensor.observe, protocol.py::StageProtocol.__init__,
-              'cfg:@equilibration.hot_lr_sensor']
-
-  - id: ramp
-    group: eq
-    kind: periodic
-    title: Every 10 steps · replay share $s$
-    lines:
-      - '$s = 0.1$ held for the first 500 steps of the stage, then'
-      - '$u$ = EMA of bwd under-coverage · $v$ = EMA of (mean raw under-coverage over the last 150 steps − mean over the 150 before)'
-      - 'trip when $u > \min u + 0.5$, release at $u \le \min u + 0.25$'
-      - '$s \mathrel{-}= 0.006$ if $v > 0$ or tripped, else $s \mathrel{+}= 0.004$; $\ s \in [0.1,\ 0.75]$'
-    anchors: [protocol.py::StageProtocol._gated_ramp_tick, train.py::Modeller._forgetting_sensor, 'cfg:@equilibration.balance']
+    patch:
+      replace:
+        - ['clip $\|g\| \le \tau',
+           'clip $\|g\| \le \tau$: $\ \tau = 10$ (route override) for the stage''s first 100 steps, then a lognormal fit to those norms, $\tau_1 = e^{\mu + 2.326\sigma}$']
+      anchors_add: ['cfg:gradient_norm_clip']
 
   - id: eq_eval
     group: eq
@@ -465,77 +210,22 @@ nodes:
               'cfg:buffers.replay_buffer.admit_from_eval', train.py::Modeller.density_readouts]
 
   - id: ckpt
-    group: eq
-    kind: periodic
-    title: Checkpoint every 50 steps · archive every 5000
-    lines:
-      - 'run ends at $n = 100{,}000$'
-      - 'records the resolved flow settings with the weights'
-    anchors: [checkpointing.py::Checkpointer._gfn_config_from, checkpointing.py::Checkpointer.save, checkpointing.py::Checkpointer.archive, 'cfg:epochs', 'cfg:archive_period']
+    patch:
+      add:
+        - 'records the resolved flow settings with the weights'
+      anchors_add: [train.py::Modeller._build_gfn_config]
 
   - id: notation
-    group: eq
-    kind: note
-    title: Notation
-    lines:
-      - '$\rho_\beta(r) = \tfrac12 r^2$ for $|r| \le \beta$, else $\beta|r| - \tfrac12\beta^2$ (gradient $\mathrm{clip}(r, \pm\beta)$)'
-      - '$\bar Z$: $\log Z$ with gradient stopped · se: standard error of $z^*$ · $\langle\cdot\rangle$: batch mean'
-      - '$n$: global step · $n_0$: the stage''s first step · $m = n - n_0$'
-      - 'under-coverage $u = \sqrt{\textstyle\sum_j \tilde w_j \min(r_j, 0)^2}$, $\ w_j = \mathrm{clamp}\big((\log R_j - M + 100)/50,\ 0,\ 1\big)$, $\ \tilde w = w/\sum w$'
-      - '$M$ = best $\log R$ in the anchor buffer'
-      - '$q_\theta$: the flow''s exact density on the box, no $\pm 200$ clip · $\log P_F = \log q_\theta(x)$, $\log P_B = 0$'
-    anchors: [utils.py::quick_tb_stats, gflownet_losses.py::get_tb_loss, gflownet_losses.py::winsorized_z_root,
-              'cfg:buffers.prior_buffer.ramp_floor', 'cfg:buffers.prior_buffer.ramp_width', models/nf_policy.py::NFPolicy._one_step]
+    patch:
+      add:
+        - '$q_\theta$: the flow''s exact density on the box, no $\pm 200$ clip · $\log P_F = \log q_\theta(x)$, $\log P_B = 0$'
+      anchors_add: [models/nf_policy.py::NFPolicy._one_step]
 
 edges:
-  - {from: target, to: energy_fn}
-  - {from: energy_fn, to: model}
-  - {from: model, to: optim_init}
-  - {from: optim_init, to: load}
-  - {from: prior_file, to: load, kind: data, label: rows}
   - {from: load, to: fit_scalers}
   - {from: fit_scalers, to: seed_stores}
   - {from: mle_data, to: fit_scalers, kind: data, label: latents}
   - {from: load, to: mle_eval, kind: data, label: readout rows}
-  - {from: load, to: mle_data, kind: data, label: kept rows}
-  - {from: seed_stores, to: mle_entry}
-  - {from: seed_stores, to: prior_buf, kind: data, label: copy}
-  - {from: seed_stores, to: anchor_buf, kind: data, label: copy}
-  - {from: mle_entry, to: mle_draw}
-  - {from: mle_data, to: mle_draw, kind: data, label: rows}
-  - {from: mle_draw, to: mle_bwd}
-  - {from: mle_bwd, to: mle_loss}
-  - {from: mle_loss, to: mle_optim}
-  - {from: mle_optim, to: mle_eval}
-  - {from: mle_eval, to: mle_gate}
-  - {from: mle_gate, to: mle_draw, label: next step}
-  - {from: mle_gate, to: mle_exit, label: '$n = 50{,}000$'}
-  - {from: mle_exit, to: eq_entry}
-  - {from: eq_entry, to: gate}
-  - {from: gate, to: fwd, label: 'yes'}
-  - {from: gate, to: bwd, label: 'no'}
-  - {from: fwd, to: reward}
-  - {from: reward, to: fwd_tb}
-  - {from: fwd_tb, to: zfill}
-  - {from: zfill, to: bwd}
-  - {from: bwd, to: replay}
-  - {from: replay, to: fused}
-  - {from: fused, to: admit}
-  - {from: admit, to: optim}
-  - {from: optim, to: trip}
-  - {from: trip, to: hot_lr}
-  - {from: hot_lr, to: ramp}
-  - {from: ramp, to: eq_eval}
-  - {from: eq_eval, to: ckpt}
-  - {from: ckpt, to: gate, label: next step}
-  - {from: zfill, to: logz, kind: write}
-  - {from: eq_eval, to: logz, kind: write}
-  - {from: eq_entry, to: logz, kind: write}
-  - {from: logz, to: bwd, kind: data, label: detached}
-  - {from: logz, to: replay, kind: data, label: detached}
-  - {from: prior_buf, to: bwd, kind: data, label: terminal states}
-  - {from: anchor_buf, to: ramp, kind: data, label: '$M$, via the bwd statistic'}
   - {from: replay_buf, to: replay, kind: data, label: 'stored pairs $(x_0, x)$'}
-  - {from: admit, to: replay_buf, kind: data, label: rows}
-  - {from: eq_eval, to: replay_buf, kind: data, label: rows}
-  - {from: eq_entry, to: replay_buf, kind: data, label: bootstrap + hand-off rows}
+remove_edges:
+  - {from: load, to: seed_stores}

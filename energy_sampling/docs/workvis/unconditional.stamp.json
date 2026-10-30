@@ -58,6 +58,13 @@
     "val_gap_max": 0.0
    }
   },
+  "cfg:@equilibration.hot_lr_sensor": {
+   "value": {
+    "above": 2.0,
+    "channel": "fwd/scatter_err",
+    "rows": 11
+   }
+  },
   "cfg:@equilibration.loss_coeffs": {
    "value": {
     "bwd": {
@@ -125,6 +132,14 @@
     }
    ]
   },
+  "cfg:@train_prior.hot_lr_sensor": {
+   "value": {
+    "above": 5.0,
+    "channel": "bwd/mle",
+    "form": "absolute",
+    "rows": 31
+   }
+  },
   "cfg:@train_prior.loss_coeffs": {
    "value": {
     "bwd": {
@@ -189,8 +204,11 @@
   "cfg:bwd_loss_coeffs.traj_grads": {
    "value": 1.0
   },
-  "cfg:condition_log_z.half_life_visits": {
-   "value": 200.0
+  "cfg:condition_log_z.eval_half_life_visits": {
+   "value": 2.0
+  },
+  "cfg:condition_log_z.z_feed": {
+   "value": "forward"
   },
   "cfg:energy_config.bounding_coeff": {
    "value": 10.0
@@ -244,6 +262,9 @@
   },
   "cfg:gradient_norm_clip": {
    "value": "auto"
+  },
+  "cfg:lr_control.fire_cut_factor": {
+   "value": 1.0
   },
   "cfg:lr_control.hard_failure": {
    "value": {
@@ -351,6 +372,9 @@
     "window_kT": 6.0
    }
   },
+  "cfg:nonfinite_abort_streak": {
+   "value": 50
+  },
   "cfg:prior_path": {
    "value": "D:/crystal_datasets/conditional/priors/noised_oct28/mipcas_elj_oct05a_k10_v2.pt"
   },
@@ -371,6 +395,9 @@
     "mode": "level"
    }
   },
+  "cfg:rewind_tolerance": {
+   "value": 0.25
+  },
   "cfg:space_groups": {
    "value": [
     2
@@ -385,8 +412,8 @@
   "cfg:z_calibration.fill_mode": {
    "value": "absorb"
   },
-  "cfg:z_calibration.fill_threshold": {
-   "value": 0.5
+  "cfg:z_calibration.fill_process_var": {
+   "value": 0.01
   },
   "checkpointing.py::Checkpointer.archive": {
    "calls": [
@@ -423,6 +450,18 @@
     "self.bars.judge"
    ],
    "hash": "ee7b49dd3720"
+  },
+  "controller.py::LRController.on_divergence": {
+   "calls": [
+    "float",
+    "int",
+    "max",
+    "print",
+    "self._cfg",
+    "self._state",
+    "self.set_scale"
+   ],
+   "hash": "93b20df51b90"
   },
   "controller.py::LRController.on_stage_change": {
    "calls": [
@@ -593,6 +632,17 @@
    ],
    "hash": "1a68332d8753"
   },
+  "grad_clip_guard.py::GradClipGuard._accumulate": {
+   "calls": [
+    "max",
+    "print"
+   ],
+   "hash": "51f88aa1d38a"
+  },
+  "grad_clip_guard.py::GradClipGuard._apply_cap": {
+   "calls": [],
+   "hash": "a480bd47ff33"
+  },
   "grad_clip_guard.py::GradClipGuard.observe": {
    "calls": [
     "float",
@@ -633,6 +683,18 @@
     "self.loss_bar.get"
    ],
    "hash": "94610342f48b"
+  },
+  "lr_hot_sensor.py::HotSensor.observe": {
+   "calls": [
+    "bool",
+    "float",
+    "int",
+    "len",
+    "self._drawdown",
+    "self._floor",
+    "self.window.append"
+   ],
+   "hash": "3b69ec051b5d"
   },
   "models/architectures.py::LearnableScalar": {
    "calls": [
@@ -848,6 +910,21 @@
    ],
    "hash": "e91340c6b7f4"
   },
+  "protocol.py::Stage._parse_hot_lr_sensor": {
+   "calls": [
+    "TypeError",
+    "ValueError",
+    "_require_count",
+    "_require_real",
+    "float",
+    "isinstance",
+    "list",
+    "set",
+    "sorted",
+    "type"
+   ],
+   "hash": "2f1e9cdd727d"
+  },
   "protocol.py::StageProtocol._gated_ramp_tick": {
    "calls": [
     "bool",
@@ -926,6 +1003,15 @@
    ],
    "hash": "526d8b63b199"
   },
+  "train.py::Modeller._eval_feed_log_z": {
+   "calls": [
+    "bool",
+    "getattr",
+    "self.condition_log_z.update",
+    "self.protocol.flag"
+   ],
+   "hash": "e702177ef61b"
+  },
   "train.py::Modeller._eval_z_fill": {
    "calls": [
     "ValueError",
@@ -990,6 +1076,14 @@
    ],
    "hash": "216a4e502c40"
   },
+  "train.py::Modeller._offpolicy_feeds_log_z": {
+   "calls": [
+    "bool",
+    "getattr",
+    "self.protocol.flag"
+   ],
+   "hash": "7e812fd54dad"
+  },
   "train.py::Modeller._prior_is_static": {
    "calls": [
     "getattr",
@@ -1030,6 +1124,17 @@
     "self._ramp_params"
    ],
    "hash": "1548ef266141"
+  },
+  "train.py::Modeller._rewind_checkpoint_path": {
+   "calls": [
+    "float",
+    "getattr",
+    "int",
+    "print",
+    "self.checkpointer.path_for",
+    "stage_and_step"
+   ],
+   "hash": "a90ec1b71a0c"
   },
   "train.py::Modeller._rollout_trigger_fires": {
    "calls": [
@@ -1104,6 +1209,7 @@
     "get_gfn_backward_loss",
     "self._bwd_retention_priority",
     "self._larder_harvest",
+    "self._offpolicy_feeds_log_z",
     "self._store_touch",
     "self.draw_bwd_sample",
     "self.prior_buffer.update_losses",
@@ -1112,7 +1218,7 @@
     "self.scramble_applicable",
     "self.tb_z_source"
    ],
-   "hash": "842e7c5aa9ad"
+   "hash": "fb723f92d052"
   },
   "train.py::Modeller.draw_bwd_sample": {
    "calls": [
@@ -1262,6 +1368,7 @@
     "print",
     "sample_eval_fwd_trajs",
     "self._anchor_energy",
+    "self._eval_feed_log_z",
     "self.condition_log_z.update_best_energy",
     "self.eval_draw_size",
     "self.force_agreement_stats",
@@ -1270,7 +1377,7 @@
     "self.screen_and_admit_anchors",
     "time"
    ],
-   "hash": "dd2d28f101de"
+   "hash": "b4644a338ee2"
   },
   "train.py::Modeller.fwd_train_step": {
    "calls": [
@@ -1311,18 +1418,6 @@
     "strip_lazy_sg_caches"
    ],
    "hash": "e4f0b8e2c1db"
-  },
-  "train.py::Modeller.init_condition_log_z": {
-   "calls": [
-    "ConditionLogZTracker",
-    "ValueError",
-    "float",
-    "getattr",
-    "hasattr",
-    "self._arm_phys_energy_guard",
-    "self._set_tracker_trainable"
-   ],
-   "hash": "627b9de07efb"
   },
   "train.py::Modeller.init_energy_function": {
    "calls": [
@@ -1471,6 +1566,31 @@
    ],
    "hash": "6b5e2bcd881c"
   },
+  "train.py::Modeller.monitor_losses": {
+   "calls": [
+    "float",
+    "getattr",
+    "len",
+    "print",
+    "self._best_metric_channels",
+    "self.combo_loss_record.append",
+    "self.fire_loss_spike",
+    "self.metric_tracker.get"
+   ],
+   "hash": "c3fb586cdce5"
+  },
+  "train.py::Modeller.observe_hot_lr": {
+   "calls": [
+    "HotSensor",
+    "getattr",
+    "int",
+    "print",
+    "self.fire_loss_spike",
+    "self.metric_tracker.get",
+    "self.metric_tracker.written_step"
+   ],
+   "hash": "f86e4ec99855"
+  },
   "train.py::Modeller.progress_metrics": {
    "calls": [
     "_column_w1_ratio",
@@ -1490,24 +1610,38 @@
    ],
    "hash": "4a978e286c0d"
   },
+  "train.py::Modeller.rebuild_prior_by_churn": {
+   "calls": [
+    "getattr",
+    "hasattr",
+    "int",
+    "max",
+    "min",
+    "print",
+    "self._prior_buffer_len",
+    "self._prior_churn_cycle",
+    "self._prior_is_static"
+   ],
+   "hash": "b28b9baafc19"
+  },
   "train.py::Modeller.replay_train_step": {
    "calls": [
     "float",
     "get_gfn_backward_loss",
     "getattr",
     "self._larder_harvest",
+    "self._offpolicy_feeds_log_z",
     "self._policy_drift_stats",
     "self._replay_val_stats",
     "self._store_touch",
     "self.draw_replay_sample",
     "self.metric_tracker.update",
-    "self.protocol.flag",
     "self.replay_buffer.absorption_stats",
     "self.replay_buffer.update_logw_stats",
     "self.replay_buffer.update_losses",
     "self.tb_z_source"
    ],
-   "hash": "050bb1a3698d"
+   "hash": "659b435b7717"
   },
   "train.py::Modeller.step_loss": {
    "calls": [
@@ -1593,7 +1727,8 @@
    "hash": "31fe2cb8a4da"
   }
  },
- "commit": "b92ced74",
- "date": "2026-10-29",
- "dirty": []
+ "commit": "a264b41b",
+ "date": "2026-10-30",
+ "dirty": [],
+ "mxt_commit": "cf163800"
 }

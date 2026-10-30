@@ -26,6 +26,13 @@ route with overrides, run it on the copy with the overrides applied that the con
 below names. The
 code in the working tree is the authority; wiki pages under `docs/wiki/` are leads only.
 
+If the YAML has `extends:`, it is a variant: it holds only its own boxes (replaced,
+`patch:`ed line by line, or new) and inherits the rest from the base YAML it names.
+Read the merged diagram with
+`python -X utf8 -c "import sys; sys.path.insert(0, 'docs/workvis'); import diagram, yaml; print(yaml.safe_dump(diagram.load('{WORKFLOW}'), allow_unicode=True, sort_keys=False))"`.
+Audit only the nodes listed below; inherited boxes are audited in the base. Your
+coverage pass looks only for behaviours that differ on this route from the base's.
+
 Audit these nodes: {NODES}
 Context for this audit: {CONTEXT}
 

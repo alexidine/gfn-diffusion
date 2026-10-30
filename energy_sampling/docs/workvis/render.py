@@ -9,13 +9,17 @@ BEFORE Mermaid lays the graph out, so every box is sized to its typeset math.
 Mermaid's own $$ math cannot be used: its pattern is greedy, so a box holding two
 formulas fails to parse.
 
-HIGHLIGHTS ARE A DIFF AGAINST THE BASELINE, by default prev/<workflow>.yaml, the
-copy /workvis takes before it revises the source. A new workflow may take a sibling
-route's diagram as its first baseline (same node ids where the boxes correspond): its
-highlights then show what differs between the two routes. A node that is new or differs
-there is outlined; within it, each line (and the title) not present in the
+A VARIANT (`extends:`) is drawn merged onto its base (diagram.py).
+
+HIGHLIGHTS ARE A DIFF AGAINST THE BASELINE: for a base diagram, by default
+prev/<workflow>.yaml, the copy /workvis takes before it revises the source; for a
+variant, by default its merged base, so its highlights show what differs between the
+two routes. A node that is new or differs there is outlined; within it, each line (and the title) not present in the
 baseline node is bold and coloured. New edges are coloured. Removed nodes are
 listed in the viewer's panel. No baseline file = nothing highlighted.
+
+The page checks itself once drawn: `window.WORKVIS_CHECK` = {ok, nodes, expected,
+mathErrors, error}, so a refresh confirms the render with one script call, no screenshot.
 
 Resolution is yaml and string work only: no torch, no import of the trainer.
 """
@@ -32,6 +36,8 @@ from pathlib import Path
 import yaml
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import diagram  # noqa: E402
 MATH = re.compile(r'(\$[^$]+\$)')
 
 #: node kind -> (Mermaid open, close, fill, stroke, text colour, dashed)
@@ -188,21 +194,27 @@ def page(src: dict, mermaid_src: str, changed: list[str], removed: list[dict],
         'removed': [n['title'] for n in removed],
         'legend': [[k, KINDS[k][2], KINDS[k][3], KINDS[k][5]] for k in KINDS],
     }
-    data = json.dumps({'mermaid': mermaid_src, 'panel': panel}).replace('</', '<\\/')
+    data = json.dumps({'mermaid': mermaid_src, 'panel': panel, 'n_nodes': len(src['nodes'])}).replace('</', '<\\/')
     return TEMPLATE.replace('__DATA__', data).replace('__TITLE__', panel['title'])
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('workflow', help='name of docs/workvis/<workflow>.yaml')
-    ap.add_argument('--baseline', help='YAML to diff against (default prev/<workflow>.yaml)')
+    ap.add_argument('--baseline', help='YAML to diff against (default: prev/<workflow>.yaml; a variant, its base)')
     ap.add_argument('--out', help='output HTML (default docs/workvis/<workflow>.html)')
     args = ap.parse_args(argv)
 
-    src_path = HERE / f'{args.workflow}.yaml'
-    base_path = Path(args.baseline) if args.baseline else HERE / 'prev' / f'{args.workflow}.yaml'
-    src = load(src_path)
-    base = load(base_path) if base_path.exists() else None
+    src = diagram.load(args.workflow)
+    if args.baseline:
+        base = load(Path(args.baseline))
+        if base.get('extends'):
+            base = diagram.merge(diagram.load(base['extends']), base)
+    elif src.get('extends'):
+        base = diagram.load(src['extends'])
+    else:
+        base_path = HERE / 'prev' / f'{args.workflow}.yaml'
+        base = load(base_path) if base_path.exists() else None
     mermaid_src, changed, removed = build(src, base)
     base_label = None
     if base is not None:
@@ -609,8 +621,11 @@ function scrollbars(view) {
     semanticZoom(el, view);
     scrollbars(view);
     view.fit();
+    const nodes = el.querySelectorAll('g.node').length, mathErrors = el.querySelectorAll('merror, .katex-error').length;
+    window.WORKVIS_CHECK = {ok: nodes === DATA.n_nodes && mathErrors === 0, nodes, expected: DATA.n_nodes, mathErrors, error: ''};
   } catch (e) {
     document.getElementById('err').textContent = 'render failed: ' + (e && e.message || e);
+    window.WORKVIS_CHECK = {ok: false, nodes: 0, expected: DATA.n_nodes, mathErrors: null, error: String(e && e.message || e)};
   }
 })();
 </script>

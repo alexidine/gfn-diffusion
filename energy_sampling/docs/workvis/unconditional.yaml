@@ -19,9 +19,9 @@ route:
     embedding_conditioning: false
     model.kind: sde
 stamp:
-  commit: b92ced74
-  date: 2026-10-29
-  audited: 'audited 2026-10-29; corrections applied, not re-audited'
+  commit: a264b41b
+  date: 2026-10-30
+  audited: 'audited 2026-10-29 at b92ced74, all nodes; 2026-10-29 at 7f21f9f8: eq_entry, optim, trip, hot_lr, eq_eval, mle_loss, mle_eval; corrections applied, not re-audited'
 
 groups:
   - {id: init, title: 'Launch · prior initialization', style: init}
@@ -42,7 +42,7 @@ nodes:
       - 'angles $(x/2 + 1/2)\,0.6\pi + 0.2\pi$ · centroid $(x/2 + 1/2)\,a_d$, $\ a = (0.5, 1, 1)$'
       - 'orientation $\theta = \tfrac{\pi}{4}(x + 1),\ \phi = \pi x,\ r = \pi(x + 1)$ → rotation vector'
       - 'periodic, wrapped with period 2: centroid $y, z$ and $\phi, r$'
-      - 'decode clamps to the box → unit cell → cluster (cutoff 10) → ELJ'
+      - 'decode clamps to a slightly tighter box (floor $-0.99$ on rows 0–2, 9, 11; ceiling $1 - 10^{-4}$ on rows 0–1) → unit cell → cluster (cutoff 10) → ELJ'
     anchors: [models/gfn.py::GFN.get_periodic_dimensions, train.py::Modeller._resolve_periodic_centroid_axes,
               models/aunit_periodicity.py::sg_periodic_centroid_axes,
               mxtaltools/dataset_utils/data_class_methods/crystal_ops.py::MolCrystalOps.latent_to_cell_params,
@@ -108,7 +108,8 @@ nodes:
       - 'every row''s reward from its stored energy terms, no rebuild'
       - 'keep: train split, children only, packing $\in [0.55,\ 0.95]$, seed energy (no Jacobian) $\le$ floor $+ 6\,kT$'
       - 'floor $= -141.04$, the best training-split row (an anchor) · 30,827 kept, 7,163 children fail the energy window'
-      - 'arms the clip: $c_1 = \min_i E_i + 250\,kT = -152.08 + 625 = 472.9$; kept energies span $[-152, -132]$, so it binds on none'
+      - 'arms the clip: $c_1 = \min_i E_i + 250\,kT = -152.07 + 625 = 472.9$, $E$ with the Jacobian (kept span $[-152, -132]$)'
+      - 'the cap acts on the energy before the Jacobian, at most $-126$ on kept rows, so it binds on none'
     anchors: [train.py::Modeller.init_prior_dataset, train.py::Modeller._load_noised_prior, train.py::Modeller._stored_reward_terms,
               noised_prior.py::check_rows, noised_prior.py::select_rows,
               energies/molecular_crystal.py::MolecularCrystal.set_reward_clip,
@@ -122,7 +123,7 @@ nodes:
       - 'prior buffer: a static copy · anchor buffer: a frozen copy (children, not anchors)'
       - 'replay buffer: none until the first admission'
     anchors: [train.py::Modeller.init_prior_buffer_seed, train.py::Modeller.init_anchor_buffer_seed,
-              train.py::Modeller.init_condition_log_z, 'cfg:buffers.anchor_buffer.frozen']
+              'cfg:buffers.anchor_buffer.frozen']
 
   # ---------------------------------------------------------------- stage 1
   - id: mle_entry
@@ -167,10 +168,10 @@ nodes:
     lines:
       - '$L = \big\langle \sum_i \log P_B - \sum_i \log P_F \big\rangle$, summed over 10 steps and all live dims, no normalisation'
       - 'gradient to the trunk, $P_F$ and $P_B$ (also through the path); none to $\log Z$'
-      - 'a tracker EMA of $\log w = \log R + \sum\log P_B - \sum\log P_F$ is updated (half-life 200 visits); $\log Z$ never moves'
+      - 'these rows do not write the tracker''s EMA of $\log w$ (z-feed forward: only forward draws do) · $\log Z$ never moves'
     anchors: [gflownet_losses.py::get_gfn_backward_loss, gflownet_losses.py::terminal_mle,
-              buffer.py::ConditionLogZTracker.update, 'cfg:@train_prior.loss_coeffs',
-              'cfg:condition_log_z.half_life_visits', 'cfg:bwd_loss_coeffs.freeze_z']
+              buffer.py::ConditionLogZTracker.update, train.py::Modeller._offpolicy_feeds_log_z, 'cfg:@train_prior.loss_coeffs',
+              'cfg:condition_log_z.z_feed', 'cfg:bwd_loss_coeffs.freeze_z']
 
   - id: mle_optim
     group: mlestep
@@ -178,7 +179,9 @@ nodes:
     lines:
       - 'same Adam, LR clock, clip and tripwire rules as equilibration'
       - 'tripwire bars fit at $m = 3000$, refit at $m \approx 4400$'
+      - 'hot-LR sensor, report only: the MLE loss, absolute form, last 31 readings, threshold 5'
     anchors: [train.py::Modeller.step_loss, controller.py::LRController.observe, grad_clip_guard.py::GradClipGuard.threshold,
+              train.py::Modeller.observe_hot_lr, 'cfg:@train_prior.hot_lr_sensor',
               grad_clip_guard.py::GradClipGuard.observe, hard_failure_bars.py::HardFailureBars.derive,
               'cfg:grad_clip_guard', 'cfg:lr_control.hard_failure']
 
@@ -189,9 +192,11 @@ nodes:
     lines:
       - '10,000 forward rollouts at $kT = 2.5$, scored with ELJ (the training step itself makes no energy call)'
       - '10,000 backward paths from dataset rows, no gradient'
-      - 'w1r per latent column: $W_1(\text{samples}, \text{MLE dataset})$ ÷ median $W_1$ of 4 reference self-draws'
-      - 'no rows enter any buffer'
-    anchors: [train.py::Modeller.evaluation, train.py::Modeller.fwd_eval_sampling, train.py::Modeller.bwd_eval_sampling,
+      - 'w1r (per latent column, $W_1$ to the MLE dataset over the median of 4 reference self-draws) is not computed: it needs $\ge 4 \times 10{,}000$ reference rows (exit gate)'
+      - 'its forward draws write the tracker''s EMA of $\log w$: one update per eval, half-life 2 updates (z-feed forward, update_log_z on)'
+      - 'no rows enter any buffer, except from the hand-off eval at $n = 50{,}000$, run after the switch to stage 2: $\le 1000$ rows to replay'
+    anchors: [train.py::Modeller.evaluation, train.py::Modeller._admit_eval_rollout, train.py::Modeller.fwd_eval_sampling, train.py::Modeller.bwd_eval_sampling,
+              train.py::Modeller._eval_feed_log_z, 'cfg:condition_log_z.z_feed', 'cfg:condition_log_z.eval_half_life_visits',
               train.py::Modeller.progress_metrics, progress_metrics.py::_column_w1_ratio,
               'cfg:eval_num_samples', 'cfg:eval_period']
 
@@ -214,7 +219,7 @@ nodes:
     lines:
       - 'snapshot: weights, Adam state, tracker, buffers'
       - 'carried: weights, $\log Z = 0$, tracker, global step $n$'
-      - 'reset: optimizer moments, LR clock, tripwire bars, clip guard'
+      - 'reset: optimizer moments, LR clock, tripwire bars · clip guard back to warm-up, keeping its last bar; the fused branch, never calibrated, starts at the seed $\tau_0$'
     anchors: [protocol.py::StageProtocol.advance, controller.py::LRController.on_stage_change,
               grad_clip_guard.py::GradClipGuard.refresh, 'cfg:@train_prior.on_exit']
 
@@ -227,7 +232,7 @@ nodes:
       - 'optimizer moments rebuilt · LR and tripwire clocks restart: $m = n - n_0$'
       - 'prior rebuild skipped: the prior buffer stays the pre-noised file''s kept rows'
       - 'bootstrap: 4000 policy samples, $\log Z \leftarrow z^*(\log w)$ with gain $K = 1$'
-      - 'replay opens with those rows ($\le 4000$: finite $\log R \ge -200$) plus $\le 1000$ rows of the hand-off evaluation'
+      - 'replay opens with those rows ($\le 4000$: finite $\log R \ge -200$ and a finite residual) plus $\le 1000$ rows of the hand-off evaluation'
     anchors: [train.py::Modeller.bootstrap_z_by_rollout, train.py::Modeller.z_level_fill, protocol.py::StageProtocol.advance,
               train.py::Modeller.rebuild_prior_by_churn, train.py::Modeller._prior_is_static,
               controller.py::LRController.on_stage_change, train.py::Modeller.manage_replay_buffer,
@@ -277,7 +282,7 @@ nodes:
       - 'forward share pinned at 0: no gradient from this branch'
       - 'still updates the tracker EMA of $\log w$ and the best energy'
     anchors: [gflownet_losses.py::get_gfn_forward_loss, gflownet_losses.py::get_tb_loss, train.py::Modeller.fused_train_step,
-              'cfg:@equilibration.fracs', 'cfg:@equilibration.deactivate_threshold']
+              'cfg:@equilibration.fracs', 'cfg:@equilibration.deactivate_threshold', 'cfg:condition_log_z.z_feed']
 
   - id: zfill
     group: eqstep
@@ -289,7 +294,7 @@ nodes:
       - 'knee 10 is the forward $\beta$, not the 80 the losses use'
     anchors: [train.py::Modeller.z_level_fill, train.py::Modeller._stash_z_fill_logw, train.py::Modeller._z_fill_head_is_fillable,
               gflownet_losses.py::winsorized_z_root, 'cfg:fwd_loss_coeffs.beta', 'cfg:z_calibration.fill_mode',
-              'cfg:z_calibration.fill_threshold']
+              'cfg:z_calibration.fill_process_var']
 
   - id: bwd
     group: eqstep
@@ -391,13 +396,15 @@ nodes:
     lines:
       - 'fires on $|\mathrm{loss}| \ge 10^6$ or $\|g\| \ge 10^6$'
       - 'from $m = 3000$: loss $\ge hi + 10\,(hi - lo)$ or $\|g\| \ge 100\times$ the largest pre-clip norm, over a 200-step window; refit at $m \approx 4400$'
-      - 'a non-finite gradient skips the step; its rewind fires on the 10-step clock; 50 in a row abort'
-      - 'a rewind restores weights, Adam state and trackers from the last good checkpoint and keeps the buffers'
+      - 'a non-finite gradient skips the step; the monitor (every 10 steps) rewinds at streak 1, 11, 21, …, so only a streak that starts on a multiple of 10 is rewound; 50 in a row abort'
+      - 'a rewind restores weights, Adam state and trackers from the latest 50-step save whose loss was within 25% of the running best, and keeps the buffers'
       - 'a rewind scales the LR by fire_cut_factor $= 1$: no cut on this config'
       - 'more than $\max(3,\ n/1000)$ rewinds abort the run'
     anchors: [controller.py::LRController.observe, controller.py::LRController.on_divergence, hard_failure_bars.py::HardFailureBars.judge,
               hard_failure_bars.py::HardFailureBars.derive, train.py::Modeller.fire_loss_spike,
-              'cfg:lr_control.hard_failure', 'cfg:lr_control.fire_cut_factor', 'cfg:max_reloads_per_1k_steps']
+              train.py::Modeller.monitor_losses, train.py::Modeller._rewind_checkpoint_path,
+              'cfg:lr_control.hard_failure', 'cfg:lr_control.fire_cut_factor', 'cfg:max_reloads_per_1k_steps',
+              'cfg:nonfinite_abort_streak', 'cfg:rewind_tolerance']
 
   - id: hot_lr
     group: eq
@@ -407,7 +414,7 @@ nodes:
       - 'reads the EMA of the forward residual spread (std of $r$ over a rollout batch)'
       - 'flags when $\ln(\text{latest} / \text{10th percentile of the last 11 readings}) > 2$'
       - 'action report: logs the flag, moves nothing'
-    anchors: [train.py::Modeller.observe_hot_lr, lr_hot_sensor.py::HotSensor.observe, protocol.py::StageProtocol.__init__,
+    anchors: [train.py::Modeller.observe_hot_lr, lr_hot_sensor.py::HotSensor.observe, protocol.py::Stage._parse_hot_lr_sensor,
               'cfg:@equilibration.hot_lr_sensor']
 
   - id: ramp
