@@ -727,11 +727,9 @@ protocols:
           buffers_active: true
           z_calibration: false          # the unconditional route's Z sidecar. Omitted on conditional_vargrad, which is what every completed conditional battery did
         on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z:rollout:4000' ]
-        # ENTRY POINT ONLY: `balance` below seeds its share from these and walks
-        # the split from here, so this states where the stage STARTS, not where it
-        # settles. Both modes enter strictly inside their `bounds`, so the ramp has
-        # room in both directions from step one.
-        fracs: { fwd: 0.0, bwd: 0.9, replay: 0.1 }
+        # FIXED: no balance block, so the split holds at these values (owner 2026-10-30;
+        # the gated_ramp controller that walked it from bwd 0.9 / replay 0.1 is removed)
+        fracs: { fwd: 0.0, bwd: 0.5, replay: 0.5 }
         # Per-mode frac floors; the integrator kinds fold these into `bounds` at
         # parse. A floor at or above deactivate_threshold keeps that branch
         # always active; below it, the branch may switch off entirely.
@@ -814,35 +812,6 @@ protocols:
           fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z ONLY: policy + conditioner detached at the source
           bwd: { tb: 1.0, beta: 80 }               # freeze_z stays 1 from base: policy only
           replay: { tb: 1.0, beta: 80 }               # freeze_z stays 1 from base: policy only
-        # ONE SENSOR, TWO MOTIONS. replay's share drifts UP by `up` per tick while
-        # the guard sensor is at or below `bar` AND the ratchet says the level is
-        # at a recent best; it moves DOWN by `down` otherwise. The rails are
-        # absolute frac bounds, so bwd's floor is a guarantee rather than an
-        # equilibrium.
-        #
-        # REPLACES kind: ratio, which keyed replay on fwd/over_coverage against
-        # bwd/relative_under_wcen at a setpoint. Two properties made that
-        # unusable here: over_coverage is the positive half of the same residual
-        # field fwd/tb_err measures, so on a positively-skewed field the two
-        # coincide and the loop steers the split on the forward TB error; and
-        # relative_under_wcen has an irreducible floor, so a scale-free setpoint
-        # against it reduces to a bar on the numerator. A ratchet carries a level
-        # reference instead, which is the thing a setpoint has no honest way to
-        # choose.
-        balance:
-          kind: gated_ramp
-          ramp: replay                       # the mode whose share drifts up when the guard is satisfied
-          guard: bwd                         # the mode that owns the sensor and takes back share when it deteriorates
-          pinned: { fwd: 0.0 }              # must equal fracs.fwd. Under freeze_policy any value above deactivate_threshold is equivalent (P7): fracs are loss weights, every active branch runs the full batch, and Adam cancels a single source's scale
-          metric: bwd/under_coverage_rise150 # the guard sensor: the 150-step rise in bwd's coverage residual
-          bar: 0.0                           # sensor level above which the ramp is vetoed. 0 = veto on ANY deterioration, making the loop a servo on the sensor's zero rather than an open-loop drift
-          ratchet_metric: bwd/under_coverage # the LEVEL the ratchet tracks; its stage minimum is the reference
-          ratchet_tol: 0.5                   # nats of slack above the running minimum that still counts as 'at a best'. At 0 only a new all-time low releases the ramp, which vetoes on a level that is far below its start and still falling
-          ratchet_cooldown_steps: 500      # train steps after stage entry during which the fracs are FROZEN at their entry values and no gr_best is recorded. The reference is a running minimum, so a level read while the stage is still settling (log Z walking to its fixed point, the buffer reaching its churned mix) is one no later state can return to, and the trip then latches for the whole stage
-          ratchet_release_tol: 0.25          # tighter re-arm level: the ratchet holds until the level comes back inside this, so it is a Schmitt trigger and not a chattering comparator
-          up: 0.004                          # share added per tick when the ramp is earned
-          down: 0.006                        # share removed per tick when guarded. > up, so a deterioration is undone faster than it was bought
-          bounds: { bwd: [ 0.25, 0.9 ], replay: [ 0.1, 0.75 ] } # ABSOLUTE frac bounds on each split mode; a ceiling on one is a floor on the other, so naming both intersects. bwd's 0.25 floor is a hard rail: the controller cannot starve the branch that owns spread
 
 
   # -- CONDITIONAL: the same MLE warm start, then condition-grouped VarGrad

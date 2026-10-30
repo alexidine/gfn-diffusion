@@ -171,11 +171,12 @@ def test_deactivate_threshold_checked_per_stage(canonical):
 
 
 def test_pinned_frac_disagreeing_with_fracs(canonical):
+    # the canonical equilibration stage holds fixed fracs (no balance), so the pin is put on it here
     cfg = copy.deepcopy(canonical)
-    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
-                 if (s.get('balance') or {}).get('pinned'))
-    mode = next(iter(stage['balance']['pinned']))
-    stage['balance']['pinned'][mode] = stage['fracs'][mode] + 0.1
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages'] if s['name'] == 'equilibration')
+    stage['balance'] = {'kind': 'gated_ramp', 'pinned': {'fwd': stage['fracs']['fwd']}}
+    assert not _fires(cfg, 'pinned_frac_matches_fracs')
+    stage['balance']['pinned']['fwd'] = stage['fracs']['fwd'] + 0.1
     assert _fires(cfg, 'pinned_frac_matches_fracs')
 
 

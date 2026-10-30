@@ -192,6 +192,11 @@ def test_a_pin_at_zero_is_not_a_way_to_rise():
     """active_modes counts pinned: {fwd: 0.0} by its key; the sidecar check reads
     it by value."""
     spec, i = _mk_dev_stage('unconditional_tb', 'equilibration')
+    # mk_dev's equilibration holds fixed fracs (no balance, owner 2026-10-30): the gated_ramp it carried until then
+    spec['balance'] = {'kind': 'gated_ramp', 'ramp': 'replay', 'guard': 'bwd', 'pinned': {'fwd': 0.0},
+                       'metric': 'bwd/under_coverage_rise150', 'bar': 0.0, 'ratchet_metric': 'bwd/under_coverage',
+                       'ratchet_tol': 0.5, 'ratchet_cooldown_steps': 500, 'ratchet_release_tol': 0.25,
+                       'up': 0.004, 'down': 0.006, 'bounds': {'bwd': [0.25, 0.9], 'replay': [0.1, 0.75]}}
     st = Stage(spec, i)
     assert 'fwd' in st.active_modes
     assert not st.balance_can_raise('fwd', 0.01)
