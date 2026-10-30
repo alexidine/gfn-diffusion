@@ -859,6 +859,65 @@ class Modeller:
         return batch.latent_params(
             gauge_fix_free_axes=self.energy_function.is_crystal)
 
+    def _live_kernel_table(self):
+        """noised_prior.live_kernel: per row of the prior dataset, the factor L (live rows x live rows) of the Gaussian
+        the MLE draw adds to that row in the run's chart (energy_config.crystal_coordinates), built once.
+
+        'hessian': L = V diag(w) from the eigenpairs (lambda_i, v_i) of the Hessian of -log R -- the trainer's own
+        reward in its own chart -- at the row, w_i = min(sqrt(live_tau / |lambda_i|), live_width_cap): an excess of
+        live_tau / 2 nats per mode in the quadratic model; a saddle keeps its unstable directions, at the width of
+        |lambda|. 'iso': L = sigma I for every row, sigma^2 = live_tau * d / mean over rows of tr|H|, the same mean
+        excess spread evenly over directions. Rows are scored here once; the draws are never scored."""
+        s = self._noised_prior_settings
+        ds = self.prior_dataset
+        live = self.gfn_model.live_idx.to(self.device)
+        d, n = int(live.numel()), len(ds)
+        T = float(self.energy_function.temperature)
+        H = torch.zeros(n, d, d, device=self.device, dtype=torch.float64)
+        for lo in range(0, n, 256):
+            idx = torch.arange(lo, min(lo + 256, n))
+            mol = ds.batch.subsample_new_batch(idx).to(self.device)
+            x0 = self._batch_latents(mol).to(self.device, torch.float32)
+            z = x0[:, live].clone().requires_grad_(True)
+            x = x0.index_copy(1, live, z)
+            temps = T * torch.ones(len(idx), device=self.device)
+            e, _ = self.energy_function.analyze_crystal_batch(x, mol, temps, keep_grads=True)
+            g = torch.autograd.grad((e / T).sum(), z, create_graph=True)[0]
+            for j in range(d):
+                H[lo:lo + len(idx), j] = torch.autograd.grad(g[:, j].sum(), z, retain_graph=j < d - 1)[0].double()
+        H = 0.5 * (H + H.transpose(1, 2))
+        lam, V = torch.linalg.eigh(H)
+        cap, tau = float(s['live_width_cap']), float(s['live_tau'])
+        if s['live_kernel'] == 'hessian':
+            w = torch.sqrt(tau / lam.abs().clamp_min(tau / cap ** 2)).clamp(max=cap)
+            L = V * w[:, None, :]
+        else:
+            sigma = min(math.sqrt(tau * d / float(lam.abs().sum(-1).mean())), cap)
+            L = sigma * torch.eye(d, device=self.device, dtype=torch.float64).expand(n, d, d).clone()
+        n_neg = int((lam < 0).any(-1).sum())
+        print(f"live kernel '{s['live_kernel']}' (tau {tau:g}, width cap {cap:g}) over {n} prior rows, {d} live "
+              f"chart rows: |lambda| median {float(lam.abs().median()):.3g}, rows with a negative mode {n_neg}, "
+              f"widths median {float(torch.linalg.norm(L, dim=1).median()):.3g}", flush=True)
+        return L.float()
+
+    def _live_kernel_draw(self, latents, inds):
+        """noised_prior.live_kernel: each drawn row moved by L z in its live chart rows, z standard normal; wrapped
+        rows folded onto their period, every other live row reflected into [-1, 1] (a stand-in for re-canonicalising
+        across a face); dead rows untouched."""
+        if getattr(self, '_live_L', None) is None:
+            self._live_L = self._live_kernel_table()
+        live = self.gfn_model.live_idx.to(latents.device)
+        rows = torch.as_tensor(inds, device=latents.device).long().flatten()
+        L = self._live_L.to(latents.device)[rows]
+        delta = torch.einsum('nij,nj->ni', L, torch.randn(L.shape[0], L.shape[1], device=latents.device))
+        z = latents[:, live] + delta
+        wrap = self.gfn_model.ang_mask.to(latents.device)[live].bool()
+        folded = torch.remainder(z + 1.0, 2.0) - 1.0
+        refl = torch.remainder(z + 1.0, 4.0)
+        refl = torch.where(refl > 2.0, 4.0 - refl, refl) - 1.0
+        z = torch.where(wrap, folded, refl.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+        return latents.index_copy(1, live, z)
+
     def _prior_row_energy(self):
         """Per-row energy of the prior buffer AT THE CURRENT LAMBDA.
 
@@ -4189,6 +4248,7 @@ class Modeller:
         energy is -T log R from the stored terms, the quantity _score_prior_rows returns."""
         ef, T = self.energy_function, float(self.args.energy_config.temperature)
         s = noised_prior.settings(self.args)
+        self._noised_prior_settings = s   # read by the MLE draw (live_kernel)
         if int(manifest.get('format_version', -1)) != noised_prior.FORMAT_VERSION:
             raise ValueError(f"pre-noised prior {self.args.prior_path}: format_version "
                              f"{manifest.get('format_version')!r}, this code reads {noised_prior.FORMAT_VERSION}")
@@ -7820,6 +7880,9 @@ class Modeller:
 
             latents = self._batch_latents(mol_batch)
             latents = latents.to(self.device)
+            if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
+                # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
+                latents = self._live_kernel_draw(latents, inds)
 
         elif self.bwd_sampling_mode == 'prior':
             # condition-blocked draws (C conditions x up to M distinct terminals

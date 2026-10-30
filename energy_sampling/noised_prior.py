@@ -14,6 +14,7 @@ graph attributes and a manifest under MANIFEST_KEY:
 The loader keeps rows by kind and split, inside the packing window and within window_kT x T of their condition's
 floor, and checks a stratified sample of rows against a fresh scoring instead of re-scoring the file.
 """
+import math
 import os
 
 import numpy as np
@@ -32,7 +33,10 @@ CHECK_TERMS = ('reduction_en', 'packing_coeff', 'cell_volume')
 ABS_TOL, REL_TOL = 0.1, 1e-4   # energy units: two scorings of one crystal differ by up to ~0.06 raw eLJ in float noise
 CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
-DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS)
+DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
+                live_kernel=None, live_tau=1.0, live_width_cap=0.25)
+#: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw)
+LIVE_KERNELS = (None, 'iso', 'hessian')
 
 
 def settings(args):
@@ -50,6 +54,12 @@ def settings(args):
         raise ValueError(f"noised_prior.train_kinds must be a non-empty subset of {sorted(KIND_NAMES)}, got "
                          f"{s['train_kinds']}")
     s['window_kT'] = None if s['window_kT'] is None else float(s['window_kT'])
+    if s['live_kernel'] not in LIVE_KERNELS:
+        raise ValueError(f"noised_prior.live_kernel must be one of {LIVE_KERNELS}, got {s['live_kernel']!r}")
+    for k in ('live_tau', 'live_width_cap'):
+        v = s[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise ValueError(f"noised_prior.{k} must be a finite number > 0, got {v!r}")
     return s
 
 
