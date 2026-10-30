@@ -14,9 +14,10 @@ DFT-corrected energy), kT = R x 300 K. Metrics, borrowed from conformer generati
 - MAT-P: the mean distance from a source structure to its nearest reference minimum inside ``WINDOW``.
 
 Identity ("a source structure is that reference minimum") is the RDF distance below each cut in ``--cuts``, and, when
-``compack_band.py`` has written COMPACK verdicts for the pairs between the first two cuts
-(``compack_band_<energy>.csv``), also "COMPACK-settled": within the first cut, or between the cuts and matched by
-COMPACK on all 30 molecules. A band pair COMPACK did not settle (timeout, or not compared) counts as no match.
+``compack_band.py`` has written COMPACK verdicts (``compack_band_<energy>.csv``), also "COMPACK-settled": within the
+first cut, or matched by COMPACK on all 30 molecules, a match also counting for the source's structures within ``DUP``
+of the matched one. A pair COMPACK did not settle (timeout, or not compared: ``compack_band`` checks only a few
+nearest structures per reference minimum, within its energy window) counts as no match.
 
 A budget is a prefix of the source's structures in a random order; COV-R and MAT-R are reported against the prefix's
 summed energy calls, as the median and 10-90% band over ``ORDERS`` orders. The ceiling drawn on COV-R is the
@@ -46,6 +47,7 @@ KT = 0.0083144626 * 300  # kJ/mol
 from eval.day_bench.converge import F_TOL
 
 WINDOW = 7.0  # kJ/mol above the reference's lowest, for the precision metrics
+DUP = 0.03  # RDF distance within which two structures of one source are taken as the same minimum
 ORDERS = 200
 STYLE = {'Clari-M': '#eb6834', 'MolCrystalFlow': '#008300', 'random': '#6b6b6b'}
 INK, GRID = '#1f2328', '#c8ccd1'
@@ -137,6 +139,21 @@ def compack_matches(path, names):
     return M, listed, unsettled
 
 
+def settled_identity(D, names, kind, ref_label, cut, verdict_path):
+    """The COMPACK-settled identity matrix (within ``cut``, or a COMPACK match carried to the matched structure's
+    near-identical copies in its source), or None without verdicts; also (pairs listed, unsettled)."""
+    C, listed, unsettled = compack_matches(verdict_path, names)
+    if C is None:
+        return None, (0, 0)
+    label = np.array([n.split(':', 1)[0] for n in names])
+    near = D <= DUP
+    for i, j in zip(*np.nonzero(np.triu(C))):  # a match holds for the source's near-identical structures too
+        r, s = (i, j) if label[i] == ref_label else (j, i)
+        same = (label == label[s]) & (kind == 'sample') & near[s]
+        C[r, same] = C[same, r] = True
+    return (D <= cut) | C, (listed, unsettled)
+
+
 def on_grid(metric, cost, grid):
     """Each order's metric at each budget on ``grid`` (the longest prefix within it; NaN before the first)."""
     out = np.full((metric.shape[0], len(grid)), np.nan)
@@ -198,11 +215,12 @@ def main():
               f'(+{entries[j]["ref_energy"] - min(entries[k]["ref_energy"] for k in ref):.2f} kJ/mol)')
 
     identities = {f'RDF <= {c}': D <= c for c in cuts}
-    C, listed, unsettled = compack_matches(os.path.join(a.out_dir, f'compack_band_{a.energy}.csv'), names)
-    if C is not None:
-        identities = {'COMPACK-settled': (D <= cuts[0]) | C, **identities}
-        print(f'COMPACK verdicts: {listed} pairs between {cuts[0]} and {cuts[1]}, {int(C.sum() // 2)} matched, '
-              f'{unsettled} unsettled (counted as no match)')
+    S, (listed, unsettled) = settled_identity(D, names, kind, ref_label, cuts[0],
+                                              os.path.join(a.out_dir, f'compack_band_{a.energy}.csv'))
+    if S is not None:
+        identities = {'COMPACK-settled': S, **identities}
+        print(f'COMPACK verdicts: {listed} pairs between {cuts[0]} and {cuts[1]}, {unsettled} unsettled (counted as '
+              f'no match)')
     main_id = next(iter(identities))
     rng = np.random.default_rng(0)
     res, rows = {}, []

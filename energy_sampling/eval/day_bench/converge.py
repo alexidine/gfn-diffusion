@@ -29,7 +29,9 @@ experimental forms, random-search endpoints) as a Z' = 1 crystal there (``p1_ing
 falling back to ``p1`` when no symmetric description is found.
 
 usage (licensed CSD Python API):
-    python -m eval.day_bench.converge SAMPLE_DIR REFCODE {p1|sg} [FORMS] [energy] [device]
+    python -m eval.day_bench.converge SAMPLE_DIR REFCODE {p1|sg} [FORMS] [energy] [device] [CONFORMER]
+
+CONFORMER: 'csd' (default) or 'day:<stem CIF>:<structure id>' (``day_landscape.load_reference``).
 
 Reads the built rows of SAMPLE_DIR/p1_relax_<energy>.csv and their endpoints in relaxed_<energy>/, plus
 relaxed_<energy>/exp_<form>.cif for each comma-separated form present; writes converged_<energy>/ and
@@ -96,10 +98,13 @@ def measures(g, T_fc, z_prime):
     return res
 
 
-def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=MAX_STEPS):
+def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=MAX_STEPS, snapshots=(),
+         max_step=None):
     """FIRE on every row of ``batch`` until each row's largest generalised force is at most ``f_tol`` (a converged row
     stops moving) or ``max_steps`` steps have run. Returns (crystals, measures and energy before, after, FIRE steps
-    taken per row)."""
+    taken per row); with ``snapshots`` (step counts, 0 = the start) also {step: (crystals, energy per molecule,
+    largest generalised force)} at each, a row that stopped earlier contributing its final state. ``max_step``
+    overrides ``FIRE['max_step']``."""
     b, x = prepare(batch.to(device))
     n, zp = x.shape[0], int(b.max_z_prime)
     zpr = b.z_prime.reshape(n).to(device)
@@ -109,6 +114,14 @@ def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=
     m = measures(g, T, zpr)
     before = {k: v.cpu().clone() for k, v in m.items()} | {'energy': e.cpu().clone()}
     x = x.double()
+    snaps = {}
+
+    def snap(k):
+        snaps[k] = (x.clone(), e.cpu().clone(), m['max'].cpu().clone())
+
+    if 0 in snapshots:
+        snap(0)
+    cap = FIRE['max_step'] if max_step is None else max_step
     v = torch.zeros_like(x)
     dt = torch.full((n,), FIRE['dt'], device=device, dtype=torch.float64)
     a = torch.full((n,), FIRE['a_start'], device=device, dtype=torch.float64)
@@ -117,7 +130,7 @@ def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=
     active = m['max'] > f_tol
     members = b.batch_to_list()
     rows, b_act = torch.arange(n, device=device), b  # the rows evaluated each step, and their batch
-    for _ in range(max_steps):
+    for step in range(1, max_steps + 1):
         if not active.any():
             break
         if int(active.sum()) <= len(rows) // 2:  # drop converged rows from the evaluated batch
@@ -138,7 +151,7 @@ def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=
         n_pos = torch.where(up, n_pos + 1, torch.zeros_like(n_pos))
         v = v + dt[:, None] * F
         dy = dt[:, None] * v
-        dy = dy * (FIRE['max_step'] / dy.norm(dim=1, keepdim=True).clamp_min(1e-12)).clamp_max(1.0)
+        dy = dy * (cap / dy.norm(dim=1, keepdim=True).clamp_min(1e-12)).clamp_max(1.0)
         dy = dy * active[:, None]
         v = v * active[:, None]
         x = x + dy / s
@@ -151,12 +164,24 @@ def fire(batch, device, energy='exp6', exp6_kwargs=None, f_tol=F_TOL, max_steps=
         for k in m:
             m[k][rows[upd]] = m_new[k][upd]
         active = active & (m['max'] > f_tol)
-    c = b.clone().detach()
-    c.set_cell_parameters(x.float(), skip_box_analysis=False)
-    c.aunit_centroid = wrap_centroid(c.aunit_centroid)
-    canonicalize_aunit(c)
+        if step in snapshots:
+            snap(step)
+    for k in snapshots:  # depths past the last step taken: every row has stopped
+        if k not in snaps:
+            snap(k)
+
+    def crystals(xk):
+        c = b.clone().detach()
+        c.set_cell_parameters(xk.float(), skip_box_analysis=False)
+        c.aunit_centroid = wrap_centroid(c.aunit_centroid)
+        canonicalize_aunit(c)
+        return c.cpu().batch_to_list()
+
     after = {k: v.cpu() for k, v in m.items()} | {'energy': e.cpu()}
-    return c.cpu().batch_to_list(), before, after, steps.cpu().numpy()
+    if snapshots:
+        return crystals(x), before, after, steps.cpu().numpy(), {k: (crystals(xk), ek, fk)
+                                                                 for k, (xk, ek, fk) in sorted(snaps.items())}
+    return crystals(x), before, after, steps.cpu().numpy()
 
 
 def converge(crystals, device, energy='exp6', f_tol=F_TOL, max_steps=MAX_STEPS, log=print):
@@ -189,15 +214,14 @@ def load_rows(sample_dir, energy, forms):
     return rows
 
 
-def main(sample_dir, refcode, mode, forms=(), energy='exp6', device='cuda'):
+def main(sample_dir, refcode, mode, forms=(), energy='exp6', device='cuda', conformer='csd'):
     from ccdc import io as ccdc_io
-    from eval.day_bench.csd_roundtrip import p1_cell
+    from eval.day_bench.day_landscape import load_reference
     torch.set_num_threads(2)
     if str(device).startswith('cuda'):
         torch.cuda.set_per_process_memory_fraction(0.4)
     reader = ccdc_io.EntryReader('CSD')
-    atoms_ref, _, _ = p1_cell(refcode, reader)
-    ref = make_reference(split_molecules(atoms_ref)[0], smiles=reader.entry(refcode).molecule.heaviest_component.smiles)
+    ref = load_reference(refcode, conformer, reader)
 
     rows = load_rows(sample_dir, energy, forms)
     groups = {}  # (description, Z') -> [(row, crystal)]
@@ -247,4 +271,5 @@ def main(sample_dir, refcode, mode, forms=(), energy='exp6', device='cuda'):
 if __name__ == '__main__':
     main(sys.argv[1], sys.argv[2], sys.argv[3],
          tuple(f for f in sys.argv[4].split(',') if f) if len(sys.argv) > 4 else (),
-         sys.argv[5] if len(sys.argv) > 5 else 'exp6', sys.argv[6] if len(sys.argv) > 6 else 'cuda')
+         sys.argv[5] if len(sys.argv) > 5 else 'exp6', sys.argv[6] if len(sys.argv) > 6 else 'cuda',
+         sys.argv[7] if len(sys.argv) > 7 else 'csd')

@@ -9,8 +9,12 @@ reference conformer (``p1_ingest.ingest``, in their own space group) and relaxed
 ``p1_relax`` lays out a generator's; ``p1_relax_<energy>.csv`` adds ``day_fitdma`` and ``ref_energy`` (the corrected
 energy, the one the reference ranking uses).
 
+With CONFORMER ``day`` the reference conformer is Day's own (``day_reference``: the rigid molecule of the landscape's
+lowest structure), so Day's structures need no refitting; ``csd`` (the default) fits the refcode's deposited molecule.
+
 usage (licensed CSD Python API):
     python -m eval.day_bench.day_landscape OUT_DIR REFCODE STEM_CSV STEM_CIF [CORRECTED_CSV|-] WINDOW [energy] [DEVICE]
+        [csd|day]
 """
 import copy
 import csv
@@ -96,15 +100,33 @@ def block_to_atoms(text):
     return Atoms(symbols=[sym[i] for i in keep], scaled_positions=frac[keep], cell=c, pbc=True)
 
 
-def main(out_dir, refcode, stem_csv, stem_cif, corrected_csv, window, energy='exp6', device='cpu'):
+def day_reference(stem_cif, structure_id, smiles):
+    """Day's rigid conformer: the first molecule of one landscape structure's full cell, as a ``p1_ingest`` reference
+    (every structure of a landscape carries the same conformer)."""
+    return make_reference(split_molecules(block_to_atoms(blocks(stem_cif)[structure_id]))[0], smiles=smiles)
+
+
+def load_reference(refcode, conformer, reader):
+    """The rigid reference conformer named by ``conformer``: 'csd' (the refcode's deposited molecule) or
+    'day:<stem CIF>:<structure id>' (Day's own, ``day_reference``)."""
+    from eval.day_bench.csd_roundtrip import p1_cell
+    smiles = reader.entry(refcode).molecule.heaviest_component.smiles
+    if conformer == 'csd':
+        return make_reference(split_molecules(p1_cell(refcode, reader)[0])[0], smiles=smiles)
+    kind, rest = conformer.split(':', 1)  # the CIF path may itself hold a drive colon
+    cif, structure_id = rest.rsplit(':', 1)
+    assert kind == 'day', f'unknown conformer {conformer!r}'
+    return day_reference(cif, structure_id, smiles)
+
+
+def main(out_dir, refcode, stem_csv, stem_cif, corrected_csv, window, energy='exp6', device='cpu', conformer='csd'):
     from ccdc import io as ccdc_io
     from eval.day_bench.csd_roundtrip import p1_cell
     torch.set_num_threads(2)
     if str(device).startswith('cuda'):
         torch.cuda.set_per_process_memory_fraction(0.4)
     reader = ccdc_io.EntryReader('CSD')
-    atoms_ref, _, _ = p1_cell(refcode, reader)
-    ref = make_reference(split_molecules(atoms_ref)[0], smiles=reader.entry(refcode).molecule.heaviest_component.smiles)
+    smiles = reader.entry(refcode).molecule.heaviest_component.smiles
     stages = stages_for(energy)
 
     land = {r['id']: r for r in csv.DictReader(open(stem_csv))}
@@ -117,6 +139,10 @@ def main(out_dir, refcode, stem_csv, stem_cif, corrected_csv, window, energy='ex
     chosen = sorted((i for i in rank if rank[i] - e0 <= window), key=lambda i: rank[i])
     print(f'{len(land)} structures in the landscape; {len(chosen)} within {window} kJ/mol of the lowest '
           f'{"corrected (DFT-level)" if corr else "FIT+DMA"} energy', flush=True)
+    if conformer == 'day':
+        ref = day_reference(stem_cif, chosen[0], smiles)
+    else:
+        ref = make_reference(split_molecules(p1_cell(refcode, reader)[0])[0], smiles=smiles)
 
     texts = blocks(stem_cif)
     raw_dir, rel_dir = os.path.join(out_dir, 'cifs'), os.path.join(out_dir, f'relaxed_{energy}')
@@ -174,4 +200,5 @@ def main(out_dir, refcode, stem_csv, stem_cif, corrected_csv, window, energy='ex
 
 if __name__ == '__main__':
     main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]),
-         sys.argv[7] if len(sys.argv) > 7 else 'exp6', sys.argv[8] if len(sys.argv) > 8 else 'cpu')
+         sys.argv[7] if len(sys.argv) > 7 else 'exp6', sys.argv[8] if len(sys.argv) > 8 else 'cpu',
+         sys.argv[9] if len(sys.argv) > 9 else 'csd')
