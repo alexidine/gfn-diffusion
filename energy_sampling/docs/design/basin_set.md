@@ -7,9 +7,10 @@ as each piece lands. Not policy.*
 *Built (2026-10-30): the guard that refuses a non-latent chart in `build_noised_prior.py` (`refuse_unscored_chart`);
 the writer and reader `mxtaltools/crystal_search/basin_set.py` (`write_basin_set`, `read_basin_set`, `live_mask`;
 committed locally in MXtalTools); `build_noised_prior.py --basins` (anchors only or with iso children, basin tags on
-every row, off-chart basins dropped and counted); `noised_prior.live_kernel: 'basin'` on the FD chart with a rolling
-bank (`train.py::Modeller._basin_kernel_table`, `._basin_fresh`, `._basin_kernel_draw`). Not built: the latent
-chart's composed canonicaliser (so `'basin'` refuses the latent chart), children drawn by the basin kernel, the
+every row, off-chart basins dropped and counted); `noised_prior.live_kernel: 'basin'` on both charts with a rolling
+bank (`train.py::Modeller._basin_kernel_table`, `._basin_fresh`, `._basin_kernel_draw`; the latent chart through
+`energies/molecular_crystal.py::latent_rows_from_params`, composed of crystal_fd's canonicaliser, trainer-box images
+and `LatentV1Chart.latents`). Not built: children drawn by the basin kernel, the
 `log_mass_laplace` column, the conditions file, the molecule coordinate match, the flat-molecule twin map (section
 2), and `FORMAT_VERSION` 2 (the basin tags are optional row attributes of version 1).*
 

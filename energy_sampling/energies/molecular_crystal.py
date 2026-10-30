@@ -144,6 +144,52 @@ def is_crystal_energy(name: str) -> bool:
 SG_LOOKUP_TABLES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
 
 
+def latent_rows_from_params(params, hand, sg: int, radius, generator=None):
+    """The trainer latent of crystals given in any description: ([B, 12] float32 latents, [B] bool ok) of cell
+    parameters ``params`` [B, 12] (MolCrystalData's layout) at handedness ``hand`` [B], space group ``sg``, molecule
+    radii ``radius`` [B]. Each crystal is canonicalised onto the +1 sheet (crystal_fd ``canon.canonicalize``), one of
+    its images inside the trainer's latent box is drawn uniformly (``domains.images(..., within='latent_v1_box')``; the
+    owner rule of 2026-09-28: noise first, then the images), and its latent is taken unclipped
+    (``charts.LatentV1Chart.latents``). ok is False for a row that does not canonicalise, has no image in the box, or
+    whose latent lies outside the live clamp (``LatentV1Chart.clamp_bounds``, e.g. a cell outside the trainer's length
+    box); such rows are zeros, never clipped. Z' = 1."""
+    from mxtaltools.crystal_fd import canon, domains
+    from mxtaltools.crystal_fd.charts import LatentV1Chart
+    from mxtaltools.crystal_fd.description import CrystalDescription
+    p = torch.as_tensor(params, dtype=torch.float64).reshape(-1, 12).cpu()
+    B = p.shape[0]
+    out = torch.zeros(B, 12, dtype=torch.float32)
+    ok = torch.zeros(B, dtype=torch.bool)
+    if B == 0:
+        return out, ok
+    desc = CrystalDescription.from_crystal_params(int(sg), p[:, :3], p[:, 3:6], p[:, 6:9], p[:, 9:12],
+                                                  torch.as_tensor(hand, dtype=torch.float64).reshape(-1, 1).cpu())
+    c = canon.canonicalize(desc, sheet=1)
+    good = torch.tensor([st in ('canonical', 'special_metric') for st in c.names()], dtype=torch.bool)
+    gi = torch.nonzero(good).flatten()
+    if gi.numel() == 0:
+        return out, ok
+    imgs, src, _ = domains.images(c.desc[gi], group='gamma_plus', within='latent_v1_box')
+    if src.numel() == 0:
+        return out, ok
+    # one image per crystal, uniformly: a random key per image, the smallest per source row wins
+    key = torch.rand(src.numel(), generator=generator)
+    order = torch.argsort(key)
+    first = {}
+    for j in order.tolist():
+        first.setdefault(int(src[j]), j)
+    rows_local = torch.tensor(sorted(first), dtype=torch.long)
+    picks = torch.tensor([first[int(r)] for r in rows_local], dtype=torch.long)
+    rad = torch.as_tensor(radius, dtype=torch.float64).reshape(-1).cpu()
+    rows = gi[rows_local]
+    chart = LatentV1Chart(int(sg), rad[rows] if rad.numel() > 1 else rad)
+    lat = chart.latents(imgs[picks])
+    lo, hi = chart.clamp_bounds()
+    inside = ((lat >= lo - 1e-6) & (lat <= hi + 1e-6)).all(1) & torch.isfinite(lat).all(1)
+    out[rows[inside]] = lat[inside].float()
+    ok[rows[inside]] = True
+    return out, ok
+
 def merge_batches(batches):
     """One batch from a list, in order, by append_batch on adjacent pairs in a balanced tree: each row is copied about
     log2(len) times, where appending one at a time copies the growing batch once per part (quadratic in the parts).

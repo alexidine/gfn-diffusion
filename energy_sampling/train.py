@@ -912,9 +912,6 @@ class Modeller:
         call."""
         s = self._noised_prior_settings
         b = self.prior_dataset.batch
-        if getattr(self.energy_function, 'crystal_coordinates', 'latent') != 'fd':
-            raise NotImplementedError("live_kernel 'basin' runs on crystal_coordinates 'fd' only: the latent chart's "
-                                      "canonicaliser with trainer-box images is not built (docs/design/basin_set.md)")
         missing = [k for k in ('basin_p', 'basin_hand', 'basin_H', 'basin_live') if not hasattr(b, k)]
         if missing:
             raise ValueError(f"noised_prior.live_kernel 'basin' needs a basin-set build (build_noised_prior --basins); "
@@ -952,11 +949,12 @@ class Modeller:
     def _basin_fresh(self, rows):
         """[len(rows), data_ndim] chart points of fresh draws around the prior rows' basin centres
         (_basin_kernel_table): each draw built in the basin's own cell parameters and canonicalised into the FD chart
-        (FDCoordinates.from_params). A draw with no chart point is redrawn up to noised_prior.live_redraws times; a
-        row still without one gets its stored chart point, counted in self._basin['misses']."""
-        if getattr(self.energy_function, 'crystal_coordinates', 'latent') != 'fd':
-            raise NotImplementedError("live_kernel 'basin' runs on crystal_coordinates 'fd' only: the latent chart's "
-                                      "canonicaliser with trainer-box images is not built (docs/design/basin_set.md)")
+        (FDCoordinates.from_params), or into the trainer latent at a uniformly drawn trainer-box image
+        (energies/molecular_crystal.py::latent_rows_from_params). A draw with no chart point is redrawn up to
+        noised_prior.live_redraws times; a row still without one gets its stored chart point, counted in
+        self._basin['misses']."""
+        from energies.molecular_crystal import latent_rows_from_params
+        fd = getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
         B = self._basin
         rows = torch.as_tensor(rows).long().flatten().cpu()
         out = B['s0'][rows].clone()
@@ -969,11 +967,16 @@ class Modeller:
             params = B['p'][r] + torch.einsum('nij,nj->ni', B['L'][r], torch.randn(len(r), 12, dtype=torch.float64))
             for g in sorted(set(B['sg'][r].tolist())):
                 sel = (B['sg'][r] == g).nonzero().flatten()
-                fc = self.energy_function.fd_coordinates_rows(int(g), B['radius'][r[sel]])
-                res = fc.from_params(params[sel], B['hand'][r[sel]])
-                ok = res.ok & torch.isfinite(res.s).all(1)
+                if fd:
+                    fc = self.energy_function.fd_coordinates_rows(int(g), B['radius'][r[sel]])
+                    res = fc.from_params(params[sel], B['hand'][r[sel]])
+                    ok = res.ok & torch.isfinite(res.s).all(1)
+                    pts = res.s[ok].float()
+                else:
+                    lat, ok = latent_rows_from_params(params[sel], B['hand'][r[sel]], int(g), B['radius'][r[sel]])
+                    pts = lat[ok]
                 done = idx[sel[ok]]
-                out[done, :fc.dim] = res.s[ok].float()
+                out[done, :pts.shape[1]] = pts
                 pending[done] = False
         B['draws'] += len(rows)
         B['misses'] += int(pending.sum())

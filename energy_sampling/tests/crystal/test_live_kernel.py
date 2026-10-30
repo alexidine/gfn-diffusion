@@ -102,7 +102,7 @@ def _basin_modeller(n=3, H_scale=1e4, caps=(1.0, 0.2, 0.1, 0.5), bank=0, fresh=0
                             radius=torch.full((n,), RADIUS), fd_state=s0.s.float(),
                             num_graphs=n, cell_lengths=torch.zeros(n, 3))
     m.prior_dataset = SimpleNamespace(batch=batch)
-    m.energy_function = SimpleNamespace(temperature=2.5, crystal_coordinates=chart,
+    m.energy_function = SimpleNamespace(temperature=2.5, crystal_coordinates=chart, is_crystal=True,
                                         fd_coordinates_rows=lambda sg, r: FDCoordinates(int(sg), float(r[0])))
     return m, s0.s.float()
 
@@ -146,7 +146,29 @@ def test_the_bank_serves_draws_and_takes_back_the_fresh_ones():
     assert m._basin['draws'] == 24 + 5
 
 
-def test_basin_draws_refuse_the_latent_chart():
+def test_basin_draws_on_the_latent_chart_decode_to_crystals_near_their_basin():
+    """latent_rows_from_params: canonicalise, one trainer-box image drawn uniformly, unclipped latent inside the
+    live clamp; the trainer's own decode of those latents gives back cells near the basin's."""
+    torch.manual_seed(0)
+    from mxtaltools.crystal_fd.charts import LatentV1Chart
     m, _ = _basin_modeller(chart='latent')
-    with pytest.raises(NotImplementedError, match="crystal_coordinates 'fd'"):
-        m._basin_kernel_table()
+    m.prior_dataset.batch.latent_params = lambda gauge_fix_free_axes=True: torch.zeros(3, 12)
+    m._basin_kernel_table()
+    x = m._basin_fresh(torch.zeros(100, dtype=torch.long))
+    assert m._basin['misses'] == 0
+    chart = LatentV1Chart(2, RADIUS)
+    lo, hi = chart.clamp_bounds()
+    assert bool(((x >= lo - 1e-6) & (x <= hi + 1e-6)).all())
+    desc, clamped = chart.describe(x)
+    assert not bool(clamped.any())
+    lengths = torch.sort(desc.crystal_params()[0], dim=1).values
+    assert float((lengths - torch.sort(torch.tensor(P_MIPCAS[:3]))[0]).abs().max(1).values.median()) < 0.1
+
+
+def test_latent_rows_refuse_a_cell_outside_the_length_box():
+    from energy_sampling.energies.molecular_crystal import latent_rows_from_params
+    far = torch.tensor([P_MIPCAS], dtype=torch.float64)
+    far[0, 2] = 45.0                                   # a 45 A axis: no trainer latent holds it
+    x, ok = latent_rows_from_params(torch.cat([torch.tensor([P_MIPCAS], dtype=torch.float64), far]),
+                                    torch.ones(2), 2, torch.full((2,), RADIUS))
+    assert ok.tolist() == [True, False] and bool((x[1] == 0).all())
