@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unconditional crystal training · NF policy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<style>
+  :root { --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; --chg:#ea580c; --bg:#f1f5f9; }
+  html, body { margin:0; height:100%; background:var(--bg); font-family:Inter, system-ui, sans-serif; color:var(--ink); }
+  #stage { position:fixed; inset:0; overflow:hidden; cursor:grab; }
+  #stage.dragging { cursor:grabbing; }
+  #stage svg { width:100%; height:100%; display:block; }
+  .node .label { font-family:Inter, system-ui, sans-serif; line-height:1.5; }
+  .t { font-weight:650; font-size:15.5px; color:var(--ink); }
+  .l { font-size:14px; color:#334155; }
+  .gt { font-weight:700; font-size:17px; letter-spacing:.01em; color:#334155; }
+  .chg, .chg .t, .chg .l, .chg math { color:var(--chg) !important; font-weight:700; }
+  math { font-size:1.06em; }
+  .node rect { rx:10px; ry:10px; }
+  .cluster rect { rx:16px; ry:16px; }
+  .edgeLabel { background:#fff !important; color:var(--muted); font-size:13px; padding:1px 4px; border-radius:4px; }
+  .edgeLabel p, .edgeLabel span { background:#fff !important; }
+  /* Overview (zoomed out): titles only, enlarged; strokes keep their screen width. */
+  .lod-titles, .lod-marks { display:none; }
+  svg.lod-over .lod-titles, svg.lod-over .lod-marks { display:inline; }
+  svg.lod-over .node .label, svg.lod-over .edgeLabels, svg.lod-over .cluster-label { visibility:hidden; }
+  svg.lod-over .label-container, svg.lod-over .cluster rect, svg.lod-over .flowchart-link { vector-effect:non-scaling-stroke; }
+  .lodt { width:100%; height:100%; display:flex; align-items:center; justify-content:center; box-sizing:border-box; padding:0 8%; cursor:zoom-in; }
+  .lodt > div { min-width:0; max-width:100%; text-align:center; font-weight:650; line-height:1.16; color:var(--ink); overflow-wrap:break-word; font-family:Inter, system-ui, sans-serif; }
+  .lodt.changed > div { color:var(--chg); font-weight:700; }
+  .lod-marks text { font-family:Inter, system-ui, sans-serif; font-weight:750; fill:#334155; opacity:.42; letter-spacing:.01em; }
+  #panel { position:fixed; top:12px; left:12px; width:300px; max-height:calc(100% - 24px); overflow:auto;
+           background:rgba(255,255,255,.96); border:1px solid var(--line); border-radius:12px;
+           box-shadow:0 4px 18px rgba(15,23,42,.08); padding:14px 16px; font-size:13px; }
+  #panel.collapsed > :not(header) { display:none; }
+  #panel header { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  #panel h1 { font-size:15px; margin:0; }
+  #panel button { border:0; background:none; color:var(--muted); cursor:pointer; font:inherit; padding:0; }
+  #panel .sub { color:var(--muted); margin:4px 0 10px; }
+  #panel h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:12px 0 6px; }
+  #panel ul { margin:0; padding-left:0; list-style:none; }
+  #panel li { margin:3px 0; }
+  #panel li a { color:var(--chg); cursor:pointer; text-decoration:none; font-weight:600; }
+  #panel li a:hover { text-decoration:underline; }
+  .chip { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-1px; margin-right:6px; border:1.5px solid; }
+  .legend { display:grid; grid-template-columns:1fr 1fr; gap:4px 8px; }
+  .hint { color:var(--muted); margin-top:12px; line-height:1.5; }
+  .ovr { margin-top:6px; padding:5px 8px; background:#f5f3ff; border-radius:6px; color:#4c1d95; }
+  .hint a { color:var(--ink); cursor:pointer; text-decoration:underline dotted; }
+  #err { position:fixed; bottom:12px; left:12px; right:12px; color:#b91c1c; white-space:pre-wrap; font:12px monospace; }
+  #mini { position:fixed; right:22px; bottom:22px; background:rgba(255,255,255,.94); border:1px solid var(--line);
+          border-radius:10px; box-shadow:0 4px 18px rgba(15,23,42,.10); padding:8px; cursor:crosshair; overflow:hidden; }
+  #mini.off { display:none; }
+  #mini .frame { position:relative; }
+  #mini svg { display:block; }
+  #mini svg * { vector-effect:non-scaling-stroke; }
+  #mini svg path { marker-start:none !important; marker-end:none !important; }
+  #mini .glab { position:absolute; font-size:10px; font-weight:650; color:#334155; line-height:1.15; white-space:nowrap;
+                margin:3px; padding:1px 4px; background:rgba(255,255,255,.85); border-radius:4px; cursor:zoom-in; }
+  #mini .glab:hover { background:#fff; color:#2563eb; }
+  #mini .view { position:absolute; border:1.5px solid #2563eb; background:rgba(37,99,235,.10); border-radius:2px; pointer-events:none; }
+  .bar { position:fixed; z-index:2; }
+  #hbar { left:12px; right:22px; bottom:2px; height:12px; }
+  #vbar { top:12px; bottom:22px; right:2px; width:12px; }
+  .thumb { position:absolute; background:rgba(100,116,139,.32); border-radius:6px; }
+  #hbar .thumb { top:3px; height:6px; }
+  #vbar .thumb { left:3px; width:6px; }
+  .bar:hover .thumb, .thumb.active { background:rgba(71,85,105,.62); }
+  #hbar:hover .thumb, #hbar .thumb.active { top:1px; height:10px; }
+  #vbar:hover .thumb, #vbar .thumb.active { left:1px; width:10px; }
+</style></head>
+<body>
+<div id="stage"></div>
+<aside id="panel"></aside>
+<div id="mini"><div class="frame"></div></div>
+<div id="hbar" class="bar"><div class="thumb"></div></div>
+<div id="vbar" class="bar"><div class="thumb"></div></div>
+<div id="err"></div>
+<script id="data" type="application/json">{"mermaid": "flowchart TD\n  subgraph g_init[\"<span class='gt'>Launch \u00b7 prior initialization<\/span>\"]\n    n_target[\"<span class='t'>Target \u00b7 MIPCAS in $P\\bar 1$, $Z' = 1$, one condition<\/span><br/><span class='l'>state $x \\in \\mathbb{R}^{12}$, nominal box $[-1, 1]^{12}$: cell lengths (3), cell angles (3), centroid (3), orientation (3)<\/span><br/><span class='l'>lengths $L_d = 2R\\,\\exp\\!\\big(\\ln lo_d + (x_d/2 + 1/2)\\ln(hi_d/lo_d)\\big)/a_d$, $\\ lo = (0.075, 0.075, 0.1)$, $hi = (3, 3, 4)$, $R$ = molecule radius<\/span><br/><span class='l'>angles $(x/2 + 1/2)\\,0.6\\pi + 0.2\\pi$ \u00b7 centroid $(x/2 + 1/2)\\,a_d$, $\\ a = (0.5, 1, 1)$<\/span><br/><span class='l'>orientation $\\theta = \\tfrac{\\pi}{4}(x + 1),\\ \\phi = \\pi x,\\ r = \\pi(x + 1)$ \u2192 rotation vector<\/span><br/><span class='l'>periodic, wrapped with period 2: centroid $y, z$ and $\\phi, r$<\/span><br/><span class='l'>decode clamps to the box \u2192 unit cell \u2192 cluster (cutoff 10) \u2192 ELJ<\/span>\"]\n    n_energy_fn[\"<span class='t'>Energy function \u00b7 ELJ at $kT = 2.5$<\/span><br/><span class='l'>computes the reduction energy and ELJ<\/span><br/><span class='l'>its ELJ coefficient and clip level are set later, by the prior load<\/span>\"]\n    n_model[\"<span class='chg'><span class='t'>Policy \u00b7 autoregressive spline flow \u00b7 3.19 M parameters<\/span><\/span><br/><span class='chg'><span class='l'>one step $x_0 = 0 \\to x$: $\\log P_F = \\log q_\\theta(x)$, exact \u00b7 the backward step is deterministic, $\\log P_B = 0$<\/span><\/span><br/><span class='chg'><span class='l'>rows: 4 wrapped (7, 8, 10, 11) on the circle of period 2 \u00b7 8 bounded (0\u20136, 9) on the closed $[-1, 1]$, zero density outside \u00b7 none dead<\/span><\/span><br/><span class='chg'><span class='l'>base uniform on $[-1, 1]^{12}$ \u00b7 no standardisation: every row is bounded or wrapped<\/span><\/span><br/><span class='chg'><span class='l'>one block, autoregressive in the order 8, 11, 10, 9, 7, 6, 5, 4, 3, 2, 1, 0<\/span><\/span><br/><span class='chg'><span class='l'>per row a rational-quadratic spline, 32 bins on $[-1, 1]$: a wrapped row is first shifted, $z = \\mathrm{wrap}(x + s(x_{o_{<j}}))$, end slopes matched; a bounded row is unshifted, both end slopes learned<\/span><\/span><br/><span class='chg'><span class='l'>bin width floor $10^{-3}$, height floor $10^{-7}$ \u00b7 knot slopes tied: harmonic mean of the adjacent bin slopes \u00d7 a learned factor in $[1/2,\\ 2]$ \u00b7 tail bound 5 unused (no unbounded row)<\/span><\/span><br/><span class='chg'><span class='l'>$q_\\theta(x) = \\prod_{j=1}^{12} q_j(x_{o_j} \\mid x_{o_{<j}})$, $\\ \\log q_\\theta(x) = -12\\ln 2 + \\sum_j \\log\\big|\\partial y_{o_j}/\\partial x_{o_j}\\big|$, $\\ y = f_\\theta(x)$: exact (triangular Jacobian)<\/span><\/span><br/><span class='chg'><span class='l'>a draw: $u \\sim \\mathcal{U}[-1, 1]^{12}$, $\\ x = f_\\theta^{-1}(u)$ row by row, cached; in bf16 it rounds differently from the full pass that scores $\\log q_\\theta(x)$<\/span><\/span><br/><span class='chg'><span class='l'>conditioner: causal transformer, width 256, 4 layers, 8 heads, pre-LayerNorm, MLP 256 \u2192 1024 \u2192 256; slot $j$ reads row $o_{j-1}$ ($x$, or $\\sin, \\cos\\,\\pi x$ if wrapped)<\/span><\/span><br/><span class='chg'><span class='l'>head \u2192 97 numbers per row, zero-initialised: $q_\\theta$ starts uniform, $\\log q_\\theta = -12\\ln 2$<\/span><\/span><br/><span class='chg'><span class='l'>layers in bf16 on CUDA, head and spline in fp32, each layer recomputed in backward \u00b7 unconditional: no context<\/span><\/span><br/><span class='l'>$\\log Z$: one scalar, initialised to 0<\/span><br/><span class='chg'><span class='l'>weights ignore the run seed: the geometry probe resets the torch seed to 0 first<\/span><\/span>\"]\n    n_optim_init[\"<span class='t'>Optimizers<\/span><br/><span class='l'>Adam $\\beta = (0.9,\\ 0.999)$, $\\ \\epsilon = 10^{-8}$, no weight decay<\/span><br/><span class='chg'><span class='l'>policy LR base $1.25\\times10^{-4}$ on the flow's conditioner (time, state and backward groups empty) \u00b7 $\\log Z$ group LR 0.1<\/span><\/span><br/><span class='chg'><span class='l'>grad clip seed $\\tau_0 = 10$ (route override: auto is refused under the NF)<\/span><\/span>\"]\n    n_fit_scalers[\"<span class='chg'><span class='t'>Fit the flow's standardisers \u00b7 no effect here<\/span><\/span><br/><span class='chg'><span class='l'>standardises the linear rows on the 30,827 kept rows<\/span><\/span><br/><span class='chg'><span class='l'>every live row here is bounded or wrapped, so $\\mu = 0$, $\\sigma = 1$ stay and $\\log q_\\theta$ carries no $-\\sum\\log\\sigma$ term<\/span><\/span><br/><span class='chg'><span class='l'>sets a persistent fitted flag: a resume does not refit<\/span><\/span>\"]\n    n_prior_file[(\"<span class='t'>Prior file \u00b7 pre-noised build, 44,132 rows<\/span><br/><span class='l'>4,012 anchors (3,799 train, 213 held out), 10 children each, built at $kT = 2.5$<\/span><br/><span class='l'>child $= \\mathrm{clip}(x_a + \\rho\\,\\hat u)$, $\\ \\hat u$ uniform on $S^{11}$, $\\ \\log_{10}\\rho \\sim U(-2.5,\\ -1.125)$<\/span><br/><span class='l'>then written as a random $P\\bar 1$ normaliser image<\/span>\")]\n    n_load[\"<span class='t'>Load and filter the prior file<\/span><br/><span class='l'>sets the ELJ coefficient $\\lambda = 0.364$ from the file (replaces the config's 1.0): effective $kT = 6.88$ in raw ELJ units<\/span><br/><span class='l'>512 stratified rows rebuilt and re-scored against their stored terms (tolerance $0.1 + 10^{-4}|E|$)<\/span><br/><span class='l'>every row's reward from its stored energy terms, no rebuild<\/span><br/><span class='l'>keep: train split, children only, packing $\\in [0.55,\\ 0.95]$, seed energy (no Jacobian) $\\le$ floor $+ 6\\,kT$<\/span><br/><span class='l'>floor $= -141.04$, the best training-split row (an anchor) \u00b7 30,827 kept, 7,163 children fail the energy window<\/span><br/><span class='l'>arms the clip: $c_1 = \\min_i E_i + 250\\,kT = -152.08 + 625 = 472.9$; kept energies span $[-152, -132]$, so it binds on none<\/span>\"]\n    n_seed_stores[\"<span class='t'>Seed the buffers from the MLE dataset<\/span><br/><span class='l'>prior buffer: a static copy \u00b7 anchor buffer: a frozen copy (children, not anchors)<\/span><br/><span class='l'>replay buffer: none until the first admission<\/span>\"]\n  end\n  subgraph g_mle[\"<span class='gt'>Stage 1 \u00b7 MLE warm start<\/span>\"]\n    n_mle_entry[\"<span class='t'>Stage entry<\/span><br/><span class='l'>first stage: no entry actions \u00b7 optimizers as built at launch<\/span><br/><span class='l'>LR clock $m$ = steps since stage entry: $\\ \\alpha = 0.05$ for $m < 3000$, $\\times 4$ geometric to $0.2$ by $m = 4000$, then held<\/span><br/><span class='l'>$\\log Z = 0$<\/span>\"]\n    n_mle_data[(\"<span class='t'>MLE dataset<\/span><br/><span class='l'>the 30,827 kept children<\/span>\")]\n    n_mle_eval[\"<span class='t'>Step 50, then every 250 steps \u00b7 evaluation<\/span><br/><span class='chg'><span class='l'>10,000 one-step draws from $q_\\theta$ at $kT = 2.5$, scored with ELJ (the training step itself makes no energy call); every draw lies in the box, so the wall term is 0<\/span><\/span><br/><span class='chg'><span class='l'>10,000 dataset rows scored by exact $\\log q_\\theta$, no gradient<\/span><\/span><br/><span class='l'>w1r per latent column: $W_1(\\text{samples}, \\text{MLE dataset})$ \u00f7 median $W_1$ of 4 reference self-draws<\/span><br/><span class='chg'><span class='l'>density readouts: mean and P90 of $-\\log q_\\theta$ on fixed rows ($\\le 4096$ per set): training rows, held-out anchor groups (1,732), clean training anchors (3,799), molecule crystals (count unconfirmed)<\/span><\/span><br/><span class='chg'><span class='l'>each also against the reference measure, $-\\log q_\\theta + \\log\\rho$ with $\\log\\rho = -E_{\\mathrm{jac}}/kT$ \u00b7 held-out gap $=$ held-out $-$ training<\/span><\/span><br/><span class='chg'><span class='l'>a held-out plateau gate on the held-out reference reading (6 evals, 0.25 nats, median of 3) is published; the stage exit does not read it<\/span><\/span><br/><span class='l'>no rows enter any buffer<\/span>\"]\n    n_mle_gate[\"<span class='t'>Exit gate \u00b7 never fires on this config<\/span><br/><span class='l'>rule: $n \\ge 2000$ and trailing medians (2500 steps) of w1r median $\\le 5$, worst $\\le 10$<\/span><br/><span class='l'>w1r needs $\\ge 4 \\times 10{,}000$ reference rows; the MLE dataset has 30,827, so w1r is never published, silently<\/span><br/><span class='l'>so the stage always runs to its bound, max_steps $= 50{,}000$<\/span>\"]\n    n_mle_exit[\"<span class='t'>Hand-off at $n = 50{,}000$<\/span><br/><span class='l'>snapshot: weights, Adam state, tracker, buffers<\/span><br/><span class='l'>carried: weights, $\\log Z = 0$, tracker, global step $n$<\/span><br/><span class='l'>reset: optimizer moments, LR clock, tripwire bars, clip guard<\/span>\"]\n    subgraph g_mlestep[\"<span class='gt'>One step $n$ \u00b7 $B = 1000$<\/span>\"]\n      n_mle_draw[\"<span class='t'>Draw 1000 rows, uniform, from the MLE dataset<\/span><br/><span class='l'>$\\log R$ rebuilt from stored energy terms: no energy call<\/span><br/><span class='l'>writes a per-row priority that only the eval report reads<\/span>\"]\n      n_mle_bwd[\"<span class='chg'><span class='t'>Backward step \u00b7 deterministic, to $x_0 = 0$<\/span><\/span><br/><span class='chg'><span class='l'>one step $x \\to x_0 = 0$, $\\log P_B = 0$: no path is sampled, nothing reparameterised (traj_grads 1 has nothing to act on)<\/span><\/span><br/><span class='chg'><span class='l'>the stored terminal, detached, wrapped rows folded onto $[-1, 1)$, scored in one conditioner pass: $\\log P_F = \\log q_\\theta(x)$<\/span><\/span><br/><span class='chg'><span class='l'>every kept row lies in the closed box (1,262 of 30,827 exactly on a face, rows 6 and 9), so $\\log q_\\theta$ is finite on all<\/span><\/span>\"]\n      n_mle_loss[\"<span class='chg'><span class='t'>MLE loss \u00b7 exact negative log-likelihood<\/span><\/span><br/><span class='chg'><span class='l'>$L = -\\langle \\log q_\\theta(x) \\rangle$: the Jensen bound $\\langle \\log P_B - \\log P_F \\rangle$ on one deterministic path, so it is tight<\/span><\/span><br/><span class='chg'><span class='l'>at initialisation $L = 12\\ln 2 = 8.318$ nats ($q_\\theta$ uniform on the box)<\/span><\/span><br/><span class='chg'><span class='l'>gradient to the conditioner only; none to $\\log Z$<\/span><\/span><br/><span class='chg'><span class='l'>a tracker EMA of $\\log w = \\log R - \\log q_\\theta(x)$ is updated (half-life 200 visits); $\\log Z$ never moves<\/span><\/span>\"]\n      n_mle_optim[\"<span class='t'>Optimizer step \u00b7 tripwire<\/span><br/><span class='l'>same Adam, LR clock, clip and tripwire rules as equilibration<\/span><br/><span class='l'>tripwire bars fit at $m = 3000$, refit at $m \\approx 4400$<\/span>\"]\n    end\n  end\n  subgraph g_eq[\"<span class='gt'>Stage 2 \u00b7 Equilibration<\/span>\"]\n    n_eq_entry[\"<span class='t'>Stage entry<\/span><br/><span class='l'>optimizer moments rebuilt \u00b7 LR and tripwire clocks restart: $m = n - n_0$<\/span><br/><span class='l'>prior rebuild skipped: the prior buffer stays the pre-noised file's kept rows<\/span><br/><span class='chg'><span class='l'>bootstrap: 4000 draws $x \\sim q_\\theta$, $\\ \\log w = \\log R - \\log q_\\theta(x)$, $\\ \\log Z \\leftarrow z^*(\\log w)$ with gain $K = 1$<\/span><\/span><br/><span class='l'>replay opens with those rows ($\\le 4000$: finite $\\log R \\ge -200$) plus $\\le 1000$ rows of the hand-off evaluation<\/span>\"]\n    n_logz{{\"<span class='t'>$\\log Z$<\/span><br/><span class='l'>one scalar, initialised 0 \u00b7 never receives gradient on this route<\/span><br/><span class='l'>still 0 at the end of the MLE stage<\/span><br/><span class='l'>moved only by the equilibration fill, or restored by a tripwire rewind<\/span>\"}}\n    n_prior_buf[(\"<span class='t'>Prior buffer \u00b7 static<\/span><br/><span class='l'>a copy of the MLE dataset: the 30,827 kept children<\/span><br/><span class='l'>no admission, churn or expiry on a pre-noised prior<\/span><br/><span class='l'>bwd writes a per-row priority that only the eval report reads<\/span>\")]\n    n_anchor_buf[(\"<span class='t'>Anchor buffer \u00b7 frozen<\/span><br/><span class='l'>a copy of the same 30,827 children<\/span><br/><span class='l'>supplies $M$ to every branch's under-coverage statistic<\/span>\")]\n    n_replay_buf[(\"<span class='t'>Replay buffer \u00b7 $\\le 50{,}000$ rows<\/span><br/><span class='l'>mean residence 240 steps \u00b7 max age 1200<\/span><br/><span class='l'>$\\approx 13$ batches at steady state (derived: $(50 + 4)$ rows/step \u00d7 240 steps; not measured)<\/span>\")]\n    n_optim[\"<span class='t'>Optimizer step \u00b7 Adam $\\beta = (0.9,\\ 0.999)$, no weight decay<\/span><br/><span class='l'>policy LR $= 1.25\\times10^{-4}\\cdot\\alpha(m)$: $\\ \\alpha = 0.05$ for $m < 3000$, $\\times 4$ geometric to $0.2$ by $m = 4000$, then held<\/span><br/><span class='chg'><span class='l'>clip $\\|g\\| \\le \\tau$: $\\ \\tau = 10$ (route override) for the stage's first 100 steps, then a lognormal fit to those norms, $\\tau_1 = e^{\\mu + 2.326\\sigma}$<\/span><\/span><br/><span class='l'>then $\\tau \\leftarrow \\tau\\, e^{0.01(\\mathbb{1}[\\|g\\| > \\tau] - 0.01)}$, held within $[\\tau_1/100,\\ 100\\,\\tau_1]$ of the fitted bar<\/span>\"]\n    n_trip[\"<span class='t'>Tripwire \u00b7 every step \u2192 rewind<\/span><br/><span class='l'>fires on $|\\mathrm{loss}| \\ge 10^6$ or $\\|g\\| \\ge 10^6$<\/span><br/><span class='l'>from $m = 3000$: loss $\\ge hi + 10\\,(hi - lo)$ or $\\|g\\| \\ge 100\\times$ the largest pre-clip norm, over a 200-step window; refit at $m \\approx 4400$<\/span><br/><span class='l'>a non-finite gradient skips the step; its rewind fires on the 10-step clock; 50 in a row abort<\/span><br/><span class='l'>a rewind restores weights, Adam state and trackers from the last good checkpoint and keeps the buffers<\/span><br/><span class='l'>a rewind scales the LR by fire_cut_factor $= 1$: no cut on this config<\/span><br/><span class='l'>more than $\\max(3,\\ n/1000)$ rewinds abort the run<\/span>\"]\n    n_hot_lr[\"<span class='t'>Every 10 steps \u00b7 hot-LR sensor, report only<\/span><br/><span class='l'>reads the EMA of the forward residual spread (std of $r$ over a rollout batch)<\/span><br/><span class='l'>flags when $\\ln(\\text{latest} / \\text{10th percentile of the last 11 readings}) > 2$<\/span><br/><span class='l'>action report: logs the flag, moves nothing<\/span>\"]\n    n_ramp[\"<span class='t'>Every 10 steps \u00b7 replay share $s$<\/span><br/><span class='l'>$s = 0.1$ held for the first 500 steps of the stage, then<\/span><br/><span class='l'>$u$ = EMA of bwd under-coverage \u00b7 $v$ = EMA of (mean raw under-coverage over the last 150 steps \u2212 mean over the 150 before)<\/span><br/><span class='l'>trip when $u > \\min u + 0.5$, release at $u \\le \\min u + 0.25$<\/span><br/><span class='l'>$s \\mathrel{-}= 0.006$ if $v > 0$ or tripped, else $s \\mathrel{+}= 0.004$; $\\ s \\in [0.1,\\ 0.75]$<\/span>\"]\n    n_eq_eval[\"<span class='t'>Every 250 steps \u00b7 evaluation<\/span><br/><span class='chg'><span class='l'>10,000 one-step draws from $q_\\theta$ at $kT = 2.5$ \u00b7 10,000 prior-buffer rows scored by $\\log q_\\theta$, no gradient<\/span><\/span><br/><span class='chg'><span class='l'>density readouts and the held-out gate as in stage 1<\/span><\/span><br/><span class='l'>\u2192 $\\log Z$ fill (same estimator) \u2192 $\\le 1000$ rows to replay<\/span>\"]\n    n_ckpt[\"<span class='t'>Checkpoint every 50 steps \u00b7 archive every 5000<\/span><br/><span class='l'>run ends at $n = 100{,}000$<\/span><br/><span class='chg'><span class='l'>records the resolved flow settings with the weights<\/span><\/span>\"]\n    n_notation[\"<span class='t'>Notation<\/span><br/><span class='l'>$\\rho_\\beta(r) = \\tfrac12 r^2$ for $|r| \\le \\beta$, else $\\beta|r| - \\tfrac12\\beta^2$ (gradient $\\mathrm{clip}(r, \\pm\\beta)$)<\/span><br/><span class='l'>$\\bar Z$: $\\log Z$ with gradient stopped \u00b7 se: standard error of $z^*$ \u00b7 $\\langle\\cdot\\rangle$: batch mean<\/span><br/><span class='l'>$n$: global step \u00b7 $n_0$: the stage's first step \u00b7 $m = n - n_0$<\/span><br/><span class='l'>under-coverage $u = \\sqrt{\\textstyle\\sum_j \\tilde w_j \\min(r_j, 0)^2}$, $\\ w_j = \\mathrm{clamp}\\big((\\log R_j - M + 100)/50,\\ 0,\\ 1\\big)$, $\\ \\tilde w = w/\\sum w$<\/span><br/><span class='l'>$M$ = best $\\log R$ in the anchor buffer<\/span><br/><span class='chg'><span class='l'>$q_\\theta$: the flow's exact density on the box, no $\\pm 200$ clip \u00b7 $\\log P_F = \\log q_\\theta(x)$, $\\log P_B = 0$<\/span><\/span>\"]\n    subgraph g_eqstep[\"<span class='gt'>One step $n$ \u00b7 $B = 1000$<\/span>\"]\n      n_gate[\"<span class='t'>Rollout this step?<\/span><br/><span class='l'>$(n - n_0)\\ \\mathrm{mod}\\ 20 = 0$<\/span><br/><span class='l'>or replay rows $/\\,B < 2$, at least 2 steps after the last rollout<\/span>\"]\n      n_fwd[\"<span class='chg'><span class='t'>Forward draw \u00b7 1000 samples, one step<\/span><\/span><br/><span class='chg'><span class='l'>$x_0 = 0 \\to x$ in one step: $x = f_\\theta^{-1}(u)$, $\\ u \\sim \\mathcal{U}[-1, 1]^{12}$ \u00b7 no time grid<\/span><\/span><br/><span class='chg'><span class='l'>inside the box by construction: bounded rows on the closed $[-1, 1]$, wrapped rows on the circle<\/span><\/span><br/><span class='chg'><span class='l'>$\\log P_F = \\log q_\\theta(x)$, exact, from a second full pass \u00b7 $\\log P_B = 0$ \u00b7 draw and score carry no gradient<\/span><\/span><br/><span class='chg'><span class='l'>no exploration noise<\/span><\/span>\"]\n      n_reward[\"<span class='t'>Reward<\/span><br/><span class='l'>$\\log R = -E/kT,\\quad kT = 2.5$<\/span><br/><span class='l'>$E = \\mathrm{cap}_2\\big(\\mathrm{cap}_1(\\lambda E_{\\mathrm{ELJ}}/Z' + 10\\,\\phi_{\\mathrm{pack}} + E_{PV}) + 10kT\\sum_d \\mathrm{relu}(|x_d| - 1)^2 + 10kT\\,\\mathrm{relu}(E_{\\mathrm{red}})\\big) + E_{\\mathrm{jac}}$<\/span><br/><span class='chg'><span class='l'>drawn and replayed states lie in the box: the decode clamp is the identity and the wall term is 0<\/span><\/span><br/><span class='l'>$\\lambda = 0.364$ \u00b7 $\\phi_{\\mathrm{pack}}$: penalty on packing coefficient outside $[0.55,\\ 0.95]$ \u00b7 $E_{PV}$ at 1 atm<\/span><br/><span class='l'>$\\mathrm{cap}_c(y) = c + \\log(1 + y - c)$ above $c$; $\\ c_1 = 472.9$, $\\ c_2 = c_1 + 0.1\\,|c_1|$<\/span><br/><span class='l'>$E_{\\mathrm{jac}} = -kT\\big(2\\ln\\sin(r/2) + \\ln\\sin\\theta + Z'\\ln(V/n_{\\mathrm{sym}})\\big)$<\/span>\"]\n      n_fwd_tb[\"<span class='t'>Forward TB \u00b7 computed, then detached<\/span><br/><span class='chg'><span class='l'>$r = \\log Z + \\log q_\\theta(x) - \\log R$<\/span><\/span><br/><span class='l'>forward share pinned at 0: no gradient from this branch<\/span><br/><span class='chg'><span class='l'>still updates the tracker EMA of $\\log w = \\log R - \\log q_\\theta(x)$ and the best energy<\/span><\/span>\"]\n      n_zfill[\"<span class='t'>Set $\\log Z$ from this rollout<\/span><br/><span class='chg'><span class='l'>$\\log w_j = \\log R_j - \\log q_\\theta(x_j)$ over $j = 1..1000$<\/span><\/span><br/><span class='l'>$z^*$ solves $\\frac{1}{B}\\sum_j \\mathrm{clip}(z - \\log w_j,\\ \\pm 10) = 0$<\/span><br/><span class='l'>Kalman: $\\log Z \\mathrel{+}= K\\,(z^* - \\log Z),\\ K = P/(P + \\mathrm{se}^2)$, $P$ grows $0.01$ per step<\/span><br/><span class='l'>knee 10 is the forward $\\beta$, not the 80 the losses use<\/span>\"]\n      n_bwd[\"<span class='t'>Backward branch \u00b7 1000 rows, uniform from the prior buffer<\/span><br/><span class='chg'><span class='l'>no backward path: $x \\to x_0 = 0$ is deterministic, $\\log P_B = 0$<\/span><\/span><br/><span class='chg'><span class='l'>the stored terminal, wrapped and detached, scored exactly: $\\log q_\\theta(x)$; the gradient reaches the flow only through this density<\/span><\/span><br/><span class='l'>$\\log R$ from the row's stored energy terms, bound term 0<\/span><br/><span class='chg'><span class='l'>$L_b = \\langle\\rho_{80}(r)\\rangle,\\quad r = \\log\\bar Z + \\log q_\\theta(x) - \\log R$<\/span><\/span>\"]\n      n_replay[\"<span class='t'>Replay branch \u00b7 1000 rows, uniform from the replay buffer<\/span><br/><span class='chg'><span class='l'>stored pair $(x_0, x)$; $x$ re-scored exactly under the current flow: $\\log q_\\theta(x)$<\/span><\/span><br/><span class='chg'><span class='l'>$\\log R$ from stored terms, bound term live on the stored $x$ (0: drawn inside the box)<\/span><\/span><br/><span class='l'>$L_r = \\langle\\rho_{80}(r)\\rangle$, same residual, $\\bar Z$ detached<\/span>\"]\n      n_fused[\"<span class='t'>Fused loss<\/span><br/><span class='l'>$L = (1 - s)\\,L_b + s\\,L_r$, $\\ s$ = replay share<\/span><br/><span class='l'>$L = L_b$ while the replay buffer is empty<\/span>\"]\n      n_admit[\"<span class='t'>Admit this rollout to replay (rollout steps only)<\/span><br/><span class='l'>rows with finite $\\log R \\ge -200$, at most 1000 per call<\/span>\"]\n    end\n  end\n  n_target --> n_energy_fn\n  n_energy_fn --> n_model\n  n_model --> n_optim_init\n  n_optim_init --> n_load\n  n_prior_file -.->|\"rows\"| n_load\n  n_load --> n_fit_scalers\n  n_fit_scalers --> n_seed_stores\n  n_mle_data -.->|\"latents\"| n_fit_scalers\n  n_load -.->|\"readout rows\"| n_mle_eval\n  n_load -.->|\"kept rows\"| n_mle_data\n  n_seed_stores --> n_mle_entry\n  n_seed_stores -.->|\"copy\"| n_prior_buf\n  n_seed_stores -.->|\"copy\"| n_anchor_buf\n  n_mle_entry --> n_mle_draw\n  n_mle_data -.->|\"rows\"| n_mle_draw\n  n_mle_draw --> n_mle_bwd\n  n_mle_bwd --> n_mle_loss\n  n_mle_loss --> n_mle_optim\n  n_mle_optim --> n_mle_eval\n  n_mle_eval --> n_mle_gate\n  n_mle_gate -->|\"next step\"| n_mle_draw\n  n_mle_gate -->|\"$n = 50{,}000$\"| n_mle_exit\n  n_mle_exit --> n_eq_entry\n  n_eq_entry --> n_gate\n  n_gate -->|\"yes\"| n_fwd\n  n_gate -->|\"no\"| n_bwd\n  n_fwd --> n_reward\n  n_reward --> n_fwd_tb\n  n_fwd_tb --> n_zfill\n  n_zfill --> n_bwd\n  n_bwd --> n_replay\n  n_replay --> n_fused\n  n_fused --> n_admit\n  n_admit --> n_optim\n  n_optim --> n_trip\n  n_trip --> n_hot_lr\n  n_hot_lr --> n_ramp\n  n_ramp --> n_eq_eval\n  n_eq_eval --> n_ckpt\n  n_ckpt -->|\"next step\"| n_gate\n  n_zfill ==> n_logz\n  n_eq_eval ==> n_logz\n  n_eq_entry ==> n_logz\n  n_logz -.->|\"detached\"| n_bwd\n  n_logz -.->|\"detached\"| n_replay\n  n_prior_buf -.->|\"terminal states\"| n_bwd\n  n_anchor_buf -.->|\"$M$, via the bwd statistic\"| n_ramp\n  n_replay_buf -.->|\"stored pairs $(x_0, x)$\"| n_replay\n  n_admit -.->|\"rows\"| n_replay_buf\n  n_eq_eval -.->|\"rows\"| n_replay_buf\n  n_eq_entry -.->|\"bootstrap + hand-off rows\"| n_replay_buf\n  classDef step fill:#ffffff,stroke:#94a3b8,color:#0f172a,stroke-width:1.5px\n  classDef once fill:#eef2ff,stroke:#818cf8,color:#0f172a,stroke-width:1.5px\n  classDef gate fill:#fffbeb,stroke:#f59e0b,color:#0f172a,stroke-width:1.5px\n  classDef periodic fill:#f0fdfa,stroke:#14b8a6,color:#0f172a,stroke-width:1.5px\n  classDef store fill:#f0f9ff,stroke:#0284c7,color:#0f172a,stroke-width:1.5px\n  classDef param fill:#f5f3ff,stroke:#7c3aed,color:#0f172a,stroke-width:1.5px\n  classDef inert fill:#f8fafc,stroke:#94a3b8,color:#64748b,stroke-width:1.5px,stroke-dasharray:5 4\n  classDef warn fill:#fef2f2,stroke:#dc2626,color:#0f172a,stroke-width:1.5px\n  classDef note fill:#ffffff,stroke:#cbd5e1,color:#334155,stroke-width:1.5px,stroke-dasharray:5 4\n  classDef changed stroke:#ea580c,stroke-width:3.5px\n  class n_mle_draw,n_mle_bwd,n_mle_loss,n_mle_optim,n_fwd,n_reward,n_zfill,n_bwd,n_replay,n_fused,n_admit,n_optim,n_trip step\n  class n_target,n_energy_fn,n_model,n_optim_init,n_load,n_seed_stores,n_mle_entry,n_mle_exit,n_eq_entry once\n  class n_gate gate\n  class n_mle_eval,n_hot_lr,n_ramp,n_eq_eval,n_ckpt periodic\n  class n_prior_file,n_mle_data,n_prior_buf,n_anchor_buf,n_replay_buf store\n  class n_logz param\n  class n_fit_scalers,n_fwd_tb inert\n  class n_mle_gate warn\n  class n_notation note\n  class n_model,n_optim_init,n_fit_scalers,n_mle_bwd,n_mle_loss,n_mle_eval,n_eq_entry,n_fwd,n_reward,n_fwd_tb,n_zfill,n_bwd,n_replay,n_optim,n_eq_eval,n_ckpt,n_notation changed\n  style g_init fill:#f8fafc,stroke:#cbd5e1,stroke-width:1.5px\n  style g_mle fill:#f0fdf4,stroke:#86efac,stroke-width:1.5px\n  style g_mlestep fill:#fffbeb,stroke:#fcd34d,stroke-width:1.5px\n  style g_eq fill:#fefce8,stroke:#fde047,stroke-width:1.5px\n  style g_eqstep fill:#fffbeb,stroke:#fcd34d,stroke-width:1.5px\n  linkStyle 5 stroke:#ea580c,stroke-width:3px\n  linkStyle 6 stroke:#ea580c,stroke-width:3px\n  linkStyle 7 stroke:#ea580c,stroke-width:3px\n  linkStyle 8 stroke:#ea580c,stroke-width:3px\n  linkStyle 47 stroke:#ea580c,stroke-width:3px", "panel": {"title": "Unconditional crystal training \u00b7 NF policy", "subtitle": "committed mk_dev + model.kind nf \u00b7 protocol unconditional_tb \u00b7 MIPCAS, ELJ", "commit": "696f746f", "audited": "not audited", "rendered": "2026-10-29 13:40", "baseline": "Differs from Unconditional crystal training (b92ced74)", "overrides": ["model.kind = nf", "gradient_norm_clip = 10.0"], "changed": [{"id": "model", "title": "Policy \u00b7 autoregressive spline flow \u00b7 3.19 M parameters"}, {"id": "optim_init", "title": "Optimizers"}, {"id": "fit_scalers", "title": "Fit the flow's standardisers \u00b7 no effect here"}, {"id": "mle_bwd", "title": "Backward step \u00b7 deterministic, to $x_0 = 0$"}, {"id": "mle_loss", "title": "MLE loss \u00b7 exact negative log-likelihood"}, {"id": "mle_eval", "title": "Step 50, then every 250 steps \u00b7 evaluation"}, {"id": "eq_entry", "title": "Stage entry"}, {"id": "fwd", "title": "Forward draw \u00b7 1000 samples, one step"}, {"id": "reward", "title": "Reward"}, {"id": "fwd_tb", "title": "Forward TB \u00b7 computed, then detached"}, {"id": "zfill", "title": "Set $\\log Z$ from this rollout"}, {"id": "bwd", "title": "Backward branch \u00b7 1000 rows, uniform from the prior buffer"}, {"id": "replay", "title": "Replay branch \u00b7 1000 rows, uniform from the replay buffer"}, {"id": "optim", "title": "Optimizer step \u00b7 Adam $\\beta = (0.9,\\ 0.999)$, no weight decay"}, {"id": "eq_eval", "title": "Every 250 steps \u00b7 evaluation"}, {"id": "ckpt", "title": "Checkpoint every 50 steps \u00b7 archive every 5000"}, {"id": "notation", "title": "Notation"}], "removed": [], "legend": [["step", "#ffffff", "#94a3b8", false], ["once", "#eef2ff", "#818cf8", false], ["gate", "#fffbeb", "#f59e0b", false], ["periodic", "#f0fdfa", "#14b8a6", false], ["store", "#f0f9ff", "#0284c7", false], ["param", "#f5f3ff", "#7c3aed", false], ["inert", "#f8fafc", "#94a3b8", true], ["warn", "#fef2f2", "#dc2626", false], ["note", "#ffffff", "#cbd5e1", true]]}}</script>
+<script>
+const DATA = JSON.parse(document.getElementById('data').textContent);
+
+// TeX between single dollars -> MathML, before layout, so boxes fit the typeset math.
+function typeset(src) {
+  return src.replace(/\$([^$]+)\$/g, (_, tex) => {
+    let m = katex.renderToString(tex, {output: 'mathml', throwOnError: false});
+    return m.replace(/<annotation[^>]*>[\s\S]*?<\/annotation>/g, '')
+            .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+            .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d))
+            .replace(/"/g, "'").replace(/\n/g, '');
+  });
+}
+
+function buildPanel(p) {
+  const el = document.getElementById('panel');
+  const legend = p.legend.map(([k, fill, stroke, dashed]) =>
+    `<span><span class="chip" style="background:${fill};border-color:${stroke};border-style:${dashed ? 'dashed' : 'solid'}"></span>${k}</span>`).join('');
+  const changed = p.baseline === null ? '<li>no baseline: nothing highlighted</li>'
+    : (p.changed.length ? p.changed.map(c => `<li><a data-id="${c.id}">${typeset(c.title)}</a></li>`).join('') : '<li>none</li>');
+  const removed = p.removed.length ? `<h2>Removed</h2><ul>${p.removed.map(t => `<li>${typeset(t)}</li>`).join('')}</ul>` : '';
+  el.innerHTML = `<header><h1>${p.title}</h1><button id="fold">hide</button></header>
+    <div class="sub">${p.subtitle}</div>
+    <div>source <b>${p.commit}</b> · ${p.audited}<br>rendered ${p.rendered}</div>
+    ${p.overrides.length ? `<div class="ovr">committed mk_dev plus: <b>${p.overrides.join('</b>, <b>')}</b></div>` : ''}
+    <h2>${p.baseline === null ? 'Changed since baseline' : p.baseline}</h2><ul>${changed}</ul>${removed}
+    <h2>Node kinds</h2><div class="legend">${legend}</div>
+    <div class="hint"><span id="wheelhint"></span> · <a id="wheelmode"></a><br>
+      drag (left or middle): pan · arrows: pan · +/−: zoom<br>
+      zoomed out, boxes show titles only<br>
+      double-click a box or a stage: zoom to it<br>
+      F: fit · M: map · click the map to go there,<br>a stage name on it to zoom to the stage<br>
+      click a changed item to fly to it</div>`;
+  document.getElementById('fold').onclick = () => {
+    el.classList.toggle('collapsed');
+    document.getElementById('fold').textContent = el.classList.contains('collapsed') ? 'show' : 'hide';
+  };
+  document.getElementById('wheelmode').onclick = () => setWheelMode(wheelMode === 'pan' ? 'zoom' : 'pan');
+  setWheelMode(wheelMode);
+}
+
+// What a plain wheel event does. 'pan' suits scroll devices that emit wheel events
+// with both deltas (TrackPoint middle-button scrolling, touchpads); 'zoom' suits a
+// mouse wheel. Ctrl+wheel (and a touchpad pinch, which arrives as one) always zooms.
+let wheelMode = 'pan';
+try { wheelMode = localStorage.getItem('workvis.wheel') || 'pan'; } catch (e) {}
+function setWheelMode(m) {
+  wheelMode = m;
+  try { localStorage.setItem('workvis.wheel', m); } catch (e) {}
+  document.getElementById('wheelhint').textContent = m === 'pan'
+    ? 'wheel / TrackPoint scroll: pan · Ctrl+wheel: zoom' : 'wheel: zoom · Shift+wheel or sideways scroll: pan';
+  document.getElementById('wheelmode').textContent = m === 'pan' ? 'make wheel zoom' : 'make wheel pan';
+}
+
+function panZoom(svg) {
+  const stage = document.getElementById('stage');
+  const bb = svg.viewBox.baseVal;
+  const home = {x: bb.x, y: bb.y, w: bb.width, h: bb.height};
+  const vb = {...home};
+  const listeners = [];
+  const apply = () => { svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); listeners.forEach(f => f()); };
+  const toSvg = (cx, cy, ctm) => { const p = svg.createSVGPoint(); p.x = cx; p.y = cy; return p.matrixTransform((ctm || svg.getScreenCTM()).inverse()); };
+  const zoomAt = (cx, cy, k) => { const p = toSvg(cx, cy); vb.x = p.x - (p.x - vb.x) * k; vb.y = p.y - (p.y - vb.y) * k; vb.w *= k; vb.h *= k; apply(); };
+  const fit = () => { Object.assign(vb, home); apply(); };
+  const animateTo = t => {
+    const s0 = {...vb}, t0 = performance.now();
+    const step = now => {
+      const u = Math.min(1, (now - t0) / 280), e = 1 - Math.pow(1 - u, 3);
+      for (const k of ['x', 'y', 'w', 'h']) vb[k] = s0[k] + (t[k] - s0[k]) * e;
+      apply(); if (u < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+  // Zoom so box b fills frac of the screen, but never past kmax screen px per unit.
+  const fitBox = (b, frac, kmax) => {
+    const W = stage.clientWidth, H = stage.clientHeight;
+    const k = Math.min(frac * W / b.w, frac * H / b.h, kmax || Infinity), w = W / k, h = H / k;
+    animateTo({x: b.x + b.w / 2 - w / 2, y: b.y + b.h / 2 - h / 2, w, h});
+  };
+  const nodeBox = g => boxOf(svg, g.querySelector('.label-container') || g);
+  // The diagram region actually on screen: the viewBox is letterboxed into the stage.
+  const visible = () => { const r = stage.getBoundingClientRect(), a = toSvg(r.left, r.top), b = toSvg(r.right, r.bottom); return {x: a.x, y: a.y, w: b.x - a.x, h: b.y - a.y}; };
+  const shift = (dx, dy) => { vb.x += dx; vb.y += dy; apply(); };  // diagram units
+  const panBy = (dx, dy) => { const m = svg.getScreenCTM(); shift(dx / m.a, dy / m.d); };  // screen px
+  const centerOn = (x, y) => { const v = visible(); shift(x - (v.x + v.w / 2), y - (v.y + v.h / 2)); };
+  const px = (e, d) => d * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? stage.clientHeight : 1);
+  stage.addEventListener('wheel', e => {
+    e.preventDefault();
+    let dx = px(e, e.deltaX), dy = px(e, e.deltaY);
+    if (e.ctrlKey || e.metaKey || (wheelMode === 'zoom' && !e.shiftKey && dx === 0)) { zoomAt(e.clientX, e.clientY, Math.exp(dy * 0.0015)); return; }
+    if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+    panBy(dx, dy);
+  }, {passive: false});
+  window.addEventListener('resize', apply);
+  let drag = null;
+  stage.addEventListener('mousedown', e => {
+    if (e.button !== 0 && e.button !== 1) return;
+    e.preventDefault();  // a middle press would otherwise start autoscroll
+    drag = {ctm: svg.getScreenCTM(), p0: toSvg(e.clientX, e.clientY), vb0: {...vb}};
+    stage.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const p = toSvg(e.clientX, e.clientY, drag.ctm);
+    vb.x = drag.vb0.x - (p.x - drag.p0.x); vb.y = drag.vb0.y - (p.y - drag.p0.y); apply();
+  });
+  window.addEventListener('mouseup', () => { drag = null; stage.classList.remove('dragging'); });
+  stage.addEventListener('auxclick', e => e.preventDefault());
+  const arrows = {ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1]};
+  window.addEventListener('keydown', e => {
+    if (e.key === 'f' || e.key === 'F' || e.key === '0') fit();
+    if (e.key === 'm' || e.key === 'M') document.getElementById('mini').classList.toggle('off');
+    const r = stage.getBoundingClientRect();
+    if (e.key === '+' || e.key === '=') zoomAt(r.width / 2, r.height / 2, 0.8);
+    if (e.key === '-') zoomAt(r.width / 2, r.height / 2, 1.25);
+    if (arrows[e.key]) { e.preventDefault(); panBy(arrows[e.key][0] * r.width * 0.15, arrows[e.key][1] * r.height * 0.15); }
+  });
+  document.getElementById('panel').addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('a[data-id]');
+    if (!a) return;
+    const g = svg.querySelector(`g.node[id*="-n_${a.dataset.id}-"]`);
+    if (g) fitBox(nodeBox(g), 0.6, 1.4);
+  });
+  // Double-click: a box zooms to read it, empty space in a stage or loop zooms to that.
+  stage.addEventListener('dblclick', e => {
+    const t = e.target.closest && (e.target.closest('g.node') || e.target.closest('[data-node]'));
+    const g = t && (t.matches('g.node') ? t : svg.querySelector(`[id="${t.dataset.node}"]`));
+    if (g) return fitBox(nodeBox(g), 0.6, 1.4);
+    const p = toSvg(e.clientX, e.clientY);
+    const hit = clustersOf(svg).filter(c => p.x >= c.b.x && p.x <= c.b.x + c.b.w && p.y >= c.b.y && p.y <= c.b.y + c.b.h)
+      .sort((a, b) => a.b.w * a.b.h - b.b.w * b.b.h)[0];
+    hit ? fitBox(hit.b, 0.96) : animateTo(home);
+  });
+  return {home, visible, shift, centerOn, onView: f => listeners.push(f), fit, fitBox};
+}
+
+// Box of an element in the diagram's own units, whatever the current zoom.
+function boxOf(svg, el) {
+  const b = el.getBBox(), m = svg.getCTM().inverse().multiply(el.getCTM());
+  return {x: m.e + b.x * m.a, y: m.f + b.y * m.d, w: b.width * m.a, h: b.height * m.d};
+}
+
+// Stage and loop boxes, each with its label and whether it sits inside another.
+function clustersOf(svg) {
+  const cs = [...svg.querySelectorAll('g.cluster')].map(c => ({r: c.querySelector('rect'), lab: c.querySelector('.cluster-label')}))
+    .filter(c => c.r && c.lab).map(c => ({...c, b: boxOf(svg, c.r), text: c.lab.textContent.trim()}));
+  const inside = (a, o) => a !== o && a.b.x >= o.b.x && a.b.y >= o.b.y && a.b.x + a.b.w <= o.b.x + o.b.w && a.b.y + a.b.h <= o.b.y + o.b.h;
+  cs.forEach(c => { c.nested = cs.some(o => inside(c, o)); });
+  return cs;
+}
+
+// Inset of the whole diagram: shapes and edges without text, stage labels on top,
+// changed boxes filled orange, and the on-screen region as a blue frame.
+function minimap(svg, view) {
+  const box = document.getElementById('mini'), frame = box.querySelector('.frame');
+  const h = view.home, s = Math.min(230 / h.w, 340 / h.h);
+  const mini = svg.cloneNode(true);  // keeps the id, so Mermaid's scoped styles still apply
+  mini.querySelectorAll('foreignObject, .edgeLabels').forEach(n => n.remove());
+  // Mermaid writes class styles inline with !important, so override them inline.
+  mini.querySelectorAll('.node .label-container').forEach(n => {
+    n.style.setProperty('stroke-width', '1px', 'important');
+    if (n.closest('.node').classList.contains('changed')) {
+      n.style.setProperty('fill', '#fdba74', 'important'); n.style.setProperty('stroke', '#ea580c', 'important');
+    }
+  });
+  mini.setAttribute('viewBox', `${h.x} ${h.y} ${h.w} ${h.h}`);
+  mini.setAttribute('width', h.w * s); mini.setAttribute('height', h.h * s);
+  frame.appendChild(mini);
+  // Label the stages only: a loop nested in a stage would sit on its stage's label.
+  clustersOf(svg).filter(c => !c.nested).forEach(({b, text}) => {
+    const d = document.createElement('div');
+    d.className = 'glab'; d.textContent = text;
+    Object.assign(d.style, {left: (b.x - h.x) * s + 'px', top: (b.y - h.y) * s + 'px'});
+    d.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); view.fitBox(b, 0.96); });
+    frame.appendChild(d);
+  });
+  const vr = document.createElement('div'); vr.className = 'view'; frame.appendChild(vr);
+  view.onView(() => {
+    const v = view.visible();
+    Object.assign(vr.style, {left: (v.x - h.x) * s + 'px', top: (v.y - h.y) * s + 'px', width: v.w * s + 'px', height: v.h * s + 'px'});
+  });
+  const at = e => { const r = mini.getBoundingClientRect(); return [h.x + (e.clientX - r.left) / s, h.y + (e.clientY - r.top) / s]; };
+  let dragging = false;
+  box.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; view.centerOn(...at(e)); });
+  window.addEventListener('mousemove', e => { if (dragging) view.centerOn(...at(e)); });
+  window.addEventListener('mouseup', () => { dragging = false; });
+  box.addEventListener('wheel', e => e.preventDefault(), {passive: false});
+}
+
+// Semantic zoom. Once the detail lines would be too small to read, each box shows
+// only its title, kept near TITLE_PX on screen (capped so it fits the box), and each
+// stage and loop shows its name in large faint letters behind its boxes.
+const LINE_UNITS = 14, OVER_BELOW = 5.6, DETAIL_ABOVE = 6.4, TITLE_PX = 15, MARK_PX = 30, LOOP_MARK_PX = 19;
+function semanticZoom(svg, view) {
+  const NS = 'http://www.w3.org/2000/svg', root = svg.querySelector('g.root');
+  const titles = [], marks = [];
+  const layer = document.createElementNS(NS, 'g'); layer.setAttribute('class', 'lod-titles');
+  svg.querySelectorAll('g.node').forEach(g => {
+    const t = g.querySelector('.t'), shape = g.querySelector('.label-container') || g;
+    if (!t) return;
+    const b = boxOf(svg, shape);
+    const fo = document.createElementNS(NS, 'foreignObject');
+    for (const [k, v] of Object.entries({x: b.x, y: b.y, width: b.w, height: b.h})) fo.setAttribute(k, v);
+    fo.dataset.node = g.id;
+    const wrap = document.createElement('div'), d = document.createElement('div');
+    wrap.className = 'lodt' + (g.classList.contains('changed') ? ' changed' : '');
+    d.innerHTML = t.innerHTML;
+    wrap.appendChild(d); fo.appendChild(wrap); layer.appendChild(fo);
+    titles.push({d, b});
+  });
+  root.appendChild(layer);
+  const back = document.createElementNS(NS, 'g'); back.setAttribute('class', 'lod-marks');
+  clustersOf(svg).forEach(c => {
+    const t = document.createElementNS(NS, 'text');
+    t.textContent = c.text; t.setAttribute('dominant-baseline', 'hanging');
+    back.appendChild(t); marks.push({t, c});
+  });
+  root.insertBefore(back, root.querySelector('g.edgePaths'));  // above stage fills, below edges and boxes
+
+  // Largest title that fits each box, and the widest each stage name may run, in diagram units.
+  svg.classList.add('lod-over');
+  for (const it of titles) {
+    let lo = 4, hi = Math.max(8, it.b.h);
+    for (let i = 0; i < 14; i++) {
+      const mid = (lo + hi) / 2; it.d.style.fontSize = mid + 'px';
+      (it.d.offsetHeight <= it.b.h * 0.86 && it.d.scrollWidth <= it.d.clientWidth + 1) ? lo = mid : hi = mid;
+    }
+    it.max = lo;
+  }
+  for (const m of marks) {
+    m.t.setAttribute('font-size', 100);
+    m.max = 100 * (m.c.b.w * 0.9) / Math.max(1, m.t.getComputedTextLength());
+  }
+  let over = null;
+  view.onView(() => {
+    const k = svg.getScreenCTM().a, line = LINE_UNITS * k;
+    const now = over === null ? line < (OVER_BELOW + DETAIL_ABOVE) / 2 : (over ? line < DETAIL_ABOVE : line < OVER_BELOW);
+    if (now !== over) { over = now; svg.classList.toggle('lod-over', over); }
+    if (!over) return;
+    for (const it of titles) it.d.style.fontSize = Math.min(TITLE_PX / k, it.max) + 'px';
+    for (const m of marks) {
+      const fs = Math.min((m.c.nested ? LOOP_MARK_PX : MARK_PX) / k, m.max), pad = 12 / k;
+      m.t.setAttribute('font-size', fs);
+      m.t.setAttribute('x', m.c.b.x + pad); m.t.setAttribute('y', m.c.b.y + pad);
+    }
+  });
+}
+
+// Scrollbars over the union of the diagram and the on-screen region.
+function scrollbars(view) {
+  const axes = [{bar: 'hbar', p: 'x', d: 'w', pos: 'left', size: 'width', c: 'clientX'},
+                {bar: 'vbar', p: 'y', d: 'h', pos: 'top', size: 'height', c: 'clientY'}];
+  for (const a of axes) {
+    a.el = document.getElementById(a.bar); a.th = a.el.firstElementChild;
+    a.span = () => { const v = view.visible(), h = view.home;
+      return [Math.min(h[a.p], v[a.p]), Math.max(h[a.p] + h[a.d], v[a.p] + v[a.d]), v]; };
+    a.th.addEventListener('mousedown', e => {
+      e.preventDefault(); e.stopPropagation();
+      const [lo, hi] = a.span();
+      a.drag = {c0: e[a.c], k: (hi - lo) / a.el.getBoundingClientRect()[a.size], moved: 0};
+      a.th.classList.add('active');
+    });
+    a.el.addEventListener('mousedown', e => {  // a press on the track centres the view there
+      e.preventDefault();
+      const [lo, hi, v] = a.span(), r = a.el.getBoundingClientRect();
+      const t = lo + (e[a.c] - r[a.pos]) / r[a.size] * (hi - lo);
+      a.p === 'x' ? view.shift(t - (v.x + v.w / 2), 0) : view.shift(0, t - (v.y + v.h / 2));
+    });
+  }
+  window.addEventListener('mousemove', e => {
+    for (const a of axes) {
+      if (!a.drag) continue;
+      const step = (e[a.c] - a.drag.c0) * a.drag.k - a.drag.moved;
+      a.drag.moved += step;
+      a.p === 'x' ? view.shift(step, 0) : view.shift(0, step);
+    }
+  });
+  window.addEventListener('mouseup', () => axes.forEach(a => { a.drag = null; a.th.classList.remove('active'); }));
+  view.onView(() => {
+    for (const a of axes) {
+      const [lo, hi, v] = a.span(), L = a.el.getBoundingClientRect()[a.size];
+      const len = Math.max(28, v[a.d] / (hi - lo) * L);
+      a.th.style[a.size] = len + 'px';
+      a.th.style[a.pos] = Math.min(L - len, (v[a.p] - lo) / (hi - lo) * L) + 'px';
+    }
+  });
+}
+
+(async () => {
+  buildPanel(DATA.panel);
+  mermaid.initialize({
+    startOnLoad: false, securityLevel: 'loose', theme: 'base',
+    maxTextSize: 5000000,  // typeset MathML inflates the source far past the 50k default
+    themeVariables: {fontFamily: 'Inter, system-ui, sans-serif', fontSize: '15px',
+                     lineColor: '#64748b', primaryTextColor: '#0f172a',
+                     clusterBkg: '#ffffff', clusterBorder: '#e2e8f0'},
+    flowchart: {htmlLabels: true, useMaxWidth: false, curve: 'basis',
+                nodeSpacing: 46, rankSpacing: 58, padding: 18, wrappingWidth: 1200},
+  });
+  try {
+    await document.fonts.ready;
+    const {svg} = await mermaid.render('wv', typeset(DATA.mermaid));
+    const stage = document.getElementById('stage');
+    stage.innerHTML = svg;
+    const el = stage.querySelector('svg');
+    el.removeAttribute('style'); el.removeAttribute('width'); el.removeAttribute('height');
+    const view = panZoom(el);
+    minimap(el, view);  // clones the drawing, so it runs before the overview layers are added
+    semanticZoom(el, view);
+    scrollbars(view);
+    view.fit();
+  } catch (e) {
+    document.getElementById('err').textContent = 'render failed: ' + (e && e.message || e);
+  }
+})();
+</script>
+</body></html>
