@@ -81,7 +81,7 @@ at the end of a run and on a stop request; anyone can run it on a partial `<run>
   The search `kT` is more than a band unit: the polish and BFGS tolerances, `merge_d2`, `capture_d2` and the glued
   merge window are all in units of it, so two sets searched at different `kT` resolve basins differently.
 - `identity`: `merge_d2` and `capture_d2` with the `kT` they are measured in; the glued-FD merge (`FD_MERGE_A` = 0.05
-  Angstrom within `FD_MERGE_KT` = 0.1 E/kT, Z' = 1, module constants of `minima.py`); the key (identifier, space group,
+  Angstrom within `FD_MERGE_KT` = 0.01 E/kT, Z' = 1, module constants of `minima.py`); the key (identifier, space group,
   Z', handedness signs in the identity description).
 - `sheets`: section 2.
 - Commits and dirty flags of MXtalTools (and GFN when the writer runs from there), host, time.
@@ -242,10 +242,11 @@ conditional basin sets exist. No method or config key the conformer route reache
 
 ## Open
 
-- Conditional support at scale: one basin set per molecule is about 10^5 search runs at qm9rc's size. The streaming
-  search needs multi-condition runs with a stop rule, `kT` and cascade reference per (molecule, space group, Z'),
-  and a cost estimate; the stop rule rarely fires at a few starts per molecule (the owner will take this up).
-- MLIP targets in the streaming search.
+- Conditional support at scale. The streaming search runs many conditions in one job, each with its own starts,
+  cascade reference and a quota (`quota` minima within `quota_band_kT` of its lowest; the owner's aim, 2026-10-30, is
+  10-100 distinct low minima with Hessians per condition, not exhaustive coverage), conditions admitted as the slots
+  need them ([crystal-search-method](../wiki/crystal-search-method.md)). Open: the cost at qm9rc's size, the quota and band
+  defaults, and one shared `kT` across molecules.
 - Z' > 1 in the dataset format.
 - Saddles: their producer (section 1) and their weight under equal rows per basin.
 - Whether the measure's curvature belongs in the draw near the rotation-vector and orientation poles (section 4).
