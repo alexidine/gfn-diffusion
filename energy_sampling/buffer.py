@@ -281,6 +281,38 @@ def toy_latent_params(batch):
     return batch.latent_params(gauge_fix_free_axes=False)
 
 
+class FDChartState:
+    """A buffer's x on crystal_coordinates 'fd' (train.py::Modeller._buffer_kwargs): [n, data_ndim] float32, the row's
+    cached chart point `fd_state` (a stored prior row, Modeller._attach_fd_reference; a generated crystal,
+    MolecularCrystal.instantiate_crystals), else the crystal canonicalised through
+    energies/fd_coordinates.py::FDCoordinates of its (space group, molecule radius), NaN for a crystal with no chart
+    point. A picklable object, not a bound method, because x_fn is pickled into the buffer's checkpoint state (a
+    Modeller method pickles the whole live Modeller, whose locks refuse it)."""
+
+    def __init__(self, data_ndim: int):
+        self.data_ndim = int(data_ndim)
+
+    def __call__(self, batch):
+        if 'fd_state' in batch.keys():
+            return batch.fd_state.reshape(int(batch.num_graphs), -1)
+        from energies.fd_coordinates import FDCoordinates
+        params = batch.full_cell_parameters().detach().cpu()
+        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+        sg = batch.sg_ind.reshape(-1).cpu()
+        radius = torch.round(batch.radius.reshape(-1).detach().cpu().double() * 1e6) / 1e6
+        state = torch.zeros(len(sg), self.data_ndim, dtype=torch.float32)
+        ok = torch.zeros(len(sg), dtype=torch.bool)
+        for g in sorted(set(sg.tolist())):
+            rows = torch.nonzero(sg == g).flatten()
+            r = radius[rows]
+            fc = FDCoordinates(int(g), float(r[0]) if bool((r == r[0]).all()) else r)
+            res = fc.from_params(params[rows], hand[rows])
+            state[rows[res.ok], :fc.dim] = res.s[res.ok].float()
+            ok[rows[res.ok]] = True
+        state[~ok] = float('nan')
+        return state
+
+
 def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)
 

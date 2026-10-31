@@ -49,7 +49,7 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
-    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, \
+    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, FDChartState, \
     DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, Z_FEED_MODES, DEFAULT_EVAL_HALF_LIFE_VISITS, \
     ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
@@ -712,12 +712,13 @@ class Modeller:
         read off a stored graph. None = latent_params() with its crystal
         gauge-fix; toy routes read gauge-FREE (every latent dim is real there --
         the fix for P1's delta-pinned u,v,w targets, 2026-08-24). On
-        crystal_coordinates 'fd' it is the row's FD chart point (_buffer_state), so
-        every buffer's x -- wass, the eval figures, anchor distances and the anchor
+        crystal_coordinates 'fd' it is the row's FD chart point (buffer.py::FDChartState, picklable: x_fn rides
+        into the buffer sidecar), so every buffer's x -- wass, the eval figures, anchor distances and the anchor
         refresh -- is in the policy's chart.
         """
+        fd = getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
         return dict(max_z_prime=max(self.args.z_primes),
-                    x_fn=(self._buffer_state if getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
+                    x_fn=(FDChartState(self.energy_function.data_ndim) if fd
                           else None if self.energy_function.is_crystal else toy_latent_params))
 
     def _eval_extra_stats(self, mol_batch):
@@ -4294,16 +4295,6 @@ class Modeller:
                     _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
                     log_ref[good] = lr.float()
         return ok, state, log_ref
-
-    def _buffer_state(self, batch):
-        """A buffer's x on the FD chart (_buffer_kwargs): the row's chart point -- its cached fd_state (a stored prior
-        row, _attach_fd_reference; a generated crystal, MolecularCrystal.instantiate_crystals), else canonicalised
-        here, NaN for a crystal with no chart point (a conditions-file crystal outside the length box)."""
-        if 'fd_state' in batch.keys():
-            return batch.fd_state.reshape(int(batch.num_graphs), -1)
-        ok, state, _ = self._fd_chart_points(batch)
-        state[~ok] = float('nan')
-        return state
 
     def _attach_fd_reference(self, batch):
         """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
