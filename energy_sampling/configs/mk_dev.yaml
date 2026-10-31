@@ -34,8 +34,8 @@ noised_prior:                # read only when prior_path is a pre-noised build (
   live_width_cap: 0.25       # live_kernel: largest width per direction, in chart units
   live_caps: [1.0, 0.2, 0.1, 0.5]  # live_kernel 'basin': largest width per mode in each block of the cell parameters (Angstrom, radian, fraction, radian)
   live_redraws: 4            # live_kernel 'basin': redraws of a draw with no chart point before the row keeps its stored point (counted)
-  live_bank: 64              # live_kernel 'basin': chart points kept per prior row (0 = every draw fresh)
-  live_fresh_frac: 0.1       # live_kernel 'basin': share of each batch drawn fresh and written into the bank
+  live_bank: 1024            # live_kernel 'basin': chart points kept per prior row, drawn at the first MLE step, unscored, not checkpointed (0 = every draw fresh)
+  live_fresh_frac: 0.0       # live_kernel 'basin': share of each batch drawn fresh and written into the bank (0 = the bank is a fixed set)
   live_shape: hessian        # live_kernel 'basin': the draw's covariance, 'hessian' (live_tau x the thermal ellipsoid, modes capped by live_caps) or 'iso' (one width per row in live_caps-scaled coordinates, same expected excess); refused with any other live_kernel
 harvest:                     # scored rollout rows kept for the next prior build (train.py::Modeller.harvest_scored_rows)
   enabled: false
