@@ -65,8 +65,8 @@ distinct basin, each a Z' = 1 `CrystalDescription` with its reference molecule (
 
 **One writer, two callers.** A converter beside `minima.py` turns a search's output rows into a basin-set folder: the
 rows `minima.minimum_rows` selects (library minima: `minimum_id >= 0`, not a recapture). The streaming search calls it
-at the end of a run and on a stop request; anyone can run it on a partial `<run>.pt` or on the batch loop's output
-(which writes no per-minimum file), which is how MLIP basin sets are produced until MLIP folds into the stream.
+at the end of a run and on a stop request; anyone can run it on a partial run's committed rows (`stream_search.py::load_stream_outputs`) or on the batch loop's
+output (which writes no per-minimum file). MLIP targets run in the stream (mxtaltools 91f40b8a).
 `save_dataset` never overwrites a folder, so there is no per-group rewrite.
 
 **Header (the format's `provenance`).**
@@ -239,6 +239,45 @@ lists `shape_path` among its data-path keys; `InnModeller` accepts `shaped` and 
 `ROWS_PER_SOURCE` (from `symmetrize_prior.py`), `keep_molecules` (`molecule_subset.py`) and `apply_overrides`
 (`inn_modeller.py`) are re-homed, since the constructor imports them; retirement covers unconditional priors until
 conditional basin sets exist. No method or config key the conformer route reaches is removed.
+
+## 7. Fill tiles (proposal, 2026-10-31)
+
+*Proposal, built and measured on one system; not adopted. Code: `data_processing/fill_basins.py`, `tile_cover.py`,
+`tests/crystal/test_tile_cover.py` (uncommitted).*
+
+At the trainer's temperature the minima's tiles miss most thermal states: the basins are anharmonic, not missing. The
+fill adds tiles of the same kind (a centre and the Hessian of the physical energy there, drawn by section 4's
+function) where low-energy states lie outside every tile:
+
+1. Draw K probes from each minimum's tile at twice its covariance and score each once with the search's energy.
+2. Keep the probes within W kT of the lowest minimum that lie outside every tile.
+3. In ascending energy, each kept probe still outside every tile becomes a tile, shaped by its own Hessian
+   (`basin_factors`: |lambda| per mode and the caps, so slopes and saddles are handled as at a minimum).
+
+One pass, one knob (K; W = 10 kT, probe width 2x and level 0.99 are fixed). Output: a basin set through
+`write_basin_set`, fill rows with `polish_status` -1, the settings, counts and each fill tile's parent minimum in the
+header's search record. `build_noised_prior --basins` reads it unchanged.
+
+Metric: thermal coverage, the share of Metropolis states at the trainer's kT (started from the minima) inside the 99%
+ellipsoid of some tile, the distance minimised over a crystal's equivalent descriptions (`tile_cover.py`, on crystal_fd
+`GluedFDMetric`). `minima.MinimaLibrary.nearest` cannot stand in: on the reference below it reports 7.8% where the
+exact test gives 26.7%.
+
+| tile set | tiles | extra energy calls | held-out thermal coverage |
+|---|---|---|---|
+| minima only | 174 | 0 | 0.267 |
+| minima + fill, K = 32 | 208 | 7k | 0.398 |
+| minima + fill, K = 128 (`fill_basins.py`, written and re-read) | 256 | 22k + 124 Hessians | 0.595 |
+| minima + fill, K = 512 | 337 | 98k | 0.697 |
+
+Table: MIPCAS sg 2 eLJ, the 174 minima of the oct29 stream search; 10,200 held-out Metropolis states at kT (102 basins
+within 6 kT, 4 chains each, 4,000 steps). One seed each. The K = 32 and 512 rows used the prototype (scratch, with a
+valley-floor centring step the spec dropped: at K = 128 it gave 0.579 against 0.581 for raw probe centres). For
+reference, the earlier noised-anchor prior used 4,012 anchors.
+
+Open: coverage stays low more than 12 kT above the lowest minimum (about 0.17 at K = 128); MLIP cost (one Hessian
+per fill tile); a second system; a basis change with an entry beyond +-1 is not tried by `tile_cover` (coverage can
+only be understated).
 
 ## Open
 
