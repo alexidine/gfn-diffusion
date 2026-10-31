@@ -890,7 +890,9 @@ class Modeller:
                 for j in range(d):
                     H[lo:lo + len(idx), j] = torch.autograd.grad(g[:, j].sum(), z, retain_graph=j < d - 1)[0].double()
         H = 0.5 * (H + H.transpose(1, 2))
-        lam, V = torch.linalg.eigh(H)
+        # on the CPU: cuSOLVER's batched eigh refuses a batch of ~80k 12x12 matrices (CUSOLVER_STATUS_INVALID_VALUE at
+        # its buffer-size call, 2026-10-31); the CPU takes well under a second for it
+        lam, V = (t.to(H.device) for t in torch.linalg.eigh(H.cpu()))
         cap, tau = float(s['live_width_cap']), float(s['live_tau'])
         if s['live_kernel'] == 'hessian':
             w = torch.sqrt(tau / lam.abs().clamp_min(tau / cap ** 2)).clamp(max=cap)
