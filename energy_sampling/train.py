@@ -7958,6 +7958,7 @@ class Modeller:
 
             latents = self._batch_latents(mol_batch)
             latents = latents.to(self.device)
+            self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(len(inds))
             if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
                 # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
                 latents = self._live_kernel_draw(latents, inds, mol_batch)
@@ -10074,6 +10075,10 @@ class Modeller:
             metrics.update(fig_dict)
 
         metrics.update(self.density_readouts())
+        if int(getattr(self, '_mle_rows_drawn', 0)) > 0:
+            # passes of the dataset-mode MLE draw over the fixed training rows (each row, on average, seen this many
+            # times); with live_kernel set the rows are kernel centres, not the points trained on
+            metrics['data/mle_passes'] = int(self._mle_rows_drawn) / max(1, len(self.prior_dataset))
         metrics.update(self.update_heldout_gate(metrics))
         metrics.update({
             'Batch Size': self.batch_size,

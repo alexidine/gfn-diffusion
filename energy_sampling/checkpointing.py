@@ -15,6 +15,9 @@ from models.nf_policy import PRECISION_ONLY_KEYS, resolve_policy_entry
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
+    # rows the dataset-mode MLE draw has taken from prior_dataset (data/mle_passes = this / its rows); rides in the
+    # checkpoint so a resumed MLE stage keeps counting its passes over the fixed set
+    '_mle_rows_drawn': 0,
     # z_level_fill's absorber (z_calibration.fill_mode: absorb): the running
     # uncertainty of log Z and the step of the last applied measurement. They
     # ride in the checkpoint so a resume or a rewind does not re-snap to the
