@@ -48,7 +48,7 @@ def arm_config(model, cap):
         put(cfg, k, v)
     for k, v in MODELS[model].items():
         put(cfg, f'model.nf.{k}', v)
-    cfg.update(run_name=f'cap_nov01_{model}_k{cap}', tag='cap_size_nov01', cuda_memory_fraction=0.30, checkpoints_dir=f'{ROOT}/checkpoints',
+    cfg.update(run_name=f'{model}_k{cap}', tag='cap_nov01', cuda_memory_fraction=0.30, checkpoints_dir=f'{ROOT}/checkpoints',
                checkpoint_read_only=False, archive_period=ARCHIVE[cap], archive_buffers=False, gradient_norm_clip=10.0,
                figs_every_n_evals=0, embedding_conditioning=True, lr_flow=1.0e-4, epochs=STEPS[cap],
                eval_period=EVAL[cap], compile_policy=False, protocol='conditional_vargrad', prior_path=PRIORS[cap],
@@ -72,6 +72,6 @@ if __name__ == '__main__':
     for model in MODELS:
         for cap in PRIORS:
             cfg = arm_config(model, cap)
-            out = HERE / f"{cfg['run_name']}.yaml"
+            out = HERE / f"cap_nov01_{model}_k{cap}.yaml"   # train.py names the run (W&B, checkpoints) tag_run_name
             out.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
             print(out.name, f'rows {ROWS[cap]:,} steps {STEPS[cap]:,} passes {STEPS[cap] * 5000 / ROWS[cap]:.1f}')
