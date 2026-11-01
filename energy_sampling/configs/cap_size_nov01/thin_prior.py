@@ -3,7 +3,7 @@ build_rc_prior.thin_rows (each molecule's lowest-eLJ crystal plus k - 1 others d
 so the cap-2 rows are a subset of the cap-4 rows). Per-row keys are subset, every other key is carried over. Each file
 is written under a temporary name and hard-linked into place only if the name is still free, so a reader never sees a
 partial file and a file once in place is never replaced: on the cluster's network filesystem, replacing a file another job
-already has open gives that reader OSError 116 (stale file handle), which killed two arms of the first launch.
+already has open gives that reader OSError 116 (stale file handle), which killed an arm of the first launch.
 usage: python configs/cap_size_nov01/thin_prior.py SRC OUT_DIR"""
 import os
 import sys

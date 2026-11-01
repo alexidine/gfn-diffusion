@@ -4,8 +4,8 @@ The recipe of the local run cond_oct31_big_allk2_w768 (W&B zo2jwtz4): the COMMIT
 (batch 5000 pinned, buffer_device cpu, anchors only, clip 10, LR hold 1.0, lr_flow 1e-4), T 6.9. Every arm runs ~30-37
 passes over its rows and evaluates every ~1.8 passes. Held-out molecules: rcoct22i1_qm9rc_test_conditions.pt (6,652; the
 all-family held-out file is not on the cluster). Two jobs, one A100 each, three arms per card under MPS at 0.30 each.
-The cross-condition matrix (xcond_eval) runs every 2 evals. The first launch carried tag 'dev' and xcond off; its w768 k2/k4
-arms died loading their prior (thin_prior.py) and are relaunched as array index 2 with this file's settings.
+The cross-condition matrix (xcond_eval) runs every 2 evals. The first launch carried tag 'dev' and xcond off; its w768 k4
+arm died loading its prior (thin_prior.py) and is relaunched alone as array index 2 with this file's settings.
 usage: python configs/cap_size_nov01/make.py   (writes <arm>.yaml beside this file)"""
 from pathlib import Path
 
