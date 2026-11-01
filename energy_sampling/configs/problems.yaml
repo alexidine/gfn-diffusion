@@ -49,6 +49,12 @@ schema: 1
 #   conditional molecule: seed from reasonable samples; per-condition coverage
 #     will be partial and that is expected.
 #
+# prior_buffer static: FALSE for the toys with a conditions-file anchor seed
+#   (toy_big_unif, toy_hard_uncond_multi). Their anchors are the target's
+#   samples and the prior dataset is the junk Gaussian above, so the buffer
+#   reaches the target only through the rebuild and top-ups from anchors, which
+#   a static buffer skips. Every other problem takes the canonical config's value.
+#
 # temperature: room-temperature kT in kJ/mol for real crystals; 1.0 for toys,
 #   where the energy is already in natural units.
 # --------------------------------------------------------------------------
@@ -161,6 +167,8 @@ problems:
     buffers:
       anchor_buffer:
         seed_source: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+      prior_buffer:
+        static: false   # domain rule above: prior_buffer static
 
   # ---- unconditional toy ------------------------------------------------
   toy_hard_uncond_multi:
@@ -185,6 +193,8 @@ problems:
     buffers:
       anchor_buffer:
         seed_source: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt'
+      prior_buffer:
+        static: false   # domain rule above: prior_buffer static
 
   # ---- latent_gaussian (the analytic toy) -------------------------------
   latent_gaussian:

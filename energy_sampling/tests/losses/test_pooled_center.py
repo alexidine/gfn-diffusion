@@ -1,0 +1,84 @@
+"""fwd_loss_coeffs.pooled_center: what pooled_condition_vargrad scores each group's rows against.
+
+'mean' is the shipped VarGrad term: the centre is the group's own row mean, kept in the
+graph, so the per-row coefficients sum to zero and one bad row spills onto its partners.
+'head' and 'head_stored' score the same rows against a DETACHED level, so the term is
+per-row TB and a row's coefficient is its own psi(u_j - L). These tests pin the three
+levels, the spill that 'mean' has and the detached centres do not, and the readouts.
+"""
+import pytest
+import torch
+
+from energy_sampling.gflownet_losses import pooled_condition_vargrad
+
+BETA = 40.0
+
+
+def _group(replay_u, stored_u, head, cid=0):
+    """One condition's live stashes on the NF: log_pb 0, log_pf the parameter, so u = log_r - log_pf."""
+    def side(us):
+        n = len(us)
+        log_pf = torch.zeros(n, requires_grad=True)
+        return {'log_r': torch.tensor(us, dtype=torch.float32), 'log_pb': torch.zeros(n), 'log_pf': log_pf,
+                'condition_id': torch.full((n,), cid), 'log_z': torch.full((n,), float(head))}
+    return side(replay_u), side(stored_u)
+
+
+def _coeffs(center, replay_u, stored_u, head=0.0):
+    """d loss / d log_pf per row, replay rows first: the sign is the direction descent moves log q there."""
+    rep, sto = _group(replay_u, stored_u, head)
+    rows, stats = pooled_condition_vargrad(rep, sto, beta=BETA, ratio=0.5, center=center)
+    rows.sum().backward()
+    return torch.cat([rep['log_pf'].grad, sto['log_pf'].grad]), stats
+
+
+def test_mean_coefficients_sum_to_zero_and_a_bad_row_spills():
+    g, _ = _coeffs('mean', [-2.0, -2.0], [2.0, 2.0])
+    assert abs(float(g.sum())) < 1e-4
+    bad, _ = _coeffs('mean', [-202.0, -2.0], [2.0, 2.0])
+    # past the knee the bad row's partners all take +beta/2 more (in -dL/dlogpf terms)
+    assert torch.allclose(-bad[1:], torch.full((3,), BETA / 2), atol=1e-3)
+
+
+@pytest.mark.parametrize('center', ['head', 'head_stored'])
+def test_detached_centres_keep_a_bad_row_to_itself(center):
+    healthy, _ = _coeffs(center, [-2.0, -2.0], [2.0, 2.0], head=0.0)
+    bad, _ = _coeffs(center, [-202.0, -2.0], [2.0, 2.0], head=0.0)
+    assert torch.allclose(bad[1:], healthy[1:], atol=1e-5), 'the partners do not see the bad row'
+    assert abs(float(bad[0])) == pytest.approx(BETA, abs=1e-4), 'its own influence is capped at beta'
+
+
+def test_head_is_tb_against_the_head():
+    g, stats = _coeffs('head', [-2.0, 1.0], [3.0, 5.0], head=1.0)
+    # 40 * smooth_l1(L, u, 40) = (u - L)^2 / 2 inside the knee; u = log_r - log_pf, so d/dlogpf = -(u - L)
+    assert torch.allclose(g, -torch.tensor([-3.0, 0.0, 2.0, 4.0]), atol=1e-5)
+    assert float(stats['pooled_center_minus_head']) == pytest.approx(0.0)
+
+
+def test_head_stored_is_half_head_half_stored_mean():
+    g, stats = _coeffs('head_stored', [-2.0, 1.0], [3.0, 5.0], head=1.0)
+    level = 0.5 * 1.0 + 0.5 * 4.0
+    assert torch.allclose(g, -(torch.tensor([-2.0, 1.0, 3.0, 5.0]) - level), atol=1e-5)
+    assert float(stats['pooled_center_minus_head']) == pytest.approx(level - 1.0)
+
+
+def test_readouts():
+    _, stats = _coeffs('mean', [-202.0, -2.0], [2.0, 2.0], head=0.0)
+    assert float(stats['pooled_gap_signed']) == pytest.approx(2.0 - (-102.0))
+    # centre (-202 - 2 + 2 + 2) / 4 = -50 drags every row past the knee, the healthy three included
+    assert float(stats['pooled_knee_frac']) == pytest.approx(1.0)
+    assert float(stats['pooled_center_minus_head']) == pytest.approx(-50.0)
+    _, stats = _coeffs('head', [-202.0, -2.0], [2.0, 2.0], head=0.0)
+    assert float(stats['pooled_knee_frac']) == pytest.approx(0.25), 'against the head only the bad row is'
+
+
+def test_unknown_centre_and_a_stash_without_the_head_raise():
+    rep, sto = _group([0.0, 0.0], [0.0, 0.0], 0.0)
+    with pytest.raises(ValueError, match='pooled_center|center='):
+        pooled_condition_vargrad(rep, sto, center='pooled')
+    for d in (rep, sto):
+        d.pop('log_z')
+    rows, stats = pooled_condition_vargrad(rep, sto, center='mean')
+    assert rows is not None and 'pooled_center_minus_head' not in stats
+    with pytest.raises(ValueError, match="'log_z'"):
+        pooled_condition_vargrad(rep, sto, center='head')

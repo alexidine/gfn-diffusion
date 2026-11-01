@@ -156,6 +156,14 @@ BWD_SAMPLING_MODES = ('dataset', 'prior')
 # fwd_loss_coeffs.pooled_source: which branch's live rows pair with bwd's in the
 # cross-branch pooled VarGrad term (train.py fused_train_step)
 POOLED_SOURCES = ('fwd', 'replay')
+# fwd_loss_coeffs.pooled_center: what each pooled group's rows are scored against
+# (gflownet_losses.pooled_condition_vargrad). 'mean' = the group's own row mean, in the
+# graph (VarGrad); 'head' = the detached Z(c) head; 'head_stored' = the detached
+# 1/2 head + 1/2 mean of the group's stored (bwd) rows. The two detached centres make
+# the term per-row TB against that level.
+POOLED_CENTERS = ('mean', 'head', 'head_stored')
+# {mode}_loss_coeffs.tb_z_source: the Z a branch's TB term reads (gflownet_losses.py)
+TB_Z_SOURCES = ('learned', 'persistent', 'batch_root')
 # stage condition_draw.pick: how the aligned per-condition draw chooses its C
 # conditions among the eligible ones (train.py _choose_draw_conditions)
 CONDITION_DRAW_PICKS = ('uniform', 'weighted')
@@ -612,7 +620,22 @@ class Stage:
                     f"stage '{self.name}': loss_coeffs.{mode}.pooled_source -- the "
                     f"key lives on the fwd block, beside pooled_vg; on {mode} nothing "
                     f"reads it.")
+        for mode in MODES:
+            zs = self.loss_coeffs.get(mode, {}).get('tb_z_source')
+            if zs is not None and zs not in TB_Z_SOURCES:
+                raise ValueError(f"stage '{self.name}': loss_coeffs.{mode}.tb_z_source="
+                                 f"{zs!r}; must be one of {TB_Z_SOURCES}")
+        for mode in ('bwd', 'replay'):
+            if 'pooled_center' in self.loss_coeffs.get(mode, {}):
+                raise ValueError(
+                    f"stage '{self.name}': loss_coeffs.{mode}.pooled_center -- the "
+                    f"key lives on the fwd block, beside pooled_vg; on {mode} nothing "
+                    f"reads it.")
         fwd_lc = self.loss_coeffs.get('fwd', {})
+        center = fwd_lc.get('pooled_center')
+        if center is not None and center not in POOLED_CENTERS:
+            raise ValueError(f"stage '{self.name}': loss_coeffs.fwd.pooled_center="
+                             f"{center!r}; must be one of {POOLED_CENTERS}")
         src = fwd_lc.get('pooled_source')
         if src is not None:
             if src not in POOLED_SOURCES:

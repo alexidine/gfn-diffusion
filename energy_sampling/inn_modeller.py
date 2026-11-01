@@ -836,6 +836,9 @@ class InnModeller(Modeller):
                                                                      "'prior_dataset'"),
             (not bool(getattr(acfg, 'frozen', False)), "buffers.anchor_buffer.frozen false (the anchor index cache "
                                                        "assumes fixed membership)"),
+            (bool(getattr(args.buffers.prior_buffer, 'static', False)),
+             "buffers.prior_buffer.static true (this route fills its prior buffer only through "
+             "top_up_prior_from_anchors, which a static buffer skips: set it false for this route)"),
         ]
         for bad, why in refusals:
             if bad:

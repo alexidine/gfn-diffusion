@@ -1844,8 +1844,16 @@ def replay_seat_problems(stage, coeff, glob) -> list[str]:
       coeff   (mode, key) -> the effective coefficient, raw (strings kept)
       glob    dotted global key -> its value, or None when absent
     Returns one message per problem; [] = clean."""
-    from protocol import POOLED_SOURCES   # local: protocol imports this module back
+    from protocol import POOLED_SOURCES, POOLED_CENTERS   # local: protocol imports this module back
     out = []
+
+    center = coeff('fwd', 'pooled_center')
+    center = 'mean' if center is None else center
+    if center not in POOLED_CENTERS:
+        out.append(f"fwd pooled_center={center!r}; must be one of {POOLED_CENTERS}.")
+    elif center != 'mean' and not (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0:
+        out.append(f"fwd pooled_center {center!r} with {CROSS_BRANCH_VARGRAD_COEFF} off; the "
+                   f"centre only scores the pooled term's rows, so it is a dead key here.")
 
     src = coeff('fwd', 'pooled_source')
     src = 'fwd' if src is None else src
@@ -1937,6 +1945,49 @@ def replay_seat_is_well_formed(cfg: dict) -> list[Violation]:
             out.append(Violation(ERROR, 'replay_seat_is_well_formed',
                                  f"stage {parsed.name!r}: {msg}"))
     return out
+
+
+def tb_z_source_is_known(cfg: dict) -> list[Violation]:
+    """Every tb_z_source a config states is one the losses implement. get_gfn_*_loss
+    tests for 'persistent' and 'batch_root' and runs anything else as 'learned', so a
+    misspelt or unbuilt source trained against the learned head with no word.
+    Modeller.tb_z_source refuses the resolved value at run time; this judges every
+    base block and every stage override in every protocol, selected or not."""
+    from protocol import TB_Z_SOURCES    # local: protocol imports this module back
+    out = []
+    for mode in ('fwd', 'bwd', 'replay'):
+        v = _get(cfg, f'{mode}_loss_coeffs.tb_z_source')
+        if v is not None and v not in TB_Z_SOURCES:
+            out.append(Violation(ERROR, 'tb_z_source_is_known',
+                                 f"{mode}_loss_coeffs.tb_z_source={v!r}; must be one of {TB_Z_SOURCES}"))
+    for name, proto in (_get(cfg, 'protocols') or {}).items():
+        for st in (proto or {}).get('stages') or []:
+            if not isinstance(st, dict):
+                continue
+            for mode, block in (st.get('loss_coeffs') or {}).items():
+                v = (block or {}).get('tb_z_source')
+                if v is not None and v not in TB_Z_SOURCES:
+                    out.append(Violation(
+                        ERROR, 'tb_z_source_is_known',
+                        f"protocols.{name} stage {st.get('name')!r}: loss_coeffs.{mode}.tb_z_source="
+                        f"{v!r}; must be one of {TB_Z_SOURCES}"))
+    return out
+
+
+def static_prior_buffer_is_seeded(cfg: dict) -> list[Violation]:
+    """buffers.prior_buffer.static needs seed_source 'prior_dataset'. Nothing enters a
+    static buffer after init_prior_buffer_seed, and seed_source 'generated' seeds nothing,
+    so manage_prior_buffer's first call would build the buffer from one eval batch and
+    hold it. The row count against max_size is only known once the prior loads, so
+    init_prior_buffer_seed refuses that half."""
+    if not _get(cfg, 'buffers.prior_buffer.static'):
+        return []
+    seed = _get(cfg, 'buffers.prior_buffer.seed_source', 'generated')
+    if seed == 'prior_dataset':
+        return []
+    return [Violation(ERROR, 'static_prior_buffer_is_seeded',
+                      f"buffers.prior_buffer.static with seed_source {seed!r}; a static buffer "
+                      f"is its seed, so it needs seed_source 'prior_dataset'.")]
 
 
 def condition_draw_problems(stage, coeff, glob) -> list[str]:
@@ -2587,6 +2638,8 @@ RULES = (
     z_fill_mode_is_well_formed,
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
+    tb_z_source_is_known,
+    static_prior_buffer_is_seeded,
     condition_draw_is_well_formed,
     nf_policy_refuses_sde_only_settings,
     # returns [] when buffers.store is absent or off

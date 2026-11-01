@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.utils import collate_data_list
 from buffer import N_FORCE_LEGS
+from protocol import POOLED_CENTERS
 from utils import compute_sample_overlap
 
 
@@ -463,7 +464,7 @@ def get_gfn_forward_loss(loss_coeffs,
     # raises. Not worth carrying that on every run for a term that is off.
     if getattr(gfn, '_stash_live_branches', False):
         gfn._live_fwd = {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
-                         'condition_id': condition_id}
+                         'condition_id': condition_id, 'log_z': log_Z_learned.detach()}
 
     losses = []
     """VarGrad losses + empirical-Z regression"""
@@ -897,7 +898,7 @@ def get_gfn_backward_loss(loss_coeffs,
     if live_stash is not None and getattr(gfn, '_stash_live_branches', False):
         setattr(gfn, f'_live_{live_stash}',
                 {'log_r': log_r, 'log_pb': log_pb, 'log_pf': log_pf,
-                 'condition_id': condition_id})
+                 'condition_id': condition_id, 'log_z': log_Z_learned.detach()})
 
     losses = []
     """VarGrad losses"""
@@ -1557,7 +1558,8 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
 
 def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
                              min_group_count: int = 2, ratio=None,
-                             bridge_only: bool = False, thin_by_condition: bool = True):
+                             bridge_only: bool = False, thin_by_condition: bool = True,
+                             center: str = 'mean'):
     """
     CROSS-BRANCH VarGrad: one per-condition group spanning BOTH the forward
     rollouts and the backward/buffer draws.
@@ -1583,11 +1585,27 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
     own branch term already carries their shape). At the measured Delta ~ 63 and
     lambda_b ~ 1/3 the usable window is roughly 21 < beta < 42.
 
+    THE CENTRE (`center`, fwd_loss_coeffs.pooled_center). 'mean' is the term
+    above: each group's rows against the group's own row mean, kept in the graph,
+    so the coefficients sum to zero. One row D nats below its group moves that
+    mean by D/n with no limit, and past the knee it adds up to beta/2 to every
+    partner's coefficient. The two DETACHED centres score each row against a
+    level L(c) that no row's residual can move, so a row's influence is its own
+    psi(u_j - L), at most beta, and the term is per-row TB against L:
+      'head'         L(c) = the Z(c) head at the group's condition (the stashes'
+                     `log_z`, detached)
+      'head_stored'  L(c) = 1/2 head(c) + 1/2 the mean u of the group's stored
+                     (bwd) rows; a group with no stored row falls back to head(c)
+    Same rows, same min_group_count gate and same knee as 'mean', so the three
+    differ only in L. Both need the stashes' `log_z` and raise without it.
+
     Returns (loss_rows, stats). `pooled_mixed_frac` is the load-bearing health
     check: a condition present in only one branch's batch forms a single-source
     group, where this term degenerates to that branch's own and its whole point
     is silently absent. Without aligned draws that fraction is ~0.19.
     """
+    if center not in POOLED_CENTERS:
+        raise ValueError(f"pooled_condition_vargrad: center={center!r}; must be one of {POOLED_CENTERS}")
     need = ('log_r', 'log_pb', 'log_pf', 'condition_id')
     if not live_fwd or not live_bwd:
         return None, {}
@@ -1662,9 +1680,18 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
     log_r, log_pb, log_pf, cid = (cat(k) for k in need)
     n_f = lf['log_pf'].shape[0]
 
-    _, _, vg = condition_grouped_empirical_z(
-        log_pb, log_pf, log_r, cid, lme=False, beta=beta,
-        min_group_count=min_group_count, detach_center=False)
+    if center == 'mean':
+        _, _, vg = condition_grouped_empirical_z(
+            log_pb, log_pf, log_r, cid, lme=False, beta=beta,
+            min_group_count=min_group_count, detach_center=False)
+    if 'log_z' in lf and 'log_z' in lb:
+        head = cat('log_z').detach()
+    elif center != 'mean':
+        raise ValueError(f"pooled_condition_vargrad: center={center!r} needs the stashes' "
+                         f"'log_z' (the Z(c) head at each row); a stash without it was "
+                         f"written by a caller that predates the detached centres")
+    else:
+        head = None
 
     counts_all = None  # set below
     is_bwd = torch.zeros(cid.shape[0], dtype=torch.float32, device=dev)
@@ -1722,6 +1749,29 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
         within_b = (lam * wb * m).sum() / denom
         bridge_m = (bridge * m).sum() / denom
         total = (within_f + within_b + bridge_m).clamp(min=1e-9)
+        # signed: stored side minus the first side, mean over mixed groups
+        gap_signed = ((bmean - fmean) * m).sum() / denom
+        if head is not None:
+            hmean = torch.zeros(k, device=dev).scatter_add_(0, inv, head) / counts_all.clamp(min=1)
+        if center == 'mean':
+            level = gmean
+        elif center == 'head':
+            level = hmean
+        else:
+            level = torch.where(nb > 0, 0.5 * hmean + 0.5 * bmean, hmean)
+
+    live_m = (counts_all >= min_group_count).float()[inv]
+    if center == 'mean':
+        # exactly 0 already on a singleton (smooth_l1(x, x)); the mask makes min_group_count > 2 mean the same here
+        vg = vg * live_m
+    else:
+        # per-row TB against the detached level, on the rows 'mean' scores
+        vg = beta * F.smooth_l1_loss(level[inv], log_r + log_pb - log_pf,
+                                     reduction='none', beta=beta) * live_m
+    with torch.no_grad():
+        n_live = live_m.sum()
+        knee_frac = (((u - level[inv]).abs() > beta).float() * live_m).sum() / n_live
+        center_minus_head = ((level[inv] - head) * live_m).sum() / n_live if head is not None else None
 
     # THE POOLED ANALOGUE OF `vg_live_frac`. A group below min_group_count
     # yields exactly zero through smooth_l1(x, x), so rows in one are paid for
@@ -1741,6 +1791,14 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
              'pooled_within_b': within_b,
              'pooled_bridge': bridge_m,
              'pooled_bridge_frac': bridge_m / total}
+    # rows past the knee, the signed stored-minus-first gap and the centre's offset from the Z(c) head; each is left
+    # out where it is undefined (no live row, no mixed group, no stashed log_z), never written as 0
+    if float(n_live) > 0:
+        stats['pooled_knee_frac'] = knee_frac
+        if center_minus_head is not None:
+            stats['pooled_center_minus_head'] = center_minus_head
+    if float(m.sum()) > 0:
+        stats['pooled_gap_signed'] = gap_signed
     return vg, stats
 
 

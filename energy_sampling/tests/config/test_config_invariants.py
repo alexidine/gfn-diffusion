@@ -1330,3 +1330,22 @@ def test_the_ema_decay_rule_abstains_on_null_and_on_the_conformer_route(canonica
     cfg['ema_decay'] = 0.5
     cfg['energy_function'] = 'conformer_torsions'
     assert not [v for v in check(cfg) if v.rule == 'ema_decay_is_conformer_only']
+
+
+def test_an_unknown_tb_z_source_is_an_error(canonical):
+    """get_gfn_*_loss tests for 'persistent' and 'batch_root' only, so any other value trained as 'learned'."""
+    assert not _fires(copy.deepcopy(canonical), 'tb_z_source_is_known')
+    assert _fires(broken(canonical, **{'bwd_loss_coeffs.tb_z_source': 'pooled'}), 'tb_z_source_is_known')
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['conditional_vargrad']['stages'][1]['loss_coeffs']['replay']['tb_z_source'] = 'persistant'
+    assert _fires(cfg, 'tb_z_source_is_known')
+
+
+def test_a_static_prior_buffer_needs_the_dataset_seed(canonical):
+    """A static buffer is its init seed; seed_source 'generated' seeds nothing."""
+    assert not _fires(copy.deepcopy(canonical), 'static_prior_buffer_is_seeded')
+    assert _fires(broken(canonical, **{'buffers.prior_buffer.seed_source': 'generated'}),
+                  'static_prior_buffer_is_seeded')
+    assert not _fires(broken(canonical, **{'buffers.prior_buffer.seed_source': 'generated',
+                                           'buffers.prior_buffer.static': False}),
+                      'static_prior_buffer_is_seeded')

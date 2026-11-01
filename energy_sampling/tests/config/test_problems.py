@@ -54,6 +54,8 @@ ALLOWED_BUFFERS = {'anchor_buffer'}
 PROTOCOL_REQUIRED_BUFFERS = {
     # conditional_vargrad's var_conditioning refuses a prioritised replay draw
     ('replay_buffer', 'prioritise', 'enabled'): False,
+    # domain rule in problems.yaml: a toy whose anchors are its target samples needs the live prior buffer
+    ('prior_buffer', 'static'): False,
 }
 
 

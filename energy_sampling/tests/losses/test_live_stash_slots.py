@@ -54,7 +54,7 @@ def test_the_replay_slot_leaves_the_bwd_rows_alone():
     gfn._live_bwd = bwd_rows
     _call(gfn, live_stash='replay')
     assert gfn._live_bwd is bwd_rows
-    assert set(gfn._live_replay) == {'log_r', 'log_pb', 'log_pf', 'condition_id'}
+    assert set(gfn._live_replay) == {'log_r', 'log_pb', 'log_pf', 'condition_id', 'log_z'}
 
 
 def test_none_stashes_nothing():

@@ -483,6 +483,7 @@ fwd_loss_coeffs:
   pooled_thin_by_condition: 1.0 # 1 = when the ratio thins the forward side, keep rows whose CONDITION the buffer side holds (whole pairs first); 0 = the old condition-blind randperm, which split pairs and left ~38% of rows single-source
   pooled_bridge_only: 0.0 # > 0.5 = restrict the buffer side of the draw to rows whose CONDITION the forward batch also holds. A kept row with no forward partner forms a single-source group, where the term degenerates to the backward branch's own and buys dilution instead of bridge. Read pooled_pairable_frac for the ceiling and pooled_lambda_b for what the ratio actually got
   pooled_source: fwd      # 'fwd' | 'replay': which branch's live rows pair with bwd's in the pooled term; pooled_ratio is then bwd's share against that branch. KEEP 'fwd' HERE and set 'replay' on the stage that runs the term: it is refused wherever pooled_vg is 0, where replay cannot carry weight, or with buffers.replay_buffer.prioritise.enabled. Published as pooled/pooled_source_replay
+  pooled_center: mean     # 'mean' | 'head' | 'head_stored': what the pooled term scores each group's rows against. mean = the group's own row mean, in the graph (VarGrad); head = the detached Z(c) head; head_stored = the detached 1/2 head + 1/2 mean of the group's stored rows. The two detached centres make the term per-row TB
 bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
@@ -1087,6 +1088,7 @@ buffers:
   prior_buffer:
     source: 'anchors'       # WHERE top-ups (and rebuild_prior_by_churn) come from: noised anchor_buffer rows at anchor_buffer.noise_log_range. 'anchors' is the only crystal source (crystal_prior_model_is_retired refuses 'prior_model' and absence); prior_buffer_prior_admit_rate reads nan, since no prior-sampler draw is made. CONDITIONAL ARM: 'anchors'
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
+    static: true  # true = the prior buffer is its init seed, every prior row (max_size must hold them): no in-run noising, churn, top-up, expiry or rebuild (train.py _prior_is_static). A pre-noised prior is static either way
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
     churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover

@@ -61,7 +61,7 @@ from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOL
 from energy_sampling.row_store import FORMAT_VERSION as ROW_STORE_FORMAT
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
-    ROLLOUT_CONDITION_DRAWS
+    ROLLOUT_CONDITION_DRAWS, TB_Z_SOURCES
 from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
@@ -250,6 +250,9 @@ def _dataset_row_batches(source, limit: Optional[int] = None):
         batch = batch.subsample_new_batch(keep)
     return [batch]
 
+
+#: pooled_condition_vargrad readouts that log_metrics also publishes as means over the steps since the last log
+POOLED_RUNNING_KEYS = ('pooled_knee_frac', 'pooled_gap_signed', 'pooled_center_minus_head')
 
 #: The conversion Modeller._refuse_mirrored_rows names for a refused file. It lives in a
 #: build script, which the trainer does not import, so it is named here and not called.
@@ -2508,12 +2511,17 @@ class Modeller:
         route needs 'persistent' where the unconditional route needs 'learned',
         and as a global it was a hand-edit every mode switch silently required.
 
-        Falls back to 'learned', which is the unconditional behaviour.
+        Falls back to 'learned', which is the unconditional behaviour. Any value
+        outside TB_Z_SOURCES raises: get_gfn_*_loss tests for 'persistent' and
+        'batch_root' only, so an unknown string would train as 'learned' silently.
         """
         c = getattr(self.args, f'{group}_loss_coeffs', None)
         if c is None:
             return 'learned'
-        return getattr(c, 'tb_z_source', 'learned')
+        source = getattr(c, 'tb_z_source', 'learned')
+        if source not in TB_Z_SOURCES:
+            raise ValueError(f"{group}_loss_coeffs.tb_z_source={source!r}; must be one of {TB_Z_SOURCES}")
+        return source
 
     def mode_repeats(self, mode: str) -> int:
         """
@@ -6066,7 +6074,8 @@ class Modeller:
                 bridge_only=float(getattr(
                     self.args.fwd_loss_coeffs, 'pooled_bridge_only', 0.0) or 0.0) > 0.5,
                 thin_by_condition=float(getattr(
-                    self.args.fwd_loss_coeffs, 'pooled_thin_by_condition', 1.0)) > 0.5)
+                    self.args.fwd_loss_coeffs, 'pooled_thin_by_condition', 1.0)) > 0.5,
+                center=getattr(self.args.fwd_loss_coeffs, 'pooled_center', 'mean') or 'mean')
             # ANNOUNCED ONCE PER STATE, not once per process: at a stage entry the
             # aligned draw has no eligible condition (the replay buffer's first
             # rows land at the end of step 0), so a once-only line reads INERT
@@ -6079,7 +6088,8 @@ class Modeller:
                 lb = getattr(self.gfn_model, '_live_bwd', None)
                 why = (' (cond_draw: no eligible condition this step)'
                        if state == 'INERT' and cond_spec and cond_draw is None else '')
-                print(f"pooled VarGrad: coeff {pooled_coeff} beta "
+                print(f"pooled VarGrad: coeff {pooled_coeff} centre "
+                      f"{getattr(self.args.fwd_loss_coeffs, 'pooled_center', 'mean') or 'mean'} beta "
                       f"{getattr(self.args.fwd_loss_coeffs, 'pooled_beta', None)} ratio "
                       f"{getattr(self.args.fwd_loss_coeffs, 'pooled_ratio', None)} "
                       f"bridge_only "
@@ -6093,6 +6103,13 @@ class Modeller:
                 pooled_stats['pooled_vg'] = pooled_rows.mean().detach()
                 self._pooled_stats = {k: float(v.detach().cpu())
                                       for k, v in pooled_stats.items()}
+                # the last step's values are one draw's; these three are also kept as
+                # means over every step since the last log (log_metrics publishes *_avg)
+                acc = self.__dict__.setdefault('_pooled_running', {})
+                for key in POOLED_RUNNING_KEYS:
+                    if key in self._pooled_stats:
+                        total, n = acc.get(key, (0.0, 0))
+                        acc[key] = (total + self._pooled_stats[key], n + 1)
             # published whenever the term is ON, active or inert, so a run says
             # which branch it paired with bwd
             self._pooled_stats['pooled_source_replay'] = float(pooled_src == 'replay')
@@ -9022,6 +9039,8 @@ class Modeller:
         # a mostly-absent one.
         metrics.update({'pooled/%s' % k: v
                         for k, v in getattr(self, '_pooled_stats', {}).items()})
+        acc = self.__dict__.pop('_pooled_running', None) or {}
+        metrics.update({'pooled/%s_avg' % k: total / n for k, (total, n) in acc.items()})
         # the force model on this eval's rollout states (force_agreement_stats); empty without a force term
         metrics.update(getattr(self, '_force_stats', {}))
 
@@ -10548,17 +10567,23 @@ class Modeller:
         }
 
     def _prior_is_static(self, what: str) -> bool:
-        """True when prior_path is a pre-noised build (_load_noised_prior): its rows are the prior buffer's whole content,
-        built offline, so the in-run noising, churn, top-up and expiry of that buffer do not run (docs/design/
-        prior_dataset_build.md). `what` names the skipped call, printed once."""
-        if not getattr(self, 'prior_is_prenoised', False):
+        """True when the prior buffer's rows are its whole content, so the in-run noising, churn, top-up and expiry of
+        that buffer do not run (docs/design/prior_dataset_build.md): prior_path is a pre-noised build
+        (_load_noised_prior), or cfg:buffers.prior_buffer.static is true, which holds the prior dataset's own rows
+        (seeded whole by init_prior_buffer_seed) on a prior that is not. `what` names the skipped call, printed once."""
+        prenoised = bool(getattr(self, 'prior_is_prenoised', False))
+        if not (prenoised or self._prior_static_flag()):
             return False
         seen = self.__dict__.setdefault('_static_prior_skips', set())
         if what not in seen:
             seen.add(what)
-            print(f"pre-noised prior: {what} skipped -- the prior buffer is the file's filtered rows, built offline",
-                  flush=True)
+            why = ("pre-noised prior: the prior buffer is the file's filtered rows, built offline" if prenoised else
+                   "buffers.prior_buffer.static: the prior buffer is the prior dataset's rows")
+            print(f"{why} -- {what} skipped", flush=True)
         return True
+
+    def _prior_static_flag(self) -> bool:
+        return bool(getattr(self.args.buffers.prior_buffer, 'static', False))
 
     def manage_prior_buffer(self, sample_batch):
         if hasattr(self, 'prior_buffer') and self._prior_is_static('manage_prior_buffer (admission, churn, expiry)'):
@@ -11204,6 +11229,8 @@ class Modeller:
         its `mcmc` config block; it is in git history if the staged
         anchor_seed -> z_match route it was built for ever returns.
         """
+        if self._prior_is_static('seed_prior_from_anchors'):
+            return
         cfg = self.args.buffers.anchor_buffer
         uniq_ids, row_idx = self.anchor_buffer.best_per_condition_indices()
         if row_idx.numel() == 0:
@@ -11888,7 +11915,16 @@ class Modeller:
         """
         if hasattr(self, 'prior_buffer'):
             return  # already populated from a reloaded checkpoint -- don't clobber it
-        if getattr(self.args.buffers.prior_buffer, 'seed_source', 'generated') != 'prior_dataset':
+        seed_source = getattr(self.args.buffers.prior_buffer, 'seed_source', 'generated')
+        if self._prior_static_flag() and not getattr(self, 'prior_is_prenoised', False):
+            # nothing enters a static buffer after this seed, so it must be the whole dataset
+            n_rows = len(self.prior_dataset) if hasattr(self, 'prior_dataset') else 0
+            if seed_source != 'prior_dataset' or n_rows > self.args.buffers.prior_buffer.max_size:
+                raise ValueError(
+                    f"buffers.prior_buffer.static needs seed_source 'prior_dataset' and max_size >= the "
+                    f"prior's rows, since nothing enters the buffer after its seed; got seed_source "
+                    f"{seed_source!r}, max_size {self.args.buffers.prior_buffer.max_size}, {n_rows} rows")
+        if seed_source != 'prior_dataset':
             return
 
         for seed_batch in self._prior_dataset_seed_batches(self.args.buffers.prior_buffer.max_size):
