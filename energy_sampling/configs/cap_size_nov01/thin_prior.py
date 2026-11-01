@@ -1,8 +1,9 @@
 """cap_size_nov01: write the 2- and 4-crystal-per-molecule priors from the uncapped rc_oct22 prior with
 build_rc_prior.thin_rows (each molecule's lowest-eLJ crystal plus k - 1 others drawn by an identifier-seeded permutation,
 so the cap-2 rows are a subset of the cap-4 rows). Per-row keys are subset, every other key is carried over. Each file
-is written under a temporary name and moved into place, so a reader never sees a partial file and two jobs doing this at
-once leave one complete copy.
+is written under a temporary name and hard-linked into place only if the name is still free, so a reader never sees a
+partial file and a file once in place is never replaced: on the cluster's network filesystem, replacing a file another job
+already has open gives that reader OSError 116 (stale file handle), which killed two arms of the first launch.
 usage: python configs/cap_size_nov01/thin_prior.py SRC OUT_DIR"""
 import os
 import sys
@@ -36,7 +37,15 @@ for k, path in want.items():
     out['n_structures'] = int(sub.num_graphs)
     out['rows_per_molecule_cap'] = k
     out['subset'] = dict(source=src, rule=f'build_rc_prior.thin_rows(k={k})', rows_in=n, rows_out=int(sub.num_graphs))
+    if os.path.exists(path):
+        print(f'cap {k}: present, kept -> {path}', flush=True)
+        continue
     tmp = f'{path}.tmp{os.getpid()}'
     torch.save(out, tmp)
-    os.replace(tmp, path)
-    print(f'cap {k}: rows {n} -> {int(sub.num_graphs)} -> {path}', flush=True)
+    try:
+        os.link(tmp, path)   # fails if another job got there first; its file stays, so its readers keep their handle
+        print(f'cap {k}: rows {n} -> {int(sub.num_graphs)} -> {path}', flush=True)
+    except FileExistsError:
+        print(f'cap {k}: written by another job meanwhile, kept -> {path}', flush=True)
+    finally:
+        os.remove(tmp)

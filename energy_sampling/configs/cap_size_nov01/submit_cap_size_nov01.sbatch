@@ -31,6 +31,7 @@ mkdir -p ${LOGS}
 case "${SLURM_ARRAY_TASK_ID}" in
     0) GROUP="cap_nov01_w768_k2 cap_nov01_w768_k4 cap_nov01_w768_k10" ;;
     1) GROUP="cap_nov01_w1024_k2 cap_nov01_w1024_k4 cap_nov01_w1024_k10" ;;
+    2) GROUP="cap_nov01_w768_k2 cap_nov01_w768_k4" ;;   # relaunch: sbatch --array=2 (first launch lost both to a stale file handle)
     *) echo "FATAL: no group for array index ${SLURM_ARRAY_TASK_ID}" >&2; exit 1 ;;
 esac
 

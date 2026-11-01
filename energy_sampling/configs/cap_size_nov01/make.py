@@ -4,6 +4,8 @@ The recipe of the local run cond_oct31_big_allk2_w768 (W&B zo2jwtz4): the COMMIT
 (batch 5000 pinned, buffer_device cpu, anchors only, clip 10, LR hold 1.0, lr_flow 1e-4), T 6.9. Every arm runs ~30-37
 passes over its rows and evaluates every ~1.8 passes. Held-out molecules: rcoct22i1_qm9rc_test_conditions.pt (6,652; the
 all-family held-out file is not on the cluster). Two jobs, one A100 each, three arms per card under MPS at 0.30 each.
+The cross-condition matrix (xcond_eval) runs every 2 evals. The first launch carried tag 'dev' and xcond off; its w768 k2/k4
+arms died loading their prior (thin_prior.py) and are relaunched as array index 2 with this file's settings.
 usage: python configs/cap_size_nov01/make.py   (writes <arm>.yaml beside this file)"""
 from pathlib import Path
 
@@ -46,7 +48,7 @@ def arm_config(model, cap):
         put(cfg, k, v)
     for k, v in MODELS[model].items():
         put(cfg, f'model.nf.{k}', v)
-    cfg.update(run_name=f'cap_nov01_{model}_k{cap}', cuda_memory_fraction=0.30, checkpoints_dir=f'{ROOT}/checkpoints',
+    cfg.update(run_name=f'cap_nov01_{model}_k{cap}', tag='cap_size_nov01', cuda_memory_fraction=0.30, checkpoints_dir=f'{ROOT}/checkpoints',
                checkpoint_read_only=False, archive_period=ARCHIVE[cap], archive_buffers=False, gradient_norm_clip=10.0,
                figs_every_n_evals=0, embedding_conditioning=True, lr_flow=1.0e-4, epochs=STEPS[cap],
                eval_period=EVAL[cap], compile_policy=False, protocol='conditional_vargrad', prior_path=PRIORS[cap],
@@ -55,7 +57,7 @@ def arm_config(model, cap):
     cfg['energy_config']['temperature'] = 6.9
     cfg['harvest']['enabled'] = False
     cfg['model']['kind'] = 'nf'
-    cfg['xcond_eval']['enabled'] = False
+    cfg['xcond_eval'].update(enabled=True, every_n_evals=2)   # NF: one exact pass per cell, no energy calls
     cfg['noised_prior'].update(train_kinds=['anchor'], live_kernel=None)
     cfg['lr_control']['schedule'] = [{'kind': 'hold', 'to': 1.0, 'steps': 1000}]
     st = cfg['protocols']['conditional_vargrad']['stages'][0]
