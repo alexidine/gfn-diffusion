@@ -734,7 +734,7 @@ protocols:
           update_log_z: true
           buffers_active: true
           z_calibration: false          # the unconditional route's Z sidecar. Omitted on conditional_vargrad, which is what every completed conditional battery did
-        on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z:rollout:4000' ]
+        on_enter: [ 'rebuild_prior_by_churn:62500', 'bootstrap_z:rollout:4000' ]
         # FIXED: no balance block, so the split holds at these values (owner 2026-10-30;
         # the gated_ramp controller that walked it from bwd 0.9 / replay 0.1 is removed)
         fracs: { fwd: 0.0, bwd: 0.5, replay: 0.5 }
@@ -919,7 +919,7 @@ protocols:
         # (condition_log_z.z_feed forward; no extra rollouts or energy calls).
         # The head is the Z a condition below min_visits reads (untrusted_z:
         # head); emp_z on the Z sidecar trains it from the first rollout on.
-        on_enter: [ 'rebuild_prior_by_churn', 'set_lr_flow:1.0e-4', 'freeze_pb', 'bootstrap_z' ]
+        on_enter: [ 'set_lr_flow:1.0e-4', 'freeze_pb', 'bootstrap_z' ]
         # fwd HAS NO FRAC: its loss enters only as the Z sidecar below, outside
         # the frac mix. min_fracs.fwd 0 holds it at exactly 0 (the
         # controller.min_mode_frac fallback would lift it to 0.001 on the first
@@ -1091,8 +1091,8 @@ buffers:
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
     churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover
     min_size: 10000
-    max_size: 250000  # todo this needs to be re-tuned for our new 'single large dataset' approach, rather than churned & dynamically noised buffer. New samples added primarily by forward rollouts? Or maybe record-breaking forward samples go to anchors, though we would want them in here too eventually, and they would have to go in directly since we're not dynamically noising anymore
-    init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
+    max_size: 8000000  # rows. Seeding takes min(prior rows, max_size); churn admits up to it. Holds the 6,675,860-row uncapped rc_oct22 prior. todo New samples added primarily by forward rollouts? Or maybe record-breaking forward samples go to anchors, though we would want them in here too eventually, and they would have to go in directly since we're not dynamically noising anymore
+    init_fraction: 0.25  # refill target of a bare rebuild_prior_by_churn (no :N), as a fraction of max_size, admitted through the online gate. Not read here: equilibration's on_enter names N
     expire_max_frac: 0.1  # per manage call, max fraction of the buffer purged for no longer clearing energy < Emin(c) + ramp_floor. 0 = channel off
     anchor_floor_frac: 0.1  # per churn cycle, minimum share of each condition's intake drawn from anchor_buffer. 0 = pooled shortfall backfill only
     reward_min: 0 # bootstrap-only fallback admission floor (absolute), used until a tracker/anchor_buffer exists to admit relative to each condition's best energy
