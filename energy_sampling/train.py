@@ -3534,7 +3534,7 @@ class Modeller:
     @torch.no_grad()
     def fit_policy_data_scalers(self, chunk: int = 65536):
         """A policy fitted to data before training (models/nf_policy.py::NFPolicy.fit_data_scalers: the flow's
-        standardisers) gets the prior's latents and, in vector conditioning, the conditions files' condition vectors;
+        standardisers) gets the prior's latents and, on a conditional route, the conditions files' condition vectors;
         Skipped for a policy without the hook (the SDE policy) and for one restored already fitted from a
         checkpoint."""
         fit = getattr(self.gfn_model, 'fit_data_scalers', None)
@@ -3547,7 +3547,7 @@ class Modeller:
             lat.append(self._batch_latents(sub).float().cpu())
         lat = torch.cat(lat)
         conds = None
-        if self.gfn_model.conditional and self.gfn_model.conditions_type == 'vector':
+        if self.gfn_model.conditional:   # molecule mode standardises the columns that pass through beside the molecule
             mb = self.mol_dataset.batch
             cs = []
             for i in range(0, mb.num_graphs, chunk):

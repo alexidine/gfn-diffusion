@@ -34,7 +34,10 @@ NF_DEFAULTS = dict(
     hidden=512, hidden_layers=2,    # the MADE conditioner's width and depth
     tf_width=256, tf_layers=4, tf_heads=8, tf_norm='layer', tf_fp32=False,
     context_dim=128, context_hidden=512,
-    atom_tokens=False, atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
+    atom_tokens=False,              # False; True (AtomEncoder: xyz in the node input, cross-attended tokens); 'split'
+                                    # (SplitAtomEncoder: invariant trunk s for the level head, point head p, tokens
+                                    # cross-attended); 'split_pooled' (the same, pooled s and p only, no cross-attention)
+    atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
     min_bin_height='auto', min_bin_height_rows='all',
     tied_derivatives=None, tied_factor=None,
     bounded_rows='auto',            # 'auto', 'none'/None, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
@@ -42,6 +45,7 @@ NF_DEFAULTS = dict(
     fold_half_rows=None,            # rows '7,8' whose distribution repeats every half period
     mix_k=0,                        # > 0: a mixture-of-logistics block of k components (unconditional)
 )
+ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
 # as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0)
 Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
@@ -150,6 +154,8 @@ class NFPolicy(nn.Module):
         del probe
         s = resolve_flow_settings(s, self.conditional, self.live_idx.tolist())
         self.settings = s
+        if s['atom_tokens'] not in ATOM_TOKEN_MODES:
+            raise ValueError(f"flow atom_tokens {s['atom_tokens']!r}: one of {ATOM_TOKEN_MODES}")
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
 
@@ -172,10 +178,13 @@ class NFPolicy(nn.Module):
                 raise NotImplementedError("flow block_orders, fold_half_rows and mix_k are built for "
                                           "unconditional policies only (as inn_modeller.py)")
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
-                          radial=s['atom_radial']) if s['atom_tokens'] else None)
+                          radial=s['atom_radial'],
+                          encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
+                          cross=s['atom_tokens'] != 'split_pooled') if s['atom_tokens'] else None)
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
-            cond_dim = 1 if atoms is not None else self.conditions_dim
+            # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
+            cond_dim = 1 + self.conditions_dim if atoms is not None else self.conditions_dim
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
                                                  transformer=transformer, atoms=atoms, bounded_rows=bounded)
@@ -231,18 +240,23 @@ class NFPolicy(nn.Module):
 
     @torch.no_grad()
     def fit_data_scalers(self, latents, conditions=None):
-        """Standardise the flow's linear rows on the training latents [N, dim] and, in vector mode, its condition
-        input on the training condition vectors [M, conditions_dim]."""
+        """Standardise the flow's linear rows on the training latents [N, dim] and its condition input on the
+        training condition vectors [M, conditions_dim]: the whole vector in vector mode, the columns beside the
+        molecule in molecule mode."""
         self.sampler.flow.set_scaler(latents.to(self.device, torch.float32)[:, self.live_idx])
-        if self.conditional and not self.settings['atom_tokens'] and conditions is not None:
-            self.sampler.flow.set_condition_scaler(conditions.to(self.device, torch.float32))
+        if self.conditional and conditions is not None and conditions.shape[-1] > 0:
+            c = conditions.to(self.device, torch.float32)
+            if self.settings['atom_tokens']:   # column 0 is the row id, never standardised (_context)
+                c = torch.cat([torch.zeros_like(c[:, :1]), c], -1)
+            self.sampler.flow.set_condition_scaler(c)
         self.scalers_fitted.fill_(True)
 
     # -- the condition -------------------------------------------------------------------------------------------
 
     def _context(self, condition, mol_batch, n):
         """The flow's condition input for n rows: the condition vector (vector mode), or row indices into an atom
-        table set from mol_batch's molecules (molecule mode, one graph per row)."""
+        table set from mol_batch's molecules (molecule mode, one graph per row) followed by the condition vector's
+        columns, standardised (temperature, space group, Z': the encoder reads the molecule, these pass through)."""
         if not self.conditional:
             return None
         if not self.settings['atom_tokens']:
@@ -259,7 +273,15 @@ class NFPolicy(nn.Module):
         z[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
         pos[nodes, idx] = mol_batch.pos.float().to(self.device)
         self.sampler.flow.set_atom_table(z, pos, counts)
-        return torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
+        ids = torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
+        if self.conditions_dim == 0:
+            return ids
+        if condition is None or condition.shape[-1] != self.conditions_dim:
+            raise ValueError(f"molecule mode with {self.conditions_dim} condition columns (temperature, space group, "
+                             f"Z') needs them passed: got {None if condition is None else tuple(condition.shape)}")
+        f = self.sampler.flow   # standardised here, not in the flow, which inn_modeller also drives raw
+        rest = (condition.to(self.device, torch.float32) - f.c_mu[1:]) / f.c_sd[1:]
+        return torch.cat([ids, rest], -1)
 
     def get_condition_embedding(self, condition, mol_batch):
         """The level head's input features for these conditions (what flow_model reads)."""

@@ -397,6 +397,54 @@ class AtomEncoder(nn.Module):
         return tokens, mask, pooled
 
 
+class SplitAtomEncoder(nn.Module):
+    """A molecule as an invariant trunk and a point head (docs/design/conditional_ar_architecture.md).
+
+    The trunk is mxtaltools' ScalarGNN on atomic numbers alone: geometry enters only through interatomic distances
+    (radial basis on a radius graph), so its node features h_i and their attention pool s do not change when the
+    molecule is rotated or reflected. The point head reads h_i together with the atom's coordinates in the standard
+    frame (the frame the orientation rows rotate from) and gives per-atom point tokens and their pool p. Information
+    runs from the trunk into the point head and never back: s is a function of distances and elements only."""
+
+    def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64):
+        super().__init__()
+        from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
+        self.cutoff, self.max_neighbors = float(cutoff), int(max_neighbors)
+        self.gnn = ScalarGNN(input_node_dim=1, node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2,
+                             embedding_dim=node_dim, num_convs=convs, num_radial=radial, cutoff=cutoff,
+                             max_num_neighbors=max_neighbors, atom_type_embedding_dim=16, norm='layer')
+        self.s_q = nn.Parameter(torch.zeros(node_dim))
+        self.s_out = nn.Linear(node_dim, pooled_dim)
+        self.pos_emb = nn.Sequential(nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64))
+        self.point = nn.Sequential(nn.Linear(node_dim + 64, node_dim), nn.SiLU(), nn.Linear(node_dim, node_dim))
+        self.tok = nn.Linear(node_dim, width)
+        self.p_q = nn.Parameter(torch.zeros(node_dim))
+        self.p_out = nn.Linear(node_dim, pooled_dim)
+
+    @staticmethod
+    def _pool(feat, q, mask):
+        score = (feat * q).sum(-1).masked_fill(~mask, float('-inf'))
+        return (torch.softmax(score, -1)[..., None] * feat).sum(1)
+
+    def forward(self, z, pos, n):
+        """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> point tokens
+        [u, a, width], mask [u, a], s [u, pooled_dim] (invariant), p [u, pooled_dim] (frame-dependent)."""
+        from mxtaltools.models.functions.radial_graph import build_radial_graph
+        u, a = z.shape
+        mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
+        batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
+        zf, pf = z[mask], pos[mask]
+        ptr = F.pad(torch.cumsum(n, 0), (1, 0))
+        edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
+        h = self.gnn(zf.to(pf.dtype)[:, None], pf, batch, edges)                    # [nodes, node_dim], invariant
+        node = h.new_zeros(u, a, h.shape[-1])
+        node[mask] = h
+        s = self.s_out(self._pool(node, self.s_q, mask))
+        pt = self.point(torch.cat([node, self.pos_emb(pos)], -1))                    # [u, a, node_dim]
+        p = self.p_out(self._pool(pt, self.p_q, mask))
+        return self.tok(pt), mask, s, p
+
+
 class _ResMLP(nn.Module):
     """Linear in, residual blocks (LayerNorm, Linear, SiLU, Linear), then LayerNorm and linear out."""
 
@@ -431,6 +479,14 @@ class _ContextFlow(nn.Module):
         # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through.
         # frames: columns 1-4 of c are a unit quaternion, the frame the row's molecule is presented in (its atoms are
         # rotated by it before encoding)
+        # atoms['encoder']: 'xyz' (AtomEncoder: coordinates in the node input; one pooled vector feeds the context and
+        # the level head) or 'split' (SplitAtomEncoder: the level head reads the invariant pool s, the context reads
+        # s and the point pool p). atoms['cross']: the blocks cross-attend to the atom tokens (False: pooled only)
+        atoms = None if atoms is None else dict(atoms)
+        self.encoder = atoms.pop('encoder', 'xyz') if atoms is not None else None
+        self.cross = bool(atoms.pop('cross', True)) if atoms is not None else False
+        if self.encoder not in (None, 'xyz', 'split'):
+            raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
         self.atoms = atoms is not None
         self.frames = bool(frames)
         if self.frames and not self.atoms:
@@ -457,17 +513,21 @@ class _ContextFlow(nn.Module):
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
-                                                        context_dim=context_dim, cross=self.atoms)
+                                                        context_dim=context_dim, cross=self.atoms and self.cross)
         elif self.atoms:
             raise NotImplementedError("atom tokens need --conditioner transformer (the MADE has no cross-attention)")
-        n_in = cond_dim
+        n_in = n_ctx = cond_dim
         if self.atoms:
-            self.atom_encoder = AtomEncoder(transformer[0], **atoms)
-            # pooled molecule + the columns after the id (and after the frame)
-            n_in = self.atom_encoder.pool_out.out_features + cond_dim - 1 - 4 * int(self.frames)
+            width = transformer[0]
+            self.atom_encoder = (SplitAtomEncoder(width, **atoms) if self.encoder == 'split'
+                                 else AtomEncoder(width, **atoms))
+            pooled = (self.atom_encoder.s_out if self.encoder == 'split' else self.atom_encoder.pool_out).out_features
+            # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
+            n_in = pooled + cond_dim - 1 - 4 * int(self.frames)
+            n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
             for name in ('atom_z', 'atom_pos', 'atom_n'):
                 self.register_buffer(name, None, persistent=False)
-        self.context = _ResMLP(n_in, context_hidden, context_dim)
+        self.context = _ResMLP(n_ctx, context_hidden, context_dim)
         self.level = _ResMLP(n_in, 256, 1)
         nn.init.zeros_(self.level.out[-1].weight)
         nn.init.zeros_(self.level.out[-1].bias)
@@ -504,14 +564,21 @@ class _ContextFlow(nn.Module):
             uniq, inv = torch.unique(c[:, :5], dim=0, return_inverse=True)
             mol = uniq[:, 0].round().long()
             pos = self.atom_pos[mol].to(dtype) @ quat_to_rotmat(uniq[:, 1:5].to(dtype)).transpose(1, 2)
-            rest = c[:, 5:]
+            first = 5
         else:
             mol, inv = torch.unique(cid, return_inverse=True)
             pos = self.atom_pos[mol].to(dtype)
-            rest = c[:, 1:]
-        tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
-        s = torch.cat([pooled[inv], rest.to(dtype)], -1)
-        return (self.context(s), tokens[inv], mask[inv]), s
+            first = 1
+        rest = c[:, first:].to(dtype)   # the condition columns after the id (temperature, space group, Z'), as given
+        if self.encoder == 'split':
+            tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
+            s = torch.cat([s_inv[inv], rest], -1)
+            vec = self.context(torch.cat([s_inv[inv], p[inv], rest], -1))
+        else:
+            tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
+            s = torch.cat([pooled[inv], rest], -1)
+            vec = self.context(s)
+        return ((vec, tokens[inv], mask[inv]) if self.cross else vec), s
 
     def set_scaler(self, x):
         """Standardise the LINEAR dims only; wrapped dims must stay on the circle, and bounded dims on their

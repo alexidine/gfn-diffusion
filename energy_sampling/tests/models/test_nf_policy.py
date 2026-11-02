@@ -172,13 +172,16 @@ def test_molecule_mode_reads_atom_tokens_from_the_batch():
     ptr = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
     mb = SimpleNamespace(z=torch.randint(1, 9, (12,)), pos=torch.randn(12, 3),
                          batch=torch.repeat_interleave(torch.arange(3), counts), ptr=ptr, num_graphs=3)
-    states, log_pfs, log_pbs, log_flow = pol.get_traj_fwd(torch.zeros(3, 12), None, 0, None, mb)
+    cond = torch.randn(3, 4)   # the condition vector's columns ride beside the molecule
+    states, log_pfs, log_pbs, log_flow = pol.get_traj_fwd(torch.zeros(3, 12), None, 0, cond, mb)
     assert states.shape == (3, 2, 12) and bool((log_pbs == 0).all())
-    _, lpf_b, _, _ = pol.get_traj_bwd(states[:, 1], None, None, mb)
+    _, lpf_b, _, _ = pol.get_traj_bwd(states[:, 1], None, cond, mb)
     assert torch.allclose(log_pfs, lpf_b, atol=1e-5)
-    assert pol.flow_model(pol.get_condition_embedding(None, mb)).shape == (3,)
+    assert pol.flow_model(pol.get_condition_embedding(cond, mb)).shape == (3,)
     with pytest.raises(ValueError, match='one graph per row'):
-        pol.get_traj_bwd(torch.zeros(4, 12), None, None, mb)
+        pol.get_traj_bwd(torch.zeros(4, 12), None, torch.randn(4, 4), mb)
+    with pytest.raises(ValueError, match='needs them passed'):
+        pol.get_traj_bwd(states[:, 1], None, None, mb)
 
 
 # -- the trainer's selection -----------------------------------------------------------------------------------------
