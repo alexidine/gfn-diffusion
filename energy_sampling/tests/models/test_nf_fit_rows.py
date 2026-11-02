@@ -71,3 +71,22 @@ def test_a_free_context_moves_log_q_and_carries_a_gradient():
     nll = -rows_given_ctx(pol.sampler, x, vec).sum()
     nll.backward()
     assert vec.grad is not None and float(vec.grad.abs().sum()) > 0
+
+
+@pytest.mark.parametrize('shape', [0.2, 0.5, 0.9])
+def test_pareto_khat_recovers_the_tail_shape_of_known_weights(shape):
+    """PSIS's k-hat on weights whose upper tail is generalised Pareto of a known shape (log w = log of the GPD draw):
+    the fitted shape must come back within 0.15 at 20,000 draws."""
+    import numpy as np
+    from eval.nf_fit import pareto_khat
+    u = np.random.default_rng(0).random(20000)
+    w = ((1 - u) ** (-shape) - 1) / shape
+    assert abs(pareto_khat(np.log(w)) - shape) < 0.15
+
+
+def test_condition_is_on_an_exact_proposal_has_no_divergence():
+    """q = pi up to the constant: every log w equals log Z, so both KLs are 0 and the ESS is full."""
+    from eval.nf_fit import condition_is
+    r = condition_is(torch.full((1000,), 3.0) + 1e-9 * torch.randn(1000))
+    assert abs(r['log_z'] - 3.0) < 1e-6 and abs(r['kl_q_pi']) < 1e-6 and abs(r['kl_pi_q']) < 1e-6
+    assert r['ess_frac'] > 0.999

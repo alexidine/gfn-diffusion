@@ -73,9 +73,26 @@ class Run:
     step: int
 
 
-def load(config, checkpoint, baseline=None, device='cpu'):
+def _load_legacy_dropped(m, path):
+    """An atom-token archive written before the condition columns rode beside the molecule (models/nf_policy.py
+    before 9c2f59d8): it was built and trained with every condition column dropped, so it is rebuilt with
+    conditions_dim 0, which is the function it trained as. The problem match is asserted as load_weights_only does."""
+    ck = torch.load(path, map_location=m.device, weights_only=False)
+    m.checkpointer.assert_problem_match(ck, path, 'checkpoint_name')
+    cfg = dict(m.checkpointer._gfn_config_from(ck), conditions_dim=0, device=m.device)
+    if cfg.get('conditions_type') != 'molecule':
+        raise ValueError(f"{path}: --legacy-dropped-columns is for molecule-mode (atom-token) archives only")
+    pol = m.checkpointer._build_gfn(cfg).to(m.device)
+    m.checkpointer._load_state(pol, ck['model_train'], f'{path} (model_train)')
+    print(f"LEGACY LOAD {path}: rebuilt with conditions_dim 0 (its condition columns were dropped in training)",
+          flush=True)
+    return pol
+
+
+def load(config, checkpoint, baseline=None, device='cpu', legacy_dropped=False):
     """The run's data through the trainer's own chain, then the archive's policy (and the baseline's) by
-    Checkpointer.load_weights_only, which asserts the archive solves this config's problem."""
+    Checkpointer.load_weights_only, which asserts the archive solves this config's problem (legacy_dropped:
+    _load_legacy_dropped)."""
     import train
     from utils import get_train_args
     args = get_train_args(['--config', config])
@@ -91,12 +108,14 @@ def load(config, checkpoint, baseline=None, device='cpu'):
     if getattr(ef, 'energy_reference_mode', None) is not None:
         # the table training scored against, installed, never recomputed (as eval/cond_panel/sampler.py::load_run)
         ef.set_energy_reference(ck['energy_reference']['table'])
-    base = None
-    if baseline is not None:
-        m.checkpointer.load_weights_only(baseline)
-        base = m.gfn_model.eval()
-    m.checkpointer.load_weights_only(checkpoint)
-    policy = m.gfn_model.eval()
+    def policy_of(path):
+        if legacy_dropped:
+            return _load_legacy_dropped(m, path).eval()
+        m.checkpointer.load_weights_only(path)
+        return m.gfn_model.eval()
+
+    base = policy_of(baseline) if baseline is not None else None
+    policy = policy_of(checkpoint)
     if not hasattr(policy, 'sampler') or not policy.conditional:
         raise ValueError(f"{checkpoint}: not a conditional flow policy (model.kind nf on a conditional route)")
     return Run(m=m, policy=policy, baseline=base, step=int(ck['modeller_state']['step_ind']))
@@ -507,49 +526,112 @@ def probe_amortise(run, sets, scored, steps=200, lr=1e-2, min_rows=4):
     return res
 
 
+def gpd_fit(x):
+    """(shape k, scale sigma) of a generalised Pareto distribution fitted to exceedances x > 0 by Zhang and Stephens'
+    empirical Bayes estimate (Technometrics 51, 2009), with the weak prior on k that PSIS uses (k shrunk toward 0.5
+    with weight 10; Vehtari et al., JMLR 2024)."""
+    x = np.sort(np.asarray(x, dtype=float))
+    n = x.size
+    m = 30 + int(math.sqrt(n))
+    b = 1.0 - np.sqrt(m / (np.arange(1, m + 1) - 0.5))
+    b = b / (3.0 * x[int(n / 4 + 0.5) - 1]) + 1.0 / x[-1]
+    k = np.log1p(-b[:, None] * x).mean(axis=1)
+    ll = n * (np.log(-b / k) - k - 1.0)
+    w = 1.0 / np.exp(ll - ll[:, None]).sum(axis=1)
+    keep = w >= 10 * np.finfo(float).eps
+    w, b = w[keep] / w[keep].sum(), b[keep]
+    bp = float((b * w).sum())
+    kp = float(np.log1p(-bp * x).mean())
+    return (n * kp + 10 * 0.5) / (n + 10), -kp / bp
+
+
+def pareto_khat(log_w):
+    """PSIS's Pareto k-hat of importance weights exp(log_w): the GPD shape fitted to the largest
+    M = min(n / 5, 3 sqrt n) weights, as exceedances over the next one. Above 0.7 the importance-sampling estimate is
+    unreliable at this n; above 1 the fitted tail has no finite mean (Vehtari et al., JMLR 2024)."""
+    lw = np.sort(np.asarray(log_w, dtype=float))
+    n = lw.size
+    m = int(min(0.2 * n, 3 * math.sqrt(n)))
+    if m < 5:
+        return float('nan')
+    w = np.exp(lw - lw[-1])
+    x = w[-m:] - w[-m - 1]
+    x = x[x > 0]
+    return float(gpd_fit(x)[0]) if x.size >= 5 else float('nan')
+
+
+def condition_is(log_w):
+    """Importance-sampling readings of one condition's draws x ~ q, log w = log R(x) - log q(x), over the finite ones:
+      log_z     log Zhat = logmeanexp(log w)
+      kl_q_pi   KL(q || pi) = log Z - E_q[log w], read with log Zhat: the gap a reverse-KL (Jensen) level carries
+      kl_pi_q   KL(pi || q) = E_pi[log w] - log Z, read by self-normalised IS: roughly the log of the number of draws
+                per-condition IS needs; a lower estimate where k-hat is high (mass q never reached is not in the sum)
+      ess_frac  the Kish effective sample size (sum w)^2 / sum w^2, over n
+      khat      pareto_khat"""
+    lw = torch.as_tensor(log_w, dtype=torch.float64)
+    lw = lw[torch.isfinite(lw)]
+    n = lw.numel()
+    lse = torch.logsumexp(lw, 0)
+    log_z = float(lse - math.log(n))
+    p = torch.softmax(lw, 0)
+    return dict(n=n, log_z=log_z, kl_q_pi=log_z - float(lw.mean()), kl_pi_q=float((p * lw).sum()) - log_z,
+                ess_frac=float(torch.exp(2 * lse - torch.logsumexp(2 * lw, 0))) / n,
+                var_logw=float(lw.var()), khat=pareto_khat(lw.numpy()))
+
+
 @torch.no_grad()
-def probe_phase2(run, sets, n_mols, k, rng):
-    """K draws per condition, through the trainer's eval sampling function and reward (eval/utils.py::
-    sample_eval_fwd_trajs): per condition Var(log w), the effective sample fraction (sum w)^2 / (K sum w^2) and the
-    importance-sampling log Z(c) = logmeanexp(log w), log w = log R - log q (log P_B = 0)."""
+def probe_phase2(run, n_mols, k, rng, chunk=1024):
+    """K draws per condition from q, through the trainer's eval sampling function and reward (eval/utils.py::
+    sample_eval_fwd_trajs): training molecules from molecules_path, held-out ones from test_molecules_path, each at
+    the run's first space group. Per condition the condition_is readings, and the level head's log Z(c) beside them;
+    no reading uses the head."""
     from energy_sampling.eval.utils import sample_eval_fwd_trajs
-    from utils import get_gfn_init_state, logmeanexp, uniform_discretizer
+    from utils import get_gfn_init_state, uniform_discretizer
     m, ef, policy = run.m, run.m.energy_function, run.policy
     T = float(m.args.energy_config.temperature)
-    mb = m.mol_dataset.batch
-    tb = m.test_mol_dataset.batch if m.test_mol_dataset is not None else None
-    res = {'draws_per_condition': k, 'sets': {}}
-    for name, cfile in (('train_minima', mb), ('heldout_mols', tb)):
-        if name not in sets or cfile is None:
+    sg = int(m.args.space_groups[0])
+    dev = policy.device
+    res = {'draws_per_condition': k, 'space_group': sg, 'sets': {}}
+    files = {'train_molecules': m.mol_dataset.batch,
+             'heldout_molecules': m.test_mol_dataset.batch if m.test_mol_dataset is not None else None}
+    for name, cfile in files.items():
+        if cfile is None:
             continue
-        b = sets[name]
-        sg_of = dict(zip(b.identifier, b.sg_ind.reshape(-1).tolist()))
-        row_of = {ident: i for i, ident in enumerate(cfile.identifier)}
-        mols = [i for i in sorted(sg_of) if i in row_of]
-        mols = rng.choice(mols, size=min(n_mols, len(mols)), replace=False).tolist()
+        n = int(cfile.num_graphs)
+        picks = sorted(rng.choice(n, size=min(n_mols, n), replace=False).tolist())
         per = []
-        for ident in mols:
-            rows = cfile.subsample_new_batch(torch.full((k,), row_of[ident], dtype=torch.long, device=cfile.ptr.device))
-            rows = rows.to(policy.device)
-            rows.orient_molecule(mode='standard')
-            out = sample_eval_fwd_trajs(get_gfn_init_state(k, ef.data_ndim, policy.device),
-                                        policy, lambda bsz: uniform_discretizer(bsz, 1), ef, rows,
-                                        sg_inds=torch.full((k,), int(sg_of[ident]), dtype=torch.long),
-                                        z_primes=torch.ones(k, dtype=torch.long),
-                                        temperatures=T * torch.ones(k, device=policy.device))
-            lw = (out['log_r'].flatten() + out['log_pb'] - out['log_pf']).double()
-            fin = torch.isfinite(lw)
-            lwf = lw[fin]
-            w = torch.softmax(lwf, 0)
-            per.append(dict(identifier=ident, finite=int(fin.sum()), var_logw=float(lwf.var()),
-                            ess_frac=float(1.0 / (w.pow(2).sum() * lwf.numel())),
-                            is_log_z=float(logmeanexp(lwf)), head_log_z=float(out['log_flow'][:, 0].mean())))
-        v = np.array([p['var_logw'] for p in per])
-        e = np.array([p['ess_frac'] for p in per])
-        d = np.array([p['is_log_z'] - p['head_log_z'] for p in per])
-        res['sets'][name] = dict(conditions=len(per), var_logw_median=float(np.median(v)),
-                                 ess_frac_median=float(np.median(e)),
-                                 is_minus_head_spread=float(np.std(d - d.mean())), per_condition=per)
+        for i in picks:
+            lw, head = [], []
+            for lo in range(0, k, chunk):
+                b = min(chunk, k - lo)
+                rows = cfile.subsample_new_batch(torch.full((b,), i, dtype=torch.long, device=cfile.ptr.device))
+                rows = rows.to(dev)
+                rows.orient_molecule(mode='standard')
+                out = sample_eval_fwd_trajs(get_gfn_init_state(b, ef.data_ndim, dev), policy,
+                                            lambda bsz: uniform_discretizer(bsz, 1), ef, rows,
+                                            sg_inds=torch.full((b,), sg, dtype=torch.long, device=dev),
+                                            z_primes=torch.ones(b, dtype=torch.long, device=dev),
+                                            temperatures=T * torch.ones(b, device=dev))
+                lw.append((out['log_r'].flatten() + out['log_pb'] - out['log_pf']).double())
+                head.append(out['log_flow'][:, 0].double())
+            lw = torch.cat(lw)
+            r = condition_is(lw)
+            # the same readings on the first K/64, K/8 and K draws: a self-normalised KL(pi || q) can be at most
+            # log K, so an estimate that tracks log K up the ladder says the true value lies above it
+            r['ladder'] = {int(n): {key: condition_is(lw[:n])[key] for key in ('log_z', 'kl_pi_q', 'khat', 'ess_frac')}
+                           for n in sorted({max(k // 64, 64), max(k // 8, 64), k}) if n <= k}
+            r.update(identifier=cfile.identifier[i], head_log_z=float(torch.cat(head).mean()))
+            per.append(r)
+            print(f"phase2 {name} {r['identifier']}: log Zhat {r['log_z']:.2f}, KL(q||pi) {r['kl_q_pi']:.2f}, "
+                  f"KL(pi||q) {r['kl_pi_q']:.2f}, ESS frac {r['ess_frac']:.4f}, k-hat {r['khat']:.2f}", flush=True)
+        col = lambda key: np.array([p[key] for p in per], dtype=float)
+        d = col('log_z') - col('head_log_z')
+        res['sets'][name] = dict(
+            conditions=len(per), kl_q_pi_median=float(np.median(col('kl_q_pi'))),
+            kl_pi_q_median=float(np.median(col('kl_pi_q'))), kl_pi_q_p90=float(np.percentile(col('kl_pi_q'), 90)),
+            ess_frac_median=float(np.median(col('ess_frac'))), khat_median=float(np.nanmedian(col('khat'))),
+            khat_above_07=float(np.mean(col('khat') > 0.7)), var_logw_median=float(np.median(col('var_logw'))),
+            is_minus_head_spread=float(np.std(d - d.mean())), per_condition=per)
     return res
 
 
@@ -670,14 +752,31 @@ def report(res):
                          f"{s['gap_median']:.2f} | {s['gap_insample_mean']:.2f} | {s['context_shift_median']:.2f}")
     p = res.get('phase2')
     if p:
-        lines.append(f"\nPhase-2 probes, level-free ({p['draws_per_condition']} draws per condition, one energy call "
-                     f"each; log w = log R - log q): median over conditions of Var(log w) (nats^2) and of the effective "
-                     f"sample fraction; spread (SD over conditions, centred) of IS log Z(c) minus the level head.")
-        lines.append('row set | conditions | Var(log w), median (nats^2) | ESS fraction, median | '
+        lines.append(f"\nPhase-2 importance sampling, level-free ({p['draws_per_condition']} draws from q per condition,"
+                     f" SG {p['space_group']}, one energy call each; log w = log R - log q). Per condition: KL(q||pi) "
+                     f"= log Zhat - mean log w (the gap a reverse-KL level carries); KL(pi||q) by self-normalised IS "
+                     f"(roughly the log of the draws per-condition IS needs; a lower estimate where k-hat is high); "
+                     f"the Kish ESS fraction; PSIS Pareto k-hat (above 0.7 the IS estimate is unreliable at this "
+                     f"draw count). Medians over conditions unless named.")
+        lines.append('molecules | conditions | KL(q||pi), median (nats) | KL(pi||q), median (nats) | '
+                     'KL(pi||q), P90 (nats) | ESS fraction, median | k-hat, median | share with k-hat > 0.7 | '
                      'IS log Z - head, SD over conditions (nats)')
         for name, s in p['sets'].items():
-            lines.append(f"{name} | {s['conditions']} | {s['var_logw_median']:.2f} | {s['ess_frac_median']:.4f} | "
-                         f"{s['is_minus_head_spread']:.2f}")
+            lines.append(f"{name} | {s['conditions']} | {s['kl_q_pi_median']:.2f} | {s['kl_pi_q_median']:.2f} | "
+                         f"{s['kl_pi_q_p90']:.2f} | {s['ess_frac_median']:.4f} | {s['khat_median']:.2f} | "
+                         f"{s['khat_above_07']:.2f} | {s['is_minus_head_spread']:.2f}")
+        sizes = sorted({n for s in p['sets'].values() for c in s['per_condition'] for n in c['ladder']})
+        lines.append(f"\nDraw-count ladder: the median over conditions of the self-normalised KL(pi||q) and of k-hat on "
+                     f"the first K draws of each condition, beside log K, the most a self-normalised KL(pi||q) can "
+                     f"read. An estimate that rises with log K has not converged: the true KL(pi||q) lies above it.")
+        lines.append('molecules | ' + ' | '.join(f'K {n}: KL(pi||q) (nats), log K, k-hat' for n in sizes))
+        for name, s in p['sets'].items():
+            cells = []
+            for n in sizes:
+                kl = [c['ladder'][n]['kl_pi_q'] for c in s['per_condition'] if n in c['ladder']]
+                kh = [c['ladder'][n]['khat'] for c in s['per_condition'] if n in c['ladder']]
+                cells.append(f"{np.median(kl):.2f}, {math.log(n):.2f}, {np.nanmedian(kh):.2f}")
+            lines.append(f"{name} | " + ' | '.join(cells))
     p = res.get('c2st')
     if p:
         lines.append(f"\nTwo-sample classifier, training against held-out molecules ({p['molecules_per_side']} per side,"
@@ -708,6 +807,8 @@ def main(argv=None):
     ap.add_argument('--c2st-mols', type=int, default=1000)
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=20261102)
+    ap.add_argument('--legacy-dropped-columns', action='store_true',
+                    help='an atom-token archive trained before its condition columns reached the flow (9c2f59d8)')
     a = ap.parse_args(argv)
     probes = [p for p in a.probes.split(',') if p]
     bad = set(probes) - set(PROBES)
@@ -716,16 +817,18 @@ def main(argv=None):
     if a.device == 'cpu':
         assert not torch.cuda.is_available(), 'CPU run with a visible GPU: set CUDA_VISIBLE_DEVICES=-1'
     os.makedirs(a.out, exist_ok=True)
-    run = load(a.config, a.checkpoint, a.baseline, a.device)
+    run = load(a.config, a.checkpoint, a.baseline, a.device, legacy_dropped=a.legacy_dropped_columns)
     cache = os.path.join(a.out, f'sets_{a.seed}_{a.mols}x{a.rows_per_mol}.pt')
-    if os.path.exists(cache):
-        sets = torch.load(cache, map_location='cpu', weights_only=False)
-        print(f'row sets from {cache}', flush=True)
-    else:
-        sets = build_sets(run, a.heldout_rows, a.mols, a.rows_per_mol, a.seed)
-        torch.save(sets, cache)
+    sets, scored = {}, {}
+    if set(probes) - {'phase2', 'c2st'}:   # those two draw their molecules from the conditions files
+        if os.path.exists(cache):
+            sets = torch.load(cache, map_location='cpu', weights_only=False)
+            print(f'row sets from {cache}', flush=True)
+        else:
+            sets = build_sets(run, a.heldout_rows, a.mols, a.rows_per_mol, a.seed)
+            torch.save(sets, cache)
+        scored = {name: score(run, b) for name, b in sets.items()}
     rng = np.random.default_rng(a.seed)
-    scored = {name: score(run, b) for name, b in sets.items()}
     res = {'checkpoint': os.path.abspath(a.checkpoint), 'baseline': a.baseline, 'config': os.path.abspath(a.config),
            'step': run.step, 'sets_file': cache}
     if 'nll' in probes:
@@ -737,7 +840,7 @@ def main(argv=None):
     if 'amortise' in probes:
         res['amortise'] = probe_amortise(run, sets, scored, steps=a.amortise_steps)
     if 'phase2' in probes:
-        res['phase2'] = probe_phase2(run, sets, a.phase2_mols, a.phase2_draws, rng)
+        res['phase2'] = probe_phase2(run, a.phase2_mols, a.phase2_draws, rng)
     if 'c2st' in probes:
         res['c2st'] = probe_c2st(run, a.c2st_mols, rng)
     stem = os.path.splitext(os.path.basename(a.checkpoint))[0]
