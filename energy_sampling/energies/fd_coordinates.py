@@ -1,7 +1,7 @@
 """Fundamental-domain coordinates for a crystal sampler: s in [-1, 1]^d <-> MXtalTools cell parameters, Z' = 1.
 
-One space group, one molecule radius (the trainer's length box at that radius, ``CrystalChart.for_latent_v1``), the
-hemisphere orientation chart (sg 6-9: its K cut). The chart is crystal_fd's ``CrystalChart``: every crystal of the
+One space group, one molecule radius (the length box ``length_box`` at that radius, ``CrystalChart.for_length_box``),
+the hemisphere orientation chart (sg 6-9: its K cut). The chart is crystal_fd's ``CrystalChart``: every crystal of the
 space group (inside the length box) has exactly one point s, and every s is a canonical crystal -- reduced cell,
 folded pose, handedness on the +1 sheet. The reduction penalty a latent sampler pays is therefore zero by
 construction.
@@ -33,6 +33,7 @@ from typing import NamedTuple
 import torch
 
 from mxtaltools.crystal_fd import canon, charts, measure
+from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.crystal_fd.description import CrystalDescription
 
 F64 = torch.float64
@@ -42,6 +43,20 @@ S_TOL = 1e-6
 #: canonicalize statuses taken as charted: 'special_metric' rows (a cell with extra automorphisms) are folded on the
 #: sheet too; their pose depends on the input basis, but the point is in the domain
 OK_STATUS = ('canonical', 'special_metric')
+#: the length box: every canonical cell length in [LENGTH_LO, 2 Z (r + LENGTH_CONTACT)] Angstrom (``length_box``)
+LENGTH_LO = 2.5
+LENGTH_CONTACT = 3.0
+
+
+def length_box(sg: int, radius):
+    """(lo, hi) [B, 3] float64 Angstrom, the same for the three cell lengths: lo = LENGTH_LO, hi = 2 Z (r +
+    LENGTH_CONTACT), Z = len(SYM_OPS[sg]) molecules in the conventional cell at Z' = 1 (centring included), r the
+    molecule radius [B] (``MolData.radius``). Owner decision 2026-11-02. Measured then: every canonical cell of the
+    CSD's Z' = 1 rows (csd_fd_v5, 394,517) and of Day's FIT+DMA landscapes (<= 30 lowest per molecule within
+    10 kJ/mol, 29,947) lies inside, the longest axis at most 0.97 of hi, the shortest 2.96 A."""
+    r = torch.as_tensor(radius, dtype=F64).reshape(-1)
+    hi = (2 * len(SYM_OPS[int(sg)]) * (r + LENGTH_CONTACT))[:, None].expand(-1, 3).clone()
+    return torch.full_like(hi, LENGTH_LO), hi
 
 
 class FDRows(NamedTuple):
@@ -58,7 +73,7 @@ class FDCoordinates:
     ----------
     sg : int
     radius : float or [B] tensor
-        The molecule radius (Angstrom) that sets the trainer's length box (``charts.latent_v1_length_box``). A [B]
+        The molecule radius (Angstrom) that sets the length box (``length_box``). A [B]
         tensor charts B rows of different molecules at once (one length box per row): every method is then called
         with exactly those B rows, in that order.
     cell_measure : str
@@ -72,7 +87,7 @@ class FDCoordinates:
         self.rows = None if r.numel() == 1 else int(r.numel())   # None: one radius for any number of rows
         self.radius = float(r[0]) if self.rows is None else r
         self.cell_measure = cell_measure
-        self.chart = charts.CrystalChart.for_latent_v1(self.sg, r, ORIENTATION)
+        self.chart = charts.CrystalChart.for_length_box(self.sg, length_box(self.sg, r), ORIENTATION)
         self.dim = self.chart.ndim
         self.wrap_mask = [d.kind == 'circle' for d in self.chart.dims]
         self.names = [d.name for d in self.chart.dims]
@@ -139,8 +154,8 @@ class FDCoordinates:
         if bool(good.any()):
             gi = torch.nonzero(good).flatten()
             # per-row length boxes: the chart of the rows that canonicalised, in their order
-            chart = self.chart if self.rows is None else charts.CrystalChart.for_latent_v1(
-                self.sg, self.radius[gi], ORIENTATION)
+            chart = self.chart if self.rows is None else charts.CrystalChart.for_length_box(
+                self.sg, length_box(self.sg, self.radius[gi]), ORIENTATION)
             y, _ = chart.inverse(c.desc[gi])
             u = self._unit_of(y, chart)
             inside = ((u >= -S_TOL) & (u <= 1 + S_TOL)).all(1) & torch.isfinite(u).all(1)
