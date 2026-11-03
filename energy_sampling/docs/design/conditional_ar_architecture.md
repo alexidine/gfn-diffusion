@@ -416,6 +416,34 @@ supersede the text above:
     commit. The `mk_dev.yaml` comments that describe the old behaviour are the owner's to edit. The per-row floor
     buffer becomes per-token.
 
+### 5.7 Owner decisions and clarifications after the check, 2026-11-03
+
+These supersede amendment 1 of §5.6 and the SG-head design of §2.2 and §2.3.
+
+- **Option A: the level learns log Z(m, g) directly** (owner, 2026-11-03).
+  - The level reads s, the molecule scalars, the static e_g, and a chirality input. Chirality is needed for the
+    enantiomorphic groups, where Z(X, P4₁) = Z(X′, P4₃).
+  - p(g | m) = softmax_g L(m, g), detached, is used for sampling.
+  - There is no separately trained SG head, so there is no ε mixing.
+  - In training, g is forced. The allocation is uniform over G_m, or scheduled. Each (m, g) is then an ordinary TB
+    problem with x drawn on-policy from q(x | g, m). The allocation does not bias L, and every group is drawn by
+    construction.
+  - Drawing g from softmax(L) is for evaluation and late training only. A level that reads g together with a separate
+    TB-trained head is the combination to avoid: TB would fix only their sum.
+  - The caveat as before: while the flow is unconverged, TB's level sits near log Z(m, g) − KL_g. Reported SG weights
+    come from importance sampling within each group.
+- **Op tokens are embedded once, after g.** They are static. The stage-indexed memory of §5.6 item 2 is therefore not
+  built. Geometric per-operation content is a later toggle.
+- **New pathways use the default initialisation** (owner): every model trains from scratch. The no-peeking test sets
+  random weights regardless.
+- **Features are torch operations on the prefix in float64,** so autograd follows them:
+  - polytope bounds as linear maps of the earlier rows;
+  - a soft minimum over images;
+  - counts as sums of sigmoids.
+
+  The no-peeking test is the backstop for anything left non-differentiable.
+- **The centroid allowed range comes from `PolytopeARChart.t_bounds`** (§5.6 item 7).
+
 **For the owner** (not settled here):
 
 - **The default block order** (§5.5).
