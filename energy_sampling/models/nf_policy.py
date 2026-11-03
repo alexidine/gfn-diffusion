@@ -52,9 +52,10 @@ Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
 
 
 def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
-    """inn_modeller.py::resolve_auto_options for a fresh build: an unset setting takes the unconditional route's
-    default, or off on a conditional policy (bounded_rows excepted: 'linear' on both); block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose
-    live rows are exactly 0-11 (the Z' = 1 crystal latent's own rows), else the alternating orders."""
+    """An unset setting takes UNCONDITIONAL_DEFAULTS on both routes (owner, 2026-11-03: the conditional spline is the
+    unconditional one unless there is a reason; inn_modeller.py::resolve_auto_options still leaves them off on its
+    conditional route); block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose live rows are exactly
+    0-11 (the Z' = 1 crystal latent's own rows), else the alternating orders."""
     s = dict(s)
     for key in ('bounded_rows', 'min_bin_height', 'block_orders'):
         if s[key] == 'none':
@@ -62,9 +63,9 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
     if s['bounded_rows'] == 'auto':   # both flows: every row the policy writes lies in [-1, 1] (latent and FD chart)
         s['bounded_rows'] = UNCONDITIONAL_DEFAULTS['bounded_rows']
     if s['min_bin_height'] == 'auto':
-        s['min_bin_height'] = None if conditional else UNCONDITIONAL_DEFAULTS['min_bin_height']
+        s['min_bin_height'] = UNCONDITIONAL_DEFAULTS['min_bin_height']
     if s['tied_derivatives'] is None:
-        s['tied_derivatives'] = False if conditional else UNCONDITIONAL_DEFAULTS['tied_derivatives']
+        s['tied_derivatives'] = UNCONDITIONAL_DEFAULTS['tied_derivatives']
     if s['tied_factor'] is None:
         s['tied_factor'] = 2.0
     if s['block_orders'] == 'auto':

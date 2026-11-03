@@ -235,14 +235,15 @@ def test_bounded_rows_linear_bounds_every_live_unwrapped_row(conditional):
 
 # -- the config audit's fixes (2026-10-27) -------------------------------------------------------------------------
 
-def test_unset_settings_resolve_per_route_as_the_inn_does():
+def test_unset_settings_resolve_to_the_unconditional_spline_on_both_routes():
     from models.nf_policy import NF_DEFAULTS, Z1_ORDER, resolve_flow_settings
     u = resolve_flow_settings(NF_DEFAULTS, False, list(range(12)))
     assert (u['bounded_rows'], u['min_bin_height'], u['tied_derivatives'], u['tied_factor'], u['block_orders']) == \
         ('linear', 1e-7, True, 2.0, Z1_ORDER)
     assert resolve_flow_settings(NF_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
     c = resolve_flow_settings(NF_DEFAULTS, True, list(range(12)))
-    assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == ('linear', None, False, None)
+    # the conditional spline takes the unconditional defaults (owner, 2026-11-03); its orders stay the alternating ones
+    assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == ('linear', 1e-7, True, None)
     n = resolve_flow_settings({**NF_DEFAULTS, 'bounded_rows': 'none', 'block_orders': 'none'}, False, list(range(12)))
     assert n['bounded_rows'] is None and n['block_orders'] is None
 

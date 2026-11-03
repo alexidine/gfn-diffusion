@@ -69,7 +69,7 @@ def test_exact_matrix_is_the_k_rollout_estimate_at_log_pb_zero():
     m_ref, m_got = xcond_metrics(*ref), xcond_metrics(*got)
     assert set(m_got) == set(m_ref) and m_got['xcond/noise_sd'] == 0.0
     for key in ('xcond/interaction_frac', 'xcond/diag_lift_nats', 'xcond/accuracy', 'xcond/logpost_true'):
-        assert abs(m_got[key] - m_ref[key]) < 1e-4, key
+        assert abs(m_got[key] - m_ref[key]) < 1e-4 * max(1.0, abs(m_ref[key])), key   # the matrices' rtol
 
 
 def _modeller(policy, k, step_ind=0, every_n_evals=1):

@@ -398,33 +398,34 @@ class AtomEncoder(nn.Module):
 
 
 class SplitAtomEncoder(nn.Module):
-    """A molecule as an invariant trunk and a point head (docs/design/conditional_ar_architecture.md).
+    """A molecule as an invariant trunk and a point stream (docs/design/conditional_ar_architecture.md §5.1).
 
     The trunk is mxtaltools' ScalarGNN on atomic numbers alone: geometry enters only through interatomic distances
-    (radial basis on a radius graph), so its node features h_i and their attention pool s do not change when the
-    molecule is rotated or reflected. The point head reads h_i together with the atom's coordinates in the standard
-    frame (the frame the orientation rows rotate from) and gives per-atom point tokens and their pool p. Information
-    runs from the trunk into the point head and never back: s is a function of distances and elements only."""
+    (radial basis on a radius graph), so its node features h_i and their pool s do not change when the molecule is
+    rotated or reflected. The point stream is a second ScalarGNN on the same graph whose node input is [Z_i, h_i,
+    MLP(x_i)], x_i the atom's coordinates in the standard frame (the frame the orientation rows rotate from); it gives
+    per-atom point tokens and their pool p. Information runs from the trunk into the point stream and never back: s is
+    a function of distances and elements only. Both pools are mxtaltools' AugSoftmaxAggregation, sum_i x_i
+    (softmax_i(t x_i) + b) per channel. point_convs 0 makes the point stream a per-atom MLP (no edges)."""
 
-    def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64):
+    def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64,
+                 point_convs=None):
         super().__init__()
         from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
+        from mxtaltools.models.modules.augmented_softmax_aggregator import AugSoftmaxAggregation
         self.cutoff, self.max_neighbors = float(cutoff), int(max_neighbors)
-        self.gnn = ScalarGNN(input_node_dim=1, node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2,
-                             embedding_dim=node_dim, num_convs=convs, num_radial=radial, cutoff=cutoff,
-                             max_num_neighbors=max_neighbors, atom_type_embedding_dim=16, norm='layer')
-        self.s_q = nn.Parameter(torch.zeros(node_dim))
-        self.s_out = nn.Linear(node_dim, pooled_dim)
+        point_convs = convs if point_convs is None else int(point_convs)
+        gnn = dict(node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2, embedding_dim=node_dim,
+                   num_radial=radial, cutoff=cutoff, max_num_neighbors=max_neighbors, atom_type_embedding_dim=16,
+                   norm='layer')
+        self.gnn = ScalarGNN(input_node_dim=1, num_convs=convs, **gnn)
         self.pos_emb = nn.Sequential(nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64))
-        self.point = nn.Sequential(nn.Linear(node_dim + 64, node_dim), nn.SiLU(), nn.Linear(node_dim, node_dim))
-        self.tok = nn.Linear(node_dim, width)
-        self.p_q = nn.Parameter(torch.zeros(node_dim))
+        self.point = ScalarGNN(input_node_dim=1 + node_dim + 64, num_convs=point_convs, **gnn)
+        self.s_pool = AugSoftmaxAggregation(channels=node_dim)
+        self.p_pool = AugSoftmaxAggregation(channels=node_dim)
+        self.s_out = nn.Linear(node_dim, pooled_dim)
         self.p_out = nn.Linear(node_dim, pooled_dim)
-
-    @staticmethod
-    def _pool(feat, q, mask):
-        score = (feat * q).sum(-1).masked_fill(~mask, float('-inf'))
-        return (torch.softmax(score, -1)[..., None] * feat).sum(1)
+        self.tok = nn.Linear(node_dim, width)
 
     def forward(self, z, pos, n):
         """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> point tokens
@@ -433,16 +434,16 @@ class SplitAtomEncoder(nn.Module):
         u, a = z.shape
         mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
         batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
-        zf, pf = z[mask], pos[mask]
+        zf, pf = z[mask].to(pos.dtype)[:, None], pos[mask]
         ptr = F.pad(torch.cumsum(n, 0), (1, 0))
         edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
-        h = self.gnn(zf.to(pf.dtype)[:, None], pf, batch, edges)                    # [nodes, node_dim], invariant
-        node = h.new_zeros(u, a, h.shape[-1])
-        node[mask] = h
-        s = self.s_out(self._pool(node, self.s_q, mask))
-        pt = self.point(torch.cat([node, self.pos_emb(pos)], -1))                    # [u, a, node_dim]
-        p = self.p_out(self._pool(pt, self.p_q, mask))
-        return self.tok(pt), mask, s, p
+        h = self.gnn(zf, pf, batch, edges)                                           # [nodes, node_dim], invariant
+        s = self.s_out(self.s_pool(h, batch, dim_size=u))
+        pt = self.point(torch.cat([zf, h, self.pos_emb(pf)], -1), pf, batch, edges)  # [nodes, node_dim]
+        p = self.p_out(self.p_pool(pt, batch, dim_size=u))
+        node = pt.new_zeros(u, a, pt.shape[-1])
+        node[mask] = pt
+        return self.tok(node), mask, s, p
 
 
 class _ResMLP(nn.Module):
