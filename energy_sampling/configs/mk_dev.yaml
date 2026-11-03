@@ -304,9 +304,9 @@ model:
     atom_convs: 3
     atom_cutoff: 10.0
     atom_radial: 32
-    min_bin_height: auto       # a floor on the spline's bin heights: auto (unconditional 1e-7, conditional the spline's own), none, or a number
+    min_bin_height: auto       # a floor on the spline's bin heights: auto (1e-7 on both routes), none, or a number
     min_bin_height_rows: all   # 'all' rows or the 'uniform'-base rows only
-    tied_derivatives: null     # knot derivatives tied to the neighbouring bin slopes: null = auto (unconditional true, conditional false)
+    tied_derivatives: null     # knot derivatives tied to the neighbouring bin slopes: null = auto (true on both routes)
     tied_factor: null          # null = 2.0
     bounded_rows: auto         # auto ('linear' on both routes), none, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
     block_orders: auto         # auto (Z' = 1 latent, one block, unconditional: 8.11.10.9.7.6.5.4.3.2.1.0; else alternating), none, or one order per block; unconditional only. Set it explicitly on a chart whose rows mean something else
