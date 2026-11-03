@@ -1,7 +1,8 @@
 # Conditional AR flow: conditioner, space-group step and prefix features (proposal, 2026-11-02)
 
 Status: proposal. Part 1 (the split encoder and the condition pass-through) is built and tested. Parts 2-4 are
-designs. The owner's choices in this document were given in the 2026-11-02 architecture thread. Everything else
+designs. The owner's choices in this document were given in the architecture thread on 2026-11-02 and 2026-11-03
+(§4). The diagram of what is built and planned is `conditional_ar_architecture.html` beside this file. Everything else
 here is a recommendation, and claims carry their evidence tag: **[built]** code and tests in the tree, **[run]** measured,
 **[derived]**, **[proposed]**.
 
@@ -112,7 +113,11 @@ depends on the molecule's chirality class. Its input is `s`, so it is invariant,
 then the flow given the SG token. `log P_F = log p(g | s) + log q(x | g, m)`, still a length-1 trajectory, so the
 losses need no change.
 
-### 2.3 Getting Z(g | m) right during training [proposed; derived]
+### 2.3 Getting Z(g | m) right during training [owner chose TB, 2026-11-03; the alternative below is in reserve]
+
+The owner chose to train the SG head by TB. The head then learns `Z_g · e^{−KL_g}`, so reported SG weights come from
+per-group importance sampling, never from the head. The rest of this section is the alternative that was not chosen,
+kept in case the TB head starves a group.
 
 **The problem.** If the head is trained by TB, its optimum is `p(g) ∝ Z_g · e^{−KL_g}` on-policy, where `KL_g` is
 how badly the flow fits group g. On stored rows the bias reverses, and under MLE the head copies the search's per-SG
@@ -126,7 +131,8 @@ counts. The review's toy, one seed:
 
 Per-group importance sampling gave 0.834 in both TB cases. The head is a fine proposal and a biased readout.
 
-**Proposal: train the head to the IS estimate, not by TB.** Three pieces, all inside the training loop:
+**Alternative (not chosen): train the head to the IS estimate, not by TB.** Four pieces, all inside the training
+loop:
 
 1. **Draws.** g is drawn from `(1 − ε) p_θ(g | s) + ε · Uniform(G_m)`, so every group keeps getting draws whatever
    the head believes. Then x is drawn from `q(x | g, m)`. Each draw gives `log w = log R(x; g, m) − log q(x | g, m)`.
@@ -157,11 +163,13 @@ Bookkeeping the refutation fixed, to apply once:
 
 ### 2.4 Order of build, smallest first
 
-1. The option C flow, with the SG given and per-(m, g) normaliser F, on a synthetic two-layout target with known
-   `Z_g`.
-2. Add the head distilled from F; check `p_θ` against per-group IS on that target.
-3. On a real energy, once FD takes several groups: one molecule, groups 14 and 15 (same layout); then 2 and 14
-   (different dimension).
+The owner's plan (2026-11-03) is to build the whole architecture before serious testing, since conditional
+training needs time and data that local smoke runs do not give.
+
+1. The option C flow with the SG given, checked on a synthetic two-layout target for exact density and round trip.
+2. The SG head, trained by TB, with force and skip.
+3. The prefix-feature hook (§3), which unconditional runs can exercise early because they converge faster.
+4. Serious testing on the cluster, once the FD energy route scores mixed-SG batches (search/prior session).
 
 ## 3. Prefix physics features (deliverable 5) [proposed]
 
@@ -210,10 +218,9 @@ A unit test asserts that the feature is unchanged when the pose rows are randomi
 - after the pose rows: centroid distances of symmetry images, and contacts of the molecule's inertia ellipsoids;
 - SG symmetry operations as tokens, which fits option C.
 
-## 4. Owner decisions this document needs
+## 4. Owner decisions, 2026-11-03
 
-1. **Training the SG head:** distil from the amortised IS normaliser F (recommended, §2.3), or TB with a per-group
-   correction afterwards.
-2. **Build order:** option C flow on a synthetic target now, ahead of the multi-SG FD energy fix (recommended), or
-   wait for that fix.
-3. **Prefix-feature test (§3):** build the hook now and run the 2-seed comparison, or after option C.
+1. **The SG head is trained by TB** (§2.3).
+2. **Build the full architecture before serious testing** (§2.4). Mid-AR features such as the packing coefficient may
+   be tried earlier on unconditional runs.
+3. **Old checkpoints are not used again**, so nothing keeps them loadable.

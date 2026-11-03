@@ -73,26 +73,9 @@ class Run:
     step: int
 
 
-def _load_legacy_dropped(m, path):
-    """An atom-token archive written before the condition columns rode beside the molecule (models/nf_policy.py
-    before 9c2f59d8): it was built and trained with every condition column dropped, so it is rebuilt with
-    conditions_dim 0, which is the function it trained as. The problem match is asserted as load_weights_only does."""
-    ck = torch.load(path, map_location=m.device, weights_only=False)
-    m.checkpointer.assert_problem_match(ck, path, 'checkpoint_name')
-    cfg = dict(m.checkpointer._gfn_config_from(ck), conditions_dim=0, device=m.device)
-    if cfg.get('conditions_type') != 'molecule':
-        raise ValueError(f"{path}: --legacy-dropped-columns is for molecule-mode (atom-token) archives only")
-    pol = m.checkpointer._build_gfn(cfg).to(m.device)
-    m.checkpointer._load_state(pol, ck['model_train'], f'{path} (model_train)')
-    print(f"LEGACY LOAD {path}: rebuilt with conditions_dim 0 (its condition columns were dropped in training)",
-          flush=True)
-    return pol
-
-
-def load(config, checkpoint, baseline=None, device='cpu', legacy_dropped=False):
+def load(config, checkpoint, baseline=None, device='cpu'):
     """The run's data through the trainer's own chain, then the archive's policy (and the baseline's) by
-    Checkpointer.load_weights_only, which asserts the archive solves this config's problem (legacy_dropped:
-    _load_legacy_dropped)."""
+    Checkpointer.load_weights_only, which asserts the archive solves this config's problem."""
     import train
     from utils import get_train_args
     args = get_train_args(['--config', config])
@@ -109,8 +92,6 @@ def load(config, checkpoint, baseline=None, device='cpu', legacy_dropped=False):
         # the table training scored against, installed, never recomputed (as eval/cond_panel/sampler.py::load_run)
         ef.set_energy_reference(ck['energy_reference']['table'])
     def policy_of(path):
-        if legacy_dropped:
-            return _load_legacy_dropped(m, path).eval()
         m.checkpointer.load_weights_only(path)
         return m.gfn_model.eval()
 
@@ -807,8 +788,6 @@ def main(argv=None):
     ap.add_argument('--c2st-mols', type=int, default=1000)
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=20261102)
-    ap.add_argument('--legacy-dropped-columns', action='store_true',
-                    help='an atom-token archive trained before its condition columns reached the flow (9c2f59d8)')
     a = ap.parse_args(argv)
     probes = [p for p in a.probes.split(',') if p]
     bad = set(probes) - set(PROBES)
@@ -817,7 +796,7 @@ def main(argv=None):
     if a.device == 'cpu':
         assert not torch.cuda.is_available(), 'CPU run with a visible GPU: set CUDA_VISIBLE_DEVICES=-1'
     os.makedirs(a.out, exist_ok=True)
-    run = load(a.config, a.checkpoint, a.baseline, a.device, legacy_dropped=a.legacy_dropped_columns)
+    run = load(a.config, a.checkpoint, a.baseline, a.device)
     cache = os.path.join(a.out, f'sets_{a.seed}_{a.mols}x{a.rows_per_mol}.pt')
     sets, scored = {}, {}
     if set(probes) - {'phase2', 'c2st'}:   # those two draw their molecules from the conditions files
