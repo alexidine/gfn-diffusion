@@ -61,6 +61,13 @@ What exists in `eval/day_bench/`, written to the decisions above. Development co
   - This closes task B5. COMPACK failures were already recorded without a verdict (`compack_endpoints.compare`).
 - `protocol_random.py`: `csd:N` allocates starts over the 26 groups by CSD frequency (`allocate`, `csd_statistics.json`).
   Starts build in all 26 groups (checked 2026-11-03).
+- `csd_statistics.py` and `.json` (task B4): bare frequencies of space groups and of molecules per primitive cell over
+  the local CSD (data version 600).
+  - Two Z' = 1 homomolecular organic populations: C/H/N/O/F only, 137,448 structures; and any organic chemistry,
+    266,903. No Day-shaped filter is applied.
+  - Day's 26 groups hold 98.9% of the C/H/N/O/F population. P2₁/c is 38% of it, P2₁2₁2₁ 18% and P-1 15%.
+  - Molecules per primitive cell in that population: 4 in 65%, 2 in 28%, 8 in 6%.
+  - At 1,000 draws, `csd:1000` gives P6₅ (group 154, frequency 0.0004) no starts.
 - MXtalTools `8f4c29ad`: `canonicalize_aunit` applies a half-cell origin shift where a group's operators and box use
   different origin choices. P4₂/n, one of the 26, refused 18 of 46 Day rows before the fix and none after (task B2).
 - Tests: `tests/crystal/test_day_bench_protocol.py`, 11 CPU tests.

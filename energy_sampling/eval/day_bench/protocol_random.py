@@ -38,10 +38,10 @@ def allocate(freq, n):
     return {g: int(k) for g, k in zip(groups, base) if k > 0}
 
 
-def csd_frequencies(population, path=CSD_STATS):
-    """{group: frequency} over Day's 26 groups for ``population`` of ``csd_statistics.json``."""
-    pop = json.load(open(path))['populations'][population]
-    sg = pop['day26_frequency'] if 'day26_frequency' in pop else pop['day26']['frequency']
+def csd_frequencies(population, path=CSD_STATS, count='raw'):
+    """{group: frequency} over Day's 26 groups for ``population`` of ``csd_statistics.json``, renormalised over the 26;
+    ``count`` 'raw' (every structure) or 'dedup' (one per refcode family)."""
+    sg = json.load(open(path))['populations'][population][count]['day26']['freq_renormalised_over_26']
     freq = {int(g): float(v) for g, v in sg.items() if int(g) in DAY_GROUPS}
     assert len(freq) == len(DAY_GROUPS), f'{population}: frequencies for {len(freq)} of the 26 groups'
     return freq

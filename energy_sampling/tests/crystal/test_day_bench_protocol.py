@@ -146,3 +146,10 @@ def test_allocate_by_largest_remainder():
     assert sum(got.values()) == 7 and got == {14: 4, 2: 2, 19: 1}
     assert allocate({1: 1.0, 2: 1.0}, 1) == {1: 1}  # tie to the lower group
     assert sum(allocate({g: 1.0 / (g + 1) for g in range(26)}, 1000).values()) == 1000
+
+
+def test_csd_plan_reads_the_committed_statistics():
+    from eval.day_bench.protocol_random import DAY_GROUPS, parse_plan
+    plan = dict(parse_plan('csd:1000', 'CHNOF_zp1'))
+    assert sum(plan.values()) == 1000 and set(plan) <= set(DAY_GROUPS)
+    assert max(plan, key=plan.get) == 14  # P2_1/c dominates Z' = 1 CSD structures
