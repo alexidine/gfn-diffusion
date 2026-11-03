@@ -1,6 +1,7 @@
 # Day-landscape benchmark: scope, design decisions and staged plan
 
-Status: **proposal for owner decision**, drafted 2026-11-02. It controls nothing executable. It scopes the benchmark
+Status: **proposal, partly decided.** Drafted 2026-11-02. The owner answered D1–D7 on 2026-11-03; those answers are in
+"Owner decisions, 2026-11-03" below and override §2 wherever the two differ. It controls nothing executable. It scopes the benchmark
 half of the Day-landscape paper: a survey of existing crystal generators against the Day group's FIT+DMA reference
 landscapes (Taylor, Butler & Day, Faraday Discuss. 256 (2025) 434-458; deposit DOI 10.5258/SOTON/D3094).
 
@@ -15,7 +16,32 @@ Relation to other documents:
 Evidence tags: **RUN** = measured this session or in a dated development run named beside it; **READ** = read from
 code, file or paper; **U** = estimate or unverified lead.
 
-## Topline
+## Owner decisions, 2026-11-03
+
+Owner's framing: the benchmark is in workflow development. It is de-prioritised behind generator convergence, because
+it counts for nothing if the generator does not converge.
+
+| decision | owner's answer (2026-11-03) | what changes in this document |
+|---|---|---|
+| D1a molecules | Pilot on a small subset of molecules, exp-6 tier only, for now. Return to the MLIP question once the MLIP we ultimately train on is chosen. | The pilot is a small exp-6 subset. Molecule tiers that depend on the MLIP, such as the 16 MACE-validated refcodes, are deferred. Stage E is deferred. |
+| D1b window and modes | Deferred, as D1a, until the MLIP decision. | The consensus window stays a recommendation. The pilot uses it as a working assumption. |
+| D2 conformer | **Hold**: keep thinking. For now, substitute early, or code the option set. | Build the substitution placement as a switchable option (early, end, own molecule). Early is the working default for development. The 2026-10-26 "decided" entry in D2 is reopened. |
+| D3 energies and relaxation | Broadly agreed with the table. The severe tier should be simpler, for example pure van der Waals overlap: the owner does not want to defend exp-6 in print. The final MLIP comes later. Keep the optimisation simple and uniform, consistent with standards in the field. | Severe = geometric van der Waals overlap only, with no exp-6 role. Optimiser settings are to follow field practice (see D3 note below). |
+| D4 identity | Agreed. The FD distance is a curio and an advertisement, not the settlement metric. | No change. |
+| D5 metrics | The output is the two-dimensional object C(E, N): coverage as a joint function of sample size N and optimisation effort E. Otherwise reasonable. | The primary result is the surface C(E, N). Curves and topline numbers are read off it. |
+| D6 groups and Z | Ours follows Z(c), or bare CSD statistics as the worst case. Methods that need a group also follow CSD statistics; uniform over groups would be "really brutal". P1 generators as recommended. | Group-needing baselines are allocated by CSD space-group frequencies, not equally over the 26. |
+| D7 roster | Cover specifically **all crystal generators published in 2026**. Add a standard classical search, for example Genarris or FastCSP; readers will expect one. | Roster widened: every 2026 generator is listed and each gets a run, or a stated reason why it cannot. A classical search arm is added. |
+
+**D3 note: field practice for the optimiser** (READ, from the papers via the 2026-10-19 scouting report).
+- Packora relaxes with UMA through ASE BFGS at fmax 0.02 eV/Å (about 1.9 kJ/mol/Å), at most 500 steps.
+- MolCrystalFlow and CG-OMatG relax in three stages, each capped at 1,000 steps: rigid-body BFGS for 100 steps, then
+  cell plus atoms, then atoms only.
+- The development optimiser stops at 0.01 kJ/mol/Å, about 200 times tighter than fmax 0.02 eV/Å.
+
+Proposed for the pilot: one rigid-body optimiser with a force tolerance of fmax 0.02 eV/Å and a 500-step cap, taken
+from the field. Depth snapshots (0, 10, 30, 100, 300, 500) supply the E axis. This is a proposal, not decided.
+
+## Topline (as drafted 2026-11-02; superseded where the owner decisions above differ)
 
 The recommended benchmark, in one paragraph per axis:
 
@@ -362,10 +388,13 @@ row says otherwise. "Have" means installed on this machine.
 | Packora-L | not installed. CUDA-only, torch 2.10 with CUDA 13.0, Python 3.10.12; licensed CSD Python API needed even to sample. | PolyForm NC 1.0.0 / CC BY-NC 4.0 | SMILES (+ RDKit template, stereo labels), Z optional | about 150 s (H100, U) | **core** if it builds on the cluster with a CSD licence; otherwise local GPU, if its CUDA 13 build runs on the RTX 5080 (U) |
 | SALA | code on GitHub `WENDI-CAI/SALA` (MIT); weights on Hugging Face `cWendi/SALA`, about 1.95 GB, no weight licence stated (web search 2026-11-02; repository not opened, U) | MIT / unstated | asymmetric-unit graph, space group and Z' required | unknown | **core**, as the only space-group-aware data-trained generator, with equal 26-group allocation (D6). Weight licence to be confirmed. |
 | OXtal | public | MIT / CC BY-NC 4.0 | SMILES or SDF; emits a 30-molecule heavy-atom cluster with no cell | 0.4–2 GPU-h | defer to an appendix: needs a lattice extractor and hydrogen placement, which are our own code and a source of failures attributable to us |
-| CrystAF | public; Linux, CUDA 12.8; no SMILES entry point | MIT / CC BY-NC 4.0 | Clari crystal object | about 400 s (L40S) | drop: distilled from Clari-M on Clari's split |
-| CG-OMatG, PackFlow, OrgFlow | no code found (scouting report; web search 2026-11-02 for PackFlow and OrgFlow) | – | – | – | drop unless released |
-| CellNet | not found by web search (2026-11-02); per the 2026-10-28 tables, a lattice flow followed by a PyXtal packing search, needing Hall setting and Z′ | – | – | 1–21 min per cell on about 48 cores | recheck availability; at most optional |
-| Genarris 3 | believed open source (U) | U | conformer, Z | U | optional classical baseline, only if a reviewer would expect it |
+| CrystAF | public; Linux, CUDA 12.8; no SMILES entry point | MIT / CC BY-NC 4.0 | Clari crystal object (a SMILES-to-crystal adapter through Clari's own builder is our code) | about 400 s (L40S) | **in** (2026 generator, owner 2026-11-03), on the cluster |
+| CG-OMatG, PackFlow, OrgFlow | no code found (scouting report; web search 2026-11-02 for PackFlow and OrgFlow) | – | – | – | **listed** (2026 generators): availability rechecked at each stage; the table states "no public code" while that holds |
+| CellNet | not found by web search (2026-11-02); per the 2026-10-28 tables, a lattice flow followed by a PyXtal packing search, needing Hall setting and Z′ | – | – | 1–21 min per cell on about 48 cores | **listed** (2026 generator); run if code is found, with groups allocated by CSD statistics (D6) |
+| SymMC-Flow and the PXRD-conditioned rigid flow (F. Cai, ChemRxiv) | diagnostic papers; generation reported at 0% | – | – | – | listed as 2026 work; no run (they report no working generator) |
+| EVA-Flow | generates one conformer inside a given crystal; no lattice or packing | – | – | – | listed as out of scope (not a crystal generator) |
+| FastCSP (Genarris 3 + UMA relaxation) | open source per its paper, code under `facebookresearch/fairchem` (web search 2026-11-03; repository and licence not opened, U) | U | conformer; Genarris draws over groups and Z | U; the paper's relaxations cost 138–172 V100 GPU-s each | **classical arm, recommended** (owner 2026-11-03: Genarris or FastCSP). Run its Genarris 3 generation stage as the sampler, then our shared relaxation and ledger, so only the proposal distribution differs. |
+| Genarris 3 alone | believed open source (U) | U | conformer, Z | U | the same arm as FastCSP's generation stage; choose one after checking the code |
 | ours (energy-trained, molecule- and group-conditioned) | in development | ours | Day's conformer; groups by learned weights | inference only; training calls amortised | **core**, entering when trained on the Day-excluded pool with the frame-rule fix in (dependencies below) |
 
 **Leakage per data-trained model.** Clari, Packora and CrystAF share a split that keeps every CSD crystal deposited by
@@ -426,8 +455,11 @@ median Day molecule has about twice imidazole's atoms, and cells up to 8 molecul
 | D3 | SALA environment and adapter (asymmetric unit → P1, labelled) | 1–2 d | unknown | A2 |
 | D4 | Optional: PyXtal random | 0.5 d | relaxation only | – |
 | D5 | Leak flags per (model, molecule) from the split files | 0.5 d | – | A2 |
+| D6 | CrystAF environment (Linux, CUDA 12.8) and a SMILES-to-Clari-crystal adapter | 1–2 d | about 400 s per 1,000 samples (L40S) | Clari-M checkpoint (have) |
+| D7 | Classical arm: FastCSP's Genarris 3 generation stage, or Genarris 3 alone, as the sampler; our shared relaxation | 1–2 d | U | code and licence check |
+| D8 | Availability recheck for CG-OMatG, PackFlow, OrgFlow and CellNet; run whichever has released code | 0.5 d per release | – | – |
 
-### Stage E: MLIP tier (cluster)
+### Stage E: MLIP tier (cluster): DEFERRED by the owner (2026-11-03) until the training MLIP is chosen
 
 | # | item | effort | compute | depends on |
 |---|---|---|---|---|
@@ -462,19 +494,19 @@ median Day molecule has about twice imidazole's atoms, and cells up to 8 molecul
   - The space-group head and its slice weights are our allocation rule.
   - The harness's "Day set C" needs Day minima in the trainer's chart, which is blocked on the frame rule.
 
-## 4. Decisions to bring to the owner now
+## 4. Still open after 2026-11-03
 
-Recommended answers first. Proceeding on the recommendation is safe for Stage B, which is reversible tooling.
-
-1. **D1.** Tiered molecules: imidazole, then the 16, then a stratified 100, plus all 1,017 for the cheap arms.
-   Consensus window ≤ 8 kJ/mol under both Day rankings. Closed reference, with extras reported separately.
-2. **D3.** Rigid P1 relaxation at Z' = Z for every method and the reference. Day's MACE for the final tier (decided),
-   UMA rigid as an optional sensitivity on the 16.
-3. **D4.** RDF screen, COMPACK settlement in the band, per-molecule calibration; 15/20 headline, 10/20 sensitivity.
-4. **D6.** No experimental space group or Z for anyone. Equal 26-group allocation for methods that need a group, a
-   CSD Z prior for P1 generators, our learned slice weights for us. Reachable-set coverage reported beside.
-5. **D7.** Core roster: quasi-random (26 groups), Clari (M now, H on approval), MolCrystalFlow, Packora-L, SALA, ours.
-   Day's search is a cost marker, not a curve. Approve the four downloads in A2.
+- **MLIP choice.** It gates D1 tiers, the D1b window, and Stage E. It is an owner decision, taken with the choice of
+  training MLIP.
+- **Conformer placement (D2), on hold.** The option set is to be coded. Early substitution is the development default.
+- **Pilot molecule subset.** Recommended: imidazole plus a few molecules chosen to span size and hydrogen-bond donors,
+  with at least one polymorphic molecule. It is small enough to run locally.
+- **Optimiser settings** from field practice (D3 note): fmax 0.02 eV/Å, 500-step cap. Proposed, not decided.
+- **Severe-overlap rule.** Proposed: any intermolecular heavy-atom pair closer than 0.75 × the sum of Bondi radii, a
+  knob. Exp-6 drops out of the severe role.
+- **CSD space-group statistics** for group-needing baselines, and for ours as the worst case (D6). Count them from the
+  local CSD at Z' = 1, together with the Z prior (task B4).
+- **Downloads in A2**, plus the CrystAF and FastCSP/Genarris code, each on the owner's approval.
 
 ## Sources
 
@@ -487,5 +519,6 @@ Recommended answers first. Proceeding on the recommendation is safe for Stage B,
 - Shared notes of the paper-review sessions (2026-11-02): `data_defects`, `day_like_pool_proposal`,
   `fd_length_box_proposal`, `ar_fit_harness`.
 - Wiki: `structure-comparison-metrics`, `landscape-structure`, `crystal-force-fields`, `mlip-energy-routes`.
+- Web search 2026-11-03 for FastCSP code (FastCSP, arXiv:2508.02641; code link `facebookresearch/fairchem`).
 - Web search 2026-11-02 for SALA, PackFlow, OrgFlow and CellNet code. Abstract-level results only; repositories not
   opened.
