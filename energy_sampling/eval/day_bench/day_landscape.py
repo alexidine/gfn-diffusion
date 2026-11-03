@@ -1,37 +1,35 @@
 """One molecule's Day landscape (Taylor, Butler & Day 2025, deposit 10.5258/SOTON/D3094) as a reference source.
 
-Reads the molecule's FIT+DMA landscape (``<stem>.csv``: id, space group, density, FIT+DMA lattice energy; ``<stem>.cif``:
-one block per structure, asymmetric unit plus symmetry operators) and, when given, the deposit's DFT-corrected
-re-ranking (``corrected.csv`` of the Delta-ML archive: ``corrected_energy_kjmol``, B86bPBE+XDM level). Structures within
-WINDOW kJ/mol of the lowest corrected energy (FIT+DMA energy when no correction is given) are refitted with the shared
-reference conformer (``p1_ingest.ingest``, in their own space group) and relaxed under the benchmark energy by
-``p1_relax``'s two stages, so they share the samples' coordinate space for RDF identity. The folder is laid out as
-``p1_relax`` lays out a generator's; ``p1_relax_<energy>.csv`` adds ``day_fitdma`` and ``ref_energy`` (the corrected
-energy, the one the reference ranking uses).
+A refcode's directory of the FIT+DMA archive holds one or more ``<stem>.csv`` (id, space group, density, FIT+DMA lattice
+energy, ...) and ``<stem>.cif`` (one block per structure: asymmetric unit plus symmetry operators). A chiral molecule's
+directory splits its structures over ``_all``, ``_racsg`` and ``_sohncke`` files, and ``_all.csv`` can hold the Sohncke
+rows only, so ``landscape`` takes the union of ids over every CSV and finds each id's block in whichever CIF holds it.
+The deposit's DFT-corrected re-ranking (the Delta-ML archive's ``<refcode>/corrected.csv``: ``corrected_energy_kjmol``,
+B86bPBE+XDM level) is joined where it exists; it covers part of some landscapes only.
 
-With CONFORMER ``day`` the reference conformer is Day's own (``day_reference``: the rigid molecule of the landscape's
-lowest structure), so Day's structures need no refitting; ``csd`` (the default) fits the refcode's deposited molecule.
+``main`` writes the reference for ``protocol_refine``: every structure within WINDOW kJ/mol of the lowest energy under
+either ranking (FIT+DMA, or corrected where present), as its primitive P1 cell (``primitive``) in ``OUT_DIR/cifs/``,
+with ``OUT_DIR/reference.csv`` (both energies, absolute and relative to the landscape's lowest, the space group and
+the molecules per conventional and primitive cell) and ``OUT_DIR/conformer.txt`` (Day's own conformer as a
+``load_reference`` spec: the rigid molecule of the landscape's lowest FIT+DMA structure). The reference then goes
+through ``protocol_refine`` like any sampler's draws, so reference minima and samples share one substitution, one
+relaxation and one description (P1 at Z' = Z); which minima count as modes, and their weights, is decided from Day's
+energies in ``protocol_report``.
 
-usage (licensed CSD Python API):
-    python -m eval.day_bench.day_landscape OUT_DIR REFCODE STEM_CSV STEM_CIF [CORRECTED_CSV|-] WINDOW [energy] [DEVICE]
-        [csd|day]
+usage (licensed CSD Python API, for the SMILES of the refcode):
+    python -m eval.day_bench.day_landscape OUT_DIR REFCODE LANDSCAPE_DIR [--corrected CSV_OR_DELTA_ML_ZIP]
+        [--window 10]
 """
-import copy
 import csv
+import glob
 import io
 import os
-import sys
-import time
-import warnings
+from collections import Counter
 
 import numpy as np
-import torch
-from ase.io import read, write
+from ase.io import write
 
-from eval.day_bench.p1_ingest import ingest, make_reference, split_molecules
-from eval.day_bench.p1_relax import CHUNK, TIGHT, relax, relax_experimental, settle_step, stages_for, to_atoms
-from mxtaltools.crystal_search.crystal_opt_utils import canonicalize_aunit
-from mxtaltools.dataset_utils.utils import collate_data_list
+from eval.day_bench.p1_ingest import make_reference, split_molecules
 
 
 def blocks(cif_path):
@@ -106,11 +104,22 @@ def day_reference(stem_cif, structure_id, smiles):
     return make_reference(split_molecules(block_to_atoms(blocks(stem_cif)[structure_id]))[0], smiles=smiles)
 
 
+def family_smiles(reader, refcode):
+    """SMILES of ``refcode``'s heaviest component, or of the first numbered member of its family when the bare family
+    name (Day's directory names, e.g. IMAZOL) is not itself an entry."""
+    for code in [refcode] + [f'{refcode}{i:02d}' for i in range(1, 100)]:
+        try:
+            return reader.entry(code).molecule.heaviest_component.smiles
+        except RuntimeError:
+            continue
+    raise KeyError(f'no CSD entry for {refcode} or its numbered family members')
+
+
 def load_reference(refcode, conformer, reader):
     """The rigid reference conformer named by ``conformer``: 'csd' (the refcode's deposited molecule) or
     'day:<stem CIF>:<structure id>' (Day's own, ``day_reference``)."""
     from eval.day_bench.csd_roundtrip import p1_cell
-    smiles = reader.entry(refcode).molecule.heaviest_component.smiles
+    smiles = family_smiles(reader, refcode)
     if conformer == 'csd':
         return make_reference(split_molecules(p1_cell(refcode, reader)[0])[0], smiles=smiles)
     kind, rest = conformer.split(':', 1)  # the CIF path may itself hold a drive colon
@@ -119,86 +128,106 @@ def load_reference(refcode, conformer, reader):
     return day_reference(cif, structure_id, smiles)
 
 
-def main(out_dir, refcode, stem_csv, stem_cif, corrected_csv, window, energy='exp6', device='cpu', conformer='csd'):
-    from ccdc import io as ccdc_io
-    from eval.day_bench.csd_roundtrip import p1_cell
-    torch.set_num_threads(2)
-    if str(device).startswith('cuda'):
-        torch.cuda.set_per_process_memory_fraction(0.4)
-    reader = ccdc_io.EntryReader('CSD')
-    smiles = reader.entry(refcode).molecule.heaviest_component.smiles
-    stages = stages_for(energy)
-
-    land = {r['id']: r for r in csv.DictReader(open(stem_csv))}
+def landscape(landscape_dir, corrected=None, refcode=None):
+    """{id: row} over the union of every CSV in ``landscape_dir``: ``sg``, ``fitdma`` (kJ/mol), ``cif`` (the CIF holding
+    its block) and, when ``corrected`` (a ``corrected.csv``, or the Delta-ML zip read at ``<refcode>/corrected.csv``)
+    has the id, ``corrected`` (kJ/mol); ``fitdma_rel`` and ``corrected_rel`` are relative to the lowest of each, and
+    ``corrected`` and ``corrected_rel`` are None for an id the correction does not cover."""
+    rows = {}
+    for path in sorted(glob.glob(os.path.join(landscape_dir, '*.csv'))):
+        for r in csv.DictReader(open(path)):
+            rows.setdefault(r['id'], dict(id=r['id'], sg=int(r['spacegroup']), fitdma=float(r['energy'])))
+    where = {}
+    for path in sorted(glob.glob(os.path.join(landscape_dir, '*.cif'))):
+        for line in open(path, encoding='utf-8', errors='replace'):
+            if line.startswith('data_'):
+                where.setdefault(line[5:].strip(), path)
+    missing = [i for i in rows if i not in where]
+    assert not missing, f'{len(missing)} ids have no CIF block, e.g. {missing[:3]}'
     corr = {}
-    if corrected_csv and corrected_csv != '-':
-        corr = {r['structure']: float(r['corrected_energy_kjmol']) for r in csv.DictReader(open(corrected_csv))}
-    rank = {i: corr.get(i, float(r['energy'])) for i, r in land.items()} if corr else \
-        {i: float(r['energy']) for i, r in land.items()}
-    e0 = min(rank.values())
-    chosen = sorted((i for i in rank if rank[i] - e0 <= window), key=lambda i: rank[i])
-    print(f'{len(land)} structures in the landscape; {len(chosen)} within {window} kJ/mol of the lowest '
-          f'{"corrected (DFT-level)" if corr else "FIT+DMA"} energy', flush=True)
-    if conformer == 'day':
-        ref = day_reference(stem_cif, chosen[0], smiles)
-    else:
-        ref = make_reference(split_molecules(p1_cell(refcode, reader)[0])[0], smiles=smiles)
+    if corrected:
+        if corrected.endswith('.zip'):
+            import zipfile
+            with zipfile.ZipFile(corrected) as z:
+                name = [n for n in z.namelist() if n.endswith(f'/{refcode}/corrected.csv')]
+                text = z.read(name[0]).decode() if name else ''
+        else:
+            text = open(corrected).read()
+        corr = {r['structure']: float(r['corrected_energy_kjmol']) for r in csv.DictReader(io.StringIO(text))}
+    f0 = min(r['fitdma'] for r in rows.values())
+    c0 = min((corr[i] for i in rows if i in corr), default=None)
+    for i, r in rows.items():
+        r.update(cif=where[i], fitdma_rel=r['fitdma'] - f0, corrected=corr.get(i),
+                 corrected_rel=corr[i] - c0 if i in corr else None)
+    return rows
 
-    texts = blocks(stem_cif)
-    raw_dir, rel_dir = os.path.join(out_dir, 'cifs'), os.path.join(out_dir, f'relaxed_{energy}')
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(rel_dir, exist_ok=True)
-    rows, crystals, names = [], [], []
-    for i in chosen:
-        atoms = block_to_atoms(texts[i])
-        name = f'{i}.cif'
-        write(os.path.join(raw_dir, name), atoms, format='cif')
-        res = ingest(atoms, ref, identifier=name)
-        row = dict(file=name, day_sg=land[i]['spacegroup'], day_fitdma=float(land[i]['energy']), ref_energy=rank[i])
-        if not res.ok:
-            rows.append(dict(row, built=False, note=res.reason))
-            continue
-        try:  # the relaxer canonicalises the asymmetric unit first and refuses some settings (seen: P4_2/n)
-            canonicalize_aunit(collate_data_list([copy.deepcopy(res.crystal)], max_z_prime=1))
-        except ValueError as err:
-            rows.append(dict(row, built=False, note=f'relaxer refuses: {err}'[:120]))
-            continue
-        rows.append(dict(row, built=True, build_residual=res.residual_max))
-        crystals.append(res.crystal)
-        names.append(name)
-    print(f'{len(crystals)} of {len(chosen)} converted to Z\' = 1 crystals of the reference conformer', flush=True)
 
-    t0 = time.time()
-    parts = [relax(collate_data_list(crystals[k:k + CHUNK * 4], max_z_prime=1), stages, device=device,
-                   scratch=os.path.join(out_dir, 'opt_intermediates.pt'))
-             for k in range(0, len(crystals), CHUNK * 4)]
-    relaxed = [c for p in parts for c in p[0].batch_to_list()]
-    e_start = torch.cat([p[1] for p in parts])
-    e_end = torch.cat([p[2] for p in parts])
-    traj = np.concatenate([p[3] for p in parts], axis=1)
-    forms = relax_experimental([refcode], ref, stages, reader, rel_dir, os.path.join(out_dir, 'opt_intermediates.pt'))
-    ex1 = forms[refcode][2]
-    by_name = {r['file']: r for r in rows}
-    for k, (n, c) in enumerate(zip(names, relaxed)):
-        cell = to_atoms(c)
-        write(os.path.join(rel_dir, n), cell, format='cif')
-        res = ingest(cell, ref, symprecs=TIGHT, identifier=n)
-        by_name[n].update(e_start=float(e_start[k]), e_end=float(e_end[k]), e_vs_exp=float(e_end[k]) - ex1,
-                          settle=settle_step(traj[:, k]), sg=res.sg if res.ok else None,
-                          symprec=res.symprec if res.ok else None, note='' if res.ok else res.reason)
-    keys = ['file', 'built', 'build_residual', 'day_sg', 'day_fitdma', 'ref_energy', 'e_start', 'e_end', 'e_vs_exp',
-            'settle', 'sg', 'symprec', 'note']
-    with open(os.path.join(out_dir, f'p1_relax_{energy}.csv'), 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=keys)
+def primitive(atoms, symprec=1e-3):
+    """The primitive P1 cell of a full conventional cell (``block_to_atoms``), by spglib; the cell itself when spglib
+    finds no smaller one or the reduction does not divide the atom count."""
+    import spglib
+    from ase import Atoms
+    cell = (np.asarray(atoms.cell), atoms.get_scaled_positions(), atoms.get_atomic_numbers())
+    out = spglib.standardize_cell(cell, to_primitive=True, no_idealize=True, symprec=symprec)
+    if out is None or len(out[2]) >= len(atoms) or len(atoms) % len(out[2]):
+        return atoms
+    lattice, frac, numbers = out
+    return Atoms(numbers=numbers, scaled_positions=frac, cell=lattice, pbc=True)
+
+
+def day_conformer_spec(rows):
+    """'day:<stem CIF>:<structure id>' of the lowest FIT+DMA structure of ``landscape`` rows."""
+    lowest = min(rows.values(), key=lambda r: r['fitdma'])
+    return f'day:{lowest["cif"]}:{lowest["id"]}'
+
+
+def in_window(r, window):
+    """Within ``window`` kJ/mol of the lowest under FIT+DMA, or under the correction where the row has one."""
+    return r['fitdma_rel'] <= window or (r['corrected_rel'] is not None and r['corrected_rel'] <= window)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('out_dir')
+    ap.add_argument('refcode')
+    ap.add_argument('landscape_dir')
+    ap.add_argument('--corrected', default=None)
+    ap.add_argument('--window', type=float, default=10.0)
+    a = ap.parse_args()
+    from ccdc import io as ccdc_io
+    reader = ccdc_io.EntryReader('CSD')
+    rows = landscape(a.landscape_dir, a.corrected, a.refcode.lower())
+    spec = day_conformer_spec(rows)
+    ref = load_reference(a.refcode.upper(), spec, reader)
+    n_at = len(ref.mol.z)
+    chosen = sorted((r for r in rows.values() if in_window(r, a.window)), key=lambda r: r['fitdma'])
+    n_corr = sum(r['corrected'] is not None for r in rows.values())
+    print(f'{a.refcode}: {len(rows)} structures in the landscape ({n_corr} with a corrected energy); {len(chosen)} '
+          f'within {a.window:g} kJ/mol of the lowest under either ranking', flush=True)
+    raw = os.path.join(a.out_dir, 'cifs')
+    os.makedirs(raw, exist_ok=True)
+    texts, out = {}, []
+    for r in chosen:
+        if r['cif'] not in texts:
+            texts[r['cif']] = blocks(r['cif'])
+        conv = block_to_atoms(texts[r['cif']][r['id']])
+        prim = primitive(conv)
+        assert len(conv) % n_at == 0 and len(prim) % n_at == 0, f'{r["id"]}: atoms not a whole number of molecules'
+        write(os.path.join(raw, f'{r["id"]}.cif'), prim, format='cif')
+        out.append(dict(file=f'{r["id"]}.extxyz', id=r['id'], day_sg=r['sg'], z_conv=len(conv) // n_at,
+                        z_prim=len(prim) // n_at, fitdma=r['fitdma'], fitdma_rel=r['fitdma_rel'],
+                        corrected='' if r['corrected'] is None else r['corrected'],
+                        corrected_rel='' if r['corrected_rel'] is None else r['corrected_rel'], cif=r['cif']))
+    with open(os.path.join(a.out_dir, 'reference.csv'), 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=list(out[0]))
         w.writeheader()
-        w.writerows([{k: r.get(k, '') for k in keys} for r in rows])
-    kept = sum(1 for r in rows if r['built'] and str(r.get('sg')) == str(r['day_sg']))
-    print(f'relaxed {len(crystals)} under {energy} on {device} in {time.time() - t0:.0f} s; {kept} kept their space '
-          f'group; energy above relaxed {refcode} (kJ/mol per molecule): median '
-          f'{np.median([r["e_vs_exp"] for r in rows if r["built"]]):.1f}')
+        w.writerows(out)
+    with open(os.path.join(a.out_dir, 'conformer.txt'), 'w') as fh:
+        fh.write(spec + '\n')
+    print(f'wrote {len(out)} primitive cells to {raw}; molecules per primitive cell '
+          f'{dict(sorted(Counter(r["z_prim"] for r in out).items()))}; conformer {spec}', flush=True)
 
 
 if __name__ == '__main__':
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]),
-         sys.argv[7] if len(sys.argv) > 7 else 'exp6', sys.argv[8] if len(sys.argv) > 8 else 'cpu',
-         sys.argv[9] if len(sys.argv) > 9 else 'csd')
+    main()

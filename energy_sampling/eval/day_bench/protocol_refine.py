@@ -10,13 +10,17 @@ graph join them, from consecutive blocks of the conformer's atom count in file o
 (``molecules_of``); a sample none of these splits into intact molecules is not legit. A rebuilt cell that does not
 reproduce the fitted molecules (largest error above ``REBUILD_TOL``) is a failure of this pipeline, not of the sampler,
 and is recorded apart. Every legit sample is optimised by ``converge.fire`` (the shared rigid-body optimiser: FIRE on
-the target energy, a row stopping once its largest generalised force is at most ``converge.F_TOL``) and written at each
-depth in ``--depths`` (0 = raw, as substituted), with its energy per molecule and largest generalised force there.
+the target energy, a row stopping once its largest generalised force is at most ``--f_tol``) and written at each
+depth in ``--depths`` (0 = raw, as substituted), with its energy per molecule, largest generalised force and van der
+Waals overlap there (``overlap``: the smallest ratio of an intermolecular heavy-atom distance to the sum of the two
+atoms' Bondi radii; a sample whose ratio falls below ``protocol_report``'s clash cut is severe, a geometric rule with no
+energy model in it). ``steps`` is the FIRE steps a row took before stopping, so its cost to depth k is min(steps, k)
+energy-and-gradient calls.
 
 usage (licensed CSD Python API; GPU):
     python -m eval.day_bench.protocol_refine SAMPLE_DIR OUT_DIR REFCODE CONFORMER [--depths 0,10,30,100,300,1000]
         [--energy exp6] [--device cuda] [--vram 0.3] [--max_step 0.1] [--chunk 100] [--limit N (evenly spaced)]
-        [--glob PATTERN]
+        [--glob PATTERN] [--f_tol 0.01]
 
 CONFORMER as ``day_landscape.load_reference``. Writes OUT_DIR/depth_<k>/<stem>.extxyz (the P1 cell with a molecule
 label per atom, ``bb_indices``, so a cell whose molecules overlap still splits into its molecules) and
@@ -39,6 +43,22 @@ from eval.day_bench.p1_relax import p1_crystal, stages_for, to_atoms
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 REBUILD_TOL = 0.1  # Angstrom
+BONDI = {1: 1.20, 6: 1.70, 7: 1.55, 8: 1.52, 9: 1.47}  # Angstrom (Bondi 1964)
+
+
+def overlap(atoms):
+    """Smallest intermolecular heavy-atom distance over the sum of the two atoms' Bondi radii, for a cell with a molecule
+    label per atom (``labelled``) whose molecules are whole: a pair is intermolecular when its labels differ or it joins
+    an atom to a periodic image. 1.0 when no heavy-atom pair is closer than its radii sum."""
+    from ase.neighborlist import neighbor_list
+    z = atoms.get_atomic_numbers()
+    lab = atoms.arrays['bb_indices']
+    rad = np.array([BONDI[int(k)] for k in z])
+    i, j, d, S = neighbor_list('ijdS', atoms, 2 * max(BONDI[k] for k in BONDI if k > 1))
+    keep = (z[i] > 1) & (z[j] > 1) & ((lab[i] != lab[j]) | (S != 0).any(1))
+    if not keep.any():
+        return 1.0
+    return float(min(1.0, (d[keep] / (rad[i[keep]] + rad[j[keep]])).min()))
 
 
 def _rejoined(z, frac, cell):
@@ -116,6 +136,7 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--glob', default='*', help='raw files to take, by name (for example sample_sg41_*)')
     ap.add_argument('--vram', type=float, default=0.3, help='share of GPU memory this process may use')
+    ap.add_argument('--f_tol', type=float, default=F_TOL, help='largest generalised force at which a row stops')
     a = ap.parse_args()
     from ccdc import io as ccdc_io
     from eval.day_bench.day_landscape import load_reference
@@ -167,13 +188,14 @@ def main():
         for i in range(0, len(members), chunk):
             part = members[i:i + chunk]
             _, _, _, steps, snaps = fire(collate_data_list([c for _, c in part], max_z_prime=zp), a.device, a.energy,
-                                         exp6_kwargs, F_TOL, max(depths), snapshots=depths, max_step=a.max_step)
+                                         exp6_kwargs, a.f_tol, max(depths), snapshots=depths, max_step=a.max_step)
             for k, (cs, e, f) in snaps.items():
                 for j, ((row, _), c) in enumerate(zip(part, cs)):
-                    write(os.path.join(a.out_dir, f'depth_{k}', row['file']), labelled(to_atoms(c), ref),
-                          format='extxyz')
+                    cell = labelled(to_atoms(c), ref)
+                    write(os.path.join(a.out_dir, f'depth_{k}', row['file']), cell, format='extxyz')
                     row[f'e_{k}'] = float(e[j])
                     row[f'f_{k}'] = float(f[j])
+                    row[f'ov_{k}'] = overlap(cell)
             for j, (row, _) in enumerate(part):
                 row['steps'] = int(steps[j])
             print(f'  Z {zp}: {min(i + chunk, len(members))} of {len(members)} in {time.time() - t0:.0f} s; energy '
@@ -181,7 +203,7 @@ def main():
                                                   for k in depths), flush=True)
 
     keys = ['file', 'legit', 'rebuilt', 'note', 'fit_rmsd', 'rebuild_residual', 'z', 'steps'] + \
-        [f'{q}_{k}' for k in depths for q in ('e', 'f')]
+        [f'{q}_{k}' for k in depths for q in ('e', 'f', 'ov')]
     os.makedirs(a.out_dir, exist_ok=True)
     with open(os.path.join(a.out_dir, f'refine_{a.energy}.csv'), 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=keys)

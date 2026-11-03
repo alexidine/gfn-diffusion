@@ -41,6 +41,46 @@ it counts for nothing if the generator does not converge.
 Proposed for the pilot: one rigid-body optimiser with a force tolerance of fmax 0.02 eV/Å and a 500-step cap, taken
 from the field. Depth snapshots (0, 10, 30, 100, 300, 500) supply the E axis. This is a proposal, not decided.
 
+## Tooling state, 2026-11-03
+
+What exists in `eval/day_bench/`, written to the decisions above. Development code, not a contract.
+- `day_landscape.py`:
+  - reads the union of a molecule's CSVs, so chiral directories are complete, and joins the Delta-ML correction;
+  - writes every structure within 10 kJ/mol under either ranking as its primitive P1 cell, with `reference.csv` and
+    Day's conformer spec.
+  - The reference then passes through `protocol_refine` like any sampler, which closes task B1.
+- `protocol_refine.py`: records the van der Waals overlap at every depth (`overlap`: smallest intermolecular heavy-atom
+  distance over the Bondi radii sum) and takes `--f_tol`.
+- `protocol_score.py`: reads the reference from that refine output, with both Day energies and the molecules per
+  primitive cell.
+- `protocol_report.py`:
+  - the C(E, N) surface (table and heatmap), and coverage against cumulative calls, each draw charged min(steps, depth);
+  - modes by complete linkage, in the window under both Day rankings;
+  - severe = overlap below `--clash` (default 0.75), with no exp-6 role;
+  - reachable-mode reach, dropped modes, the effective number of modes hit, and a ledger.
+  - This closes task B5. COMPACK failures were already recorded without a verdict (`compack_endpoints.compare`).
+- `protocol_random.py`: `csd:N` allocates starts over the 26 groups by CSD frequency (`allocate`, `csd_statistics.json`).
+  Starts build in all 26 groups (checked 2026-11-03).
+- MXtalTools `8f4c29ad`: `canonicalize_aunit` applies a half-cell origin shift where a group's operators and box use
+  different origin choices. P4₂/n, one of the 26, refused 18 of 46 Day rows before the fix and none after (task B2).
+- Tests: `tests/crystal/test_day_bench_protocol.py`, 11 CPU tests.
+- Smoke, imidazole, 2026-11-03: Day reference of 250 minima, then 100 MolCrystalFlow draws refined to 1,000 steps,
+  scored and reported (`artifacts/generator_scouting_oct19/pilot_nov03/`). This is a test of the pipeline, not a
+  result.
+  - 247 of the 250 reference minima rebuilt. 3 rebuilds missed by about 2 Å, probably the frame flip on symmetric
+    molecules; this is open.
+  - The 247 minima form 206 modes, 62 of them in the window.
+  - No Day minimum falls under the clash cut: the smallest raw overlap is 0.87.
+- Not built:
+  - the conformer-substitution option set (early substitution only, as now);
+  - environments for SALA (its install was refused by the session's permission classifier; the commands are with the
+    owner), Packora, CrystAF and Genarris/FastCSP.
+- Downloaded 2026-11-03, outside the repo:
+  - Clari-H weights (Hugging Face cache);
+  - SALA code and weights (`external_generators/SALA`, `sala_ckpt`; checksum matches);
+  - Packora's `csd_clari.csv` and OXtal's `train_ccdc_ids.txt` (`external_generators/leak_lists/`);
+  - PyXtal 1.1.5 (`C:/Users/mikem/venvs/pyxtal`).
+
 ## Topline (as drafted 2026-11-02; superseded where the owner decisions above differ)
 
 The recommended benchmark, in one paragraph per axis:

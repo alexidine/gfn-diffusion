@@ -97,6 +97,11 @@ training are reported beside the curves as an amortised cost.
 
 ## Development implementation (untracked, `energy_sampling/eval/day_bench/`)
 
+*Superseded in part on 2026-11-03.* Several pieces changed: the reference build, the severe rule (now a geometric van
+der Waals overlap, no longer exp-6), the mode grouping and window, and the report (the C(E, N) surface and the calls
+ledger). `day_benchmark_scope.md`, section "Tooling state, 2026-11-03", describes the current code; the list below is
+the 2026-10-26 state.
+
 - `day_landscape.py`: Day's FIT+DMA structures into the pipeline (cspy CIF blocks, Z' = 1 in their space group).
 - `p1_ingest.py`, `p1_relax.py`: a sample as a P1 cell of Z rigid conformers; a fixed two-stage first relaxation.
 - `converge.py`: FIRE to a force threshold, energy calls counted.
