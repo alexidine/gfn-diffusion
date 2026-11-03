@@ -224,3 +224,206 @@ A unit test asserts that the feature is unchanged when the pose rows are randomi
 2. **Build the full architecture before serious testing** (§2.4). Mid-AR features such as the packing coefficient may
    be tried earlier on unconditional runs.
 3. **Old checkpoints are not used again**, so nothing keeps them loadable.
+4. **Option C, with consistent semantic ordering.** Build the SG step now, but do not test it yet. Converge on a
+   single SG first.
+5. **Give every row both s and p for now.** The encoder is a new model, not Mo3ENet.
+6. **The conditional spline defaults equal the unconditional ones** unless there is a compelling reason. A small spline
+   battery is advisable.
+7. **The placing flow gets the symmetry operations directly.** The SG head may read them too. Standard settings and
+   one consistent chart always apply.
+8. **The op-set autoencoder pretraining is in.**
+9. **Molecule scalars come from the featurization workflow.**
+
+## 5. Agreed wiring, 2026-11-03 [proposed; supersedes §1 to §3 where they differ]
+
+This is the build specification the owner agreed after three rounds. The sections above stay as the record of how it
+was reached.
+
+### 5.1 Encoder
+
+- **Trunk (invariant).** mxtaltools `ScalarGNN` on atomic numbers and the radius graph, as built. Per-atom `h_i`. Its
+  pool `s` is an `AugSoftmaxAggregation` (mxtaltools), replacing the learned-query attention pool.
+- **Point stream.** A second `ScalarGNN` on the same graph. Node input is `[Z_i, h_i, MLP(x_i)]`, with `x_i` in the
+  standard frame (`EmbeddingBlock` concatenates the continuous columns after column 0). Toggle `point_convs`: 0 gives
+  today's per-atom MLP. The trunk runs first and never reads this stream, so `s` is invariant by construction. Its
+  pool `p` is AugSoftmax. Per-atom point tokens stay available to cross-attention (`atom_tokens: split`).
+- **Molecule scalars** go into the context as explicit invariants:
+  - `V_mol` and `r_mol` come from the featurization workflow (`MolData.mol_volume` and `MolData.radius`, filled by
+    `mol_analysis`);
+  - the principal moments come from mxtaltools `batch_molecule_principal_axes_torch`, computed under `no_grad`
+    (it adds noise to coordinates that require grad).
+- **Chirality to the SG head.** `s` is mirror-blind, so the SG head also reads the allowed-group mask G_m and one
+  pseudoscalar, a chirality index that changes sign under reflection.
+
+### 5.2 Symmetry operations
+
+- **Op features.** Per operation (M, m) in the standard setting, centring included:
+  - M, as 9 integers;
+  - m, as sin and cos of 2πm;
+  - whether the operation is proper or improper (det M);
+  - its rotation order;
+  - its intrinsic screw or glide component;
+  - a pure-translation flag.
+
+  The largest Day group has 18 operations (R-3, hexagonal setting).
+- **e_g.** MLP per operation, then an AugSoftmax pool. It feeds three readers:
+  - the policy context `c`, so every slot sees it;
+  - the SG head;
+  - the level head. These read the static form only, so they stay frame-free.
+- **Op tokens.** These join the atom tokens in the conditioner's cross-attention memory. They are refreshed when a
+  block completes:
+  - static, while the cell block is drawn;
+  - after the cell: the Cartesian rotation `T M T⁻¹`, and the screw/glide length over `r_mol`;
+  - after the position: the minimum-image vector to the image centroid, and its length over `r_mol`.
+
+  Every refresh is a function of g and of completed blocks only, so the Jacobian stays triangular.
+- **Toggles.** `sym_ops: none | pooled | tokens | tokens_dynamic`; and the pretrained encoder, `frozen | finetune | off`.
+- **Pretraining.** A minimal set autoencoder over all 230 groups. The vocabulary is the distinct (M, m) operations
+  across the standard settings. The decoder gives per-operation membership logits, trained with BCE. No energy data is
+  involved.
+- **The overfit test,** once training uses more than one SG: leave-one-group-out NLL for three arms, a pretrained e_g,
+  an e_g learned from scratch, and a one-hot group label as the control.
+
+### 5.3 Option C flow
+
+- **Typed tokens.** About 14 quantity types: `L_a`, `L_b`, `L_c`, `cos α`, `cos β`, `cos γ`, `X`, `Y`, `Z`, the
+  `X±Y` diagonals, `θ`, `φ`, `r` and `r_signed`. Each carries its kind (circle or interval) from the chart's wrap mask.
+  `r` is an interval in the hemisphere chart; only `φ` is a circle in the orientation block.
+- **Slot input.** Each slot adds together:
+  - the type embedding of the coordinate it predicts;
+  - that coordinate's allowed range given the prefix (`chart.bounds`), decoded into physical units;
+  - the previous row's raw value and its decoded value;
+  - `c`;
+  - the prefix features of completed blocks.
+
+  The decoded units are: lengths as `log(L / r_mol)`, angles as cosines, fractional coordinates with sin and cos for
+  circles, and orientation angles.
+- **g is slot 0.** Sequences are padded at the end, and log q sums over real tokens only.
+- **Per-token spline settings** are looked up from the type. The spline defaults are `UNCONDITIONAL_DEFAULTS` on both
+  routes: tied derivatives with F = 2, a floor of 1e-7, and bounded rows linear.
+- **Block order is a toggle,** keyed by block name. The prefix-feature hook and the op-token stages are keyed by
+  which blocks are complete, never by slot index.
+- **Comparisons across orders use total NLL only.** Per-row NLL measures different conditionals under different
+  orders.
+- **Tests:** exactness (a triangular Jacobian, autograd log-det) and a round trip, for every layout and every order.
+
+### 5.4 Prefix features
+
+All are closed-form, about 15 numbers in total. None is tested.
+
+- **After the cell block:**
+  - `log(V_cell / V_mol)`;
+  - `log(V_asu / V_mol)`, with `V_asu = V_cell / Z`; this is `−log c_pack`;
+  - the sorted principal lattice lengths over `r_mol`;
+  - `d₁₀₀`, `d₀₁₀` and `d₀₀₁` over the molecule's thinnest extent;
+  - the shortest reduced-cell vector over its longest extent.
+- **After the position block:**
+  - the nearest image-centroid distance over `r_mol`;
+  - the number of images within `2 r_mol`;
+  - the distance to the nearest inversion centre, 2-fold axis and mirror/glide plane.
+- **Per-group FD measure.** It is computed exactly from the chart's polytope (`crystal_fd/certify.py`) and checked
+  against the group-theoretic count. It is offered to the SG and level heads only, never to the flow, where it is
+  redundant with the cell rows. In polar groups it is not `V_cell` × a constant: the position block lacks the free
+  axis.
+
+### 5.5 Open: block order [observation that conflicts with §5.3's default]
+
+The oct19 MIPCAS run (unconditional, latent chart, one seed) is recorded in agent memory, not in a frozen result. It
+found that drawing the cell rows first was **worse** than `Z1_ORDER` (`8.11.10.9.7.6.5.4.3.2.1.0`: centroid z,
+orientation, centroid y and x, then the cell last). The figures:
+
+| order | ELBO (nats) | draws above 30 kT (of 40k) | P99.9 excess (kT) |
+|---|---|---|---|
+| cell first (`5.4.3.2.1.0.8.11.10.9.7.6`) | 34.59 | 144 | 95 |
+| `Z1_ORDER` (pose first) | 35.34 | 99 | 44 |
+
+Caption: unconditional MIPCAS on the latent chart, 3M energy calls, one seed each, 40k evaluation draws. Higher ELBO is
+better.
+
+`Z1_ORDER` is what `resolve_flow_settings` gives an unconditional one-block flow today. The cell-stage prefix features
+and the cell-stage op tokens of §5.2 and §5.4 assume that the cell comes first. Under a pose-first order, the cell
+slots come last and those features have nothing to inform. They would have to become pose-stage features read by the
+cell slots. The default order is therefore an owner decision, not something to settle in the build.
+
+Two further points bear on that decision:
+
+- **`Z1_ORDER` also reverses the rows within each block.** It draws r before θ and φ, so the run above confounds block
+  order with in-block order. On the FD chart only whole-block permutations keep `chart.bounds` causal: the bounds are
+  autoregressive within a block (`charts.py:1290`), and the K-cut bound on r reads θ and φ (`charts.py:685`).
+- **Under a pose-first order, every position-stage feature in §5.4 is inert too.** All of them need the cell metric.
+
+### 5.6 Adversarial check, 2026-11-03: amendments to §5.1 to §5.4
+
+An independent review checked §5 against the code. Its material findings were spot-checked in the code
+(`spline_flow.py:572`, `ar_transformer.py:54-84, 170`, `eval/day_bench/protocol_random.py:24`). These amendments
+supersede the text above:
+
+1. **The level head reads g only when g is forced.**
+   - Today the level input already includes the condition columns, SG among them (`spline_flow.py:574`). That is
+     right while g is forced: the level is then log Z_g(c).
+   - When g is drawn, a level that reads g absorbs log p(g | c) for each (c, g). The SG head's TB gradient then has
+     zero mean, so the head learns nothing.
+   - So in drawn mode the level reads s and the molecule scalars only, and e_g goes to the SG head only.
+   - g is drawn from (1 − ε)·p_θ + ε·Uniform(G_m), so no group can starve without end; TB tolerates the off-policy
+     draws.
+   - The per-condition trackers key per molecule, not per (molecule, SG) (`buffer.py::ConditionLogZTracker`).
+   - The FD measure is dropped: it is a function of (g, r_mol) only, so it adds nothing to either head.
+2. **Stage-indexed memory.** The parallel pass holds every stage version of the op tokens in the memory at once, and
+   masks each query to its stage with a `[b, 1, n, m]` mask. Today the mask is `[b, 1, 1, m]`
+   (`ar_transformer.py:81`). The decode appends a stage's keys and values at the step that completes its block; today
+   it projects the memory once (`ar_transformer.py:170`). Replacing the memory in place would leak later rows.
+3. **The exactness test randomises the zero-initialised weights first.** These are `proj_x` and the feature
+   projection; at their zero init a leak has no effect. The test then perturbs rows ≥ j and asserts that row j's
+   spline parameters are bit-identical, in float64. A Jacobian check alone misses detached or non-differentiable
+   features.
+4. **Features are computed identically in both passes.**
+   - They are computed in float64 from the float32-rounded, clamped prefix in both passes.
+   - Counts are soft, and nearest-element choices are smooth.
+   - The reason: draws are re-scored by the teacher-forced pass (`nf_policy.py:359`), so a feature that switches on
+     rounding differences samples from a different q than the one scored.
+5. **Prefix features only on the block that reads data-space x.** That is `blocks[0]`, or the hook refuses
+   `n_blocks > 1`. The decode inverts the later blocks before data-space x exists (`spline_flow.py:645`).
+6. **No after-cell rotation refresh.**
+   - The FD charts fix the Cartesian frame of the cell, so T M T⁻¹ depends on g alone. Monoclinic b is along y
+     whatever β is, orthorhombic and higher have fixed angles, and triclinic has only ±I.
+   - The after-cell op tokens keep the translation parts in Å over r_mol: screw/glide lengths and the lattice
+     translations.
+   - If the orientation is drawn before anything that reads it, add an after-orientation refresh with RᵀQR, the
+     image's orientation in the molecule's frame.
+7. **The allowed-range input uses the physical range.**
+   - `PolytopeARChart.bounds` returns [0, 1] (`charts.py:288`). The physical centroid range comes from `t_bounds`.
+   - θ and φ have constant bounds, so the input carries information only on the cell rows, the centroid rows and the
+     K-cut r.
+8. **The type names follow the chart's coordinates.** These are `log_c`, `r2`, `r1`, `s_beta`, `s_gamma`, `v`, the
+   monoclinic `s`, `log_a`, `log_b`, `t_x`, `t_y`, `t_z`, `t_x±y`, `θ`, `φ`, `r` and `r_signed`, keyed by
+   quantity, not slot. The decoded physical value goes in beside the raw one; it is not a renaming.
+9. **Molecule scalars need plumbing.**
+   - The flow receives only z and pos (`nf_policy.py:271`), so `V_mol` and `r_mol` go through the atom table, on a
+     log scale with their own scaler.
+   - The extents come from `eigvalsh` of the heavy-atom gyration tensor, with the thinnest and longest extents
+     included.
+   - There are two radius conventions: `mol_analysis` uses heavy atoms; QM9 and `random_conformers` use all atoms. The
+     FD length box reads one of them.
+10. **Redundant features are dropped.**
+    - `log(V_asu / V_mol)` differs from `log(V_cell / V_mol)` by a constant per group, so only one is kept.
+    - The sorted lattice lengths and the shortest reduced-cell vector are already in the reduced FD prefix.
+11. **Mixed-SG batches run as per-SG sub-batches.** Today NFPolicy takes one geometry from one probe
+    (`nf_policy.py:140`). Wrap masks, dead-row pinning, stage boundaries and the chart all differ per group, and
+    `fd_coordinates_rows` rebuilds the chart on CPU in float64 whenever radii differ. Splitting a mixed batch by SG
+    keeps every per-chart path unchanged.
+12. **Spline defaults.** No technical blocker. The test that pins conditional parity with `inn_modeller`
+    (`tests/models/test_nf_policy.py:244`) and the run-settings section of `ar-spline-flow.md` change in the same
+    commit. The `mk_dev.yaml` comments that describe the old behaviour are the owner's to edit. The per-row floor
+    buffer becomes per-token.
+
+**For the owner** (not settled here):
+
+- **The default block order** (§5.5).
+- **Enantiomorphic closure of the Day groups.** The set holds 76, 96, 145, 154 and 169 but not their partners 78, 92,
+  144, 152 and 170. So Σ_g Z_g differs between a chiral molecule and its mirror image, and a mirror-blind level head
+  is misspecified. Options:
+  - close the allowed set G_m under the partner map;
+  - fix one enantiomer per molecule;
+  - accept the asymmetry as part of the benchmark's declared convention.
+- **The radius convention** that the length box and r_mol share: heavy atoms or all atoms. This is a data-thread
+  interface, not this thread's call.
