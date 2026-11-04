@@ -528,6 +528,10 @@ class _ContextFlow(nn.Module):
         # atoms['mol_scalars']: the width of per-molecule invariant scalars (set_mol_scalars) read by the level head and
         # the context beside the pooled molecule; 0 = none
         self.n_mol_scalars = int(atoms.pop('mol_scalars', 0)) if atoms is not None else 0
+        # atoms['sym_ops']: the width of e_g (models/sym_ops.py::SymOpEncoder over the row's space group's operations),
+        # read by the level head and the context beside the pooled molecule; 0 = none. Option A of the design: with g
+        # given, the level is log Z(m, g)
+        self.n_sym = int(atoms.pop('sym_ops', 0)) if atoms is not None else 0
         if self.encoder not in (None, 'xyz', 'split'):
             raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
         self.atoms = atoms is not None
@@ -579,7 +583,11 @@ class _ContextFlow(nn.Module):
                                  else AtomEncoder(width, **atoms))
             pooled = (self.atom_encoder.s_out if self.encoder == 'split' else self.atom_encoder.pool_out).out_features
             # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
-            n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars
+            n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars + self.n_sym
+            if self.n_sym:
+                from models.sym_ops import SymOpEncoder
+                self.sym_encoder = SymOpEncoder(out_dim=self.n_sym)
+                self.row_groups = None
             n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
             for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):
                 self.register_buffer(name, None, persistent=False)
@@ -593,6 +601,10 @@ class _ContextFlow(nn.Module):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
         atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+
+    def set_row_groups(self, groups):
+        """Per condition id: the space group [n_cond] (long) whose e_g the level head and the context read."""
+        self.row_groups = groups
 
     def set_mol_scalars(self, scalars):
         """Per condition id: the molecule's invariant scalars [n_cond, n_mol_scalars] (models/nf_policy.py::
@@ -653,6 +665,11 @@ class _ContextFlow(nn.Module):
             if self.atom_scalars is None:
                 raise RuntimeError("the flow reads molecule scalars and none are set (set_mol_scalars)")
             rest = torch.cat([self.atom_scalars[mol].to(dtype)[inv], rest], -1)
+        if self.n_sym:                  # e_g of each row's space group, from its operations
+            if self.row_groups is None:
+                raise RuntimeError("the flow reads e_g and no space groups are set (set_row_groups)")
+            groups, ginv = torch.unique(self.row_groups.to(cid.device)[cid], return_inverse=True)
+            rest = torch.cat([self.sym_encoder.embed(groups.tolist()).to(dtype)[ginv], rest], -1)
         if self.encoder == 'split':
             tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
             s = torch.cat([s_inv[inv], rest], -1)

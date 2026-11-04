@@ -180,3 +180,34 @@ def test_point_convs_zero_is_a_per_atom_stream_and_needs_the_split_encoder():
         assert torch.isfinite(pol.log_density(torch.rand(3, 12) * 1.6 - 0.8, cond, _mols())).all()
     with pytest.raises(ValueError, match='atom_point_convs'):
         NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': True, 'atom_point_convs': 1}, seed=0)
+
+
+def test_e_g_reaches_the_level_and_log_q_and_its_encoder_is_in_a_parameter_group():
+    """nf sym_ops: e_g of each row's space group (sg_ind on the batch) is read beside the molecule (option A: with g
+    given, the level head learns log Z(m, g)); its encoder trains with the condition's other encoders."""
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    torch.manual_seed(0)
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 8, 'mol_scalars': True}, seed=0)
+    groups = [pol.t_model, pol.s_model, pol.forward_policy, pol.backward_policy, pol.conditions_embedding_model,
+              pol.flow_model]
+    ids = [id(p) for g in groups for p in g.parameters()]
+    assert len(ids) == len(set(ids)) and set(ids) == {id(p) for p in pol.parameters()}
+    g = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for p in pol.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g))
+    pol.eval()
+    cond = torch.randn(3, 4)
+    x = torch.rand(3, 12) * 1.6 - 0.8
+
+    def batch(sgs):
+        mb = _with_fields(_mols())
+        mb.sg_ind = torch.tensor(sgs)
+        return mb
+    with torch.no_grad():
+        a, b = pol.get_condition_embedding(cond, batch([14, 14, 2])), pol.get_condition_embedding(cond, batch([2, 14, 2]))
+        assert not torch.allclose(a[0], b[0]) and torch.allclose(a[1:], b[1:])
+        assert not torch.allclose(pol.log_density(x, cond, batch([14, 14, 2])), pol.log_density(x, cond, batch([2, 14, 2])))
+    with pytest.raises(ValueError, match='sg_ind'):
+        pol.get_condition_embedding(cond, _with_fields(_mols()))
