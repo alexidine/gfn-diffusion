@@ -3497,7 +3497,8 @@ class Modeller:
                 if nf.get('sym_ops', 'none') in (None, False, 'none', 'off') and not self.args.sg_conditioning:
                     raise ValueError(f"an FD run over space groups {list(fd.groups)}: the policy must read each row's "
                                      f"group (model.nf.sym_ops pooled, or sg_conditioning)")
-                cfg['policy'] = dict(pol, fd_space_groups=[int(g) for g in fd.groups])
+                cfg['policy'] = dict(pol, fd_space_groups=[int(g) for g in fd.groups],
+                                     fd_group_in_condition=bool(self.args.sg_conditioning))
             elif (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
                 cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
         else:

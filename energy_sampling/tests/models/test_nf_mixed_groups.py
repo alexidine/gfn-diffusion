@@ -147,6 +147,20 @@ def test_slot_describer_is_each_groups_own_in_its_slots(prefix):
     assert len(set(desc.types)) == layout.dim   # every slot its own embedding
 
 
+def test_a_mixed_group_policy_that_cannot_read_the_group_is_refused():
+    """A shared slot means different coordinates in different groups: without e_g (sym_ops pooled) or a
+    space-group condition column the flow would learn one blend over the groups. Typed rows do not carry it."""
+    layout = FDSlotLayout(GROUPS)
+    cfg = dict(gfn_config(True, cond_dim=4), dim=layout.dim, angular_mask=list(layout.wrap_mask),
+               periodic_centroid_axes=None, dead_latent_rows=None, conditions_type='molecule')
+    for rows in ('plain', 'prefix'):
+        with pytest.raises(ValueError, match="read each row's"):
+            NFPolicy(cfg, {**SMALL, **TF, 'sym_ops': 'none', 'row_tokens': rows}, seed=0,
+                     fd_space_groups=list(GROUPS))
+    NFPolicy(cfg, {**SMALL, **TF, 'sym_ops': 'none'}, seed=0, fd_space_groups=list(GROUPS),
+             fd_group_in_condition=True)
+
+
 def test_mixed_groups_are_refused_off_the_conditional_molecule_route():
     layout = FDSlotLayout(GROUPS)
     cfg = dict(gfn_config(False), dim=layout.dim, angular_mask=list(layout.wrap_mask),

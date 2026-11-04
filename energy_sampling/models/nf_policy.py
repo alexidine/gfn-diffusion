@@ -142,7 +142,8 @@ def build_policy(gfn_config: dict):
         return GFN(**cfg)
     if kind == 'nf':
         return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)),
-                        fd_space_group=pol.get('fd_space_group'), fd_space_groups=pol.get('fd_space_groups'))
+                        fd_space_group=pol.get('fd_space_group'), fd_space_groups=pol.get('fd_space_groups'),
+                        fd_group_in_condition=bool(pol.get('fd_group_in_condition', False)))
     raise ValueError(f"model kind {kind!r}: 'sde' or 'nf'")
 
 
@@ -188,11 +189,15 @@ class _LevelHead(nn.Module):
 class NFPolicy(nn.Module):
     GAUSS_PARAM_KEYS = ('means_f', 'logvars_f', 'diag_logvars_f', 'rho_f', 'means_b', 'logvars_b')
 
-    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None, fd_space_groups=None):
+    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None, fd_space_groups=None,
+                 fd_group_in_condition: bool = False):
         """fd_space_group: the one space group of an FD run (typed rows describe its chart). fd_space_groups: the
         space groups of a mixed-group FD run (two or more), whose state is energies/fd_coordinates.py::FDSlotLayout's
         slots: each row's pad slots are pinned at 0 with no density (spline_flow.py::_ContextFlow.set_row_live, from
-        mol_batch.sg_ind) and typed rows describe each row's own group (models/fd_slot_describer.py)."""
+        mol_batch.sg_ind) and typed rows describe each row's own group (models/fd_slot_describer.py). The policy must
+        read each row's group, since a shared slot means different coordinates in different groups: flow sym_ops
+        pooled, or fd_group_in_condition (the condition vector carries it: sg_conditioning). Typed rows alone do not
+        (groups of one chart family share their row names)."""
         super().__init__()
         from models.gfn import GFN
         unknown = set(flow) - set(NF_ALL_DEFAULTS)
@@ -231,6 +236,10 @@ class NFPolicy(nn.Module):
             if not (self.conditional and s['atom_tokens']):
                 raise NotImplementedError("a mixed-group FD state needs a conditional policy on the molecule route "
                                           "(atom_tokens): each row's space group is read from mol_batch")
+            if s['sym_ops'] in (None, False, 0, 'off', 'none') and not fd_group_in_condition:
+                raise ValueError(f"fd_space_groups {list(self.fd_slots.groups)}: the policy must read each row's "
+                                 f"space group (flow sym_ops pooled, or a space-group condition column: "
+                                 f"sg_conditioning); without it the flow learns one blend over the groups")
         if s['row_tokens'] not in ROW_TOKENS:
             raise ValueError(f"flow row_tokens {s['row_tokens']!r}: one of {ROW_TOKENS}")
         if s['sym_ops'] not in SYM_OPS:
