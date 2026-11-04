@@ -272,10 +272,10 @@ class LatentFlow(nn.Module):
             if isinstance(blk.made, CausalTransformerConditioner):
                 blk.made.bf16 = bool(on)
 
-    def set_row_radius(self, radius, volume=None):
+    def set_row_radius(self, radius, mol=None):
         """Typed rows: the molecule radius per row [n] (Angstrom) of the next call, and with prefix features its
-        volume [n] (cubic Angstrom)."""
-        self.row_radius, self.row_volume = radius, volume
+        molecule inputs [n, 3] (models/fd_row_describer.py::mol_inputs)."""
+        self.row_radius, self.row_volume = radius, mol
 
     def row_extra(self, z):
         """Typed rows: the describer's per-row features [b, d, k] of the block's rows z [b, d]; None without one."""
@@ -693,10 +693,10 @@ class _ContextFlow(nn.Module):
             raise ValueError(f"{scalars.shape[-1]} molecule scalars, the flow reads {self.n_mol_scalars}")
         self.atom_scalars = scalars
 
-    def set_row_radius(self, radius, volume=None):
+    def set_row_radius(self, radius, mol=None):
         """Typed rows: the molecule radius [n_cond] (Angstrom, MolData.radius) per condition id, beside the atom
-        table, and with prefix features its volume [n_cond] (cubic Angstrom, MolData.mol_volume)."""
-        self.row_radius, self.row_volume = radius, volume
+        table, and with prefix features its molecule inputs [n_cond, 3] (models/fd_row_describer.py::mol_inputs)."""
+        self.row_radius, self.row_volume = radius, mol
 
     def row_extra(self, x, c):
         """Typed rows: the describer's per-row features [b, d, k] of the block's rows x [b, d] under conditions c

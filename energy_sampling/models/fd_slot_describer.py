@@ -66,26 +66,27 @@ class SlotRowDescriber:
                                f"for {b} rows (set_row_groups)")
         return self.row_sg
 
-    def __call__(self, s, radius, volume=None):
-        """[B, dim, k] of states s [B, dim] at molecule radii [B] and, with prefix features, volumes [B]."""
-        st = self.stepper(radius, volume, s.shape[0], s.device)
+    def __call__(self, s, radius, mol=None):
+        """[B, dim, k] of states s [B, dim] at molecule radii [B] and, with prefix features, molecule inputs
+        [B, len(MOL_INPUTS)] (models/fd_row_describer.py::mol_inputs)."""
+        st = self.stepper(radius, mol, s.shape[0], s.device)
         return torch.stack([st.row(s, i) for i in range(self.dim)], 1).to(dtype=s.dtype)
 
-    def stepper(self, radius, volume=None, b=None, device=None):
-        return SlotStepper(self, radius, volume, b, device)
+    def stepper(self, radius, mol=None, b=None, device=None):
+        return SlotStepper(self, radius, mol, b, device)
 
 
 class SlotStepper:
     """Slot i's features [B, k] from slots < i: each group's RowStepper over its own rows, asked for its chart row in
     slot i (slots and chart rows increase together within a group)."""
 
-    def __init__(self, desc: SlotRowDescriber, radius, volume, b, device):
+    def __init__(self, desc: SlotRowDescriber, radius, mol, b, device):
         r = torch.as_tensor(radius)
         dev = r.device if device is None else device
         r = r.to(device=dev, dtype=F64).reshape(-1)
         self.b = r.numel() if b is None else int(b)
         sg = desc._groups(self.b)
-        vol = None if volume is None else torch.as_tensor(volume).to(device=dev, dtype=F64).reshape(-1)
+        vol = None if mol is None else torch.as_tensor(mol).to(device=dev, dtype=F64).reshape(self.b, -1)
         self.desc, self.dev = desc, dev
         self.parts = []   # (group, rows, chart row of each slot or -1, stepper)
         for g in sorted(set(sg.tolist())):

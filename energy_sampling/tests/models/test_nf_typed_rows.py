@@ -34,6 +34,12 @@ TF = dict(conditioner='transformer', tf_width=32, tf_layers=2, tf_heads=2, tf_fp
           atom_convs=2, atom_tokens='split', row_tokens='typed')
 
 
+def _mol(vol, thin=1.9, long=5.0):
+    """Prefix molecule inputs [B, 3] (models/fd_row_describer.py::MOL_INPUTS) at volumes vol [B]."""
+    vol = torch.as_tensor(vol)
+    return torch.stack([vol, torch.full_like(vol, thin), torch.full_like(vol, long)], -1)
+
+
 def _rows(d, b, seed):
     return torch.rand(b, d, generator=torch.Generator().manual_seed(seed), dtype=torch.float64) * 2 - 1
 
@@ -96,7 +102,7 @@ def test_stepper_gives_the_full_pass_features_one_row_at_a_time(sg, prefix):
     desc = FDRowDescriber(sg, prefix=prefix)
     s = _rows(desc.dim, 32, sg)
     radius = torch.rand(32, dtype=torch.float64, generator=torch.Generator().manual_seed(5)) * 3 + 2
-    vol = torch.rand(32, dtype=torch.float64, generator=torch.Generator().manual_seed(6)) * 200 + 100
+    vol = _mol(torch.rand(32, dtype=torch.float64, generator=torch.Generator().manual_seed(6)) * 200 + 100)
     full = desc(s, radius, vol)
     st = desc.stepper(radius, vol, 32)
     for i in range(desc.dim):
@@ -117,7 +123,7 @@ def test_describer_on_the_gpu_gives_the_cpu_features(sg):
     desc = FDRowDescriber(sg, prefix=True)
     s = _rows(desc.dim, 64, sg).float()
     radius = torch.rand(64, generator=torch.Generator().manual_seed(3)) * 3 + 2
-    vol = torch.rand(64, generator=torch.Generator().manual_seed(4)) * 200 + 100
+    vol = _mol(torch.rand(64, generator=torch.Generator().manual_seed(4)) * 200 + 100)
     cpu = desc(s, radius, vol)
     gpu = desc(s.cuda(), radius.cuda(), vol.cuda())
     assert gpu.device.type == 'cuda' and gpu.dtype == s.dtype
@@ -282,7 +288,7 @@ def test_prefix_features_read_only_completed_blocks(sg):
     assert desc.k == K_EXTRA + len(CELL_FEATS) + len(POS_FEATS)
     s = _rows(desc.dim, 32, sg) * 0.98
     radius = torch.full((32,), 3.1, dtype=torch.float64)
-    vol = torch.full((32,), 140.0, dtype=torch.float64)
+    vol = _mol(torch.full((32,), 140.0, dtype=torch.float64))
     out = desc(s, radius, vol)
     assert torch.isfinite(out).all()
     for i in range(desc.dim):
@@ -307,13 +313,23 @@ def test_prefix_cell_and_image_features_match_a_direct_computation():
     b = 16
     s = _rows(desc.dim, b, 5) * 0.95
     radius = torch.full((b,), 3.0, dtype=torch.float64)
-    vol = torch.full((b,), 150.0, dtype=torch.float64)
+    vol = _mol(torch.full((b,), 150.0, dtype=torch.float64))
     out = desc(s, radius, vol)
     d, _ = FDCoordinates(14, 3.0).to_description(s)
     T = cell_matrices(d.cell)
     v_cell = torch.linalg.det(T).abs()
     last = out[:, -1]
     assert torch.allclose(last[:, K_EXTRA], torch.log(v_cell / (4 * 150.0)), atol=1e-9)
+    # plane spacings over the thinnest half-extent (1.9), and the shortest lattice vector over the longest (5.0)
+    from mxtaltools.crystal_fd.ops import metric_tensor
+    dd = 1.0 / torch.sqrt(torch.diagonal(torch.linalg.inv(metric_tensor(d.cell)), dim1=-2, dim2=-1))
+    i_thin = K_EXTRA + CELL_FEATS.index('log_d100_thin')
+    assert torch.allclose(last[:, i_thin:i_thin + 3], torch.log(dd / 1.9), atol=1e-9)
+    n = torch.stack(torch.meshgrid(*(torch.arange(-3, 4, dtype=torch.float64),) * 3, indexing='ij'), -1).reshape(-1, 3)
+    n = n[n.abs().sum(-1) > 0]
+    l_min = torch.einsum('bij,kj->bki', T, n).norm(dim=-1).amin(-1)      # brute force over a wider integer box
+    i_short = K_EXTRA + CELL_FEATS.index('log_shortest_over_long')
+    assert torch.allclose(last[:, i_short], torch.log(l_min / 5.0), atol=1e-9), (last[:, i_short] - torch.log(l_min / 5.0)).abs().max()
     t = d.t[:, 0]
     grid = torch.stack(torch.meshgrid(*(torch.arange(-2, 3, dtype=torch.float64),) * 3, indexing='ij'), -1)
     disp = (-t - t)[:, None] + grid.reshape(-1, 3)[None]
@@ -325,7 +341,7 @@ def test_prefix_cell_and_image_features_match_a_direct_computation():
 def test_p1_has_no_images_and_says_so():
     from models.fd_row_describer import CELL_FEATS
     desc = FDRowDescriber(1, prefix=True)
-    out = desc(_rows(desc.dim, 4, 1), torch.full((4,), 3.0), torch.full((4,), 100.0))
+    out = desc(_rows(desc.dim, 4, 1), torch.full((4,), 3.0), _mol(torch.full((4,), 100.0)))
     pos = out[:, -1, K_EXTRA + len(CELL_FEATS):]
     assert torch.equal(pos[:, :8], torch.zeros_like(pos[:, :8])) and torch.equal(pos[:, 8], torch.ones(4, dtype=pos.dtype))
 

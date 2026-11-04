@@ -6,7 +6,7 @@ what s means physically:
 
 - ``types``: the row's coordinate type, an index into FD_TYPES (the chart's coordinate name). The same name means
   the same quantity in every space group, so the conditioner's slot and value embeddings are shared across groups.
-- ``__call__(s, radius, volume)`` -> [B, d, k], row i's block a function of rows < i only (the conditioner adds it
+- ``__call__(s, radius, mol)`` -> [B, d, k], row i's block a function of rows < i only (the conditioner adds it
   to the slot that predicts row i):
     [lo_i, hi_i]        the physical interval of row i given rows < i (cell and orientation blocks: chart.bounds;
                         centroid block: PolytopeARChart.t_bounds, the fractional-coordinate interval, not u's [0, 1]);
@@ -21,14 +21,20 @@ what s means physically:
 - with ``prefix=True``, the prefix physics features of the blocks completed before row i (zero, flag 0, on rows of
   the block itself and before it):
     after the cell block (CELL_FEATS):  log(V_cell / (Z V_mol)) (= -log packing coefficient), log(d_100 / r_mol),
-        log(d_010 / r_mol), log(d_001 / r_mol) (interplanar spacings from the reciprocal metric), flag;
+        log(d_010 / r_mol), log(d_001 / r_mol) (interplanar spacings from the reciprocal metric), the same three over
+        the molecule's thinnest half-extent (does a layer of molecules fit between the planes), log(L_min / its
+        longest half-extent) (L_min the shortest lattice vector, over the 13 combinations n in {-1, 0, 1}^3 of the
+        cell vectors up to sign; on the FD charts' cells no miss against a search over [-4, 4]^3, 4000 chart rows in
+        each of 14 Day groups, 2026-11-04: does the molecule collide with its own translate), flag;
     after the centroid block (POS_FEATS): over the images of the molecule's centroid under every non-identity
         operation of the group (minimum image over the 27 neighbouring cells, distances over r_mol): a soft minimum
         of the distance, a soft count within 2 r_mol, the soft minimum per operation class (inversion, other proper
         operations, other improper operations; translations count only in the first two), the class's presence (0/1),
         flag.
   Z is the number of operations of the conventional cell (centring included), V_mol the molecule volume
-  (MolData.mol_volume). Soft, so the features are differentiable and a draw's rounding cannot switch them.
+  (MolData.mol_volume); the half-extents are sqrt of the heavy-atom gyration tensor's least and greatest eigenvalues
+  plus R_VDW (mol_inputs), so a planar molecule keeps a thickness. The molecule enters as mol [B, len(MOL_INPUTS)].
+  Soft, so the features are differentiable and a draw's rounding cannot switch them.
 
 Computed in float64 on the rows' device from the clamped rows, as energies/molecular_crystal.py::fd_rows_to_params
 clamps them, so the density pass and the cached decode see the same numbers for the same float32 rows.
@@ -44,12 +50,34 @@ FD_TYPES = ('log_a', 'log_b', 'log_c', 'r1', 'r2', 's', 's_beta', 's_gamma', 'v'
             'theta', 'phi', 'r', 'r_signed')
 LENGTHS = ('log_a', 'log_b', 'log_c', 'r1', 'r2')   # rows whose physical value is a log length
 K_EXTRA = 5
-CELL_FEATS = ('log_vcell_over_zvmol', 'log_d100', 'log_d010', 'log_d001', 'cell_done')
+CELL_FEATS = ('log_vcell_over_zvmol', 'log_d100', 'log_d010', 'log_d001', 'log_d100_thin', 'log_d010_thin',
+              'log_d001_thin', 'log_shortest_over_long', 'cell_done')
+#: the molecule input of prefix features, per row: volume (cubic Angstrom), thinnest and longest half-extent (Angstrom)
+MOL_INPUTS = ('volume', 'thin', 'long')
+R_VDW = 1.7         # Angstrom added to a gyration half-extent (a carbon's van der Waals radius)
 POS_FEATS = ('image_softmin', 'images_within_2r', 'inversion_softmin', 'proper_softmin', 'improper_softmin',
              'has_inversion', 'has_proper', 'has_improper', 'position_done')
 SOFT_TAU = 0.05     # soft minimum temperature, in units of r_mol
 COUNT_WIDTH = 0.1   # soft count's sigmoid width, in units of r_mol
 F64 = torch.float64
+
+
+def mol_inputs(volume, z, pos, counts):
+    """[n, len(MOL_INPUTS)] float64 prefix molecule inputs of n molecules: volume [n] (MolData.mol_volume), atomic
+    numbers z [n, a] and positions pos [n, a, 3] padded past counts [n]. Half-extents from the heavy-atom gyration
+    tensor (every atom when a molecule has no heavy atom), sqrt(eigenvalue) + R_VDW."""
+    n, a = z.shape
+    real = torch.arange(a, device=z.device)[None, :] < counts[:, None]
+    heavy = real & (z > 1)
+    heavy = torch.where(heavy.any(1, keepdim=True), heavy, real)
+    p = pos.to(F64)
+    w = heavy.to(F64)[..., None]
+    mu = (p * w).sum(1) / w.sum(1)
+    d = (p - mu[:, None]) * w
+    lam = torch.linalg.eigvalsh(d.transpose(1, 2) @ d / w.sum(1)[..., None]).clamp_min(0.0)   # ascending
+    ext = torch.sqrt(lam) + R_VDW
+    v = torch.as_tensor(volume).to(device=p.device, dtype=F64).reshape(-1)
+    return torch.stack([v, ext[:, 0], ext[:, -1]], -1)
 
 
 def _op_classes(sg):
@@ -98,6 +126,13 @@ def _cell_row_map(blk, ys, i):
     return None                                                                         # log lengths already
 
 
+def _lattice_combos(like):
+    """[13, 3] the integer combinations n in {-1, 0, 1}^3 of the cell vectors, one of each +/- pair."""
+    n = torch.stack(torch.meshgrid(*(torch.arange(-1, 2, dtype=like.dtype, device=like.device),) * 3,
+                                   indexing='ij'), -1).reshape(-1, 3)
+    return n[14:]                       # after the zero vector (index 13): exactly one of n, -n
+
+
 def _softmin(x, mask, tau=SOFT_TAU):
     """Soft minimum over the last axis of x where mask (zero where nothing is masked in)."""
     big = torch.where(mask, -x / tau, torch.full_like(x, -float('inf')))
@@ -141,26 +176,31 @@ class FDRowDescriber:
         self.z = len(SYM_OPS[self.sg])
         self.op_W, self.op_w, self.op_cls = _op_classes(self.sg)
 
-    def __call__(self, s: torch.Tensor, radius: torch.Tensor, volume=None) -> torch.Tensor:
+    def __call__(self, s: torch.Tensor, radius: torch.Tensor, mol=None) -> torch.Tensor:
         """[B, d, k] (module docstring) of rows s [B, d] at molecule radii radius [B] (Angstrom) and, with prefix
-        features, molecule volumes volume [B] (cubic Angstrom)."""
+        features, molecule inputs mol [B, len(MOL_INPUTS)] (mol_inputs)."""
         if s.ndim != 2 or s.shape[1] != self.dim:
             raise ValueError(f'sg {self.sg}: expected rows [B, {self.dim}], got {tuple(s.shape)}')
-        st = self.stepper(radius, volume, s.shape[0], s.device)
+        st = self.stepper(radius, mol, s.shape[0], s.device)
         return torch.stack([st.row(s, i) for i in range(self.dim)], 1).to(dtype=s.dtype)
 
-    def stepper(self, radius, volume=None, b=None, device=None) -> 'RowStepper':
+    def stepper(self, radius, mol=None, b=None, device=None) -> 'RowStepper':
         """A RowStepper for b rows at these radii and volumes: row i's features one row at a time, each row's chart
         work done once, so a decode that fixes one row per step pays for one row per step. __call__ is a stepper
         run over every row, so the two give the same numbers."""
-        return RowStepper(self, radius, volume, b, device)
+        return RowStepper(self, radius, mol, b, device)
 
-    def _cell_features(self, cell, r, vol):
+    def _cell_features(self, cell, r, mol):
         from mxtaltools.crystal_fd.ops import cell_matrices, metric_tensor
-        v_cell = torch.linalg.det(cell_matrices(cell)).abs()
+        T = cell_matrices(cell)                                                      # [B, 3, 3], columns a, b, c
+        v_cell = torch.linalg.det(T).abs()
         g_inv = torch.linalg.inv(metric_tensor(cell))
         d = 1.0 / torch.sqrt(torch.diagonal(g_inv, dim1=-2, dim2=-1))              # [B, 3] d_100, d_010, d_001
+        combos = _lattice_combos(T)                                                  # [13, 3]
+        l_min = torch.einsum('bij,kj->bki', T, combos).norm(dim=-1).amin(-1)        # [B] shortest lattice vector
+        vol, thin, long = mol[:, 0], mol[:, 1], mol[:, 2]
         return torch.cat([torch.log(v_cell / (self.z * vol))[:, None], torch.log(d / r[:, None]),
+                          torch.log(d / thin[:, None]), torch.log(l_min / long)[:, None],
                           torch.ones_like(r)[:, None]], -1)
 
     def _position_features(self, cell, t, r):
@@ -193,7 +233,7 @@ class RowStepper:
     asked for in increasing order; a row already fixed is not re-read, so s's rows < i must not change between
     calls (in a decode they do not)."""
 
-    def __init__(self, desc: FDRowDescriber, radius, volume, b, device):
+    def __init__(self, desc: FDRowDescriber, radius, mol, b, device):
         from energies.fd_coordinates import ORIENTATION, length_box
         from mxtaltools.crystal_fd.charts import CellChart, CrystalChart, PolytopeARChart
         self.desc = desc
@@ -204,11 +244,13 @@ class RowStepper:
             raise ValueError(f'{r.numel()} radii for {b} rows')
         self.r, self.b, self.dev = r, r.numel(), dev
         self.log_r = torch.log(r)
-        self.vol = None
+        self.mol = None
         if desc.prefix:
-            if volume is None:
-                raise ValueError('prefix features need the molecule volumes (MolData.mol_volume)')
-            self.vol = torch.as_tensor(volume).to(device=dev, dtype=F64).reshape(-1)
+            if mol is None:
+                raise ValueError('prefix features need the molecule inputs (fd_row_describer.mol_inputs)')
+            self.mol = torch.as_tensor(mol).to(device=dev, dtype=F64).reshape(-1, len(MOL_INPUTS))
+            if self.mol.shape[0] != self.b:
+                raise ValueError(f'{self.mol.shape[0]} molecule inputs for {self.b} rows')
         # FDCoordinates(sg, r).chart, built on the rows' device (the centroid block's coefficient tables included)
         chart = CrystalChart.for_length_box(desc.sg, length_box(desc.sg, r), ORIENTATION, device=dev)
         self.where = []                                   # row -> (block, offset, index in block)
@@ -278,7 +320,7 @@ class RowStepper:
         if self.desc.prefix and i == blk.ndim - 1:
             if isinstance(blk, self._cell_type):
                 self.cell = blk.map(torch.stack(ys + [y], 1))[0]                        # [B, 6] lengths, angles
-                self.cell_f = self.desc._cell_features(self.cell, self.r, self.vol)
+                self.cell_f = self.desc._cell_features(self.cell, self.r, self.mol)
                 if self.pos_blk.ndim == 0:      # a group with no centroid rows: its position is fixed with the cell
                     self._position_done(s)
             elif isinstance(blk, self._pos_type):

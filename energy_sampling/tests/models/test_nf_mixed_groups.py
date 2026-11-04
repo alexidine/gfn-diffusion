@@ -123,6 +123,7 @@ def test_slot_describer_is_each_groups_own_in_its_slots(prefix):
     s = _states(layout, sgs, 1)
     r = torch.rand(5, dtype=torch.float64, generator=torch.Generator().manual_seed(2)) * 3 + 2
     v = torch.rand(5, dtype=torch.float64, generator=torch.Generator().manual_seed(3)) * 200 + 100
+    v = torch.stack([v, torch.full_like(v, 1.9), torch.full_like(v, 5.0)], -1)   # fd_row_describer.MOL_INPUTS
     out = desc(s, r, v if prefix else None)
     assert out.shape == (5, layout.dim, desc.k) and desc.k == desc.k_group + len(FD_TYPES) + 1
     for g in GROUPS:

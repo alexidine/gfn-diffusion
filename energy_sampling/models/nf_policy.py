@@ -395,8 +395,8 @@ class NFPolicy(nn.Module):
         columns, standardised (temperature, space group, Z': the encoder reads the molecule, these pass through)."""
         if not self.conditional:
             if getattr(self.sampler, 'describer', None) is not None:
-                r, v = self._unconditional_molecule(mol_batch)
-                self.sampler.set_row_radius(r.expand(n), None if v is None else v.expand(n))
+                r, m = self._unconditional_molecule(mol_batch)
+                self.sampler.set_row_radius(r.expand(n), None if m is None else m.expand(n, -1))
             return None
         if not self.settings['atom_tokens']:
             return condition.to(self.device, torch.float32)
@@ -432,15 +432,16 @@ class NFPolicy(nn.Module):
             if radius is None:
                 raise ValueError("flow row_tokens typed/prefix need each molecule's radius (MolData.radius) on "
                                  "mol_batch")
-            volume = None
+            mol = None
             if self.sampler.flow.describer.prefix:
                 volume = getattr(mol_batch, 'mol_volume', None)
                 if volume is None:
                     raise ValueError("flow row_tokens prefix needs each molecule's volume (MolData.mol_volume) on "
                                      "mol_batch")
-                volume = torch.as_tensor(volume).reshape(-1).to(self.device, torch.float64)
+                from models.fd_row_describer import mol_inputs
+                mol = mol_inputs(volume, z, pos, counts).to(self.device)
             self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64),
-                                             volume)
+                                             mol)
         ids = torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
         if self.conditions_dim == 0:
             return ids
@@ -453,18 +454,33 @@ class NFPolicy(nn.Module):
 
     def _unconditional_molecule(self, mol_batch):
         """Typed rows on an unconditional policy: the one molecule's radius [] (Angstrom) and, with prefix features,
-        volume [] (cubic Angstrom, else None), float64, read from mol_batch.radius / mol_volume when the call carries
-        them (every row must agree with the values first seen) and the held values otherwise."""
+        its molecule inputs [3] (models/fd_row_describer.py::mol_inputs; else None), float64, read from mol_batch
+        (radius; mol_volume, z, pos) when the call carries them (every row must agree with the values first seen) and
+        the held values otherwise."""
         prefix = self.sampler.describer.prefix
         for name, attr in (('radius', '_mol_radius'), ('mol_volume', '_mol_volume')):
             if name == 'mol_volume' and not prefix:
                 continue
             val = getattr(mol_batch, name, None) if mol_batch is not None else None
+            if val is not None and name == 'mol_volume':
+                if getattr(mol_batch, 'pos', None) is None:
+                    raise ValueError("flow row_tokens prefix needs the molecule's atoms (z, pos) on mol_batch")
+                from models.fd_row_describer import mol_inputs
+                ptr = mol_batch.ptr.to(self.device)
+                nodes = mol_batch.batch.to(self.device)
+                counts = torch.diff(ptr)
+                idx = torch.arange(nodes.numel(), device=self.device) - ptr[nodes]
+                zz = torch.zeros(int(counts.numel()), int(counts.max()), dtype=torch.long, device=self.device)
+                pp = torch.zeros(*zz.shape, 3, dtype=torch.float64, device=self.device)
+                zz[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
+                pp[nodes, idx] = mol_batch.pos.double().to(self.device)
+                val = mol_inputs(val, zz, pp, counts)
             if val is not None:
-                v = torch.as_tensor(val).reshape(-1).to(self.device, torch.float64)
+                v = torch.as_tensor(val).to(self.device, torch.float64)
+                v = v.reshape(-1) if name == 'radius' else v.reshape(-1, 3)
                 if getattr(self, attr) is None:
                     setattr(self, attr, v[0].clone())
-                if not bool(torch.allclose(v, getattr(self, attr).expand_as(v), rtol=1e-6, atol=1e-6)):
+                if not bool(torch.allclose(v, getattr(self, attr).expand_as(v), rtol=1e-6, atol=1e-5)):
                     raise ValueError(f"flow typed_rows on an unconditional policy: the batch's molecule {name}s "
                                      f"differ from the one molecule's (an unconditional run has one molecule)")
             if getattr(self, attr) is None:
