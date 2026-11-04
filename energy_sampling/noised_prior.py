@@ -118,7 +118,8 @@ def basin_factors(H, live, caps, kT, tau, shape='hessian'):
     return L
 
 
-def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws=4, width=12, generator=None):
+def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws=4, width=12, generator=None,
+               pack=None):
     """(points [N, width] float32, ok [N] bool): fresh draws x = p[r] + L[r] z around the basins r in rows (p [n, 12],
     hand [n], L [n, 12, 12] from basin_factors, sg [n], radius [n]), each canonicalised into the chart:
       'fd'      fd_coordinates(sg, radius).from_params (energies/fd_coordinates.py::FDCoordinates; train.py passes
@@ -126,7 +127,8 @@ def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws
       'latent'  the trainer latent at a uniformly drawn trainer-box image
                 (energies/molecular_crystal.py::latent_rows_from_params)
     A draw with no chart point is redrawn up to `redraws` times; a row still without one has ok False and zeros. The
-    draws use `generator` (None: the global torch generator)."""
+    draws use `generator` (None: the global torch generator). pack(sg, points) -> [n, width] places a group's chart
+    points in the state (an FD run's energies/fd_coordinates.py::FDSlotLayout.pack); None: in the first columns."""
     from energies.molecular_crystal import latent_rows_from_params
     if chart not in ('fd', 'latent'):
         raise ValueError(f"basin_draw: chart must be 'fd' or 'latent', got {chart!r}")
@@ -151,7 +153,10 @@ def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws
                                                   generator=generator)
                 pts = lat[ok]
             done = idx[sel[ok]]
-            out[done, :pts.shape[1]] = pts
+            if pack is not None:
+                out[done] = pack(int(g), pts)
+            else:
+                out[done, :pts.shape[1]] = pts
             pending[done] = False
     return out, ~pending
 

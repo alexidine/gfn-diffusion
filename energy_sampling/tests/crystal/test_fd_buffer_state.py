@@ -9,6 +9,7 @@ CPU, no model or energy.
 
     python -m pytest -q tests/crystal/test_fd_buffer_state.py
 """
+import importlib.util
 import inspect
 import pickle
 from types import SimpleNamespace
@@ -46,11 +47,14 @@ def _rows(params, fd_state=None):
 def test_the_fd_buffer_reader_pickles_and_the_modeller_hands_it_out():
     m = Modeller.__new__(Modeller)
     m.args = SimpleNamespace(z_primes=[1])
-    m.energy_function = SimpleNamespace(crystal_coordinates='fd', data_ndim=12, is_crystal=True)
+    m.energy_function = SimpleNamespace(crystal_coordinates='fd', data_ndim=12, is_crystal=True,
+                                        fd_layout=SimpleNamespace(groups=(2, 14)))
     x_fn = m._buffer_kwargs()['x_fn']
     assert isinstance(x_fn, FDChartState) and not inspect.ismethod(x_fn)
     back = pickle.loads(pickle.dumps(x_fn))
-    assert back.data_ndim == 12
+    assert back.data_ndim == 12 and back.space_groups == (2, 14)
+    if importlib.util.find_spec('mxtaltools.crystal_fd') is not None:   # the built slot layout is not pickled
+        assert x_fn._layout().dim == 12 and '_slots' not in pickle.loads(pickle.dumps(x_fn)).__dict__
 
 
 def test_the_reader_returns_the_cached_chart_point_else_canonicalises_else_nan():

@@ -12,7 +12,10 @@ What each test would catch:
   * a reduction penalty on FD rows (the chart is the reduced set) or a bounding term inside [-1, 1];
   * the change of measure not being -T * fd_coordinates.log_reference;
   * a non-finite gradient of the reward with respect to s;
-  * Z' > 1 or several space groups accepted; the state width not the chart's.
+  * Z' > 1 accepted; the state width not the chart's;
+  * several space groups in one batch: a row scored through another group's chart, a pad slot's value read or not
+    refused, the slot layout of one group not its chart, a circle slot that is an interval in some group, a stored
+    row not round-tripping into its slots.
 """
 import pytest
 import torch
@@ -96,11 +99,66 @@ def test_reward_gradient_in_s_is_finite(capsys):
     assert float(s.grad.abs().sum()) > 0
 
 
-def test_fd_needs_one_space_group_and_z_prime_1(capsys):
+def test_fd_needs_z_prime_1(capsys):
     with pytest.raises(NotImplementedError, match="Z' = 1"):
         _energy(capsys, crystal_coordinates='fd', z_primes=(1, 2))
-    with pytest.raises(NotImplementedError, match='one space group'):
-        _energy(capsys, crystal_coordinates='fd', space_groups=[2, 14])
+
+
+def test_fd_slot_layout():
+    from energies.fd_coordinates import PAD, FDCoordinates, FDSlotLayout
+    one, fc = FDSlotLayout([14]), FDCoordinates(14, 4.0)   # one group: the state is its chart
+    assert (one.dim, one.sg, one.slots[14].tolist()) == (fc.dim, 14, list(range(fc.dim)))
+    assert one.wrap_mask == fc.wrap_mask and one.names == fc.names
+    two = FDSlotLayout([14, 2, 14])
+    assert (two.groups, two.dim, two.sg, two.block_width) == ((2, 14), 12, None, [6, 3, 3])
+    assert two.group_names[14] == ['log_c', 'log_a', 'log_b', 's', PAD, PAD, 't_x', 't_y', 't_z', 'theta', 'phi', 'r']
+    # a slot is a circle iff it is one in every group whose row it carries: t_z is an interval in sg 14
+    assert [n for n, w in zip(two.names, two.wrap_mask) if w] == ['t_x', 't_y', 'phi']
+    assert FDSlotLayout([2, 19]).wrap_mask[6:9] == [False, False, True]   # sg 19: t_x, t_y intervals, t_z a circle
+    live = two.live_mask(torch.tensor([2, 14]))
+    assert live[0].all() and live[1].tolist() == [True] * 4 + [False] * 2 + [True] * 6
+    s = torch.rand(3, 10)
+    torch.testing.assert_close(two.unpack(14, two.pack(14, s)), s)
+    assert bool((two.pack(14, s)[:, 4:6] == 0).all())
+    with pytest.raises(ValueError, match='not in this FD layout'):
+        two.live_mask(torch.tensor([19]))
+
+
+def test_mixed_groups_score_each_row_through_its_own_chart(capsys):
+    """One batch of sg 2 and sg 14 rows scores each row as the one-group route scores it, refuses a value in a pad
+    slot, and a stored row goes back into its own slots (fd_rows_of, FDChartState)."""
+    from buffer import FDChartState
+    mixed = _energy(capsys, crystal_coordinates='fd', space_groups=[2, 14])
+    lay = mixed.fd_layout
+    assert mixed.data_ndim == 12 and lay.groups == (2, 14)
+    sgs = torch.tensor([2, 14, 2, 14, 14, 2])
+    n = len(sgs)
+    g = torch.Generator().manual_seed(5)
+    states = torch.zeros(n, 12)
+    for i, sg in enumerate(sgs.tolist()):
+        s = torch.rand(1, len(lay.slots[sg]), generator=g) * 1.6 - 0.8
+        s[:, 0] = 0.85   # the longest axis long: physical packing
+        states[i] = lay.pack(sg, s)[0]
+    T = torch.full((n,), 2.5)
+    mols = _molecules(n)
+    mols.sg_ind = sgs
+    energy, scored = mixed.analyze_crystal_batch(states, mols, T, return_batch=True)
+    assert scored.sg_ind.reshape(-1).tolist() == sgs.tolist() and torch.isfinite(energy).all()
+    for sg in (2, 14):
+        rows = sgs == sg
+        single = _energy(capsys, crystal_coordinates='fd', space_groups=[sg])
+        m1 = _molecules(int(rows.sum()))
+        m1.sg_ind = sgs[rows]
+        e1, b1 = single.analyze_crystal_batch(lay.unpack(sg, states[rows]), m1, T[rows], return_batch=True)
+        torch.testing.assert_close(scored.full_cell_parameters()[rows], b1.full_cell_parameters())
+        torch.testing.assert_close(energy[rows], e1, rtol=1e-4, atol=1e-3)
+    bad = states.clone()
+    bad[1, 4] = 0.3   # a pad slot of the sg 14 row
+    with pytest.raises(ValueError, match='pad slots'):
+        mixed.analyze_crystal_batch(bad, mols, T)
+    delattr(scored, 'fd_state')
+    torch.testing.assert_close(mixed.fd_rows_of(scored), states, atol=2e-4, rtol=0)
+    torch.testing.assert_close(FDChartState(12, lay.groups)(scored), states, atol=2e-4, rtol=0)
 
 
 def test_fd_layout_sets_the_state_width(capsys):

@@ -696,6 +696,8 @@ def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violatio
     nothing and fails in the right place."""
     if _get(cfg, 'model.periodic_centroids') is not True:
         return []
+    if _get(cfg, 'energy_config.crystal_coordinates') == 'fd':   # the FD chart wraps its own rows; not read there
+        return []
     out = []
     sgs = list(_get(cfg, 'space_groups', []) or [])
     if len(sgs) != 1:

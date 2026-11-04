@@ -166,6 +166,15 @@ class FDCoordinates:
             s[gi[inside]] = (2 * u[inside].clamp(0.0, 1.0) - 1)
         return FDRows(s=s, ok=good, status=status)
 
+    def block_widths(self) -> list:
+        """[cell, centroid, orientation] row counts of the chart (every group's chart has these three blocks, in
+        this order; a group with no free centroid coordinate has a centroid block of 0 rows)."""
+        kinds = [type(b).__name__ for b in self.chart.blocks]
+        if len(kinds) != 3 or not (kinds[0] == 'CellChart' and kinds[1] == 'PolytopeARChart'
+                                   and isinstance(self.chart.blocks[2], charts.OrientationChart)):
+            raise NotImplementedError(f'sg {self.sg}: chart blocks {kinds}, not cell, centroid, orientation')
+        return [int(b.ndim) for b in self.chart.blocks]
+
     def _unit_of(self, y: torch.Tensor, chart=None) -> torch.Tensor:
         """The inverse of ``charts.from_unit``: u_i = (y_i - lo_i(y_<i)) / (hi_i - lo_i(y_<i)); circle coordinates
         are first wrapped into their [lo, hi) period."""
@@ -179,3 +188,95 @@ class FDCoordinates:
                 yi = lo + torch.remainder(yi - lo, float(d.period))
             u[:, i] = (yi - lo) / (hi - lo)
         return u
+
+
+#: the blocks of every group's chart, in chart order (FDCoordinates.block_widths)
+FD_BLOCKS = ('cell', 'centroid', 'orientation')
+PAD = 'pad'
+
+
+class FDSlotLayout:
+    """The trainer state of an FD run over the space groups ``groups`` (Z' = 1), so that one batch can hold rows of
+    several groups.
+
+    Slot block k (FD_BLOCKS) is as wide as the widest group's block k. A group's chart rows fill the first slots of
+    each block, in chart order; its remaining slots are pads, held at 0 and carrying no density (the policy pins
+    them, ``live_mask``). With one group the slots are exactly its chart rows, in order: the state of a one-group run.
+
+    ``wrap_mask``: a slot is a circle iff it is a circle in every group whose row it carries. A circle row modelled as
+    an interval on [-1, 1] is still a density on it; an interval row modelled as a circle would be tied at its two
+    ends. With one group it is the chart's own ``wrap_mask``.
+
+    Parameters
+    ----------
+    groups : iterable of int
+        The run's space groups (``MolecularCrystal.space_groups``); duplicates and order do not matter.
+    radius : float
+        Any molecule radius: the slots, widths and circle rows do not depend on it.
+    """
+
+    def __init__(self, groups, radius: float = 4.0):
+        self.groups = tuple(sorted({int(g) for g in groups}))
+        if not self.groups:
+            raise ValueError('FDSlotLayout needs at least one space group')
+        self.charts = {g: FDCoordinates(g, radius) for g in self.groups}
+        widths = {g: fc.block_widths() for g, fc in self.charts.items()}
+        self.block_width = [max(w[k] for w in widths.values()) for k in range(len(FD_BLOCKS))]
+        self.block_start = [sum(self.block_width[:k]) for k in range(len(FD_BLOCKS))]
+        self.dim = sum(self.block_width)
+        lut = torch.full((max(self.groups) + 1,), -1, dtype=torch.long)
+        lut[torch.tensor(self.groups)] = torch.arange(len(self.groups))
+        self._index = lut
+        self.slots, names = {}, {}
+        live = torch.zeros(len(self.groups), self.dim, dtype=torch.bool)
+        wrap = torch.zeros(len(self.groups), self.dim, dtype=torch.bool)
+        for j, g in enumerate(self.groups):
+            fc = self.charts[g]
+            slot = []
+            for k, n in enumerate(widths[g]):
+                slot += list(range(self.block_start[k], self.block_start[k] + n))
+            self.slots[g] = torch.tensor(slot, dtype=torch.long)
+            live[j, self.slots[g]] = True
+            wrap[j, self.slots[g]] = torch.tensor(fc.wrap_mask, dtype=torch.bool)
+            row_names = [PAD] * self.dim
+            for i, n in zip(slot, fc.names):
+                row_names[i] = n
+            names[g] = row_names
+        self.group_names = names
+        self.live = live                                  # [n_groups, dim]
+        self.group_wrap = wrap                            # [n_groups, dim], each group's own circle rows
+        self.wrap_mask = [bool(live[:, i].any()) and bool((wrap[:, i] | ~live[:, i]).all()) for i in range(self.dim)]
+        #: per slot, the chart names it carries across the groups ('|'-joined); one group: the chart's names
+        self.names = ['|'.join(dict.fromkeys(names[g][i] for g in self.groups if names[g][i] != PAD)) or PAD
+                      for i in range(self.dim)]
+        self.sg = self.groups[0] if len(self.groups) == 1 else None
+
+    def group_index(self, sg) -> torch.Tensor:
+        """[B] index into ``groups`` of each row's space group ``sg`` [B]; raises on a group outside the layout."""
+        sg = torch.as_tensor(sg).long().reshape(-1).cpu()
+        idx = torch.full_like(sg, -1)
+        ok = (sg >= 0) & (sg < len(self._index))
+        idx[ok] = self._index[sg[ok]]
+        if bool((idx < 0).any()):
+            bad = sorted(set(sg[idx < 0].tolist()))
+            raise ValueError(f'space groups {bad} are not in this FD layout {list(self.groups)}')
+        return idx
+
+    def live_mask(self, sg) -> torch.Tensor:
+        """[B, dim] bool, the slots that carry a chart row of each row's space group ``sg`` [B] (False: a pad)."""
+        return self.live[self.group_index(sg)]
+
+    def pack(self, sg: int, s: torch.Tensor) -> torch.Tensor:
+        """[n, dim] state of chart rows s [n, d_sg] of group sg, pads 0."""
+        slot = self.slots[int(sg)]
+        if s.shape[-1] != len(slot):
+            raise ValueError(f'sg {int(sg)}: chart rows are {len(slot)} wide, got {s.shape[-1]}')
+        out = s.new_zeros(s.shape[0], self.dim)
+        out[:, slot.to(s.device)] = s
+        return out
+
+    def unpack(self, sg: int, x: torch.Tensor) -> torch.Tensor:
+        """[n, d_sg] chart rows of group sg from states x [n, dim] (the pads dropped, not checked)."""
+        if x.shape[-1] != self.dim:
+            raise ValueError(f'FD states are {self.dim} wide, got {x.shape[-1]}')
+        return x[:, self.slots[int(sg)].to(x.device)]

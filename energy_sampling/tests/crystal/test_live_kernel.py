@@ -88,7 +88,7 @@ def test_malformed_basin_settings_are_refused(block):
 
 def _basin_modeller(n=3, H_scale=1e4, caps=(1.0, 0.2, 0.1, 0.5), bank=0, fresh=0.1, redraws=4, chart='fd'):
     pytest.importorskip('mxtaltools.crystal_fd')
-    from energy_sampling.energies.fd_coordinates import FDCoordinates
+    from energy_sampling.energies.fd_coordinates import FDCoordinates, FDSlotLayout
     fc = FDCoordinates(2, RADIUS)
     p = torch.tensor([P_MIPCAS] * n, dtype=torch.float64)
     s0 = fc.from_params(p, torch.ones(n, dtype=torch.float64))
@@ -103,7 +103,8 @@ def _basin_modeller(n=3, H_scale=1e4, caps=(1.0, 0.2, 0.1, 0.5), bank=0, fresh=0
                             num_graphs=n, cell_lengths=torch.zeros(n, 3))
     m.prior_dataset = SimpleNamespace(batch=batch)
     m.energy_function = SimpleNamespace(temperature=2.5, crystal_coordinates=chart, is_crystal=True,
-                                        fd_coordinates_rows=lambda sg, r: FDCoordinates(int(sg), float(r[0])))
+                                        fd_coordinates_rows=lambda sg, r: FDCoordinates(int(sg), float(r[0])),
+                                        fd_layout=FDSlotLayout([2]))
     return m, s0.s.float()
 
 

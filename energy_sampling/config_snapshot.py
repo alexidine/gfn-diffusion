@@ -193,19 +193,22 @@ def _periodic_centroid_axes(args):
 
 
 def _fd_wrap_rows(args):
-    """energy_config.crystal_coordinates 'fd': {chart row name: wrapped}, the FD chart's circle rows
-    (energies/fd_coordinates.py::FDCoordinates.wrap_mask) for the one space group; the trainer passes these as the
-    angular mask and does not read model.periodic_centroids. A string when the chart cannot be built."""
+    """energy_config.crystal_coordinates 'fd': {state slot name: wrapped}, the circle slots of the run's state
+    (energies/fd_coordinates.py::FDSlotLayout.wrap_mask over space_groups; one group: its chart's circle rows, keyed
+    by chart name); the trainer passes these as the angular mask and does not read model.periodic_centroids. Several
+    groups key each slot by its index and the chart names it carries. A string when the layout cannot be built."""
     sgs = list(getattr(args, 'space_groups', []) or [])
-    if len(sgs) != 1:
-        return f'INVALID: needs exactly one space group, got {sgs}'
+    if not sgs:
+        return 'INVALID: needs at least one space group'
     try:
-        from energy_sampling.energies.fd_coordinates import FDCoordinates
+        from energy_sampling.energies.fd_coordinates import FDSlotLayout
         from energy_sampling.energies.molecular_crystal import FD_LAYOUT_RADIUS
-        fd = FDCoordinates(int(sgs[0]), FD_LAYOUT_RADIUS)
+        fd = FDSlotLayout(sgs, FD_LAYOUT_RADIUS)
     except Exception as e:
         return f'UNRESOLVED: {type(e).__name__}: {e}'
-    return {name: bool(w) for name, w in zip(fd.names, fd.wrap_mask)}
+    if fd.sg is not None:
+        return {name: bool(w) for name, w in zip(fd.names, fd.wrap_mask)}
+    return {f'{i}:{name}': bool(w) for i, (name, w) in enumerate(zip(fd.names, fd.wrap_mask))}
 
 
 def snapshot(yaml_path: str) -> dict:

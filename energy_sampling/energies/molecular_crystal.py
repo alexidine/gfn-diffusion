@@ -250,7 +250,7 @@ class MolecularCrystal(BaseSet):
                  prior_flow_path: Optional[str] = None,  # density proxy for the PRIOR POLICY, written by build_prior_flow.py
                  lambda_mix: float = 1.0,  # 1 = pure physical target; 0 = pure prior-flow target (the null test). Schedulable via balance.anneal_coeffs.
                  energy_reference: Optional[str] = None,  # 'seed_min': score the physical leg against each condition's lowest seed energy (set_energy_reference); None: no reference
-                 crystal_coordinates: str = 'latent',  # 'latent': x is the trainer latent; 'fd': x is crystal_fd's fundamental-domain chart in [-1, 1]^d (energies/fd_coordinates.py), Z' = 1 only
+                 crystal_coordinates: str = 'latent',  # 'latent': x is the trainer latent; 'fd': x is crystal_fd's fundamental-domain chart in [-1, 1]^d (energies/fd_coordinates.py), Z' = 1 only, its rows in the slots of energies/fd_coordinates.py::FDSlotLayout over space_groups
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -304,11 +304,12 @@ class MolecularCrystal(BaseSet):
         self._fd_charts = {}  # (sg, radius) -> FDCoordinates, built on first use
         self.fd_layout = None
         if crystal_coordinates == 'fd':
-            # the state is the chart of ONE space group (its width and circle rows are the group's); Z' = 1
-            if len(space_groups) != 1 or max(z_primes) != 1:
-                raise NotImplementedError(f"crystal_coordinates 'fd' needs one space group and Z' = 1, got "
-                                          f"space_groups={list(space_groups)}, z_primes={list(z_primes)}")
-            self.fd_layout = self.fd_coordinates_for(int(space_groups[0]), FD_LAYOUT_RADIUS)
+            # the state is the slot layout of the run's space groups (energies/fd_coordinates.py::FDSlotLayout: one
+            # group = its chart rows; several = each group's rows in its blocks' slots, pads at 0); Z' = 1
+            if max(z_primes) != 1:
+                raise NotImplementedError(f"crystal_coordinates 'fd' needs Z' = 1, got z_primes={list(z_primes)}")
+            from energies.fd_coordinates import FDSlotLayout
+            self.fd_layout = FDSlotLayout(space_groups, FD_LAYOUT_RADIUS)
             self.data_ndim = self.fd_layout.dim
         self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
@@ -653,7 +654,8 @@ class MolecularCrystal(BaseSet):
     def fd_rows_to_params(self, x, crystal_batch):
         """crystal_coordinates 'fd': ([B, 12] cell parameters, [B] handedness, [B] log reference density on s) of
         rows x [B, d] in [-1, 1], each through the chart of its own (space group, molecule radius); differentiable
-        in x. Raises for Z' > 1 or rows of different widths."""
+        in x. x is in the slots of fd_layout (energies/fd_coordinates.py::FDSlotLayout). Raises for Z' > 1, a row of
+        another width, or a row whose pad slots (the slots its space group leaves empty) are not 0."""
         if self.max_z_prime != 1:
             raise NotImplementedError("crystal_coordinates 'fd' is Z' = 1 only")
         sg = crystal_batch.sg_ind.reshape(-1).cpu()
@@ -668,12 +670,17 @@ class MolecularCrystal(BaseSet):
             fc = self.fd_coordinates_rows(int(g), radius[rows_cpu])
             rows = rows_cpu.to(x.device)
             xs = x[rows]
-            if xs.shape[1] < fc.dim or (xs.shape[1] > fc.dim and bool((xs[:, fc.dim:] != 0).any())):
-                raise ValueError(f'sg {g}: FD rows need {fc.dim} live columns (zero-padded beyond), got '
-                                 f'{xs.shape[1]}')
+            if xs.shape[1] != self.fd_layout.dim:
+                raise ValueError(f'sg {g}: FD rows are {self.fd_layout.dim} slots wide, got {xs.shape[1]}')
+            pads = ~self.fd_layout.live_mask(torch.full((1,), int(g)))[0].to(x.device)
+            if bool(pads.any()) and bool((xs[:, pads] != 0).any()):
+                raise ValueError(f'sg {g}: FD rows carry nonzero values in the pad slots '
+                                 f'{torch.nonzero(pads).flatten().tolist()} its chart leaves empty (the policy must '
+                                 f'pin them at 0: FDSlotLayout.live_mask)')
             # into the open box, as latent_to_cell_params clamps the latent: a policy whose rows are not bounded
             # (the conditional flow) draws past the faces, and a chart face is a degenerate crystal (log reference -inf)
-            p, h, lr = fc.to_params(xs[:, :fc.dim].double().cpu().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS))
+            s = self.fd_layout.unpack(int(g), xs)
+            p, h, lr = fc.to_params(s.double().cpu().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS))
             params = params.index_copy(0, rows, p.to(x))
             hand = hand.index_copy(0, rows, h.to(x))
             log_ref = log_ref.index_copy(0, rows, lr.to(x))
@@ -689,6 +696,7 @@ class MolecularCrystal(BaseSet):
         sg = batch.sg_ind.reshape(-1).cpu()
         radius = batch.radius.reshape(-1).detach().cpu().double()
         out = torch.zeros(len(sg), self.data_ndim, dtype=torch.float32)
+        self.fd_layout.group_index(sg)   # raises on a row of a group outside the run's layout
         for g in sorted(set(sg.tolist())):
             rows = torch.nonzero(sg == g).flatten()
             fc = self.fd_coordinates_rows(int(g), radius[rows])
@@ -698,7 +706,7 @@ class MolecularCrystal(BaseSet):
                 bad = Counter(st for st, ok in zip(r.status, r.ok.tolist()) if not ok)
                 raise ValueError(f'sg {g}: {int((~r.ok).sum())} of {len(rows)} stored rows have no FD chart '
                                  f'point ({dict(bad)})')
-            out[rows, :fc.dim] = r.s.float()
+            out[rows] = self.fd_layout.pack(int(g), r.s.float())
         return out
 
     def instantiate_crystals(self, x, mol_batch):
@@ -1744,7 +1752,8 @@ class MolecularCrystal(BaseSet):
         device = mol_batch.device
         n = mol_batch.num_graphs
 
-        if self.sg_conditioning:
+        if self.sg_conditioning or (self.fd_layout is not None and len(self.fd_layout.groups) > 1):
+            # each row's own group: an FD state over several groups is the chart of the row's group
             sgs = mol_batch.sg_ind
         else:
             sgs = torch.full(

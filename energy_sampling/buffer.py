@@ -289,13 +289,29 @@ class FDChartState:
     point. A picklable object, not a bound method, because x_fn is pickled into the buffer's checkpoint state (a
     Modeller method pickles the whole live Modeller, whose locks refuse it)."""
 
-    def __init__(self, data_ndim: int):
+    def __init__(self, data_ndim: int, space_groups=None):
         self.data_ndim = int(data_ndim)
+        # the run's groups, whose energies/fd_coordinates.py::FDSlotLayout places each row's chart in the state; None
+        # (and a state pickled before 2026-11-04): each chart's rows in the first columns, a one-group run's layout
+        self.space_groups = None if space_groups is None else tuple(int(g) for g in space_groups)
+
+    def _layout(self):
+        groups = getattr(self, 'space_groups', None)
+        if groups is None:
+            return None
+        if getattr(self, '_slots', None) is None:
+            from energies.fd_coordinates import FDSlotLayout
+            self._slots = FDSlotLayout(groups)
+        return self._slots
+
+    def __getstate__(self):   # the layout is rebuilt from the groups, not pickled
+        return {k: v for k, v in self.__dict__.items() if k != '_slots'}
 
     def __call__(self, batch):
         if 'fd_state' in batch.keys():
             return batch.fd_state.reshape(int(batch.num_graphs), -1)
         from energies.fd_coordinates import FDCoordinates
+        layout = self._layout()
         params = batch.full_cell_parameters().detach().cpu()
         hand = batch.aunit_handedness.reshape(-1).detach().cpu()
         sg = batch.sg_ind.reshape(-1).cpu()
@@ -307,7 +323,9 @@ class FDChartState:
             r = radius[rows]
             fc = FDCoordinates(int(g), float(r[0]) if bool((r == r[0]).all()) else r)
             res = fc.from_params(params[rows], hand[rows])
-            state[rows[res.ok], :fc.dim] = res.s[res.ok].float()
+            s = res.s[res.ok].float()
+            state[rows[res.ok]] = layout.pack(int(g), s) if layout is not None else torch.nn.functional.pad(
+                s, (0, self.data_ndim - s.shape[1]))
             ok[rows[res.ok]] = True
         state[~ok] = float('nan')
         return state

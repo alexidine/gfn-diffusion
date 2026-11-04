@@ -721,7 +721,7 @@ class Modeller:
         """
         fd = getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
         return dict(max_z_prime=max(self.args.z_primes),
-                    x_fn=(FDChartState(self.energy_function.data_ndim) if fd
+                    x_fn=(FDChartState(self.energy_function.data_ndim, self.energy_function.fd_layout.groups) if fd
                           else None if self.energy_function.is_crystal else toy_latent_params))
 
     def _eval_extra_stats(self, mol_batch):
@@ -959,7 +959,8 @@ class Modeller:
         pts, ok = noised_prior.basin_draw(B['p'], B['hand'], B['L'], B['sg'], B['radius'], rows, chart,
                                           fd_coordinates=getattr(self.energy_function, 'fd_coordinates_rows', None),
                                           redraws=int(self._noised_prior_settings['live_redraws']),
-                                          width=B['s0'].shape[1])
+                                          width=B['s0'].shape[1],
+                                          pack=self.energy_function.fd_layout.pack if chart == 'fd' else None)
         out = torch.where(ok[:, None], pts, B['s0'][rows])
         B['draws'] += len(rows)
         B['misses'] += int((~ok).sum())
@@ -3482,6 +3483,9 @@ class Modeller:
             cfg = dict(self._build_latent_gfn_config(periodic_centroids=False), dim=fd.dim,
                        angular_mask=list(fd.wrap_mask), periodic_centroid_axes=None, dead_latent_rows=None)
             if (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
+                if getattr(fd, 'sg', None) is None:
+                    raise NotImplementedError(f"nf row_tokens describe one space group's chart; this FD run has "
+                                              f"{list(fd.groups)} (energies/fd_coordinates.py::FDSlotLayout)")
                 cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
         else:
             cfg = self._build_latent_gfn_config()
@@ -4302,7 +4306,7 @@ class Modeller:
                 r = fc.from_params(params[rows], hand[rows])
                 good = rows[r.ok]
                 ok[good] = True
-                state[good, :fc.dim] = r.s[r.ok].float()
+                state[good] = ef.fd_layout.pack(int(g), r.s[r.ok].float())
                 if good.numel():
                     _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
                     log_ref[good] = lr.float()
@@ -9911,7 +9915,8 @@ class Modeller:
                 width = int(self._batch_latents(batch.subsample_new_batch(u[:1].to(batch.ptr.device))).shape[1])
                 pts, ok = noised_prior.basin_draw(B['p'], B['hand'], L, B['sg'], B['radius'], inv, chart,
                                                   fd_coordinates=getattr(ef, 'fd_coordinates_rows', None),
-                                                  redraws=int(s['live_redraws']), width=width, generator=g)
+                                                  redraws=int(s['live_redraws']), width=width, generator=g,
+                                                  pack=ef.fd_layout.pack if chart == 'fd' else None)
                 self._readout_rows[key] = (rows[ok], pts[ok])
             rows, pts = self._readout_rows[key]
             self._put_nll(out, key, self._nll_at(batch, rows, lambda i, j: pts[i:j], chunk))
