@@ -250,8 +250,9 @@ def _tb_direction_figs(fig_dict, prefix, log_r, log_pfs, log_pbs, log_flow,
     fig_dict[f'{prefix} TB Residual vs R'] = xy_scatter_plot(
         log_r, tb_residual, 'Reward', 'TB Residual')
 
-    fig_dict[f'{prefix} Lattice Latents Trajectories'] = visualize_latent_trajs(
-        flow_states.detach().cpu().numpy(), 20, log_r.detach().cpu().numpy())
+    if _has_trajectory(flow_states):
+        fig_dict[f'{prefix} Lattice Latents Trajectories'] = visualize_latent_trajs(
+            flow_states.detach().cpu().numpy(), 20, log_r.detach().cpu().numpy())
 
 
 def eval_figs(fwd_stats,
@@ -708,9 +709,17 @@ def condition_tracker_figs(tracker, energy_function, current_step, worst_quantil
     return fig_dict
 
 
+def _has_trajectory(flow_states):
+    """More than one step between the initial and terminal states. A one-step policy (model.kind nf) has none: its
+    per-step Gaussian parameters, step sizes and trajectory traces are each one point, so their figures are not drawn."""
+    return flow_states is not None and flow_states.ndim >= 2 and int(flow_states.shape[1]) > 2
+
+
 def log_traj_params(means_f, vars_f, fig_dict,
                     flow_states,
                     means_b, vars_b, prefix: str):
+    if not _has_trajectory(flow_states):
+        return
     fig_dict[f'{prefix} Gauss Params'] = mean_var_fig(vars_f, means_f,
                                                               vars_b, means_b)
     fig_dict[f'{prefix} Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)

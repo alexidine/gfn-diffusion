@@ -380,6 +380,12 @@ def config_signature(cfg):
         # crystal peaks already on record -- stays byte-identical.
         if _get(cfg, 'energy_function') in CONFORMER_ENERGY_FUNCTIONS:
             fields += _conformer_set_key(cfg, model)
+        # APPENDED, and only under model.kind nf, so every SDE key stays byte-identical. Without it an NF run signed as
+        # the SDE config it sits beside (T, s_emb_dim, dplr_rank are SDE sizes) and inherited that run's peak
+        # (2026-11-04: a one-step NF refused on an SDE peak of 14.6 GB)
+        policy = _get(cfg, 'policy', {})
+        if _get(policy, 'kind', 'sde') == 'nf':
+            fields += _nf_key(_get(policy, 'nf', {}))
         return '|'.join(str(v) for v in fields)
     except (TypeError, ValueError):
         return None
@@ -389,6 +395,15 @@ def config_signature(cfg):
 #: same route `_CONFORMER_ENERGY_FUNCTIONS`.
 CONFORMER_ENERGY_FUNCTIONS = ('conformer_torsions',)
 _UNREADABLE_SET = 'set:unreadable'
+
+
+def _nf_key(nf):
+    """The NF policy's footprint fields: its conditioner and size, and the per-row and molecule inputs that add
+    memory (models/nf_policy.py::NF_DEFAULTS for an unset key)."""
+    from models.nf_policy import NF_DEFAULTS
+    g = lambda k: _get(nf, k, NF_DEFAULTS[k])   # noqa: E731
+    return ('nf', str(g('conditioner')), int(g('n_blocks')), int(g('n_bins')), int(g('tf_width')),
+            int(g('tf_layers')), str(g('row_tokens')), str(g('atom_tokens')), str(g('sym_ops')))
 
 
 def _conformer_set_key(cfg, model):

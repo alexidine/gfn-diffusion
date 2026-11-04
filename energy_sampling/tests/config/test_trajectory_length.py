@@ -164,3 +164,20 @@ def test_gfn_config_leaves_T_out():
     assert 'T' not in cfg
     assert cfg['s_emb_dim'] == 8 and cfg['policy_hidden_dim'] == 16
     assert model.T == 10, 'the config namespace itself is not modified'
+
+
+def test_the_vram_signature_tells_an_nf_policy_from_the_sde_it_sits_beside():
+    """An NF run's peak is not its SDE neighbour's: the NF key is appended (model kind, conditioner and size, row
+    and molecule inputs) and only under kind nf, so an SDE config's signature, and the peaks recorded under it, are
+    unchanged (2026-11-04: a one-step NF was refused on an SDE peak of 14.6 GB)."""
+    cfg = gpu_guard.read_config(str(CANONICAL))
+    sde = gpu_guard.config_signature(cfg)
+    assert 'nf' not in sde.split('|')
+    nf = dict(cfg, policy={'kind': 'nf', 'nf': {}})
+    sig = gpu_guard.config_signature(nf)
+    assert sig.startswith(sde + '|nf|') and sig != sde
+    wide = dict(cfg, policy={'kind': 'nf', 'nf': {'tf_width': 512}})
+    prefix = dict(cfg, policy={'kind': 'nf', 'nf': {'row_tokens': 'prefix'}})
+    assert len({sig, gpu_guard.config_signature(wide), gpu_guard.config_signature(prefix)}) == 3
+    live = dict(cfg, policy=SimpleNamespace(kind='nf', nf=SimpleNamespace(row_tokens='prefix')))
+    assert gpu_guard.config_signature(live) == gpu_guard.config_signature(prefix)   # train.py's Namespace args
