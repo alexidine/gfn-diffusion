@@ -12,8 +12,11 @@ what s means physically:
                         centroid block: PolytopeARChart.t_bounds, the fractional-coordinate interval, not u's [0, 1]);
     [y_{i-1}]           the previous row's physical value (zero at i = 0);
     [sin, cos]          of 2 pi u_{i-1} when the previous row is a circle, else zero.
-  Lengths (log_a, log_b, log_c) are log(L / r_mol), r_mol the molecule radius; every other coordinate is in the
-  chart's own units (ratios, cosine factors, fractional coordinates, radians).
+  Physical units: a cell row that sets a length (log_a, log_b, log_c, and the triclinic ratios r2 = b/c and r1 = a/b,
+  which set b and a) is log(L / r_mol), r_mol the molecule radius; a cell row that sets an angle (the triclinic
+  s_beta, s_gamma and v, which set cos beta, cos gamma and cos alpha; the monoclinic s, which sets cos beta) is that
+  cosine, its interval mapped through the same (monotone, given the earlier rows) map; centroid rows are fractional
+  coordinates and orientation rows radians.
 - with ``prefix=True``, the prefix physics features of the blocks completed before row i (zero, flag 0, on rows of
   the block itself and before it):
     after the cell block (CELL_FEATS):  log(V_cell / (Z V_mol)) (= -log packing coefficient), log(d_100 / r_mol),
@@ -37,7 +40,7 @@ import torch
 FD_TYPES = ('log_a', 'log_b', 'log_c', 'r1', 'r2', 's', 's_beta', 's_gamma', 'v',
             't_x', 't_y', 't_z', 't_x+y', 't_x-y',
             'theta', 'phi', 'r', 'r_signed')
-LENGTHS = ('log_a', 'log_b', 'log_c')
+LENGTHS = ('log_a', 'log_b', 'log_c', 'r1', 'r2')   # rows whose physical value is a log length
 K_EXTRA = 5
 CELL_FEATS = ('log_vcell_over_zvmol', 'log_d100', 'log_d010', 'log_d001', 'cell_done')
 POS_FEATS = ('image_softmin', 'images_within_2r', 'inversion_softmin', 'proper_softmin', 'improper_softmin',
@@ -64,6 +67,38 @@ def _op_classes(sg):
     if not W:
         return torch.zeros(0, 3, 3, dtype=F64), torch.zeros(0, 3, dtype=F64), torch.zeros(0, dtype=torch.long)
     return torch.stack(W), torch.stack(w), torch.tensor(cls)
+
+
+def _cell_physical(blk, y, lo, hi):
+    """A cell block's rows as lengths (log Angstrom) and cosines: (values, lows, highs), lists of [B] per row, from
+    the chart's values y and intervals [lo, hi] (CellChart.map's formulas). Row i's interval is mapped by a function
+    of rows < i only, increasing (a decreasing map swaps the ends), so the interval stays an interval."""
+    if blk.family == 'triclinic':
+        log_c, r2, r1, sb, sg, v = y
+        log_b = log_c + torch.log(r2)
+        lam = blk.lam(r1, sb, sg)
+        maps = [None,
+                lambda x: log_c + torch.log(x.clamp_min(1e-12)),          # r2 -> log b
+                lambda x: log_b + torch.log(x.clamp_min(1e-12)),          # r1 -> log a
+                lambda x: x * r1 * r2 / 2,                                # s_beta -> cos beta
+                lambda x: x * r1 / 2,                                     # s_gamma -> cos gamma
+                lambda x: (lam + (1 - lam) * x) * r2 / 2]                 # v -> cos alpha
+    elif blk.family == 'monoclinic':
+        log_c, log_a, log_b, s = y
+        m = blk._mono_bound(torch.exp(log_a), torch.exp(log_c))
+        maps = [None, None, None, lambda x: -x * m]                       # s -> cos beta (decreasing)
+    else:
+        return y, lo, hi                                                  # log lengths already
+    out_y, out_lo, out_hi = [], [], []
+    for i, f in enumerate(maps):
+        if f is None:
+            out_y.append(y[i]), out_lo.append(lo[i]), out_hi.append(hi[i])
+            continue
+        a, z = f(lo[i]), f(hi[i])
+        out_y.append(f(y[i]))
+        out_lo.append(torch.minimum(a, z))
+        out_hi.append(torch.maximum(a, z))
+    return out_y, out_lo, out_hi
 
 
 def _softmin(x, mask, tau=SOFT_TAU):
@@ -136,11 +171,14 @@ class FDRowDescriber:
                 prev.append(a + u[:, off + i] * (z - a))
                 lo.append(a)
                 hi.append(z)
-            y.extend(prev)
             if self.prefix and isinstance(blk, CellChart):
                 cell = blk.map(torch.stack(prev, 1))[0]                   # [B, 6] lengths, angles
             elif self.prefix and isinstance(blk, PolytopeARChart):
                 t = blk.map(u[:, off:off + blk.ndim])[0]                 # [B, 3] fractional, free axes at the gauge
+            if isinstance(blk, CellChart) and blk.ndim:
+                n = blk.ndim
+                prev, lo[-n:], hi[-n:] = _cell_physical(blk, prev, lo[-n:], hi[-n:])
+            y.extend(prev)
         lo, hi, y = torch.stack(lo, 1), torch.stack(hi, 1), torch.stack(y, 1)
         shift = torch.where(self.is_length, torch.log(r)[:, None], torch.zeros_like(lo))
         lo, hi, y = lo - shift, hi - shift, y - shift

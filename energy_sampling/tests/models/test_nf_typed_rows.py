@@ -51,7 +51,7 @@ def test_describer_row_i_reads_only_the_rows_before_it(sg):
         assert torch.equal(desc(s2, radius)[:, i], out[:, i]), (sg, desc.names[i])
 
 
-@pytest.mark.parametrize('sg', (2, 14, 88, 9))
+@pytest.mark.parametrize('sg', (2, 14, 88, 9, 19))
 def test_describer_values_are_the_charts_physical_coordinates(sg):
     from energies.fd_coordinates import FDCoordinates
     from mxtaltools.crystal_fd import charts
@@ -67,9 +67,18 @@ def test_describer_values_are_the_charts_physical_coordinates(sg):
         if isinstance(blk, charts.PolytopeARChart) and blk.ndim:
             t, _ = blk.map(y[:, off:off + blk.ndim])
             want[:, off:off + blk.ndim] = blk.ar_coordinates(t)
+        if isinstance(blk, charts.CellChart):   # lengths and cosines of the cell the chart decodes
+            cell, _ = blk.map(y[:, off:off + blk.ndim])
+            L, cos = torch.log(cell[:, :3]), torch.cos(cell[:, 3:])
+            phys = {'triclinic': [L[:, 2], L[:, 1], L[:, 0], cos[:, 1], cos[:, 2], cos[:, 0]],
+                    'monoclinic': [L[:, 2], L[:, 0], L[:, 1], cos[:, 1]]}.get(blk.family)
+            if phys is not None:
+                want[:, off:off + blk.ndim] = torch.stack(phys, 1)
     want = torch.where(desc.is_length, want - math.log(3.7), want)
     got = out[:, 1:, 2]                     # row i + 1 carries row i's value
     assert torch.allclose(got, want[:, :-1], atol=1e-10), (got - want[:, :-1]).abs().max()
+    lo, hi = out[:, :-1, 0], out[:, :-1, 1]   # and each value lies in its own row's physical interval
+    assert bool(((got >= lo - 1e-9) & (got <= hi + 1e-9)).all())
 
 
 def _mols(n, seed=0):
