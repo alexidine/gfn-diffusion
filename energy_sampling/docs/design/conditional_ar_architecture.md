@@ -326,7 +326,7 @@ All are closed-form, about 15 numbers in total. None is tested.
   redundant with the cell rows. In polar groups it is not `V_cell` × a constant: the position block lacks the free
   axis.
 
-### 5.5 Open: block order [observation that conflicts with §5.3's default]
+### 5.5 Block order [settled 2026-11-04: cell first; the observation below predates it]
 
 The oct19 MIPCAS run (unconditional, latent chart, one seed) is recorded in agent memory, not in a frozen result. It
 found that drawing the cell rows first was **worse** than `Z1_ORDER` (`8.11.10.9.7.6.5.4.3.2.1.0`: centroid z,
@@ -340,10 +340,12 @@ orientation, centroid y and x, then the cell last). The figures:
 Caption: unconditional MIPCAS on the latent chart, 3M energy calls, one seed each, 40k evaluation draws. Higher ELBO is
 better.
 
-`Z1_ORDER` is what `resolve_flow_settings` gives an unconditional one-block flow today. The cell-stage prefix features
+`Z1_ORDER` was what `resolve_flow_settings` gave an unconditional one-block flow when this was written; since
+2026-11-04 the default is the chart's own order, cell first, on every route (owner: much has changed since this
+measurement). The cell-stage prefix features
 and the cell-stage op tokens of §5.2 and §5.4 assume that the cell comes first. Under a pose-first order, the cell
 slots come last and those features have nothing to inform. They would have to become pose-stage features read by the
-cell slots. The default order is therefore an owner decision, not something to settle in the build.
+cell slots. The default order was therefore an owner decision; the owner took cell first (2026-11-04).
 
 Two further points bear on that decision:
 
@@ -446,15 +448,15 @@ These supersede amendment 1 of §5.6 and the SG-head design of §2.2 and §2.3.
 
 **For the owner** (not settled here):
 
-- **The default block order** (§5.5).
-- **Enantiomorphic closure of the Day groups.** The set holds 76, 96, 145, 154 and 169 but not their partners 78, 92,
+- **The default block order** (§5.5): settled 2026-11-04, cell first on every route.
+- **Enantiomorphic closure of the Day groups** (owner, 2026-11-04: left for now). The set holds 76, 96, 145, 154 and 169 but not their partners 78, 92,
   144, 152 and 170. So Σ_g Z_g differs between a chiral molecule and its mirror image, and a mirror-blind level head
   is misspecified. Options:
   - close the allowed set G_m under the partner map;
   - fix one enantiomer per molecule;
   - accept the asymmetry as part of the benchmark's declared convention.
 - **The radius convention** that the length box and r_mol share: heavy atoms or all atoms. This is a data-thread
-  interface, not this thread's call.
+  interface; the owner prefers heavy atoms unless the data thread finds a compelling reason (2026-11-04).
 
 ### 5.8 Build status, 2026-11-04 [built = code and tests in the tree]
 

@@ -75,10 +75,32 @@ def test_describer_values_are_the_charts_physical_coordinates(sg):
             if phys is not None:
                 want[:, off:off + blk.ndim] = torch.stack(phys, 1)
     want = torch.where(desc.is_length, want - math.log(3.7), want)
+    # a circle row's value is carried by its sin and cos alone (its raw value jumps at the seam): zero there
+    want = torch.where(desc.is_circle, torch.zeros_like(want), want)
     got = out[:, 1:, 2]                     # row i + 1 carries row i's value
     assert torch.allclose(got, want[:, :-1], atol=1e-10), (got - want[:, :-1]).abs().max()
     lo, hi = out[:, :-1, 0], out[:, :-1, 1]   # and each value lies in its own row's physical interval
-    assert bool(((got >= lo - 1e-9) & (got <= hi + 1e-9)).all())
+    line = ~desc.is_circle[:-1]
+    assert bool(((got >= lo - 1e-9) & (got <= hi + 1e-9))[:, line].all())
+    ang = 2 * math.pi * (s + 1) / 2         # and a circle row's sin, cos are of its unit fraction
+    circ = desc.is_circle[:-1]
+    assert torch.allclose(out[:, 1:, 3][:, circ], torch.sin(ang[:, :-1][:, circ]), atol=1e-10)
+    assert torch.allclose(out[:, 1:, 4][:, circ], torch.cos(ang[:, :-1][:, circ]), atol=1e-10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
+@pytest.mark.parametrize('sg', (2, 14, 88, 148))
+def test_describer_on_the_gpu_gives_the_cpu_features(sg):
+    """The describer computes on the rows' device; prefix features included, the GPU and CPU agree to float64
+    rounding, and the output stays on the rows' device in their dtype."""
+    desc = FDRowDescriber(sg, prefix=True)
+    s = _rows(desc.dim, 64, sg).float()
+    radius = torch.rand(64, generator=torch.Generator().manual_seed(3)) * 3 + 2
+    vol = torch.rand(64, generator=torch.Generator().manual_seed(4)) * 200 + 100
+    cpu = desc(s, radius, vol)
+    gpu = desc(s.cuda(), radius.cuda(), vol.cuda())
+    assert gpu.device.type == 'cuda' and gpu.dtype == s.dtype
+    assert torch.allclose(gpu.cpu(), cpu, atol=1e-5, rtol=1e-5), (gpu.cpu() - cpu).abs().max()
 
 
 def _mols(n, seed=0):

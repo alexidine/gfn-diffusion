@@ -2680,8 +2680,9 @@ def build_parser():
     p.add_argument('--block_orders', default='auto',
                    help="unconditional runs: comma-separated order per block, 'id' (stored rows), 'rev', or "
                         "'.'-separated latent row indices (e.g. 6.7.8.9.10.11.3.4.5.0.1.2); 'none' = alternate "
-                        "stored, reversed, random; 'auto' = Z1_ORDER on an unconditional one-block run over the "
-                        "12-row Z'=1 latent, the --init_from checkpoint's own orders, else 'none'")
+                        "stored, reversed, random; 'auto' = 'id' (the stored order, cell first) on an unconditional "
+                        "one-block run, the --init_from checkpoint's own orders, else 'none'; Z1_ORDER (pose first "
+                        "on the Z'=1 latent) only when named")
     p.add_argument('--fold_half_rows', default=None,
                    help="unconditional runs: comma-separated wrapped latent rows whose distribution repeats every "
                         "half period (the prior's exact image copies, e.g. 7,8 for centroid y, z in sg 2); the flow "
@@ -2875,8 +2876,9 @@ ARM_OVERRIDES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config
 # tied knot derivatives, the bin-height floor and error-filtered replay. The conditional route refuses all four.
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0,
                               bank_frac=0.1)
-# the default row order of a one-block flow over the 12-row crystal latent at Z' = 1 (rows 0-11 all live): centroid z,
-# the orientation rows, centroid y and x, then the cell angles and lengths
+# a pose-first row order of a one-block flow over the 12-row crystal latent at Z' = 1 (rows 0-11 all live): centroid z,
+# the orientation rows, centroid y and x, then the cell angles and lengths. Taken only when named: 'auto' is the stored
+# order, cell first (owner, 2026-11-04)
 Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
 
 
@@ -2889,8 +2891,9 @@ def resolve_auto_options(inn, conditional, ck_inn=None, live_rows=None):
     was trained under before the key existed (off, 1e-3 everywhere, free); otherwise the unconditional route's default
     (UNCONDITIONAL_DEFAULTS), or off on a conditional run. Replay (`--bank_frac`) is a training setting and takes the
     route's default either way. 'none' turns `--bounded_rows` or `--min_bin_height` off explicitly. `--block_orders`
-    'auto' is Z1_ORDER on an unconditional one-block run whose live rows `live_rows` are exactly 0-11, the
-    checkpoint's own orders under `--init_from`, else none (the alternating orders); 'none' sets the alternation."""
+    'auto' is 'id' (the stored row order, cell first) on an unconditional one-block run, the checkpoint's own orders
+    under `--init_from`, else none (the alternating orders, whose first block is the stored order); 'none' sets the
+    alternation. `live_rows` is not read."""
     src = []
 
     def pick(key, from_ck, route, off):
@@ -2920,9 +2923,8 @@ def resolve_auto_options(inn, conditional, ck_inn=None, live_rows=None):
                                 if inn.tied_derivatives else 2.0)
     if inn.bank_frac is None:
         inn.bank_frac = float(pick('bank_frac', False, UNCONDITIONAL_DEFAULTS['bank_frac'], 0.0))
-    if inn.block_orders == 'auto':
-        z1 = int(inn.n_blocks) == 1 and live_rows is not None and list(live_rows) == list(range(12))
-        inn.block_orders = pick('block_orders', True, Z1_ORDER if z1 else None, None)
+    if inn.block_orders == 'auto':   # the stored order: the cell rows first (owner, 2026-11-04)
+        inn.block_orders = pick('block_orders', True, 'id' if int(inn.n_blocks) == 1 else None, None)
     elif inn.block_orders == 'none':
         inn.block_orders = None
     return ', '.join(src)

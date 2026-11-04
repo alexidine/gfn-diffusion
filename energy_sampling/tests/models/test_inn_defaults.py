@@ -3,7 +3,7 @@ CPU tests for inn_modeller.py's defaults and how it fills the options left unset
 
 WHAT THIS FILE IS FOR. The architecture defaults are one transformer block of 32 bins. Five options default per route:
 on an unconditional run bounded linear rows, tied knot derivatives, a 1e-7 bin-height floor, replay at 0.1 and, on a
-one-block flow over the 12-row latent, the row order Z1_ORDER; on a conditional run, which refuses them, off. With
+one-block flow, the stored row order 'id' (cell first; Z1_ORDER only when named); on a conditional run, which refuses them, off. With
 --init_from the density options and the order come from the checkpoint instead, so an older checkpoint is rebuilt as
 the density it was trained as: a key the checkpoint lacks means the setting it ran under before the key existed. Every
 failure here is silent in a run (a checkpoint loaded into the wrong density still produces numbers), so each case is
@@ -49,7 +49,7 @@ def test_unconditional_defaults():
     inn = _unset()
     im.resolve_auto_options(inn, conditional=False, live_rows=LIVE12)
     assert _settings(inn) == ('linear', 1e-7, True, 2.0, 0.1)
-    assert inn.block_orders == im.Z1_ORDER
+    assert inn.block_orders == 'id'
 
 
 def test_conditional_route_is_off():
@@ -59,11 +59,14 @@ def test_conditional_route_is_off():
     assert inn.block_orders is None
 
 
-def test_z1_order_only_on_one_block_over_the_12_row_latent():
-    for live, n_blocks in ((LIVE12[:-1], 1), (LIVE12 + [12, 13], 1), (LIVE12, 2)):
+def test_stored_order_on_any_one_block_flow():
+    for live, n_blocks, want in ((LIVE12[:-1], 1, 'id'), (LIVE12 + [12, 13], 1, 'id'), (LIVE12, 2, None)):
         inn = _unset(n_blocks)
         im.resolve_auto_options(inn, conditional=False, live_rows=live)
-        assert inn.block_orders is None, (live, n_blocks)
+        assert inn.block_orders == want, (live, n_blocks)
+    inn = _unset()   # a checkpoint that stored the pose-first order keeps it
+    im.resolve_auto_options(inn, conditional=False, ck_inn={'block_orders': im.Z1_ORDER}, live_rows=LIVE12)
+    assert inn.block_orders == im.Z1_ORDER
 
 
 def test_old_checkpoint_keeps_its_density():

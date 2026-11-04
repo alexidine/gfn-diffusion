@@ -10,8 +10,9 @@ what s means physically:
   to the slot that predicts row i):
     [lo_i, hi_i]        the physical interval of row i given rows < i (cell and orientation blocks: chart.bounds;
                         centroid block: PolytopeARChart.t_bounds, the fractional-coordinate interval, not u's [0, 1]);
-    [y_{i-1}]           the previous row's physical value (zero at i = 0);
-    [sin, cos]          of 2 pi u_{i-1} when the previous row is a circle, else zero.
+    [y_{i-1}]           the previous row's physical value (zero at i = 0, and when the previous row is a circle);
+    [sin, cos]          of 2 pi u_{i-1} when the previous row is a circle, else zero. A circle row is given by these
+                        alone: its raw value jumps at the seam, where they are continuous.
   Physical units: a cell row that sets a length (log_a, log_b, log_c, and the triclinic ratios r2 = b/c and r1 = a/b,
   which set b and a) is log(L / r_mol), r_mol the molecule radius; a cell row that sets an angle (the triclinic
   s_beta, s_gamma and v, which set cos beta, cos gamma and cos alpha; the monoclinic s, which sets cos beta) is that
@@ -29,8 +30,9 @@ what s means physically:
   Z is the number of operations of the conventional cell (centring included), V_mol the molecule volume
   (MolData.mol_volume). Soft, so the features are differentiable and a draw's rounding cannot switch them.
 
-Computed in float64 on the CPU from the clamped rows, as energies/molecular_crystal.py::fd_rows_to_params clamps them,
-so the density pass and the cached decode see the same numbers for the same float32 rows. Differentiable in s."""
+Computed in float64 on the rows' device from the clamped rows, as energies/molecular_crystal.py::fd_rows_to_params
+clamps them, so the density pass and the cached decode see the same numbers for the same float32 rows.
+Differentiable in s."""
 import math
 
 import torch
@@ -147,17 +149,18 @@ class FDRowDescriber:
     def __call__(self, s: torch.Tensor, radius: torch.Tensor, volume=None) -> torch.Tensor:
         """[B, d, k] (module docstring) of rows s [B, d] at molecule radii radius [B] (Angstrom) and, with prefix
         features, molecule volumes volume [B] (cubic Angstrom)."""
-        from energies.fd_coordinates import FDCoordinates
+        from energies.fd_coordinates import ORIENTATION, length_box
         from energies.molecular_crystal import FD_OPEN_EPS
-        from mxtaltools.crystal_fd.charts import CellChart, PolytopeARChart
+        from mxtaltools.crystal_fd.charts import CellChart, CrystalChart, PolytopeARChart
         if s.ndim != 2 or s.shape[1] != self.dim:
             raise ValueError(f'sg {self.sg}: expected rows [B, {self.dim}], got {tuple(s.shape)}')
-        b = s.shape[0]
-        r = torch.as_tensor(radius, dtype=F64).reshape(-1).cpu()
+        b, dev = s.shape[0], s.device
+        r = torch.as_tensor(radius).to(device=dev, dtype=F64).reshape(-1)
         if r.numel() != b:
             raise ValueError(f'{r.numel()} radii for {b} rows')
-        u = ((s.to(F64).cpu().clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS)) + 1) / 2
-        chart = FDCoordinates(self.sg, r).chart
+        u = ((s.to(F64).clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS)) + 1) / 2
+        # FDCoordinates(sg, r).chart, built on the rows' device (the centroid block's coefficient tables included)
+        chart = CrystalChart.for_length_box(self.sg, length_box(self.sg, r), ORIENTATION, device=dev)
         lo, hi, y = [], [], []
         cell = t = None
         for off, blk in zip(chart.offsets, chart.blocks):
@@ -180,26 +183,27 @@ class FDRowDescriber:
                 prev, lo[-n:], hi[-n:] = _cell_physical(blk, prev, lo[-n:], hi[-n:])
             y.extend(prev)
         lo, hi, y = torch.stack(lo, 1), torch.stack(hi, 1), torch.stack(y, 1)
-        shift = torch.where(self.is_length, torch.log(r)[:, None], torch.zeros_like(lo))
+        shift = torch.where(self.is_length.to(dev), torch.log(r)[:, None], torch.zeros_like(lo))
         lo, hi, y = lo - shift, hi - shift, y - shift
         ang = 2 * math.pi * u
-        circ = self.is_circle.expand(b, -1)
+        circ = self.is_circle.to(dev).expand(b, -1)
         sin = torch.where(circ, torch.sin(ang), torch.zeros_like(ang))
         cos = torch.where(circ, torch.cos(ang), torch.zeros_like(ang))
+        y = torch.where(circ, torch.zeros_like(y), y)          # a circle row's value is its sin, cos: no seam jump
         prev_feats = torch.stack([y, sin, cos], -1)                                  # [B, d, 3] of row i
         prev_feats = torch.cat([prev_feats.new_zeros(b, 1, 3), prev_feats[:, :-1]], 1)   # shifted: row i - 1's
         parts = [torch.stack([lo, hi], -1), prev_feats]
         if self.prefix:
             if volume is None:
                 raise ValueError('prefix features need the molecule volumes (MolData.mol_volume)')
-            vol = torch.as_tensor(volume, dtype=F64).reshape(-1).cpu()
-            rows = torch.arange(self.dim)
+            vol = torch.as_tensor(volume).to(device=dev, dtype=F64).reshape(-1)
+            rows = torch.arange(self.dim, device=dev)
             cf = self._cell_features(cell, r, vol)                                   # [B, n_cell]
             pf = self._position_features(cell, t, r)                                 # [B, n_pos]
             parts.append(torch.where((rows >= self.cell_end)[None, :, None], cf[:, None], torch.zeros_like(cf[:, None])))
             parts.append(torch.where((rows >= self.pos_end)[None, :, None], pf[:, None], torch.zeros_like(pf[:, None])))
         out = torch.cat([p.expand(b, self.dim, -1) for p in parts], -1)
-        return out.to(device=s.device, dtype=s.dtype)
+        return out.to(dtype=s.dtype)
 
     def _cell_features(self, cell, r, vol):
         from mxtaltools.crystal_fd.ops import cell_matrices, metric_tensor
@@ -211,20 +215,22 @@ class FDRowDescriber:
 
     def _position_features(self, cell, t, r):
         from mxtaltools.crystal_fd.ops import cell_matrices
-        b = cell.shape[0]
+        b, dev = cell.shape[0], cell.device
         n_ops = self.op_W.shape[0]
-        flags = torch.stack([(self.op_cls == k).any() for k in range(3)]).to(F64).expand(b, 3)
+        W, w, cls = self.op_W.to(dev), self.op_w.to(dev), self.op_cls.to(dev)
+        flags = torch.stack([(cls == k).any() for k in range(3)]).to(F64).expand(b, 3)
         if n_ops == 0:
-            return torch.cat([torch.zeros(b, 5, dtype=F64), flags, torch.ones(b, 1, dtype=F64)], -1)
+            return torch.cat([cell.new_zeros(b, 5), flags, cell.new_ones(b, 1)], -1)
         T = cell_matrices(cell)                                                      # [B, 3, 3], cart = T frac
-        img = torch.einsum('kij,bj->bki', self.op_W, t) + self.op_w                  # [B, n_ops, 3]
+        img = torch.einsum('kij,bj->bki', W, t) + w                                  # [B, n_ops, 3]
         delta = img - t[:, None]
         delta = delta - torch.round(delta)
-        shifts = torch.stack(torch.meshgrid(*(torch.arange(-1, 2, dtype=F64),) * 3, indexing='ij'), -1).reshape(-1, 3)
+        shifts = torch.stack(torch.meshgrid(*(torch.arange(-1, 2, dtype=F64, device=dev),) * 3, indexing='ij'),
+                             -1).reshape(-1, 3)
         cart = torch.einsum('bij,bkmj->bkmi', T, delta[:, :, None] + shifts)          # [B, n_ops, 27, 3]
         dist = cart.norm(dim=-1).amin(-1) / r[:, None]                                # [B, n_ops] over r_mol
         every = torch.ones_like(dist, dtype=torch.bool)
         out = [_softmin(dist, every), torch.sigmoid((2.0 - dist) / COUNT_WIDTH).sum(-1)]
         for k in range(3):
-            out.append(_softmin(dist, (self.op_cls == k).expand(b, -1)))
-        return torch.cat([torch.stack(out, -1), flags, torch.ones(b, 1, dtype=F64)], -1)
+            out.append(_softmin(dist, (cls == k).expand(b, -1)))
+        return torch.cat([torch.stack(out, -1), flags, cell.new_ones(b, 1)], -1)

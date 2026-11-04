@@ -393,7 +393,7 @@ class NFPolicy(nn.Module):
             if self.sampler.flow.describer.prefix:
                 volume = getattr(mol_batch, 'mol_volume', None)
                 if volume is None:
-                    raise ValueError("flow prefix_features need each molecule's volume (MolData.mol_volume) on "
+                    raise ValueError("flow row_tokens prefix needs each molecule's volume (MolData.mol_volume) on "
                                      "mol_batch")
                 volume = torch.as_tensor(volume).reshape(-1).to(self.device, torch.float64)
             self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64),
