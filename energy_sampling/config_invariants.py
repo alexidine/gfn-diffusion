@@ -2074,6 +2074,18 @@ def rollout_condition_draw_problems(glob) -> list[str]:
             out.append(f"condition_log_z.rollout_under_drawn_power={p:g} with "
                        f"rollout_condition_draw={mode or 'iid'!r}; only 'under_drawn' reads "
                        f"it, so a non-default value is a dead key.")
+    from protocol import ROLLOUT_GROUP_DRAWS, ROLLOUT_GROUP_UNIFORM_FRAC
+    gmode = glob('condition_log_z.rollout_group_draw')
+    if gmode is not None and gmode not in ROLLOUT_GROUP_DRAWS:
+        out.append(f"condition_log_z.rollout_group_draw={gmode!r}; must be one of {ROLLOUT_GROUP_DRAWS}.")
+    frac = glob('condition_log_z.rollout_group_draw_uniform_frac')
+    if frac is not None:
+        f = _num(frac)
+        if f is None or not 0.0 <= f <= 1.0:
+            out.append(f"condition_log_z.rollout_group_draw_uniform_frac={frac!r}; must be in [0, 1].")
+        elif gmode != 'level' and f != ROLLOUT_GROUP_UNIFORM_FRAC:
+            out.append(f"condition_log_z.rollout_group_draw_uniform_frac={f:g} with rollout_group_draw="
+                       f"{gmode or 'uniform'!r}; only 'level' reads it, so a non-default value is a dead key.")
     return out
 
 

@@ -527,6 +527,17 @@ Open, written down rather than guessed:
    input. s stays rotation invariant and tells a chiral molecule, a chiral conformer of an achiral one included,
    from its mirror image; everything that reads s (the level head, the context) gets it. Off in mk_dev. Closing the
    allowed groups (a) is left for now (owner).
-2. **The drawn SG step.** The SG head as softmax(L) and drawing g are not built. Both wait on the FD energy route
-   scoring several groups in one run (search/prior session).
+2. **The drawn SG step.** Built 2026-11-04 (`models/group_draw.py`): p(g | m) = softmax over the run's groups of
+   the level L(m, g) (`level_group_logits`, `draw_groups`), drawn by the forward rollout under
+   `cfg:condition_log_z.rollout_group_draw` `level` with a uniform share (`rollout_group_draw_uniform_frac`), the
+   rollout's temperatures and Z' kept (`train.py::Modeller._level_group_draw`); `uniform` (default) is the old draw,
+   so g stays forced unless chosen. TB is unchanged: under option A a drawn g's residual is the forced one's. The
+   reported weights come from `group_weights_is` (per-group importance sampling with ESS), not the head; it is a
+   function, not yet wired into an eval panel. No per-molecule allowed set (G_m is every run group).
 3. **Block-order toggle:** not built. The owner chose the chart's order, 2026-11-04.
+4. **Op tokens** (`sym_ops tokens`, built 2026-11-04): e_g as `pooled`, and each operation's state from the encoder's
+   per-operation MLP, projected with a learned segment vector, joins the atom tokens in the cross-attention memory.
+   Static, as §5.7 settled; `tokens_dynamic` stays refused.
+5. **Prefix extras** (built 2026-11-04, closing §5.8 departure 7's first two items): the plane spacings also over the
+   thinnest half-extent, and the shortest lattice vector over the longest half-extent (half-extents from the
+   heavy-atom gyration tensor plus 1.7 Å, `models/fd_row_describer.py::mol_inputs`).

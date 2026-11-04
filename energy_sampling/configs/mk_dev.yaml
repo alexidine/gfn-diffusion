@@ -567,6 +567,8 @@ condition_log_z:  # todo kindof fine with this as long as its general / doesn't 
   weighted_condition_sampling_uniform_beta: 0.5  # fraction of each draw taken uniformly regardless of weight
   rollout_condition_draw: iid  # how a forward rollout picks its batch_size mol_dataset rows. 'iid' = uniform without replacement within a rollout (or the weighted measure above, on a stage declaring the flag). 'cycle' = without replacement ACROSS rollouts: a shuffled pass over every row, reshuffled when spent; not checkpointed, so a resume starts a fresh pass. 'under_drawn' = p ~ (1 + n)^-power, n = trainable replay rows the row's conditions hold. Non-iid is refused beside a stage declaring flags.weighted_condition_sampling. Applies to every forward rollout (cadence, warm-up, trigger, z-pin, z_calibration). CONDITIONAL ARM: 'cycle'
   rollout_under_drawn_power: 1.0  # the power in 'under_drawn'; must be > 0 there. Read by 'under_drawn' only, so any other value under another draw is refused as a dead key
+  rollout_group_draw: uniform  # how a forward rollout gives each molecule its space group. 'uniform' over space_groups; 'level' = from the policy's p(g | m) = softmax over space_groups of the level L(m, g) (models/group_draw.py), temperatures and Z' kept. 'level' needs model.kind nf, conditional, >1 space group, and a level that reads g (model.nf.sym_ops pooled/tokens or sg_conditioning)
+  rollout_group_draw_uniform_frac: 0.1  # 'level' only: the share of the draw taken uniformly over space_groups, so no group starves; a non-default value under 'uniform' is refused as a dead key
 
 # Interspersed Z-only calibration: extra Z optimizer steps per policy step.
 # Silent when disabled, inside the deadband, cold, mid-accumulation, or in a

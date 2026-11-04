@@ -170,6 +170,11 @@ CONDITION_DRAW_PICKS = ('uniform', 'weighted')
 # condition_log_z.rollout_condition_draw: how a forward rollout chooses its
 # mol_dataset rows (train.py _rollout_mol_batch). 'iid' is the draw before the key.
 ROLLOUT_CONDITION_DRAWS = ('iid', 'cycle', 'under_drawn')
+#: condition_log_z.rollout_group_draw: how a forward rollout gives each molecule its space group. 'uniform' over the
+#: run's groups (energy_function.condition_samples); 'level' from the policy's p(g | m) = softmax_g L(m, g)
+#: (models/group_draw.py), mixed with rollout_group_draw_uniform_frac of the uniform draw
+ROLLOUT_GROUP_DRAWS = ('uniform', 'level')
+ROLLOUT_GROUP_UNIFORM_FRAC = 0.1
 STAGE_FLAGS =('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
                'buffers_active', 'weighted_bwd_sampling', 'z_calibration')
 

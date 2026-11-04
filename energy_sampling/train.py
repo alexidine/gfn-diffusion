@@ -2009,6 +2009,7 @@ class Modeller:
         # since the last report (drained on read). ABSENT on a stage without it.
         # no_grad_steps: those of the skipped steps that were left with no
         # gradient at all and so took no optimizer step (train_step).
+        metrics.update(getattr(self, '_sg_draw_stats', {}) or {})   # rollout_group_draw 'level' only
         if getattr(self.protocol.stage, 'condition_draw', None):
             metrics.update(getattr(self, '_cond_draw_stats', {}) or {})
             metrics['cond_draw/skipped_steps'] = float(getattr(self, '_cond_draw_skips', 0))
@@ -2413,6 +2414,9 @@ class Modeller:
         problems = rollout_condition_draw_problems(_glob)
         if problems:
             raise ValueError(' '.join(problems))
+        if (getattr(getattr(self.args, 'condition_log_z', None), 'rollout_group_draw', 'uniform')
+                or 'uniform') == 'level':
+            Modeller._check_level_group_draw(self)
         for _st in self.protocol.stages:
             _coeff = (lambda mode, key, _st=_st: _st.loss_coeffs.get(mode, {}).get(
                 key, self.protocol.base_coeffs(mode).get(key)))
@@ -3175,6 +3179,59 @@ class Modeller:
         return next(self.mol_dataset.loader(
             self.batch_size, mode='graphs', repeats=repeats, p=p,
             beta=getattr(cfg, 'weighted_condition_sampling_uniform_beta', 0.0) if p is not None else None))
+
+    def _rollout_group_mode(self) -> str:
+        """condition_log_z.rollout_group_draw: 'uniform' (absent) or 'level'."""
+        from protocol import ROLLOUT_GROUP_DRAWS
+        mode = getattr(getattr(self.args, 'condition_log_z', None), 'rollout_group_draw', 'uniform') or 'uniform'
+        if mode not in ROLLOUT_GROUP_DRAWS:
+            raise ValueError(f"condition_log_z.rollout_group_draw={mode!r}; must be one of {ROLLOUT_GROUP_DRAWS}")
+        return mode
+
+    def _check_level_group_draw(self):
+        """rollout_group_draw 'level' reads the level of each candidate group: it needs a conditional flow policy
+        whose level reads g (model.nf.sym_ops pooled or tokens, or sg_conditioning) and more than one space group."""
+        groups = list(getattr(self.args, 'space_groups', []) or [])
+        pol = getattr(self.args, 'policy', None)     # model.kind / model.nf, as the loader resolves them
+        kind = getattr(pol, 'kind', 'sde') if pol is not None else 'sde'
+        nf = getattr(pol, 'nf', None) if pol is not None else None
+        nf = dict(vars(nf)) if nf is not None and not isinstance(nf, dict) else dict(nf or {})
+        policy = getattr(self, 'gfn_model', None)
+        if kind != 'nf' or (policy is not None and not getattr(policy, 'conditional', True)):
+            raise ValueError("condition_log_z.rollout_group_draw 'level' draws g from the flow policy's level: it "
+                             "needs model.kind nf on a conditional route")
+        if len(set(int(g) for g in groups)) < 2:
+            raise ValueError(f"condition_log_z.rollout_group_draw 'level' over space groups {groups}: one group "
+                             f"leaves nothing to draw (set it to 'uniform')")
+        if nf.get('sym_ops', 'none') not in ('pooled', 'tokens') and not self.args.sg_conditioning:
+            raise ValueError("condition_log_z.rollout_group_draw 'level': the level must read g (model.nf.sym_ops "
+                             "pooled or tokens, or sg_conditioning), else every group has one level")
+
+    def _level_group_draw(self, mol_batch, log_T_tensor, repeats):
+        """rollout_group_draw 'level': redraw each molecule's space group from (1 - eps) p(g | m) + eps Uniform,
+        p = softmax over the run's groups of the policy's level L(m, g) (models/group_draw.py), keeping the
+        temperatures and Z' the rollout already drew. Returns condition_samples' outputs; writes sg_draw/* stats."""
+        from models.group_draw import draw_groups, level_group_logits
+        from protocol import ROLLOUT_GROUP_UNIFORM_FRAC
+        ef = self.energy_function
+        groups = [int(g) for g in ef.space_groups]
+        temp = (torch.pow(10.0, log_T_tensor.reshape(-1)) if ef.temperature_conditioning else None)
+        zp = mol_batch.z_prime.reshape(-1).long().clone()
+
+        def condition_of(g):
+            mb, _, cond, _ = ef.condition_samples(mol_batch.clone(), temperature=temp,
+                                                  sg_inds=torch.full_like(zp, g), z_primes=zp, repeats=repeats)
+            return mb, cond
+        logits = level_group_logits(self.gfn_model, condition_of, mol_batch, groups)[::repeats]
+        frac = float(getattr(self.args.condition_log_z, 'rollout_group_draw_uniform_frac',
+                             ROLLOUT_GROUP_UNIFORM_FRAC))
+        g, _, p = draw_groups(logits, groups, uniform_frac=frac)
+        ent = -(p * torch.log(p.clamp_min(1e-300))).sum(-1)
+        self._sg_draw_stats = {'sg_draw/entropy_nats': float(ent.mean()),
+                               'sg_draw/max_p': float(p.max(-1).values.mean()),
+                               'sg_draw/uniform_entropy_nats': float(np.log(len(groups)))}
+        return ef.condition_samples(mol_batch, temperature=temp, sg_inds=g.repeat_interleave(repeats).to(zp.device),
+                                    z_primes=zp, repeats=repeats)
 
     def _rollout_condition_rows(self, n: int, mode: str) -> np.ndarray:
         """`n` mol_dataset row indices for one rollout under a non-iid `mode`."""
@@ -7153,6 +7210,9 @@ class Modeller:
         init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
+        if self._rollout_group_mode() == 'level':   # each molecule's space group from the level, not uniform
+            mol_batch, log_T_tensor, condition, condition_id = self._level_group_draw(mol_batch, log_T_tensor,
+                                                                                      repeats)
 
         out = get_gfn_forward_loss(self.args.fwd_loss_coeffs,
                                    init_state,
