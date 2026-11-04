@@ -192,9 +192,9 @@ class CausalTransformerConditioner(nn.Module):
         forward() does for its slot on the completed rows, so the result matches the d-pass inverse (invert_block)
         to rounding, at about one forward pass of conditioner work instead of d. A conditional conditioner takes the
         same ctx as forward(): the context vector's projection is added to every token, and a cross-attending one's
-        memory is projected to keys and values once per layer for the whole decode. `extra_of()` returns the per-row
-        features [b, d, extra_dim] of the rows fixed so far; at slot j only row order[j]'s are read, which by the
-        contract depend on rows already fixed."""
+        memory is projected to keys and values once per layer for the whole decode. `extra_of(row)` returns that row's
+        per-row features [b, extra_dim] from the rows fixed so far, called for row order[j] at slot j; by the contract
+        they depend on rows already fixed."""
         if (extra_of is None) != (self.extra is None):
             raise ValueError("decode's extra_of must be given exactly when the conditioner takes per-row features")
         if (ctx is None) != (self.ctx is None):
@@ -221,7 +221,7 @@ class CausalTransformerConditioner(nn.Module):
                 tok = ((f.unsqueeze(-1) * self.feat_w[cols]).sum(1) + value_emb[prev]).unsqueeze(1)
             tok = tok + slot_emb[j]
             if extra_of is not None:
-                tok = tok + self.extra(extra_of()[:, int(self.order[j])].to(dtype)).unsqueeze(1)
+                tok = tok + self.extra(extra_of(int(self.order[j])).to(dtype)).unsqueeze(1)
             if add is not None:
                 tok = tok + add
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=on_cuda and self.bf16):

@@ -71,36 +71,31 @@ def _op_classes(sg):
     return torch.stack(W), torch.stack(w), torch.tensor(cls)
 
 
-def _cell_physical(blk, y, lo, hi):
-    """A cell block's rows as lengths (log Angstrom) and cosines: (values, lows, highs), lists of [B] per row, from
-    the chart's values y and intervals [lo, hi] (CellChart.map's formulas). Row i's interval is mapped by a function
-    of rows < i only, increasing (a decreasing map swaps the ends), so the interval stays an interval."""
-    if blk.family == 'triclinic':
-        log_c, r2, r1, sb, sg, v = y
-        log_b = log_c + torch.log(r2)
-        lam = blk.lam(r1, sb, sg)
-        maps = [None,
-                lambda x: log_c + torch.log(x.clamp_min(1e-12)),          # r2 -> log b
-                lambda x: log_b + torch.log(x.clamp_min(1e-12)),          # r1 -> log a
-                lambda x: x * r1 * r2 / 2,                                # s_beta -> cos beta
-                lambda x: x * r1 / 2,                                     # s_gamma -> cos gamma
-                lambda x: (lam + (1 - lam) * x) * r2 / 2]                 # v -> cos alpha
-    elif blk.family == 'monoclinic':
-        log_c, log_a, log_b, s = y
-        m = blk._mono_bound(torch.exp(log_a), torch.exp(log_c))
-        maps = [None, None, None, lambda x: -x * m]                       # s -> cos beta (decreasing)
-    else:
-        return y, lo, hi                                                  # log lengths already
-    out_y, out_lo, out_hi = [], [], []
-    for i, f in enumerate(maps):
-        if f is None:
-            out_y.append(y[i]), out_lo.append(lo[i]), out_hi.append(hi[i])
-            continue
-        a, z = f(lo[i]), f(hi[i])
-        out_y.append(f(y[i]))
-        out_lo.append(torch.minimum(a, z))
-        out_hi.append(torch.maximum(a, z))
-    return out_y, out_lo, out_hi
+def _cell_row_map(blk, ys, i):
+    """The map taking cell row i's chart value to its physical value (log Angstrom or a cosine; CellChart.map's
+    formulas), given the block's earlier chart values ys (a list of [B]), or None for the identity. A function of rows
+    < i only, monotone in its argument (a decreasing map swaps an interval's ends)."""
+    if blk.family == 'triclinic':      # rows log_c, r2, r1, s_beta, s_gamma, v
+        if i == 0:
+            return None
+        log_c = ys[0]
+        if i == 1:
+            return lambda x: log_c + torch.log(x.clamp_min(1e-12))                      # r2 -> log b
+        r2 = ys[1]
+        if i == 2:
+            log_b = log_c + torch.log(r2)
+            return lambda x: log_b + torch.log(x.clamp_min(1e-12))                      # r1 -> log a
+        r1 = ys[2]
+        if i == 3:
+            return lambda x: x * r1 * r2 / 2                                            # s_beta -> cos beta
+        if i == 4:
+            return lambda x: x * r1 / 2                                                 # s_gamma -> cos gamma
+        lam = blk.lam(r1, ys[3], ys[4])
+        return lambda x: (lam + (1 - lam) * x) * r2 / 2                                 # v -> cos alpha
+    if blk.family == 'monoclinic' and i == 3:  # rows log_c, log_a, log_b, s
+        m = blk._mono_bound(torch.exp(ys[1]), torch.exp(ys[0]))
+        return lambda x: -x * m                                                         # s -> cos beta (decreasing)
+    return None                                                                         # log lengths already
 
 
 def _softmin(x, mask, tau=SOFT_TAU):
@@ -149,61 +144,16 @@ class FDRowDescriber:
     def __call__(self, s: torch.Tensor, radius: torch.Tensor, volume=None) -> torch.Tensor:
         """[B, d, k] (module docstring) of rows s [B, d] at molecule radii radius [B] (Angstrom) and, with prefix
         features, molecule volumes volume [B] (cubic Angstrom)."""
-        from energies.fd_coordinates import ORIENTATION, length_box
-        from energies.molecular_crystal import FD_OPEN_EPS
-        from mxtaltools.crystal_fd.charts import CellChart, CrystalChart, PolytopeARChart
         if s.ndim != 2 or s.shape[1] != self.dim:
             raise ValueError(f'sg {self.sg}: expected rows [B, {self.dim}], got {tuple(s.shape)}')
-        b, dev = s.shape[0], s.device
-        r = torch.as_tensor(radius).to(device=dev, dtype=F64).reshape(-1)
-        if r.numel() != b:
-            raise ValueError(f'{r.numel()} radii for {b} rows')
-        u = ((s.to(F64).clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS)) + 1) / 2
-        # FDCoordinates(sg, r).chart, built on the rows' device (the centroid block's coefficient tables included)
-        chart = CrystalChart.for_length_box(self.sg, length_box(self.sg, r), ORIENTATION, device=dev)
-        lo, hi, y = [], [], []
-        cell = t = None
-        for off, blk in zip(chart.offsets, chart.blocks):
-            prev = []
-            for i in range(blk.ndim):
-                pre = torch.stack(prev, 1) if prev else u.new_zeros(b, 0)
-                if isinstance(blk, PolytopeARChart):
-                    a, z = blk.t_bounds(pre, i)        # the fractional interval, over the earlier fractional coordinates
-                else:
-                    a, z = blk.bounds(pre, i)
-                prev.append(a + u[:, off + i] * (z - a))
-                lo.append(a)
-                hi.append(z)
-            if self.prefix and isinstance(blk, CellChart):
-                cell = blk.map(torch.stack(prev, 1))[0]                   # [B, 6] lengths, angles
-            elif self.prefix and isinstance(blk, PolytopeARChart):
-                t = blk.map(u[:, off:off + blk.ndim])[0]                 # [B, 3] fractional, free axes at the gauge
-            if isinstance(blk, CellChart) and blk.ndim:
-                n = blk.ndim
-                prev, lo[-n:], hi[-n:] = _cell_physical(blk, prev, lo[-n:], hi[-n:])
-            y.extend(prev)
-        lo, hi, y = torch.stack(lo, 1), torch.stack(hi, 1), torch.stack(y, 1)
-        shift = torch.where(self.is_length.to(dev), torch.log(r)[:, None], torch.zeros_like(lo))
-        lo, hi, y = lo - shift, hi - shift, y - shift
-        ang = 2 * math.pi * u
-        circ = self.is_circle.to(dev).expand(b, -1)
-        sin = torch.where(circ, torch.sin(ang), torch.zeros_like(ang))
-        cos = torch.where(circ, torch.cos(ang), torch.zeros_like(ang))
-        y = torch.where(circ, torch.zeros_like(y), y)          # a circle row's value is its sin, cos: no seam jump
-        prev_feats = torch.stack([y, sin, cos], -1)                                  # [B, d, 3] of row i
-        prev_feats = torch.cat([prev_feats.new_zeros(b, 1, 3), prev_feats[:, :-1]], 1)   # shifted: row i - 1's
-        parts = [torch.stack([lo, hi], -1), prev_feats]
-        if self.prefix:
-            if volume is None:
-                raise ValueError('prefix features need the molecule volumes (MolData.mol_volume)')
-            vol = torch.as_tensor(volume).to(device=dev, dtype=F64).reshape(-1)
-            rows = torch.arange(self.dim, device=dev)
-            cf = self._cell_features(cell, r, vol)                                   # [B, n_cell]
-            pf = self._position_features(cell, t, r)                                 # [B, n_pos]
-            parts.append(torch.where((rows >= self.cell_end)[None, :, None], cf[:, None], torch.zeros_like(cf[:, None])))
-            parts.append(torch.where((rows >= self.pos_end)[None, :, None], pf[:, None], torch.zeros_like(pf[:, None])))
-        out = torch.cat([p.expand(b, self.dim, -1) for p in parts], -1)
-        return out.to(dtype=s.dtype)
+        st = self.stepper(radius, volume, s.shape[0], s.device)
+        return torch.stack([st.row(s, i) for i in range(self.dim)], 1).to(dtype=s.dtype)
+
+    def stepper(self, radius, volume=None, b=None, device=None) -> 'RowStepper':
+        """A RowStepper for b rows at these radii and volumes: row i's features one row at a time, each row's chart
+        work done once, so a decode that fixes one row per step pays for one row per step. __call__ is a stepper
+        run over every row, so the two give the same numbers."""
+        return RowStepper(self, radius, volume, b, device)
 
     def _cell_features(self, cell, r, vol):
         from mxtaltools.crystal_fd.ops import cell_matrices, metric_tensor
@@ -234,3 +184,121 @@ class FDRowDescriber:
         for k in range(3):
             out.append(_softmin(dist, (cls == k).expand(b, -1)))
         return torch.cat([torch.stack(out, -1), flags, cell.new_ones(b, 1)], -1)
+
+
+class RowStepper:
+    """Row i's features [B, k] of FDRowDescriber (module docstring), rows in the chart's order. ``row(s, i)`` reads
+    rows < i of s [B, d] (rows from i on may hold anything) and fixes each of them once: its chart value from the
+    interval found at its own step, its physical value, and the prefix features when a block completes. Rows are
+    asked for in increasing order; a row already fixed is not re-read, so s's rows < i must not change between
+    calls (in a decode they do not)."""
+
+    def __init__(self, desc: FDRowDescriber, radius, volume, b, device):
+        from energies.fd_coordinates import ORIENTATION, length_box
+        from mxtaltools.crystal_fd.charts import CellChart, CrystalChart, PolytopeARChart
+        self.desc = desc
+        r = torch.as_tensor(radius)
+        dev = r.device if device is None else device
+        r = r.to(device=dev, dtype=F64).reshape(-1)
+        if b is not None and r.numel() != b:
+            raise ValueError(f'{r.numel()} radii for {b} rows')
+        self.r, self.b, self.dev = r, r.numel(), dev
+        self.log_r = torch.log(r)
+        self.vol = None
+        if desc.prefix:
+            if volume is None:
+                raise ValueError('prefix features need the molecule volumes (MolData.mol_volume)')
+            self.vol = torch.as_tensor(volume).to(device=dev, dtype=F64).reshape(-1)
+        # FDCoordinates(sg, r).chart, built on the rows' device (the centroid block's coefficient tables included)
+        chart = CrystalChart.for_length_box(desc.sg, length_box(desc.sg, r), ORIENTATION, device=dev)
+        self.where = []                                   # row -> (block, offset, index in block)
+        for off, blk in zip(chart.offsets, chart.blocks):
+            self.where += [(blk, off, i) for i in range(blk.ndim)]
+            if isinstance(blk, PolytopeARChart):
+                self.pos_blk, self.pos_off = blk, off
+        self._cell_type, self._pos_type = CellChart, PolytopeARChart
+        self.bounds = {}                                  # row -> physical (lo, hi), [B] each
+        self.chart_lo_hi = {}                             # row -> chart (lo, hi)
+        self.ys = {}                                      # row -> chart value
+        self.prev = {}                                    # row -> (physical value, sin, cos), as row + 1 reads them
+        self.cell = self.cell_f = self.pos_f = None
+        self.n_fixed = 0
+
+    def _u(self, s, row):
+        from energies.molecular_crystal import FD_OPEN_EPS
+        return (s[:, row].to(device=self.dev, dtype=F64).clamp(-1 + FD_OPEN_EPS, 1 - FD_OPEN_EPS) + 1) / 2
+
+    def _block_ys(self, row):
+        blk, off, i = self.where[row]
+        return [self.ys[off + k] for k in range(i)]
+
+    def _interval(self, row):
+        """Row's chart interval given the earlier rows of its block, and its physical interval."""
+        if row in self.bounds:
+            return
+        blk, off, i = self.where[row]
+        ys = self._block_ys(row)
+        pre = torch.stack(ys, 1) if ys else self.r.new_zeros(self.b, 0)
+        if isinstance(blk, self._pos_type):
+            a, z = blk.t_bounds(pre, i)        # the fractional interval, over the earlier fractional coordinates
+        else:
+            a, z = blk.bounds(pre, i)
+        self.chart_lo_hi[row] = (a, z)
+        f = _cell_row_map(blk, ys, i) if isinstance(blk, self._cell_type) else None
+        if f is not None:
+            fa, fz = f(a), f(z)
+            a, z = torch.minimum(fa, fz), torch.maximum(fa, fz)
+        if bool(self.desc.is_length[row]):
+            a, z = a - self.log_r, z - self.log_r
+        self.bounds[row] = (a, z)
+
+    def _position_done(self, s):
+        t = self.pos_blk.map(torch.stack([self._u(s, self.pos_off + k) for k in range(self.pos_blk.ndim)], 1)
+                             if self.pos_blk.ndim else self.r.new_zeros(self.b, 0))[0]   # [B, 3] fractional
+        self.pos_f = self.desc._position_features(self.cell, t, self.r)
+
+    def _fix(self, s, row):
+        """Row's chart and physical value from s, and the prefix features of a block it completes."""
+        self._interval(row)
+        blk, off, i = self.where[row]
+        u = self._u(s, row)
+        a, z = self.chart_lo_hi[row]
+        y = a + u * (z - a)
+        ys = self._block_ys(row)
+        self.ys[row] = y
+        if bool(self.desc.is_circle[row]):     # a circle row's value is its sin, cos: no seam jump
+            ang = 2 * math.pi * u
+            self.prev[row] = (torch.zeros_like(y), torch.sin(ang), torch.cos(ang))
+        else:
+            f = _cell_row_map(blk, ys, i) if isinstance(blk, self._cell_type) else None
+            v = y if f is None else f(y)
+            if bool(self.desc.is_length[row]):
+                v = v - self.log_r
+            self.prev[row] = (v, torch.zeros_like(y), torch.zeros_like(y))
+        if self.desc.prefix and i == blk.ndim - 1:
+            if isinstance(blk, self._cell_type):
+                self.cell = blk.map(torch.stack(ys + [y], 1))[0]                        # [B, 6] lengths, angles
+                self.cell_f = self.desc._cell_features(self.cell, self.r, self.vol)
+                if self.pos_blk.ndim == 0:      # a group with no centroid rows: its position is fixed with the cell
+                    self._position_done(s)
+            elif isinstance(blk, self._pos_type):
+                self._position_done(s)
+
+    def row(self, s, i):
+        """Row i's features [B, k], float64, from rows < i of s."""
+        d = self.desc
+        if s.shape[0] != self.b:
+            raise ValueError(f'{self.b} radii for {s.shape[0]} rows')
+        if i < self.n_fixed:
+            raise ValueError(f'row {i} asked after rows up to {self.n_fixed - 1} were fixed: rows go in order')
+        while self.n_fixed < i:
+            self._fix(s, self.n_fixed)
+            self.n_fixed += 1
+        self._interval(i)
+        lo, hi = self.bounds[i]
+        prev = self.prev[i - 1] if i else (torch.zeros_like(lo),) * 3
+        parts = [torch.stack([lo, hi, *prev], -1)]
+        if d.prefix:
+            parts.append(self.cell_f if i >= d.cell_end else lo.new_zeros(self.b, len(CELL_FEATS)))
+            parts.append(self.pos_f if i >= d.pos_end else lo.new_zeros(self.b, len(POS_FEATS)))
+        return torch.cat(parts, -1)

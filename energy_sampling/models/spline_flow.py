@@ -25,7 +25,7 @@ def quat_to_rotmat(q):
 
 
 @torch.no_grad()
-def invert_block_cached(blk, y, ctx=None, extra_of=None):
+def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None):
     """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
     per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
     each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding; with
@@ -33,7 +33,10 @@ def invert_block_cached(blk, y, ctx=None, extra_of=None):
     conditioning amplifies that (--tf_fp32 runs them in the input's precision).
     ctx: a _ContextBlock's context, as its forward takes it (_ContextFlow.context_input's first output).
     extra_of: for a conditioner with per-row features, a function of the block's rows x [b, d] filled so far (zero
-    beyond) returning those features (_ContextFlow.row_extra)."""
+    beyond) returning those features (_ContextFlow.row_extra).
+    extra_step: in place of extra_of, a function returning a stepper whose row(x, i) gives row i's features [b, k]
+    from the rows fixed so far (models/fd_row_describer.py::RowStepper): one row's work per decode step instead of
+    every row's."""
     b = y.shape[0]
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
@@ -52,8 +55,13 @@ def invert_block_cached(blk, y, ctx=None, extra_of=None):
             shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
         x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
 
-    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx,
-                    extra_of=None if extra_of is None else (lambda: extra_of(x)))
+    row_of = None
+    if extra_step is not None:
+        st = extra_step()
+        row_of = lambda i: st.row(x, i)                                    # noqa: E731
+    elif extra_of is not None:
+        row_of = lambda i: extra_of(x)[:, i]                               # noqa: E731
+    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx, extra_of=row_of)
     return x
 
 
@@ -271,6 +279,10 @@ class LatentFlow(nn.Module):
                                f"{None if r is None else r.shape[0]} for {z.shape[0]} rows")
         return self.describer(z, r, self.row_volume)
 
+    def row_extra_step(self):
+        """Typed rows: a stepper giving one row's features at a time (invert_block_cached's extra_step)."""
+        return self.describer.stepper(self.row_radius, self.row_volume, None, self.flow.mu.device)
+
     def _fold(self, x):
         if not self.half_rows:
             return x
@@ -315,7 +327,8 @@ class LatentFlow(nn.Module):
             if isinstance(blk, _MixBlock):
                 z = blk.invert(z, f.d)
             elif isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z, None, None if self.describer is None else self.row_extra)
+                z = invert_block_cached(blk, z, None, extra_step=None if self.describer is None
+                                        else self.row_extra_step)
             else:
                 z = invert_block(blk, z, f.d)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
@@ -436,6 +449,38 @@ class AtomEncoder(nn.Module):
         return tokens, mask, pooled
 
 
+class ChiralChannels(nn.Module):
+    """Per-atom pseudoscalars: invariant under rotation, odd under reflection.
+
+    For atom i and channel c, three vectors v_{c,a} = sum_j w_{c,a}(d_ij) (x_j - x_i) / d_ij over its graph neighbours,
+    each with its own learned radial filter w_{c,a} (a Gaussian basis on [0, cutoff] under a cosine envelope), and
+    chi_{c,i} = asinh(v_{c,1} . (v_{c,2} x v_{c,3})). The triple product is a determinant, so it is unchanged by a
+    rotation and changes sign under a reflection; it is zero wherever the local environment has a mirror plane (all
+    three vectors then lie in it). asinh keeps it odd and of order one. The molecule's mirror image therefore gives
+    each atom -chi, an achiral molecule a pattern equal to its own mirror image's up to the symmetry's atom
+    permutation, and a chiral conformer (an achiral molecule's included) one that differs from its mirror image's."""
+
+    def __init__(self, channels=8, radial=16, cutoff=4.0):
+        super().__init__()
+        self.channels, self.cutoff = int(channels), float(cutoff)
+        self.register_buffer('centres', torch.linspace(0.0, self.cutoff, int(radial)))
+        self.width = self.cutoff / max(int(radial) - 1, 1)
+        self.filters = nn.Linear(int(radial), 3 * self.channels)
+
+    def forward(self, pos, edges):
+        """pos [nodes, 3], edges [2, E] (source, target) -> chi [nodes, channels]."""
+        src, dst = edges[0], edges[1]
+        r = pos[src] - pos[dst]                                              # [E, 3], target to source
+        d = r.norm(dim=-1).clamp_min(1e-6)
+        env = torch.where(d < self.cutoff, 0.5 * (torch.cos(math.pi * d / self.cutoff) + 1), torch.zeros_like(d))
+        basis = torch.exp(-((d[:, None] - self.centres) / self.width) ** 2) * env[:, None]
+        w = self.filters(basis).view(-1, self.channels, 3)                   # [E, c, 3]
+        msg = w[..., None] * (r / d[:, None])[:, None, None, :]              # [E, c, 3 vectors, 3 xyz]
+        v = pos.new_zeros(pos.shape[0], self.channels, 3, 3).index_add_(0, dst, msg)
+        trip = (v[:, :, 0] * torch.linalg.cross(v[:, :, 1], v[:, :, 2])).sum(-1)
+        return torch.asinh(trip)
+
+
 class SplitAtomEncoder(nn.Module):
     """A molecule as an invariant trunk and a point stream (docs/design/conditional_ar_architecture.md §5.1).
 
@@ -445,10 +490,13 @@ class SplitAtomEncoder(nn.Module):
     MLP(x_i)], x_i the atom's coordinates in the standard frame (the frame the orientation rows rotate from); it gives
     per-atom point tokens and their pool p. Information runs from the trunk into the point stream and never back: s is
     a function of distances and elements only. Both pools are mxtaltools' AugSoftmaxAggregation, sum_i x_i
-    (softmax_i(t x_i) + b) per channel. point_convs 0 makes the point stream a per-atom MLP (no edges)."""
+    (softmax_i(t x_i) + b) per channel. point_convs 0 makes the point stream a per-atom MLP (no edges).
+    chirality > 0: the trunk's node input also carries that many ChiralChannels pseudoscalars, so h_i and s stay
+    invariant under rotation but tell a chiral molecule from its mirror image (and everything that reads them, the
+    level head included, can)."""
 
     def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64,
-                 point_convs=None):
+                 point_convs=None, chirality=0):
         super().__init__()
         from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
         from mxtaltools.models.modules.augmented_softmax_aggregator import AugSoftmaxAggregation
@@ -457,7 +505,8 @@ class SplitAtomEncoder(nn.Module):
         gnn = dict(node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2, embedding_dim=node_dim,
                    num_radial=radial, cutoff=cutoff, max_num_neighbors=max_neighbors, atom_type_embedding_dim=16,
                    norm='layer')
-        self.gnn = ScalarGNN(input_node_dim=1, num_convs=convs, **gnn)
+        self.chiral = ChiralChannels(int(chirality)) if chirality else None
+        self.gnn = ScalarGNN(input_node_dim=1 + int(chirality), num_convs=convs, **gnn)
         self.pos_emb = nn.Sequential(nn.Linear(3, 64), nn.SiLU(), nn.Linear(64, 64))
         self.point = ScalarGNN(input_node_dim=1 + node_dim + 64, num_convs=point_convs, **gnn)
         self.s_pool = AugSoftmaxAggregation(channels=node_dim)
@@ -476,7 +525,8 @@ class SplitAtomEncoder(nn.Module):
         zf, pf = z[mask].to(pos.dtype)[:, None], pos[mask]
         ptr = F.pad(torch.cumsum(n, 0), (1, 0))
         edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
-        h = self.gnn(zf, pf, batch, edges)                                           # [nodes, node_dim], invariant
+        x0 = zf if self.chiral is None else torch.cat([zf, self.chiral(pf, edges)], -1)
+        h = self.gnn(x0, pf, batch, edges)                       # [nodes, node_dim], rotation invariant
         s = self.s_out(self.s_pool(h, batch, dim_size=u))
         pt = self.point(torch.cat([zf, h, self.pos_emb(pf)], -1), pf, batch, edges)  # [nodes, node_dim]
         p = self.p_out(self.p_pool(pt, batch, dim_size=u))
@@ -630,6 +680,15 @@ class _ContextFlow(nn.Module):
         vol = None if self.row_volume is None else self.row_volume[cid]
         return self.describer(x, self.row_radius[cid], vol)
 
+    def row_extra_step(self, c):
+        """Typed rows: a stepper giving one row's features at a time under conditions c (invert_block_cached's
+        extra_step)."""
+        if self.row_radius is None:
+            raise RuntimeError("typed rows need the molecule radii (set_row_radius)")
+        cid = c[:, 0].round().long()
+        vol = None if self.row_volume is None else self.row_volume[cid]
+        return self.describer.stepper(self.row_radius[cid], vol, c.shape[0], c.device)
+
     def context_input(self, c):
         """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's
         input in atom mode, else the embedded standardised condition and the standardised condition. While
@@ -747,9 +806,11 @@ class ConditionalLatentFlow(nn.Module):
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
         extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
+        extra_step = None if f.describer is None else (lambda: f.row_extra_step(c))
         for blk in reversed(list(f.blocks)):
             if isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z, ctx, extra_of)       # one decode step per row, not d full passes
+                z = invert_block_cached(blk, z, ctx, extra_step=extra_step)   # one decode step (one row's features)
+                #                                                              per row, not d full passes
             else:
                 z = blk.invert(z, ctx, extra_of)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)

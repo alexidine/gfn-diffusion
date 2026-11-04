@@ -248,3 +248,75 @@ def test_sym_ops_modes():
     for bad in ({'mol_scalars': True}, {'sym_ops': 'pooled'}):
         with pytest.raises(ValueError, match='molecule route'):
             NFPolicy(gfn_config(False), {**SMALL, **bad}, seed=0)
+
+
+def _mirror_symmetric(seed, n_half=4):
+    """An achiral molecule: n_half atoms on one side of the plane x = 0 and their mirror images, element for element,
+    in random positions (so it is not planar and has no symmetry but the mirror)."""
+    g = torch.Generator().manual_seed(seed)
+    half = torch.randn(n_half, 3, generator=g) * 1.2
+    half[:, 0] = half[:, 0].abs() + 0.3
+    mirror = half * torch.tensor([-1.0, 1.0, 1.0])
+    z = torch.randint(1, 9, (n_half,), generator=g)
+    return torch.cat([z, z]), torch.cat([half, mirror])
+
+
+def test_chiral_channels_are_rotation_invariant_reflection_odd_and_zero_on_a_mirror_plane():
+    from models.spline_flow import ChiralChannels
+    from mxtaltools.models.functions.radial_graph import build_radial_graph
+    torch.manual_seed(0)
+    chi = ChiralChannels(8)
+    pos = torch.randn(7, 3, dtype=torch.float64) * 1.5
+    chi = chi.double()
+
+    def run(p):
+        batch = torch.zeros(p.shape[0], dtype=torch.long)
+        e = build_radial_graph(p, batch, torch.tensor([0, p.shape[0]]), 10.0, 64)['edge_index']
+        return chi(p, e)
+    c0 = run(pos)
+    assert c0.abs().max() > 1e-3                                       # a random molecule is chiral
+    assert torch.allclose(run(pos @ _rotation(1).T.double()), c0, atol=1e-9)
+    assert torch.allclose(run(pos @ _rotation(1, proper=False).T.double()), -c0, atol=1e-9)
+    flat = pos.clone()
+    flat[:, 2] = 0.0                                                   # planar: every environment has a mirror plane
+    assert run(flat).abs().max() < 1e-9
+
+
+def test_with_chirality_the_invariant_pool_tells_a_chiral_molecule_from_its_mirror_image():
+    """atom_chirality: s (and so the level head's input) stays rotation invariant, differs between a chiral molecule
+    and its mirror image, and does not differ for an achiral one; without it, s is reflection invariant (above)."""
+    torch.manual_seed(0)
+    enc = SplitAtomEncoder(32, node_dim=16, convs=2, chirality=8).double()
+    z = torch.randint(1, 9, (1, 7))
+    n = torch.tensor([7])
+    pos = torch.randn(1, 7, 3, dtype=torch.float64) * 1.5
+    s0 = enc(z, pos, n)[2]
+    assert torch.allclose(enc(z, pos @ _rotation(3).T.double(), n)[2], s0, atol=1e-5)
+    s_mirror = enc(z, pos @ _rotation(3, proper=False).T.double(), n)[2]
+    assert (s_mirror - s0).abs().max() > 1e-4
+    za, pa = _mirror_symmetric(4)
+    sa = enc(za[None], pa[None].double(), torch.tensor([8]))[2]
+    sb = enc(za[None], (pa @ _rotation(5, proper=False).T)[None].double(), torch.tensor([8]))[2]
+    assert torch.allclose(sa, sb, atol=1e-5)   # _rotation is orthogonal to float32 rounding
+
+
+def test_atom_chirality_reaches_the_level_and_needs_the_split_encoder():
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    torch.manual_seed(0)
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'atom_chirality': True}, seed=0)
+    g = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for p in pol.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g))
+    pol.eval()
+    cond = torch.randn(3, 4)
+    with torch.no_grad():
+        e0 = pol.get_condition_embedding(cond, _mols())
+        e_rot = pol.get_condition_embedding(cond, _mols(rot=_rotation(2)))
+        e_mir = pol.get_condition_embedding(cond, _mols(rot=_rotation(2, proper=False)))
+    assert torch.allclose(e0, e_rot, atol=1e-5)
+    assert (e0 - e_mir).abs().max() > 1e-5
+    for bad in ({'atom_tokens': True}, {}):
+        with pytest.raises(ValueError, match='atom_chirality'):
+            NFPolicy(cfg if bad else gfn_config(False), {**SMALL, **TF, **bad, 'atom_chirality': True}, seed=0)

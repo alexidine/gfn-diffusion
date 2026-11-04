@@ -484,7 +484,7 @@ Where the build departs from §5 to §5.7 (each a deliberate scope cut or substi
 2. **Molecule scalars are not in the context** (§5.1). V_mol and r_mol reach only the prefix features. The principal
    moments are not computed.
 3. **No chirality input; e_g is not read** by the policy context, the level head or an SG head (§5.2, §5.7). The level
-   still reads the SG condition column.
+   still reads the SG condition column. [Since closed: e_g as `sym_ops: pooled`, chirality as `atom_chirality`, §5.9.]
 4. **Decoded units** (§5.3): only `log_a`, `log_b` and `log_c` become `log(L / r_mol)`. The triclinic `r2 = b/c` and
    `r1 = a/b`, the cosine factors (`s_beta`, `s_gamma`, `v`, monoclinic `s`) and the orientation angles are passed in
    the chart's own units, not as lengths and cosines.
@@ -521,7 +521,12 @@ Open, written down rather than guessed:
    - (c) **Leave the level mirror-blind** and accept the bias on enantiomorphic groups, of order the gap between the
      pair's two Z.
 
-   Nothing is built. The point stream p carries chirality to the policy already, but p never reaches the level.
+   Built 2026-11-04 (owner: the model should have the information, not be blind), as a learned form of (b) inside
+   the encoder: `cfg:model.nf.atom_chirality` adds `models/spline_flow.py::ChiralChannels`, per-atom pseudoscalars
+   (the triple product of three learned radially weighted neighbour-vector sums), to the invariant trunk's node
+   input. s stays rotation invariant and tells a chiral molecule, a chiral conformer of an achiral one included,
+   from its mirror image; everything that reads s (the level head, the context) gets it. Off in mk_dev. Closing the
+   allowed groups (a) is left for now (owner).
 2. **The drawn SG step.** The SG head as softmax(L) and drawing g are not built. Both wait on the FD energy route
    scoring several groups in one run (search/prior session).
 3. **Block-order toggle:** not built. The owner chose the chart's order, 2026-11-04.

@@ -266,8 +266,10 @@ def eval_figs(fwd_stats,
               chart='latent',
               ):
     """chart: the coordinates of prior_latent_params and anchor_latents (energy_config.crystal_coordinates); the
-    samples are read in the same chart for 'Lattice Latents Distribution' ('latent': latent_params; 'fd': the FD
-    chart rows s in [-1, 1], fd_chart_coordinates)."""
+    samples are read in the same chart for 'Lattice Latents Distribution' ('latent': latent_params; 'fd': the run's
+    own FD chart rows s in [-1, 1], each draw's fd_state, else energy_function.fd_rows_of. Not mxtaltools'
+    fd_chart_coordinates, which charts at the trainer's latent length box, so its cell-length rows are other
+    coordinates than the reference's)."""
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
     log_r = fwd_stats['log_r']
@@ -334,11 +336,16 @@ def eval_figs(fwd_stats,
         # functions the prior does not contain (P1, toy_wk_aug24 2026-08-24) --
         # the very artifact that surfaced the target-pinning bug upstream.
         from energies.molecular_crystal import is_crystal_energy
+        rows = None
+        if chart == 'fd':
+            rows = getattr(sample_batch, 'fd_state', None)
+            if rows is None:
+                rows = energy_function.fd_rows_of(sample_batch)
         fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
             space=chart, ref_dist=prior_latent_params, quantiles=[0.1],
             show=False, return_fig=True, override_energy=scaled_energy,
             gauge_fix_free_axes=is_crystal_energy(energy_function),
-            aux_dists=[anchor_latents] if anchor_latents is not None else None)
+            aux_dists=[anchor_latents] if anchor_latents is not None else None, samples=rows)
     with fig_guard('Sample Scatter'):
         # subsampled: the funnel is a density scatter and reads the same at 2k
         # points as at the full eval batch, but plotly serializes every marker

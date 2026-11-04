@@ -88,6 +88,27 @@ def test_describer_values_are_the_charts_physical_coordinates(sg):
     assert torch.allclose(out[:, 1:, 4][:, circ], torch.cos(ang[:, :-1][:, circ]), atol=1e-10)
 
 
+@pytest.mark.parametrize('sg', DAY_FAMILIES)
+@pytest.mark.parametrize('prefix', (False, True))
+def test_stepper_gives_the_full_pass_features_one_row_at_a_time(sg, prefix):
+    """The cached decode's RowStepper: asked for row i with rows >= i holding anything (as a decode's unfilled rows
+    do), it returns the full pass's row i bit for bit; rows must be asked for in order."""
+    desc = FDRowDescriber(sg, prefix=prefix)
+    s = _rows(desc.dim, 32, sg)
+    radius = torch.rand(32, dtype=torch.float64, generator=torch.Generator().manual_seed(5)) * 3 + 2
+    vol = torch.rand(32, dtype=torch.float64, generator=torch.Generator().manual_seed(6)) * 200 + 100
+    full = desc(s, radius, vol)
+    st = desc.stepper(radius, vol, 32)
+    for i in range(desc.dim):
+        s2 = s.clone()
+        s2[:, i:] = _rows(desc.dim - i, 32, 200 + i)
+        assert torch.equal(st.row(s2, i), full[:, i]), (sg, prefix, desc.names[i])
+    with pytest.raises(ValueError, match='in order'):
+        st.row(s, 0)
+    with pytest.raises(ValueError, match='radii'):
+        desc.stepper(radius, vol, 32).row(s[:4], 0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
 @pytest.mark.parametrize('sg', (2, 14, 88, 148))
 def test_describer_on_the_gpu_gives_the_cpu_features(sg):
