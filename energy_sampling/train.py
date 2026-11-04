@@ -892,6 +892,8 @@ class Modeller:
         ds = self.prior_dataset
         if s['live_kernel'] == 'basin':
             return self._basin_kernel_table()
+        if s['live_kernel'] == 'metric':
+            return self._metric_kernel_table()
         live = self.gfn_model.live_idx.to(self.device)
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
@@ -982,6 +984,72 @@ class Modeller:
         B['misses'] += int((~ok).sum())
         return out
 
+    def _metric_kernel_table(self):
+        """noised_prior.live_kernel 'metric': the prior's own build kick, redrawn live. Each draw is
+        noised_prior.metric_kick of the drawn row's stored crystal, an isotropic step in the FD identity metric (every
+        coordinate in Angstrom) of length 10^U(log_lo, log_hi) at the build manifest's range, charted in the run's
+        chart; unscored, so draws outside the build's energy window are kept. Shares the basin kernel's bank
+        (noised_prior.live_bank points per row, live_fresh_frac of each batch redrawn; _basin_kernel_draw). Refused
+        unless the prior was built with child_kernel 'metric'."""
+        s = self._noised_prior_settings
+        m = getattr(self, '_noised_prior_manifest', None) or {}
+        if m.get('child_kernel') != 'metric':
+            raise ValueError(f"noised_prior.live_kernel 'metric' redraws the prior's own metric kick: this prior was "
+                             f"built with child_kernel {m.get('child_kernel', 'iso')!r} (build_noised_prior "
+                             f"--child_kernel metric)")
+        b = self.prior_dataset.batch
+        n = int(b.num_graphs)
+        self._basin = dict(kind='metric', lo=float(m['log_lo']), hi=float(m['log_hi']),
+                           s0=self._batch_latents(b).detach().cpu().float(), draws=0, misses=0)
+        k = int(s['live_bank'])
+        if k > 0:
+            rows = torch.arange(n).repeat_interleave(k)
+            self._basin['bank'] = self._metric_fresh(rows).reshape(n, k, -1)
+        print(f"live kernel 'metric' (kick 10^U({self._basin['lo']:g}, {self._basin['hi']:g}) Angstrom, the build's) "
+              f"over {n} prior rows; bank {k} per row, fresh share {float(s['live_fresh_frac']):g}; misses "
+              f"{self._basin['misses']} of {self._basin['draws']} draws", flush=True)
+        return True   # the draw reads self._basin; _live_L only marks the table built
+
+    def _metric_fresh(self, rows, chunk: int = 4096):
+        """[len(rows), data_ndim] chart points of fresh metric kicks of the prior rows `rows` (_metric_kernel_table).
+        A kick with no chart point (it leaves the length box, or does not canonicalise) is redrawn up to
+        noised_prior.live_redraws times; a row still without one gets its stored chart point, counted in
+        self._basin['misses']."""
+        B, ef = self._basin, self.energy_function
+        rows = torch.as_tensor(rows).long().flatten().cpu()
+        prior = self.prior_dataset.batch
+        out = B['s0'][rows].clone()
+        done = torch.zeros(len(rows), dtype=torch.bool)
+        fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+        for _ in range(1 + int(self._noised_prior_settings['live_redraws'])):
+            pending = torch.nonzero(~done).flatten()
+            if not pending.numel():
+                break
+            for lo in range(0, int(pending.numel()), chunk):
+                part = pending[lo:lo + chunk]
+                sub = prior.subsample_new_batch(rows[part].to(prior.ptr.device))
+                if 'fd_state' in sub.keys():
+                    delattr(sub, 'fd_state')   # the stored row's chart point, not the kicked crystal's
+                noised_prior.metric_kick(sub, B['lo'], B['hi'])
+                if fd:
+                    params = sub.full_cell_parameters().detach().cpu()
+                    hand = sub.aunit_handedness.reshape(-1).detach().cpu()
+                    sg = sub.sg_ind.reshape(-1).cpu()
+                    radius = sub.radius.reshape(-1).detach().cpu().double()
+                    for g in sorted(set(sg.tolist())):
+                        at = torch.nonzero(sg == g).flatten()
+                        r = ef.fd_coordinates_rows(int(g), radius[at]).from_params(params[at], hand[at])
+                        ok = r.ok.bool()
+                        idx = part[at[ok]]
+                        out[idx] = ef.fd_layout.pack(int(g), r.s[ok].float())
+                        done[idx] = True
+                else:
+                    out[part] = self._batch_latents(sub).detach().cpu().float()
+                    done[part] = True
+        B['draws'] += len(rows)
+        B['misses'] += int((~done).sum())
+        return out
+
     def _basin_kernel_draw(self, latents, inds, mol_batch):
         """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
         With noised_prior.live_bank > 0, a uniformly chosen point of the row's bank, a share live_fresh_frac of the
@@ -989,16 +1057,17 @@ class Modeller:
         canonicalisation, not an energy call, is the cost: about 0.55 s per 1000 fresh MIPCAS draws on CPU
         (2026-10-30, crystal_fd's triclinic reduction)."""
         B = self._basin
+        fresh_of = self._metric_fresh if B.get('kind') == 'metric' else self._basin_fresh
         rows = torch.as_tensor(inds).long().flatten().cpu()
         if 'bank' not in B:
-            return self._basin_fresh(rows).to(latents)
+            return fresh_of(rows).to(latents)
         k = B['bank'].shape[1]
         slot = torch.randint(k, (len(rows),))
         out = B['bank'][rows, slot].clone()
         n_fresh = int(math.ceil(float(self._noised_prior_settings['live_fresh_frac']) * len(rows)))
         if n_fresh:
             pick = torch.randperm(len(rows))[:n_fresh]
-            fresh = self._basin_fresh(rows[pick])
+            fresh = fresh_of(rows[pick])
             out[pick] = fresh
             B['bank'][rows[pick], slot[pick]] = fresh
         return out.to(latents)
@@ -1009,7 +1078,7 @@ class Modeller:
         across a face); dead rows untouched. 'basin' draws in cell parameters instead (_basin_kernel_draw)."""
         if getattr(self, '_live_L', None) is None:
             self._live_L = self._live_kernel_table()
-        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'basin':
+        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') in ('basin', 'metric'):
             return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
         rows = torch.as_tensor(inds, device=latents.device).long().flatten()

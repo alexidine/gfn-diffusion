@@ -36,8 +36,9 @@ CHECK_ROWS = 512
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
                 live_bank=64, live_fresh_frac=0.1, live_shape='hessian')
-#: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw)
-LIVE_KERNELS = (None, 'iso', 'hessian', 'basin')
+#: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
+#: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row
+LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
 
