@@ -155,3 +155,11 @@ def test_hot_lr_sensor_numeric_fields_must_be_numbers(key, bad, match):
 
 def test_hot_lr_sensor_valid_block_still_parses():
     assert stage(hot_lr_sensor=HOT).hot_lr_sensor['above'] == 5.0
+
+
+def test_an_empty_exit_list_is_refused_not_fired_at_the_first_eval():
+    """all() over no terms is True: `exit: []` used to advance the stage at its first eval (2026-11-04, an MLE-only
+    taster went straight to its second stage). Omitting `exit` is the terminal stage."""
+    with pytest.raises(ValueError, match='empty exit list'):
+        stage(exit=[])
+    assert stage().exit is None

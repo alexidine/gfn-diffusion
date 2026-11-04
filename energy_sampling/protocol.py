@@ -1643,6 +1643,11 @@ class Stage:
     def _parse_exit(self, node):
         if node is None:
             return None
+        if not node:
+            # all() over no terms is True, so an empty list would advance at the first eval -- the opposite of what
+            # `exit: []` reads as. A stage that should not exit omits `exit` (terminal) or bounds itself by max_steps
+            raise ValueError(f"stage '{self.name}': an empty exit list would fire at the first eval; omit 'exit' "
+                             f"for a terminal stage, or give a term")
         terms = []
         for i, t in enumerate(node):
             bad = set(t) - TERM_KEYS
