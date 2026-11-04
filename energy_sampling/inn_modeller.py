@@ -1123,10 +1123,10 @@ class InnModeller(Modeller):
             self.pbuf_scored += int(batch.num_graphs)
             self.pbuf_window['drawn'] += int(batch.num_graphs)
         tile = getattr(self.args.buffers.anchor_buffer, 'tile', 'iso')
-        if tile in ('iso', 'shaped'):
+        if tile in ('iso', 'metric', 'shaped'):
             return super()._noise_and_condition(batch, noise_log_range, anchor_inds=anchor_inds)
         if tile != 'gauss':
-            raise ValueError(f"buffers.anchor_buffer.tile {tile!r}: iso, shaped or gauss")
+            raise ValueError(f"buffers.anchor_buffer.tile {tile!r}: iso, metric, shaped or gauss")
         self._gauss_kick(batch, self.gauss_sigma)
         batch, log_T, condition, condition_id = self.energy_function.condition_samples(
             batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)

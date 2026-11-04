@@ -1209,8 +1209,9 @@ buffers:
     health_gate_ceiling: 0.5
     replay_beta: 1.0           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors
     noise_log_range: [ -2.5, -1.5 ]  # log10-uniform isotropic latent noise magnitude for prior top-ups
+    metric_noise_log_range: null     # tile 'metric' only: [lo, hi] log10 Angstrom radius of the iso draw in the FD identity metric (noised_prior.metric_kick); null raises under 'metric'. build_noised_prior --child_kernel metric calibrates one (manifest log_lo, log_hi)
     # --- the SHAPE of the jitter a drawn anchor gets before it is rescored ---
-    tile: 'iso'               # 'iso' = the log-uniform isotropic draw above, centred on the STORED anchor. 'shaped' = a per-anchor Gaussian read from shape_path, centred on that anchor's stored RELAXED minimum; noise_log_range is then unread. Absent = 'iso'
+    tile: 'iso'               # 'iso' = the log-uniform isotropic draw above, centred on the STORED anchor. 'metric' = the same draw isotropic in the FD identity metric (Angstrom), radius from metric_noise_log_range; noise_log_range is then unread. Any other value raises (inn_modeller adds 'gauss'). 'shaped' = a per-anchor Gaussian read from shape_path, centred on that anchor's stored RELAXED minimum; noise_log_range is then unread. Absent = 'iso'
     shape_path: null          # path to the tile sidecar (format_version 1; per anchor: x_min, evals, evecs, plus a sha1 of anchor_buffer.x). Read ONCE, when the anchor buffer is seeded or restored. Missing file, wrong format_version, row-count mismatch or sha mismatch RAISES -- there is no fallback to 'iso'. Inert while tile is 'iso'
     tile_temperature: 1.0     # scales the tile variance: the width along eigenvector i is sqrt(tile_temperature / lambda_i)
     tile_width_cap: 0.15      # latent units. The width used for any direction with lambda <= 0, and the cap on every direction's width

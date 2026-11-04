@@ -20,6 +20,9 @@ direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded,
 10^h for h in PILOT_GRID, and log_hi is the h whose median seed-energy excess over the parent
 (MolecularCrystal.seed_energy_from, in kT at the run's temperature) lies nearest --window_kT; the table goes in the
 manifest. Every finite child is kept whatever its energy: the energy and packing windows are load-time settings.
+With --child_kernel metric the kick is noised_prior.metric_kick instead: the same log-uniform radius and uniform
+direction, measured in the FD identity metric (Angstrom; --log_lo/--log_hi in log10 Angstrom, pilot over
+METRIC_PILOT_GRID, no fallback: a pilot that misses the target by more than a factor 2 stops the build).
 With --basins and --child_kernel basin, the K children of a basin are instead draws of its kernel
 (noised_prior.basin_factors at --shape, --tau, --caps; noised_prior.basin_draw into the trainer latent at a uniformly
 drawn trainer-box image; basin_kick): no calibration, no image step, a draw with no chart point after --redraws
@@ -55,6 +58,8 @@ PILOT_ROWS = 2048
 BASIN_ROUND_TRIP_TOL = 1e-3   # latent units: a decoded basin draw's latent_params against the latent it was decoded from
 PHI_LATENT = 10               # Z' = 1 latent row of the orientation's azimuth, periodic on [-1, 1]
 PILOT_GRID = tuple(-2.5 + 0.125 * i for i in range(17))   # 10^-2.5 .. 10^-0.5
+METRIC_PILOT_GRID = tuple(-2.0 + 0.125 * i for i in range(21))   # 10^-2 .. 10^0.5 Angstrom
+KICK_UNITS = {'iso': 'latent', 'metric': 'angstrom'}   # the unit of --log_lo/--log_hi per --child_kernel
 
 
 def build_parser():
@@ -70,8 +75,8 @@ def build_parser():
     p.add_argument('--out', required=True)
     p.add_argument('--set', action='append', default=[], dest='overrides', metavar='KEY=VALUE')
     p.add_argument('--k', type=int, default=10, help='children per anchor')
-    p.add_argument('--log_lo', type=float, default=None, help="--child_kernel iso: the iso tile's lowest log10 radius "
-                   "(default -2.5)")
+    p.add_argument('--log_lo', type=float, default=None, help="--child_kernel iso/metric: the lowest log10 radius "
+                   "(default -2.5 latent units for iso, -2.0 Angstrom for metric)")
     p.add_argument('--log_hi', default='auto', help="'auto' (pilot calibration) or a number")
     p.add_argument('--window_kT', type=float, default=6.0, help='the calibration target, the load-time window')
     p.add_argument('--heldout_frac', type=float, default=0.05)
@@ -81,8 +86,9 @@ def build_parser():
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--chunk', type=int, default=4096, help='rows per scoring call')
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--child_kernel', choices=['iso', 'basin'], default='iso',
-                   help="'iso': the latent iso tile (--log_lo/--log_hi); 'basin' (with --basins): draws of each "
+    p.add_argument('--child_kernel', choices=['iso', 'metric', 'basin'], default='iso',
+                   help="'iso': the latent iso tile (--log_lo/--log_hi); 'metric': the iso tile in the FD identity "
+                        "metric, radius in Angstrom (noised_prior.metric_kick); 'basin' (with --basins): draws of each "
                         "basin's kernel (noised_prior.basin_factors/basin_draw)")
     p.add_argument('--tau', type=float, default=None, help="--child_kernel basin: the kernel's tau (default 1: the "
                    "basin's thermal ellipsoid at the run's T)")
@@ -166,8 +172,14 @@ def load_harvest(pattern, identity, keys, molecules):
     return (collate(parts) if parts else None), files
 
 
-def kick(batch, lo, hi, device):
+def kick(batch, lo, hi, device, kernel='iso'):
+    """(batch on device, [n] radii): each row kicked by the --child_kernel's iso draw at 10^U(lo, hi), 'iso' in the
+    trainer latent (log_noise_latent_parameters), 'metric' in the FD identity metric (noised_prior.metric_kick)."""
     b = batch.to(device)
+    if kernel == 'metric':
+        return b, NP.metric_kick(b, lo, hi)
+    if kernel != 'iso':
+        raise ValueError(f"kick: kernel 'iso' or 'metric', got {kernel!r}")
     mag = b.log_noise_latent_parameters(lo, hi)
     return b, mag
 
@@ -191,7 +203,7 @@ def check_child_kernel_args(args):
     else:
         if kernel_flags:
             raise SystemExit(f"{sorted('--' + k for k in kernel_flags)} are read by --child_kernel basin only")
-        args.log_lo = -2.5 if args.log_lo is None else args.log_lo
+        args.log_lo = ((-2.0 if args.child_kernel == 'metric' else -2.5) if args.log_lo is None else args.log_lo)
 
 
 def basin_kick(anchors, rep, L, args, generator):
@@ -221,13 +233,15 @@ def basin_kick(anchors, rep, L, args, generator):
 
 
 def calibrate(ef, anchors, e_anchor, train_idx, T, args, rng):
-    """(log_hi, table): the pilot of PILOT_ROWS training anchors kicked at each fixed radius in PILOT_GRID."""
+    """(log_hi, table): the pilot of PILOT_ROWS training anchors kicked at each fixed radius in PILOT_GRID ('iso') or
+    METRIC_PILOT_GRID ('metric')."""
+    grid = METRIC_PILOT_GRID if args.child_kernel == 'metric' else PILOT_GRID
     pick = rng.choice(train_idx, min(PILOT_ROWS, len(train_idx)), replace=False)
     base = anchors.subsample_new_batch(torch.as_tensor(pick))
     table = []
-    for h in PILOT_GRID:
+    for h in grid:
         torch.manual_seed(args.seed + 11)
-        b, _ = kick(base.subsample_new_batch(torch.arange(base.num_graphs)), h, h, args.device)
+        b, _ = kick(base.subsample_new_batch(torch.arange(base.num_graphs)), h, h, args.device, args.child_kernel)
         scored = collate(score(ef, b, T, args.device, args.chunk))
         du = (seed_energy(ef, scored, T, args.device) - e_anchor[torch.as_tensor(pick)]) / T
         ok = torch.isfinite(du)
@@ -242,6 +256,10 @@ def calibrate(ef, anchors, e_anchor, train_idx, T, args, rng):
                else math.inf)
     log_hi = best['log_radius']
     if not (0.5 * args.window_kT <= best['excess_kT_p50'] <= 2.0 * args.window_kT):
+        if args.child_kernel == 'metric':
+            raise SystemExit(f"pilot: no radius in 10^[{grid[0]:g}, {grid[-1]:g}] A put the median excess within a "
+                             f"factor 2 of {args.window_kT:g} kT (nearest P50 {best['excess_kT_p50']:.3g} kT); give "
+                             f"--log_hi explicitly")
         print(f"  pilot: no radius put the median excess within a factor 2 of {args.window_kT:g} kT; "
               f"log_hi falls back to -1.5", flush=True)
         log_hi = -1.5
@@ -457,7 +475,8 @@ def main(argv=None):
     else:
         log_hi, table = float(args.log_hi), None
     if not basin_children:
-        print(f"children: K {args.k} per anchor at 10^U({args.log_lo:g}, {log_hi:g})", flush=True)
+        print(f"children: K {args.k} per anchor, {args.child_kernel} kick at 10^U({args.log_lo:g}, {log_hi:g}) "
+              f"({KICK_UNITS[args.child_kernel]})", flush=True)
 
     sg = set(torch.as_tensor(anchors.sg_ind).reshape(-1).tolist())
     zp = set(torch.as_tensor(anchors.z_prime).reshape(-1).tolist())
@@ -481,7 +500,7 @@ def main(argv=None):
             misses += miss
             mag = torch.zeros(len(rep))
         else:
-            b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device)
+            b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device, args.child_kernel)
         scored = score(ef, b, T, args.device, args.chunk)
         for s in scored:
             if images:
@@ -550,6 +569,7 @@ def main(argv=None):
                                                    dropped_off_chart=basins['dropped_off_chart']),
         child_kernel=args.child_kernel, basin_kernel=kernel,
         k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
+        kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),

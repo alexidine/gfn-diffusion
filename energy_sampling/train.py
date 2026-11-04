@@ -774,14 +774,30 @@ class Modeller:
         sidecar, so a call site that cannot supply it raises rather than falling back
         to the isotropic draw.
         """
-        if getattr(self.args.buffers.anchor_buffer, 'tile', 'iso') == 'shaped':
+        tile = getattr(self.args.buffers.anchor_buffer, 'tile', 'iso')
+        if tile == 'shaped':
             self._shaped_anchor_tile(batch, anchor_inds)
-        else:
+        elif tile == 'metric':
+            # the iso draw in the FD identity metric: radius 10^U(metric_noise_log_range) Angstrom
+            noised_prior.metric_kick(batch, *self._metric_noise_log_range())
+        elif tile == 'iso':
             batch.log_noise_latent_parameters(*noise_log_range)
+        else:
+            raise ValueError(f"buffers.anchor_buffer.tile must be 'iso', 'metric' or 'shaped', got {tile!r}")
         batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)
         batch.orient_molecule(mode='std')
         return batch, log_T_tensor, condition, condition_id
+
+    def _metric_noise_log_range(self):
+        """(lo, hi) of buffers.anchor_buffer.metric_noise_log_range, the log10 Angstrom radius range of the 'metric'
+        tile; null or a malformed pair raises (no fallback to the latent noise_log_range, whose unit differs)."""
+        r = getattr(self.args.buffers.anchor_buffer, 'metric_noise_log_range', None)
+        if (r is None or len(r) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in r)
+                or not float(r[0]) <= float(r[1])):
+            raise ValueError("buffers.anchor_buffer.tile 'metric' needs metric_noise_log_range [lo, hi] (log10 "
+                             f"Angstrom, lo <= hi), got {r!r}")
+        return float(r[0]), float(r[1])
 
     @torch.no_grad()
     def _shaped_anchor_tile(self, batch, anchor_inds):
@@ -4401,7 +4417,8 @@ class Modeller:
               f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} "
               + (f"basin-kernel children ({manifest.get('basin_kernel')}, windowed by their basin)"
                  if manifest.get('child_kernel') == 'basin' else
-                 f"at 10^U({manifest.get('log_lo')}, {manifest.get('log_hi')})")
+                 f"{manifest.get('child_kernel', 'iso')} kick at 10^U({manifest.get('log_lo')}, "
+                 f"{manifest.get('log_hi')}) ({manifest.get('kick_units', 'latent')})")
               + f" and T {manifest.get('temperature')}); "
               f"training on {int(keep.sum())} rows of kinds {list(s['train_kinds'])} within {s['window_kT']} kT "
               f"(T {T:g}) of their condition floor and packing {s['packing_window']}; held-out anchor-group rows "
@@ -12132,6 +12149,8 @@ class Modeller:
         # fixed point in init, which the resume path does not reach in the same order.
         if getattr(cfg, 'tile', 'iso') == 'shaped':
             self._load_anchor_tile(source)
+        elif getattr(cfg, 'tile', 'iso') == 'metric':
+            self._metric_noise_log_range()   # refuse a missing or malformed range at construction, not at the first draw
 
     def _load_anchor_tile(self, source):
         """Read buffers.anchor_buffer.shape_path and bind it to the LIVE anchor set.

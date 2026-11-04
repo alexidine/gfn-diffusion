@@ -84,6 +84,105 @@ def settings(args):
     return s
 
 
+def _metric_projector(lattice_codes, dtype, device):
+    """[n, 12, 12]: the orthogonal projector onto the live coordinates of each row's crystal system, in the metric
+    coordinates of metric_kick (Z' = 1). It mirrors mxtaltools enforce_crystal_system: lengths tied to their mean
+    (tetragonal and hexagonal a = b; rhombohedral and cubic a = b = c) move together, fixed angles do not move,
+    rhombohedral angles move together; the centroid and orientation rows are always live."""
+    from mxtaltools.constants.space_group_info import LATTICE_TO_CODE as C
+    eye3 = torch.eye(3, dtype=dtype, device=device)
+    ab = torch.tensor([[.5, .5, 0.], [.5, .5, 0.], [0., 0., 1.]], dtype=dtype, device=device)
+    abc = torch.full((3, 3), 1.0 / 3.0, dtype=dtype, device=device)
+    zero = torch.zeros(3, 3, dtype=dtype, device=device)
+    beta = torch.diag(torch.tensor([0., 1., 0.], dtype=dtype, device=device))
+    blocks = {C['triclinic']: (eye3, eye3), C['monoclinic']: (eye3, beta), C['orthorhombic']: (eye3, zero),
+              C['tetragonal']: (ab, zero), C['hexagonal']: (ab, zero), C['rhombohedral']: (abc, abc),
+              C['cubic']: (abc, zero)}
+    codes = torch.as_tensor(lattice_codes).reshape(-1).tolist()
+    bad = sorted(set(codes) - set(blocks))
+    if bad:
+        raise ValueError(f"metric_kick: unknown lattice codes {bad}")
+    P = torch.zeros(len(codes), 12, 12, dtype=dtype, device=device)
+    for i, c in enumerate(codes):
+        P[i, :3, :3], P[i, 3:6, 3:6] = blocks[c]
+    P[:, 6:9, 6:9] = eye3
+    P[:, 9:12, 9:12] = eye3
+    return P
+
+
+def _rodrigues(w):
+    """[n, 3, 3] float64 rotation matrices of rotation vectors w [n, 3], exact at w = 0."""
+    th = w.norm(dim=1).clamp_min(1e-300)[:, None, None]
+    K = torch.zeros(len(w), 3, 3, dtype=w.dtype, device=w.device)
+    K[:, 0, 1], K[:, 0, 2], K[:, 1, 2] = -w[:, 2], w[:, 1], -w[:, 0]
+    K = (K - K.transpose(1, 2)) / th
+    eye = torch.eye(3, dtype=w.dtype, device=w.device).expand_as(K)
+    return eye + torch.sin(th) * K + (1 - torch.cos(th)) * (K @ K)
+
+
+def radius_of_gyration(batch):
+    """[n] float64: each molecule's RMS atom distance from its heavy-atom centroid (Angstrom), as mxtaltools
+    crystal_fd.metric.molecule_info defines r_g."""
+    pos, z, g = batch.pos.double(), batch.z.reshape(-1), batch.batch.reshape(-1)
+    n = int(batch.num_graphs)
+    heavy = (z > 1).double()
+    hn = torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, heavy)
+    c = torch.zeros(n, 3, dtype=pos.dtype, device=pos.device).index_add_(0, g, pos * heavy[:, None])
+    c = c / hn.clamp_min(1)[:, None]
+    d2 = ((pos - c[g]) ** 2).sum(1)
+    cnt = torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, torch.ones_like(d2))
+    return torch.sqrt(torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, d2) / cnt)
+
+
+def metric_kick(batch, log_lo, log_hi, eps=1e-6, generator=None):
+    """Displace each Z' = 1 crystal of `batch` by a step isotropic in the FD identity metric (mxtaltools
+    crystal_fd.metric: every coordinate in Angstrom), of length 10^U(log_lo, log_hi) Angstrom; IN PLACE. Returns [n]
+    the step lengths (Angstrom).
+
+    The metric coordinates of a displacement are
+      lengths      (da, db, dc)
+      angles       (dalpha sqrt(bc), dbeta sqrt(ac), dgamma sqrt(ab))
+      centroid     T_fc du, the Cartesian displacement of the molecule centre
+      orientation  r_g w, w the rotation vector of the turn applied to the molecule (radius_of_gyration)
+    each at the crystal before the step. The direction is uniform on the unit sphere of the row's live coordinates
+    (_metric_projector: the crystal system's tied and fixed cell parameters), so in every live direction a step of
+    length rho moves the crystal rho in the metric to first order. A free polar axis of the space group is not
+    removed: a step along it moves nothing physical. After the step the row goes through the same three primitives as
+    the latent iso kick (MolCrystalOps.log_noise_latent_parameters): latent_params, clipped to [-1 + eps, 1 - eps],
+    latent_to_cell_params, clean_cell_parameters(mode='hard'), so a kicked crystal is one the trainer latent can
+    hold. The draws use `generator` (None: the global torch generator)."""
+    from mxtaltools.common.geometry_utils import init_sym_info, rotmat2rotvec_stable
+    from mxtaltools.crystal_building.utils import canonicalize_rotvec
+    if int(batch.max_z_prime) != 1:
+        raise ValueError(f"metric_kick: Z' = 1 batches only, got max_z_prime {int(batch.max_z_prime)}")
+    dev, F = batch.cell_lengths.device, torch.float64
+    n = int(batch.num_graphs)
+    p = batch.full_cell_parameters().detach().to(F)
+    codes = init_sym_info()['lattice_code'][torch.as_tensor(batch.sg_ind).reshape(-1).long().cpu()]
+    P = _metric_projector(codes, F, dev)
+    g = torch.randn(n, 12, dtype=F, generator=generator).to(dev)
+    y = torch.einsum('nij,nj->ni', P, g)
+    u = y / y.norm(dim=1, keepdim=True)
+    t = torch.rand(n, dtype=F, generator=generator).to(dev)
+    rho = 10 ** (float(log_lo) + (float(log_hi) - float(log_lo)) * t)
+    s = rho[:, None] * u
+    a, b, c = p[:, 0], p[:, 1], p[:, 2]
+    q = p.clone()
+    q[:, :3] = p[:, :3] + s[:, :3]
+    q[:, 3:6] = p[:, 3:6] + s[:, 3:6] / torch.stack([torch.sqrt(b * c), torch.sqrt(a * c), torch.sqrt(a * b)], 1)
+    T = batch.T_fc.detach().to(F).reshape(n, 3, 3)
+    q[:, 6:9] = p[:, 6:9] + torch.linalg.solve(T, s[:, 6:9, None])[..., 0]
+    w = s[:, 9:12] / radius_of_gyration(batch).to(dev)[:, None]
+    # the latent's orientation rows hold the +z half-space description (canonicalize_rotvec), which an angle in
+    # [0, pi] from rotmat2rotvec_stable need not be: the round trip below would clip z, a different rotation
+    q[:, 9:12] = canonicalize_rotvec(rotmat2rotvec_stable(_rodrigues(w) @ _rodrigues(p[:, 9:12])).to(F))
+    batch.set_cell_parameters(q.to(batch.cell_lengths.dtype))
+    lat = batch.latent_params(gauge_fix_free_axes=False)
+    batch.latent_to_cell_params(lat.clip(min=-1 + eps, max=1 - eps))
+    batch.clean_cell_parameters(mode='hard')
+    return rho
+
+
 def basin_factors(H, live, caps, kT, tau, shape='hessian'):
     """[n, 12, 12] float64: the factor L of each basin's draw x = p + L z, z standard normal (docs/design/basin_set.md
     section 4), from its Hessian H [n, 12, 12] of the physical energy (energy units; MolCrystalData's cell parameters)
