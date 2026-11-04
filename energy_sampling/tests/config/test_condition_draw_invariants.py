@@ -103,6 +103,9 @@ def test_more_than_one_space_group_is_refused():
     cfg = _s7_cfg()
     cfg['space_groups'] = [2, 14]
     assert any('space-group' in m for m in _msgs(cfg))
+    # on the FD chart a stored row keeps its own group (train.py::Modeller._stored_groups): not refused
+    cfg['energy_config']['crystal_coordinates'] = 'fd'
+    assert not any('space-group' in m for m in _msgs(cfg))
 
 
 def test_the_block_is_a_bwd_group_source():

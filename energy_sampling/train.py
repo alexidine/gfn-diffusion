@@ -3246,14 +3246,16 @@ class Modeller:
         cond_draw/* stats and counts a skipped step."""
         ef = self.energy_function
         n_combos = int(getattr(ef, 'n_sg', 1) * getattr(ef, 'n_zp', 1))
-        if n_combos > 1:
+        if n_combos > 1 and not self._stored_groups(None, probe=True):
             # draw_bwd_sample and _finish_replay_draw re-run condition_samples,
             # which redraws the space group and Z' -- the stored condition_id
-            # would no longer be the one the rows are trained under
+            # would no longer be the one the rows are trained under. An FD run over
+            # several groups keeps each stored row's own (_stored_groups)
             raise ValueError(
                 f"condition_draw on a route with {n_combos} space-group/Z' combinations "
                 f"per molecule: every draw redraws them, so the rows it groups by "
-                f"stored condition_id are trained under different conditions.")
+                f"stored condition_id are trained under different conditions (an FD run over several "
+                f"space groups keeps them).")
         x, y = int(spec['replay_rows']), int(spec['prior_rows'])
         lib = int(getattr(ef, 'condition_library_size', 0) or 0)
         rb = getattr(self, 'replay_buffer', None)
@@ -3296,8 +3298,9 @@ class Modeller:
         """(k eligible conditions without replacement, fell_back) for pick
         'weighted'. The weight is weighted_condition_sampling's per-row fit-error
         measure, at condition_log_z's weighted_condition_sampling_temperature and
-        _clip_quantile, mapped row -> condition by mol_id (condition_id == mol_id
-        here: _choose_draw_conditions refuses more than one SG/Z' combination).
+        _clip_quantile, per molecule (mol_dataset's rows, by mol_id), each condition taking its molecule's weight:
+        condition_id = mol_id x (space groups x Z') + its group and Z' (MolecularCrystal.condition_samples), so a
+        molecule's conditions over several space groups share its weight.
         weighted_condition_sampling_uniform_beta keeps its meaning as the
         fraction of the draw taken UNIFORMLY: that many of the k conditions are
         picked uniformly from the eligible ones the weighted part left. With no
@@ -3310,9 +3313,12 @@ class Modeller:
         if p_row is None:
             return np.random.choice(eligible, size=k, replace=False).astype(np.int64), True
         mol_id = self.mol_dataset.batch.mol_id.detach().cpu().long().numpy().ravel()
-        w = np.zeros(max(int(eligible.max()), int(mol_id.max())) + 1)
+        ef = self.energy_function
+        per = int(getattr(ef, 'n_sg', 1) * getattr(ef, 'n_zp', 1))   # conditions per molecule
+        mol_of = eligible // per
+        w = np.zeros(max(int(mol_of.max()), int(mol_id.max())) + 1)
         w[mol_id] = np.asarray(p_row, dtype=np.float64)
-        w_el = w[eligible]
+        w_el = w[mol_of]
         # an eligible condition with no mol_dataset row takes the mean weight,
         # the tracker's own fill for an unvisited condition, never zero
         w_el = np.where(w_el > 0, w_el, w_el[w_el > 0].mean() if (w_el > 0).any() else 1.0)
@@ -8492,12 +8498,14 @@ class Modeller:
             origin = origin[rows]
         self._replay_draw_origin = _origin_fracs(origin, 'replay_draw_origin_frac')
 
-    def _stored_groups(self, mol_batch) -> dict:
+    def _stored_groups(self, mol_batch, probe: bool = False):
         """condition_samples kwargs that keep a stored row's own space group and Z' on an FD run over several
         space groups: its state is in the slots of its own group's chart (energies/fd_coordinates.py::FDSlotLayout),
         so a redrawn group would score it as another crystal. {} elsewhere (one group: nothing to redraw; the latent
-        route keeps its redraw)."""
+        route keeps its redraw). probe: whether this run keeps them (a bool; mol_batch is not read)."""
         layout = getattr(self.energy_function, 'fd_layout', None)
+        if probe:
+            return layout is not None and layout.sg is None
         if layout is None or layout.sg is not None:
             return {}
         return dict(sg_inds=mol_batch.sg_ind.reshape(-1).long(), z_primes=mol_batch.z_prime.reshape(-1).long())

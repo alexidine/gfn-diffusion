@@ -35,17 +35,20 @@ class _Counts:
         return out
 
 
-def _chooser(rep, pri, batch_size=100, n_sg=1, p_row=None, beta=0.0):
+def _chooser(rep, pri, batch_size=100, n_sg=1, p_row=None, beta=0.0, fd_groups=None, n_mol=None):
+    layout = None if fd_groups is None else SimpleNamespace(sg=None if len(fd_groups) > 1 else fd_groups[0],
+                                                            groups=tuple(fd_groups))
     m = SimpleNamespace(
-        energy_function=SimpleNamespace(n_sg=n_sg, n_zp=1, condition_library_size=len(rep)),
+        energy_function=SimpleNamespace(n_sg=n_sg, n_zp=1, condition_library_size=len(rep), fd_layout=layout),
         replay_buffer=_Counts(rep), prior_buffer=_Counts(pri), batch_size=batch_size,
         args=SimpleNamespace(condition_log_z=SimpleNamespace(
             weighted_condition_sampling_temperature=0.3,
             weighted_condition_sampling_clip_quantile=0.99,
             weighted_condition_sampling_uniform_beta=beta)),
-        mol_dataset=SimpleNamespace(batch=SimpleNamespace(mol_id=torch.arange(len(rep)))),
+        mol_dataset=SimpleNamespace(batch=SimpleNamespace(mol_id=torch.arange(len(rep) if n_mol is None else n_mol))),
         weighted_condition_sampling=lambda **kw: p_row)
     m._choose_draw_conditions = MethodType(Modeller._choose_draw_conditions, m)
+    m._stored_groups = MethodType(Modeller._stored_groups, m)
     m._weighted_draw_conditions = MethodType(Modeller._weighted_draw_conditions, m)
     return m
 
@@ -94,6 +97,23 @@ def test_no_eligible_condition_is_an_empty_choice_and_a_counted_skip():
 def test_more_than_one_space_group_combination_is_refused():
     with pytest.raises(ValueError, match='space-group'):
         _chooser([2] * 6, [2] * 6, n_sg=2)._choose_draw_conditions(SPEC)
+
+
+def test_an_fd_run_over_several_space_groups_draws_per_condition():
+    """Its draws keep each stored row's own group (Modeller._stored_groups), so the stored condition_id is the one
+    the rows train under: condition ids mol x 2 + group, every (molecule, group) its own condition."""
+    m = _chooser([2, 0, 2, 2, 0, 2], [2] * 6, n_sg=2, fd_groups=(2, 14), n_mol=3)
+    assert sorted(m._choose_draw_conditions(SPEC).tolist()) == [0, 2, 3, 5]
+
+
+def test_the_weighted_pick_gives_each_condition_its_molecules_weight():
+    """Over several space groups condition c belongs to molecule c // (groups x Z'): molecule 1's weight goes to
+    conditions 2 and 3, not to condition 1."""
+    p = np.array([0.01, 0.98, 0.01])
+    m = _chooser([2] * 6, [2] * 6, batch_size=2, n_sg=2, fd_groups=(2, 14), n_mol=3, p_row=p)   # C = 1
+    spec = dict(SPEC, pick='weighted')
+    picks = np.array([int(m._choose_draw_conditions(spec)[0]) for _ in range(400)])
+    assert np.isin(picks, [2, 3]).mean() > 0.9 and (picks == 1).mean() < 0.05
 
 
 def test_the_uniform_pick_is_without_replacement_and_even():

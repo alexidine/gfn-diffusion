@@ -2004,10 +2004,13 @@ def condition_draw_problems(stage, coeff, glob) -> list[str]:
                               effective condition_block_m of 0 on bwd AND replay
                               (the stage override, else the base block -- mk_dev's
                               base bwd value is 2), since both set the rows per
-                              condition; and one space group x Z' per molecule,
-                              because every draw re-runs condition_samples, which
-                              redraws both, so the stored condition_id it groups
-                              by would not be the one the rows train under.
+                              condition; and one space group x Z' per molecule
+                              except on the FD chart, because every draw re-runs
+                              condition_samples, which redraws both, so the stored
+                              condition_id it groups by would not be the one the
+                              rows train under (an FD run keeps a stored row's own
+                              group, train.py::Modeller._stored_groups, and is
+                              Z' = 1).
       rollout_condition_draw  (global) a non-'iid' value refuses a stage declaring
                               flags.weighted_condition_sampling: both set the
                               forward rollout's condition draw.
@@ -2031,7 +2034,7 @@ def condition_draw_problems(stage, coeff, glob) -> list[str]:
         sgs, zps = glob('space_groups'), glob('z_primes')
         n_combos = (len(sgs) if isinstance(sgs, (list, tuple)) else 1) * \
                    (len(zps) if isinstance(zps, (list, tuple)) else 1)
-        if n_combos > 1:
+        if n_combos > 1 and glob('energy_config.crystal_coordinates') != 'fd':
             out.append(f"condition_draw on a route with {n_combos} space-group x Z' "
                        f"combinations per molecule. Every draw re-runs condition_samples, "
                        f"which redraws them, so rows grouped by stored condition_id train "
