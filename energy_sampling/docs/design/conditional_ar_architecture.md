@@ -455,3 +455,36 @@ These supersede amendment 1 of §5.6 and the SG-head design of §2.2 and §2.3.
   - accept the asymmetry as part of the benchmark's declared convention.
 - **The radius convention** that the length box and r_mol share: heavy atoms or all atoms. This is a data-thread
   interface, not this thread's call.
+
+### 5.8 Build status, 2026-11-04 [built = code and tests in the tree]
+
+Built:
+- Encoder: point stream as a second `ScalarGNN`, AugSoftmax pools (`3a777aad`).
+- Spline defaults on the conditional route equal the unconditional ones (`3a777aad`).
+- Typed FD rows, conditional and unconditional (`nf typed_rows`; `b2552116`, `1d846282`). Order: the chart's own,
+  which is the owner's lengths, angles, position, orientation in every Day group.
+- Prefix features (`nf prefix_features`; `f47e1d9a`).
+- The operation-set featuriser, `e_g` encoder and membership autoencoder (`models/sym_ops.py`, `5c85e073`): pretrains
+  to all 230 groups exact. Not wired to the policy.
+- Both new settings are in `models/nf_policy.py::NF_PENDING_DEFAULTS` until mk_dev carries them (owner-edited file).
+
+Where the build departs from §5 to §5.7 (each a deliberate scope cut or substitution; none settled by the owner):
+1. **No `point_convs` key.** The point stream's depth is `atom_convs`, so the per-atom MLP arm (0 convs) is not
+   reachable from a config.
+2. **Molecule scalars are not in the context** (§5.1). V_mol and r_mol reach only the prefix features. The principal
+   moments are not computed.
+3. **No chirality input; e_g is not read** by the policy context, the level head or an SG head (§5.2, §5.7). The level
+   still reads the SG condition column.
+4. **Decoded units** (§5.3): only `log_a`, `log_b` and `log_c` become `log(L / r_mol)`. The triclinic `r2 = b/c` and
+   `r1 = a/b`, the cosine factors (`s_beta`, `s_gamma`, `v`, monoclinic `s`) and the orientation angles are passed in
+   the chart's own units, not as lengths and cosines.
+5. **No g slot and no padding** (§5.3). One space group per run, so the slot index and the type coincide. The type
+   tables are still keyed by coordinate name, ready for several groups.
+6. **No block-order toggle.** The order is fixed to the chart's.
+7. **Prefix features, substitutions** (§5.4):
+   - the interplanar spacings are over `r_mol`, not over the molecule's thinnest extent;
+   - the shortest-reduced-cell-vector feature is not built;
+   - "distance to the nearest inversion centre, 2-fold axis, mirror/glide plane" is the per-class soft minimum of the
+     centroid's image distance (inversion; other proper operations; other improper operations). For inversion and
+     pure rotations that is twice the distance to the element. For screws and glides it includes the intrinsic
+     translation.
