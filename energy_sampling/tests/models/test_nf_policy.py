@@ -194,6 +194,16 @@ def test_mk_dev_model_section_is_the_sde_policy_with_the_nf_defaults():
     assert raw['model']['nf'] == NF_DEFAULTS   # one set of defaults: the YAML block and the code agree
 
 
+def test_pending_nf_settings_are_not_yet_in_mk_dev():
+    """NF_PENDING_DEFAULTS holds settings built since mk_dev's nf block was last edited: once the owner adds one to
+    mk_dev, it moves into NF_DEFAULTS (and the test above then pins it)."""
+    import yaml
+    from models.nf_policy import NF_DEFAULTS, NF_PENDING_DEFAULTS
+    raw = yaml.safe_load((ROOT / 'configs' / 'mk_dev.yaml').read_text(encoding='utf-8'))
+    assert not set(NF_PENDING_DEFAULTS) & set(raw['model']['nf'])
+    assert not set(NF_PENDING_DEFAULTS) & set(NF_DEFAULTS)
+
+
 def test_build_policy_dispatches_and_leaves_an_sde_config_alone():
     from types import SimpleNamespace
     from models.nf_policy import build_policy

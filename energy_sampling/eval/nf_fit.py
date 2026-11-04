@@ -214,18 +214,21 @@ def _with_vec(ctx, vec):
     return (vec,) + tuple(ctx[1:]) if isinstance(ctx, tuple) else vec
 
 
-def rows_given_ctx(sampler, x, ctx):
+def rows_given_ctx(sampler, x, ctx, extra=None):
     """[n, d] log q terms per live chart row of a ConditionalLatentFlow at its block context `ctx`, x [n, dim]
     wrapped and pinned: base log-density plus every block's log-derivative of that row, less log sd on standardised
     rows. Their sum over rows is sampler.log_prob(x, c) at ctx = context_input(c)[0] (the harness asserts it). With
-    one block, row j's term is log q(x_order[j] | x_order[<j], c)."""
+    one block, row j's term is log q(x_order[j] | x_order[<j], c). extra: a typed-row flow's per-row features of x
+    (row_extra; they depend on x and the molecule, not on ctx), as block_context returns them."""
     from models.spline_flow import _rq_spline, _wrap
     f = sampler.flow
     xl = x[:, sampler.live_idx]
     z = torch.where(f.is_wrap, _wrap(xl), (xl - f.mu) / f.sd)
     terms = torch.where(f.is_wrap, torch.zeros_like(f.sd), -torch.log(f.sd)).expand_as(z).clone()
+    if (extra is None) != (f.describer is None):
+        raise ValueError("a typed-row flow's row terms need its per-row features (block_context's second output)")
     for blk in f.blocks:
-        shift, sp = blk.spline_params(z, ctx)
+        shift, sp = blk.spline_params(z, ctx, extra)
         if blk.has_bounded:
             u = z + torch.where(blk.is_bounded, torch.zeros_like(shift), shift)
             u = torch.where(blk.is_wrap, _wrap(u), u)
@@ -262,9 +265,19 @@ def policy_inputs(run, rows, cond_rows=None):
     return x, condition, cb, log_ref.cpu()
 
 
-def block_context(policy, condition, mol_batch, n):
+def block_context(policy, condition, mol_batch, n, x=None):
+    """The blocks' context for n rows, and with x [n, dim] the typed-row flow's per-row features of x (None for a
+    flow without typed rows)."""
     c = policy._context(condition, mol_batch, n)
-    return policy.sampler.flow.context_input(c)[0]
+    f = policy.sampler.flow
+    ctx = f.context_input(c)[0]
+    if x is None:
+        return ctx
+    if f.describer is None:
+        return ctx, None
+    from models.spline_flow import _wrap
+    xl = x[:, policy.sampler.live_idx]
+    return ctx, f.row_extra(torch.where(f.is_wrap, _wrap(xl), (xl - f.mu) / f.sd), c)
 
 
 @torch.no_grad()
@@ -279,8 +292,8 @@ def score(run, rows, policy=None, cond_rows=None, check=True):
         sub = rows.subsample_new_batch(idx.to(rows.ptr.device))
         csub = None if cond_rows is None else cond_rows.subsample_new_batch(idx.to(cond_rows.ptr.device))
         x, cond, cb, log_ref = policy_inputs(run, sub, csub)
-        ctx = block_context(policy, cond, cb, len(idx))
-        t = rows_given_ctx(policy.sampler, x, ctx)
+        ctx, extra = block_context(policy, cond, cb, len(idx), x)
+        t = rows_given_ctx(policy.sampler, x, ctx, extra)
         if check and lo == 0:
             exact = policy.log_density(x, cond, cb).float()
             gap = float((t.sum(-1) - exact).abs().max())
@@ -469,11 +482,12 @@ def probe_amortise(run, sets, scored, steps=200, lr=1e-2, min_rows=4):
                 fold[i] = gs.setdefault(g, len(gs)) % 2
             x, cond, cb, _ = policy_inputs(run, rows)
             with torch.no_grad():
-                ctx = block_context(policy, cond, cb, len(kk))
+                ctx, extra = block_context(policy, cond, cb, len(kk), x)
             ctx = tuple(t.detach() for t in ctx) if isinstance(ctx, tuple) else ctx.detach()
             vec0 = _ctx_vec(ctx)
             init = torch.stack([vec0[mol_ix == j][0] for j in range(len(mols))])
-            amort = -rows_given_ctx(policy.sampler, x, ctx).sum(-1).detach()
+            ex = lambda s: None if extra is None else extra[s]
+            amort = -rows_given_ctx(policy.sampler, x, ctx, extra).sum(-1).detach()
             free = torch.full_like(amort, float('nan'))
             insample = torch.full_like(amort, float('nan'))
             for f in (0, 1):
@@ -484,15 +498,16 @@ def probe_amortise(run, sets, scored, steps=200, lr=1e-2, min_rows=4):
                     for _ in range(steps):
                         opt.zero_grad()
                         nll = -rows_given_ctx(policy.sampler, x[fit], _with_vec(
-                            tuple(t[fit] for t in ctx) if isinstance(ctx, tuple) else ctx[fit], v[mol_ix[fit]])).sum(-1)
+                            tuple(t[fit] for t in ctx) if isinstance(ctx, tuple) else ctx[fit], v[mol_ix[fit]]),
+                            ex(fit)).sum(-1)
                         nll[torch.isfinite(nll)].sum().backward()
                         opt.step()
                 with torch.no_grad():
                     sl = lambda t, s: tuple(u[s] for u in t) if isinstance(t, tuple) else t[s]
                     free[read] = -rows_given_ctx(policy.sampler, x[read], _with_vec(sl(ctx, read),
-                                                                                  v[mol_ix[read]])).sum(-1)
+                                                                                  v[mol_ix[read]]), ex(read)).sum(-1)
                     insample[fit] = -rows_given_ctx(policy.sampler, x[fit], _with_vec(sl(ctx, fit),
-                                                                                    v[mol_ix[fit]])).sum(-1)
+                                                                                    v[mol_ix[fit]]), ex(fit)).sum(-1)
             gap = per_molecule(kk, amort - free)
             gap_in = per_molecule(kk, amort - insample)
             mean, se, nm = _mean_se(gap.values())

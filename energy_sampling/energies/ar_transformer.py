@@ -13,6 +13,12 @@ layers with causal self-attention, then a shared head. Every slot gets the full 
 unlike MADE, whose hidden units are split among degrees. With context_dim set, forward takes
 the condition's embedding as a second argument (as _ContextMADE does) and adds its projection
 to every token.
+
+Typed rows (docs/design/conditional_ar_architecture.md §5.3): with `row_types` (one index per dim into a shared
+table of `n_types` coordinate types, models/fd_row_describer.py::FD_TYPES) the slot and value embeddings are looked
+up by the coordinate's type instead of its position, so a type means the same thing in every chart; with
+`extra_dim`, forward and decode also take per-row features extra [b, d, extra_dim] whose row i is a function of the
+rows before row i in the order only (the caller's contract), projected and added to the slot that predicts row i.
 """
 import math
 
@@ -87,7 +93,7 @@ class CausalTransformerConditioner(nn.Module):
     """Features of x in, spline parameters of every dim out (dim order), autoregressive in `order`."""
 
     def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, norm='layer', context_dim=None,
-                 cross=False):
+                 cross=False, row_types=None, n_types=None, extra_dim=0):
         super().__init__()
         # conditional runs: the condition's embedding, projected to the width, is added to every token; with `cross`,
         # every layer also cross-attends to a memory of tokens passed with it (forward's ctx = (vector, memory, mask))
@@ -99,8 +105,18 @@ class CausalTransformerConditioner(nn.Module):
         self.register_buffer('slot_of_dim', torch.argsort(torch.as_tensor(order, dtype=torch.long)))
         self.register_buffer('feat_dim', torch.as_tensor(feat_dim, dtype=torch.long))
         self.feat_w = nn.Parameter(torch.randn(len(feat_dim), width) / math.sqrt(2.0))
-        self.dim_emb = nn.Parameter(torch.zeros(d, width))           # which dim a value belongs to
-        self.slot_emb = nn.Parameter(0.02 * torch.randn(d, width))   # which dim a slot predicts
+        if row_types is None:
+            self.dim_emb = nn.Parameter(torch.zeros(d, width))           # which dim a value belongs to
+            self.slot_emb = nn.Parameter(0.02 * torch.randn(d, width))   # which dim a slot predicts
+            self.row_types = None
+        else:   # the same two tables, keyed by coordinate type (shared across charts) rather than by dim
+            if len(row_types) != d or n_types is None or not all(0 <= int(t) < int(n_types) for t in row_types):
+                raise ValueError(f"row_types {list(row_types)}: one type in [0, {n_types}) per dim ({d})")
+            self.register_buffer('row_types', torch.as_tensor(row_types, dtype=torch.long))
+            self.type_val_emb = nn.Parameter(torch.zeros(int(n_types), width))
+            self.type_slot_emb = nn.Parameter(0.02 * torch.randn(int(n_types), width))
+        self.extra_dim = int(extra_dim)
+        self.extra = nn.Linear(self.extra_dim, width) if self.extra_dim else None
         self.start = nn.Parameter(torch.zeros(width))
         self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross, norm=norm) for _ in range(layers))
         self.ln = _norm(norm, width)
@@ -112,12 +128,30 @@ class CausalTransformerConditioner(nn.Module):
             self.head.bias.zero_()
             self.head.bias[2 * n_bins:3 * n_bins] = _SOFTPLUS_ONE
 
-    def forward(self, feats, ctx=None):
+    def _value_emb(self):
+        """[d, width] by dim: the embedding of the dim a value belongs to."""
+        return self.dim_emb if self.row_types is None else self.type_val_emb[self.row_types]
+
+    def _slot_emb(self):
+        """[d, width] by slot: the embedding of the dim slot j predicts."""
+        return self.slot_emb if self.row_types is None else self.type_slot_emb[self.row_types[self.order]]
+
+    def _check_extra(self, extra, b):
+        if (extra is None) != (self.extra is None):
+            raise ValueError(f"this conditioner takes per-row features of width {self.extra_dim}"
+                             if self.extra is not None else "per-row features passed to a conditioner built without")
+        if extra is not None and tuple(extra.shape) != (b, self.d, self.extra_dim):
+            raise ValueError(f"per-row features of shape {tuple(extra.shape)}, expected {(b, self.d, self.extra_dim)}")
+
+    def forward(self, feats, ctx=None, extra=None):
         b = feats.shape[0]
         width = self.feat_w.shape[1]
+        self._check_extra(extra, b)
         val = feats.new_zeros(b, self.d, width).index_add_(1, self.feat_dim, feats.unsqueeze(-1) * self.feat_w)
-        val = val + self.dim_emb
-        h = torch.cat((self.start.expand(b, 1, width), val[:, self.order[:-1]]), dim=1) + self.slot_emb
+        val = val + self._value_emb()
+        h = torch.cat((self.start.expand(b, 1, width), val[:, self.order[:-1]]), dim=1) + self._slot_emb()
+        if extra is not None:
+            h = h + self.extra(extra.to(h.dtype))[:, self.order]
         if (ctx is None) != (self.ctx is None):
             raise ValueError("a conditional transformer conditioner needs ctx, an unconditional one takes none")
         mem = mem_mask = None
@@ -144,7 +178,7 @@ class CausalTransformerConditioner(nn.Module):
         return out[:, self.slot_of_dim].reshape(b, self.d * self.n_params)
 
     @torch.no_grad()
-    def decode(self, feats_of, solve_row, b, dtype, ctx=None):
+    def decode(self, feats_of, solve_row, b, dtype, ctx=None, extra_of=None):
         """Autoregressive decoding with a key/value cache, one slot per step, for sampling.
 
         At step j the cache holds every layer's keys and values for slots 0..j-1. Slot j's token -- the start token at
@@ -155,7 +189,11 @@ class CausalTransformerConditioner(nn.Module):
         forward() does for its slot on the completed rows, so the result matches the d-pass inverse (invert_block)
         to rounding, at about one forward pass of conditioner work instead of d. A conditional conditioner takes the
         same ctx as forward(): the context vector's projection is added to every token, and a cross-attending one's
-        memory is projected to keys and values once per layer for the whole decode."""
+        memory is projected to keys and values once per layer for the whole decode. `extra_of()` returns the per-row
+        features [b, d, extra_dim] of the rows fixed so far; at slot j only row order[j]'s are read, which by the
+        contract depend on rows already fixed."""
+        if (extra_of is None) != (self.extra is None):
+            raise ValueError("decode's extra_of must be given exactly when the conditioner takes per-row features")
         if (ctx is None) != (self.ctx is None):
             raise ValueError("a conditional transformer conditioner needs ctx, an unconditional one takes none")
         vec, mem, mem_mask = ctx if isinstance(ctx, tuple) else (ctx, None, None)
@@ -169,6 +207,7 @@ class CausalTransformerConditioner(nn.Module):
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=on_cuda and self.bf16):
             mem_kv = [layer.kv_x(mem) if mem is not None else None for layer in self.layers]
         cache = [None] * len(self.layers)
+        value_emb, slot_emb = self._value_emb(), self._slot_emb()
         prev = None
         for j in range(self.d):
             if j == 0:
@@ -176,8 +215,10 @@ class CausalTransformerConditioner(nn.Module):
             else:
                 cols = self.feat_dim == prev
                 f = feats_of()[:, cols]                                           # [b, columns of row prev]
-                tok = ((f.unsqueeze(-1) * self.feat_w[cols]).sum(1) + self.dim_emb[prev]).unsqueeze(1)
-            tok = tok + self.slot_emb[j]
+                tok = ((f.unsqueeze(-1) * self.feat_w[cols]).sum(1) + value_emb[prev]).unsqueeze(1)
+            tok = tok + slot_emb[j]
+            if extra_of is not None:
+                tok = tok + self.extra(extra_of()[:, int(self.order[j])].to(dtype)).unsqueeze(1)
             if add is not None:
                 tok = tok + add
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=on_cuda and self.bf16):

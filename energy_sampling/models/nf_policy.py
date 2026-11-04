@@ -45,6 +45,14 @@ NF_DEFAULTS = dict(
     fold_half_rows=None,            # rows '7,8' whose distribution repeats every half period
     mix_k=0,                        # > 0: a mixture-of-logistics block of k components (unconditional)
 )
+# settings built after mk_dev's nf block was last edited (mk_dev is owner-edited): accepted and defaulted like
+# NF_DEFAULTS, absent from mk_dev until the owner adds them, then moved into NF_DEFAULTS (tests/models/test_nf_policy.py
+# pins both halves)
+NF_PENDING_DEFAULTS = dict(
+    typed_rows=False,               # True: the FD chart's rows as typed tokens with their physical values and allowed
+                                    # ranges (models/fd_row_describer.py; one block, the crystal_fd chart)
+)
+NF_ALL_DEFAULTS = {**NF_DEFAULTS, **NF_PENDING_DEFAULTS}
 ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
 # as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0)
@@ -89,7 +97,7 @@ def resolve_policy_entry(policy, gfn_config: dict):
     held = gfn_config.get('hold_dead_latent_rows', True)
     dead = {int(r) for r in (gfn_config.get('dead_latent_rows') or ())} if held else set()
     live = [i for i in range(int(gfn_config['dim'])) if i not in dead]
-    nf = resolve_flow_settings({**NF_DEFAULTS, **dict(policy.get('nf') or {})}, bool(gfn_config.get('conditional')),
+    nf = resolve_flow_settings({**NF_ALL_DEFAULTS, **dict(policy.get('nf') or {})}, bool(gfn_config.get('conditional')),
                                live)
     return {**policy, 'nf': nf}
 
@@ -105,7 +113,8 @@ def build_policy(gfn_config: dict):
         from models.gfn import GFN
         return GFN(**cfg)
     if kind == 'nf':
-        return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)))
+        return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)),
+                        fd_space_group=pol.get('fd_space_group'))
     raise ValueError(f"model kind {kind!r}: 'sde' or 'nf'")
 
 
@@ -131,13 +140,13 @@ class _LevelHead(nn.Module):
 class NFPolicy(nn.Module):
     GAUSS_PARAM_KEYS = ('means_f', 'logvars_f', 'diag_logvars_f', 'rho_f', 'means_b', 'logvars_b')
 
-    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0):
+    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None):
         super().__init__()
         from models.gfn import GFN
-        unknown = set(flow) - set(NF_DEFAULTS)
+        unknown = set(flow) - set(NF_ALL_DEFAULTS)
         if unknown:
-            raise KeyError(f"unknown nf settings {sorted(unknown)}; known: {sorted(NF_DEFAULTS)}")
-        s = {**NF_DEFAULTS, **flow}
+            raise KeyError(f"unknown nf settings {sorted(unknown)}; known: {sorted(NF_ALL_DEFAULTS)}")
+        s = {**NF_ALL_DEFAULTS, **flow}
         probe = GFN(**gfn_config)   # geometry only
         self.device = probe.device
         self.dim = int(probe.dim)
@@ -159,6 +168,20 @@ class NFPolicy(nn.Module):
             raise ValueError(f"flow atom_tokens {s['atom_tokens']!r}: one of {ATOM_TOKEN_MODES}")
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
+        describer = None
+        if s['typed_rows']:
+            # the policy entry names the chart's space group (train.py::Modeller._build_gfn_config on crystal_fd)
+            if fd_space_group is None:
+                raise ValueError("flow typed_rows describes crystal_fd's chart rows: it needs "
+                                 "energy_config.crystal_coordinates fd")
+            if not (self.conditional and s['atom_tokens']):
+                raise NotImplementedError("flow typed_rows is built for the conditional molecule route (atom_tokens) "
+                                          "only")
+            from models.fd_row_describer import FDRowDescriber
+            describer = FDRowDescriber(int(fd_space_group))
+            if describer.dim != self.dim or self.dead_rows:
+                raise ValueError(f"flow typed_rows: sg {int(fd_space_group)}'s chart has {describer.dim} rows, the "
+                                 f"policy {self.dim} ({len(self.dead_rows)} dead)")
 
         wrap_mask = self.ang_mask.cpu().tolist()
         transformer = ((s['tf_width'], s['tf_layers'], s['tf_heads'], s['tf_norm'])
@@ -188,7 +211,8 @@ class NFPolicy(nn.Module):
             cond_dim = 1 + self.conditions_dim if atoms is not None else self.conditions_dim
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
-                                                 transformer=transformer, atoms=atoms, bounded_rows=bounded)
+                                                 transformer=transformer, atoms=atoms, bounded_rows=bounded,
+                                                 describer=describer)
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -274,6 +298,11 @@ class NFPolicy(nn.Module):
         z[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
         pos[nodes, idx] = mol_batch.pos.float().to(self.device)
         self.sampler.flow.set_atom_table(z, pos, counts)
+        if self.sampler.flow.describer is not None:
+            radius = getattr(mol_batch, 'radius', None)
+            if radius is None:
+                raise ValueError("flow typed_rows needs each molecule's radius (MolData.radius) on mol_batch")
+            self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64))
         ids = torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
         if self.conditions_dim == 0:
             return ids

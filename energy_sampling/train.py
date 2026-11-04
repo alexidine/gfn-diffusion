@@ -3481,6 +3481,8 @@ class Modeller:
                   f"{[n for n, w in zip(fd.names, fd.wrap_mask) if w]}; model.periodic_centroids is not read")
             cfg = dict(self._build_latent_gfn_config(periodic_centroids=False), dim=fd.dim,
                        angular_mask=list(fd.wrap_mask), periodic_centroid_axes=None, dead_latent_rows=None)
+            if (cfg.get('policy') or {}).get('nf', {}).get('typed_rows'):   # the chart's group, which they describe
+                cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
         else:
             cfg = self._build_latent_gfn_config()
         if 'policy' in cfg:   # the nf settings resolved on this config's route and rows, as the policy builds them

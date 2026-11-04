@@ -18,7 +18,7 @@ import torch
 
 from energy_sampling.checkpointing import MODELLER_STATE_DEFAULTS, Checkpointer
 from energy_sampling.train import Modeller
-from models.nf_policy import NF_DEFAULTS, build_policy, resolve_flow_settings
+from models.nf_policy import NF_ALL_DEFAULTS, build_policy, resolve_flow_settings
 
 # small flows on the CPU; nothing reads the data drive
 pytestmark = pytest.mark.fast
@@ -153,7 +153,7 @@ def test_gfn_config_stores_the_settings_resolved(tmp_path, conditional):
     m = _modeller(tmp_path, conditional)
     entry = m._build_gfn_config()['policy']
     assert entry['kind'] == 'nf' and entry['seed'] == 3
-    assert entry['nf'] == resolve_flow_settings({**NF_DEFAULTS, **SMALL}, conditional, list(range(12)))
+    assert entry['nf'] == resolve_flow_settings({**NF_ALL_DEFAULTS, **SMALL}, conditional, list(range(12)))
     assert 'auto' not in entry['nf'].values()
     assert m._policy_entry()['policy']['nf'] == SMALL   # the configured block, before resolution
 

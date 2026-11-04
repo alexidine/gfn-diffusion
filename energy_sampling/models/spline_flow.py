@@ -25,13 +25,15 @@ def quat_to_rotmat(q):
 
 
 @torch.no_grad()
-def invert_block_cached(blk, y, ctx=None):
+def invert_block_cached(blk, y, ctx=None, extra_of=None):
     """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
     per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
     each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding; with
     the layers in bf16 the decode's one-token path and forward's full pass round differently, and a trained map's
     conditioning amplifies that (--tf_fp32 runs them in the input's precision).
-    ctx: a _ContextBlock's context, as its forward takes it (_ContextFlow.context_input's first output)."""
+    ctx: a _ContextBlock's context, as its forward takes it (_ContextFlow.context_input's first output).
+    extra_of: for a conditioner with per-row features, a function of the block's rows x [b, d] filled so far (zero
+    beyond) returning those features (_ContextFlow.row_extra)."""
     b = y.shape[0]
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
@@ -50,11 +52,12 @@ def invert_block_cached(blk, y, ctx=None):
             shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
         x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
 
-    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx)
+    blk.made.decode(lambda: blk._feats(x), solve_row, b, y.dtype, ctx,
+                    extra_of=None if extra_of is None else (lambda: extra_of(x)))
     return x
 
 
-def invert_differentiable(blk, y, ctx=None):
+def invert_differentiable(blk, y, ctx=None, extra_of=None):
     """A block's inverse at y with the autograd graph kept (prior_flow.invert_block and
     _ContextBlock.invert run without one). After blk.d passes the result is the exact
     preimage for any parameter value, so the graph through the passes carries its exact
@@ -68,7 +71,7 @@ def invert_differentiable(blk, y, ctx=None):
             p = blk.made(blk._feats(x)).view(y.shape[0], blk.d, blk.n_params)
             shift, sp = p[..., -1], p[..., :3 * blk.n_bins].view(y.shape[0], blk.d, 3, blk.n_bins)
         else:
-            shift, sp = blk.spline_params(x, ctx)
+            shift, sp = blk.spline_params(x, ctx, None if extra_of is None else extra_of(x))
         if bnd is None:
             z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, min_height=mh, tied=td)
         else:
@@ -324,12 +327,14 @@ class _ContextBlock(_Block):
         super().__init__(order, wrap_mask, n_bins, hidden, bound, bounded_mask)
         self.made = _ContextMADE(order, wrap_mask, hidden, n_bins, context_dim)
 
-    def spline_params(self, x, ctx):
-        p = self.made(self._feats(x), ctx).view(x.shape[0], self.d, self.n_params)
+    def spline_params(self, x, ctx, extra=None):
+        """extra: per-row features [b, d, k] for a conditioner built to take them (typed rows), else None."""
+        p = (self.made(self._feats(x), ctx) if extra is None else self.made(self._feats(x), ctx, extra)
+             ).view(x.shape[0], self.d, self.n_params)
         return p[..., -1], p[..., :3 * self.n_bins].view(x.shape[0], self.d, 3, self.n_bins)
 
-    def forward(self, x, ctx):
-        shift, sp = self.spline_params(x, ctx)
+    def forward(self, x, ctx, extra=None):
+        shift, sp = self.spline_params(x, ctx, extra)
         if self.has_bounded:
             z = x + torch.where(self.is_bounded, torch.zeros_like(shift), shift)
             z = torch.where(self.is_wrap, _wrap(z), z)
@@ -341,11 +346,11 @@ class _ContextBlock(_Block):
         return y, ld.sum(-1)
 
     @torch.no_grad()
-    def invert(self, y, ctx):
+    def invert(self, y, ctx, extra_of=None):
         """x with forward(x, ctx) == y: one more coordinate exact per pass, whatever the order."""
         x = torch.zeros_like(y)
         for _ in range(self.d):
-            shift, sp = self.spline_params(x, ctx)
+            shift, sp = self.spline_params(x, ctx, None if extra_of is None else extra_of(x))
             if self.has_bounded:
                 z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height,
                                       self.tied)
@@ -468,7 +473,7 @@ class _ContextFlow(nn.Module):
     """The blocks of a conditional flow, the condition's embedding, and the level head."""
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None, atoms=None, bounded_mask=None, frames=False):
+                 transformer=None, atoms=None, bounded_mask=None, frames=False, describer=None):
         super().__init__()
         d = len(wrap_mask)
         # bounded dims (see _Block) are not standardised and take a uniform base, as wrapped dims do
@@ -511,10 +516,23 @@ class _ContextFlow(nn.Module):
         self.orders = orders
         self.blocks = nn.ModuleList(
             _ContextBlock(o, wrap_mask, n_bins, hidden, bound, context_dim, bmask) for o in orders)
+        # describer: typed rows (models/fd_row_describer.py::FDRowDescriber), whose per-row features are physical
+        # functions of the data rows; legal only in a block that reads the data rows in the chart's own order, so one
+        # block, the identity order, and no standardisation (every row bounded or a circle, as on the FD chart)
+        self.describer = describer
+        typed = {}
+        if describer is not None:
+            from models.fd_row_describer import FD_TYPES, K_EXTRA
+            if transformer is None or n_blocks != 1 or describer.dim != d or not all(self.unit_base.tolist()):
+                raise NotImplementedError("typed rows need the transformer conditioner, one block, and every row "
+                                          "bounded or a circle on the describer's chart")
+            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=K_EXTRA)
+        self.register_buffer('row_radius', None, persistent=False)
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
-                                                        context_dim=context_dim, cross=self.atoms and self.cross)
+                                                        context_dim=context_dim, cross=self.atoms and self.cross,
+                                                        **typed)
         elif self.atoms:
             raise NotImplementedError("atom tokens need --conditioner transformer (the MADE has no cross-attention)")
         n_in = n_ctx = cond_dim
@@ -538,6 +556,20 @@ class _ContextFlow(nn.Module):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
         atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+
+    def set_row_radius(self, radius):
+        """Typed rows: the molecule radius [n_cond] (Angstrom, MolData.radius) per condition id, beside the atom
+        table."""
+        self.row_radius = radius
+
+    def row_extra(self, x, c):
+        """Typed rows: the describer's per-row features [b, d, k] of the block's rows x [b, d] under conditions c
+        (column 0 the condition id); None without a describer."""
+        if self.describer is None:
+            return None
+        if self.row_radius is None:
+            raise RuntimeError("typed rows need the molecule radii (set_row_radius)")
+        return self.describer(x, self.row_radius[c[:, 0].round().long()])
 
     def context_input(self, c):
         """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's
@@ -600,7 +632,8 @@ class ConditionalLatentFlow(nn.Module):
     """q(x | c): LatentFlow with every block reading an embedding of the condition vector c."""
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
-                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, bounded_rows=(), frames=False):
+                 n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, bounded_rows=(), frames=False,
+                 describer=None):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
@@ -612,7 +645,8 @@ class ConditionalLatentFlow(nn.Module):
         self.register_buffer('live_idx', torch.tensor(live, dtype=torch.long))
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
                                  n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
-                                 bounded_mask=[i in self.bounded_rows for i in live], frames=frames)
+                                 bounded_mask=[i in self.bounded_rows for i in live], frames=frames,
+                                 describer=describer)
 
     def to_base(self, x, c, detach_context: bool = False):
         f = self.flow
@@ -622,8 +656,9 @@ class ConditionalLatentFlow(nn.Module):
         x = x[:, self.live_idx]
         z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
         ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
+        extra = f.row_extra(z, c)   # typed rows: one block, reading the data rows (no standardisation)
         for blk in f.blocks:
-            z, l = blk(z, ctx)
+            z, l = blk(z, ctx, extra)
             ld = ld + l
         return z, ld
 
@@ -643,11 +678,12 @@ class ConditionalLatentFlow(nn.Module):
         z0 = torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
                          torch.randn(n, f.d, device=dev, dtype=dtype))
         z = z0
+        extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
         for blk in reversed(list(f.blocks)):
             if isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z, ctx)       # one decode step per row, not d full passes
+                z = invert_block_cached(blk, z, ctx, extra_of)       # one decode step per row, not d full passes
             else:
-                z = blk.invert(z, ctx)
+                z = blk.invert(z, ctx, extra_of)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
         x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
         return (x, z0) if return_base else x
@@ -674,8 +710,9 @@ class ConditionalLatentFlow(nn.Module):
         f = self.flow
         ctx = f.context_input(c)[0]
         z = z0
+        extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
         for blk in reversed(list(f.blocks)):
-            z = invert_differentiable(blk, z, ctx)
+            z = invert_differentiable(blk, z, ctx, extra_of)
         x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
         x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
         return x
