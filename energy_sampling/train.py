@@ -4841,7 +4841,7 @@ class Modeller:
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
                          name=self.run_name,
-                         tags=[self.args.tag])):
+                         tags=[self.args.tag] + (['smoke'] if getattr(self.args, 'smoke', False) else []))):
             self.times['initialization_start'] = time()
 
             # up before anything else so the occupancy trace covers init too -- the

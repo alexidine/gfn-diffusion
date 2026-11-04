@@ -63,6 +63,7 @@ MODES = ('fwd', 'bwd', 'replay')
 # list as a changed learning rate.
 _ENVIRONMENT_KEYS = frozenset({
     'checkpoints_dir', 'device', 'cuda_memory_fraction', 'run_name', 'tag',
+    'smoke',
 })
 
 

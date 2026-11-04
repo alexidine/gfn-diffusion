@@ -8,6 +8,7 @@ project_state_version: 10
 
 run_name: 'mk_dev'
 tag: 'dev'
+smoke: false  # true adds the wandb tag 'smoke' beside `tag`; set it on every smoke test
 seed: 12345
 device: 'cuda'
 cuda_memory_fraction: 0.9  # NOTE increment this to 0.97 when spawning a cluster run

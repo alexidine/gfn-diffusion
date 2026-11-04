@@ -53,7 +53,7 @@ Its seed block, `conformer_cond/make.py::SEED_FRESH`, sets `CK=null`, so a first
 
 ## wandb logging
 
-`train.py::Modeller.train` opens `wandb.init(project="GFN Energy", config=..., name=self.run_name, tags=[self.args.tag])` with no `mode` argument, so the mode comes from the environment and nothing in the submission script sets it. Outside `tests/`, `WANDB_MODE` is assigned in four files of the repository, each to `disabled`: `bench/calibrate_noise.py`, `tierc_smoke.py` in the environment of the subprocess it launches, and `eval/conformer_logz_check.py` and `eval/conformer_model_eval.py` by `os.environ.setdefault`.
+`train.py::Modeller.train` opens `wandb.init(project="GFN Energy", config=..., name=self.run_name, tags=...)` with no `mode` argument; the tags are `cfg:tag`, plus `smoke` when `cfg:smoke` is true, so the mode comes from the environment and nothing in the submission script sets it. Outside `tests/`, `WANDB_MODE` is assigned in four files of the repository, each to `disabled`: `bench/calibrate_noise.py`, `tierc_smoke.py` in the environment of the subprocess it launches, and `eval/conformer_logz_check.py` and `eval/conformer_model_eval.py` by `os.environ.setdefault`.
 
 `train.py::Modeller._log_metrics` catches every exception from `wandb.log`, prints on the first of each run of consecutive failures, publishes the cumulative count as `run/log_failures`, and raises after `train.py::Modeller._MAX_LOG_FAILURES` (200) consecutive failures. The comment beside the batch-controller series in `train.py::Modeller.ten_step_reporting` states that wandb uploads no console log at all for a run left in state `crashed`, while history series survive a hard kill.
 
@@ -83,7 +83,7 @@ Resubmission is per array, not per arm: the same `--array=0-{last}` range re-ent
 
 ## Config keys
 
-`cfg:run_name`, `cfg:tag`, `cfg:epochs`, `cfg:eval_period`, `cfg:figs_period`, `cfg:figs_every_n_evals`, `cfg:checkpoints_dir`, `cfg:checkpoint_name`, `cfg:prior_model_name`, `cfg:load_weights_only`, `cfg:nonfinite_abort_streak`, `cfg:gpu_util_window_s`, `cfg:gpu_util_sample_period_s`, `cfg:gpu_util_policy_window_s`.
+`cfg:run_name`, `cfg:tag`, `cfg:smoke`, `cfg:epochs`, `cfg:eval_period`, `cfg:figs_period`, `cfg:figs_every_n_evals`, `cfg:checkpoints_dir`, `cfg:checkpoint_name`, `cfg:prior_model_name`, `cfg:load_weights_only`, `cfg:nonfinite_abort_streak`, `cfg:gpu_util_window_s`, `cfg:gpu_util_sample_period_s`, `cfg:gpu_util_policy_window_s`.
 
 Code: `train.py::Modeller.train`, `._log_metrics`, `._MAX_LOG_FAILURES`, `._start_gpu_util_thread`, `._sample_gpu_util`, `._gpu_util_mean`, `._gpu_util_capacity`, `._announce_gpu_util_source`, `.vram_ledger`, `.ten_step_reporting`; `train.py::_UTIL_MIN_SPAN_S`, `train.py::FrozenTrainingState`; `gpu_guard.py::_visible_index`; `utils.py::_report_config_invariants`; `config_invariants.py::check`, `::figs_period_fires`, `::step_cadence_keys_are_retired`; `train.py::Modeller.figs_due`, `::Modeller.init_gfn`; `configs/final_sep19/make.py::SBATCH`, `::SEED_A`, `::SEED_B`, `::WALL`, `::committed_mk_dev`; `mxtaltools/common/sym_utils.py::MONO_CLASS`; `configs/conformer_cond/make.py::conformer_template`, `::render_sbatch`, `::DATA_GUARD`, `::SEED_FRESH`, `::arm_digest`; `configs/mle_w3_sep16/make.py::dirty_files`, `::_scan_local_paths`, `::CLUSTER_CKPTS`, `::CLUSTER_DATA`; `configs/prod_sep20/submit_prod_sep20.sbatch`, `configs/prod_sep20/INDEX_a.tsv`, `configs/prod_sep12/submit_prod_sep12.sbatch`.
 
