@@ -117,9 +117,9 @@ class CausalTransformerConditioner(nn.Module):
             self.type_slot_emb = nn.Parameter(0.02 * torch.randn(int(n_types), width))
         self.extra_dim = int(extra_dim)
         self.extra = nn.Linear(self.extra_dim, width) if self.extra_dim else None
-        if self.extra is not None:   # starts as the untyped conditioner: with the default init the per-row features cost
-            nn.init.zeros_(self.extra.weight)   # ~3 nats of MLE fit at step 4000 on MIPCAS (2026-11-04); the no-peeking
-            nn.init.zeros_(self.extra.bias)     # tests randomise every weight, so the zero hides no leak there
+        if self.extra is not None:   # zero: the conditioner starts as the untyped one. The no-peeking tests randomise
+            nn.init.zeros_(self.extra.weight)   # every weight, so the zero hides no leak there
+            nn.init.zeros_(self.extra.bias)
         self.start = nn.Parameter(torch.zeros(width))
         self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross, norm=norm) for _ in range(layers))
         self.ln = _norm(norm, width)
