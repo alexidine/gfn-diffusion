@@ -140,7 +140,7 @@ def build_policy(gfn_config: dict):
         return GFN(**cfg)
     if kind == 'nf':
         return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)),
-                        fd_space_group=pol.get('fd_space_group'))
+                        fd_space_group=pol.get('fd_space_group'), fd_space_groups=pol.get('fd_space_groups'))
     raise ValueError(f"model kind {kind!r}: 'sde' or 'nf'")
 
 
@@ -186,7 +186,11 @@ class _LevelHead(nn.Module):
 class NFPolicy(nn.Module):
     GAUSS_PARAM_KEYS = ('means_f', 'logvars_f', 'diag_logvars_f', 'rho_f', 'means_b', 'logvars_b')
 
-    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None):
+    def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None, fd_space_groups=None):
+        """fd_space_group: the one space group of an FD run (typed rows describe its chart). fd_space_groups: the
+        space groups of a mixed-group FD run (two or more), whose state is energies/fd_coordinates.py::FDSlotLayout's
+        slots: each row's pad slots are pinned at 0 with no density (spline_flow.py::_ContextFlow.set_row_live, from
+        mol_batch.sg_ind) and typed rows describe each row's own group (models/fd_slot_describer.py)."""
         super().__init__()
         from models.gfn import GFN
         unknown = set(flow) - set(NF_ALL_DEFAULTS)
@@ -215,6 +219,16 @@ class NFPolicy(nn.Module):
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
         describer = None
+        self.fd_slots = None
+        if fd_space_groups is not None and len(set(int(g) for g in fd_space_groups)) > 1:
+            from energies.fd_coordinates import FDSlotLayout
+            self.fd_slots = FDSlotLayout(fd_space_groups)
+            if self.fd_slots.dim != self.dim or self.dead_rows:
+                raise ValueError(f"fd_space_groups {list(self.fd_slots.groups)}: the slot layout has "
+                                 f"{self.fd_slots.dim} rows, the policy {self.dim} ({len(self.dead_rows)} dead)")
+            if not (self.conditional and s['atom_tokens']):
+                raise NotImplementedError("a mixed-group FD state needs a conditional policy on the molecule route "
+                                          "(atom_tokens): each row's space group is read from mol_batch")
         if s['row_tokens'] not in ROW_TOKENS:
             raise ValueError(f"flow row_tokens {s['row_tokens']!r}: one of {ROW_TOKENS}")
         if s['sym_ops'] not in SYM_OPS:
@@ -222,7 +236,10 @@ class NFPolicy(nn.Module):
         if s['sym_ops'] in ('tokens', 'tokens_dynamic'):
             raise NotImplementedError(f"flow sym_ops {s['sym_ops']!r}: op tokens are designed (docs/design/"
                                       f"conditional_ar_architecture.md §5.2) and not built; 'pooled' is")
-        if s['row_tokens'] != 'plain':
+        if s['row_tokens'] != 'plain' and self.fd_slots is not None:
+            from models.fd_slot_describer import SlotRowDescriber
+            describer = SlotRowDescriber(self.fd_slots, prefix=s['row_tokens'] == 'prefix')
+        elif s['row_tokens'] != 'plain':
             # the policy entry names the chart's space group (train.py::Modeller._build_gfn_config on crystal_fd)
             if fd_space_group is None:
                 raise ValueError(f"flow row_tokens {s['row_tokens']!r} describes crystal_fd's chart rows: it "
@@ -351,7 +368,9 @@ class NFPolicy(nn.Module):
         training condition vectors [M, conditions_dim]: the whole vector in vector mode, the columns beside the
         molecule in molecule mode."""
         self.sampler.flow.set_scaler(latents.to(self.device, torch.float32)[:, self.live_idx])
-        if self.conditional and conditions is not None and conditions.shape[-1] > 0:
+        # conditions_dim 0 (the molecule alone): condition_samples' one-column zero placeholder is no column, as
+        # _context reads it
+        if self.conditional and self.conditions_dim > 0 and conditions is not None and conditions.shape[-1] > 0:
             c = conditions.to(self.device, torch.float32)
             if self.settings['atom_tokens']:   # column 0 is the row id, never standardised (_context)
                 c = torch.cat([torch.zeros_like(c[:, :1]), c], -1)
@@ -390,6 +409,14 @@ class NFPolicy(nn.Module):
             if sg is None:
                 raise ValueError("flow sym_ops need each row's space group (sg_ind on mol_batch)")
             self.sampler.flow.set_row_groups(torch.as_tensor(sg).reshape(-1).long())
+        if self.fd_slots is not None:   # each row's pads, by the row's own group (a scramble moves conditions only)
+            sg = getattr(mol_batch, 'sg_ind', None)
+            if sg is None:
+                raise ValueError("a mixed-group FD state needs each row's space group (sg_ind on mol_batch)")
+            sg = torch.as_tensor(sg).reshape(-1).long()
+            self.sampler.flow.set_row_live(self.fd_slots.live_mask(sg).to(self.device))
+            if self.sampler.flow.describer is not None:
+                self.sampler.flow.describer.set_row_groups(sg)
         if self.sampler.flow.describer is not None:
             radius = getattr(mol_batch, 'radius', None)
             if radius is None:

@@ -190,9 +190,15 @@ def identity(args, energy_function):
 def identity_mismatch(stored, current):
     """The identity keys on which a file and a run differ, as 'key: file X, run Y' strings (empty when they agree).
     The keys are the current definition's (identity): a key a file records that this code no longer counts as identity
-    does not refuse it; a key the file lacks does."""
-    keys = sorted(current)
-    return [f"{k}: file {stored.get(k)!r}, run {current.get(k)!r}" for k in keys if stored.get(k) != current.get(k)]
+    does not refuse it; a key the file lacks does. space_groups and z_primes agree when the file's are a subset of the
+    run's: each stored row was scored under its own group and Z', which a run that also builds others scores the same
+    (2026-11-04, for FD runs over several space groups, energies/fd_coordinates.py::FDSlotLayout)."""
+    def same(k):
+        a, b = stored.get(k), current.get(k)
+        if k in ('space_groups', 'z_primes') and isinstance(a, list) and isinstance(b, list):
+            return bool(a) and set(a) <= set(b)
+        return a == b
+    return [f"{k}: file {stored.get(k)!r}, run {current.get(k)!r}" for k in sorted(current) if not same(k)]
 
 
 def condition_groups(batch):

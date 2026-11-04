@@ -3480,12 +3480,19 @@ class Modeller:
         if fd is not None:  # energy_config.crystal_coordinates 'fd': the chart's width and circle rows, no dead rows
             print(f"crystal_coordinates 'fd': the FD chart wraps its own circle rows "
                   f"{[n for n, w in zip(fd.names, fd.wrap_mask) if w]}; model.periodic_centroids is not read")
-            cfg = dict(self._build_latent_gfn_config(periodic_centroids=False), dim=fd.dim,
+            cfg = dict(self._build_latent_gfn_config(periodic_centroids=False, latent_rows=False), dim=fd.dim,
                        angular_mask=list(fd.wrap_mask), periodic_centroid_axes=None, dead_latent_rows=None)
-            if (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
-                if getattr(fd, 'sg', None) is None:
-                    raise NotImplementedError(f"nf row_tokens describe one space group's chart; this FD run has "
-                                              f"{list(fd.groups)} (energies/fd_coordinates.py::FDSlotLayout)")
+            if getattr(fd, 'sg', None) is None:   # several groups: the slot layout (energies/fd_coordinates.py)
+                pol = cfg.get('policy') or {}
+                nf = pol.get('nf') or {}
+                if pol.get('kind') != 'nf' or not cfg.get('conditional'):
+                    raise NotImplementedError(f"an FD run over space groups {list(fd.groups)} needs model.kind nf on a "
+                                              f"conditional route: the policy pins each row's pad slots")
+                if nf.get('sym_ops', 'none') in (None, False, 'none', 'off') and not self.args.sg_conditioning:
+                    raise ValueError(f"an FD run over space groups {list(fd.groups)}: the policy must read each row's "
+                                     f"group (model.nf.sym_ops pooled, or sg_conditioning)")
+                cfg['policy'] = dict(pol, fd_space_groups=[int(g) for g in fd.groups])
+            elif (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
                 cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
         else:
             cfg = self._build_latent_gfn_config()
@@ -3493,9 +3500,11 @@ class Modeller:
             cfg['policy'] = resolve_policy_entry(cfg['policy'], cfg)
         return cfg
 
-    def _build_latent_gfn_config(self, periodic_centroids: bool = True):
+    def _build_latent_gfn_config(self, periodic_centroids: bool = True, latent_rows: bool = True):
         """gfn_config on the latent chart. periodic_centroids False skips _resolve_periodic_centroid_axes (its checks
-        and its printout of the latent aunit axes) and passes periodic_centroid_axes None. model.T (the trajectory
+        and its printout of the latent aunit axes) and passes periodic_centroid_axes None; latent_rows False skips
+        _resolve_dead_latent_rows (the latent's dead rows, which several space groups may disagree on) and passes
+        dead_latent_rows None (the FD route: its chart has no dead rows). model.T (the trajectory
         length, read through utils.trajectory_T) is not a GFN argument and is left out."""
         model = {k: v for k, v in vars(self.args.model).items() if k != 'T'}
         return dict(
@@ -3504,7 +3513,7 @@ class Modeller:
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
             periodic_centroid_axes=self._resolve_periodic_centroid_axes() if periodic_centroids else None,
-            dead_latent_rows=self._resolve_dead_latent_rows(),
+            dead_latent_rows=self._resolve_dead_latent_rows() if latent_rows else None,
             conditional=any([
                 self.args.temperature_conditioning,
                 self.args.molecule_conditioning,
@@ -8483,6 +8492,16 @@ class Modeller:
             origin = origin[rows]
         self._replay_draw_origin = _origin_fracs(origin, 'replay_draw_origin_frac')
 
+    def _stored_groups(self, mol_batch) -> dict:
+        """condition_samples kwargs that keep a stored row's own space group and Z' on an FD run over several
+        space groups: its state is in the slots of its own group's chart (energies/fd_coordinates.py::FDSlotLayout),
+        so a redrawn group would score it as another crystal. {} elsewhere (one group: nothing to redraw; the latent
+        route keeps its redraw)."""
+        layout = getattr(self.energy_function, 'fd_layout', None)
+        if layout is None or layout.sg is not None:
+            return {}
+        return dict(sg_inds=mol_batch.sg_ind.reshape(-1).long(), z_primes=mol_batch.z_prime.reshape(-1).long())
+
     def _finish_replay_draw(self, mol_batch, traj, inds, repeats):
         """Shared tail of every replay draw: latents, conditions, rewards.
 
@@ -8495,7 +8514,7 @@ class Modeller:
 
         mol_batch = mol_batch.to(self.device)
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            mol_batch, repeats=repeats)
+            mol_batch, repeats=repeats, **self._stored_groups(mol_batch))
         temperature = 10 ** log_T_tensor
         # the stored trajectory's last state is the policy's PRE-CLAMP terminal, i.e.
         # the raw latent the forward branch scored bounding on at admission; hand it
@@ -8694,7 +8713,8 @@ class Modeller:
                 mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
                     mol_batch,
                     temperature=torch.ones(mol_batch.num_graphs, dtype=torch.float32,
-                                           device=mol_batch.device) * self.args.energy_config.temperature)
+                                           device=mol_batch.device) * self.args.energy_config.temperature,
+                    **self._stored_groups(mol_batch))
 
                 log_r = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                        temperature=10 ** log_T_tensor)
@@ -10072,10 +10092,18 @@ class Modeller:
             # backstop on top of eval_figs' per-block guards: nothing in
             # figure land may interrupt a live run
             with fig_guard('eval figure generation'):
-                x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
+                x, y, ref_inds = next(self.prior_dataset.loader(batch_size=10000, mode='tensors', return_inds=True))
                 anchor_buffer = getattr(self, 'anchor_buffer', None)
                 anchor_latents = (anchor_buffer.x.detach().cpu().numpy()
                                   if anchor_buffer is not None and len(anchor_buffer) > 0 else None)
+                fd_layout = getattr(self.energy_function, 'fd_layout', None)
+                fd_groups = None
+                if fd_layout is not None and fd_layout.sg is None:   # several groups: one figure per group
+                    fd_groups = dict(layout=fd_layout,
+                                     ref=self.prior_dataset.batch.sg_ind.reshape(-1).cpu()[
+                                         torch.as_tensor(ref_inds, dtype=torch.long)],
+                                     aux=(anchor_buffer.batch.sg_ind.reshape(-1).cpu()
+                                          if anchor_latents is not None else None))
                 # always sample from forward policy
                 fig_dict, metrics = eval_figs(fwd_stats,
                                               bwd_stats,
@@ -10087,7 +10115,8 @@ class Modeller:
                                               anchor_latents=anchor_latents,
                                               domain_figs=self._domain_figs,
                                               chart=('fd' if getattr(self.energy_function, 'crystal_coordinates',
-                                                                     'latent') == 'fd' else 'latent'))
+                                                                     'latent') == 'fd' else 'latent'),
+                                              fd_groups=fd_groups)
             if hasattr(self, 'condition_log_z'):
                 # cross-sections of the per-condition tracker state -- built
                 # purely from its running stats, no sampling / energy calls

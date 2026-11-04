@@ -24,8 +24,14 @@ def quat_to_rotmat(q):
                        ).reshape(q.shape[:-1] + (3, 3))
 
 
+def _pin(x, live):
+    """x with the rows live marks False (pad slots of a mixed-group FD state, energies/fd_coordinates.py::
+    FDSlotLayout) set to 0; live None: x."""
+    return x if live is None else torch.where(live, x, torch.zeros_like(x))
+
+
 @torch.no_grad()
-def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None):
+def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None, live=None):
     """invert_block for a block whose conditioner is a CausalTransformerConditioner: the conditioner decodes one row
     per step through its key/value cache (CausalTransformerConditioner.decode) instead of running d full passes, and
     each step inverts that row's spline at y. Same arithmetic per row as invert_block, so the same x to rounding; with
@@ -36,7 +42,8 @@ def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None):
     beyond) returning those features (_ContextFlow.row_extra).
     extra_step: in place of extra_of, a function returning a stepper whose row(x, i) gives row i's features [b, k]
     from the rows fixed so far (models/fd_row_describer.py::RowStepper): one row's work per decode step instead of
-    every row's."""
+    every row's.
+    live: [b, d] bool, False on a row's pad slots, which are pinned at 0 as each is solved (None: none)."""
     b = y.shape[0]
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
@@ -53,7 +60,8 @@ def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None):
         else:
             z = rq_spline_inverse(y[:, sl], sp, blk.bound[sl], blk.is_wrap[sl], bnd[sl], shift, mhi, td)
             shift = torch.where(bnd[sl], torch.zeros_like(shift), shift)
-        x[:, sl] = torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift)
+        x[:, sl] = _pin(torch.where(blk.is_wrap[sl], _wrap(z - shift), z - shift),
+                        None if live is None else live[:, sl])
 
     row_of = None
     if extra_step is not None:
@@ -65,11 +73,11 @@ def invert_block_cached(blk, y, ctx=None, extra_of=None, extra_step=None):
     return x
 
 
-def invert_differentiable(blk, y, ctx=None, extra_of=None):
+def invert_differentiable(blk, y, ctx=None, extra_of=None, live=None):
     """A block's inverse at y with the autograd graph kept (prior_flow.invert_block and
     _ContextBlock.invert run without one). After blk.d passes the result is the exact
     preimage for any parameter value, so the graph through the passes carries its exact
-    derivative."""
+    derivative. live: [b, d] bool, pad slots (False) pinned at 0 on every pass (None: none)."""
     x = torch.zeros_like(y)
     bnd = blk.is_bounded if getattr(blk, 'has_bounded', False) else None
     mh = getattr(blk, 'min_height', None)
@@ -86,7 +94,7 @@ def invert_differentiable(blk, y, ctx=None, extra_of=None):
         else:
             z = rq_spline_inverse(y, sp, blk.bound, blk.is_wrap, bnd, shift, mh, td)
             shift = torch.where(bnd, torch.zeros_like(shift), shift)
-        x = torch.where(blk.is_wrap, _wrap(z - shift), z - shift)
+        x = _pin(torch.where(blk.is_wrap, _wrap(z - shift), z - shift), live)
     return x
 
 
@@ -380,21 +388,26 @@ class _ContextBlock(_Block):
              ).view(x.shape[0], self.d, self.n_params)
         return p[..., -1], p[..., :3 * self.n_bins].view(x.shape[0], self.d, 3, self.n_bins)
 
-    def forward(self, x, ctx, extra=None):
+    def forward(self, x, ctx, extra=None, live=None):
+        """live: [b, d] bool, False on a row's pad slots (a mixed-group FD state): they go in and come out as 0 and
+        add nothing to the log-det, so the block is a map of the live rows alone and the pads, constant given the
+        row's group, tell later rows nothing. None: every row live."""
+        x = _pin(x, live)
         shift, sp = self.spline_params(x, ctx, extra)
         if self.has_bounded:
             z = x + torch.where(self.is_bounded, torch.zeros_like(shift), shift)
             z = torch.where(self.is_wrap, _wrap(z), z)
             y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, self.is_bounded, shift, self.min_height, self.tied)
-            return y, ld.sum(-1)
-        z = x + shift
-        z = torch.where(self.is_wrap, _wrap(z), z)
-        y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
-        return y, ld.sum(-1)
+        else:
+            z = x + shift
+            z = torch.where(self.is_wrap, _wrap(z), z)
+            y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
+        return _pin(y, live), _pin(ld, live).sum(-1)
 
     @torch.no_grad()
-    def invert(self, y, ctx, extra_of=None):
-        """x with forward(x, ctx) == y: one more coordinate exact per pass, whatever the order."""
+    def invert(self, y, ctx, extra_of=None, live=None):
+        """x with forward(x, ctx) == y: one more coordinate exact per pass, whatever the order; pad slots (live
+        False) pinned at 0 on every pass."""
         x = torch.zeros_like(y)
         for _ in range(self.d):
             shift, sp = self.spline_params(x, ctx, None if extra_of is None else extra_of(x))
@@ -404,7 +417,7 @@ class _ContextBlock(_Block):
                 shift = torch.where(self.is_bounded, torch.zeros_like(shift), shift)
             else:
                 z = rq_spline_inverse(y, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
-            x = torch.where(self.is_wrap, _wrap(z - shift), z - shift)
+            x = _pin(torch.where(self.is_wrap, _wrap(z - shift), z - shift), live)
         return x
 
 
@@ -620,6 +633,7 @@ class _ContextFlow(nn.Module):
                                           "bounded or a circle on the describer's chart")
             typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=describer.k)
         self.register_buffer('row_radius', None, persistent=False)
+        self.row_live = None   # [n, d] bool per row of the next call, False on pad slots (set_row_live); None: all live
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
@@ -652,6 +666,21 @@ class _ContextFlow(nn.Module):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
         atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+
+    def set_row_live(self, live):
+        """Per row of the next calls, in the rows' order (not by condition id: a scrambled condition does not move a
+        row's pads): [n, d] bool, False on the slots the row's space group leaves empty (energies/fd_coordinates.py::
+        FDSlotLayout.live_mask over the flow's rows); None: every row live."""
+        self.row_live = live
+
+    def live_rows(self, n):
+        """The live mask [n, d] of the next call's n rows, or None."""
+        live = self.row_live
+        if live is None:
+            return None
+        if tuple(live.shape) != (n, self.d):
+            raise RuntimeError(f"row live mask {tuple(live.shape)} for {n} rows of {self.d} (set_row_live)")
+        return live
 
     def set_row_groups(self, groups):
         """Per condition id: the space group [n_cond] (long) whose e_g the level head and the context read."""
@@ -781,20 +810,33 @@ class ConditionalLatentFlow(nn.Module):
         if detach_context:   # the blocks train, the condition's encoder does not (scramble_conditions)
             ctx = tuple(t.detach() for t in ctx) if isinstance(ctx, tuple) else ctx.detach()
         x = x[:, self.live_idx]
-        z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
-        ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
+        live = f.live_rows(x.shape[0])
+        z = _pin(torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd), live)
+        if live is None:
+            ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
+        else:
+            ld = -_pin(torch.where(f.is_wrap, torch.zeros_like(f.sd), torch.log(f.sd)).expand_as(z), live).sum(-1)
         extra = f.row_extra(z, c)   # typed rows: one block, reading the data rows (no standardisation)
         for blk in f.blocks:
-            z, l = blk(z, ctx, extra)
+            z, l = blk(z, ctx, extra) if live is None else blk(z, ctx, extra, live)
             ld = ld + l
         return z, ld
 
     def log_prob(self, x, c, detach_context: bool = False):
+        """log q(x | c); on a mixed-group FD state (_ContextFlow.set_row_live) the density of each row's live slots
+        alone."""
         f = self.flow
         z, ld = self.to_base(x, c, detach_context=detach_context)
-        zl = z[:, ~f.unit_base]
-        base = (-math.log(2.0) * int(f.unit_base.sum())
-                - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])
+        live = f.live_rows(z.shape[0])
+        if live is None:
+            zl = z[:, ~f.unit_base]
+            base = (-math.log(2.0) * int(f.unit_base.sum())
+                    - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])
+            return base + ld
+        unit, gauss = f.unit_base & live, ~f.unit_base & live
+        zl = torch.where(gauss, z, torch.zeros_like(z))
+        base = (-math.log(2.0) * unit.sum(-1) - 0.5 * (zl * zl).sum(-1)
+                - 0.5 * math.log(2 * math.pi) * gauss.sum(-1))
         return base + ld
 
     @torch.no_grad()
@@ -802,19 +844,20 @@ class ConditionalLatentFlow(nn.Module):
         f = self.flow
         dev, dtype = f.mu.device, f.mu.dtype
         ctx = f.context_input(c)[0]
-        z0 = torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
-                         torch.randn(n, f.d, device=dev, dtype=dtype))
+        live = f.live_rows(n)
+        z0 = _pin(torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
+                              torch.randn(n, f.d, device=dev, dtype=dtype)), live)
         z = z0
         extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
         extra_step = None if f.describer is None else (lambda: f.row_extra_step(c))
         for blk in reversed(list(f.blocks)):
             if isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z, ctx, extra_step=extra_step)   # one decode step (one row's features)
-                #                                                              per row, not d full passes
+                z = invert_block_cached(blk, z, ctx, extra_step=extra_step, live=live)   # one decode step (one
+                #                                                       row's features) per row, not d full passes
             else:
-                z = blk.invert(z, ctx, extra_of)
+                z = blk.invert(z, ctx, extra_of, live)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
+        x[:, self.live_idx] = _pin(torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu), live)
         return (x, z0) if return_base else x
 
     def set_bf16(self, on: bool):
@@ -838,12 +881,13 @@ class ConditionalLatentFlow(nn.Module):
         """The draw sample() makes from base points z0, differentiable in the parameters."""
         f = self.flow
         ctx = f.context_input(c)[0]
-        z = z0
+        live = f.live_rows(z0.shape[0])
+        z = _pin(z0, live)
         extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
         for blk in reversed(list(f.blocks)):
-            z = invert_differentiable(blk, z, ctx, extra_of)
+            z = invert_differentiable(blk, z, ctx, extra_of, live)
         x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
-        x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
+        x[:, self.live_idx] = _pin(torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu), live)
         return x
 
     def level(self, c):

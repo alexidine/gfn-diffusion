@@ -264,12 +264,16 @@ def eval_figs(fwd_stats,
               anchor_latents=None,
               domain_figs=None,
               chart='latent',
+              fd_groups=None,
               ):
     """chart: the coordinates of prior_latent_params and anchor_latents (energy_config.crystal_coordinates); the
     samples are read in the same chart for 'Lattice Latents Distribution' ('latent': latent_params; 'fd': the run's
     own FD chart rows s in [-1, 1], each draw's fd_state, else energy_function.fd_rows_of. Not mxtaltools'
     fd_chart_coordinates, which charts at the trainer's latent length box, so its cell-length rows are other
-    coordinates than the reference's)."""
+    coordinates than the reference's).
+    fd_groups: on an FD run over several space groups, dict(layout=energies/fd_coordinates.py::FDSlotLayout,
+    ref=[N] space group of each prior_latent_params row, aux=[M] of each anchor_latents row or None): the figure is drawn
+    once per group of the samples ('Lattice Latents Distribution sg<g>'), each group's rows in its own chart."""
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
     log_r = fwd_stats['log_r']
@@ -341,11 +345,32 @@ def eval_figs(fwd_stats,
             rows = getattr(sample_batch, 'fd_state', None)
             if rows is None:
                 rows = energy_function.fd_rows_of(sample_batch)
-        fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
-            space=chart, ref_dist=prior_latent_params, quantiles=[0.1],
-            show=False, return_fig=True, override_energy=scaled_energy,
-            gauge_fix_free_axes=is_crystal_energy(energy_function),
-            aux_dists=[anchor_latents] if anchor_latents is not None else None, samples=rows)
+        if fd_groups is None:
+            fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
+                space=chart, ref_dist=prior_latent_params, quantiles=[0.1],
+                show=False, return_fig=True, override_energy=scaled_energy,
+                gauge_fix_free_axes=is_crystal_energy(energy_function),
+                aux_dists=[anchor_latents] if anchor_latents is not None else None, samples=rows)
+        else:
+            layout = fd_groups['layout']
+            rows = torch.as_tensor(rows).reshape(sample_batch.num_graphs, -1)
+            sgs = torch.as_tensor(sample_batch.sg_ind).reshape(-1).cpu()
+            ref_sg = torch.as_tensor(fd_groups['ref']).reshape(-1).cpu()
+            aux_sg = fd_groups.get('aux')
+            ref = torch.as_tensor(prior_latent_params).cpu()
+            for g in sorted(set(sgs.tolist())):
+                sel = torch.nonzero(sgs == g).flatten()
+                aux = None
+                if anchor_latents is not None and aux_sg is not None:
+                    a_rows = torch.as_tensor(aux_sg).reshape(-1).cpu() == g
+                    if bool(a_rows.any()):
+                        aux = [layout.unpack(g, torch.as_tensor(anchor_latents)[a_rows]).numpy()]
+                sub = sample_batch.subsample_new_batch(sel)
+                fig_dict[f'Lattice Latents Distribution sg{g}'] = sub.plot_batch_cell_params(
+                    space=chart, ref_dist=layout.unpack(g, ref[ref_sg == g]).numpy(), quantiles=[0.1],
+                    show=False, return_fig=True, override_energy=scaled_energy[sel],
+                    gauge_fix_free_axes=is_crystal_energy(energy_function), aux_dists=aux,
+                    samples=layout.unpack(g, rows[sel].cpu()))
     with fig_guard('Sample Scatter'):
         # subsampled: the funnel is a density scatter and reads the same at 2k
         # points as at the full eval batch, but plotly serializes every marker

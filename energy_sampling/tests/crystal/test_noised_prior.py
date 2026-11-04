@@ -97,6 +97,11 @@ def test_identity_mismatch_names_each_difference():
     b = dict(energy_function='elj', lj_coeff=1.0, cutoff=10)
     assert NP.identity_mismatch(a, a) == []
     assert NP.identity_mismatch(a, b) == ["lj_coeff: file 0.36, run 1.0"]
+    # a file's space groups and Z' may be a subset of the run's (each row was scored under its own), not a superset
+    f = dict(a, space_groups=[2], z_primes=[1])
+    assert NP.identity_mismatch(f, dict(f, space_groups=[2, 14])) == []
+    assert NP.identity_mismatch(dict(f, space_groups=[2, 14]), f) == ["space_groups: file [2, 14], run [2]"]
+    assert NP.identity_mismatch(f, dict(f, space_groups=[14])) == ["space_groups: file [2], run [14]"]
 
 
 def test_compare_terms_passes_float_noise_and_fails_a_real_miss():
