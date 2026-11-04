@@ -40,9 +40,11 @@ NF_DEFAULTS = dict(
     atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
     atom_point_convs=None,          # the split encoder's point-stream message-passing rounds; None = atom_convs, 0 = a
                                     # per-atom MLP
-    atom_chirality=False,           # True (split encoder): the invariant trunk also reads CHIRAL_CHANNELS learned
-                                    # per-atom pseudoscalars (models/spline_flow.py::ChiralChannels), so the level
-                                    # head and the context tell a molecule from its mirror image
+    atom_chirality=True,            # the split encoder's invariant trunk also reads CHIRAL_CHANNELS learned per-atom
+                                    # pseudoscalars (models/spline_flow.py::ChiralChannels), so the level head and the
+                                    # context tell a molecule from its mirror image (owner, 2026-11-04: on by default).
+                                    # Read by the split encoder only: the xyz encoder reads coordinates already, and a
+                                    # policy without atom tokens has no molecule encoder
     min_bin_height='auto', min_bin_height_rows='all',
     tied_derivatives=None, tied_factor=None,
     bounded_rows='auto',            # 'auto', 'none'/None, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
@@ -267,10 +269,9 @@ class NFPolicy(nn.Module):
         half_rows = [int(r) for r in str(s['fold_half_rows']).split(',')] if s['fold_half_rows'] else []
         if s['mix_k'] and s['tied_derivatives']:
             raise NotImplementedError("flow tied_derivatives with mix_k")
-        if not self.conditional and (s['mol_scalars'] or s['sym_ops'] != 'none' or s['sym_ops_init']
-                                     or s['atom_chirality']):
-            raise ValueError("flow mol_scalars, sym_ops and atom_chirality are read beside the condition's molecule: "
-                             "they need a conditional policy on the molecule route")
+        if not self.conditional and (s['mol_scalars'] or s['sym_ops'] != 'none' or s['sym_ops_init']):
+            raise ValueError("flow mol_scalars and sym_ops are read beside the condition's molecule: they need a "
+                             "conditional policy on the molecule route")
         if self.conditional:
             if orders is not None or half_rows or s['mix_k']:
                 raise NotImplementedError("flow block_orders, fold_half_rows and mix_k are built for "
@@ -291,9 +292,9 @@ class NFPolicy(nn.Module):
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
                 atoms['chirality'] = CHIRAL_CHANNELS if s['atom_chirality'] else 0
-            elif s['atom_point_convs'] is not None or s['atom_chirality']:
-                raise ValueError("flow atom_point_convs and atom_chirality set the split encoder: they need "
-                                 "atom_tokens 'split' or 'split_pooled'")
+            elif s['atom_point_convs'] is not None:
+                raise ValueError("flow atom_point_convs sets the split encoder's point stream: it needs atom_tokens "
+                                 "'split' or 'split_pooled'")
             if s['mol_scalars'] and atoms is None:
                 raise ValueError("flow mol_scalars are read beside the molecule's atoms: they need atom_tokens")
             if s['sym_ops'] == 'pooled' and atoms is None:

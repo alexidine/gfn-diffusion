@@ -146,7 +146,8 @@ def test_molecule_scalars_are_invariant_and_read_by_the_level_and_log_q(proper):
     cfg = gfn_config(True, cond_dim=4)
     cfg['conditions_type'] = 'molecule'
     torch.manual_seed(0)
-    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'mol_scalars': True}, seed=0)
+    # chirality off: with it the level input tells a molecule from its mirror image (proper=False), on purpose
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'mol_scalars': True, 'atom_chirality': False}, seed=0)
     g = torch.Generator().manual_seed(5)
     with torch.no_grad():
         for p in pol.parameters():
@@ -317,6 +318,9 @@ def test_atom_chirality_reaches_the_level_and_needs_the_split_encoder():
         e_mir = pol.get_condition_embedding(cond, _mols(rot=_rotation(2, proper=False)))
     assert torch.allclose(e0, e_rot, atol=1e-5)
     assert (e0 - e_mir).abs().max() > 1e-5
-    for bad in ({'atom_tokens': True}, {}):
-        with pytest.raises(ValueError, match='atom_chirality'):
-            NFPolicy(cfg if bad else gfn_config(False), {**SMALL, **TF, **bad, 'atom_chirality': True}, seed=0)
+    # read by the split encoder only: the xyz encoder and a policy without atom tokens build as they did
+    xyz = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': True, 'atom_chirality': True}, seed=0)
+    assert not any('chiral' in k for k in xyz.state_dict())
+    NFPolicy(gfn_config(False), {**SMALL, 'atom_chirality': True}, seed=0)
+    off = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'atom_chirality': False}, seed=0)
+    assert not any('chiral' in k for k in off.state_dict())

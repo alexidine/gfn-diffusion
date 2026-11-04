@@ -306,7 +306,7 @@ model:
     atom_cutoff: 10.0
     atom_radial: 32
     atom_point_convs: null     # the split encoder's point-stream rounds: null = atom_convs, 0 = a per-atom MLP
-    atom_chirality: false      # true (split encoder): the invariant trunk also reads learned per-atom pseudoscalars (rotation-invariant, reflection-odd), so the level head and context tell a molecule from its mirror image
+    atom_chirality: true       # the split encoder's invariant trunk also reads learned per-atom pseudoscalars (rotation-invariant, reflection-odd), so the level head and context tell a molecule from its mirror image; read by the split encoder only
     min_bin_height: auto      # a floor on the spline's bin heights: auto (1e-7 on both routes), none, or a number
     min_bin_height_rows: all   # 'all' rows or the 'uniform'-base rows only
     tied_derivatives: null     # knot derivatives tied to the neighbouring bin slopes: null = auto (true on both routes)
