@@ -130,3 +130,53 @@ def test_an_unknown_atom_token_mode_is_refused():
     cfg['conditions_type'] = 'molecule'
     with pytest.raises(ValueError, match='atom_tokens'):
         NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'spilt'}, seed=0)
+
+
+# -- nf mol_scalars and atom_point_convs (pending settings) ----------------------------------------------------------
+
+def _with_fields(mb, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    mb.mol_volume = torch.rand(mb.num_graphs, generator=g) * 100 + 80
+    mb.radius = torch.rand(mb.num_graphs, generator=g) * 2 + 2.5
+    return mb
+
+
+@pytest.mark.parametrize('proper', [True, False])
+def test_molecule_scalars_are_invariant_and_read_by_the_level_and_log_q(proper):
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    torch.manual_seed(0)
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'mol_scalars': True}, seed=0)
+    g = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for p in pol.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g))
+    pol.eval()
+    cond = torch.randn(3, 4)
+    a = pol.get_condition_embedding(cond, _with_fields(_mols()))
+    sc = pol.sampler.flow.atom_scalars.clone()
+    b = pol.get_condition_embedding(cond, _with_fields(_mols(rot=_rotation(2, proper))))
+    assert torch.allclose(sc, pol.sampler.flow.atom_scalars, atol=1e-5)
+    assert torch.allclose(a, b, atol=1e-5)
+    x = torch.rand(3, 12) * 1.6 - 0.8
+    with torch.no_grad():
+        lq = pol.log_density(x, cond, _with_fields(_mols()))
+        mb = _with_fields(_mols())
+        mb.mol_volume = mb.mol_volume * 2
+        assert not torch.allclose(pol.get_condition_embedding(cond, mb), a)
+        assert not torch.allclose(pol.log_density(x, cond, mb), lq)
+    with pytest.raises(ValueError, match='mol_volume'):
+        pol.get_condition_embedding(cond, _mols())
+
+
+def test_point_convs_zero_is_a_per_atom_stream_and_needs_the_split_encoder():
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'atom_point_convs': 0}, seed=0)
+    assert len(pol.sampler.flow.atom_encoder.point.interaction_blocks) == 0
+    assert len(pol.sampler.flow.atom_encoder.gnn.interaction_blocks) == TF['atom_convs']
+    cond = torch.randn(3, 4)
+    with torch.no_grad():
+        assert torch.isfinite(pol.log_density(torch.rand(3, 12) * 1.6 - 0.8, cond, _mols())).all()
+    with pytest.raises(ValueError, match='atom_point_convs'):
+        NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': True, 'atom_point_convs': 1}, seed=0)

@@ -525,6 +525,9 @@ class _ContextFlow(nn.Module):
         atoms = None if atoms is None else dict(atoms)
         self.encoder = atoms.pop('encoder', 'xyz') if atoms is not None else None
         self.cross = bool(atoms.pop('cross', True)) if atoms is not None else False
+        # atoms['mol_scalars']: the width of per-molecule invariant scalars (set_mol_scalars) read by the level head and
+        # the context beside the pooled molecule; 0 = none
+        self.n_mol_scalars = int(atoms.pop('mol_scalars', 0)) if atoms is not None else 0
         if self.encoder not in (None, 'xyz', 'split'):
             raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
         self.atoms = atoms is not None
@@ -576,9 +579,9 @@ class _ContextFlow(nn.Module):
                                  else AtomEncoder(width, **atoms))
             pooled = (self.atom_encoder.s_out if self.encoder == 'split' else self.atom_encoder.pool_out).out_features
             # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
-            n_in = pooled + cond_dim - 1 - 4 * int(self.frames)
+            n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars
             n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
-            for name in ('atom_z', 'atom_pos', 'atom_n'):
+            for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):
                 self.register_buffer(name, None, persistent=False)
         self.context = _ResMLP(n_ctx, context_hidden, context_dim)
         self.level = _ResMLP(n_in, 256, 1)
@@ -590,6 +593,13 @@ class _ContextFlow(nn.Module):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
         atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+
+    def set_mol_scalars(self, scalars):
+        """Per condition id: the molecule's invariant scalars [n_cond, n_mol_scalars] (models/nf_policy.py::
+        MOL_SCALARS), beside the atom table."""
+        if scalars.shape[-1] != self.n_mol_scalars:
+            raise ValueError(f"{scalars.shape[-1]} molecule scalars, the flow reads {self.n_mol_scalars}")
+        self.atom_scalars = scalars
 
     def set_row_radius(self, radius, volume=None):
         """Typed rows: the molecule radius [n_cond] (Angstrom, MolData.radius) per condition id, beside the atom
@@ -639,6 +649,10 @@ class _ContextFlow(nn.Module):
             pos = self.atom_pos[mol].to(dtype)
             first = 1
         rest = c[:, first:].to(dtype)   # the condition columns after the id (temperature, space group, Z'), as given
+        if self.n_mol_scalars:          # invariant molecule scalars: read by the level head and the context alike
+            if self.atom_scalars is None:
+                raise RuntimeError("the flow reads molecule scalars and none are set (set_mol_scalars)")
+            rest = torch.cat([self.atom_scalars[mol].to(dtype)[inv], rest], -1)
         if self.encoder == 'split':
             tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
             s = torch.cat([s_inv[inv], rest], -1)

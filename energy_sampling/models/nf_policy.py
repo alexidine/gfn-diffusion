@@ -53,7 +53,14 @@ NF_PENDING_DEFAULTS = dict(
                                     # ranges (models/fd_row_describer.py; one block, the crystal_fd chart)
     prefix_features=False,          # True (needs typed_rows): each row also reads the prefix physics of the blocks
                                     # completed before it (packing, interplanar spacings, symmetry-image distances)
+    atom_point_convs=None,          # the split encoder's point-stream message-passing rounds; None = atom_convs, 0 = a
+                                    # per-atom MLP
+    mol_scalars=False,              # True (molecule route): the level head and the context also read the molecule's
+                                    # log volume, log radius and log principal extents (MOL_SCALARS)
 )
+#: the molecule scalars of nf mol_scalars: log MolData.mol_volume, log MolData.radius, and the log square roots of the
+#: heavy-atom gyration tensor's eigenvalues, largest first (invariant to rotation and reflection)
+MOL_SCALARS = ('log_volume', 'log_radius', 'log_extent_1', 'log_extent_2', 'log_extent_3')
 NF_ALL_DEFAULTS = {**NF_DEFAULTS, **NF_PENDING_DEFAULTS}
 ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
 # as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
@@ -120,6 +127,26 @@ def build_policy(gfn_config: dict):
         return NFPolicy(cfg, dict(pol.get('nf') or {}), seed=int(pol.get('seed', 0)),
                         fd_space_group=pol.get('fd_space_group'))
     raise ValueError(f"model kind {kind!r}: 'sde' or 'nf'")
+
+
+def _mol_scalars(mol_batch, z, pos, counts):
+    """[n, len(MOL_SCALARS)] float32 molecule scalars (MOL_SCALARS) of the n molecules of an atom table (z [n, a],
+    pos [n, a, 3], counts [n]) whose MolData fields are on mol_batch."""
+    vol, rad = getattr(mol_batch, 'mol_volume', None), getattr(mol_batch, 'radius', None)
+    if vol is None or rad is None:
+        raise ValueError("flow mol_scalars need each molecule's mol_volume and radius (MolData) on mol_batch")
+    n, a = z.shape
+    real = torch.arange(a, device=z.device)[None, :] < counts[:, None]
+    heavy = real & (z > 1)
+    heavy = torch.where(heavy.any(1, keepdim=True), heavy, real)   # a molecule of hydrogens only: every atom
+    w = heavy.to(pos.dtype)[..., None]
+    mu = (pos * w).sum(1) / w.sum(1)
+    d = (pos - mu[:, None]) * w
+    gyr = d.transpose(1, 2) @ d / w.sum(1)[..., None]
+    ext = 0.5 * torch.log(torch.linalg.eigvalsh(gyr.double()).flip(-1).clamp_min(1e-6)).to(pos.dtype)
+    v = torch.as_tensor(vol).reshape(-1).to(pos)
+    r = torch.as_tensor(rad).reshape(-1).to(pos)
+    return torch.cat([torch.log(v)[:, None], torch.log(r)[:, None], ext], -1).float()
 
 
 class _Empty(nn.Module):
@@ -210,7 +237,15 @@ class NFPolicy(nn.Module):
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial'],
                           encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
-                          cross=s['atom_tokens'] != 'split_pooled') if s['atom_tokens'] else None)
+                          cross=s['atom_tokens'] != 'split_pooled',
+                          mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0) if s['atom_tokens'] else None)
+            if atoms is not None and atoms['encoder'] == 'split':
+                atoms['point_convs'] = s['atom_point_convs']
+            elif s['atom_point_convs'] is not None:
+                raise ValueError("flow atom_point_convs sets the split encoder's point stream: it needs atom_tokens "
+                                 "'split' or 'split_pooled'")
+            if s['mol_scalars'] and atoms is None:
+                raise ValueError("flow mol_scalars are read beside the molecule's atoms: they need atom_tokens")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
@@ -308,6 +343,8 @@ class NFPolicy(nn.Module):
         z[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
         pos[nodes, idx] = mol_batch.pos.float().to(self.device)
         self.sampler.flow.set_atom_table(z, pos, counts)
+        if self.settings['mol_scalars']:
+            self.sampler.flow.set_mol_scalars(_mol_scalars(mol_batch, z, pos, counts).to(self.device))
         if self.sampler.flow.describer is not None:
             radius = getattr(mol_batch, 'radius', None)
             if radius is None:
