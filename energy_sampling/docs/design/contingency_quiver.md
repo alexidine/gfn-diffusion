@@ -116,6 +116,24 @@ frequencies and learned as a benchmark ablation on coverage per energy call.
 group, estimate each Ẑ_g by importance sampling with a defensive mixture, then allocate the remaining budget in
 proportion. It costs energy calls at evaluation, which counts against the efficiency metric.
 
+## D. Added 2026-11-04 from `conditional_convergence_afresh.md`
+
+Each idea is derived there and checked only on CPU toys.
+
+- **D1. Level tolerance rule.** A level ℓ = J_F + a harms stored rows iff a > KL(q‖π). A mixed level λJ_B + (1−λ)J_F
+  harms iff λΔ > KL.
+- **D2. Floor level** min(head(c), fresh log w(c)). In expectation it never pushes mass off stored rows: a finisher.
+- **D3. Mixed VarGrad identity.** One fresh plus one stored row in mixed VarGrad is, in expectation, stored-row TB at
+  level J_F, with the fresh row's baseline sitting near J_B.
+- **D4. Information ladder** I_own / I_nn / I_spec. On training rows I_own ≤ log N exactly. It is the readout of what
+  conditional MLE learned.
+- **D5. ΔJ_F between two checkpoints = −ΔKL(q‖π)** at a fixed condition. A transfer readout that needs no Z.
+- **D6. Importance-corrected replay.** Store birth log q_old, weight by a truncated q/q_old. Level-free reuse of
+  energy calls.
+- **D7. Relax-and-absorb.** Relax model draws on new molecules and feed the minima back as MLE rows.
+- **D8. Empirical-Bayes shrinkage of the head** toward group means, and contrastive Δlog Z (evidence networks) as
+  monitors. Not evaluated.
+
 ## Sources
 
 Review lane reports from 2026-11-02 (hub scratchpad `review/`): `zc/zc_map.md`, `ar/critic_conditioner.md`,
