@@ -178,6 +178,68 @@ def embed_bundles(outs, n_neighbors=300, min_dist=0.75, n_landmarks=10000, seed=
     return res
 
 
+DUO_LANDMARK_KW = dict(init='spectral', repulsion_strength=2.0)   # the joint LJ + model layout's landmark settings
+
+
+def embed_into(ref_out, new_out, ref_xy, n_neighbors=300, min_dist=0.75, seed=0, tag='self'):
+    """Every draw of bundle `new_out` placed into a FIXED embedding of bundle `ref_out` (`ref_xy`, [N_ref, 2]), the
+    way umap-learn's UMAP.transform places new points: each new draw's n_neighbors nearest ref draws (the stored
+    cross kNN, cross_knn), fuzzy membership weights from them (smooth_knn_dist, compute_membership_strengths with
+    local_connectivity 0), a start at the weighted mean of those neighbours' positions (init_graph_transform), then
+    30 epochs of the UMAP layout optimisation with the ref points held still (min_dist sets a and b; repulsion 1,
+    learning rate 1/4, 5 negative samples). The ref layout is not changed. Cached in new_out as
+    embedding_into_<ref>_<tag>_nn<k>_md<min_dist>_s<seed>.npz; `tag` names the ref embedding."""
+    import scipy.sparse
+    from umap.umap_ import (smooth_knn_dist, compute_membership_strengths, find_ab_params, make_epochs_per_sample,
+                            init_graph_transform)
+    from umap.layouts import optimize_layout_euclidean
+    cache = os.path.join(new_out, f'embedding_into_{os.path.basename(ref_out)}_{tag}_nn{n_neighbors}_md{min_dist}'
+                                  f'_s{seed}.npz')
+    if os.path.exists(cache):
+        return np.load(cache)['xy']
+    cross_knn(new_out, ref_out)
+    k = n_neighbors
+    idx = np.load(os.path.join(new_out, f'cross_{os.path.basename(ref_out)}_idx.npy'))[:, :k].astype(np.int64)
+    dst = np.load(os.path.join(new_out, f'cross_{os.path.basename(ref_out)}_dist.npy'))[:, :k].astype(np.float32)
+    assert idx.max() < len(ref_xy), f"cross kNN indexes {idx.max() + 1} ref draws, the ref embedding has {len(ref_xy)}"
+    sigmas, rhos = smooth_knn_dist(np.ascontiguousarray(dst), float(k), local_connectivity=0.0)
+    rows, cols, vals, _ = compute_membership_strengths(np.ascontiguousarray(idx), np.ascontiguousarray(dst), sigmas,
+                                                       rhos, bipartite=True)
+    graph = scipy.sparse.coo_matrix((vals, (rows, cols)), shape=(len(idx), len(ref_xy)))
+    csr = graph.tocsr()
+    csr.eliminate_zeros()
+    ref = np.ascontiguousarray(ref_xy, dtype=np.float32)
+    xy = init_graph_transform(csr, ref).astype(np.float32)
+    n_epochs = 30   # UMAP.transform's choice for more than 10,000 new points
+    graph.data[graph.data < graph.data.max() / n_epochs] = 0.0
+    graph.eliminate_zeros()
+    a, b = find_ab_params(1.0, min_dist)
+    rng_state = np.random.RandomState(seed).randint(np.iinfo(np.int32).min + 1, np.iinfo(np.int32).max - 1,
+                                                   3).astype(np.int64)
+    t0 = time.time()
+    xy = optimize_layout_euclidean(xy, ref.copy(), graph.row, graph.col, n_epochs, graph.shape[1],
+                                   make_epochs_per_sample(graph.data, n_epochs), a, b, rng_state, 1.0, 0.25, 5.0,
+                                   True)
+    _log(f"embed_into: {len(xy)} draws of {os.path.basename(new_out)} placed into {os.path.basename(ref_out)}'s "
+         f"{tag} embedding in {time.time() - t0:.0f}s")
+    np.savez(cache, xy=xy)
+    return xy
+
+
+def model_frame(uma_bundle, elj_bundle, frame, device='cuda'):
+    """The model bundle's embedding for the single-model figures: frame 'self' = the model's own embedding
+    (embed_bundles([uma_bundle])); 'joint' = the model's draws and references as laid out in the joint LJ + model
+    embedding that the LJ-vs-model figure uses (bundle_duo, frame 'joint'). Returns (xy of every model draw, refs)."""
+    if frame == 'self':
+        emb = embed_bundles([uma_bundle], device=device)
+    elif frame == 'joint':
+        cross_knn(uma_bundle, elj_bundle, device=device)
+        emb = embed_bundles([uma_bundle, elj_bundle], device=device, landmark_kwargs=DUO_LANDMARK_KW)
+    else:
+        raise ValueError(f"frame {frame!r}: 'self' or 'joint'")
+    return emb['draws'][0], emb['refs']
+
+
 def mean_shift_pointers(out, cutoffs, device='cuda', row_block=1024, col_chunk=8192, dens=None, tag=''):
     """utils.mean_shift_density's pointer table over a bundle's window & reduced draws, for every cutoff at once.
 
@@ -285,8 +347,9 @@ def _rank(raw_draws, raw_pts):
 
 def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, energy_function, max_n_clusters,
                      min_basin_size, device='cuda', basins_from='bundle', d_cut=None, max_basins=None,
-                     scale_label=None, extra_scales=None):
-    """figures.combo_fig's inputs over the bundle's window & reduced draws.
+                     scale_label=None, extra_scales=None, frame='self'):
+    """figures.combo_fig's inputs over the bundle's window & reduced draws. `frame` picks the embedding the
+    draws are drawn in (model_frame).
 
     Basins are the 10k analysis's: its mean-shift anchors are reused and every bundle draw is assigned by the same
     rule (kernel weight to each anchor, normalised over anchors, >= 0.8 or unassigned; anchors of basins the 10k
@@ -380,9 +443,9 @@ def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, e
     print(f"  bundle landscape: {M} draws; basin sizes {sizes}; unassigned {int((indexed < 0).sum())} "
           f"({100 * float((indexed < 0).float().mean()):.1f}%)")
 
-    emb = embed_bundles([uma_bundle], device=device)
-    xy = emb['draws'][0][rows.numpy()]
-    sample_embedding = np.concatenate([xy, emb['refs'], xy[e_min]], 0)
+    xy_all, refs_xy = model_frame(uma_bundle, elj_bundle, frame, device=device)
+    xy = xy_all[rows.numpy()]
+    sample_embedding = np.concatenate([xy, refs_xy, xy[e_min]], 0)
     polymorph_inds = [M + r for r in range(R)]
     new_min_inds = [M + R + k for k in range(n_basins)]
 
@@ -433,14 +496,22 @@ def bundle_landscape(uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, e
             energy.numpy(), np.arange(M), stats), thermos
 
 
-def bundle_duo(uma_bundle, elj_bundle, device='cuda'):
+def bundle_duo(uma_bundle, elj_bundle, device='cuda', frame='joint'):
     """The LJ-vs-UMA embedding over both bundles' window & reduced draws: what generate_figs.duo_embedding_fig
-    plots and saves for the fused figure."""
+    plots and saves for the fused figure. frame 'joint': both bundles embedded together; 'model': the model's own
+    embedding (embed_bundles([uma_bundle]), the single-model figures' frame), with the LJ draws placed into it by
+    embed_into and the model layout left as it is."""
     cross_knn(uma_bundle, elj_bundle, device=device)
-    emb = embed_bundles([uma_bundle, elj_bundle], device=device,
-                        landmark_kwargs=dict(init='spectral', repulsion_strength=2.0))
+    if frame == 'joint':
+        emb = embed_bundles([uma_bundle, elj_bundle], device=device, landmark_kwargs=DUO_LANDMARK_KW)
+        draws = emb['draws']
+    elif frame == 'model':
+        emb = embed_bundles([uma_bundle], device=device)
+        draws = [emb['draws'][0], embed_into(uma_bundle, elj_bundle, emb['draws'][0])]
+    else:
+        raise ValueError(f"frame {frame!r}: 'joint' or 'model'")
     out = {}
-    for tag, o, xy in (('uma', uma_bundle, emb['draws'][0]), ('lj', elj_bundle, emb['draws'][1])):
+    for tag, o, xy in (('uma', uma_bundle, draws[0]), ('lj', elj_bundle, draws[1])):
         keep = torch.load(os.path.join(o, 'draws.pt'), weights_only=False)['window_reduced'].numpy()
         out[tag] = xy[keep]
     out['poly'] = emb['refs']

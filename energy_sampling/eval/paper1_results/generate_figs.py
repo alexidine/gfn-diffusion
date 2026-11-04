@@ -62,6 +62,11 @@ def require_log_r(results, tag):
 SCALE_RADII = {'mipcas': {'match15of20': 0.169, 'match10of20': 0.242},
                'nehzor': {'match15of20': 0.177, 'match10of20': 0.319}}
 KERNEL_REACH = 3.0   # sigma = d_cut / 3, i.e. the kernel's d_cut IS the COMPACK distance above
+# EMBED_FRAMES picks the 100k embeddings: unset = the paper's (the LJ-vs-model figure in the joint LJ + model frame,
+# the single-model figures in the model's own frame); 'alt' = the swap: the LJ-vs-model figure in the model's own frame
+# with the LJ draws placed into it (landscape_100k.embed_into), the single-model figures in the joint frame
+EMBED_FRAMES = {'': dict(duo='joint', single='self'), 'alt': dict(duo='model', single='joint')}[
+    os.environ.get('EMBED_FRAMES', '')]
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, out_dir=PAPER_FIG_DIR,
@@ -249,7 +254,8 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
         if bundled:   # every window & reduced draw of both bundles, embedded jointly
             from energy_sampling.eval.paper1_results.landscape_100k import bundle_duo
             fig_dict['duo_embedding'], duo = duo_embedding_fig(None, None, None, None, None, None,
-                                                               precomputed=bundle_duo(uma_bundle, elj_bundle))
+                                                               precomputed=bundle_duo(uma_bundle, elj_bundle,
+                                                                                      frame=EMBED_FRAMES['duo']))
         else:
             fig_dict['duo_embedding'], duo = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor,
                                                                uma_batch, uma_results)
@@ -283,7 +289,8 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, 
                 uma_bundle, elj_bundle, uma_results, uma_thermos, ebatch, 'uma', max_n_clusters=4,
                 min_basin_size=100, d_cut=d_cut, max_basins=6 if diagnostic else 4,
                 scale_label=None if diagnostic else '10/20',
-                extra_scales=None if diagnostic else {'15/20': kernel['match15of20']})
+                extra_scales=None if diagnostic else {'15/20': kernel['match15of20']},
+                frame=EMBED_FRAMES['single'])
             (basin_colorscale, basin_min_batch, indexed_cluster_labels,
              n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
              polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
@@ -676,16 +683,16 @@ def fused_duo_embedding(mol_names, out_dir):
     export_figs({'duo_embedding_fused': fig}, '_'.join(mol_names), out_dir)
 
 
-def scale_embeddings(mol_name, uma_bundle, out_dir):
+def scale_embeddings(mol_name, uma_bundle, out_dir, elj_bundle=None):
     """The UMA model's 100k embedding (window & reduced draws) coloured three ways: lattice energy, and the P(x)
     percentile at the 10/20 and 15/20 kernel scales (sigma = d_cut / 3, sums from the bundle's histograms)."""
     from scipy.stats import rankdata
     from energy_sampling.eval.paper1_results.dens_engine import kernel_sums_from_hist
-    from energy_sampling.eval.paper1_results.landscape_100k import embed_bundles
+    from energy_sampling.eval.paper1_results.landscape_100k import model_frame
     draws = torch.load(os.path.join(uma_bundle, 'draws.pt'), weights_only=False)
     keep = draws['window_reduced'].numpy()
     n = len(keep)
-    emb = embed_bundles([uma_bundle])
+    emb_xy, emb_refs = model_frame(uma_bundle, elj_bundle, EMBED_FRAMES['single'])
     energy = draws['energy'].numpy()[keep]
     panels = [dict(values=energy, title='Lattice energy', colorbar='E (kJ/mol)', colorscale='Turbo_r',
                    # colour scale capped 10 kT above the lowest draw; draws above it (up to the 15 kT window) take the end colour
@@ -695,7 +702,7 @@ def scale_embeddings(mol_name, uma_bundle, out_dir):
         panels.append(dict(values=100 * (rankdata(s) - 0.5) / len(s), title=f'P<sup>{label}</sup>(x) percentile',
                            colorbar='percentile', colorscale='Turbo', range=(0, 100), top='high'))
         print(f"  {mol_name} {label}: {100 * float(np.mean(s < 1)):.1f}% of draws below one draw's weight")
-    fig = scale_embedding_fig(emb['draws'][0][keep], panels, emb['refs'])
+    fig = scale_embedding_fig(emb_xy[keep], panels, emb_refs)
     export_figs({'embedding_scales': fig}, mol_name, out_dir)
 
 
@@ -899,6 +906,6 @@ if __name__ == '__main__':
     if not only_fig or 'embedding_scales' in only_fig:
         for m, paths in PAIRS.items():
             if paths.get('uma_bundle') and (not only or m in only):
-                scale_embeddings(m, paths['uma_bundle'], out_dir)
+                scale_embeddings(m, paths['uma_bundle'], out_dir, elj_bundle=paths.get('elj_bundle'))
     if not only_fig or only_fig.intersection(('energy_marginal', 'density_contours', 'energies_fused')):
         fused_energies([m for m in PAIRS if not only or m in only], out_dir)

@@ -2463,7 +2463,9 @@ def fused_duo_embedding_fig(panels, callout='EXP'):
 
         # molecule: the stretch of the top band with the fewest points under it (the left end holds the letter)
         size = 0.30 * (x_rng[1] - x_rng[0])
-        cands = np.linspace(x_rng[0] + 0.22 * (x_rng[1] - x_rng[0]), x_rng[1] - size, 12)
+        # (the last panel's top-right corner holds the legend)
+        right = x_rng[1] - size - (0.22 * (x_rng[1] - x_rng[0]) if col == len(panels) else 0.0)
+        cands = np.linspace(x_rng[0] + 0.22 * (x_rng[1] - x_rng[0]), right, 12)
         top = pts[:, 1] > y_rng[1] - size
         counts = [int((top & (pts[:, 0] > c) & (pts[:, 0] < c + size)).sum()) for c in cands]
         cx = cands[int(np.argmin(counts))]
