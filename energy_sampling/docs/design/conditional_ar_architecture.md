@@ -488,3 +488,30 @@ Where the build departs from §5 to §5.7 (each a deliberate scope cut or substi
      centroid's image distance (inversion; other proper operations; other improper operations). For inversion and
      pure rotations that is twice the distance to the element. For screws and glides it includes the intrinsic
      translation.
+
+### 5.9 Closed on the side branch `ar-overnight-nov04`, and open questions (2026-11-04)
+
+The side branch closes these departures of §5.8, each behind a pending setting, default off:
+- **Departure 1** (`atom_point_convs`).
+- **Departure 2** (`mol_scalars`). The extents are the log square roots of the heavy-atom gyration tensor's
+  eigenvalues, not mxtaltools' inertial axes.
+- **Departure 4** for the cell block (physical units).
+- **e_g into the level head and the context** (`sym_ops`, `sym_ops_hidden`, `sym_ops_init`). This is option A's group
+  input. The encoder trains with the condition encoders and can start from the pretrained autoencoder.
+
+Open, written down rather than guessed:
+1. **The chirality input under option A.** With g given, the level learns log Z(m, g). For an enantiomorphic pair,
+   Z(X, P4₁) = Z(X′, P4₃), while Z(X, P4₁) and Z(X′, P4₁) differ. A mirror-blind level (s, the molecule scalars and
+   e_g are all mirror-blind) cannot represent that. The choices, recommended first:
+   - (a) **Close the allowed groups under the enantiomorph map** (§5.6, owner question 2). Each pair's sum is then
+     mirror-symmetric, and a per-group level needs only a sign. That sign could be the stereo descriptor from
+     perception.
+   - (b) **A geometric pseudoscalar of the standard-frame molecule,** for example a signed triple product of the
+     principal axes weighted by element. It vanishes on achiral molecules, but also on some chiral ones.
+   - (c) **Leave the level mirror-blind** and accept the bias on enantiomorphic groups, of order the gap between the
+     pair's two Z.
+
+   Nothing is built. The point stream p carries chirality to the policy already, but p never reaches the level.
+2. **The drawn SG step.** The SG head as softmax(L) and drawing g are not built. Both wait on the FD energy route
+   scoring several groups in one run (search/prior session).
+3. **Block-order toggle:** not built. The owner chose the chart's order, 2026-11-04.
