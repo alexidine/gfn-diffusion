@@ -461,12 +461,20 @@ These supersede amendment 1 of §5.6 and the SG-head design of §2.2 and §2.3.
 Built:
 - Encoder: point stream as a second `ScalarGNN`, AugSoftmax pools (`3a777aad`).
 - Spline defaults on the conditional route equal the unconditional ones (`3a777aad`).
-- Typed FD rows, conditional and unconditional (`nf typed_rows`; `b2552116`, `1d846282`). Order: the chart's own,
-  which is the owner's lengths, angles, position, orientation in every Day group.
-- Prefix features (`nf prefix_features`; `f47e1d9a`).
+- Typed FD rows, conditional and unconditional (`nf row_tokens typed`; `b2552116`, `1d846282`). Order: the chart's
+  own, which is the owner's lengths, angles, position, orientation in every Day group.
+- Prefix features (`nf row_tokens prefix`; `f47e1d9a`).
 - The operation-set featuriser, `e_g` encoder and membership autoencoder (`models/sym_ops.py`, `5c85e073`): pretrains
   to all 230 groups exact. Not wired to the policy.
-- Both new settings are in `models/nf_policy.py::NF_PENDING_DEFAULTS` until mk_dev carries them (owner-edited file).
+- **Settings (owner, 2026-11-04: grouped into coarse knobs, in `models/nf_policy.py::NF_DEFAULTS` and mk_dev, all
+  off):** `row_tokens` (`plain`, `typed`, `prefix`), `mol_scalars`, `sym_ops` (`none`, `pooled`; `tokens` and
+  `tokens_dynamic` of §5.2 refused as not built), `sym_ops_init` (a pretrained encoder file, whose width and hidden
+  width it carries; else a new encoder of `models/nf_policy.py::SYM_OPS_SHAPE`), and `atom_point_convs` beside
+  `atom_convs`. The pretrained encoder's frozen mode of §5.2 is not built.
+- **Default order (owner, 2026-11-04): the chart's own, cell first,** on every one-block unconditional flow:
+  `block_orders: auto` resolves to `id` (`models/nf_policy.py::resolve_flow_settings`). Before, it resolved to
+  `models/nf_policy.py::Z1_ORDER` (pose first) on any 12-row unconditional flow, which silently included the FD chart
+  of sg 2. `Z1_ORDER` is now taken only when named; a checkpoint that stored it keeps it.
 
 Where the build departs from §5 to §5.7 (each a deliberate scope cut or substitution; none settled by the owner):
 1. **No `point_convs` key.** The point stream's depth is `atom_convs`, so the per-atom MLP arm (0 convs) is not
@@ -480,7 +488,7 @@ Where the build departs from §5 to §5.7 (each a deliberate scope cut or substi
    the chart's own units, not as lengths and cosines.
 5. **No g slot and no padding** (§5.3). One space group per run, so the slot index and the type coincide. The type
    tables are still keyed by coordinate name, ready for several groups.
-6. **No block-order toggle.** The order is fixed to the chart's.
+6. **No block-order toggle.** The order is the chart's by default; `block_orders` still names any other.
 7. **Prefix features, substitutions** (§5.4):
    - the interplanar spacings are over `r_mol`, not over the molecule's thinnest extent;
    - the shortest-reduced-cell-vector feature is not built;
@@ -491,12 +499,12 @@ Where the build departs from §5 to §5.7 (each a deliberate scope cut or substi
 
 ### 5.9 Closed on the side branch `ar-overnight-nov04`, and open questions (2026-11-04)
 
-The side branch closes these departures of §5.8, each behind a pending setting, default off:
+The side branch closes these departures of §5.8, each behind a setting, default off (names as grouped in §5.8):
 - **Departure 1** (`atom_point_convs`).
 - **Departure 2** (`mol_scalars`). The extents are the log square roots of the heavy-atom gyration tensor's
   eigenvalues, not mxtaltools' inertial axes.
 - **Departure 4** for the cell block (physical units).
-- **e_g into the level head and the context** (`sym_ops`, `sym_ops_hidden`, `sym_ops_init`). This is option A's group
+- **e_g into the level head and the context** (`sym_ops pooled`, `sym_ops_init`). This is option A's group
   input. The encoder trains with the condition encoders and can start from the pretrained autoencoder.
 
 Open, written down rather than guessed:

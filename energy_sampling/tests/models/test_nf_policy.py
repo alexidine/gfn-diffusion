@@ -246,11 +246,14 @@ def test_bounded_rows_linear_bounds_every_live_unwrapped_row(conditional):
 # -- the config audit's fixes (2026-10-27) -------------------------------------------------------------------------
 
 def test_unset_settings_resolve_to_the_unconditional_spline_on_both_routes():
-    from models.nf_policy import NF_DEFAULTS, Z1_ORDER, resolve_flow_settings
+    from models.nf_policy import NF_DEFAULTS, resolve_flow_settings
     u = resolve_flow_settings(NF_DEFAULTS, False, list(range(12)))
+    # block_orders 'auto' is the chart's own order, cell first, on any one-block unconditional flow (owner,
+    # 2026-11-04), the 12-row Z' = 1 latent included; Z1_ORDER (pose first) is taken only when named
     assert (u['bounded_rows'], u['min_bin_height'], u['tied_derivatives'], u['tied_factor'], u['block_orders']) == \
-        ('linear', 1e-7, True, 2.0, Z1_ORDER)
-    assert resolve_flow_settings(NF_DEFAULTS, False, [0, 1, 2])['block_orders'] is None   # not the Z' = 1 latent
+        ('linear', 1e-7, True, 2.0, 'id')
+    assert resolve_flow_settings(NF_DEFAULTS, False, [0, 1, 2])['block_orders'] == 'id'
+    assert resolve_flow_settings({**NF_DEFAULTS, 'n_blocks': 2}, False, list(range(12)))['block_orders'] is None
     c = resolve_flow_settings(NF_DEFAULTS, True, list(range(12)))
     # the conditional spline takes the unconditional defaults (owner, 2026-11-03); its orders stay the alternating ones
     assert (c['bounded_rows'], c['min_bin_height'], c['tied_derivatives'], c['block_orders']) == ('linear', 1e-7, True, None)

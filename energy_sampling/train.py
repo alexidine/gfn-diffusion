@@ -3481,7 +3481,7 @@ class Modeller:
                   f"{[n for n, w in zip(fd.names, fd.wrap_mask) if w]}; model.periodic_centroids is not read")
             cfg = dict(self._build_latent_gfn_config(periodic_centroids=False), dim=fd.dim,
                        angular_mask=list(fd.wrap_mask), periodic_centroid_axes=None, dead_latent_rows=None)
-            if (cfg.get('policy') or {}).get('nf', {}).get('typed_rows'):   # the chart's group, which they describe
+            if (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
                 cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
         else:
             cfg = self._build_latent_gfn_config()
@@ -10080,7 +10080,9 @@ class Modeller:
                                               metrics,
                                               temperature_conditioning=self.args.temperature_conditioning,
                                               anchor_latents=anchor_latents,
-                                              domain_figs=self._domain_figs)
+                                              domain_figs=self._domain_figs,
+                                              chart=('fd' if getattr(self.energy_function, 'crystal_coordinates',
+                                                                     'latent') == 'fd' else 'latent'))
             if hasattr(self, 'condition_log_z'):
                 # cross-sections of the per-condition tracker state -- built
                 # purely from its running stats, no sampling / energy calls

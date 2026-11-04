@@ -167,6 +167,12 @@ def save_encoder(model, path):
                 'hidden': enc.out.in_features, 'vocabulary': len(vocabulary()[0])}, path)
 
 
+def encoder_shape(path):
+    """(e_g width, hidden width) of a save_encoder file."""
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    return int(ck['out_dim']), int(ck['hidden'])
+
+
 def load_encoder_into(encoder, path):
     """Load a save_encoder file into encoder (a SymOpEncoder of the same shape); raises on a shape mismatch."""
     ck = torch.load(path, map_location='cpu', weights_only=False)

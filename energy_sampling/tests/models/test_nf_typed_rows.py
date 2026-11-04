@@ -31,7 +31,7 @@ from test_nf_policy import SMALL, gfn_config  # noqa: E402
 pytestmark = pytest.mark.fast
 DAY_FAMILIES = (1, 2, 9, 14, 19, 61, 88, 148)
 TF = dict(conditioner='transformer', tf_width=32, tf_layers=2, tf_heads=2, tf_fp32=True, atom_node_dim=16,
-          atom_convs=2, atom_tokens='split', typed_rows=True)
+          atom_convs=2, atom_tokens='split', row_tokens='typed')
 
 
 def _rows(d, b, seed):
@@ -168,6 +168,8 @@ def test_typed_rows_are_refused_off_the_fd_chart_and_off_the_conditional_route()
         NFPolicy(cfg, {**SMALL, **TF, 'n_blocks': 2}, seed=0, fd_space_group=14)
     with pytest.raises(ValueError, match="chart has 10 rows"):
         NFPolicy(dict(cfg, dim=12, angular_mask=[False] * 12), {**SMALL, **TF}, seed=0, fd_space_group=14)
+    with pytest.raises(ValueError, match='row_tokens'):
+        NFPolicy(cfg, {**SMALL, **TF, 'row_tokens': 'typed_rows'}, seed=0, fd_space_group=14)
 
 
 # -- the unconditional route (one molecule; the prefix-feature testbed) ------------------------------------------------
@@ -177,7 +179,7 @@ def _unconditional_typed(sg, scale=0.3):
     cfg = dict(gfn_config(False), dim=desc.dim, angular_mask=list(desc.wrap_mask), periodic_centroid_axes=None,
                dead_latent_rows=None)
     flow = {**SMALL, 'conditioner': 'transformer', 'tf_width': 32, 'tf_layers': 2, 'tf_heads': 2, 'tf_fp32': True,
-            'typed_rows': True}
+            'row_tokens': 'typed'}
     torch.manual_seed(0)
     pol = NFPolicy(cfg, flow, seed=0, fd_space_group=sg).double()
     g = torch.Generator().manual_seed(3)
@@ -188,7 +190,7 @@ def _unconditional_typed(sg, scale=0.3):
 
 
 def test_unconditional_typed_rows_keep_the_charts_order_even_on_twelve_rows():
-    """sg 2's chart has 12 rows, which would otherwise resolve block_orders 'auto' to the latent's Z1_ORDER."""
+    """sg 2's chart has 12 rows, as the Z' = 1 latent: block_orders 'auto' is still the chart's own order."""
     pol = _unconditional_typed(2)
     assert pol.sampler.flow.orders == [list(range(12))]
     assert pol.sampler.flow.blocks[0].made.order.tolist() == list(range(12))
@@ -286,7 +288,7 @@ def test_p1_has_no_images_and_says_so():
 
 
 def test_prefix_policy_round_trips_and_does_not_peek():
-    pol = _typed_policy(14, prefix_features=True)
+    pol = _typed_policy(14, row_tokens='prefix')
     f = pol.sampler.flow
     mb = _mols(4, 6)
     mb.mol_volume = torch.rand(4, generator=torch.Generator().manual_seed(1)) * 100 + 80

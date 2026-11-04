@@ -191,14 +191,17 @@ def test_precision_settings_follow_the_run_and_other_settings_refuse(tmp_path, c
         m.checkpointer.load_full(path)
 
 
-def test_resolution_reads_the_live_rows_as_the_gfn_does():
-    """Dead rows leave the live rows (block_orders 'auto' is Z1_ORDER only on live rows 0-11); with
-    hold_dead_latent_rows false the GFN holds none, and neither does the resolution."""
+def test_resolution_gives_the_charts_order_whatever_the_dead_rows():
+    """block_orders 'auto' resolves to 'id' on a one-block unconditional flow whether or not dead rows are held; a
+    resolved entry (what gfn_config and checkpoints store) resolves to itself, so a checkpoint that stored Z1_ORDER
+    keeps it."""
     from models.nf_policy import Z1_ORDER, resolve_policy_entry
     entry = {'kind': 'nf', 'nf': dict(SMALL), 'seed': 3}
     cfg = dict(dim=13, conditional=False, dead_latent_rows=[12])
-    assert resolve_policy_entry(entry, cfg)['nf']['block_orders'] == Z1_ORDER
-    assert resolve_policy_entry(entry, dict(cfg, hold_dead_latent_rows=False))['nf']['block_orders'] is None
+    assert resolve_policy_entry(entry, cfg)['nf']['block_orders'] == 'id'
+    assert resolve_policy_entry(entry, dict(cfg, hold_dead_latent_rows=False))['nf']['block_orders'] == 'id'
+    old = resolve_policy_entry({**entry, 'nf': dict(SMALL, block_orders=Z1_ORDER)}, dict(cfg, dim=12))
+    assert resolve_policy_entry(old, dict(cfg, dim=12)) == old and old['nf']['block_orders'] == Z1_ORDER
     assert resolve_policy_entry(None, cfg) is None and resolve_policy_entry({'kind': 'sde'}, cfg) == {'kind': 'sde'}
 
 

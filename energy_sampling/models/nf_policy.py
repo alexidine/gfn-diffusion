@@ -38,30 +38,37 @@ NF_DEFAULTS = dict(
                                     # (SplitAtomEncoder: invariant trunk s for the level head, point head p, tokens
                                     # cross-attended); 'split_pooled' (the same, pooled s and p only, no cross-attention)
     atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
+    atom_point_convs=None,          # the split encoder's point-stream message-passing rounds; None = atom_convs, 0 = a
+                                    # per-atom MLP
     min_bin_height='auto', min_bin_height_rows='all',
     tied_derivatives=None, tied_factor=None,
     bounded_rows='auto',            # 'auto', 'none'/None, 'linear' (every live unwrapped row on the closed [-1, 1]), or rows '0,3'
-    block_orders='auto',            # 'auto', 'none'/None, or one order per block: 'id', 'rev' or rows '8.11.10...'
+    block_orders='auto',            # 'auto' (one-block unconditional: 'id', the chart's own order, cell first; else
+                                    # the alternating orders), 'none'/None, or one order per block: 'id', 'rev' or rows
     fold_half_rows=None,            # rows '7,8' whose distribution repeats every half period
     mix_k=0,                        # > 0: a mixture-of-logistics block of k components (unconditional)
+    row_tokens='plain',             # 'plain' (each row its value only); 'typed' (crystal_fd's chart rows as typed tokens
+                                    # with their physical values and allowed ranges, models/fd_row_describer.py; one
+                                    # block); 'prefix' (typed, and each row also reads the prefix physics of the blocks
+                                    # completed before it: packing, interplanar spacings, symmetry-image distances)
+    mol_scalars=False,              # True (molecule route): the level head and the context also read the molecule's
+                                    # log volume, log radius and log principal extents (MOL_SCALARS)
+    sym_ops='none',                 # 'none'; 'pooled' (molecule route): the level head and the context also read e_g of
+                                    # the row's space group from its symmetry operations (models/sym_ops.py)
+    sym_ops_init=None,              # with sym_ops pooled: a models/sym_ops.py save_encoder file, whose pretrained encoder
+                                    # e_g starts from (width and hidden from the file); None = a new one, SYM_OPS_SHAPE
 )
 # settings built after mk_dev's nf block was last edited (mk_dev is owner-edited): accepted and defaulted like
 # NF_DEFAULTS, absent from mk_dev until the owner adds them, then moved into NF_DEFAULTS (tests/models/test_nf_policy.py
 # pins both halves)
-NF_PENDING_DEFAULTS = dict(
-    typed_rows=False,               # True: the FD chart's rows as typed tokens with their physical values and allowed
-                                    # ranges (models/fd_row_describer.py; one block, the crystal_fd chart)
-    prefix_features=False,          # True (needs typed_rows): each row also reads the prefix physics of the blocks
-                                    # completed before it (packing, interplanar spacings, symmetry-image distances)
-    atom_point_convs=None,          # the split encoder's point-stream message-passing rounds; None = atom_convs, 0 = a
-                                    # per-atom MLP
-    mol_scalars=False,              # True (molecule route): the level head and the context also read the molecule's
-                                    # log volume, log radius and log principal extents (MOL_SCALARS)
-    sym_ops=0,                      # > 0 (molecule route): the level head and the context also read e_g, this wide, of
-                                    # the row's space group from its symmetry operations (models/sym_ops.py)
-    sym_ops_hidden=128,             # the e_g encoder's hidden width
-    sym_ops_init=None,              # a models/sym_ops.py save_encoder file: e_g's encoder starts from the pretrained one
-)
+NF_PENDING_DEFAULTS = dict()
+ROW_TOKENS = ('plain', 'typed', 'prefix')
+#: sym_ops: 'pooled' is built; 'tokens' and 'tokens_dynamic' (op tokens in the cross-attention memory, static or
+#: refreshed per completed block; docs/design/conditional_ar_architecture.md §5.2) are designed and not built
+SYM_OPS = ('none', 'pooled', 'tokens', 'tokens_dynamic')
+#: (e_g width, hidden width) of a new e_g encoder: models/sym_ops.py::pretrain's defaults, so a fresh and a pretrained
+#: encoder have one shape
+SYM_OPS_SHAPE = (64, 256)
 #: the molecule scalars of nf mol_scalars: log MolData.mol_volume, log MolData.radius, and the log square roots of the
 #: heavy-atom gyration tensor's eigenvalues, largest first (invariant to rotation and reflection)
 MOL_SCALARS = ('log_volume', 'log_radius', 'log_extent_1', 'log_extent_2', 'log_extent_3')
@@ -69,14 +76,15 @@ NF_ALL_DEFAULTS = {**NF_DEFAULTS, **NF_PENDING_DEFAULTS}
 ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
 # as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0)
-Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'
+Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'   # pose first (centroid z, orientation, centroid y, x, then the cell)
 
 
-def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
+def resolve_flow_settings(s: dict, conditional: bool, live_rows=None) -> dict:
     """An unset setting takes UNCONDITIONAL_DEFAULTS on both routes (owner, 2026-11-03: the conditional spline is the
     unconditional one unless there is a reason; inn_modeller.py::resolve_auto_options still leaves them off on its
-    conditional route); block_orders 'auto' is Z1_ORDER on an unconditional one-block flow whose live rows are exactly
-    0-11 (the Z' = 1 crystal latent's own rows), else the alternating orders."""
+    conditional route); block_orders 'auto' is 'id' (the chart's own row order, cell block first) on an unconditional
+    one-block flow, else the alternating orders, whose first block is also the stored order. Z1_ORDER, the pose-first
+    order inn_modeller.py's 'auto' still gives the Z' = 1 latent, is taken only when named. live_rows is not read."""
     s = dict(s)
     for key in ('bounded_rows', 'min_bin_height', 'block_orders'):
         if s[key] == 'none':
@@ -89,11 +97,10 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
         s['tied_derivatives'] = UNCONDITIONAL_DEFAULTS['tied_derivatives']
     if s['tied_factor'] is None:
         s['tied_factor'] = 2.0
-    if s['block_orders'] == 'auto' and s.get('typed_rows'):   # typed rows read the chart in its own order
-        s['block_orders'] = 'id' if not conditional else None
-    if s['block_orders'] == 'auto':
-        z1 = not conditional and int(s['n_blocks']) == 1 and list(live_rows) == list(range(12))
-        s['block_orders'] = Z1_ORDER if z1 else None
+    if s['block_orders'] == 'auto':   # the chart's own order: the cell block first (owner, 2026-11-04)
+        s['block_orders'] = 'id' if not conditional and int(s['n_blocks']) == 1 else None
+    if s['sym_ops'] in (None, False, 0, 'off'):   # YAML reads a bare `off` as false
+        s['sym_ops'] = 'none'
     return s
 
 
@@ -204,20 +211,25 @@ class NFPolicy(nn.Module):
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
         describer = None
-        if s['prefix_features'] and not s['typed_rows']:
-            raise ValueError("flow prefix_features are features of the typed rows: they need typed_rows")
-        if s['typed_rows']:
+        if s['row_tokens'] not in ROW_TOKENS:
+            raise ValueError(f"flow row_tokens {s['row_tokens']!r}: one of {ROW_TOKENS}")
+        if s['sym_ops'] not in SYM_OPS:
+            raise ValueError(f"flow sym_ops {s['sym_ops']!r}: one of {SYM_OPS}")
+        if s['sym_ops'] in ('tokens', 'tokens_dynamic'):
+            raise NotImplementedError(f"flow sym_ops {s['sym_ops']!r}: op tokens are designed (docs/design/"
+                                      f"conditional_ar_architecture.md §5.2) and not built; 'pooled' is")
+        if s['row_tokens'] != 'plain':
             # the policy entry names the chart's space group (train.py::Modeller._build_gfn_config on crystal_fd)
             if fd_space_group is None:
-                raise ValueError("flow typed_rows describes crystal_fd's chart rows: it needs "
-                                 "energy_config.crystal_coordinates fd")
+                raise ValueError(f"flow row_tokens {s['row_tokens']!r} describes crystal_fd's chart rows: it "
+                                 f"needs energy_config.crystal_coordinates fd")
             if self.conditional and not s['atom_tokens']:
-                raise NotImplementedError("flow typed_rows on a conditional policy needs the molecule route "
-                                          "(atom_tokens): the vector route carries no molecule radius")
+                raise NotImplementedError(f"flow row_tokens {s['row_tokens']!r} on a conditional policy needs the "
+                                          f"molecule route (atom_tokens): the vector route carries no molecule radius")
             from models.fd_row_describer import FDRowDescriber
-            describer = FDRowDescriber(int(fd_space_group), prefix=bool(s['prefix_features']))
+            describer = FDRowDescriber(int(fd_space_group), prefix=s['row_tokens'] == 'prefix')
             if describer.dim != self.dim or self.dead_rows:
-                raise ValueError(f"flow typed_rows: sg {int(fd_space_group)}'s chart has {describer.dim} rows, the "
+                raise ValueError(f"flow row_tokens: sg {int(fd_space_group)}'s chart has {describer.dim} rows, the "
                                  f"policy {self.dim} ({len(self.dead_rows)} dead)")
 
         wrap_mask = self.ang_mask.cpu().tolist()
@@ -234,16 +246,26 @@ class NFPolicy(nn.Module):
         half_rows = [int(r) for r in str(s['fold_half_rows']).split(',')] if s['fold_half_rows'] else []
         if s['mix_k'] and s['tied_derivatives']:
             raise NotImplementedError("flow tied_derivatives with mix_k")
+        if not self.conditional and (s['mol_scalars'] or s['sym_ops'] != 'none' or s['sym_ops_init']):
+            raise ValueError("flow mol_scalars and sym_ops are read beside the condition's molecule: they need a "
+                             "conditional policy on the molecule route")
         if self.conditional:
             if orders is not None or half_rows or s['mix_k']:
                 raise NotImplementedError("flow block_orders, fold_half_rows and mix_k are built for "
                                           "unconditional policies only (as inn_modeller.py)")
+            if s['sym_ops_init'] and s['sym_ops'] != 'pooled':
+                raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops pooled")
+            sym_w, sym_h = SYM_OPS_SHAPE
+            if s['sym_ops_init']:
+                from models.sym_ops import encoder_shape
+                sym_w, sym_h = encoder_shape(s['sym_ops_init'])
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial'],
                           encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
                           cross=s['atom_tokens'] != 'split_pooled',
                           mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0,
-                          sym_ops=int(s['sym_ops']), sym_hidden=int(s['sym_ops_hidden'])) if s['atom_tokens'] else None)
+                          sym_ops=sym_w if s['sym_ops'] == 'pooled' else 0, sym_hidden=sym_h)
+                     if s['atom_tokens'] else None)
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
             elif s['atom_point_convs'] is not None:
@@ -251,10 +273,8 @@ class NFPolicy(nn.Module):
                                  "'split' or 'split_pooled'")
             if s['mol_scalars'] and atoms is None:
                 raise ValueError("flow mol_scalars are read beside the molecule's atoms: they need atom_tokens")
-            if s['sym_ops'] and atoms is None:
+            if s['sym_ops'] == 'pooled' and atoms is None:
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
-            if s['sym_ops_init'] and not s['sym_ops']:
-                raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
@@ -359,7 +379,7 @@ class NFPolicy(nn.Module):
         self.sampler.flow.set_atom_table(z, pos, counts)
         if self.settings['mol_scalars']:
             self.sampler.flow.set_mol_scalars(_mol_scalars(mol_batch, z, pos, counts).to(self.device))
-        if self.settings['sym_ops']:
+        if self.settings['sym_ops'] == 'pooled':
             sg = getattr(mol_batch, 'sg_ind', None)
             if sg is None:
                 raise ValueError("flow sym_ops need each row's space group (sg_ind on mol_batch)")
@@ -367,7 +387,8 @@ class NFPolicy(nn.Module):
         if self.sampler.flow.describer is not None:
             radius = getattr(mol_batch, 'radius', None)
             if radius is None:
-                raise ValueError("flow typed_rows needs each molecule's radius (MolData.radius) on mol_batch")
+                raise ValueError("flow row_tokens typed/prefix need each molecule's radius (MolData.radius) on "
+                                 "mol_batch")
             volume = None
             if self.sampler.flow.describer.prefix:
                 volume = getattr(mol_batch, 'mol_volume', None)

@@ -263,7 +263,11 @@ def eval_figs(fwd_stats,
               temperature_conditioning: bool = False,
               anchor_latents=None,
               domain_figs=None,
+              chart='latent',
               ):
+    """chart: the coordinates of prior_latent_params and anchor_latents (energy_config.crystal_coordinates); the
+    samples are read in the same chart for 'Lattice Latents Distribution' ('latent': latent_params; 'fd': the FD
+    chart rows s in [-1, 1], fd_chart_coordinates)."""
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
     log_r = fwd_stats['log_r']
@@ -331,7 +335,7 @@ def eval_figs(fwd_stats,
         # the very artifact that surfaced the target-pinning bug upstream.
         from energies.molecular_crystal import is_crystal_energy
         fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
-            space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
+            space=chart, ref_dist=prior_latent_params, quantiles=[0.1],
             show=False, return_fig=True, override_energy=scaled_energy,
             gauge_fix_free_axes=is_crystal_energy(energy_function),
             aux_dists=[anchor_latents] if anchor_latents is not None else None)

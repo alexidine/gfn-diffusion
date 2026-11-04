@@ -188,7 +188,7 @@ def test_e_g_reaches_the_level_and_log_q_and_its_encoder_is_in_a_parameter_group
     cfg = gfn_config(True, cond_dim=4)
     cfg['conditions_type'] = 'molecule'
     torch.manual_seed(0)
-    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 8, 'mol_scalars': True}, seed=0)
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 'pooled', 'mol_scalars': True}, seed=0)
     groups = [pol.t_model, pol.s_model, pol.forward_policy, pol.backward_policy, pol.conditions_embedding_model,
               pol.flow_model]
     ids = [id(p) for g in groups for p in g.parameters()]
@@ -221,10 +221,30 @@ def test_sym_ops_init_loads_the_pretrained_encoder(tmp_path):
     save_encoder(ae, path)
     cfg = gfn_config(True, cond_dim=4)
     cfg['conditions_type'] = 'molecule'
-    flow = {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 8, 'sym_ops_hidden': 16, 'sym_ops_init': str(path)}
-    pol = NFPolicy(cfg, flow, seed=0)
+    flow = {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 'pooled', 'sym_ops_init': str(path)}
+    pol = NFPolicy(cfg, flow, seed=0)     # e_g's width and hidden width are the file's (8, 16), not SYM_OPS_SHAPE
     got = pol.sampler.flow.sym_encoder.state_dict()
     for k, v in ae.encoder.state_dict().items():
         assert torch.equal(got[k].cpu(), v), k
-    with pytest.raises(ValueError, match='width'):
-        NFPolicy(cfg, {**flow, 'sym_ops': 4}, seed=0)
+    with pytest.raises(ValueError, match='needs sym_ops pooled'):
+        NFPolicy(cfg, {**flow, 'sym_ops': 'none'}, seed=0)
+
+
+def test_sym_ops_modes():
+    """sym_ops: 'none' (also YAML's bare off, read as false), 'pooled' (a new encoder of SYM_OPS_SHAPE); the op-token
+    modes are designed and refused; mol_scalars and sym_ops off the molecule route raise rather than go inert."""
+    from models.nf_policy import SYM_OPS_SHAPE
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    flow = {**SMALL, **TF, 'atom_tokens': 'split'}
+    assert NFPolicy(cfg, {**flow, 'sym_ops': False}, seed=0).settings['sym_ops'] == 'none'
+    enc = NFPolicy(cfg, {**flow, 'sym_ops': 'pooled'}, seed=0).sampler.flow.sym_encoder
+    assert (enc.out.out_features, enc.out.in_features) == SYM_OPS_SHAPE
+    for mode in ('tokens', 'tokens_dynamic'):
+        with pytest.raises(NotImplementedError, match='not built'):
+            NFPolicy(cfg, {**flow, 'sym_ops': mode}, seed=0)
+    with pytest.raises(ValueError, match='one of'):
+        NFPolicy(cfg, {**flow, 'sym_ops': 8}, seed=0)
+    for bad in ({'mol_scalars': True}, {'sym_ops': 'pooled'}):
+        with pytest.raises(ValueError, match='molecule route'):
+            NFPolicy(gfn_config(False), {**SMALL, **bad}, seed=0)
