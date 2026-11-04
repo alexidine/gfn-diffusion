@@ -532,6 +532,7 @@ class _ContextFlow(nn.Module):
         # read by the level head and the context beside the pooled molecule; 0 = none. Option A of the design: with g
         # given, the level is log Z(m, g)
         self.n_sym = int(atoms.pop('sym_ops', 0)) if atoms is not None else 0
+        sym_hidden = int(atoms.pop('sym_hidden', 128)) if atoms is not None else 128
         if self.encoder not in (None, 'xyz', 'split'):
             raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
         self.atoms = atoms is not None
@@ -586,7 +587,7 @@ class _ContextFlow(nn.Module):
             n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars + self.n_sym
             if self.n_sym:
                 from models.sym_ops import SymOpEncoder
-                self.sym_encoder = SymOpEncoder(out_dim=self.n_sym)
+                self.sym_encoder = SymOpEncoder(out_dim=self.n_sym, hidden=sym_hidden)
                 self.row_groups = None
             n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
             for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):

@@ -158,3 +158,32 @@ def pretrain(steps=4000, lr=3e-3, out_dim=64, hidden=256, seed=0, log_every=0):
         wrong = ((model(groups) > 0).float() != target)
     return model, {'loss': float(loss.detach()), 'bit_errors': int(wrong.sum()),
                    'groups_exact': int((~wrong.any(-1)).sum())}
+
+
+def save_encoder(model, path):
+    """The pretrained encoder's weights and shape, for nf sym_ops_init."""
+    enc = model.encoder
+    torch.save({'state_dict': enc.state_dict(), 'out_dim': enc.out.out_features,
+                'hidden': enc.out.in_features, 'vocabulary': len(vocabulary()[0])}, path)
+
+
+def load_encoder_into(encoder, path):
+    """Load a save_encoder file into encoder (a SymOpEncoder of the same shape); raises on a shape mismatch."""
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    if (ck['out_dim'], ck['hidden']) != (encoder.out.out_features, encoder.out.in_features):
+        raise ValueError(f"{path}: an e_g encoder of width {ck['out_dim']} (hidden {ck['hidden']}), the flow's is "
+                         f"{encoder.out.out_features} (hidden {encoder.out.in_features})")
+    encoder.load_state_dict(ck['state_dict'])
+
+
+if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser(description='pretrain the space-group autoencoder and save its encoder')
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--out_dim', type=int, default=64)
+    ap.add_argument('--hidden', type=int, default=256)
+    ap.add_argument('--steps', type=int, default=4000)
+    a = ap.parse_args()
+    m, res = pretrain(steps=a.steps, out_dim=a.out_dim, hidden=a.hidden, log_every=500)
+    print(res)
+    save_encoder(m, a.out)

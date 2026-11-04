@@ -59,6 +59,8 @@ NF_PENDING_DEFAULTS = dict(
                                     # log volume, log radius and log principal extents (MOL_SCALARS)
     sym_ops=0,                      # > 0 (molecule route): the level head and the context also read e_g, this wide, of
                                     # the row's space group from its symmetry operations (models/sym_ops.py)
+    sym_ops_hidden=128,             # the e_g encoder's hidden width
+    sym_ops_init=None,              # a models/sym_ops.py save_encoder file: e_g's encoder starts from the pretrained one
 )
 #: the molecule scalars of nf mol_scalars: log MolData.mol_volume, log MolData.radius, and the log square roots of the
 #: heavy-atom gyration tensor's eigenvalues, largest first (invariant to rotation and reflection)
@@ -241,7 +243,7 @@ class NFPolicy(nn.Module):
                           encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
                           cross=s['atom_tokens'] != 'split_pooled',
                           mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0,
-                          sym_ops=int(s['sym_ops'])) if s['atom_tokens'] else None)
+                          sym_ops=int(s['sym_ops']), sym_hidden=int(s['sym_ops_hidden'])) if s['atom_tokens'] else None)
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
             elif s['atom_point_convs'] is not None:
@@ -251,6 +253,8 @@ class NFPolicy(nn.Module):
                 raise ValueError("flow mol_scalars are read beside the molecule's atoms: they need atom_tokens")
             if s['sym_ops'] and atoms is None:
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
+            if s['sym_ops_init'] and not s['sym_ops']:
+                raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
@@ -266,6 +270,9 @@ class NFPolicy(nn.Module):
                 embed['atom_encoder'] = self.sampler.flow.atom_encoder
             if getattr(self.sampler.flow, 'n_sym', 0):   # e_g's encoder trains with the condition's other encoders
                 embed['sym_encoder'] = self.sampler.flow.sym_encoder
+                if s['sym_ops_init']:
+                    from models.sym_ops import load_encoder_into
+                    load_encoder_into(self.sampler.flow.sym_encoder, s['sym_ops_init'])
             self.conditions_embedding_model = embed
         else:
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),

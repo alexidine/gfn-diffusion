@@ -211,3 +211,20 @@ def test_e_g_reaches_the_level_and_log_q_and_its_encoder_is_in_a_parameter_group
         assert not torch.allclose(pol.log_density(x, cond, batch([14, 14, 2])), pol.log_density(x, cond, batch([2, 14, 2])))
     with pytest.raises(ValueError, match='sg_ind'):
         pol.get_condition_embedding(cond, _with_fields(_mols()))
+
+
+def test_sym_ops_init_loads_the_pretrained_encoder(tmp_path):
+    from models.sym_ops import SymOpAutoencoder, save_encoder
+    torch.manual_seed(1)
+    ae = SymOpAutoencoder(out_dim=8, hidden=16)
+    path = tmp_path / 'eg.pt'
+    save_encoder(ae, path)
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    flow = {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 8, 'sym_ops_hidden': 16, 'sym_ops_init': str(path)}
+    pol = NFPolicy(cfg, flow, seed=0)
+    got = pol.sampler.flow.sym_encoder.state_dict()
+    for k, v in ae.encoder.state_dict().items():
+        assert torch.equal(got[k].cpu(), v), k
+    with pytest.raises(ValueError, match='width'):
+        NFPolicy(cfg, {**flow, 'sym_ops': 4}, seed=0)
