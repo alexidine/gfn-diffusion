@@ -12,7 +12,9 @@ share operations share their tokens, which is the route to a sensible input for 
   distinct operations of all 230 groups, translations on a 1/24 grid); ``pretrain`` fits it by binary cross-entropy
   on the 230 groups, no energy data. Its encoder is the pretrained e_g.
 
-Not yet read by the policy (the SG step is built later; §2.4)."""
+Read by the conditional flow policy with nf sym_ops 'pooled' (models/spline_flow.py::_ContextFlow: e_g of each
+row's space group joins the level head's input and the context vector); the op-token modes and an SG head that draws g
+are not built (§2.4, §5.2)."""
 import math
 from functools import lru_cache
 
