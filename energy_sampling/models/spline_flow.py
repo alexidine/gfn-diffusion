@@ -68,7 +68,8 @@ def invert_differentiable(blk, y, ctx=None, extra_of=None):
     td = getattr(blk, 'tied', False)
     for _ in range(blk.d):
         if ctx is None:
-            p = blk.made(blk._feats(x)).view(y.shape[0], blk.d, blk.n_params)
+            p = (blk.made(blk._feats(x)) if extra_of is None else blk.made(blk._feats(x), None, extra_of(x))
+                 ).view(y.shape[0], blk.d, blk.n_params)
             shift, sp = p[..., -1], p[..., :3 * blk.n_bins].view(y.shape[0], blk.d, 3, blk.n_bins)
         else:
             shift, sp = blk.spline_params(x, ctx, None if extra_of is None else extra_of(x))
@@ -184,7 +185,7 @@ class LatentFlow(nn.Module):
     """q(x) over the full latent: a spline flow on the live rows, dead rows pinned at 0."""
 
     def __init__(self, dim, wrap_mask, dead_rows, n_blocks, n_bins, hidden, bound, seed, transformer=None,
-                 block_orders=None, half_rows=(), bounded_rows=(), mix_k=0):
+                 block_orders=None, half_rows=(), bounded_rows=(), mix_k=0, describer=None):
         super().__init__()
         self.mix_k = int(mix_k)
         dead = {int(d) for d in dead_rows}
@@ -227,9 +228,23 @@ class LatentFlow(nn.Module):
                  else _Block(o, live_wrap, n_bins, tuple(hidden), bound, live_bnd)) for o in self.flow.orders)
         elif self.mix_k:
             raise NotImplementedError("--mix_k needs --block_orders")
+        # describer: typed rows, as ConditionalLatentFlow's: one block in the chart's own order over unstandardised
+        # rows (models/fd_row_describer.py). The molecule radius is per row (set_row_radius)
+        self.describer = describer
+        typed = {}
+        if describer is not None:
+            from models.fd_row_describer import FD_TYPES, K_EXTRA
+            if (transformer is None or n_blocks != 1 or self.flow.orders[0] != list(range(len(live)))
+                    or describer.dim != len(live) or self.half_rows or self.mix_k
+                    or not all(self.flow.unit_base.tolist())):
+                raise NotImplementedError("typed rows need the transformer conditioner, one block in the identity "
+                                          "order, no folded or mixture rows, and every row bounded or a circle on "
+                                          "the describer's chart")
+            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=K_EXTRA)
+        self.register_buffer('row_radius', None, persistent=False)
         if transformer is not None:  # (width, layers, heads): each block's MADE replaced by a causal transformer
             for blk, order in zip(self.flow.blocks, self.flow.orders):
-                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer)
+                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer, **typed)
                 if isinstance(blk, _MixBlock):
                     blk.widen_head()
         elif self.mix_k:
@@ -240,6 +255,20 @@ class LatentFlow(nn.Module):
         for blk in self.flow.blocks:
             if isinstance(blk.made, CausalTransformerConditioner):
                 blk.made.bf16 = bool(on)
+
+    def set_row_radius(self, radius):
+        """Typed rows: the molecule radius per row [n] (Angstrom) of the next call."""
+        self.row_radius = radius
+
+    def row_extra(self, z):
+        """Typed rows: the describer's per-row features [b, d, k] of the block's rows z [b, d]; None without one."""
+        if self.describer is None:
+            return None
+        r = self.row_radius
+        if r is None or r.shape[0] != z.shape[0]:
+            raise RuntimeError(f"typed rows need one molecule radius per row (set_row_radius): "
+                               f"{None if r is None else r.shape[0]} for {z.shape[0]} rows")
+        return self.describer(z, r)
 
     def _fold(self, x):
         if not self.half_rows:
@@ -262,13 +291,17 @@ class LatentFlow(nn.Module):
         x = self._fold(x)[:, self.live_idx]
         z = torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd)
         ld = x.new_zeros(x.shape[0]) - torch.log(f.sd[~f.is_wrap]).sum()
+        extra = self.row_extra(z)
         for blk in f.blocks:
-            z, l = blk(z)
+            z, l = blk(z) if extra is None else blk(z, extra)
             ld = ld + l
         return z, ld
 
     def log_prob(self, x, c=None):
-        return self.flow.log_prob(self._fold(x)[:, self.live_idx])
+        f = self.flow
+        xl = self._fold(x)[:, self.live_idx]
+        extra = self.row_extra(torch.where(f.is_wrap, _wrap(xl), (xl - f.mu) / f.sd))
+        return f.log_prob(xl) if extra is None else f.log_prob(xl, extra)
 
     @torch.no_grad()
     def sample(self, n, c=None, return_base: bool = False):
@@ -281,7 +314,7 @@ class LatentFlow(nn.Module):
             if isinstance(blk, _MixBlock):
                 z = blk.invert(z, f.d)
             elif isinstance(blk.made, CausalTransformerConditioner):
-                z = invert_block_cached(blk, z)       # one decode step per row, not d full passes
+                z = invert_block_cached(blk, z, None, None if self.describer is None else self.row_extra)
             else:
                 z = invert_block(blk, z, f.d)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
@@ -298,7 +331,7 @@ class LatentFlow(nn.Module):
         f = self.flow
         z = z0
         for blk in reversed(list(f.blocks)):
-            z = invert_differentiable(blk, z)
+            z = invert_differentiable(blk, z, None, None if self.describer is None else self.row_extra)
         x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
         x[:, self.live_idx] = torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu)
         return x

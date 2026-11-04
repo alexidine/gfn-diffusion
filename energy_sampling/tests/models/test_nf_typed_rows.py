@@ -159,3 +159,61 @@ def test_typed_rows_are_refused_off_the_fd_chart_and_off_the_conditional_route()
         NFPolicy(cfg, {**SMALL, **TF, 'n_blocks': 2}, seed=0, fd_space_group=14)
     with pytest.raises(ValueError, match="chart has 10 rows"):
         NFPolicy(dict(cfg, dim=12, angular_mask=[False] * 12), {**SMALL, **TF}, seed=0, fd_space_group=14)
+
+
+# -- the unconditional route (one molecule; the prefix-feature testbed) ------------------------------------------------
+
+def _unconditional_typed(sg, scale=0.3):
+    desc = FDRowDescriber(sg)
+    cfg = dict(gfn_config(False), dim=desc.dim, angular_mask=list(desc.wrap_mask), periodic_centroid_axes=None,
+               dead_latent_rows=None)
+    flow = {**SMALL, 'conditioner': 'transformer', 'tf_width': 32, 'tf_layers': 2, 'tf_heads': 2, 'tf_fp32': True,
+            'typed_rows': True}
+    torch.manual_seed(0)
+    pol = NFPolicy(cfg, flow, seed=0, fd_space_group=sg).double()
+    g = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for p in pol.parameters():
+            p.add_(scale * torch.randn(p.shape, generator=g, dtype=p.dtype))
+    return pol.eval()
+
+
+def test_unconditional_typed_rows_keep_the_charts_order_even_on_twelve_rows():
+    """sg 2's chart has 12 rows, which would otherwise resolve block_orders 'auto' to the latent's Z1_ORDER."""
+    pol = _unconditional_typed(2)
+    assert pol.sampler.flow.orders == [list(range(12))]
+    assert pol.sampler.flow.blocks[0].made.order.tolist() == list(range(12))
+
+
+@pytest.mark.parametrize('sg', (14, 2))
+def test_unconditional_typed_draws_round_trip_and_do_not_peek(sg):
+    pol = _unconditional_typed(sg)
+    n = 6
+    mb = SimpleNamespace(radius=torch.full((n,), 3.3))
+    pol._context(None, mb, n)
+    f = pol.sampler.flow
+    with torch.no_grad():
+        x, z0 = pol.sampler.sample(n, return_base=True)
+        z, _ = pol.sampler.to_base(x)
+        assert torch.allclose(z, z0, atol=1e-8), (z - z0).abs().max()
+        lp = pol.sampler.log_prob(x)
+        assert torch.isfinite(lp).all()
+        blk = f.blocks[0]
+        made = blk.made
+        xs = _rows(f.d, n, 21) * 0.98
+        p0 = made(blk._feats(xs), None, pol.sampler.row_extra(xs))
+        p0 = p0.view(n, f.d, -1)
+        for j in range(f.d):
+            x2 = xs.clone()
+            x2[:, j:] = _rows(f.d - j, n, 70 + j) * 0.98
+            p2 = made(blk._feats(x2), None, pol.sampler.row_extra(x2)).view(n, f.d, -1)
+            assert torch.equal(p2[:, j], p0[:, j]), j
+
+
+def test_unconditional_typed_rows_hold_one_molecule_radius():
+    pol = _unconditional_typed(14)
+    pol._context(None, SimpleNamespace(radius=torch.full((4,), 3.3)), 4)
+    pol._context(None, None, 5)                      # a call without the batch reuses the molecule's radius
+    assert pol.sampler.row_radius.shape == (5,)
+    with pytest.raises(ValueError, match='differ'):
+        pol._context(None, SimpleNamespace(radius=torch.tensor([3.3, 4.0])), 2)

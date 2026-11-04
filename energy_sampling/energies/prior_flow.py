@@ -292,9 +292,11 @@ class _Block(nn.Module):
         trip = torch.stack((x, torch.sin(ang), torch.cos(ang)), dim=-1)   # [B, d, 3]
         return trip[:, self.feat_dim, self.feat_kind]
 
-    def forward(self, x):
+    def forward(self, x, extra=None):
+        """extra: per-row features [b, d, k] for a conditioner built to take them (typed rows), else None."""
         b = x.shape[0]
-        p = self.made(self._feats(x)).view(b, self.d, self.n_params)
+        p = (self.made(self._feats(x)) if extra is None else self.made(self._feats(x), None, extra)
+             ).view(b, self.d, self.n_params)
         shift = p[..., -1]
         sp = p[..., :3 * self.n_bins].view(b, self.d, 3, self.n_bins)
 
@@ -351,14 +353,15 @@ class _Flow(nn.Module):
         self.mu.copy_(mu)
         self.sd.copy_(sd)
 
-    def log_prob(self, x):
-        """log p in INTERNAL coordinates: wrapped dims on [-1,1], linear standardised."""
+    def log_prob(self, x, extra=None):
+        """log p in INTERNAL coordinates: wrapped dims on [-1,1], linear standardised. extra: a one-block typed-row
+        flow's per-row features of the block's input (models/spline_flow.py::LatentFlow.row_extra)."""
         z = torch.where(self.is_wrap, _wrap(x), (x - self.mu) / self.sd)
         # the fixed per-dim standardisation of the linear dims is itself a change
         # of variable and owes a (constant) log-jacobian
         ld = x.new_zeros(x.shape[0]) - torch.log(self.sd[~self.is_wrap]).sum()
         for blk in self.blocks:
-            z, l = blk(z)
+            z, l = blk(z) if extra is None else blk(z, extra)
             ld = ld + l
         base = x.new_zeros(x.shape[0])
         if self.unit_base.any():

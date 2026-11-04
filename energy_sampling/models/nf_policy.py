@@ -76,6 +76,8 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows) -> dict:
         s['tied_derivatives'] = UNCONDITIONAL_DEFAULTS['tied_derivatives']
     if s['tied_factor'] is None:
         s['tied_factor'] = 2.0
+    if s['block_orders'] == 'auto' and s.get('typed_rows'):   # typed rows read the chart in its own order
+        s['block_orders'] = 'id' if not conditional else None
     if s['block_orders'] == 'auto':
         z1 = not conditional and int(s['n_blocks']) == 1 and list(live_rows) == list(range(12))
         s['block_orders'] = Z1_ORDER if z1 else None
@@ -174,9 +176,9 @@ class NFPolicy(nn.Module):
             if fd_space_group is None:
                 raise ValueError("flow typed_rows describes crystal_fd's chart rows: it needs "
                                  "energy_config.crystal_coordinates fd")
-            if not (self.conditional and s['atom_tokens']):
-                raise NotImplementedError("flow typed_rows is built for the conditional molecule route (atom_tokens) "
-                                          "only")
+            if self.conditional and not s['atom_tokens']:
+                raise NotImplementedError("flow typed_rows on a conditional policy needs the molecule route "
+                                          "(atom_tokens): the vector route carries no molecule radius")
             from models.fd_row_describer import FDRowDescriber
             describer = FDRowDescriber(int(fd_space_group))
             if describer.dim != self.dim or self.dead_rows:
@@ -222,7 +224,8 @@ class NFPolicy(nn.Module):
         else:
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
                                       transformer=transformer, block_orders=orders, half_rows=half_rows,
-                                      bounded_rows=bounded, mix_k=int(s['mix_k']))
+                                      bounded_rows=bounded, mix_k=int(s['mix_k']), describer=describer)
+            self._mol_radius = None   # typed rows: the one molecule's radius, from the first batch that carries it
             self.flow_model = LearnableScalar(0.0)
             blocks = self.sampler.flow.blocks
             self.conditions_embedding_model = _Empty()
@@ -283,6 +286,8 @@ class NFPolicy(nn.Module):
         table set from mol_batch's molecules (molecule mode, one graph per row) followed by the condition vector's
         columns, standardised (temperature, space group, Z': the encoder reads the molecule, these pass through)."""
         if not self.conditional:
+            if getattr(self.sampler, 'describer', None) is not None:
+                self.sampler.set_row_radius(self._unconditional_radius(mol_batch).expand(n))
             return None
         if not self.settings['atom_tokens']:
             return condition.to(self.device, torch.float32)
@@ -312,6 +317,23 @@ class NFPolicy(nn.Module):
         f = self.sampler.flow   # standardised here, not in the flow, which inn_modeller also drives raw
         rest = (condition.to(self.device, torch.float32) - f.c_mu[1:]) / f.c_sd[1:]
         return torch.cat([ids, rest], -1)
+
+    def _unconditional_radius(self, mol_batch):
+        """Typed rows on an unconditional policy: the one molecule's radius [] (Angstrom, float64), read from
+        mol_batch.radius when the call carries it (every row must agree with the radius first seen) and the cached
+        value otherwise."""
+        radius = getattr(mol_batch, 'radius', None) if mol_batch is not None else None
+        if radius is not None:
+            r = torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64)
+            if self._mol_radius is None:
+                self._mol_radius = r[0].clone()
+            if not bool(torch.allclose(r, self._mol_radius.expand_as(r), rtol=1e-6, atol=1e-6)):
+                raise ValueError("flow typed_rows on an unconditional policy: the batch's molecule radii differ from "
+                                 "the one molecule's (an unconditional run has one molecule)")
+        if self._mol_radius is None:
+            raise ValueError("flow typed_rows needs the molecule's radius (MolData.radius on mol_batch) on the first "
+                             "call")
+        return self._mol_radius
 
     def get_condition_embedding(self, condition, mol_batch):
         """The level head's input features for these conditions (what flow_model reads)."""
