@@ -62,11 +62,12 @@ def require_log_r(results, tag):
 SCALE_RADII = {'mipcas': {'match15of20': 0.169, 'match10of20': 0.242},
                'nehzor': {'match15of20': 0.177, 'match10of20': 0.319}}
 KERNEL_REACH = 3.0   # sigma = d_cut / 3, i.e. the kernel's d_cut IS the COMPACK distance above
-# EMBED_FRAMES picks the 100k embeddings: unset = the paper's (the LJ-vs-model figure in the joint LJ + model frame,
-# the single-model figures in the model's own frame); 'alt' = the swap: the LJ-vs-model figure in the model's own frame
-# with the LJ draws placed into it (landscape_100k.embed_into), the single-model figures in the joint frame
-EMBED_FRAMES = {'': dict(duo='joint', single='self'), 'alt': dict(duo='model', single='joint')}[
-    os.environ.get('EMBED_FRAMES', '')]
+# EMBED_FRAMES picks the 100k embeddings. Unset = the paper's (owner 2026-11-04): every embedding figure in the joint
+# LJ + model frame, the single-model figures showing the model's draws only. 'self': the single-model figures in the
+# model's own frame (the paper's figures until 2026-11-04). 'model': the LJ-vs-model figure in the model's own frame with
+# the LJ draws placed into it (landscape_100k.embed_into)
+EMBED_FRAMES = {'': dict(duo='joint', single='joint'), 'self': dict(duo='joint', single='self'),
+                'model': dict(duo='model', single='joint')}[os.environ.get('EMBED_FRAMES', '')]
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path, out_dir=PAPER_FIG_DIR,
