@@ -4,8 +4,9 @@
 ("attack afresh converging a TB-ish model on a huge conditioning space"). Source: workflow wf_c1c46233-a70, which ran
 four evidence readers (run history, code, the 2026-11-02 reviews, literature), five independent designers, two
 refuters per design and a completeness critic. Every derivation here was checked only on CPU toys. A toy checks a
-mechanism; it is never evidence about crystals. Nothing was launched. Raw reports: hub scratchpad
-`conv_afresh/out/` (synthesis.md, critic.md, ground_*.md, routes.json).*
+mechanism; it is never evidence about crystals. Nothing was launched. Raw reports and toy scripts:
+`D:/crystal_datasets/paper_review_nov02/conv_afresh_nov04/` (`out/` holds synthesis.md, critic.md, ground_*.md and routes.json;
+toy paths below, such as `math_lens/headk1.py`, are relative to it).*
 
 ## 1. Topline
 
@@ -21,7 +22,7 @@ mechanism; it is never evidence about crystals. Nothing was launched. Raw report
   subtracted from the residual is a baseline:
   - an error in it costs variance, never bias, as long as it is not clipped (Huber knee, §2);
   - so TB with a learned head and VarGrad's group centre differ only in variance;
-  - the toy (`conv_afresh/math_lens/headk1.py`) says K = 1 with a head baseline beats grouped K = 2–4 at equal calls
+  - the toy (`math_lens/headk1.py`) says K = 1 with a head baseline beats grouped K = 2–4 at equal calls
     when the head's error is under about 10 nats. That held at a toy between-condition spread τ = 3; the real τ has
     never been measured.
 - **Where a level error does harm: on a stored row.** There, a level error e = L − log Z(c) adds +e·∇KL(μ_c‖q_c)
@@ -54,7 +55,7 @@ Losses: λ_M·L_MLE + λ_R·L_R on the flow and encoder, plus a separate head lo
      diverged.
    - Anneal λ_M to a small floor on a step-count schedule, not a gate, so the anneal terminates. Until the floor is
      reached, the fixed point is a per-condition compromise between reverse KL to π and forward KL to the buffer law
-     (toy `conv_afresh/math_lens/fixedpoint.py`).
+     (toy `math_lens/fixedpoint.py`).
 2. **L_R on fresh draws only.**
    - Draws: one per visited condition, drawn without gradient (as `NFPolicy.get_traj_fwd` already does).
    - Coefficient: a = sg[log q − log R + b(c)], with b(c) = sg[head(c)].
