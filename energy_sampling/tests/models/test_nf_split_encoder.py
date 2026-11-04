@@ -241,14 +241,48 @@ def test_sym_ops_modes():
     assert NFPolicy(cfg, {**flow, 'sym_ops': False}, seed=0).settings['sym_ops'] == 'none'
     enc = NFPolicy(cfg, {**flow, 'sym_ops': 'pooled'}, seed=0).sampler.flow.sym_encoder
     assert (enc.out.out_features, enc.out.in_features) == SYM_OPS_SHAPE
-    for mode in ('tokens', 'tokens_dynamic'):
-        with pytest.raises(NotImplementedError, match='not built'):
-            NFPolicy(cfg, {**flow, 'sym_ops': mode}, seed=0)
+    with pytest.raises(NotImplementedError, match='not built'):
+        NFPolicy(cfg, {**flow, 'sym_ops': 'tokens_dynamic'}, seed=0)
+    with pytest.raises(ValueError, match='split_pooled'):
+        NFPolicy(cfg, {**flow, 'atom_tokens': 'split_pooled', 'sym_ops': 'tokens'}, seed=0)
     with pytest.raises(ValueError, match='one of'):
         NFPolicy(cfg, {**flow, 'sym_ops': 8}, seed=0)
     for bad in ({'mol_scalars': True}, {'sym_ops': 'pooled'}):
         with pytest.raises(ValueError, match='molecule route'):
             NFPolicy(gfn_config(False), {**SMALL, **bad}, seed=0)
+
+
+def test_op_tokens_join_the_memory_and_are_one_density():
+    """sym_ops tokens: the row's group's operations are tokens of the cross-attention memory beside its atoms (padded
+    to the batch's largest group), they move log q, and a draw and its rescore are one density."""
+    from models.sym_ops import group_tokens
+    cfg = gfn_config(True, cond_dim=4)
+    cfg['conditions_type'] = 'molecule'
+    torch.manual_seed(0)
+    pol = NFPolicy(cfg, {**SMALL, **TF, 'atom_tokens': 'split', 'sym_ops': 'tokens'}, seed=0)
+    g = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for p in pol.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=g))
+    pol.eval()
+    mb, cond = _with_fields(_mols()), torch.randn(3, 4)
+    mb.sg_ind = torch.tensor([14, 2, 61])
+    f = pol.sampler.flow
+    with torch.no_grad():
+        c = pol._context(cond, mb, 3)
+        vec, mem, mask = f.context_input(c)[0]
+        n_ops = [group_tokens(sg).shape[0] for sg in (14, 2, 61)]
+        n_atoms = int(mb.ptr.diff().max())
+        assert mem.shape[1] == n_atoms + max(n_ops)
+        assert mask[:, n_atoms:].sum(1).tolist() == n_ops
+        x = torch.rand(3, 12) * 1.6 - 0.8
+        lq = pol.log_density(x, cond, mb)
+        f.op_seg.add_(1.0)                       # the op tokens are read by log q
+        assert not torch.allclose(pol.log_density(x, cond, mb), lq)
+        f.op_seg.sub_(1.0)
+        states, log_pfs, _, _ = pol.get_traj_fwd(torch.zeros(3, 12), None, 0, cond, mb)
+        _, lpf_b, _, _ = pol.get_traj_bwd(states[:, 1], None, cond, mb)
+        assert torch.allclose(log_pfs, lpf_b, atol=1e-5)
 
 
 def _mirror_symmetric(seed, n_half=4):

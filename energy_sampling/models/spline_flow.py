@@ -596,6 +596,9 @@ class _ContextFlow(nn.Module):
         # given, the level is log Z(m, g)
         self.n_sym = int(atoms.pop('sym_ops', 0)) if atoms is not None else 0
         sym_hidden = int(atoms.pop('sym_hidden', 128)) if atoms is not None else 128
+        # atoms['sym_tokens']: each operation of the row's group is also a token of the cross-attention memory, beside
+        # the atom tokens (static: a function of g alone, so every slot may read it)
+        self.sym_tokens = bool(atoms.pop('sym_tokens', False)) if atoms is not None else False
         if self.encoder not in (None, 'xyz', 'split'):
             raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
         self.atoms = atoms is not None
@@ -653,6 +656,12 @@ class _ContextFlow(nn.Module):
                 from models.sym_ops import SymOpEncoder
                 self.sym_encoder = SymOpEncoder(out_dim=self.n_sym, hidden=sym_hidden)
                 self.row_groups = None
+            if self.sym_tokens:
+                if not self.n_sym or not self.cross:
+                    raise ValueError("op tokens join the cross-attention memory beside e_g: they need sym_ops and "
+                                     "a cross-attending conditioner")
+                self.op_tok = nn.Linear(sym_hidden, width)          # an operation's state -> a memory token
+                self.op_seg = nn.Parameter(0.02 * torch.randn(width))   # tells an operation token from an atom's
             n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
             for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):
                 self.register_buffer(name, None, persistent=False)
@@ -767,6 +776,10 @@ class _ContextFlow(nn.Module):
             tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
             s = torch.cat([pooled[inv], rest], -1)
             vec = self.context(s)
+        if self.cross and self.sym_tokens:   # the row's group's operations beside its molecule's atoms
+            ops, op_mask = self.sym_encoder.op_states(groups.tolist())
+            op_tokens = (self.op_tok(ops.to(dtype)) + self.op_seg.to(dtype))[ginv]
+            return (vec, torch.cat([tokens[inv], op_tokens], 1), torch.cat([mask[inv], op_mask[ginv]], 1)), s
         return ((vec, tokens[inv], mask[inv]) if self.cross else vec), s
 
     def set_scaler(self, x):

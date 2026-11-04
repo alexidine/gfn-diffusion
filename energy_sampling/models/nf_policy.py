@@ -59,7 +59,9 @@ NF_DEFAULTS = dict(
     mol_scalars=False,              # True (molecule route): the level head and the context also read the molecule's
                                     # log volume, log radius and log principal extents (MOL_SCALARS)
     sym_ops='none',                 # 'none'; 'pooled' (molecule route): the level head and the context also read e_g of
-                                    # the row's space group from its symmetry operations (models/sym_ops.py)
+                                    # the row's space group from its symmetry operations (models/sym_ops.py);
+                                    # 'tokens': pooled, and each operation is also a token of the cross-attention
+                                    # memory beside the atom tokens (needs atom_tokens split or True)
     sym_ops_init=None,              # with sym_ops pooled: a models/sym_ops.py save_encoder file, whose pretrained encoder
                                     # e_g starts from (width and hidden from the file); None = a new one, SYM_OPS_SHAPE
 )
@@ -69,7 +71,7 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict()
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
-#: sym_ops: 'pooled' is built; 'tokens' and 'tokens_dynamic' (op tokens in the cross-attention memory, static or
+#: sym_ops: 'pooled' and 'tokens' are built; 'tokens_dynamic' (op tokens in the cross-attention memory, static or
 #: refreshed per completed block; docs/design/conditional_ar_architecture.md §5.2) are designed and not built
 SYM_OPS = ('none', 'pooled', 'tokens', 'tokens_dynamic')
 #: (e_g width, hidden width) of a new e_g encoder: models/sym_ops.py::pretrain's defaults, so a fresh and a pretrained
@@ -244,9 +246,11 @@ class NFPolicy(nn.Module):
             raise ValueError(f"flow row_tokens {s['row_tokens']!r}: one of {ROW_TOKENS}")
         if s['sym_ops'] not in SYM_OPS:
             raise ValueError(f"flow sym_ops {s['sym_ops']!r}: one of {SYM_OPS}")
-        if s['sym_ops'] in ('tokens', 'tokens_dynamic'):
-            raise NotImplementedError(f"flow sym_ops {s['sym_ops']!r}: op tokens are designed (docs/design/"
-                                      f"conditional_ar_architecture.md §5.2) and not built; 'pooled' is")
+        if s['sym_ops'] == 'tokens_dynamic':
+            raise NotImplementedError(f"flow sym_ops {s['sym_ops']!r}: per-block op tokens are designed (docs/design/"
+                                      f"conditional_ar_architecture.md §5.2) and not built; 'pooled' and 'tokens' "
+                                      f"are")
+        e_g = s['sym_ops'] in ('pooled', 'tokens')
         if s['row_tokens'] != 'plain' and self.fd_slots is not None:
             from models.fd_slot_describer import SlotRowDescriber
             describer = SlotRowDescriber(self.fd_slots, prefix=s['row_tokens'] == 'prefix')
@@ -285,8 +289,11 @@ class NFPolicy(nn.Module):
             if orders is not None or half_rows or s['mix_k']:
                 raise NotImplementedError("flow block_orders, fold_half_rows and mix_k are built for "
                                           "unconditional policies only (as inn_modeller.py)")
-            if s['sym_ops_init'] and s['sym_ops'] != 'pooled':
-                raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops pooled")
+            if s['sym_ops_init'] and not e_g:
+                raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops pooled or tokens")
+            if s['sym_ops'] == 'tokens' and s['atom_tokens'] == 'split_pooled':
+                raise ValueError("flow sym_ops tokens join the cross-attention memory: atom_tokens split_pooled has "
+                                 "none")
             sym_w, sym_h = SYM_OPS_SHAPE
             if s['sym_ops_init']:
                 from models.sym_ops import encoder_shape
@@ -296,7 +303,7 @@ class NFPolicy(nn.Module):
                           encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
                           cross=s['atom_tokens'] != 'split_pooled',
                           mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0,
-                          sym_ops=sym_w if s['sym_ops'] == 'pooled' else 0, sym_hidden=sym_h)
+                          sym_ops=sym_w if e_g else 0, sym_hidden=sym_h, sym_tokens=s['sym_ops'] == 'tokens')
                      if s['atom_tokens'] else None)
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
@@ -306,7 +313,7 @@ class NFPolicy(nn.Module):
                                  "'split' or 'split_pooled'")
             if s['mol_scalars'] and atoms is None:
                 raise ValueError("flow mol_scalars are read beside the molecule's atoms: they need atom_tokens")
-            if s['sym_ops'] == 'pooled' and atoms is None:
+            if e_g and atoms is None:
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
@@ -414,7 +421,7 @@ class NFPolicy(nn.Module):
         self.sampler.flow.set_atom_table(z, pos, counts)
         if self.settings['mol_scalars']:
             self.sampler.flow.set_mol_scalars(_mol_scalars(mol_batch, z, pos, counts).to(self.device))
-        if self.settings['sym_ops'] == 'pooled':
+        if self.settings['sym_ops'] in ('pooled', 'tokens'):
             sg = getattr(mol_batch, 'sg_ind', None)
             if sg is None:
                 raise ValueError("flow sym_ops need each row's space group (sg_ind on mol_batch)")

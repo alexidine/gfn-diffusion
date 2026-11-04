@@ -12,9 +12,10 @@ share operations share their tokens, which is the route to a sensible input for 
   distinct operations of all 230 groups, translations on a 1/24 grid); ``pretrain`` fits it by binary cross-entropy
   on the 230 groups, no energy data. Its encoder is the pretrained e_g.
 
-Read by the conditional flow policy with nf sym_ops 'pooled' (models/spline_flow.py::_ContextFlow: e_g of each
-row's space group joins the level head's input and the context vector); the op-token modes and an SG head that draws g
-are not built (§2.4, §5.2)."""
+Read by the conditional flow policy (models/spline_flow.py::_ContextFlow): with nf sym_ops 'pooled' e_g of each row's
+space group joins the level head's input and the context vector; with 'tokens' also each operation's state
+(SymOpEncoder.op_states, projected to the transformer width) joins the atom tokens in the conditioner's cross-attention
+memory. The per-block op tokens ('tokens_dynamic') are not built (§5.2)."""
 import math
 from functools import lru_cache
 
@@ -123,6 +124,22 @@ class SymOpEncoder(nn.Module):
         tok, idx = batch_tokens(groups)
         p = next(self.parameters())
         return self(tok.to(p), idx.to(p.device), len(groups))
+
+    def op_states(self, groups):
+        """Per operation of each group, the per-operation MLP's output (what the pool reads): ([G, n_max, hidden],
+        mask [G, n_max] True on real operations), groups padded to the most operations among them."""
+        tok, idx = batch_tokens(groups)
+        p = next(self.parameters())
+        h = self.op(tok.to(p))
+        counts = torch.bincount(idx, minlength=len(groups))
+        n_max = int(counts.max())
+        start = torch.cumsum(counts, 0) - counts
+        slot = torch.arange(idx.numel()) - start[idx]
+        out = h.new_zeros(len(groups), n_max, h.shape[-1])
+        mask = torch.zeros(len(groups), n_max, dtype=torch.bool, device=p.device)
+        out[idx.to(p.device), slot.to(p.device)] = h
+        mask[idx.to(p.device), slot.to(p.device)] = True
+        return out, mask
 
 
 class SymOpAutoencoder(nn.Module):

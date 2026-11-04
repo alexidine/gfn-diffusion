@@ -317,7 +317,7 @@ model:
     mix_k: 0                   # > 0: mixture-of-logistics blocks of k components; unconditional only
     row_tokens: plain          # plain | typed (FD chart rows as typed tokens with their physical values and allowed ranges) | prefix (typed + physics of the completed blocks: packing, plane spacings, symmetry-image distances). typed/prefix need crystal_coordinates fd and one block
     mol_scalars: false         # true (molecule route): the level and the context also read log volume, log radius, log principal extents
-    sym_ops: none              # none | pooled (molecule route): the level and the context also read e_g, an embedding of the row's space group from its symmetry operations. tokens / tokens_dynamic: not built
+    sym_ops: none              # none | pooled (molecule route): the level and the context also read e_g, an embedding of the row's space group from its symmetry operations | tokens: pooled, and each operation is also a token of the cross-attention memory beside the atoms. tokens_dynamic: not built
     sym_ops_init: null         # with sym_ops pooled: a models/sym_ops.py save_encoder file (python -m models.sym_ops --out PATH); null = a new encoder
 
 # trunk read by model.force_drift_fwd / force_drift_bwd and by model.state_atoms; not loaded when all three are off
