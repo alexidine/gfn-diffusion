@@ -233,14 +233,14 @@ class LatentFlow(nn.Module):
         self.describer = describer
         typed = {}
         if describer is not None:
-            from models.fd_row_describer import FD_TYPES, K_EXTRA
+            from models.fd_row_describer import FD_TYPES
             if (transformer is None or n_blocks != 1 or self.flow.orders[0] != list(range(len(live)))
                     or describer.dim != len(live) or self.half_rows or self.mix_k
                     or not all(self.flow.unit_base.tolist())):
                 raise NotImplementedError("typed rows need the transformer conditioner, one block in the identity "
                                           "order, no folded or mixture rows, and every row bounded or a circle on "
                                           "the describer's chart")
-            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=K_EXTRA)
+            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=describer.k)
         self.register_buffer('row_radius', None, persistent=False)
         if transformer is not None:  # (width, layers, heads): each block's MADE replaced by a causal transformer
             for blk, order in zip(self.flow.blocks, self.flow.orders):
@@ -256,9 +256,10 @@ class LatentFlow(nn.Module):
             if isinstance(blk.made, CausalTransformerConditioner):
                 blk.made.bf16 = bool(on)
 
-    def set_row_radius(self, radius):
-        """Typed rows: the molecule radius per row [n] (Angstrom) of the next call."""
-        self.row_radius = radius
+    def set_row_radius(self, radius, volume=None):
+        """Typed rows: the molecule radius per row [n] (Angstrom) of the next call, and with prefix features its
+        volume [n] (cubic Angstrom)."""
+        self.row_radius, self.row_volume = radius, volume
 
     def row_extra(self, z):
         """Typed rows: the describer's per-row features [b, d, k] of the block's rows z [b, d]; None without one."""
@@ -268,7 +269,7 @@ class LatentFlow(nn.Module):
         if r is None or r.shape[0] != z.shape[0]:
             raise RuntimeError(f"typed rows need one molecule radius per row (set_row_radius): "
                                f"{None if r is None else r.shape[0]} for {z.shape[0]} rows")
-        return self.describer(z, r)
+        return self.describer(z, r, self.row_volume)
 
     def _fold(self, x):
         if not self.half_rows:
@@ -555,11 +556,11 @@ class _ContextFlow(nn.Module):
         self.describer = describer
         typed = {}
         if describer is not None:
-            from models.fd_row_describer import FD_TYPES, K_EXTRA
+            from models.fd_row_describer import FD_TYPES
             if transformer is None or n_blocks != 1 or describer.dim != d or not all(self.unit_base.tolist()):
                 raise NotImplementedError("typed rows need the transformer conditioner, one block, and every row "
                                           "bounded or a circle on the describer's chart")
-            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=K_EXTRA)
+            typed = dict(row_types=describer.types, n_types=len(FD_TYPES), extra_dim=describer.k)
         self.register_buffer('row_radius', None, persistent=False)
         if transformer is not None:  # (width, layers, heads): each block's _ContextMADE replaced by a causal transformer
             for blk, order in zip(self.blocks, orders):
@@ -590,10 +591,10 @@ class _ContextFlow(nn.Module):
         atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
 
-    def set_row_radius(self, radius):
+    def set_row_radius(self, radius, volume=None):
         """Typed rows: the molecule radius [n_cond] (Angstrom, MolData.radius) per condition id, beside the atom
-        table."""
-        self.row_radius = radius
+        table, and with prefix features its volume [n_cond] (cubic Angstrom, MolData.mol_volume)."""
+        self.row_radius, self.row_volume = radius, volume
 
     def row_extra(self, x, c):
         """Typed rows: the describer's per-row features [b, d, k] of the block's rows x [b, d] under conditions c
@@ -602,7 +603,9 @@ class _ContextFlow(nn.Module):
             return None
         if self.row_radius is None:
             raise RuntimeError("typed rows need the molecule radii (set_row_radius)")
-        return self.describer(x, self.row_radius[c[:, 0].round().long()])
+        cid = c[:, 0].round().long()
+        vol = None if self.row_volume is None else self.row_volume[cid]
+        return self.describer(x, self.row_radius[cid], vol)
 
     def context_input(self, c):
         """What every block and the level head read: (embedded vector, atom tokens, atom mask) and the level head's

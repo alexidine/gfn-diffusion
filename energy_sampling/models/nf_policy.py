@@ -51,6 +51,8 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict(
     typed_rows=False,               # True: the FD chart's rows as typed tokens with their physical values and allowed
                                     # ranges (models/fd_row_describer.py; one block, the crystal_fd chart)
+    prefix_features=False,          # True (needs typed_rows): each row also reads the prefix physics of the blocks
+                                    # completed before it (packing, interplanar spacings, symmetry-image distances)
 )
 NF_ALL_DEFAULTS = {**NF_DEFAULTS, **NF_PENDING_DEFAULTS}
 ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
@@ -171,6 +173,8 @@ class NFPolicy(nn.Module):
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
         describer = None
+        if s['prefix_features'] and not s['typed_rows']:
+            raise ValueError("flow prefix_features are features of the typed rows: they need typed_rows")
         if s['typed_rows']:
             # the policy entry names the chart's space group (train.py::Modeller._build_gfn_config on crystal_fd)
             if fd_space_group is None:
@@ -180,7 +184,7 @@ class NFPolicy(nn.Module):
                 raise NotImplementedError("flow typed_rows on a conditional policy needs the molecule route "
                                           "(atom_tokens): the vector route carries no molecule radius")
             from models.fd_row_describer import FDRowDescriber
-            describer = FDRowDescriber(int(fd_space_group))
+            describer = FDRowDescriber(int(fd_space_group), prefix=bool(s['prefix_features']))
             if describer.dim != self.dim or self.dead_rows:
                 raise ValueError(f"flow typed_rows: sg {int(fd_space_group)}'s chart has {describer.dim} rows, the "
                                  f"policy {self.dim} ({len(self.dead_rows)} dead)")
@@ -225,7 +229,7 @@ class NFPolicy(nn.Module):
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
                                       transformer=transformer, block_orders=orders, half_rows=half_rows,
                                       bounded_rows=bounded, mix_k=int(s['mix_k']), describer=describer)
-            self._mol_radius = None   # typed rows: the one molecule's radius, from the first batch that carries it
+            self._mol_radius = self._mol_volume = None   # typed rows: the one molecule's, from the first batch
             self.flow_model = LearnableScalar(0.0)
             blocks = self.sampler.flow.blocks
             self.conditions_embedding_model = _Empty()
@@ -287,7 +291,8 @@ class NFPolicy(nn.Module):
         columns, standardised (temperature, space group, Z': the encoder reads the molecule, these pass through)."""
         if not self.conditional:
             if getattr(self.sampler, 'describer', None) is not None:
-                self.sampler.set_row_radius(self._unconditional_radius(mol_batch).expand(n))
+                r, v = self._unconditional_molecule(mol_batch)
+                self.sampler.set_row_radius(r.expand(n), None if v is None else v.expand(n))
             return None
         if not self.settings['atom_tokens']:
             return condition.to(self.device, torch.float32)
@@ -307,7 +312,15 @@ class NFPolicy(nn.Module):
             radius = getattr(mol_batch, 'radius', None)
             if radius is None:
                 raise ValueError("flow typed_rows needs each molecule's radius (MolData.radius) on mol_batch")
-            self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64))
+            volume = None
+            if self.sampler.flow.describer.prefix:
+                volume = getattr(mol_batch, 'mol_volume', None)
+                if volume is None:
+                    raise ValueError("flow prefix_features need each molecule's volume (MolData.mol_volume) on "
+                                     "mol_batch")
+                volume = torch.as_tensor(volume).reshape(-1).to(self.device, torch.float64)
+            self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64),
+                                             volume)
         ids = torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
         if self.conditions_dim == 0:
             return ids
@@ -318,22 +331,26 @@ class NFPolicy(nn.Module):
         rest = (condition.to(self.device, torch.float32) - f.c_mu[1:]) / f.c_sd[1:]
         return torch.cat([ids, rest], -1)
 
-    def _unconditional_radius(self, mol_batch):
-        """Typed rows on an unconditional policy: the one molecule's radius [] (Angstrom, float64), read from
-        mol_batch.radius when the call carries it (every row must agree with the radius first seen) and the cached
-        value otherwise."""
-        radius = getattr(mol_batch, 'radius', None) if mol_batch is not None else None
-        if radius is not None:
-            r = torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64)
-            if self._mol_radius is None:
-                self._mol_radius = r[0].clone()
-            if not bool(torch.allclose(r, self._mol_radius.expand_as(r), rtol=1e-6, atol=1e-6)):
-                raise ValueError("flow typed_rows on an unconditional policy: the batch's molecule radii differ from "
-                                 "the one molecule's (an unconditional run has one molecule)")
-        if self._mol_radius is None:
-            raise ValueError("flow typed_rows needs the molecule's radius (MolData.radius on mol_batch) on the first "
-                             "call")
-        return self._mol_radius
+    def _unconditional_molecule(self, mol_batch):
+        """Typed rows on an unconditional policy: the one molecule's radius [] (Angstrom) and, with prefix features,
+        volume [] (cubic Angstrom, else None), float64, read from mol_batch.radius / mol_volume when the call carries
+        them (every row must agree with the values first seen) and the held values otherwise."""
+        prefix = self.sampler.describer.prefix
+        for name, attr in (('radius', '_mol_radius'), ('mol_volume', '_mol_volume')):
+            if name == 'mol_volume' and not prefix:
+                continue
+            val = getattr(mol_batch, name, None) if mol_batch is not None else None
+            if val is not None:
+                v = torch.as_tensor(val).reshape(-1).to(self.device, torch.float64)
+                if getattr(self, attr) is None:
+                    setattr(self, attr, v[0].clone())
+                if not bool(torch.allclose(v, getattr(self, attr).expand_as(v), rtol=1e-6, atol=1e-6)):
+                    raise ValueError(f"flow typed_rows on an unconditional policy: the batch's molecule {name}s "
+                                     f"differ from the one molecule's (an unconditional run has one molecule)")
+            if getattr(self, attr) is None:
+                raise ValueError(f"flow typed_rows needs the molecule's {name} (MolData.{name} on mol_batch) on the "
+                                 f"first call")
+        return self._mol_radius, (self._mol_volume if prefix else None)
 
     def get_condition_embedding(self, condition, mol_batch):
         """The level head's input features for these conditions (what flow_model reads)."""
