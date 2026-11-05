@@ -740,9 +740,13 @@ class Checkpointer:
         # settings would silently train the checkpoint's (an SDE checkpoint carries no entry). Both sides are compared
         # resolved on the checkpoint's route and rows (a checkpoint written before gfn_config stored them resolved
         # loads when its resolution matches); the seed and PRECISION_ONLY_KEYS are not compared, and the precision
-        # keys follow this run's config
+        # keys follow this run's config. This run's side is the entry a fresh build would store
+        # (train.py::Modeller._build_gfn_config), so the FD chart's group fields (fd_space_group, fd_space_groups) it
+        # adds are compared like the rest; _policy_entry alone lacks them
+        build = getattr(self.modeller, '_build_gfn_config', None)
         entry = getattr(self.modeller, '_policy_entry', None)
-        asked = resolve_policy_entry((entry() if entry is not None else {}).get('policy'), config)
+        mine = build() if build is not None else (entry() if entry is not None else {})
+        asked = resolve_policy_entry(mine.get('policy'), config)
         held = resolve_policy_entry(config.get('policy'), config)
 
         def strip(e):

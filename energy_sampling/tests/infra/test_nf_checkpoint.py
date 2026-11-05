@@ -211,3 +211,25 @@ def test_save_creates_a_missing_checkpoints_dir(tmp_path):
     saved = _fresh_run(tmp_path / 'not' / 'yet', False)
     saved.checkpointer.save('running')
     assert (tmp_path / 'not' / 'yet' / 'nf_ck_probe-abc123_running.pt').is_file()
+
+
+@pytest.mark.parametrize('row_tokens', ['typed', 'prefix'])
+def test_an_fd_typed_row_checkpoint_matches_its_own_run(tmp_path, row_tokens):
+    """An FD run with typed or prefix rows stores its chart's group in the policy entry (_build_gfn_config adds
+    fd_space_group). The load's comparison must read this run's entry the same way, or every such checkpoint is
+    refused by its own run (2026-11-04: a weights-only warm start from an nf/fd/prefix MIPCAS MLE run raised
+    'policy in this run's config ... differs', fd_space_group None against 2)."""
+    from energies.fd_coordinates import FDSlotLayout
+    m = _modeller(tmp_path, False, nf={**SMALL, 'row_tokens': row_tokens})
+    m.energy_function = SimpleNamespace(fd_layout=FDSlotLayout([2]))
+    m._build_latent_gfn_config = lambda periodic_centroids=True, **kw: _base_config(False) | m._policy_entry()
+    stored = m._build_gfn_config()
+    assert stored['policy']['fd_space_group'] == 2
+    loaded = m.checkpointer._gfn_config_from({'gfn_config': stored})
+    assert loaded['policy']['fd_space_group'] == 2
+
+    other = _modeller(tmp_path, False, nf={**SMALL, 'row_tokens': row_tokens})
+    other.energy_function = SimpleNamespace(fd_layout=FDSlotLayout([14]))
+    other._build_latent_gfn_config = m._build_latent_gfn_config
+    with pytest.raises(ValueError, match="policy in this run's config"):
+        other.checkpointer._gfn_config_from({'gfn_config': stored})
