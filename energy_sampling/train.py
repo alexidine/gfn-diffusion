@@ -1002,11 +1002,39 @@ class Modeller:
         self._basin = dict(kind='metric', lo=float(m['log_lo']), hi=float(m['log_hi']),
                            s0=self._batch_latents(b).detach().cpu().float(), draws=0, misses=0)
         k = int(s['live_bank'])
+        source = ''
         if k > 0:
-            rows = torch.arange(n).repeat_interleave(k)
-            self._basin['bank'] = self._metric_fresh(rows).reshape(n, k, -1)
+            # the bank's sidecar cache (noised_prior.cache_path 'metricbank'): FD route only, keyed on the prior file,
+            # the MLE rows' own chart points (which rows, in which order), the kick, the bank size, the redraw count,
+            # the seed and the chart cache's check digest (so a chart-code change redraws the bank)
+            path = getattr(self.args, 'prior_path', None) if hasattr(self, 'args') else None
+            chart = getattr(self, '_fd_chart_digest', None)
+            key = side = hit = None
+            if path and chart and os.path.exists(path):
+                key = dict(file=noised_prior.file_identity(path), rows=noised_prior.digest(self._basin['s0']),
+                           k=k, lo=self._basin['lo'], hi=self._basin['hi'],
+                           redraws=int(s['live_redraws']), seed=int(self.args.seed), chart=chart)
+                side = noised_prior.cache_path(path, 'metricbank', key)
+                hit = noised_prior.load_cache(side, key)
+                if hit is not None and not (tuple(hit['bank'].shape) == (n, k, self._basin['s0'].shape[-1])
+                                            and bool(torch.isfinite(hit['bank']).all())):
+                    print(f"fd cache {side}: bank of the wrong shape or not finite; redrawing", flush=True)
+                    hit = None
+            if hit is not None:
+                self._basin['bank'] = hit['bank'].float()
+                self._basin['draws'], self._basin['misses'] = int(hit['draws']), int(hit['misses'])
+                source = f" (read from {side})"
+            else:
+                t0 = time()
+                rows = torch.arange(n).repeat_interleave(k)
+                self._basin['bank'] = self._metric_fresh(rows).reshape(n, k, -1)
+                source = f" (drawn in {time() - t0:.0f} s)"
+                if key is not None and noised_prior.save_cache(side, key, bank=self._basin['bank'],
+                                                               draws=self._basin['draws'],
+                                                               misses=self._basin['misses']):
+                    source = source[:-1] + f", written to {side})"
         print(f"live kernel 'metric' (kick 10^U({self._basin['lo']:g}, {self._basin['hi']:g}) Angstrom, the build's) "
-              f"over {n} prior rows; bank {k} per row, fresh share {float(s['live_fresh_frac']):g}; misses "
+              f"over {n} prior rows; bank {k} per row{source}, fresh share {float(s['live_fresh_frac']):g}; misses "
               f"{self._basin['misses']} of {self._basin['draws']} draws", flush=True)
         return True   # the draw reads self._basin; _live_L only marks the table built
 
@@ -4483,13 +4511,46 @@ class Modeller:
                     log_ref[good] = lr.float()
         return ok, state, log_ref
 
-    def _attach_fd_reference(self, batch):
+    def _fd_chart_points_cached(self, batch, prior_path):
+        """_fd_chart_points of a whole pre-noised prior file's batch, through the sidecar cache beside `prior_path`
+        (noised_prior.cache_path 'fdchart', keyed on the file's size and modification time, its row count and this
+        run's FD layout). A cached result is used only after a fresh conversion of noised_prior.FD_CACHE_CHECK_ROWS
+        rows agrees with it; a disagreement (the chart code changed) recomputes and rewrites. Sets
+        self._fd_chart_digest, the digest of those rows' chart points, which the metric bank's cache keys on."""
+        ef = self.energy_function
+        n = int(batch.num_graphs)
+        key = dict(file=noised_prior.file_identity(prior_path), rows=n, data_ndim=int(ef.data_ndim),
+                   space_groups=[int(g) for g in getattr(ef.fd_layout, 'groups', [])] or None)
+        side = noised_prior.cache_path(prior_path, 'fdchart', key)
+        idx = torch.randperm(n, generator=torch.Generator().manual_seed(0))[:min(n, noised_prior.FD_CACHE_CHECK_ROWS)]
+        hit = noised_prior.load_cache(side, key)
+        if hit is not None:
+            ok, state, log_ref = hit['ok'], hit['state'], hit['log_ref']
+            ok2, s2, lr2 = self._fd_chart_points(batch.subsample_new_batch(idx.to(batch.ptr.device)))
+            if not (torch.equal(ok2, ok[idx]) and torch.allclose(s2, state[idx], atol=1e-5)
+                    and torch.allclose(lr2, log_ref[idx], atol=1e-4, rtol=1e-5)):
+                print(f"fd cache {side}: {len(idx)} re-converted rows disagree with the cache (the chart code "
+                      f"changed?); recomputing every row", flush=True)
+                hit = None
+            else:
+                print(f"fd cache: chart points of {n} rows read from {side} ({len(idx)} rows re-converted and "
+                      f"agree)", flush=True)
+        if hit is None:
+            t0 = time()
+            ok, state, log_ref = self._fd_chart_points(batch)
+            wrote = noised_prior.save_cache(side, key, ok=ok, state=state, log_ref=log_ref)
+            print(f"fd cache: chart points of {n} rows converted in {time() - t0:.0f} s"
+                  + (f", written to {side}" if wrote else ''), flush=True)
+        self._fd_chart_digest = noised_prior.digest(ok[idx], state[idx])
+        return ok, state, log_ref
+
+    def _attach_fd_reference(self, batch, points=None):
         """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
         Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
         row (`fd_state`, read by _batch_latents), attached as row attributes so they ride with every draw. Returns [n] bool: the rows that have an FD chart point (a row
         that does not canonicalise, or whose canonical cell is outside the length box, has none and must be
-        dropped; its reference is set to 0)."""
-        ok, state, log_ref = self._fd_chart_points(batch)
+        dropped; its reference is set to 0). `points`: _fd_chart_points' result when the caller already has it."""
+        ok, state, log_ref = self._fd_chart_points(batch) if points is None else points
         batch.add_graph_attr(log_ref.to(batch.ptr.device), 'fd_log_reference')
         # the chart rows themselves, which _batch_latents reads instead of canonicalising every draw again
         batch.add_graph_attr(state.to(batch.ptr.device), 'fd_state')
@@ -4519,7 +4580,7 @@ class Modeller:
 
         fd_ok = None
         if getattr(ef, 'crystal_coordinates', 'latent') == 'fd':
-            fd_ok = self._attach_fd_reference(prior)
+            fd_ok = self._attach_fd_reference(prior, self._fd_chart_points_cached(prior, self.args.prior_path))
             print(f"pre-noised prior: FD chart points for {int(fd_ok.sum())} of {fd_ok.numel()} rows "
                   f"(rows without one are dropped)", flush=True)
         idx = noised_prior.check_rows(prior, s['check_rows'], seed=int(self.args.seed))

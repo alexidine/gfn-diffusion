@@ -59,3 +59,76 @@ def test_metric_live_kernel_needs_a_metric_build(capsys):
     m._noised_prior_manifest = {'child_kernel': 'iso', 'log_lo': -2.0, 'log_hi': -0.5}
     with pytest.raises(ValueError, match="child_kernel 'iso'"):
         train.Modeller._metric_kernel_table(m)
+
+
+# -- the sidecar caches (noised_prior.cache_path) ------------------------------------------------------------------
+
+def _cached_stub(capsys, tmp_path, seed=0):
+    train, m, s0 = _stub(capsys)
+    prior_file = tmp_path / 'prior.pt'
+    prior_file.write_bytes(b'stand-in for a pre-noised prior file: the caches key on its size and mtime')
+    m.args = SimpleNamespace(prior_path=str(prior_file), seed=seed)
+    m._fd_chart_points = lambda b: train.Modeller._fd_chart_points(m, b)
+    return train, m, prior_file
+
+
+def test_chart_points_are_cached_beside_the_prior_and_read_back(capsys, tmp_path):
+    train, m, prior_file = _cached_stub(capsys, tmp_path)
+    batch = m.prior_dataset.batch
+    first = train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    side = list(tmp_path.glob('prior.pt.fdchart-*.pt'))
+    assert len(side) == 1, side
+    assert 'converted in' in capsys.readouterr().out
+    calls = []
+    m._fd_chart_points = lambda b: calls.append(int(b.num_graphs)) or train.Modeller._fd_chart_points(m, b)
+    second = train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    assert 'read from' in capsys.readouterr().out
+    assert calls == [int(batch.num_graphs)]   # only the check sample was converted (here every row: 6 < 256)
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+
+
+def test_a_cache_that_disagrees_with_a_fresh_conversion_is_recomputed(capsys, tmp_path):
+    train, m, prior_file = _cached_stub(capsys, tmp_path)
+    batch = m.prior_dataset.batch
+    good = train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    side = next(tmp_path.glob('prior.pt.fdchart-*.pt'))
+    d = torch.load(side, weights_only=False)
+    d['state'] = d['state'] + 0.1   # as if written by other chart code
+    torch.save(d, side)
+    capsys.readouterr()
+    again = train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    assert 'disagree with the cache' in capsys.readouterr().out
+    assert torch.equal(again[1], good[1])
+    assert torch.equal(torch.load(side, weights_only=False)['state'], good[1])   # rewritten
+
+
+def test_a_changed_prior_file_misses_the_cache(capsys, tmp_path):
+    train, m, prior_file = _cached_stub(capsys, tmp_path)
+    batch = m.prior_dataset.batch
+    train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    prior_file.write_bytes(b'a rebuilt prior file of another size')
+    capsys.readouterr()
+    train.Modeller._fd_chart_points_cached(m, batch, str(prior_file))
+    assert 'converted in' in capsys.readouterr().out
+    assert len(list(tmp_path.glob('prior.pt.fdchart-*.pt'))) == 2
+
+
+def test_the_metric_bank_is_cached_per_seed(capsys, tmp_path):
+    train, m, prior_file = _cached_stub(capsys, tmp_path)
+    train.Modeller._fd_chart_points_cached(m, m.prior_dataset.batch, str(prior_file))   # sets the chart digest
+    train.Modeller._metric_kernel_table(m)
+    bank = m._basin['bank'].clone()
+    assert 'written to' in capsys.readouterr().out
+    train.Modeller._metric_kernel_table(m)
+    assert 'read from' in capsys.readouterr().out
+    assert torch.equal(m._basin['bank'], bank) and m._basin['draws'] == 18
+    m.args.seed = 1
+    train.Modeller._metric_kernel_table(m)
+    assert 'drawn in' in capsys.readouterr().out and not torch.equal(m._basin['bank'], bank)
+
+
+def test_no_bank_cache_without_a_checked_chart(capsys, tmp_path):
+    train, m, prior_file = _cached_stub(capsys, tmp_path)   # no _fd_chart_points_cached call: no chart digest
+    train.Modeller._metric_kernel_table(m)
+    assert not list(tmp_path.glob('prior.pt.metricbank-*.pt'))

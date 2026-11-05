@@ -12,7 +12,9 @@ graph attributes and a manifest under MANIFEST_KEY:
   noised_parent  the anchor row a child was kicked from (an anchor: itself)
 
 The loader keeps rows by kind and split, inside the packing window and within window_kT x T of their condition's
-floor, and checks a stratified sample of rows against a fresh scoring instead of re-scoring the file.
+floor, and checks a stratified sample of rows against a fresh scoring instead of re-scoring the file. On the FD
+route it also reads the rows' chart points and the metric kernel's bank from sidecar caches beside the file when
+their keys match (FD_CACHE_VERSION, cache_path), and writes them when they do not.
 """
 import math
 import os
@@ -41,6 +43,67 @@ DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), chec
 LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
+
+# SIDECAR CACHES beside the prior file, for the two CPU conversions an FD run otherwise repeats at every launch: the
+# chart point of every stored row (train.py::Modeller._fd_chart_points) and the metric kernel's bank
+# (train.py::Modeller._metric_kernel_table). A cache is used only when its key equals this launch's; the chart cache
+# is also re-checked against a fresh conversion of FD_CACHE_CHECK_ROWS rows, and the bank cache keys on that sample's
+# digest, so a change to the chart code invalidates both. A write that fails (read-only folder) is reported, not raised.
+FD_CACHE_VERSION = 1
+FD_CACHE_CHECK_ROWS = 256
+
+
+def file_identity(path) -> dict:
+    """The size and modification time of the file at `path`: what a sidecar cache keys the file on."""
+    st = os.stat(path)
+    return dict(size=int(st.st_size), mtime_ns=int(st.st_mtime_ns))
+
+
+def digest(*tensors) -> str:
+    """A short sha1 of the tensors' bytes (CPU, contiguous)."""
+    import hashlib
+    h = hashlib.sha1()
+    for t in tensors:
+        h.update(torch.as_tensor(t).detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def cache_path(prior_path, kind: str, key: dict) -> str:
+    """`<prior_path>.<kind>-<hash of key>.pt`: the sidecar a cache of `kind` with this key lives in."""
+    import hashlib
+    import json
+    h = hashlib.sha1(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return f"{prior_path}.{kind}-{h}.pt"
+
+
+def load_cache(path, key: dict):
+    """The cache dict at `path` when it exists, loads and carries exactly `key` at FD_CACHE_VERSION; else None."""
+    if not os.path.exists(path):
+        return None
+    try:
+        d = torch.load(path, weights_only=False, map_location='cpu')
+    except Exception as e:   # a truncated or foreign file is a miss, never a crash
+        print(f"fd cache {path}: unreadable ({type(e).__name__}: {e}); recomputing", flush=True)
+        return None
+    if not isinstance(d, dict) or d.get('version') != FD_CACHE_VERSION or d.get('key') != key:
+        return None
+    return d
+
+
+def save_cache(path, key: dict, **payload) -> bool:
+    """Write the cache atomically (a temporary file, then a rename); False, with a printed reason, when it cannot."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        torch.save(dict(version=FD_CACHE_VERSION, key=key, **payload), tmp)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        print(f"fd cache {path}: not written ({e})", flush=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def settings(args):
