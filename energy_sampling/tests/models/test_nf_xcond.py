@@ -109,3 +109,27 @@ def test_k_null_is_refused_under_the_sde_policy():
     assert not hasattr(sde, 'log_density')
     with pytest.raises(ValueError, match='xcond_eval.k is null'):
         Modeller.log_xcond_metrics(_modeller(sde, None), lambda b: None, _cols())
+
+
+def test_a_batch_that_repeats_conditions_takes_its_first_distinct_ones():
+    """An eval drawn with replacement from a small condition set (one row per molecule) repeats conditions within its
+    first C rows; the matrix takes the first row of each of the first C distinct conditions instead of skipping."""
+    torch.manual_seed(1)
+    conds = torch.randn(C, COND_DIM)
+    order = torch.tensor([0, 0, 1, 0, 2, 1])            # C distinct conditions, repeats among the first C rows
+    batch = _Batch(conds[order], order)
+    picked = []
+    real = batch.subsample_new_batch
+    batch.subsample_new_batch = lambda idx: picked.append(idx.cpu().tolist()) or real(idx)
+    torch.manual_seed(2)
+    out = Modeller.log_xcond_metrics(_modeller(flow_policy(True), None), lambda b: None, batch)
+    assert out['xcond/skipped'] == 0.0 and out['xcond/n_conditions'] == C
+    assert picked[0] == [0, 2, 4]                         # the first row of conditions 0, 1, 2
+
+
+def test_fewer_distinct_conditions_than_columns_still_skips():
+    torch.manual_seed(1)
+    order = torch.tensor([0, 1, 0, 1, 1, 0])
+    batch = _Batch(torch.randn(C, COND_DIM)[order], order)
+    assert Modeller.log_xcond_metrics(_modeller(flow_policy(True), None), lambda b: None, batch) == {
+        'xcond/skipped': 1.0}

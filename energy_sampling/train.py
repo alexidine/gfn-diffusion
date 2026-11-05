@@ -168,6 +168,26 @@ def _runs_grouped_vargrad(args, branch_coeffs) -> bool:
         lambda k: float(getattr(fwd, k, 0) or 0))
 
 
+def generalisation_gaps(out, trained=None) -> dict:
+    """The generalisation gaps of Modeller.density_readouts' readouts `out` (nats; one chart, so no reference term),
+    each readout minus its reference, where both are present:
+      eval_test/mle_gap               held-out molecules against the training molecules' crystals: a pre-noised
+                                      prior's clean training anchors (eval_bwd/mle_anchors) where it has them -- the
+                                      like-for-like set to a held-out file of anchors, since molecules_path may hold
+                                      one crystal per molecule -- else the molecules_path crystals
+      eval_bwd/mle_heldout_gap        held-out anchor groups against the training rows
+      eval_bwd/mle_kernel_heldout_gap held-out basins' kernel draws against the training basins'
+      eval_bwd/mle_fresh_gap          fresh kernel draws against the points trained on (`trained`, only where those
+                                      are draws of the readout kernel itself: Modeller._fresh_gap_source)"""
+    test_ref = 'eval_bwd/mle_anchors' if 'eval_bwd/mle_anchors' in out else 'eval_bwd/mle_mol_crystals'
+    gaps = {'eval_test/mle_gap': ('eval_test/mle', test_ref),
+            'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle'),
+            'eval_bwd/mle_kernel_heldout_gap': ('eval_bwd/mle_kernel_heldout', 'eval_bwd/mle_kernel')}
+    if trained is not None:
+        gaps['eval_bwd/mle_fresh_gap'] = ('eval_bwd/mle_kernel', trained)
+    return {gap: out[a] - out[b] for gap, (a, b) in gaps.items() if a in out and b in out}
+
+
 def eval_cadence_fires(step_ind, every_n_evals, eval_period) -> bool:
     """An eval-relative cadence: True when `step_ind` is a multiple of
     `every_n_evals * eval_period`. Read on the step grid rather than by counting
@@ -9199,13 +9219,21 @@ class Modeller:
         n = int(getattr(cfg, 'per_condition', 4))
         batch = sample_batch.to(self.device)
         cid = getattr(batch, 'condition_id', None)
-        if cid is None or batch.num_graphs < C or torch.unique(cid[:C]).numel() < C:
-            # a square matrix needs C DISTINCT conditions; scoring a repeated condition as
-            # two columns would put duplicate columns into the decomposition.
+        # a square matrix needs C DISTINCT conditions; scoring a repeated condition as two
+        # columns would put duplicate columns into the decomposition. The columns are the
+        # first row of each of the batch's first C distinct conditions: an eval drawn with
+        # replacement from a small condition set (one row per molecule) repeats conditions
+        # within its first C rows, which used to skip the pass.
+        first = {}
+        if cid is not None:
+            for i, v in enumerate(cid.reshape(-1).tolist()):
+                first.setdefault(v, i)
+        if len(first) < C:
             return {'xcond/skipped': 1.0}
+        pick = torch.tensor(sorted(first.values())[:C], device=self.device)
 
         with torch.no_grad():
-            cols = batch.subsample_new_batch(torch.arange(C, device=self.device))
+            cols = batch.subsample_new_batch(pick)
             cond_vec = cols.conditions
             dim = self._batch_latents(cols).shape[1]
             tile = torch.arange(C, device=self.device).repeat_interleave(n)
@@ -10215,19 +10243,7 @@ class Modeller:
             out.update(self._kernel_readouts(n_rows, chunk))
         finally:
             policy.train(was_training)
-        # the generalisation gaps (nats; one chart, so no reference term): held-out molecules against the training
-        # molecules' crystals (inn_modeller.py's eval_test/mle_gap), held-out anchor groups against training rows,
-        # held-out basins' kernel draws against the training basins', and fresh kernel draws against the points
-        # trained on (only where those are draws of the readout kernel itself: _fresh_gap_source)
-        gaps = {'eval_test/mle_gap': ('eval_test/mle', 'eval_bwd/mle_mol_crystals'),
-                'eval_bwd/mle_heldout_gap': ('eval_bwd/mle_heldout_rows', 'eval_bwd/mle'),
-                'eval_bwd/mle_kernel_heldout_gap': ('eval_bwd/mle_kernel_heldout', 'eval_bwd/mle_kernel')}
-        trained = self._fresh_gap_source()
-        if trained is not None:
-            gaps['eval_bwd/mle_fresh_gap'] = ('eval_bwd/mle_kernel', trained)
-        for gap, (a, b) in gaps.items():
-            if a in out and b in out:
-                out[gap] = out[a] - out[b]
+        out.update(generalisation_gaps(out, self._fresh_gap_source()))
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',

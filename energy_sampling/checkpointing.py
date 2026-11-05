@@ -444,13 +444,50 @@ class Checkpointer:
                           if getattr(m, 'row_store', None) is not None else None),
         }
 
+    #: the per-row columns a buffer's fingerprint sums (_buffer_fingerprint)
+    FINGERPRINT_COLUMNS = ('x', 'y', 'ema_loss', 'select_counts', 'birth_step', 'birth_loss', 'ema_logw', 'traj')
+
+    def _buffer_fingerprint(self):
+        """A cheap identity of the resident stores: per store its row count and the sum of each per-row column
+        (FINGERPRINT_COLUMNS); None (always write) while a row store is live, whose state this does not cover. Any
+        admission, eviction, draw count or loss update moves it."""
+        m = self.modeller
+        if getattr(m, 'row_store', None) is not None:
+            return None
+        out = []
+        for name in self.CURRENCY_CHECKED_BUFFERS:
+            b = getattr(m, name, None)
+            if b is None:
+                out.append(None)
+                continue
+            x = getattr(b, 'x', None)
+            if not torch.is_tensor(x):
+                return None   # a store this cannot read: always write
+            sums = []
+            for col in self.FINGERPRINT_COLUMNS:
+                t = getattr(b, col, None)
+                sums.append(float(t.double().sum()) if torch.is_tensor(t) else None)
+            out.append((name, int(x.shape[0]), tuple(sums)))
+        return tuple(out)
+
     def save_buffers(self, tag: Optional[str] = None):
-        """Write the buffer sidecar. Called only at eval cadence -- see BUFFER_SUFFIX."""
+        """Write the buffer sidecar. Called only at eval cadence -- see BUFFER_SUFFIX. The untagged eval-cadence
+        write is skipped when no store changed since the last one (_buffer_fingerprint) and its file is on disk: an
+        MLE stage never touches the static buffer it seeded, which is GBs per write. Tagged writes always happen."""
         if self.read_only:
             return
         path = self.buffers_path(tag)
+        fp = self._buffer_fingerprint() if tag is None else None
+        if fp is not None and fp == getattr(self, '_last_buffer_fp', None) and os.path.exists(path):
+            if not getattr(self, '_announced_buffer_skip', False):
+                self._announced_buffer_skip = True
+                print(f"buffers unchanged since the last write: {path} kept (skipped until a store changes)",
+                      flush=True)
+            return
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         atomic_save(self.buffer_state(), path)
+        if tag is None:
+            self._last_buffer_fp = fp
 
     def restore_buffers(self, state: dict, source: str):
         m = self.modeller

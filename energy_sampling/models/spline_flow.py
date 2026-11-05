@@ -421,6 +421,40 @@ class _ContextBlock(_Block):
         return x
 
 
+#: atom graphs an encoder keeps per atom-table key (nf_policy's per-molecule table: one key per molecule set)
+ATOM_GRAPH_CACHE = 8
+
+
+def _atom_graph(enc, z, pos, n, key=None):
+    """(mask [u, a], batch [nodes], z [nodes], pos [nodes, 3], ptr [u + 1], edges, flat [nodes]) of an atom table:
+    the radius graph within each molecule and the flat indices of its atom slots. With `key` (an atom table that names
+    its molecule set, ConditionalLatentFlow.set_atom_table) the graph is kept on the encoder and reused, so a step on a
+    known molecule set builds no graph and reads no count back from the device."""
+    from mxtaltools.models.functions.radial_graph import build_radial_graph
+    cache = enc.__dict__.setdefault('_graphs', {})
+    ck = None if key is None else (key, str(z.device), pos.dtype, tuple(z.shape))
+    if ck is not None and ck in cache:
+        return cache[ck]
+    u, a = z.shape
+    mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
+    batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
+    zf, pf = z[mask], pos[mask]
+    ptr = F.pad(torch.cumsum(n, 0), (1, 0))
+    edges = build_radial_graph(pf, batch, ptr, enc.cutoff, enc.max_neighbors)['edge_index']
+    out = (mask, batch, zf, pf, ptr, edges, torch.nonzero(mask.reshape(-1)).reshape(-1))
+    if ck is not None:
+        if len(cache) >= ATOM_GRAPH_CACHE:
+            cache.pop(next(iter(cache)))
+        cache[ck] = out
+    return out
+
+
+def _scatter_nodes(h, flat, u, a):
+    """[u, a, dim] with each node's row h at its atom slot (flat, _atom_graph) and zeros on padding; out of place, so
+    it carries the gradient, and it reads nothing back from the device."""
+    return h.new_zeros(u * a, h.shape[-1]).index_copy(0, flat, h).reshape(u, a, h.shape[-1])
+
+
 class AtomEncoder(nn.Module):
     """A molecule as tokens, one per atom, for the conditional flow to cross-attend to.
 
@@ -443,19 +477,13 @@ class AtomEncoder(nn.Module):
         self.pool_q = nn.Parameter(torch.zeros(node_dim))
         self.pool_out = nn.Linear(node_dim, pooled_dim)
 
-    def forward(self, z, pos, n):
+    def forward(self, z, pos, n, key=None):
         """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> tokens [u, a, width],
-        mask [u, a] (True on atoms), pooled [u, pooled_dim]."""
-        from mxtaltools.models.functions.radial_graph import build_radial_graph
+        mask [u, a] (True on atoms), pooled [u, pooled_dim]. key: the atom table's molecule-set key (_atom_graph)."""
         u, a = z.shape
-        mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
-        batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
-        zf, pf = z[mask], pos[mask]
-        ptr = F.pad(torch.cumsum(n, 0), (1, 0))
-        edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
+        mask, batch, zf, pf, ptr, edges, flat = _atom_graph(self, z, pos, n, key)
         h = self.gnn(torch.cat([zf.to(pf.dtype)[:, None], pf], -1), pf, batch, edges)       # [nodes, node_dim]
-        node = h.new_zeros(u, a, h.shape[-1])
-        node[mask] = h
+        node = _scatter_nodes(h, flat, u, a)
         tokens = self.tok(torch.cat([node, self.pos_emb(pos)], -1))
         score = (node * self.pool_q).sum(-1).masked_fill(~mask, float('-inf'))
         pooled = self.pool_out((torch.softmax(score, -1)[..., None] * node).sum(1))
@@ -528,24 +556,19 @@ class SplitAtomEncoder(nn.Module):
         self.p_out = nn.Linear(node_dim, pooled_dim)
         self.tok = nn.Linear(node_dim, width)
 
-    def forward(self, z, pos, n):
+    def forward(self, z, pos, n, key=None):
         """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> point tokens
-        [u, a, width], mask [u, a], s [u, pooled_dim] (invariant), p [u, pooled_dim] (frame-dependent)."""
-        from mxtaltools.models.functions.radial_graph import build_radial_graph
+        [u, a, width], mask [u, a], s [u, pooled_dim] (invariant), p [u, pooled_dim] (frame-dependent). key: the atom
+        table's molecule-set key (_atom_graph)."""
         u, a = z.shape
-        mask = torch.arange(a, device=z.device)[None, :] < n[:, None]
-        batch = torch.arange(u, device=z.device)[:, None].expand(u, a)[mask]
-        zf, pf = z[mask].to(pos.dtype)[:, None], pos[mask]
-        ptr = F.pad(torch.cumsum(n, 0), (1, 0))
-        edges = build_radial_graph(pf, batch, ptr, self.cutoff, self.max_neighbors)['edge_index']
+        mask, batch, zf, pf, ptr, edges, flat = _atom_graph(self, z, pos, n, key)
+        zf = zf.to(pos.dtype)[:, None]
         x0 = zf if self.chiral is None else torch.cat([zf, self.chiral(pf, edges)], -1)
         h = self.gnn(x0, pf, batch, edges)                       # [nodes, node_dim], rotation invariant
         s = self.s_out(self.s_pool(h, batch, dim_size=u))
         pt = self.point(torch.cat([zf, h, self.pos_emb(pf)], -1), pf, batch, edges)  # [nodes, node_dim]
         p = self.p_out(self.p_pool(pt, batch, dim_size=u))
-        node = pt.new_zeros(u, a, pt.shape[-1])
-        node[mask] = pt
-        return self.tok(node), mask, s, p
+        return self.tok(_scatter_nodes(pt, flat, u, a)), mask, s, p
 
 
 class _ResMLP(nn.Module):
@@ -671,10 +694,14 @@ class _ContextFlow(nn.Module):
         nn.init.zeros_(self.level.out[-1].bias)
         self._shared = None   # context_input's results by condition tensor while ConditionalLatentFlow.shared_context is open
 
-    def set_atom_table(self, z, pos, n):
+    def set_atom_table(self, z, pos, n, key=None):
         """Per condition id: atomic numbers [n_cond, a] (0 = padding), standard-frame coordinates [n_cond, a, 3] and
-        atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start)."""
+        atom counts [n_cond]; data, not weights (rebuilt from the conditions files on every start). key: a hashable
+        name of the table's molecule set, given when each table row is a distinct molecule that the next calls use
+        (nf_policy's per-molecule table); the whole table is then encoded with no unique() over the condition ids and
+        its atom graph is reused (_atom_graph). None: the ids index rows, and only the ids present are encoded."""
         self.atom_z, self.atom_pos, self.atom_n = z, pos, n
+        self.atom_key = key
 
     def set_row_live(self, live):
         """Per row of the next calls, in the rows' order (not by condition id: a scrambled condition does not move a
@@ -745,10 +772,20 @@ class _ContextFlow(nn.Module):
             s = self.standardise(c)
             return self.context(s), s
         cid = c[:, 0].round().long()
-        if self.atom_z is None or bool((self.atom_n[cid] == 0).any()):
+        key = getattr(self, 'atom_key', None)
+        if self.atom_z is None:
+            raise RuntimeError("a condition id with no atoms in the atom table")
+        # a keyed table (set_atom_table) was checked for empty rows where it was built; reading the ids' counts back
+        # would stall every step on the device
+        if key is None and bool((self.atom_n[cid] == 0).any()):
             raise RuntimeError("a condition id with no atoms in the atom table")
         dtype = self.c_mu.dtype   # the flow's own precision (a double copy for the round-trip check), as standardise
-        if self.frames:
+        if key is not None and not self.frames:
+            # one table row per distinct molecule, every one used: encode the table as it stands
+            mol, inv = torch.arange(self.atom_z.shape[0], device=cid.device), cid
+            pos = self.atom_pos.to(dtype)
+            first = 1
+        elif self.frames:
             # one encoding per (molecule, frame), the atoms rotated into the row's frame
             uniq, inv = torch.unique(c[:, :5], dim=0, return_inverse=True)
             mol = uniq[:, 0].round().long()
@@ -768,12 +805,13 @@ class _ContextFlow(nn.Module):
                 raise RuntimeError("the flow reads e_g and no space groups are set (set_row_groups)")
             groups, ginv = torch.unique(self.row_groups.to(cid.device)[cid], return_inverse=True)
             rest = torch.cat([self.sym_encoder.embed(groups.tolist()).to(dtype)[ginv], rest], -1)
+        gkey = key if (key is not None and not self.frames) else None   # the graph is the table's only when unrotated
         if self.encoder == 'split':
-            tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
+            tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
             s = torch.cat([s_inv[inv], rest], -1)
             vec = self.context(torch.cat([s_inv[inv], p[inv], rest], -1))
         else:
-            tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol])
+            tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
             s = torch.cat([pooled[inv], rest], -1)
             vec = self.context(s)
         if self.cross and self.sym_tokens:   # the row's group's operations beside its molecule's atoms

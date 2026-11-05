@@ -53,9 +53,14 @@ class _Tracker:
         return torch.zeros(len(cid)), torch.zeros(len(cid), dtype=torch.bool)
 
 
-def _call(coeffs, log_r=None, tracker=None, **kw):
+def _samples(seed=0):
+    return torch.randn(B, D, generator=torch.Generator().manual_seed(seed))
+
+
+def _call(coeffs, log_r=None, tracker=None, samples=None, **kw):
     gfn = _Gfn()
-    loss, d = get_gfn_backward_loss(coeffs, torch.randn(B, D), gfn, log_r, None, None, repeats=1,
+    samples = _samples() if samples is None else samples
+    loss, d = get_gfn_backward_loss(coeffs, samples, gfn, log_r, None, None, repeats=1,
                                     report_losses=True, condition_log_z=tracker, condition_id=torch.arange(B),
                                     update_log_z=True, mode_level_stream='bwd', **kw)
     return gfn, loss, d
@@ -76,10 +81,9 @@ def test_a_reward_free_mle_call_trains_and_omits_the_reward_keys():
 
 
 def test_the_same_mle_loss_with_or_without_the_reward():
-    torch.manual_seed(0)
-    _, with_r, _ = _call(_coeffs(), log_r=torch.randn(B))
-    torch.manual_seed(0)
-    _, without, _ = _call(_coeffs())
+    log_r = torch.randn(B, generator=torch.Generator().manual_seed(1))
+    _, with_r, _ = _call(_coeffs(), log_r=log_r, samples=_samples(3))
+    _, without, _ = _call(_coeffs(), samples=_samples(3))
     assert torch.equal(with_r, without)
 
 

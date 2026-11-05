@@ -409,16 +409,14 @@ class NFPolicy(nn.Module):
             return condition.to(self.device, torch.float32)
         if int(mol_batch.num_graphs) != n:
             raise ValueError(f"molecule mode needs one graph per row: {int(mol_batch.num_graphs)} graphs, {n} rows")
-        ptr = mol_batch.ptr.to(self.device)
-        nodes = mol_batch.batch.to(self.device)
-        counts = torch.diff(ptr)
-        a = int(counts.max())
-        idx = torch.arange(nodes.numel(), device=self.device) - ptr[nodes]
-        z = torch.zeros(n, a, dtype=torch.long, device=self.device)
-        pos = torch.zeros(n, a, 3, device=self.device)
-        z[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
-        pos[nodes, idx] = mol_batch.pos.float().to(self.device)
-        self.sampler.flow.set_atom_table(z, pos, counts)
+        table = self._molecule_table(mol_batch, n)
+        if table is not None:   # one atom-table row per distinct molecule, the condition id each row's molecule
+            key, row_mol, table_first, z, pos, counts, mol_in = table
+            self.sampler.flow.set_atom_table(z, pos, counts, key=key)
+        else:
+            z, pos, counts = self._row_atom_table(mol_batch, n)
+            row_mol = mol_in = table_first = None
+            self.sampler.flow.set_atom_table(z, pos, counts)
         if self.settings['mol_scalars']:
             self.sampler.flow.set_mol_scalars(_mol_scalars(mol_batch, z, pos, counts).to(self.device))
         if self.settings['sym_ops'] in ('pooled', 'tokens'):
@@ -446,10 +444,14 @@ class NFPolicy(nn.Module):
                     raise ValueError("flow row_tokens prefix needs each molecule's volume (MolData.mol_volume) on "
                                      "mol_batch")
                 from models.fd_row_describer import mol_inputs
-                mol = mol_inputs(volume, z, pos, counts).to(self.device)
-            self.sampler.flow.set_row_radius(torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64),
-                                             mol)
-        ids = torch.arange(n, device=self.device, dtype=torch.float32)[:, None]
+                mol = mol_inputs(volume, z, pos, counts).to(self.device) if mol_in is None else mol_in
+            # by condition id (ConditionalLatentFlow.row_extra reads row_radius[cid]): per graph, or per molecule
+            radius = torch.as_tensor(radius).reshape(-1).to(self.device, torch.float64)
+            if table is not None:
+                radius = radius[table_first]
+            self.sampler.flow.set_row_radius(radius, mol)
+        ids = (torch.arange(n, device=self.device, dtype=torch.float32) if row_mol is None
+               else row_mol.to(torch.float32))[:, None]
         if self.conditions_dim == 0:
             return ids
         if condition is None or condition.shape[-1] != self.conditions_dim:
@@ -458,6 +460,83 @@ class NFPolicy(nn.Module):
         f = self.sampler.flow   # standardised here, not in the flow, which inn_modeller also drives raw
         rest = (condition.to(self.device, torch.float32) - f.c_mu[1:]) / f.c_sd[1:]
         return torch.cat([ids, rest], -1)
+
+    def _row_atom_table(self, mol_batch, n):
+        """(z [n, a] long, pos [n, a, 3], counts [n]) of mol_batch's n graphs, one atom-table row per graph."""
+        ptr = mol_batch.ptr.to(self.device)
+        nodes = mol_batch.batch.to(self.device)
+        counts = torch.diff(ptr)
+        a = int(counts.max())
+        idx = torch.arange(nodes.numel(), device=self.device) - ptr[nodes]
+        z = torch.zeros(n, a, dtype=torch.long, device=self.device)
+        pos = torch.zeros(n, a, 3, device=self.device)
+        z[nodes, idx] = mol_batch.z.long().to(self.device).flatten()
+        pos[nodes, idx] = mol_batch.pos.float().to(self.device)
+        return z, pos, counts
+
+    #: per-molecule atom tables kept by molecule set (_molecule_table)
+    MOLECULE_TABLE_CACHE = 8
+    #: Angstrom: rows of one identifier agree this closely or keep their own atom-table rows (the norbornane P-1
+    #: prior's rows of one molecule differ by up to 5e-5 A, float noise from the crystal builds)
+    MOLECULE_TABLE_POS_TOL = 1e-3
+
+    def _molecule_table(self, mol_batch, n):
+        """One atom-table row per DISTINCT molecule of the n rows, keyed by the rows' identifiers (host strings):
+        (key, row_mol [n] long, first row of each molecule [u], z [u, a], pos [u, a, 3], counts [u], prefix molecule
+        inputs [u, 3] or None), each
+        molecule's atoms from its first row, kept per molecule set so a known set costs no device work. None, and the
+        caller keeps one table row per graph, where rows are not interchangeable by molecule: no identifiers, flow
+        frames (each row's atoms rotate into its own frame), molecule scalars, or a space-group embedding (the flow
+        reads it by condition id)."""
+        ids = getattr(mol_batch, 'identifier', None)
+        f = self.sampler.flow
+        if (ids is None or isinstance(ids, (str, bytes)) or len(ids) != n or getattr(f, 'frames', False)
+                or self.settings['mol_scalars'] or self.settings['sym_ops'] != 'none'
+                or getattr(self, '_molecule_table_off', False)):
+            return None
+        ids = [str(k) for k in ids]
+        first = {}
+        for i, k in enumerate(ids):
+            first.setdefault(k, i)
+        keys = tuple(sorted(first))
+        slot = {k: j for j, k in enumerate(keys)}
+        row_mol = torch.tensor([slot[k] for k in ids], dtype=torch.long, device=self.device)
+        cache = self.__dict__.setdefault('_molecule_tables', {})
+        ck = (keys, str(self.device))
+        hit = cache.get(ck)
+        if hit is None:
+            rows = torch.tensor([first[k] for k in keys], dtype=torch.long)
+            z_all, pos_all, counts_all = self._row_atom_table(mol_batch, n)
+            r = rows.to(self.device)
+            z, pos, counts = z_all[r], pos_all[r], counts_all[r]
+            if bool((counts == 0).any()):
+                raise ValueError("molecule mode: a molecule with no atoms in mol_batch")
+            # rows of one identifier must carry one molecule (rigid conformer); a prior whose crystals each carry
+            # their own conformer keeps one table row per graph for the rest of the run
+            same = (torch.equal(z_all, z[row_mol]) and torch.equal(counts_all, counts[row_mol])
+                    and float((pos_all - pos[row_mol]).abs().max()) <= self.MOLECULE_TABLE_POS_TOL)
+            if not same:
+                self._molecule_table_off = True
+                print("nf policy: rows sharing an identifier carry different atoms (beyond "
+                      f"{self.MOLECULE_TABLE_POS_TOL} A); one atom-table row per graph from here on", flush=True)
+                return None
+            mol_in = None
+            describer = getattr(f, 'describer', None)
+            if describer is not None and describer.prefix:
+                volume = getattr(mol_batch, 'mol_volume', None)
+                if volume is None:
+                    raise ValueError("flow row_tokens prefix needs each molecule's volume (MolData.mol_volume) on "
+                                     "mol_batch")
+                from models.fd_row_describer import mol_inputs
+                vol = torch.as_tensor(volume).reshape(-1)[rows.to(torch.as_tensor(volume).device)]
+                mol_in = mol_inputs(vol, z, pos, counts).to(self.device)
+            if len(cache) >= self.MOLECULE_TABLE_CACHE:
+                cache.pop(next(iter(cache)))
+            hit = cache[ck] = (z, pos, counts, mol_in)
+        z, pos, counts, mol_in = hit
+        # each molecule's first row in THIS batch (its radius is read per molecule, by condition id)
+        table_first = torch.tensor([first[k] for k in keys], dtype=torch.long, device=self.device)
+        return keys, row_mol, table_first, z, pos, counts, mol_in
 
     def _unconditional_molecule(self, mol_batch):
         """Typed rows on an unconditional policy: the one molecule's radius [] (Angstrom) and, with prefix features,
