@@ -47,6 +47,22 @@ def test_selection_keeps_training_children_inside_both_windows():
     assert masks['train'].tolist() == [False, True, False, False, False, False]
     assert masks['heldout'].tolist() == [False, False, False, False, False, True]
     assert masks['anchors'].tolist() == [True, False, False, False, False, False]
+    # the prior buffer's seed: every scored training row inside both windows, the anchor as well as the child
+    assert masks['buffer'].tolist() == [True, True, False, False, False, False]
+
+
+def test_the_buffer_seed_takes_every_scored_kind_whatever_mle_trains_on():
+    """An MLE run on anchors (with a live kernel) still hands its children, scored at build, to the buffer-fed
+    stages; harvested rows and held-out rows never enter (owner 2026-11-04: the noised set carries from MLE to TB)."""
+    e = torch.zeros(4, dtype=torch.float64)
+    packing = torch.full((4,), 0.7, dtype=torch.float64)
+    kinds = torch.tensor([NP.KIND_ANCHOR, NP.KIND_CHILD, NP.KIND_HARVESTED, NP.KIND_CHILD])
+    splits = torch.tensor([0, 0, 0, 1])
+    for kinds_trained in (['anchor'], ['child'], ['anchor', 'child']):
+        masks, _ = NP.select_rows(e, packing, kinds, splits, torch.zeros(4, dtype=torch.long), 1.0,
+                                  _settings(train_kinds=kinds_trained))
+        assert masks['buffer'].tolist() == [True, True, False, False]
+        assert not bool((masks['train'] & ~masks['buffer']).any())   # the MLE set is always inside the seed
 
 
 def test_held_out_rows_never_set_the_floor():

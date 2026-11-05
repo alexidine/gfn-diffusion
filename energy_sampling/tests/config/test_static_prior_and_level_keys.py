@@ -86,3 +86,17 @@ def test_mk_dev_states_the_new_keys_and_validates():
     bad = copy.deepcopy(cfg)
     bad['buffers']['prior_buffer']['seed_source'] = 'generated'
     assert [v.rule for v in ci.static_prior_buffer_is_seeded(bad)] == ['static_prior_buffer_is_seeded']
+
+
+def test_the_buffer_seeds_from_the_scored_rows_when_a_prenoised_prior_has_them():
+    """_prior_buffer_seed_source: a pre-noised prior's scored training rows (prior_buffer_source) when the load built
+    them, else prior_dataset; the seed draw reads it."""
+    import types as _t
+    src, ds = _t.SimpleNamespace(batch='scored'), _t.SimpleNamespace(batch='mle')
+    m = SimpleNamespace(prior_dataset=ds, prior_buffer_source=src)
+    pick = MethodType(Modeller._prior_buffer_seed_source, m)
+    assert pick() is src
+    m.prior_buffer_source = None
+    assert pick() is ds
+    del m.prior_buffer_source
+    assert pick() is ds

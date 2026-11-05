@@ -402,6 +402,9 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
       train      rows the run trains on: training split, a kind in train_kinds, inside both windows
       heldout    held-out anchor groups' rows of those kinds, inside both windows
       anchors    clean training anchors inside both windows (a readout when anchors are not trained on)
+      buffer     every scored training row inside both windows, anchors and children whatever train_kinds holds: the
+                 prior buffer's seed (train.py::Modeller.prior_buffer_source), so the noised rows the build already
+                 scored serve the buffer-fed stages as well as, or instead of, MLE
     and the per-row floor. The energy window is window_kT x T above the floor (None: no energy window), both read on
     window_e (window_energy; None: seed_energy)."""
     lo, hi = s['packing_window']
@@ -418,7 +421,9 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
     for name in s['train_kinds']:
         kind_ok |= kinds == KIND_NAMES[name]
     good = in_pack & in_window
+    scored = (kinds == KIND_ANCHOR) | (kinds == KIND_CHILD)
     return dict(floor_ok=floor_ok, train=(splits == SPLIT_TRAIN) & kind_ok & good,
+                buffer=(splits == SPLIT_TRAIN) & scored & good,
                 heldout=(splits == SPLIT_HELDOUT) & kind_ok & good,
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
 

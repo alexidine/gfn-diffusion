@@ -3639,15 +3639,28 @@ class Modeller:
                 if nf.get('sym_ops', 'none') in (None, False, 'none', 'off') and not self.args.sg_conditioning:
                     raise ValueError(f"an FD run over space groups {list(fd.groups)}: the policy must read each row's "
                                      f"group (model.nf.sym_ops pooled, or sg_conditioning)")
-                cfg['policy'] = dict(pol, fd_space_groups=[int(g) for g in fd.groups],
-                                     fd_group_in_condition=bool(self.args.sg_conditioning))
-            elif (cfg.get('policy') or {}).get('nf', {}).get('row_tokens', 'plain') != 'plain':   # the chart's group
-                cfg['policy'] = dict(cfg['policy'], fd_space_group=int(fd.sg))
+            if cfg.get('policy'):
+                cfg['policy'] = dict(cfg['policy'], **self._fd_policy_fields(cfg['policy']))
         else:
             cfg = self._build_latent_gfn_config()
         if 'policy' in cfg:   # the nf settings resolved on this config's route and rows, as the policy builds them
             cfg['policy'] = resolve_policy_entry(cfg['policy'], cfg)
         return cfg
+
+    def _fd_policy_fields(self, entry):
+        """The FD chart's group fields a policy entry carries (_build_gfn_config; compared by
+        checkpointing.py::Checkpointer._gfn_config_from): fd_space_groups and fd_group_in_condition on a run over
+        several groups, fd_space_group on a one-group run with typed or prefix rows, else none. None off the FD route
+        or before the energy function exists (the conformer route at load)."""
+        fd = getattr(getattr(self, 'energy_function', None), 'fd_layout', None)
+        if fd is None or not entry:
+            return {}
+        if getattr(fd, 'sg', None) is None:
+            return dict(fd_space_groups=[int(g) for g in fd.groups],
+                        fd_group_in_condition=bool(self.args.sg_conditioning))
+        if (entry.get('nf') or {}).get('row_tokens', 'plain') != 'plain':
+            return dict(fd_space_group=int(fd.sg))
+        return {}
 
     def _build_latent_gfn_config(self, periodic_centroids: bool = True, latent_rows: bool = True):
         """gfn_config on the latent chart. periodic_centroids False skips _resolve_periodic_centroid_axes (its checks
@@ -4539,6 +4552,12 @@ class Modeller:
         self.prior_is_prenoised = True   # the prior buffer is these rows: _prior_is_static
         self.prior_heldout_batch = pick(masks['heldout'] & torch.isfinite(log_r))
         self.prior_anchor_batch = pick(masks['anchors'] & torch.isfinite(log_r))
+        # the prior buffer's seed: every scored training row, so the build's children carry into the buffer-fed
+        # stages whatever train_kinds the MLE draw reads (init_prior_buffer_source)
+        buf = masks['buffer'] & torch.isfinite(log_r)
+        n_buf = int(buf.sum())
+        # rows equal to the MLE set's need no second copy: the buffer then seeds from prior_dataset itself
+        self._prior_buffer_rows = None if bool((buf == keep).all()) else pick(buf)
         print(f"pre-noised prior: {int(prior.num_graphs)} rows ({int((kinds == noised_prior.KIND_ANCHOR).sum())} "
               f"anchors, {int((kinds == noised_prior.KIND_CHILD).sum())} children; built K {manifest.get('k')} "
               + (f"basin-kernel children ({manifest.get('basin_kernel')}, windowed by their basin)"
@@ -4550,7 +4569,8 @@ class Modeller:
               f"(T {T:g}) of their condition floor and packing {s['packing_window']}; held-out anchor-group rows "
               f"{int(masks['heldout'].sum())}, clean training anchors {int(masks['anchors'].sum())}; conditions "
               f"{n_groups}, with no training row {int((kept_per == 0).sum())}, rows per condition min "
-              f"{int(kept_per.min())} median {float(kept_per.float().median()):.0f} max {int(kept_per.max())}",
+              f"{int(kept_per.min())} median {float(kept_per.float().median()):.0f} max {int(kept_per.max())}; "
+              f"prior buffer seed {n_buf} scored training rows (anchors and children)",
               flush=True)
         if not bool(keep.any()):
             raise ValueError("pre-noised prior: no row survives the load-time selection")
@@ -4761,6 +4781,23 @@ class Modeller:
                                            y_fn=self._buffer_y_fn(),
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
+        self.init_prior_buffer_source()
+
+    def init_prior_buffer_source(self):
+        """A pre-noised prior's buffer seed (_load_noised_prior's `buffer` rows: every scored training row, anchors
+        and children) as a dataset built like prior_dataset, read by _prior_buffer_seed_source. Any other prior has
+        none, and the buffer seeds from prior_dataset as before."""
+        rows = getattr(self, '_prior_buffer_rows', None)
+        self._prior_buffer_rows = None
+        self.prior_buffer_source = None if rows is None else CrystalBuffer(
+            rows, device=self.buffer_device, **self._buffer_kwargs(), y_fn=self._buffer_y_fn(),
+            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
+
+    def _prior_buffer_seed_source(self):
+        """The dataset the prior buffer and the row store seed from: prior_buffer_source on a pre-noised prior (its
+        scored training rows, whatever noised_prior.train_kinds the MLE draw reads), else prior_dataset."""
+        src = getattr(self, 'prior_buffer_source', None)
+        return src if src is not None else self.prior_dataset
 
     @staticmethod
     def _load_condition_file(path):
@@ -4822,6 +4859,8 @@ class Modeller:
         energy_function.condition_library_size == n_molecules * n_sg * n_zp).
         """
         datasets = [self.mol_dataset, self.prior_dataset]
+        if getattr(self, 'prior_buffer_source', None) is not None:
+            datasets.append(self.prior_buffer_source)
         if self.test_mol_dataset is not None:
             datasets.append(self.test_mol_dataset)
         batches = [d.batch for d in datasets]
@@ -8295,10 +8334,12 @@ class Modeller:
 
     @torch.no_grad()
     def _store_seed(self, settings, chunk: int = 8192):
-        """Seed a new store from prior_dataset (tags from noised_kind) and prior_heldout_batch (held out)."""
+        """Seed a new store from the prior buffer's seed source (_prior_buffer_seed_source: every scored training row
+        of a pre-noised prior; tags from noised_kind) and prior_heldout_batch (held out)."""
         ef = self.energy_function
         parts = []
-        for batch, held in ((self.prior_dataset.batch, False), (getattr(self, 'prior_heldout_batch', None), True)):
+        for batch, held in ((self._prior_buffer_seed_source().batch, False),
+                            (getattr(self, 'prior_heldout_batch', None), True)):
             if batch is None or int(batch.num_graphs) == 0:
                 continue
             tag = noised_prior.tag(batch, 'noised_kind')
@@ -12210,7 +12251,7 @@ class Modeller:
         rows (_dataset_row_batches), so the draw is never held in full at once;
         the first builds the buffer and the rest are added to it.
         """
-        for seed_batch in _dataset_row_batches(self.prior_dataset, limit):
+        for seed_batch in _dataset_row_batches(self._prior_buffer_seed_source(), limit):
             seed_batch = seed_batch.to(self.device)
             seed_batch, _, _, _ = self.energy_function.condition_samples(
                 seed_batch,

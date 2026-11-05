@@ -62,7 +62,7 @@ def _modeller(ckdir, conditional, nf=None):
     m.lr_controller = SimpleNamespace(announce=lambda: None)
     m._ray_askers = lambda: []
     m._build_latent_gfn_config = lambda periodic_centroids=True: _base_config(conditional) | m._policy_entry()
-    for name in ('_policy_entry', '_build_gfn_config', 'init_schedulers_optimizers'):
+    for name in ('_policy_entry', '_fd_policy_fields', '_build_gfn_config', 'init_schedulers_optimizers'):
         setattr(m, name, types.MethodType(getattr(Modeller, name), m))
     m.gfn_from_config = build_policy
     m.optimizers = {}
