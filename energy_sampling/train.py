@@ -8847,6 +8847,88 @@ class Modeller:
         the batch and the memory profile all change at once."""
         self.eval_batch_cap = None
 
+    def _bwd_eval_draw(self, mol_batch, discretizer):
+        """One backward eval rollout from stored rows, at the eval temperature: the row's latent as the terminal
+        state, its condition (its own space group and Z' where _stored_groups keeps them), its prebuilt reward and
+        the policy's backward trajectory. Shared by bwd_eval_sampling and bwd_heldout_readouts so the two read on
+        one footing. Returns (mol_batch, condition_id, flow_states, log_pfs, log_pbs, log_z, gauss_params, log_r),
+        log_z the policy's per-row log Z (log_flow at the source)."""
+        mol_batch = mol_batch.to(self.gfn_model.device)
+        terminal_state = self._batch_latents(mol_batch)
+        mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
+            mol_batch,
+            temperature=torch.ones(mol_batch.num_graphs, dtype=torch.float32,
+                                   device=mol_batch.device) * self.args.energy_config.temperature,
+            **self._stored_groups(mol_batch))
+        log_r = self.energy_function.prebuilt_sample_to_reward(mol_batch, temperature=10 ** log_T_tensor)
+        terminal_state = terminal_state.to(self.gfn_model.device)
+        condition = condition.to(self.gfn_model.device)
+        flow_states, log_pfs, log_pbs, log_flow, gauss_params = self.gfn_model.get_traj_bwd(
+            terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
+        return mol_batch, condition_id, flow_states, log_pfs, log_pbs, log_flow[:, 0], gauss_params, log_r
+
+    #: OOM retries per set before bwd_heldout_readouts drops that set for the eval (handle_train_epoch_error returns
+    #: without shrinking the eval draw at step 0, so the retry loop needs its own bound)
+    BWD_READOUT_MAX_RETRIES = 8
+
+    @torch.no_grad()
+    def bwd_heldout_readouts(self, discretizer):
+        """Backward TB residuals on held-out stored crystals against training ones, the TB route's counterpart of
+        density_readouts' eval_bwd/mle_heldout_gap (which needs an exact density). Per row,
+            delta = log_Z + sum log P_F(tau) - log R(x) - sum log P_B(tau | x),   tau ~ P_B(. | x),
+        through _bwd_eval_draw (bwd_eval_sampling's path). Two sets of the same size n = min(the eval draw at the
+        first readout, held-out rows, training rows), each drawn once (seed + 7) and read at every eval:
+          eval_bwd/tb_heldout_rows      mean delta over prior_heldout_batch rows (a pre-noised prior's held-out anchor
+                                        groups: training molecules, crystals never trained on)
+          eval_bwd/tb_train_rows        mean delta over prior_dataset rows
+          eval_bwd/tb_{heldout,train}_rows_std   std of delta over the same rows (log Z-invariant)
+          eval_bwd/tb_heldout_gap       tb_train_rows - tb_heldout_rows, nats; > 0 = held-out crystals worse fit
+        On an unconditional run log Z is one number, so the gap does not depend on it; on a conditional run the two
+        sets mix conditions differently and per-condition log Z does not cancel. log Z is the policy's own (log_flow
+        at the source), as bwd_eval_sampling reads it. tau is drawn afresh each eval, so the curves carry rollout noise
+        on fixed rows. Absent without held-out rows (a prior that is not a pre-noised build with held-out groups)."""
+        held = getattr(self, 'prior_heldout_batch', None)
+        if held is None or int(held.num_graphs) == 0:
+            return {}
+        sets = {'heldout_rows': held, 'train_rows': self.prior_dataset.batch}
+        if getattr(self, '_bwd_readout_rows', None) is None:
+            n = min(int(self.eval_draw_size()), *(int(b.num_graphs) for b in sets.values()))
+            g = torch.Generator().manual_seed(int(self.args.seed) + 7)
+            self._bwd_readout_rows = {k: torch.randperm(int(b.num_graphs), generator=g)[:n].sort().values
+                                      for k, b in sets.items()}
+        out = {}
+        for name, batch in sets.items():
+            idx = self._bwd_readout_rows[name]
+            deltas, i, retries = [], 0, 0
+            while i < idx.numel():
+                chunk = max(1, int(self.eval_draw_size()))
+                try:
+                    sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device))
+                    _, _, _, log_pfs, log_pbs, log_z, _, log_r = self._bwd_eval_draw(sub, discretizer)
+                except (RuntimeError, ValueError) as e:
+                    self.handle_train_epoch_error(e, 'eval_bwd')   # re-raises anything but a CUDA OOM
+                    retries += 1
+                    if retries > self.BWD_READOUT_MAX_RETRIES:
+                        print(f"bwd_heldout_readouts: {name} dropped this eval after {retries - 1} OOM retries",
+                              flush=True)
+                        deltas = None
+                        break
+                    continue
+                deltas.append((log_z.reshape(-1) + log_pfs.sum(-1) - log_r.reshape(-1)
+                               - log_pbs.sum(-1)).float().flatten().cpu())
+                i += chunk
+            if not deltas:
+                continue
+            d = torch.cat(deltas)
+            d = d[torch.isfinite(d)]
+            if d.numel() == 0:
+                continue
+            out[f'eval_bwd/tb_{name}'] = float(d.mean())
+            out[f'eval_bwd/tb_{name}_std'] = float(d.std()) if d.numel() > 1 else 0.0
+        if 'eval_bwd/tb_heldout_rows' in out and 'eval_bwd/tb_train_rows' in out:
+            out['eval_bwd/tb_heldout_gap'] = out['eval_bwd/tb_train_rows'] - out['eval_bwd/tb_heldout_rows']
+        return out
+
     @torch.no_grad()
     def bwd_eval_sampling(
             self,
@@ -8862,25 +8944,8 @@ class Modeller:
                 else:
                     assert False
 
-                mol_batch = mol_batch.to(self.gfn_model.device)
-                terminal_state = self._batch_latents(mol_batch)
-
-                mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-                    mol_batch,
-                    temperature=torch.ones(mol_batch.num_graphs, dtype=torch.float32,
-                                           device=mol_batch.device) * self.args.energy_config.temperature,
-                    **self._stored_groups(mol_batch))
-
-                log_r = self.energy_function.prebuilt_sample_to_reward(mol_batch,
-                                                                       temperature=10 ** log_T_tensor)
-
-                terminal_state = terminal_state.to(self.gfn_model.device)
-                condition = condition.to(self.gfn_model.device)
-
-                (backward_flow_states, b_log_pfs, b_log_pbs, log_flow,
-                 b_gauss_params) = self.gfn_model.get_traj_bwd(
-                    terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
-                log_z = log_flow[:, 0]
+                (mol_batch, condition_id, backward_flow_states, b_log_pfs, b_log_pbs, log_z, b_gauss_params,
+                 log_r) = self._bwd_eval_draw(mol_batch, discretizer)
 
                 samples += mol_batch.num_graphs
 
@@ -10234,6 +10299,7 @@ class Modeller:
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         self._merge_metrics(metrics, self.log_metrics(fwd_stats, bwd_stats, sample_batch),
                             'log_metrics')
+        self._merge_metrics(metrics, self.bwd_heldout_readouts(eval_discretizer), 'bwd_heldout_readouts')
         if getattr(self, 'test_mol_dataset', None) is not None:
             self._merge_metrics(metrics, self.log_test_metrics(eval_discretizer, fwd_stats),
                                 'log_test_metrics')
