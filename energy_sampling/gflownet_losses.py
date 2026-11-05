@@ -690,6 +690,16 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, loss_dict
 
 
+#: the backward-branch terms that read log R; every other term (mle) reads only log P_F / log P_B
+BWD_REWARD_TERMS = ('tb', 'tbc', 'vg_lb', 'vg_lme', 'emp_z', 'emp_z_persistent', 'pf_boost', 'level_gap', 'db',
+                    'subtb')
+
+
+def bwd_loss_reads_reward(loss_coeffs) -> bool:
+    """Whether a backward/replay coefficient block weights any term that reads log R (BWD_REWARD_TERMS)."""
+    return any(float(getattr(loss_coeffs, k, 0) or 0) > 0 for k in BWD_REWARD_TERMS)
+
+
 def get_gfn_backward_loss(loss_coeffs,
                           samples,
                           gfn,
@@ -730,7 +740,16 @@ def get_gfn_backward_loss(loss_coeffs,
     embedding INSIDE the model, at the conditioner->trunk seam; `condition`
     itself stays correctly paired everywhere in this function (see
     GFN._maybe_scramble_condition_embedding). 0 = off.
+
+    log_r None: a reward-free call (an MLE-only stage's draw, which never scores its rows). Refused unless no term
+    reads log R (bwd_loss_reads_reward), the call replays no stored trajectory and the pooled stash is not armed; the
+    condition log Z tracker and the level stream are not fed, and loss_dict carries no log_r, resid or logr_mean.
     """
+    no_reward = log_r is None
+    if no_reward and (bwd_loss_reads_reward(loss_coeffs) or trajectories is not None
+                      or (live_stash is not None and getattr(gfn, '_stash_live_branches', False))):
+        raise ValueError("get_gfn_backward_loss: log_r None (a reward-free draw) needs every reward-reading term "
+                         f"{BWD_REWARD_TERMS} at 0, no stored trajectory and no pooled stash")
     freeze_policy = getattr(loss_coeffs, 'freeze_policy', 0) > 0.5
     freeze_z = getattr(loss_coeffs, 'freeze_z', 0) > 0.5
 
@@ -856,6 +875,8 @@ def get_gfn_backward_loss(loss_coeffs,
             detach_traj=loss_coeffs.traj_grads == 0, freeze_policy=freeze_policy,
             scramble_condition_tiles=scramble_condition_tiles)
     log_Z_learned = log_flow[:, 0]
+    if no_reward:   # a placeholder no weighted term reads (checked above); never fed to the tracker or a stream
+        log_r = torch.full_like(log_flow[:, -1].detach(), float('nan'))
     log_flow[:, -1] = log_r
 
     log_pf = log_pfs.sum(-1)
@@ -878,7 +899,7 @@ def get_gfn_backward_loss(loss_coeffs,
     # the Z model's, which is trained and judged on forward rollouts only.
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
-        do_update=update_log_z, mode_level_stream=mode_level_stream)
+        do_update=update_log_z and not no_reward, mode_level_stream=None if no_reward else mode_level_stream)
 
     # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
     # branches' log-weights in one scope. Stashed on the model rather than
@@ -1105,6 +1126,9 @@ def get_gfn_backward_loss(loss_coeffs,
         loss_dict['logr_mean'] = log_r.detach().mean()
         loss_dict['logpb_mean'] = log_pb.detach().mean()
         loss_dict['logpf_mean'] = log_pf.detach().mean()
+        if no_reward:
+            for k in ('log_r', 'resid', 'logr_mean'):
+                del loss_dict[k]
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
             loss_dict.update(condition_group_stats(condition_id))

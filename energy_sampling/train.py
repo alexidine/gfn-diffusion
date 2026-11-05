@@ -70,7 +70,8 @@ from energy_sampling.utils import is_cuda_oom, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
     cal_subtb_coef_matrix, per_condition_fraction, trajectory_T
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
-                             winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj, untrusted_z_for)
+                             winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj, untrusted_z_for,
+                             bwd_loss_reads_reward)
 from progress_metrics import parse_heldout_gate, resolve_heldout_source, heldout_plateau, HELDOUT_AUTO_SOURCES
 from models import GFN
 from models.nf_policy import build_policy, resolve_policy_entry
@@ -6657,12 +6658,13 @@ class Modeller:
         # difference IS the old unclipped tb_resid.
         _z = loss_dict.get('log_z_target')
         _z = loss_dict['log_Z'] if _z is None else _z
-        stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
-                               _z, loss_dict['log_r'],
-                               clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'), 'beta', None),
-                               condition_id=loss_dict.get('condition_id'),
-                               worst_quantile=self.args.conditional_worst_quantile,
-                               **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
+        # a reward-free draw (an MLE-only stage, get_gfn_backward_loss log_r None) has no log w to read
+        stats = {} if 'log_r' not in loss_dict else quick_tb_stats(
+            loss_dict['log_pf'], loss_dict['log_pb'], _z, loss_dict['log_r'],
+            clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'), 'beta', None),
+            condition_id=loss_dict.get('condition_id'),
+            worst_quantile=self.args.conditional_worst_quantile,
+            **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id',
                        'log_T_tensor', 'log_z_target']})
@@ -7813,7 +7815,7 @@ class Modeller:
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
                                                 self.gfn_model,
-                                                log_reward.to(self.device),
+                                                None if log_reward is None else log_reward.to(self.device),
                                                 discretizer,
                                                 mol_batch,
                                                 condition=condition,
@@ -7836,7 +7838,7 @@ class Modeller:
             # a scrambled condition's log q is not the row's own: no write
             if not scramble_tiles:
                 self._store_touch(inds, loss_dict)
-        else:
+        elif 'resid' in loss_dict:   # a reward-free draw has no residual to rank rows by
             priority = self._bwd_retention_priority(loss_dict)
             if self.bwd_sampling_mode == 'dataset':
                 self.prior_dataset.update_losses(priority, inds)
@@ -8297,10 +8299,20 @@ class Modeller:
             mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
             z_primes=mol_batch.z_prime.reshape(-1).long())
         temperature = 10 ** log_T_tensor
-        log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
-                                                                    temperature)  # relies on the energy terms being attached to the graphs!
+        if self._bwd_draw_is_reward_free():
+            log_reward = None   # an MLE-only stage never reads log R (get_gfn_backward_loss log_r None)
+        else:
+            log_reward = self.energy_function.prebuilt_sample_to_reward(
+                mol_batch, temperature)  # relies on the energy terms being attached to the graphs!
 
         return condition, condition_id, inds, latents, log_reward, mol_batch, traj
+
+    def _bwd_draw_is_reward_free(self) -> bool:
+        """Whether this step's backward draw goes unscored: the 'dataset' draw (the MLE stage's) under coefficients
+        whose every log R term is 0 (gflownet_losses.bwd_loss_reads_reward) and with no pooled stash armed."""
+        return (self.bwd_sampling_mode == 'dataset' and self.row_store is None
+                and not bwd_loss_reads_reward(self.args.bwd_loss_coeffs)
+                and not getattr(self.gfn_model, '_stash_live_branches', False))
 
     @torch.no_grad()
     def current_log_z(self):
