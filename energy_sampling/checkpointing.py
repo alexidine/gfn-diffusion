@@ -466,7 +466,14 @@ class Checkpointer:
             sums = []
             for col in self.FINGERPRINT_COLUMNS:
                 t = getattr(b, col, None)
-                sums.append(float(t.double().sum()) if torch.is_tensor(t) else None)
+                if not torch.is_tensor(t):
+                    sums.append(None)
+                elif t.is_floating_point():
+                    # NaN is a legitimate column value (birth_log_pf of a seeded or eval-born row) and NaN != NaN:
+                    # the sum around the NaNs and their count
+                    sums.append((float(t.double().nansum()), int(torch.isnan(t).sum())))
+                else:
+                    sums.append(float(t.double().sum()))
             out.append((name, int(x.shape[0]), tuple(sums)))
         return tuple(out)
 

@@ -37,6 +37,19 @@ def test_an_unchanged_store_is_written_once(tmp_path, monkeypatch, capsys):
     assert len(writes) == 1 and 'buffers unchanged' in capsys.readouterr().out
 
 
+def test_nan_columns_do_not_read_as_a_change(tmp_path, monkeypatch):
+    """A seeded row's birth_log_pf is NaN by design, and NaN != NaN: the first fingerprint never matched."""
+    s = _store()
+    s.birth_loss[1] = float('nan')
+    c, writes = _ckpt(tmp_path, monkeypatch, prior_buffer=s)
+    c.save_buffers()
+    c.save_buffers()
+    assert len(writes) == 1
+    s.birth_loss[2] = float('nan')    # one more NaN is a change
+    c.save_buffers()
+    assert len(writes) == 2
+
+
 @pytest.mark.parametrize('change', ['row', 'draw', 'loss'])
 def test_any_change_to_a_store_writes_again(tmp_path, monkeypatch, change):
     s = _store()
