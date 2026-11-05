@@ -1,3 +1,4 @@
+import inspect
 import os
 import re
 import shutil
@@ -8,6 +9,7 @@ import torch
 
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     BufferCurrencyError
+from energy_sampling import noised_prior
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, keeps_ema_copy, normalize_problem_def, trajectory_T
 from models import GFN
@@ -436,13 +438,58 @@ class Checkpointer:
             'problem_def': m.problem_def,  # guards against pairing buffers with another problem's checkpoint
             'problem_hash': m.problem_hash,  # legacy guard - hash changes whenever the exclusion list grows, the def compare doesn't
             'step_ind': m.step_ind,  # buffers lag their checkpoint by up to eval_period; this reports by how much
-            'prior_buffer': m.prior_buffer.state_dict() if hasattr(m, 'prior_buffer') else None,
+            'prior_buffer': self._store_state('prior_buffer'),
             'replay_buffer': m.replay_buffer.state_dict() if hasattr(m, 'replay_buffer') else None,
-            'anchor_buffer': m.anchor_buffer.state_dict() if hasattr(m, 'anchor_buffer') else None,
+            'anchor_buffer': self._store_state('anchor_buffer'),
             # buffers.store (row_store.py), stamped with what its rows depend on (Modeller._store_stamp)
             'row_store': (m.row_store.state_dict(m._store_stamp())
                           if getattr(m, 'row_store', None) is not None else None),
         }
+
+    #: the stores whose rows a launch's own seed rebuilds (train.py::Modeller.settle_seeded_store)
+    SEEDED_STORES = ('prior_buffer', 'anchor_buffer')
+
+    def _store_state(self, name):
+        """A resident store's sidecar entry. COMPACT -- every column but the rows' graphs, keyed by the seed's row
+        digest (`compact_seed`) -- while the store's rows are still exactly the rows this launch's seed built
+        (Modeller._seed_digests, set by settle_seeded_store), so a resume rebuilds them from the prior file instead of
+        reading GBs of graphs; FULL once anything changed its rows, for a store the seed never built, and for a
+        store class whose state_dict cannot leave its rows out."""
+        m = self.modeller
+        b = getattr(m, name, None)
+        if b is None:
+            return None
+        seed = (getattr(m, '_seed_digests', None) or {}).get(name)
+        x = getattr(b, 'x', None)
+        if (seed is not None and torch.is_tensor(x) and 'rows' in inspect.signature(b.state_dict).parameters
+                and noised_prior.digest(x) == seed):
+            state = b.state_dict(rows=False)
+            state['x'] = None   # the seed rebuilds the rows and their latents; the digest checks them
+            state['compact_seed'] = seed
+            return state
+        return b.state_dict()
+
+    def apply_compact_store(self, name, state):
+        """Restore a compact sidecar entry (_store_state) onto the store the seed just rebuilt: refused unless the
+        rebuilt rows' digest is the one the records were written against (the prior file, its window or the seed
+        changed); the store is then rebuilt through its class's own from_state_dict with the records and its rows."""
+        m = self.modeller
+        b = getattr(m, name, None)
+        if b is None:
+            raise ValueError(f"buffer sidecar: {name} was written compactly (its rows rebuilt from the prior at "
+                             f"resume), but this launch built no {name} to rebuild them into")
+        got = noised_prior.digest(b.x)
+        if got != state['compact_seed']:
+            raise ValueError(f"buffer sidecar: {name}'s records belong to rows with digest {state['compact_seed']}, "
+                             f"but this launch's seed built rows with digest {got}: the prior file, its load "
+                             f"window or the seed changed since the sidecar was written. Resume from a full "
+                             f"sidecar or start the buffers fresh")
+        full = dict(state, batch=b.batch, x=b.x)
+        setattr(m, name, type(b).from_state_dict(full, device=m.buffer_device))
+        if name == 'anchor_buffer' and hasattr(m, 'apply_anchor_buffer_policy'):
+            m.apply_anchor_buffer_policy('sidecar restore')   # config owns the anchor policy, as on a full restore
+        print(f"buffer sidecar: {name} rebuilt from this launch's seed ({int(b.x.shape[0])} rows) with its saved "
+              f"per-row records", flush=True)
 
     #: the per-row columns a buffer's fingerprint sums (_buffer_fingerprint)
     FINGERPRINT_COLUMNS = ('x', 'y', 'ema_loss', 'select_counts', 'birth_step', 'birth_loss', 'ema_logw', 'traj')
@@ -518,6 +565,16 @@ class Checkpointer:
         # and grow_prior_buffer returns early -- it only fires on RESUME.
         buf_cls = getattr(m, 'buffer_cls', CrystalBuffer)
         anchor_cls = getattr(m, 'anchor_buffer_cls', AnchorBuffer)
+        # COMPACT entries (_store_state) hold records without rows: applied now onto a store that already exists (a
+        # mid-run reload), else parked for train.py::Modeller.settle_seeded_store to apply once the seed rebuilds it
+        for name in self.SEEDED_STORES:
+            entry = state.get(name)
+            if entry is not None and entry.get('compact_seed') is not None:
+                state = dict(state, **{name: None})
+                if getattr(m, name, None) is not None:
+                    self.apply_compact_store(name, entry)
+                else:
+                    m.__dict__.setdefault('_compact_records', {})[name] = entry
         if state.get('prior_buffer') is not None:
             m.prior_buffer = buf_cls.from_state_dict(state['prior_buffer'], device=m.buffer_device)
         if state.get('replay_buffer') is not None:

@@ -5171,7 +5171,9 @@ class Modeller:
             # prior_buffer seed (like grow_prior_buffer, needs init_identifiers()'s
             # mol_id on prior_dataset.batch; no sampling/energy involved). Runs
             # first so grow_prior_buffer's top-up sees the seeded fill level.
+            restored = hasattr(self, 'prior_buffer')
             self.init_prior_buffer_seed()
+            self.settle_seeded_store('prior_buffer', seeded=not restored)
             # An ungated fill from the prior SAMPLER while the buffer is under max_size,
             # reached only on a route that has one (ConformerModeller's InternalPrior;
             # the crystal route has none, _has_prior_sampler). Under source 'anchors'
@@ -5183,7 +5185,9 @@ class Modeller:
             elif self._has_prior_sampler():
                 self.grow_prior_buffer()
             self.init_condition_log_z()
+            restored = hasattr(self, 'anchor_buffer')
             self.init_anchor_buffer_seed()
+            self.settle_seeded_store('anchor_buffer', seeded=not restored)
             self.init_row_store()   # buffers.store; a no-op when it is absent or off
             # Restored or seeded, every resident crystal row must be stamped with
             # THIS run's lj_coeff before anything draws from it. Here and not in
@@ -12282,6 +12286,21 @@ class Modeller:
         # are born with a NaN birth_log_pf
         self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=False,
                                   origin=ORIGIN_EVAL)
+
+    def settle_seeded_store(self, name, seeded: bool):
+        """After `name`'s seed at init (prior_buffer, anchor_buffer). seeded: this launch's seed built the store (it
+        was not restored whole from a sidecar). Then its row digest is kept (self._seed_digests), so the checkpointer
+        writes the store compactly -- records only, no graphs -- while its rows are still the seed's
+        (checkpointing.Checkpointer._store_state), and a compact entry a restore parked is applied onto the rebuilt
+        rows (Checkpointer.apply_compact_store, which refuses rows that are not the ones the records belong to). A
+        parked entry with no store to receive it raises."""
+        parked = (getattr(self, '_compact_records', None) or {}).pop(name, None)
+        if parked is not None:
+            self.checkpointer.apply_compact_store(name, parked)
+        b = getattr(self, name, None)
+        if seeded and b is not None and torch.is_tensor(getattr(b, 'x', None)):
+            self.__dict__.setdefault('_seed_digests', {})[name] = (
+                parked['compact_seed'] if parked is not None else noised_prior.digest(b.x))
 
     def init_prior_buffer_seed(self):
         """

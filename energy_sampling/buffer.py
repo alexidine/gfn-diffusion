@@ -466,7 +466,9 @@ class CrystalBuffer:
     # Persistence
     # ---------------------------------------------------------------------
 
-    def state_dict(self):
+    def state_dict(self, rows: bool = True):
+        # rows=False: everything but the rows' graphs ('batch' None) -- the per-row records a store whose rows its
+        # seed rebuilds needs (checkpointing.Checkpointer._store_state, a compact sidecar entry).
         # NB copy.copy first: PyG's Data.cpu()/.to() MUTATE IN PLACE (apply
         # rewrites the store and returns self), so a bare self.batch.cpu()
         # here silently demoted the entire live GPU-resident buffer to CPU at
@@ -481,7 +483,7 @@ class CrystalBuffer:
             # empty one, or -- never legitimately -- a crystal store some
             # construction path forgot to stamp; from_state_dict refuses that)
             'lj_coeff': self.stored_lj_coeff('state_dict'),
-            'batch': copy.copy(self.batch).cpu(),
+            'batch': copy.copy(self.batch).cpu() if rows else None,
             'max_z_prime': self.max_z_prime,
             'x_fn': self.x_fn,
             'y_fn': self.y_fn,
@@ -4476,8 +4478,8 @@ class AnchorBuffer(CrystalBuffer):
     # Persistence
     # ---------------------------------------------------------------------
 
-    def state_dict(self):
-        state = super().state_dict()
+    def state_dict(self, rows: bool = True):
+        state = super().state_dict(rows=rows)
         state['reward'] = self.reward.cpu()
         state['energy'] = self.energy.cpu()
         # carried through unchanged: a buffer restored without one stays None,
