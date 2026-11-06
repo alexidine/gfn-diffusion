@@ -624,8 +624,13 @@ class _ContextFlow(nn.Module):
         # atoms['sym_tokens']: each operation of the row's group is also a token of the cross-attention memory, beside
         # the atom tokens (static: a function of g alone, so every slot may read it)
         self.sym_tokens = bool(atoms.pop('sym_tokens', False)) if atoms is not None else False
-        if self.encoder not in (None, 'xyz', 'split'):
-            raise ValueError(f"atom encoder {self.encoder!r}: 'xyz' or 'split'")
+        if self.encoder not in (None, 'xyz', 'split', 'none'):
+            raise ValueError(f"atom encoder {self.encoder!r}: 'xyz', 'split' or 'none'")
+        if self.encoder == 'none':
+            if self.cross or self.sym_tokens:
+                raise ValueError("atom encoder 'none' has no atom tokens to cross-attend to")
+            for k in ('node_dim', 'convs', 'cutoff', 'radial', 'point_convs', 'chirality'):
+                atoms.pop(k, None)   # the encoder's settings: nothing reads them
         self.atoms = atoms is not None
         self.frames = bool(frames)
         if self.frames and not self.atoms:
@@ -672,9 +677,13 @@ class _ContextFlow(nn.Module):
         n_in = n_ctx = cond_dim
         if self.atoms:
             width = transformer[0]
-            self.atom_encoder = (SplitAtomEncoder(width, **atoms) if self.encoder == 'split'
-                                 else AtomEncoder(width, **atoms))
-            pooled = (self.atom_encoder.s_out if self.encoder == 'split' else self.atom_encoder.pool_out).out_features
+            if self.encoder == 'none':   # the molecule route without an encoder: scalars and condition columns only
+                pooled = 0
+            else:
+                self.atom_encoder = (SplitAtomEncoder(width, **atoms) if self.encoder == 'split'
+                                     else AtomEncoder(width, **atoms))
+                pooled = (self.atom_encoder.s_out if self.encoder == 'split'
+                          else self.atom_encoder.pool_out).out_features
             # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
             n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars + self.n_sym
             if self.n_sym:
@@ -808,6 +817,8 @@ class _ContextFlow(nn.Module):
             groups, ginv = torch.unique(self.row_groups.to(cid.device)[cid], return_inverse=True)
             rest = torch.cat([self.sym_encoder.embed(groups.tolist()).to(dtype)[ginv], rest], -1)
         gkey = key if (key is not None and not self.frames) else None   # the graph is the table's only when unrotated
+        if self.encoder == 'none':
+            return self.context(rest), rest
         if self.encoder == 'split':
             tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
             s = torch.cat([s_inv[inv], rest], -1)

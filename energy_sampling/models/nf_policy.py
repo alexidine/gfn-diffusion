@@ -36,7 +36,10 @@ NF_DEFAULTS = dict(
     context_dim=128, context_hidden=512,
     atom_tokens=False,              # False; True (AtomEncoder: xyz in the node input, cross-attended tokens); 'split'
                                     # (SplitAtomEncoder: invariant trunk s for the level head, point head p, tokens
-                                    # cross-attended); 'split_pooled' (the same, pooled s and p only, no cross-attention)
+                                    # cross-attended); 'split_pooled' (the same, pooled s and p only, no cross-attention);
+                                    # 'scalars' (the molecule route with no atom encoder: the context and the level head
+                                    # read only mol_scalars, when set, and the condition columns; prefix rows still read
+                                    # the molecule's radius)
     atom_node_dim=128, atom_convs=3, atom_cutoff=10.0, atom_radial=32,
     atom_point_convs=None,          # the split encoder's point-stream message-passing rounds; None = atom_convs, 0 = a
                                     # per-atom MLP
@@ -84,7 +87,7 @@ SYM_OPS_SHAPE = (64, 256)
 #: heavy-atom gyration tensor's eigenvalues, largest first (invariant to rotation and reflection)
 MOL_SCALARS = ('log_volume', 'log_radius', 'log_extent_1', 'log_extent_2', 'log_extent_3')
 NF_ALL_DEFAULTS = {**NF_DEFAULTS, **NF_PENDING_DEFAULTS}
-ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled')
+ATOM_TOKEN_MODES = (False, True, 'split', 'split_pooled', 'scalars')
 # as inn_modeller.py::UNCONDITIONAL_DEFAULTS and ::Z1_ORDER: the unconditional route's defaults for the 'auto' settings
 UNCONDITIONAL_DEFAULTS = dict(bounded_rows='linear', min_bin_height=1e-7, tied_derivatives=True, tied_factor=2.0)
 Z1_ORDER = '8.11.10.9.7.6.5.4.3.2.1.0'   # pose first (centroid z, orientation, centroid y, x, then the cell)
@@ -294,17 +297,18 @@ class NFPolicy(nn.Module):
                                           "unconditional policies only (as inn_modeller.py)")
             if s['sym_ops_init'] and not e_g:
                 raise ValueError("flow sym_ops_init loads e_g's encoder: it needs sym_ops pooled or tokens")
-            if s['sym_ops'] == 'tokens' and s['atom_tokens'] == 'split_pooled':
-                raise ValueError("flow sym_ops tokens join the cross-attention memory: atom_tokens split_pooled has "
-                                 "none")
+            if s['sym_ops'] == 'tokens' and s['atom_tokens'] in ('split_pooled', 'scalars'):
+                raise ValueError(f"flow sym_ops tokens join the cross-attention memory: atom_tokens "
+                                 f"{s['atom_tokens']} has none")
             sym_w, sym_h = SYM_OPS_SHAPE
             if s['sym_ops_init']:
                 from models.sym_ops import encoder_shape
                 sym_w, sym_h = encoder_shape(s['sym_ops_init'])
             atoms = (dict(node_dim=s['atom_node_dim'], convs=s['atom_convs'], cutoff=s['atom_cutoff'],
                           radial=s['atom_radial'],
-                          encoder='split' if str(s['atom_tokens']).startswith('split') else 'xyz',
-                          cross=s['atom_tokens'] != 'split_pooled',
+                          encoder=('split' if str(s['atom_tokens']).startswith('split') else
+                                   'none' if s['atom_tokens'] == 'scalars' else 'xyz'),
+                          cross=s['atom_tokens'] not in ('split_pooled', 'scalars'),
                           mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0,
                           sym_ops=sym_w if e_g else 0, sym_hidden=sym_h, sym_tokens=s['sym_ops'] == 'tokens')
                      if s['atom_tokens'] else None)
@@ -330,7 +334,7 @@ class NFPolicy(nn.Module):
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
-            if atoms is not None:
+            if atoms is not None and atoms['encoder'] != 'none':
                 embed['atom_encoder'] = self.sampler.flow.atom_encoder
             if getattr(self.sampler.flow, 'n_sym', 0):   # e_g's encoder trains with the condition's other encoders
                 embed['sym_encoder'] = self.sampler.flow.sym_encoder
