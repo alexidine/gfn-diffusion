@@ -691,13 +691,20 @@ class NFPolicy(nn.Module):
         return states, log_pfs, log_pbs, log_flow
 
     @torch.no_grad()
-    def log_density(self, x, condition, mol_batch):
+    def log_density(self, x, condition, mol_batch, frames=None):
         """Exact log q(x | c) of terminal states x [N, dim] (the trainer's latents), as the backward step scores
-        them: angles wrapped and dead rows pinned first. Read by train.py::Modeller.density_readouts."""
+        them: angles wrapped and dead rows pinned first. Read by train.py::Modeller.density_readouts. frames
+        (rotate_frames): [N, 4] quaternions, each row scored with its molecule presented in its frame (the row
+        re-expressed for it, plus the map's log-Jacobian); None: the standard frame."""
         n = x.shape[0]
         x = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
-        c = self._context(condition, mol_batch, n)
-        return self.sampler.log_prob(x, c) if self.conditional else self.sampler.log_prob(x)
+        c = self._context(condition, mol_batch, n, frames=frames)
+        if not self.conditional:
+            return self.sampler.log_prob(x)
+        if frames is None:
+            return self.sampler.log_prob(x, c)
+        xm, lj = self._present(x, frames.to(self.device, torch.float64))
+        return self.sampler.log_prob(xm, c) + lj.to(torch.float32)
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True, freeze_policy: bool = False,

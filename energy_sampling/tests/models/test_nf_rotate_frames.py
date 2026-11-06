@@ -100,3 +100,18 @@ def test_rotate_frames_are_refused_where_they_do_not_hold():
         _typed_policy(7, scale=0.0, atom_tokens="split", rotate_frames=True)   # a K-cut group
     with pytest.raises(ValueError, match='rotate_frames'):
         _typed_policy(2, scale=0.0, atom_tokens='scalars', rotate_frames=True)
+
+
+def test_log_density_in_a_frame_is_the_framed_backward_score():
+    pol, mb, cond, x = _setup()
+    pol.train()
+    torch.manual_seed(13)
+    with torch.no_grad():
+        _, log_pf, _, _ = pol.get_traj_bwd(x, None, cond, mb)
+    torch.manual_seed(13)
+    q = pol._frames(N)
+    pol.eval()
+    framed = pol.log_density(x, cond, mb, frames=q)
+    assert torch.allclose(framed, log_pf[:, 0], atol=1e-4)
+    assert torch.allclose(pol.log_density(x, cond, mb, frames=torch.tensor([[1.0, 0, 0, 0]]).expand(N, 4)),
+                          pol.log_density(x, cond, mb), atol=1e-4)   # the identity frame is the standard one

@@ -88,6 +88,11 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
+#: model.nf rotate_frames: density_readouts also scores the first FRAME_SPREAD_ROWS fixed rows of each set in
+#: FRAME_SPREAD_K random frames (fixed per eval by the seed) and logs <set>_frame_spread, the mean over rows of the std
+#: of -log q across the frames, and <set>_frame_shift, the mean over rows of (mean over frames - standard frame), nats.
+#: Both are 0 for a flow whose density does not depend on the frame the molecule is presented in.
+FRAME_SPREAD_K, FRAME_SPREAD_ROWS = 4, 1024
 
 #: WALL-CLOCK SECONDS a set of occupancy readings must span before their mean is
 #: allowed to stand for anything -- the metric windows and the sizer's per-rung
@@ -10223,6 +10228,8 @@ class Modeller:
                 ef, T = self.energy_function, float(self.args.energy_config.temperature)
                 fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
                 nll, log_ref = [], []
+                spread_k = FRAME_SPREAD_K if (getattr(policy, 'settings', {}) or {}).get('rotate_frames') else 0
+                framed = ([], [])   # the standard-frame -log q, and [rows, K] -log q in K random frames
                 for i in range(0, idx.numel(), chunk):
                     sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device)).to(self.device)
                     if fd and not hasattr(sub, 'fd_state'):
@@ -10236,7 +10243,23 @@ class Modeller:
                     sub, _, condition, _ = ef.condition_samples(
                         sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
                     nll.append(-policy.log_density(x, condition, sub).float().flatten().cpu())
+                    if spread_k and i < FRAME_SPREAD_ROWS:   # model.nf rotate_frames: the same rows in K frames
+                        m = min(int(sub.num_graphs), FRAME_SPREAD_ROWS - i)
+                        framed[0].append(nll[-1][:m])
+                        g = torch.Generator().manual_seed(int(self.args.seed) + 7 + i)
+                        q = torch.randn(spread_k, m, 4, generator=g, dtype=torch.float64)
+                        q = q / q.norm(dim=-1, keepdim=True)
+                        cols = [-policy.log_density(x[:m], condition[:m], sub.subsample_new_batch(
+                            torch.arange(m, device=sub.ptr.device)), frames=q[k]).float().flatten().cpu()
+                            for k in range(spread_k)]
+                        framed[1].append(torch.stack(cols, 1))
                 nll, log_ref = torch.cat(nll), torch.cat(log_ref)
+                if framed[1]:
+                    f_std, f_all = torch.cat(framed[0]), torch.cat(framed[1])
+                    okf = torch.isfinite(f_all).all(1) & torch.isfinite(f_std)
+                    if bool(okf.any()):
+                        out[f'{key}_frame_spread'] = float(f_all[okf].std(1).mean())
+                        out[f'{key}_frame_shift'] = float((f_all[okf].mean(1) - f_std[okf]).mean())
                 ok = torch.isfinite(nll)
                 if bool(ok.any()):
                     out[key] = float(nll[ok].mean())
@@ -10253,7 +10276,7 @@ class Modeller:
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',
-                   'mle_bank', '_ref', '_gap'))), flush=True)
+                   'mle_bank', '_ref', '_gap', '_frame_spread'))), flush=True)
         return out
 
     #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature
