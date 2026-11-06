@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: wd_1e4
+run_name: floor_1e4
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -54,7 +54,7 @@ lr_flow: 0.1
 min_lr: 1.0e-08
 max_lr: null
 weight_decay: 0.0001
-use_weight_decay: true
+use_weight_decay: false
 progress_gate:
   mode: level
   level_window: 2500
@@ -185,7 +185,7 @@ model:
     atom_radial: 32
     atom_point_convs: null
     atom_chirality: true
-    min_bin_height: auto
+    min_bin_height: 0.0001
     min_bin_height_rows: all
     tied_derivatives: null
     tied_factor: null

@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: batch_250
+run_name: floor_1e3
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -185,7 +185,7 @@ model:
     atom_radial: 32
     atom_point_convs: null
     atom_chirality: true
-    min_bin_height: auto
+    min_bin_height: 0.001
     min_bin_height_rows: all
     tied_derivatives: null
     tied_factor: null
@@ -205,7 +205,7 @@ drift_force:
   max_pairs_per_call: 4000000
   partial: false
 buffer_device: cuda
-batch_size: 250
+batch_size: 500
 grow_batch_size: false
 max_batch_size: 20000
 eval_num_samples: 10000

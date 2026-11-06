@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: atom_d256
+run_name: cond_plain
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -179,7 +179,7 @@ model:
     context_dim: 128
     context_hidden: 512
     atom_tokens: true
-    atom_node_dim: 256
+    atom_node_dim: 128
     atom_convs: 3
     atom_cutoff: 10.0
     atom_radial: 32
@@ -193,7 +193,7 @@ model:
     block_orders: auto
     fold_half_rows: null
     mix_k: 0
-    row_tokens: prefix
+    row_tokens: plain
     mol_scalars: false
     sym_ops: none
     sym_ops_init: null

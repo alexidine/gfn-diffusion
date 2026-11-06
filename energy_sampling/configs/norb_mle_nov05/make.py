@@ -42,40 +42,65 @@ def lr(final):
     return {'stage.lr_schedule': LR_BASE + [{'to': final, 'steps': 1000, 'kind': 'geometric'}]}
 
 
-# arm -> (overrides, one line saying what it changes); GPU groups of PER_GPU, in this order
+# SLOTS ARE FIXED BY THE QUEUED SBATCH (array groups of PER_GPU, in this order), so a revision keeps the slot names
+# and gives each slot's yaml its arm's own run_name (the W&B name). Revised 2026-11-06 before any job started, after the
+# local runs showed capacity mostly shifts the overfit timescale: the battery now spends its arms on data sharpness
+# (kick scale), data learning curves, spline sharpness, molecule controls, and only two capacity points.
+# slot -> (overrides, one line saying what it changes, run_name)
+CAP128 = {'model.nf.tf_width': 128, 'model.nf.tf_layers': 2, 'model.nf.tf_mlp_ratio': 1, 'model.nf.atom_convs': 2,
+          'model.nf.context_hidden': 128, 'model.nf.level_hidden': 128}
+CAP64 = {'model.nf.tf_width': 64, 'model.nf.tf_heads': 4, 'model.nf.tf_layers': 2, 'model.nf.tf_mlp_ratio': 1,
+         'model.nf.atom_node_dim': 64, 'model.nf.atom_convs': 2, 'model.nf.context_dim': 64,
+         'model.nf.context_hidden': 64, 'model.nf.level_hidden': 64}
+KICK075 = {'prior_path': f'{DATA}/norbornane_p1_train_k100_kick075.pt'}
+KICK133 = {'prior_path': f'{DATA}/norbornane_p1_train_k100_kick133.pt'}
 ARMS = {
-    # reference and noise floor, learning rate (mk_dev: 0.05 x seed_lr held 3k steps, then to 0.2 x = 2.5e-5)
-    'base': ({}, 'the base recipe'),
-    'base_s2': ({'seed': 12346}, 'the base, another seed (the noise floor)'),
-    'lr_x01': (lr(0.1), 'final LR 0.1 x seed_lr (1.25e-5)'),
-    'lr_x04': (lr(0.4), 'final LR 0.4 x seed_lr (5e-5)'),
-    'lr_x08': (lr(0.8), 'final LR 0.8 x seed_lr (1e-4)'),
-    'wd_1e4': ({'use_weight_decay': True, 'weight_decay': 1e-4}, 'Adam weight decay 1e-4 (L2, every group)'),
-    'wd_1e3': ({'use_weight_decay': True, 'weight_decay': 1e-3}, 'Adam weight decay 1e-3'),
-    'batch_250': ({'batch_size': 250}, 'batch 250 (accumulated to the same 1000-row update)'),
-    # molecule conditioner, and data
+    # reference and noise floor; LR (mk_dev: 0.05 x seed_lr held 3k steps, then to 0.2 x = 2.5e-5)
+    'base': ({}, 'the base recipe', 'base'),
+    'base_s2': ({'seed': 12346}, 'the base, another seed (the noise floor)', 'base_s2'),
+    'lr_x01': (lr(0.1), 'final LR 0.1 x seed_lr (1.25e-5)', 'lr_x01'),
+    'lr_x04': (lr(0.4), 'final LR 0.4 x seed_lr (5e-5)', 'lr_x04'),
+    # regularisation and spline sharpness
+    'lr_x08': ({'use_weight_decay': True, 'weight_decay': 1e-2}, 'Adam weight decay 1e-2', 'wd_1e2'),
+    'wd_1e4': ({'model.nf.min_bin_height': 1e-4}, 'spline bin-height floor 1e-4 (base 1e-7)', 'floor_1e4'),
+    'wd_1e3': ({'use_weight_decay': True, 'weight_decay': 1e-3}, 'Adam weight decay 1e-3', 'wd_1e3'),
+    'batch_250': ({'model.nf.min_bin_height': 1e-3}, 'spline bin-height floor 1e-3', 'floor_1e3'),
+    # molecule controls and capacity
     'pooled_mol': ({'model.nf.atom_tokens': 'split_pooled'},
-                   'molecule as pooled vectors only, no cross-attention to atoms'),
-    'atom_d64': ({'model.nf.atom_node_dim': 64}, 'atom encoder node width 64 (base 128)'),
-    'atom_d256': ({'model.nf.atom_node_dim': 256}, 'atom encoder node width 256'),
-    'atom_c1': ({'model.nf.atom_convs': 1}, 'atom encoder 1 message-passing round (base 3)'),
-    'atom_c5': ({'model.nf.atom_convs': 5}, 'atom encoder 5 rounds'),
-    'window_15': ({'noised_prior.window_kT': 15.0}, 'data: minima within 15 kT (more minima per molecule; base 10)'),
-    # AR model
-    'tf_w128': ({'model.nf.tf_width': 128, 'model.nf.tf_heads': 4}, 'transformer width 128 (base 256)'),
-    'tf_w512': ({'model.nf.tf_width': 512}, 'transformer width 512'),
-    'tf_l2': ({'model.nf.tf_layers': 2}, 'transformer 2 layers (base 4)'),
-    'tf_l8': ({'model.nf.tf_layers': 8}, 'transformer 8 layers'),
-    'norm_rms': ({'model.nf.tf_norm': 'rms'}, 'RMS norm in the transformer (base layer norm)'),
-    'ctx_256': ({'model.nf.context_dim': 256}, 'condition context width 256 (base 128)'),
+                   'molecule as pooled vectors only, no cross-attention to atoms', 'pooled_mol'),
+    'atom_d64': ({'molecule_conditioning': False, 'model.nf.atom_tokens': False, 'model.nf.row_tokens': 'plain'},
+                 'MOLECULE-BLIND: no conditioning, plain rows (the flow sees nothing molecule-specific)', 'blind_plain'),
+    'atom_d256': ({'model.nf.row_tokens': 'plain'}, 'conditional with plain rows (the pair of blind_plain)', 'cond_plain'),
+    'atom_c1': (CAP128, 'every width <= 128, 2 layers (transformer MLP and level head 128 too): 734k params',
+                'cap128_l2'),
+    'atom_c5': (CAP64, 'every width <= 64, 2 layers', 'cap64_l2'),
+    'window_15': ({'noised_prior.window_kT': 15.0}, 'data: minima within 15 kT (more minima per molecule; base 10)',
+                  'window_15'),
+    # data sharpness: kick scale (the K100 children re-drawn at a larger radius; same seed, same held-out minima)
+    'tf_w128': (KICK075, 'children kicked up to 0.75 A (10^U(-2, -0.125); base up to 0.42 A)', 'kick_075'),
+    'tf_w512': (KICK133, 'children kicked up to 1.33 A (10^U(-2, 0.125))', 'kick_133'),
+    'tf_l2': ({'model.nf.tf_layers': 2}, 'transformer 2 layers (base 4)', 'tf_l2'),
+    'tf_l8': ({**KICK133, **CAP128}, 'kick_133 and cap128_l2 together', 'kick133_cap128'),
+    # data learning curves (nested subsets of the base prior; the 35 held-out molecules unchanged)
+    'norm_rms': ({'prior_path': f'{DATA}/norbornane_p1_train_k100_mol50.pt',
+                  'molecules_path': f'{DATA}/norbornane_p1_train_conditions_mol50.pt'},
+                 'data: 60 of the 117 molecules (their own condition file)',
+                 'mol_50'),
+    'ctx_256': ({'prior_path': f'{DATA}/norbornane_p1_train_k100_mol25.pt',
+                  'molecules_path': f'{DATA}/norbornane_p1_train_conditions_mol25.pt'},
+                 'data: 36 of the 117 molecules (their own condition file)',
+                'mol_25'),
     # rows and spline
-    'rows_typed': ({'model.nf.row_tokens': 'typed'}, 'typed FD rows without the prefix physics features'),
-    'bins_16': ({'model.nf.n_bins': 16}, 'spline 16 bins (base 32)'),
-    'bins_64': ({'model.nf.n_bins': 64}, 'spline 64 bins'),
-    # (two flow blocks are refused under typed rows: one block only)
+    'rows_typed': ({'model.nf.row_tokens': 'typed'}, 'typed FD rows without the prefix physics features',
+                   'rows_typed'),
+    'bins_16': ({'model.nf.n_bins': 16}, 'spline 16 bins (base 32)', 'bins_16'),
+    'bins_64': ({'prior_path': f'{DATA}/norbornane_p1_train_k100_min50.pt'},
+                'data: half of the minima of each molecule (its lowest kept)', 'minima_50'),
     'lr_nohold': ({'stage.lr_schedule': [{'to': 0.2, 'steps': 1, 'kind': 'hold'}]},
-                  'final LR 0.2 x seed_lr from step 0, no 3k-step warm hold'),
+                  'final LR 0.2 x seed_lr from step 0, no 3k-step warm hold', 'lr_nohold'),
 }
+# the policy settings not yet in mk_dev (models/nf_policy.py NF_PENDING_DEFAULTS): set without the key check
+PENDING_NF = ('tf_mlp_ratio', 'level_hidden')
 
 
 def put(cfg, dotted, value):
@@ -85,17 +110,17 @@ def put(cfg, dotted, value):
         if k not in node:
             raise KeyError(f'{dotted}: {k!r} is not a key of the base config')
         node = node[k]
-    if last not in node:
+    if last not in node and not (dotted.startswith('model.nf.') and last in PENDING_NF):
         raise KeyError(f'{dotted}: {last!r} is not a key of the base config (mk_dev carries every live key)')
     node[last] = value
 
 
 def arm_config(arm):
     cfg = yaml.safe_load((HERE.parent / 'mk_dev.yaml').read_text(encoding='utf-8'))
-    over, _ = ARMS[arm]
+    over, _, run_name = ARMS[arm]
     for k, v in {**BASE, **{k: v for k, v in over.items() if not k.startswith('stage.')}}.items():
         put(cfg, k, v)
-    cfg['run_name'] = arm
+    cfg['run_name'] = run_name
     stages = cfg['protocols'][cfg['protocol']]['stages']
     assert stages[0]['name'] == 'train_prior', [s['name'] for s in stages]
     p1 = dict(stages[0])

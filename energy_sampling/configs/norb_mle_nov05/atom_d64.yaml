@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: atom_d64
+run_name: blind_plain
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -178,8 +178,8 @@ model:
     tf_fp32: false
     context_dim: 128
     context_hidden: 512
-    atom_tokens: true
-    atom_node_dim: 64
+    atom_tokens: false
+    atom_node_dim: 128
     atom_convs: 3
     atom_cutoff: 10.0
     atom_radial: 32
@@ -193,7 +193,7 @@ model:
     block_orders: auto
     fold_half_rows: null
     mix_k: 0
-    row_tokens: prefix
+    row_tokens: plain
     mol_scalars: false
     sym_ops: none
     sym_ops_init: null
@@ -587,7 +587,7 @@ buffers:
     reach_topup_size: 1000
 energy_function: elj
 temperature_conditioning: false
-molecule_conditioning: true
+molecule_conditioning: false
 sg_conditioning: false
 space_groups:
 - 2

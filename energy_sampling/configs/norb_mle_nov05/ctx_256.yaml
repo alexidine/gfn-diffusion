@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: ctx_256
+run_name: mol_25
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -11,8 +11,8 @@ mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints
 checkpoint_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_k100_metric.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_conditions.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_k100_mol25.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_conditions_mol25.pt
 test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_test_w10.pt
 prior_scan_cache: false
 noised_prior:
@@ -176,7 +176,7 @@ model:
     tf_heads: 8
     tf_norm: layer
     tf_fp32: false
-    context_dim: 256
+    context_dim: 128
     context_hidden: 512
     atom_tokens: true
     atom_node_dim: 128

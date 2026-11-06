@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: tf_w512
+run_name: kick_133
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -11,7 +11,7 @@ mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints
 checkpoint_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_k100_metric.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_k100_kick133.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_conditions.pt
 test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_test_w10.pt
 prior_scan_cache: false
@@ -171,7 +171,7 @@ model:
     bound: 5.0
     hidden: 512
     hidden_layers: 2
-    tf_width: 512
+    tf_width: 256
     tf_layers: 4
     tf_heads: 8
     tf_norm: layer

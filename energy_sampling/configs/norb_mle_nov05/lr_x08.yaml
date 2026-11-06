@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: lr_x08
+run_name: wd_1e2
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -53,8 +53,8 @@ lr_fused: auto
 lr_flow: 0.1
 min_lr: 1.0e-08
 max_lr: null
-weight_decay: 0.0001
-use_weight_decay: false
+weight_decay: 0.01
+use_weight_decay: true
 progress_gate:
   mode: level
   level_window: 2500
@@ -385,13 +385,6 @@ protocols:
       on_exit:
       - snapshot:phase1_exit
       - stop
-      lr_schedule:
-      - to: 0.05
-        steps: 3000
-        kind: hold
-      - to: 0.8
-        steps: 1000
-        kind: geometric
   conditional_vargrad:
     stages:
     - name: train_prior

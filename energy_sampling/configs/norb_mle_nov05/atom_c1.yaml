@@ -1,5 +1,5 @@
 project_state_version: 10
-run_name: atom_c1
+run_name: cap128_l2
 tag: norb_mle_nov05
 smoke: false
 seed: 12345
@@ -171,16 +171,16 @@ model:
     bound: 5.0
     hidden: 512
     hidden_layers: 2
-    tf_width: 256
-    tf_layers: 4
+    tf_width: 128
+    tf_layers: 2
     tf_heads: 8
     tf_norm: layer
     tf_fp32: false
     context_dim: 128
-    context_hidden: 512
+    context_hidden: 128
     atom_tokens: true
     atom_node_dim: 128
-    atom_convs: 1
+    atom_convs: 2
     atom_cutoff: 10.0
     atom_radial: 32
     atom_point_convs: null
@@ -197,6 +197,8 @@ model:
     mol_scalars: false
     sym_ops: none
     sym_ops_init: null
+    tf_mlp_ratio: 1
+    level_hidden: 128
 drift_force:
   checkpoint: null
   chunk: 1000
