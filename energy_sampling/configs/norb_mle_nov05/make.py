@@ -54,6 +54,9 @@ CAP64 = {'model.nf.tf_width': 64, 'model.nf.tf_heads': 4, 'model.nf.tf_layers': 
          'model.nf.context_hidden': 64, 'model.nf.level_hidden': 64}
 KICK075 = {'prior_path': f'{DATA}/norbornane_p1_train_k100_kick075.pt'}
 KICK133 = {'prior_path': f'{DATA}/norbornane_p1_train_k100_kick133.pt'}
+# the 10 kT window read on each child's own energy drops nearly every kick past 0.4 A (kick133: 3% of 0.4-0.8 A kept,
+# none above 0.8 A), so a kick prior trains on the base's data; windowing each child at its parent minimum keeps them
+PARENTWIN = {'noised_prior.window_by': 'parent'}
 ARMS = {
     # reference and noise floor; LR (mk_dev: 0.05 x seed_lr held 3k steps, then to 0.2 x = 2.5e-5)
     'base': ({}, 'the base recipe', 'base'),
@@ -76,11 +79,14 @@ ARMS = {
     'atom_c5': (CAP64, 'every width <= 64, 2 layers', 'cap64_l2'),
     'window_15': ({'noised_prior.window_kT': 15.0}, 'data: minima within 15 kT (more minima per molecule; base 10)',
                   'window_15'),
-    # data sharpness: kick scale (the K100 children re-drawn at a larger radius; same seed, same held-out minima)
-    'tf_w128': (KICK075, 'children kicked up to 0.75 A (10^U(-2, -0.125); base up to 0.42 A)', 'kick_075'),
-    'tf_w512': (KICK133, 'children kicked up to 1.33 A (10^U(-2, 0.125))', 'kick_133'),
+    # data sharpness: kick scale, every kick of an in-window minimum kept (revised 2026-11-06, second revision, before
+    # any job started: the children re-drawn at a larger radius, same seed, same minima, windowed at the parent)
+    'tf_w128': ({**KICK075, **PARENTWIN}, 'children kicked up to 0.75 A, windowed at their parent minimum',
+                'kick075_parentwin'),
+    'tf_w512': ({**KICK133, **PARENTWIN}, 'children kicked up to 1.33 A, windowed at their parent minimum',
+                'kick133_parentwin'),
     'tf_l2': ({'model.nf.tf_layers': 2}, 'transformer 2 layers (base 4)', 'tf_l2'),
-    'tf_l8': ({**KICK133, **CAP128}, 'kick_133 and cap128_l2 together', 'kick133_cap128'),
+    'tf_l8': (PARENTWIN, 'the base children (up to 0.42 A), windowed at their parent minimum', 'base_parentwin'),
     # data learning curves (nested subsets of the base prior; the 35 held-out molecules unchanged)
     'norm_rms': ({'prior_path': f'{DATA}/norbornane_p1_train_k100_mol50.pt',
                   'molecules_path': f'{DATA}/norbornane_p1_train_conditions_mol50.pt'},
@@ -99,8 +105,9 @@ ARMS = {
     'lr_nohold': ({'stage.lr_schedule': [{'to': 0.2, 'steps': 1, 'kind': 'hold'}]},
                   'final LR 0.2 x seed_lr from step 0, no 3k-step warm hold', 'lr_nohold'),
 }
-# the policy settings not yet in mk_dev (models/nf_policy.py NF_PENDING_DEFAULTS): set without the key check
-PENDING_NF = ('tf_mlp_ratio', 'level_hidden')
+# settings not yet in mk_dev, set without the key check: the policy's (models/nf_policy.py NF_PENDING_DEFAULTS) and
+# the noised prior's window_by (noised_prior.py DEFAULTS)
+PENDING = ('model.nf.tf_mlp_ratio', 'model.nf.level_hidden', 'noised_prior.window_by')
 
 
 def put(cfg, dotted, value):
@@ -110,7 +117,7 @@ def put(cfg, dotted, value):
         if k not in node:
             raise KeyError(f'{dotted}: {k!r} is not a key of the base config')
         node = node[k]
-    if last not in node and not (dotted.startswith('model.nf.') and last in PENDING_NF):
+    if last not in node and dotted not in PENDING:
         raise KeyError(f'{dotted}: {last!r} is not a key of the base config (mk_dev carries every live key)')
     node[last] = value
 

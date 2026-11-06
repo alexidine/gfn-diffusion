@@ -16,8 +16,8 @@
 #   array 0: base (the base recipe); base_s2 (the base, another seed (the noise floor)); lr_x01 (final LR 0.1 x seed_lr (1.25e-5)); lr_x04 (final LR 0.4 x seed_lr (5e-5))
 #   array 1: lr_x08 (Adam weight decay 1e-2); wd_1e4 (spline bin-height floor 1e-4 (base 1e-7)); wd_1e3 (Adam weight decay 1e-3); batch_250 (spline bin-height floor 1e-3)
 #   array 2: pooled_mol (molecule as pooled vectors only, no cross-attention to atoms); atom_d64 (MOLECULE-BLIND: no conditioning, plain rows (the flow sees nothing molecule-specific)); atom_d256 (conditional with plain rows (the pair of blind_plain)); atom_c1 (every width <= 128, 2 layers (transformer MLP and level head 128 too): 734k params)
-#   array 3: atom_c5 (every width <= 64, 2 layers); window_15 (data: minima within 15 kT (more minima per molecule; base 10)); tf_w128 (children kicked up to 0.75 A (10^U(-2, -0.125); base up to 0.42 A)); tf_w512 (children kicked up to 1.33 A (10^U(-2, 0.125)))
-#   array 4: tf_l2 (transformer 2 layers (base 4)); tf_l8 (kick_133 and cap128_l2 together); norm_rms (data: 60 of the 117 molecules (their own condition file)); ctx_256 (data: 36 of the 117 molecules (their own condition file))
+#   array 3: atom_c5 (every width <= 64, 2 layers); window_15 (data: minima within 15 kT (more minima per molecule; base 10)); tf_w128 (children kicked up to 0.75 A, windowed at their parent minimum); tf_w512 (children kicked up to 1.33 A, windowed at their parent minimum)
+#   array 4: tf_l2 (transformer 2 layers (base 4)); tf_l8 (the base children (up to 0.42 A), windowed at their parent minimum); norm_rms (data: 60 of the 117 molecules (their own condition file)); ctx_256 (data: 36 of the 117 molecules (their own condition file))
 #   array 5: rows_typed (typed FD rows without the prefix physics features); bins_16 (spline 16 bins (base 32)); bins_64 (data: half of the minima of each molecule (its lowest kept)); lr_nohold (final LR 0.2 x seed_lr from step 0, no 3k-step warm hold)
 # Read: eval_test/mle and eval_test/mle_gap (between molecules), eval_bwd/mle_heldout_gap (within), against base/base_s2.
 module purge
