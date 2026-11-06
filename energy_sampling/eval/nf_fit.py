@@ -344,7 +344,8 @@ def probe_nll(run, sets, scored):
         res['sets'][name] = dict(rows=int(b.num_graphs), molecules=nm, nonfinite=int((~fin).sum()),
                                  nll=mean, nll_se=se, nll_ref=rmean, nll_ref_se=rse,
                                  nll_p90=float(torch.quantile(s['nll'][fin].double(), 0.9)) if fin.any() else None,
-                                 per_row=[float(v) for v in s['terms'][fin].mean(0)])
+                                 per_row=[float(v) for v in s['terms'][fin].mean(0)],
+                                 per_molecule=mol, per_molecule_ref=molref)
     return res
 
 

@@ -166,6 +166,21 @@ class FDCoordinates:
             s[gi[inside]] = (2 * u[inside].clamp(0.0, 1.0) - 1)
         return FDRows(s=s, ok=good, status=status)
 
+    def reframe(self, s: torch.Tensor, R0: torch.Tensor) -> FDRows:
+        """The chart rows of the crystals of s [B, d] with the molecule presented as R0 [B, 3, 3] (proper rotations)
+        applied to its standard-frame coordinates: the builder rotates the recentred molecule by the orientation R,
+        so R becomes R R0^T and no other parameter changes; then canonicalised as from_params. Rows on the +1
+        handedness sheet only (every chart row is, after canonicalisation); one off it raises, since a mirrored
+        molecule would take M R0 M (M the sheet's mirror) instead of R0."""
+        from mxtaltools.common.geometry_utils import rotmat2rotvec_stable, rotvec2rotmat
+        params, hand, _ = self.to_params(s)
+        if bool((hand != 1).any()):
+            raise NotImplementedError("reframe: a chart row off the +1 handedness sheet")
+        p = params.to(F64)
+        R = rotvec2rotmat(p[:, 9:12])
+        p[:, 9:12] = rotmat2rotvec_stable(R @ torch.as_tensor(R0).to(F64).transpose(1, 2))
+        return self.from_params(p, hand)
+
     def block_widths(self) -> list:
         """[cell, centroid, orientation] row counts of the chart (every group's chart has these three blocks, in
         this order; a group with no free centroid coordinate has a centroid block of 0 rows)."""

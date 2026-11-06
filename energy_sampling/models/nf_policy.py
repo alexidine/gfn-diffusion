@@ -74,6 +74,11 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict(
     tf_mlp_ratio=4,                 # each transformer layer's MLP is tf_width -> tf_mlp_ratio x tf_width -> tf_width
     level_hidden=256,               # the level head's (log Z(c)) residual MLP width (conditional route)
+    frames=False,                   # True (molecule route, an atom encoder): the condition carries the frame the row's
+                                    # molecule is presented in, a unit quaternion (w, x, y, z), and the encoder reads the
+                                    # molecule's atoms rotated into it; a row's frame is mol_batch.presented_frame
+                                    # [n, 4] when the batch carries it (the MLE draw under train.py nf frames), else the
+                                    # standard frame (every other draw and every readout)
 )
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
@@ -324,13 +329,17 @@ class NFPolicy(nn.Module):
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
+            if s['frames'] and (atoms is None or atoms['encoder'] == 'none'):
+                raise ValueError("flow frames rotate the atoms an encoder reads: they need atom_tokens True, 'split' "
+                                 "or 'split_pooled'")
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
-            cond_dim = 1 + self.conditions_dim if atoms is not None else self.conditions_dim
+            cond_dim = (1 + 4 * int(bool(s['frames'])) + self.conditions_dim if atoms is not None
+                        else self.conditions_dim)
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
                                                  transformer=transformer, atoms=atoms, bounded_rows=bounded,
                                                  describer=describer, mlp_ratio=int(s['tf_mlp_ratio']),
-                                                 level_hidden=int(s['level_hidden']))
+                                                 level_hidden=int(s['level_hidden']), frames=bool(s['frames']))
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -399,7 +408,8 @@ class NFPolicy(nn.Module):
         if self.conditional and self.conditions_dim > 0 and conditions is not None and conditions.shape[-1] > 0:
             c = conditions.to(self.device, torch.float32)
             if self.settings['atom_tokens']:   # column 0 is the row id, never standardised (_context)
-                c = torch.cat([torch.zeros_like(c[:, :1]), c], -1)
+                c = torch.cat([torch.zeros_like(c[:, :1]).expand(-1, 1 + 4 * int(bool(self.settings['frames']))), c],
+                              -1)   # (and the frame's four columns under frames)
             self.sampler.flow.set_condition_scaler(c)
         self.scalers_fitted.fill_(True)
 
@@ -461,13 +471,21 @@ class NFPolicy(nn.Module):
             self.sampler.flow.set_row_radius(radius, mol)
         ids = (torch.arange(n, device=self.device, dtype=torch.float32) if row_mol is None
                else row_mol.to(torch.float32))[:, None]
+        first = 1
+        if self.settings['frames']:   # the frame each row's molecule is presented in: the standard one unless given
+            q = getattr(mol_batch, 'presented_frame', None)
+            if q is None:
+                q = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(n, 4)
+            q = torch.as_tensor(q).reshape(n, 4).to(self.device, torch.float32)
+            ids = torch.cat([ids, q], -1)
+            first = 5
         if self.conditions_dim == 0:
             return ids
         if condition is None or condition.shape[-1] != self.conditions_dim:
             raise ValueError(f"molecule mode with {self.conditions_dim} condition columns (temperature, space group, "
                              f"Z') needs them passed: got {None if condition is None else tuple(condition.shape)}")
         f = self.sampler.flow   # standardised here, not in the flow, which inn_modeller also drives raw
-        rest = (condition.to(self.device, torch.float32) - f.c_mu[1:]) / f.c_sd[1:]
+        rest = (condition.to(self.device, torch.float32) - f.c_mu[first:]) / f.c_sd[first:]
         return torch.cat([ids, rest], -1)
 
     def _row_atom_table(self, mol_batch, n):
