@@ -210,17 +210,19 @@ FD_BLOCKS = ('cell', 'centroid', 'orientation')
 PAD = 'pad'
 
 
-#: groups whose chart point moves only in its orientation rows when the molecule's frame changes (no symmetry
-#: operation folds the orientation into another cell or centroid): rotate_orientation is exact there
-FRAME_FREE_GROUPS = (1, 2)
+#: groups whose orientation block is the K-cut hemisphere (crystal_fd KCutHemisphereChart): a frame change there can
+#: leave the cut, and folding it back is not a change of the orientation rows alone, so rotate_orientation refuses them
+KCUT_GROUPS = (6, 7, 8, 9)
 #: the hemisphere chart's bounds per orientation coordinate (mxtaltools crystal_fd.charts.OrientationChart.bounds)
 HEMISPHERE_BOUNDS = ((0.0, math.pi / 2), (-math.pi, math.pi), (0.0, 2 * math.pi))
 
 
 def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
     """(s' [n, d], log |ds'/ds| [n]) of FD chart rows s [n, d] with the molecule presented as R0 [n, 3, 3] applied to
-    its standard-frame coordinates: the orientation R becomes R R0^T and no other row moves (FRAME_FREE_GROUPS only;
-    FDCoordinates.reframe is the exact, CPU-bound reference). Torch on s's device and dtype; the rotation in float64.
+    its standard-frame coordinates: the orientation R becomes R R0^T and no other row moves, on any group whose
+    orientation block is the plain hemisphere chart (frame_rows; FDCoordinates.reframe is the exact, CPU-bound
+    reference, which agrees on every such group tested, tests/crystal/test_fd_reframe.py). Torch on s's device and
+    dtype; the rotation in float64.
     The map preserves Haar measure, so log |ds'/ds| = log rho(y) - log rho(y'), rho the hemisphere chart's Haar
     density (the unit map's constant scale cancels)."""
     from mxtaltools.crystal_fd import so3
@@ -235,6 +237,29 @@ def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
     out[:, rows] = (2 * (y2 - lo) / (hi - lo) - 1).to(s.dtype)
     log_jac = so3.haar_log_density('hemisphere', y) - so3.haar_log_density('hemisphere', y2)
     return out, log_jac.to(s.dtype)
+
+
+def frame_rows(groups):
+    """The state rows (theta, phi, r) rotate_orientation re-expresses, for a run over `groups`: one group's chart
+    indices, or several groups' shared orientation slots (FDSlotLayout). Raises for a K-cut group, or a layout whose
+    groups do not share those slots."""
+    groups = sorted({int(g) for g in groups})
+    bad = [g for g in groups if g in KCUT_GROUPS]
+    if bad:
+        raise NotImplementedError(f"a frame change on the K-cut orientation chart of sg {bad} is not a change of its "
+                                  f"orientation rows alone")
+    if len(groups) == 1:
+        names = FDCoordinates(groups[0], 3.0).names
+        return [names.index(k) for k in ('theta', 'phi', 'r')]
+    layout = FDSlotLayout(groups)
+    rows = None
+    for g in groups:
+        names = layout.group_names[g]
+        r = [names.index(k) for k in ('theta', 'phi', 'r')]
+        if rows is not None and r != rows:
+            raise NotImplementedError(f"sg {groups}: the orientation rows sit in different slots")
+        rows = r
+    return rows
 
 
 class FDSlotLayout:

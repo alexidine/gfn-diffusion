@@ -8,7 +8,7 @@ So:
   * a training-mode forward draw returns a standard-frame state whose log q is that same backward score under the
     draw's own frame (sample -> standard -> re-expressed is the identity);
   * a frame in the condition equals the standard frame with the molecule's atoms rotated by it;
-  * rotate_frames are refused off sg 1-2 or without an atom encoder.
+  * rotate_frames are refused on the K-cut groups (6-9) or without an atom encoder.
 
     python -m pytest -q tests/models/test_nf_rotate_frames.py
 """
@@ -96,7 +96,7 @@ def test_a_frame_in_the_condition_is_the_molecule_rotated():
 
 
 def test_rotate_frames_are_refused_where_they_do_not_hold():
-    with pytest.raises(NotImplementedError, match='rotate_frames'):
-        _typed_policy(14, scale=0.0, atom_tokens='split', rotate_frames=True)
+    with pytest.raises(NotImplementedError, match='K-cut'):
+        _typed_policy(7, scale=0.0, atom_tokens="split", rotate_frames=True)   # a K-cut group
     with pytest.raises(ValueError, match='rotate_frames'):
         _typed_policy(2, scale=0.0, atom_tokens='scalars', rotate_frames=True)

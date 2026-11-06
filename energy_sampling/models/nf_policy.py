@@ -74,7 +74,7 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict(
     tf_mlp_ratio=4,                 # each transformer layer's MLP is tf_width -> tf_mlp_ratio x tf_width -> tf_width
     level_hidden=256,               # the level head's (log Z(c)) residual MLP width (conditional route)
-    rotate_frames=False,            # True (molecule route with an atom encoder, FD chart of sg 1 or 2): every training-
+    rotate_frames=False,            # True (molecule route with an atom encoder, FD chart, no K-cut group): every training-
                                     # mode step presents each row's molecule in a fresh random frame R0 (uniform on
                                     # SO(3)): the encoder reads the atoms rotated by R0 (the quaternion rides in the
                                     # condition) and the flow models the orientation rows re-expressed for that frame
@@ -333,15 +333,16 @@ class NFPolicy(nn.Module):
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
             if s['rotate_frames']:
-                from energies.fd_coordinates import FRAME_FREE_GROUPS, FDCoordinates
+                from energies.fd_coordinates import frame_rows
                 if atoms is None or atoms['encoder'] == 'none':
                     raise ValueError("flow rotate_frames rotate the atoms an encoder reads: they need atom_tokens "
                                      "True, 'split' or 'split_pooled'")
-                if fd_space_group is None or self.fd_slots is not None or int(fd_space_group) not in FRAME_FREE_GROUPS:
-                    raise NotImplementedError(f"flow rotate_frames re-expresses FD orientation rows alone: one space "
-                                              f"group of {FRAME_FREE_GROUPS} on the FD chart, got {fd_space_group}")
-                names = FDCoordinates(int(fd_space_group), 3.0).names
-                self.orientation_rows = [names.index(k) for k in ('theta', 'phi', 'r')]
+                groups = (self.fd_slots.groups if self.fd_slots is not None
+                          else [fd_space_group] if fd_space_group is not None else None)
+                if groups is None:
+                    raise NotImplementedError("flow rotate_frames re-express the FD chart's orientation rows: they "
+                                              "need energy_config.crystal_coordinates fd")
+                self.orientation_rows = frame_rows(groups)   # raises for the K-cut groups (6-9)
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
             cond_dim = (1 + 4 * int(bool(s['rotate_frames'])) + self.conditions_dim if atoms is not None
                         else self.conditions_dim)   # the row id (and the frame's quaternion), then the columns

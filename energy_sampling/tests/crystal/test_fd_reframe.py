@@ -138,3 +138,52 @@ def test_the_fast_rotation_log_jacobian_is_the_maps_own():
         f = lambda o: rotate_orientation(torch.cat([s[i:i + 1, :9], o[None]], 1), R0[i:i + 1])[0][0, 9:]
         J = torch.autograd.functional.jacobian(f, s[i, 9:].clone())
         assert abs(float(torch.log(torch.linalg.det(J).abs())) - float(log_jac[i])) < 1e-6
+
+
+def _crystals_sg(sg, n=20, seed=0):
+    """n random Z' = 1 crystals of space group sg (angles fixed by its lattice: triclinic free, monoclinic beta,
+    orthorhombic right)."""
+    h = math.pi / 2
+    ang = [1.5, 1.6, 1.7] if sg <= 2 else [h, 1.8, h] if sg <= 15 else [h, h, h]
+    g = torch.Generator().manual_seed(seed)
+    rows = []
+    for i in range(n):
+        pos = torch.tensor([[-0.8, -0.2, 0.0], [0.7, -0.1, 0.1], [0.1, 0.8, -0.1], [0.4, 0.3, 0.9]])
+        mol = MolData(z=torch.tensor([6, 7, 8, 6]), pos=pos, x=torch.zeros((4, 1)), identifier=f'syn-{i}',
+                      mol_volume=torch.tensor(55.0), mass=torch.tensor(54.0), radius=torch.tensor(RADIUS),
+                      z_prime=torch.tensor(1, dtype=torch.long))
+        ax = torch.randn(3, generator=g)
+        rv = ax / ax.norm() * (0.2 + 2.8 * torch.rand(1, generator=g))
+        rows.append(MolCrystalData(molecule=mol, sg_ind=sg, z_prime=torch.tensor(1),
+                                   cell_lengths=torch.tensor([6.0, 7.0, 8.0]) + torch.rand(3, generator=g),
+                                   cell_angles=torch.tensor(ang), aunit_centroid=torch.rand(3, generator=g) * 0.5,
+                                   aunit_orientation=rv.float(), aunit_handedness=torch.tensor([1.0]),
+                                   identifier=f'syn-{i}', max_z_prime=1))
+    return collate_data_list(rows, max_z_prime=1)
+
+
+@pytest.mark.parametrize('sg', (1, 4, 14, 15, 19, 33, 61))
+def test_the_fast_rotation_is_exact_on_hemisphere_chart_groups(sg):
+    from energies.fd_coordinates import frame_rows, rotate_orientation
+    b = _crystals_sg(sg, seed=sg)
+    fd = FDCoordinates(sg, RADIUS)
+    r = fd.from_params(b.full_cell_parameters(), b.aunit_handedness.reshape(-1))
+    s = r.s[r.ok]
+    R0 = _frames(len(s), 40 + sg)
+    exact = fd.reframe(s, R0)
+    assert bool(exact.ok.all())
+    fast, _ = rotate_orientation(s, R0, rows=frame_rows([sg]))
+    d = fast - exact.s
+    wrap = torch.tensor(fd.wrap_mask)
+    d = torch.where(wrap, d - 2 * torch.round(d / 2), d)
+    assert float(d.abs().max()) < 1e-4, (sg, float(d.abs().max()))
+
+
+def test_frame_rows_refuse_the_k_cut_groups():
+    from energies.fd_coordinates import frame_rows
+    for sg in (6, 7, 8, 9):
+        with pytest.raises(NotImplementedError, match='K-cut'):
+            frame_rows([sg])
+    with pytest.raises(NotImplementedError, match='K-cut'):
+        frame_rows([2, 7])
+    assert frame_rows([2, 14]) == frame_rows([2]) or len(frame_rows([2, 14])) == 3
