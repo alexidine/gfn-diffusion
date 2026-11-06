@@ -68,7 +68,10 @@ NF_DEFAULTS = dict(
 # settings built after mk_dev's nf block was last edited (mk_dev is owner-edited): accepted and defaulted like
 # NF_DEFAULTS, absent from mk_dev until the owner adds them, then moved into NF_DEFAULTS (tests/models/test_nf_policy.py
 # pins both halves)
-NF_PENDING_DEFAULTS = dict()
+NF_PENDING_DEFAULTS = dict(
+    tf_mlp_ratio=4,                 # each transformer layer's MLP is tf_width -> tf_mlp_ratio x tf_width -> tf_width
+    level_hidden=256,               # the level head's (log Z(c)) residual MLP width (conditional route)
+)
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
 #: sym_ops: 'pooled' and 'tokens' are built; 'tokens_dynamic' (op tokens in the cross-attention memory, static or
@@ -322,7 +325,8 @@ class NFPolicy(nn.Module):
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
                                                  transformer=transformer, atoms=atoms, bounded_rows=bounded,
-                                                 describer=describer)
+                                                 describer=describer, mlp_ratio=int(s['tf_mlp_ratio']),
+                                                 level_hidden=int(s['level_hidden']))
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -337,7 +341,8 @@ class NFPolicy(nn.Module):
         else:
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
                                       transformer=transformer, block_orders=orders, half_rows=half_rows,
-                                      bounded_rows=bounded, mix_k=int(s['mix_k']), describer=describer)
+                                      bounded_rows=bounded, mix_k=int(s['mix_k']), describer=describer,
+                                      mlp_ratio=int(s['tf_mlp_ratio']))
             self._mol_radius = self._mol_volume = None   # typed rows: the one molecule's, from the first batch
             self.flow_model = LearnableScalar(0.0)
             blocks = self.sampler.flow.blocks

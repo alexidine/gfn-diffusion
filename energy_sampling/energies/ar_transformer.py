@@ -93,7 +93,7 @@ class CausalTransformerConditioner(nn.Module):
     """Features of x in, spline parameters of every dim out (dim order), autoregressive in `order`."""
 
     def __init__(self, order, feat_dim, n_bins, width=256, layers=4, heads=8, norm='layer', context_dim=None,
-                 cross=False, row_types=None, n_types=None, extra_dim=0):
+                 cross=False, row_types=None, n_types=None, extra_dim=0, mlp_ratio=4):
         super().__init__()
         # conditional runs: the condition's embedding, projected to the width, is added to every token; with `cross`,
         # every layer also cross-attends to a memory of tokens passed with it (forward's ctx = (vector, memory, mask))
@@ -121,7 +121,9 @@ class CausalTransformerConditioner(nn.Module):
             nn.init.zeros_(self.extra.weight)   # every weight, so the zero hides no leak there
             nn.init.zeros_(self.extra.bias)
         self.start = nn.Parameter(torch.zeros(width))
-        self.layers = nn.ModuleList(_CausalLayer(width, heads, cross=cross, norm=norm) for _ in range(layers))
+        # mlp_ratio: each layer's MLP is width -> mlp_ratio x width -> width (nf tf_mlp_ratio)
+        self.layers = nn.ModuleList(_CausalLayer(width, heads, mlp_ratio=int(mlp_ratio), cross=cross, norm=norm)
+                                    for _ in range(layers))
         self.ln = _norm(norm, width)
         self.bf16 = True
         self.head = nn.Linear(width, self.n_params)

@@ -201,7 +201,7 @@ class LatentFlow(nn.Module):
     """q(x) over the full latent: a spline flow on the live rows, dead rows pinned at 0."""
 
     def __init__(self, dim, wrap_mask, dead_rows, n_blocks, n_bins, hidden, bound, seed, transformer=None,
-                 block_orders=None, half_rows=(), bounded_rows=(), mix_k=0, describer=None):
+                 block_orders=None, half_rows=(), bounded_rows=(), mix_k=0, describer=None, mlp_ratio=4):
         super().__init__()
         self.mix_k = int(mix_k)
         dead = {int(d) for d in dead_rows}
@@ -260,7 +260,8 @@ class LatentFlow(nn.Module):
         self.register_buffer('row_radius', None, persistent=False)
         if transformer is not None:  # (width, layers, heads): each block's MADE replaced by a causal transformer
             for blk, order in zip(self.flow.blocks, self.flow.orders):
-                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer, **typed)
+                blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
+                                                        mlp_ratio=mlp_ratio, **typed)
                 if isinstance(blk, _MixBlock):
                     blk.widen_head()
         elif self.mix_k:
@@ -593,7 +594,8 @@ class _ContextFlow(nn.Module):
     """The blocks of a conditional flow, the condition's embedding, and the level head."""
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
-                 transformer=None, atoms=None, bounded_mask=None, frames=False, describer=None):
+                 transformer=None, atoms=None, bounded_mask=None, frames=False, describer=None, mlp_ratio=4,
+                 level_hidden=256):
         super().__init__()
         d = len(wrap_mask)
         # bounded dims (see _Block) are not standardised and take a uniform base, as wrapped dims do
@@ -664,7 +666,7 @@ class _ContextFlow(nn.Module):
             for blk, order in zip(self.blocks, orders):
                 blk.made = CausalTransformerConditioner(order, blk.feat_dim.tolist(), n_bins, *transformer,
                                                         context_dim=context_dim, cross=self.atoms and self.cross,
-                                                        **typed)
+                                                        mlp_ratio=mlp_ratio, **typed)
         elif self.atoms:
             raise NotImplementedError("atom tokens need --conditioner transformer (the MADE has no cross-attention)")
         n_in = n_ctx = cond_dim
@@ -689,7 +691,7 @@ class _ContextFlow(nn.Module):
             for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):
                 self.register_buffer(name, None, persistent=False)
         self.context = _ResMLP(n_ctx, context_hidden, context_dim)
-        self.level = _ResMLP(n_in, 256, 1)
+        self.level = _ResMLP(n_in, int(level_hidden), 1)   # nf level_hidden
         nn.init.zeros_(self.level.out[-1].weight)
         nn.init.zeros_(self.level.out[-1].bias)
         self._shared = None   # context_input's results by condition tensor while ConditionalLatentFlow.shared_context is open
@@ -840,7 +842,7 @@ class ConditionalLatentFlow(nn.Module):
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
                  n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, bounded_rows=(), frames=False,
-                 describer=None):
+                 describer=None, mlp_ratio=4, level_hidden=256):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
@@ -853,7 +855,7 @@ class ConditionalLatentFlow(nn.Module):
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
                                  n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
                                  bounded_mask=[i in self.bounded_rows for i in live], frames=frames,
-                                 describer=describer)
+                                 describer=describer, mlp_ratio=mlp_ratio, level_hidden=level_hidden)
 
     def to_base(self, x, c, detach_context: bool = False):
         f = self.flow
