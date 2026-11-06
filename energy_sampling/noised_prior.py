@@ -54,9 +54,10 @@ FD_CACHE_CHECK_ROWS = 256
 
 
 def file_identity(path) -> dict:
-    """The size and modification time of the file at `path`: what a sidecar cache keys the file on."""
-    st = os.stat(path)
-    return dict(size=int(st.st_size), mtime_ns=int(st.st_mtime_ns))
+    """The size of the file at `path`: what a sidecar cache keys the file on. Not its modification time, which a copy
+    to another host changes: the chart cache re-converts FD_CACHE_CHECK_ROWS rows against itself on every read, so a
+    file of the same size with other contents still misses (and the bank keys on that check's digest)."""
+    return dict(size=int(os.stat(path).st_size))
 
 
 def digest(*tensors) -> str:

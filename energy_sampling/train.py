@@ -4534,7 +4534,7 @@ class Modeller:
 
     def _fd_chart_points_cached(self, batch, prior_path):
         """_fd_chart_points of a whole pre-noised prior file's batch, through the sidecar cache beside `prior_path`
-        (noised_prior.cache_path 'fdchart', keyed on the file's size and modification time, its row count and this
+        (noised_prior.cache_path 'fdchart', keyed on the file's size (not its mtime: a copy keeps the cache), its row count and this
         run's FD layout). A cached result is used only after a fresh conversion of noised_prior.FD_CACHE_CHECK_ROWS
         rows agrees with it; a disagreement (the chart code changed) recomputes and rewrites. Sets
         self._fd_chart_digest, the digest of those rows' chart points, which the metric bank's cache keys on."""
