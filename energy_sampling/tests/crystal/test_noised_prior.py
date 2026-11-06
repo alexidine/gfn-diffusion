@@ -235,6 +235,29 @@ def test_basin_kernel_children_are_windowed_by_their_basin():
     assert by_row['train'].tolist() == [False] * 5
 
 
+
+def test_window_by_parent_windows_a_child_at_its_anchors_energy():
+    # rows: anchor 0 (E 0), anchor 1 (E 10), child of 0 at E 50 (a long kick), child of 1 at E 0.5
+    seed = torch.tensor([0.0, 10.0, 50.0, 0.5], dtype=torch.float64)
+    kinds = torch.tensor([0, 0, 1, 1])
+    parents = torch.tensor([0, 1, 0, 1])
+    zeros = torch.zeros(4, dtype=torch.long)
+    assert torch.equal(NP.window_energy(seed, kinds, zeros, None, {'child_kernel': 'metric'}), seed)
+    we = NP.window_energy(seed, kinds, zeros, None, {'child_kernel': 'metric'}, by='parent', parents=parents)
+    assert we.tolist() == [0.0, 10.0, 0.0, 10.0]
+    packing = torch.full((4,), 0.7, dtype=torch.float64)
+    s = _settings(window_kT=2.0, window_by='parent')
+    by_parent, _ = NP.select_rows(seed, packing, kinds, zeros, zeros, 1.0, s, window_e=we)
+    assert by_parent['train'].tolist() == [False, False, True, False]    # the long kick of the low minimum stays
+    by_row, _ = NP.select_rows(seed, packing, kinds, zeros, zeros, 1.0, _settings(window_kT=2.0))
+    assert by_row['train'].tolist() == [False, False, False, True]       # each row by its own energy
+    with pytest.raises(ValueError, match='needs'):
+        NP.window_energy(seed, kinds, zeros, None, None, by='parent')
+    with pytest.raises(ValueError, match='not an anchor'):
+        NP.window_energy(seed, kinds, zeros, None, None, by='parent', parents=torch.tensor([0, 1, 3, 1]))
+    with pytest.raises(ValueError, match='window_by'):
+        _settings(window_by='anchor')
+
 def test_the_builder_refuses_kernel_flags_its_child_kernel_does_not_read():
     from data_processing.build_noised_prior import build_parser, check_child_kernel_args
     base = ['--config', 'c.yaml', '--out', 'o.pt']

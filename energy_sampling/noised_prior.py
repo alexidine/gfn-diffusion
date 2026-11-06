@@ -37,7 +37,11 @@ CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
-                live_bank=64, live_fresh_frac=0.1, live_shape='hessian')
+                live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row')
+#: window_by: the energy a child's energy window reads (window_energy): 'row' its own (a basin-kernel build always
+#: reads its basin's anchor), 'parent' its parent anchor's (noised_parent), so a minimum passes or fails the window
+#: with every kick of it, long kicks included
+WINDOW_BY = ('row', 'parent')
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row
 LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric')
@@ -141,6 +145,8 @@ def settings(args):
     f = s['live_fresh_frac']
     if isinstance(f, bool) or not isinstance(f, (int, float)) or not 0 <= f <= 1:
         raise ValueError(f"noised_prior.live_fresh_frac must be a number in [0, 1], got {f!r}")
+    if s['window_by'] not in WINDOW_BY:
+        raise ValueError(f"noised_prior.window_by must be one of {WINDOW_BY}, got {s['window_by']!r}")
     if s['live_shape'] not in LIVE_SHAPES:
         raise ValueError(f"noised_prior.live_shape must be one of {LIVE_SHAPES}, got {s['live_shape']!r}")
     if s['live_shape'] != DEFAULTS['live_shape'] and s['live_kernel'] != 'basin':
@@ -433,14 +439,30 @@ def compare_terms(stored, fresh, energy_attr):
     return worst_ratio, worst_abs, per_term
 
 
-def window_energy(seed_energy, kinds, groups, basin_ids, manifest):
+def window_energy(seed_energy, kinds, groups, basin_ids, manifest, by='row', parents=None):
     """[n] float64: the energy each row's energy window reads. A build whose children were drawn by the basin kernel
     (manifest child_kernel 'basin') windows a child by its basin's anchor's energy (the anchor of its condition group
-    with its basin_id), so a basin passes or fails the energy window with every draw of it; every other row reads its
-    own. Keyed on (condition group, basin_id), not on row indices, so it holds on a subset of the file's rows; a child
-    whose basin has no anchor among the rows raises. The packing window and the FD chart still cut draws one by one."""
+    with its basin_id), so a basin passes or fails the energy window with every draw of it. Keyed on (condition group,
+    basin_id), not on row indices, so it holds on a subset of the file's rows; a child whose basin has no anchor among
+    the rows raises. Any other build: by 'row' (cfg:noised_prior.window_by) every row reads its own; by 'parent' a
+    child reads its parent anchor's (parents: noised_parent, row indices into these same rows; a parent that is not an
+    anchor raises). The packing window and the FD chart still cut draws one by one."""
     if (manifest or {}).get('child_kernel') != 'basin':
-        return seed_energy
+        if by == 'row':
+            return seed_energy
+        if by != 'parent':
+            raise ValueError(f"window_energy: by must be one of {WINDOW_BY}, got {by!r}")
+        if parents is None:
+            raise ValueError("window_energy: by 'parent' needs the rows' noised_parent")
+        kinds = torch.as_tensor(kinds).reshape(-1).long()
+        parents = torch.as_tensor(parents).reshape(-1).long()
+        child = kinds == KIND_CHILD
+        bad = int((kinds[parents[child]] != KIND_ANCHOR).sum())
+        if bad:
+            raise ValueError(f"window_energy: {bad} children whose noised_parent is not an anchor among these rows")
+        out = seed_energy.clone()
+        out[child] = seed_energy[parents[child]]
+        return out
     kinds = torch.as_tensor(kinds).reshape(-1).long()
     key = torch.as_tensor(groups).reshape(-1).long() * (1 << 32) + torch.as_tensor(basin_ids).reshape(-1).long()
     anchor = kinds == KIND_ANCHOR

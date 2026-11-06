@@ -4623,7 +4623,9 @@ class Modeller:
         kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
         packing = torch.as_tensor(prior.packing_coeff).reshape(-1).double().cpu()
         groups = noised_prior.condition_groups(prior)
-        window_e = noised_prior.window_energy(seed_e, kinds, groups, getattr(prior, 'basin_id', None), manifest)
+        window_e = noised_prior.window_energy(
+            seed_e, kinds, groups, getattr(prior, 'basin_id', None), manifest, by=s['window_by'],
+            parents=noised_prior.tag(prior, 'noised_parent') if s['window_by'] == 'parent' else None)
         self._noised_prior_manifest = manifest   # read by the kernel readouts' fresh gap (_kernel_readouts)
         masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s, window_e=window_e)
         keep = masks['train'] & torch.isfinite(log_r)
