@@ -88,9 +88,6 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
-#: model.nf frames: the seed of the per-row frames of a pre-noised FD prior (Modeller._fd_frame_points_cached); part
-#: of the sidecar's key, so changing it rebuilds the frames
-FD_FRAMES_SEED = 20261106
 
 #: WALL-CLOCK SECONDS a set of occupancy readings must span before their mean is
 #: allowed to stand for anything -- the metric windows and the sizer's per-rung
@@ -4568,59 +4565,6 @@ class Modeller:
         self._fd_chart_digest = noised_prior.digest(ok[idx], state[idx])
         return ok, state, log_ref
 
-    def _nf_frames(self) -> bool:
-        """model.nf frames: the MLE draw presents each row's molecule in the row's own pre-built frame
-        (_fd_frame_points_cached); every other draw and every readout reads the standard frame."""
-        pol = getattr(self.args, 'policy', None)
-        if pol is None or getattr(pol, 'kind', 'sde') != 'nf':
-            return False
-        nf = getattr(pol, 'nf', None)
-        nf = dict(vars(nf)) if nf is not None and not isinstance(nf, dict) else dict(nf or {})
-        return bool(nf.get('frames', False))
-
-    def _fd_frame_points_cached(self, batch, prior_path, points):
-        """model.nf frames on the FD chart: per stored row, one frame R0 drawn uniformly on SO(3) (seeded by the row
-        index, so a file's frames are fixed) and the row's chart point with the molecule presented in it
-        (energies/fd_coordinates.py::FDCoordinates.reframe), through the sidecar cache 'fdframes' beside
-        `prior_path`, keyed as the chart cache. ([n, 4] quaternions (w, x, y, z), [n, data_ndim] chart rows): a row
-        with no chart point, or whose reframed row does not chart, keeps the standard frame and its own point."""
-        from models.spline_flow import quat_to_rotmat
-        ef = self.energy_function
-        ok, state, _ = points
-        n = int(batch.num_graphs)
-        key = dict(file=noised_prior.file_identity(prior_path), rows=n, data_ndim=int(ef.data_ndim),
-                   space_groups=[int(g) for g in getattr(ef.fd_layout, 'groups', [])] or None, frames=FD_FRAMES_SEED,
-                   digest=getattr(self, '_fd_chart_digest', None))
-        side = noised_prior.cache_path(prior_path, 'fdframes', key)
-        hit = noised_prior.load_cache(side, key)
-        if hit is not None:
-            print(f"fd frames: {n} rows' frames read from {side}", flush=True)
-            return hit['q'], hit['state']
-        t0 = time()
-        g = torch.Generator().manual_seed(FD_FRAMES_SEED)
-        q = torch.randn(n, 4, generator=g, dtype=torch.float64)
-        q = q / q.norm(dim=1, keepdim=True)
-        q = torch.where(q[:, :1] < 0, -q, q)
-        framed = state.clone()
-        sg = batch.sg_ind.reshape(-1).cpu()
-        radius = batch.radius.reshape(-1).detach().cpu().double()
-        moved = torch.zeros(n, dtype=torch.bool)
-        for grp in sorted(set(sg.tolist())):
-            rows_g = torch.nonzero((sg == grp) & ok).flatten()
-            for lo in range(0, rows_g.numel(), 50000):
-                rows = rows_g[lo:lo + 50000]
-                fc = ef.fd_coordinates_rows(int(grp), radius[rows])
-                r = fc.reframe(ef.fd_layout.unpack(int(grp), state[rows].double()), quat_to_rotmat(q[rows]))
-                good = rows[r.ok]
-                framed[good] = ef.fd_layout.pack(int(grp), r.s[r.ok].float())
-                moved[good] = True
-        q[~moved] = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
-        q = q.float()
-        wrote = noised_prior.save_cache(side, key, q=q, state=framed)
-        print(f"fd frames: {int(moved.sum())} of {n} rows reframed in {time() - t0:.0f} s"
-              + (f", written to {side}" if wrote else ''), flush=True)
-        return q, framed
-
     def _attach_fd_reference(self, batch, points=None):
         """crystal_coordinates 'fd': each stored row's log reference density on the FD chart (what generator_energy's
         Jacobian reads, `fd_log_reference`, otherwise set only when a crystal is built from FD rows) and its chart
@@ -4657,12 +4601,7 @@ class Modeller:
 
         fd_ok = None
         if getattr(ef, 'crystal_coordinates', 'latent') == 'fd':
-            points = self._fd_chart_points_cached(prior, self.args.prior_path)
-            fd_ok = self._attach_fd_reference(prior, points)
-            if self._nf_frames():   # each row's own frame and its chart point in it, read by the MLE draw only
-                fq, fs = self._fd_frame_points_cached(prior, self.args.prior_path, points)
-                prior.add_graph_attr(fq.to(prior.ptr.device), 'fd_frame_q')
-                prior.add_graph_attr(fs.to(prior.ptr.device), 'fd_frame_state')
+            fd_ok = self._attach_fd_reference(prior, self._fd_chart_points_cached(prior, self.args.prior_path))
             print(f"pre-noised prior: FD chart points for {int(fd_ok.sum())} of {fd_ok.numel()} rows "
                   f"(rows without one are dropped)", flush=True)
         idx = noised_prior.check_rows(prior, s['check_rows'], seed=int(self.args.seed))
@@ -8335,19 +8274,6 @@ class Modeller:
             latents = self._batch_latents(mol_batch)
             latents = latents.to(self.device)
             self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(len(inds))
-            frame_q = None
-            if self._nf_frames():   # model.nf frames: the row's own frame and its chart point in that frame
-                fs = getattr(mol_batch, 'fd_frame_state', None)
-                if fs is None or (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
-                    raise NotImplementedError("model.nf frames read a pre-noised FD prior's pre-built frames "
-                                              "(fd_frame_state), without noised_prior.live_kernel")
-                latents = fs.reshape(int(mol_batch.num_graphs), -1).to(self.device)
-                frame_q = mol_batch.fd_frame_q.reshape(-1, 4)
-                if not getattr(self, '_frames_announced', False):
-                    self._frames_announced = True
-                    moved = int((frame_q[:, 0] < 1 - 1e-6).sum())
-                    print(f"MLE draw: rows presented in their pre-built frames ({moved} of {len(frame_q)} rows of "
-                          f"the first batch off the standard frame)", flush=True)
             if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
                 # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
                 latents = self._live_kernel_draw(latents, inds, mol_batch)
@@ -8398,8 +8324,6 @@ class Modeller:
         mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
             z_primes=mol_batch.z_prime.reshape(-1).long())
-        if self.bwd_sampling_mode == 'dataset' and frame_q is not None:
-            mol_batch.presented_frame = frame_q.to(self.device)   # read by models/nf_policy.py::NFPolicy._context
         temperature = 10 ** log_T_tensor
         if self._bwd_draw_is_reward_free():
             log_reward = None   # an MLE-only stage never reads log R (get_gfn_backward_loss log_r None)

@@ -111,3 +111,30 @@ def test_reframe_round_trips():
     wrap = torch.tensor(fd.wrap_mask)
     d = torch.where(wrap, d - 2 * torch.round(d / 2), d)
     assert float(d.abs().max()) < 1e-6, float(d.abs().max())
+
+
+def test_the_fast_orientation_rotation_matches_the_exact_reframe():
+    from energies.fd_coordinates import rotate_orientation
+    for seed in range(3):
+        b = _crystals(seed=seed)
+        fd = FDCoordinates(2, RADIUS)
+        s = fd.from_params(b.full_cell_parameters(), b.aunit_handedness.reshape(-1)).s
+        R0 = _frames(int(b.num_graphs), 20 + seed)
+        exact = fd.reframe(s, R0).s
+        fast, _ = rotate_orientation(s, R0, rows=[fd.names.index(k) for k in ('theta', 'phi', 'r')])
+        d = fast - exact
+        wrap = torch.tensor(fd.wrap_mask)
+        d = torch.where(wrap, d - 2 * torch.round(d / 2), d)
+        assert float(d.abs().max()) < 1e-5, float(d.abs().max())
+
+
+def test_the_fast_rotation_log_jacobian_is_the_maps_own():
+    from energies.fd_coordinates import rotate_orientation
+    g = torch.Generator().manual_seed(9)
+    s = torch.rand(6, 12, generator=g, dtype=torch.float64) * 1.6 - 0.8
+    R0 = _frames(6, 30)
+    _, log_jac = rotate_orientation(s, R0)
+    for i in range(6):
+        f = lambda o: rotate_orientation(torch.cat([s[i:i + 1, :9], o[None]], 1), R0[i:i + 1])[0][0, 9:]
+        J = torch.autograd.functional.jacobian(f, s[i, 9:].clone())
+        assert abs(float(torch.log(torch.linalg.det(J).abs())) - float(log_jac[i])) < 1e-6

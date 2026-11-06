@@ -74,11 +74,13 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict(
     tf_mlp_ratio=4,                 # each transformer layer's MLP is tf_width -> tf_mlp_ratio x tf_width -> tf_width
     level_hidden=256,               # the level head's (log Z(c)) residual MLP width (conditional route)
-    frames=False,                   # True (molecule route, an atom encoder): the condition carries the frame the row's
-                                    # molecule is presented in, a unit quaternion (w, x, y, z), and the encoder reads the
-                                    # molecule's atoms rotated into it; a row's frame is mol_batch.presented_frame
-                                    # [n, 4] when the batch carries it (the MLE draw under train.py nf frames), else the
-                                    # standard frame (every other draw and every readout)
+    rotate_frames=False,            # True (molecule route with an atom encoder, FD chart of sg 1 or 2): every training-
+                                    # mode step presents each row's molecule in a fresh random frame R0 (uniform on
+                                    # SO(3)): the encoder reads the atoms rotated by R0 (the quaternion rides in the
+                                    # condition) and the flow models the orientation rows re-expressed for that frame
+                                    # (R -> R R0^T, energies/fd_coordinates.py::rotate_orientation); states, log q and
+                                    # everything outside the step stay in the standard frame (log q carries the map's
+                                    # Haar Jacobian). Eval mode (readouts, eval draws) presents the standard frame
 )
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
@@ -240,6 +242,7 @@ class NFPolicy(nn.Module):
             raise ValueError("flow atom_tokens reads the molecule from mol_batch: it needs molecule conditioning")
         describer = None
         self.fd_slots = None
+        self.orientation_rows = None   # rotate_frames: the FD orientation rows (theta, phi, r) a frame re-expresses
         if fd_space_groups is not None and len(set(int(g) for g in fd_space_groups)) > 1:
             from energies.fd_coordinates import FDSlotLayout
             self.fd_slots = FDSlotLayout(fd_space_groups)
@@ -329,17 +332,25 @@ class NFPolicy(nn.Module):
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
-            if s['frames'] and (atoms is None or atoms['encoder'] == 'none'):
-                raise ValueError("flow frames rotate the atoms an encoder reads: they need atom_tokens True, 'split' "
-                                 "or 'split_pooled'")
+            if s['rotate_frames']:
+                from energies.fd_coordinates import FRAME_FREE_GROUPS, FDCoordinates
+                if atoms is None or atoms['encoder'] == 'none':
+                    raise ValueError("flow rotate_frames rotate the atoms an encoder reads: they need atom_tokens "
+                                     "True, 'split' or 'split_pooled'")
+                if fd_space_group is None or self.fd_slots is not None or int(fd_space_group) not in FRAME_FREE_GROUPS:
+                    raise NotImplementedError(f"flow rotate_frames re-expresses FD orientation rows alone: one space "
+                                              f"group of {FRAME_FREE_GROUPS} on the FD chart, got {fd_space_group}")
+                names = FDCoordinates(int(fd_space_group), 3.0).names
+                self.orientation_rows = [names.index(k) for k in ('theta', 'phi', 'r')]
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
-            cond_dim = (1 + 4 * int(bool(s['frames'])) + self.conditions_dim if atoms is not None
-                        else self.conditions_dim)
+            cond_dim = (1 + 4 * int(bool(s['rotate_frames'])) + self.conditions_dim if atoms is not None
+                        else self.conditions_dim)   # the row id (and the frame's quaternion), then the columns
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
                                                  transformer=transformer, atoms=atoms, bounded_rows=bounded,
                                                  describer=describer, mlp_ratio=int(s['tf_mlp_ratio']),
-                                                 level_hidden=int(s['level_hidden']), frames=bool(s['frames']))
+                                                 level_hidden=int(s['level_hidden']),
+                                                 frames=bool(s['rotate_frames']))
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -407,15 +418,34 @@ class NFPolicy(nn.Module):
         # _context reads it
         if self.conditional and self.conditions_dim > 0 and conditions is not None and conditions.shape[-1] > 0:
             c = conditions.to(self.device, torch.float32)
-            if self.settings['atom_tokens']:   # column 0 is the row id, never standardised (_context)
-                c = torch.cat([torch.zeros_like(c[:, :1]).expand(-1, 1 + 4 * int(bool(self.settings['frames']))), c],
-                              -1)   # (and the frame's four columns under frames)
+            if self.settings['atom_tokens']:   # column 0 is the row id (and 1-4 the frame), never standardised
+                c = torch.cat([torch.zeros_like(c[:, :1]).expand(-1, self._lead_columns()), c], -1)
             self.sampler.flow.set_condition_scaler(c)
         self.scalers_fitted.fill_(True)
 
     # -- the condition -------------------------------------------------------------------------------------------
 
-    def _context(self, condition, mol_batch, n):
+    def _lead_columns(self):
+        """Columns of the molecule-mode condition before the condition vector: the row id, and the frame."""
+        return 1 + 4 * int(bool(self.settings.get('rotate_frames')))
+
+    def _frames(self, n):
+        """rotate_frames in training mode: n unit quaternions (w, x, y, z), uniform on SO(3); else None."""
+        if not (self.settings.get('rotate_frames') and self.training):
+            return None
+        q = torch.randn(n, 4, device=self.device, dtype=torch.float64)
+        q = q / q.norm(dim=1, keepdim=True)
+        return torch.where(q[:, :1] < 0, -q, q)
+
+    def _present(self, x, q, inverse=False):
+        """(x re-expressed for frame q (standard -> presented; inverse: presented -> standard), log |dx'/dx|)."""
+        from energies.fd_coordinates import rotate_orientation
+        from models.spline_flow import quat_to_rotmat
+        R0 = quat_to_rotmat(q)
+        y, lj = rotate_orientation(x, R0.transpose(1, 2) if inverse else R0, rows=self.orientation_rows)
+        return self._wrap_ang(y), lj
+
+    def _context(self, condition, mol_batch, n, frames=None):
         """The flow's condition input for n rows: the condition vector (vector mode), or row indices into an atom
         table set from mol_batch's molecules (molecule mode, one graph per row) followed by the condition vector's
         columns, standardised (temperature, space group, Z': the encoder reads the molecule, these pass through)."""
@@ -471,21 +501,18 @@ class NFPolicy(nn.Module):
             self.sampler.flow.set_row_radius(radius, mol)
         ids = (torch.arange(n, device=self.device, dtype=torch.float32) if row_mol is None
                else row_mol.to(torch.float32))[:, None]
-        first = 1
-        if self.settings['frames']:   # the frame each row's molecule is presented in: the standard one unless given
-            q = getattr(mol_batch, 'presented_frame', None)
-            if q is None:
-                q = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(n, 4)
-            q = torch.as_tensor(q).reshape(n, 4).to(self.device, torch.float32)
+        if self.settings.get('rotate_frames'):   # the frame each row's molecule is presented in (identity: standard)
+            q = (torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(n, 4) if frames is None
+                 else frames.to(self.device, torch.float32))
             ids = torch.cat([ids, q], -1)
-            first = 5
         if self.conditions_dim == 0:
             return ids
         if condition is None or condition.shape[-1] != self.conditions_dim:
             raise ValueError(f"molecule mode with {self.conditions_dim} condition columns (temperature, space group, "
                              f"Z') needs them passed: got {None if condition is None else tuple(condition.shape)}")
         f = self.sampler.flow   # standardised here, not in the flow, which inn_modeller also drives raw
-        rest = (condition.to(self.device, torch.float32) - f.c_mu[first:]) / f.c_sd[first:]
+        lead = self._lead_columns()
+        rest = (condition.to(self.device, torch.float32) - f.c_mu[lead:]) / f.c_sd[lead:]
         return torch.cat([ids, rest], -1)
 
     def _row_atom_table(self, mol_batch, n):
@@ -637,11 +664,17 @@ class NFPolicy(nn.Module):
 
     # -- the trajectory interface ---------------------------------------------------------------------------------
 
-    def _one_step(self, s0, x, c, freeze_policy, return_gauss_params, scrambled: bool = False):
+    def _one_step(self, s0, x, c, freeze_policy, return_gauss_params, scrambled: bool = False, x_model=None,
+                  log_jac=None):
+        """x: the standard-frame state; x_model: what the flow scores (x re-expressed for the row's frame under
+        rotate_frames, else x), log_jac: log |d x_model / d x|, so log q(x) = log q_flow(x_model) + log_jac."""
         n = x.shape[0]
+        xm = x if x_model is None else x_model
         with (torch.no_grad() if freeze_policy else contextlib.nullcontext()):
-            log_q = (self.sampler.log_prob(x, c, detach_context=scrambled) if self.conditional
-                     else self.sampler.log_prob(x))
+            log_q = (self.sampler.log_prob(xm, c, detach_context=scrambled) if self.conditional
+                     else self.sampler.log_prob(xm))
+        if log_jac is not None:
+            log_q = log_q + log_jac.to(log_q.dtype)
         if freeze_policy:
             log_q = log_q.detach()
         states = torch.stack([s0.to(x.dtype), x], 1)
@@ -673,20 +706,30 @@ class NFPolicy(nn.Module):
         if exploration_std:
             raise NotImplementedError("exploration noise on the flow policy")
         n = initial_state.shape[0]
-        c = self._context(condition, mol_batch, n)
+        q = self._frames(n) if self.conditional else None
+        c = self._context(condition, mol_batch, n, frames=q)
         with torch.no_grad():
             x = self.sampler.sample(n, c) if self.conditional else self.sampler.sample(n)
         x = self._pin_dead(self._wrap_ang(x.to(torch.float32)))
-        return self._one_step(initial_state, x, c, freeze_policy, return_gauss_params)
+        if q is None:
+            return self._one_step(initial_state, x, c, freeze_policy, return_gauss_params)
+        xs, lj_back = self._present(x, q, inverse=True)   # the draw, presented -> standard
+        return self._one_step(initial_state, xs, c, freeze_policy, return_gauss_params, x_model=x,
+                              log_jac=-lj_back)
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch, return_gauss_params: bool = False,
                      detach_traj: bool = False, freeze_policy: bool = False, scramble_condition_tiles: int = 0,
                      drift_context=None):
         n = terminal_state.shape[0]
         x = self._pin_dead(self._wrap_ang(terminal_state.detach().to(self.device, torch.float32)))
-        c = self._scramble(self._context(condition, mol_batch, n), n, scramble_condition_tiles)
+        q = self._frames(n) if self.conditional else None
+        if q is not None and scramble_condition_tiles > 0:
+            raise NotImplementedError("rotate_frames with scramble_conditions: the frame belongs to the row's state")
+        c = self._scramble(self._context(condition, mol_batch, n, frames=q), n, scramble_condition_tiles)
         s0 = torch.zeros_like(x)
-        return self._one_step(s0, x, c, freeze_policy, return_gauss_params, scrambled=scramble_condition_tiles > 0)
+        xm, lj = self._present(x, q) if q is not None else (None, None)
+        return self._one_step(s0, x, c, freeze_policy, return_gauss_params, scrambled=scramble_condition_tiles > 0,
+                              x_model=xm, log_jac=lj)
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch, return_gauss_params: bool = False,
                         freeze_policy: bool = False, scramble_condition_tiles: int = 0, resample_last_k: int = 0,
@@ -695,9 +738,13 @@ class NFPolicy(nn.Module):
             raise NotImplementedError("replay-tail re-propagation does not apply to a one-step flow policy")
         n = trajectory.shape[0]
         x = self._pin_dead(self._wrap_ang(trajectory[:, -1].detach().to(self.device, torch.float32)))
-        c = self._scramble(self._context(condition, mol_batch, n), n, scramble_condition_tiles)
+        q = self._frames(n) if self.conditional else None
+        if q is not None and scramble_condition_tiles > 0:
+            raise NotImplementedError("rotate_frames with scramble_conditions: the frame belongs to the row's state")
+        c = self._scramble(self._context(condition, mol_batch, n, frames=q), n, scramble_condition_tiles)
+        xm, lj = self._present(x, q) if q is not None else (None, None)
         return self._one_step(trajectory[:, 0].detach().to(self.device, torch.float32), x, c, freeze_policy,
-                              return_gauss_params, scrambled=scramble_condition_tiles > 0)
+                              return_gauss_params, scrambled=scramble_condition_tiles > 0, x_model=xm, log_jac=lj)
 
     # -- P_B snapshots and the SDE-only calls ------------------------------------------------------------------------
 

@@ -210,6 +210,33 @@ FD_BLOCKS = ('cell', 'centroid', 'orientation')
 PAD = 'pad'
 
 
+#: groups whose chart point moves only in its orientation rows when the molecule's frame changes (no symmetry
+#: operation folds the orientation into another cell or centroid): rotate_orientation is exact there
+FRAME_FREE_GROUPS = (1, 2)
+#: the hemisphere chart's bounds per orientation coordinate (mxtaltools crystal_fd.charts.OrientationChart.bounds)
+HEMISPHERE_BOUNDS = ((0.0, math.pi / 2), (-math.pi, math.pi), (0.0, 2 * math.pi))
+
+
+def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
+    """(s' [n, d], log |ds'/ds| [n]) of FD chart rows s [n, d] with the molecule presented as R0 [n, 3, 3] applied to
+    its standard-frame coordinates: the orientation R becomes R R0^T and no other row moves (FRAME_FREE_GROUPS only;
+    FDCoordinates.reframe is the exact, CPU-bound reference). Torch on s's device and dtype; the rotation in float64.
+    The map preserves Haar measure, so log |ds'/ds| = log rho(y) - log rho(y'), rho the hemisphere chart's Haar
+    density (the unit map's constant scale cancels)."""
+    from mxtaltools.crystal_fd import so3
+    rows = list(rows)
+    lo = torch.tensor([b[0] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
+    hi = torch.tensor([b[1] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
+    y = lo + (s[:, rows].to(F64) + 1) / 2 * (hi - lo)
+    R = so3.hemisphere_to_matrix(y)
+    y2 = so3.matrix_to_hemisphere(R @ R0.to(device=s.device, dtype=F64).transpose(1, 2))
+    y2[:, 1] = torch.remainder(y2[:, 1] - lo[1], 2 * math.pi) + lo[1]          # phi on its circle
+    out = s.clone()
+    out[:, rows] = (2 * (y2 - lo) / (hi - lo) - 1).to(s.dtype)
+    log_jac = so3.haar_log_density('hemisphere', y) - so3.haar_log_density('hemisphere', y2)
+    return out, log_jac.to(s.dtype)
+
+
 class FDSlotLayout:
     """The trainer state of an FD run over the space groups ``groups`` (Z' = 1), so that one batch can hold rows of
     several groups.
