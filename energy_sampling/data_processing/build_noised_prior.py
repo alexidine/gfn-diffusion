@@ -13,6 +13,11 @@ is below it (data_processing.molecule_subset), as the trainers' --molecule_fract
 
 HELD OUT. Within each condition (identifier, space group, Z') the lowest-energy anchor stays in training; every
 other anchor is held out with probability --heldout_frac, whole, with every child of it (noised_split SPLIT_HELDOUT).
+A band set (--basins of kind 'band': thinned low-energy states of a search's descents, mxtaltools
+stream_search.write_band) is held out by descent group instead: the states whose descents ended at one minimum
+(group_id) go together, so a held-out state never has a training neighbour from its own valley; the group of a
+condition's lowest anchor stays in training. A set without Hessians (band sets, the search's endpoint mode) carries
+no basin_H, and --child_kernel basin refuses it.
 
 CHILDREN. Each anchor is kicked K times by MolCrystalOps.log_noise_latent_parameters(log_lo, log_hi) (a unit
 direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded, hard-cleaned) and scored. With
@@ -352,11 +357,50 @@ def load_basin_anchors(args, run_args):
     anchors = collate_data_list(rows)
     anchors['smiles'] = None
     c = ds.columns
-    tags = dict(basin_id=c['basin_id'].long(), basin_p=c['p'].double(), basin_hand=c['p_handedness'].double(),
-                basin_H=c['H'].double() * factor, basin_live=c['live_mask'].bool(), basin_E=c['E'].double() * factor)
+    if args.child_kernel == 'basin' and 'H' not in c:
+        raise SystemExit(f"--child_kernel basin draws from each basin's Hessian; {args.basins} has none "
+                         f"(kind {header.get('kind', 'minima')!r}): use --child_kernel iso or metric")
+    tags = basin_tags(c, factor)
     what = (f"basin set {args.basins}: {len(ds)} usable of {int(usable.numel())} rows "
             f"({energy.get('target')}, x {factor:g} to run units, search kT {header['search'].get('kT')})")
     return anchors, tsf, what, dict(tags=tags, header=header, factor=factor, path=os.path.abspath(args.basins))
+
+
+def basin_tags(columns, factor):
+    """The per-anchor tags of a basin or band set's columns, energies and Hessians times ``factor`` (to run units):
+    basin_id, basin_p, basin_hand, basin_live, basin_E; basin_H when the set has Hessians; basin_group (the descent's
+    minimum) when it has group_id (a band set)."""
+    c = columns
+    tags = dict(basin_id=c['basin_id'].long(), basin_p=c['p'].double(), basin_hand=c['p_handedness'].double(),
+                basin_live=c['live_mask'].bool(), basin_E=c['E'].double() * factor)
+    if 'H' in c:
+        tags['basin_H'] = c['H'].double() * factor
+    if 'group_id' in c:
+        tags['basin_group'] = c['group_id'].long()
+    return tags
+
+
+def heldout_mask(groups, e_anchor, frac, rng, units=None):
+    """[B] bool, the anchors held out: within each condition (``groups``) the lowest-energy anchor (``e_anchor``,
+    non-finite last) stays in training. Without ``units`` every other anchor is held out with probability ``frac``
+    (one draw per anchor, in order); with ``units`` [B] (a band set's descent groups) each (condition, unit) is held
+    out whole with probability ``frac`` (one draw per pair, in order of first appearance), never the lowest anchor's."""
+    B = len(e_anchor)
+    lowest = torch.zeros(B, dtype=torch.bool)
+    e_fin = torch.where(torch.isfinite(e_anchor), e_anchor, torch.full_like(e_anchor, float('inf')))
+    seen = set()
+    for i in torch.argsort(e_fin).tolist():
+        g = int(groups[i])
+        if g not in seen:
+            seen.add(g)
+            lowest[i] = True
+    if units is None:
+        return torch.as_tensor(rng.random(B) < frac) & ~lowest
+    pairs = [(int(g), int(u)) for g, u in zip(torch.as_tensor(groups).tolist(), torch.as_tensor(units).tolist())]
+    order = list(dict.fromkeys(pairs))
+    drawn = dict(zip(order, (rng.random(len(order)) < frac).tolist()))
+    keep = {pairs[i] for i in torch.nonzero(lowest).flatten().tolist()}
+    return torch.tensor([drawn[p] and p not in keep for p in pairs], dtype=torch.bool)
 
 
 def check_basin_energies(anchors, basins, tol):
@@ -443,21 +487,15 @@ def main(argv=None):
         print(f"harvest: {n_promoted} rows below their condition's floor become anchors; "
               f"{rest_rows.numel()} are kept as harvested rows", flush=True)
 
-    # held out whole, per condition, never a condition's lowest anchor
+    # held out whole, per condition, never a condition's lowest anchor (a band set: whole descent groups)
     groups = NP.condition_groups(anchors)
-    lowest = torch.zeros(anchors.num_graphs, dtype=torch.bool)
-    e_fin = torch.where(torch.isfinite(e_anchor), e_anchor, torch.full_like(e_anchor, float('inf')))
-    order = torch.argsort(e_fin)
-    seen = set()
-    for i in order.tolist():
-        g = int(groups[i])
-        if g not in seen:
-            seen.add(g)
-            lowest[i] = True
-    held = torch.as_tensor(rng.random(anchors.num_graphs) < args.heldout_frac) & ~lowest
+    units = getattr(anchors, 'basin_group', None)
+    held = heldout_mask(groups, e_anchor, args.heldout_frac, rng,
+                        units=None if units is None else torch.as_tensor(units).reshape(-1))
     split = torch.where(held, NP.SPLIT_HELDOUT, NP.SPLIT_TRAIN)
     train_idx = torch.nonzero(~held).flatten().numpy()
-    print(f"held out: {int(held.sum())} of {anchors.num_graphs} anchors over {len(seen)} conditions", flush=True)
+    print(f"held out: {int(held.sum())} of {anchors.num_graphs} anchors over {len(set(groups.tolist()))} conditions"
+          f"{'' if units is None else ', by descent group'}", flush=True)
 
     kernel = None
     if basin_children:
@@ -573,7 +611,7 @@ def main(argv=None):
         window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),
-        counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(seen),
+        counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(set(groups.tolist())),
                     children_within_window=inside, children_far_below_parent=int(below_parent.sum())),
         commits=dict(gfn=git_commit(HERE), mxtaltools=git_commit(os.path.dirname(os.path.dirname(
             __import__('mxtaltools').__file__)))),

@@ -275,3 +275,36 @@ def test_the_builder_refuses_kernel_flags_its_child_kernel_does_not_read():
     a = build_parser().parse_args(base + ['--source', 's'])
     check_child_kernel_args(a)
     assert a.log_lo == -2.5
+
+
+def test_a_band_set_tags_its_descent_group_and_no_hessian():
+    """build_noised_prior.basin_tags: a set without H (a band set, the search's endpoint mode) carries no basin_H; a
+    band set's group_id becomes basin_group; energies and Hessians take the factor to run units."""
+    from data_processing.build_noised_prior import basin_tags
+    c = dict(basin_id=torch.arange(3), p=torch.zeros(3, 12), p_handedness=torch.ones(3),
+             live_mask=torch.ones(3, 12, dtype=torch.bool), E=torch.tensor([1.0, 2.0, 3.0]))
+    t = basin_tags(c, 2.0)
+    assert 'basin_H' not in t and 'basin_group' not in t and t['basin_E'].tolist() == [2.0, 4.0, 6.0]
+    t = basin_tags(dict(c, H=torch.eye(12).repeat(3, 1, 1), group_id=torch.tensor([5, 5, 7])), 2.0)
+    assert float(t['basin_H'][0, 0, 0]) == 2.0 and t['basin_group'].tolist() == [5, 5, 7]
+
+
+def test_held_out_by_descent_group_keeps_groups_whole():
+    """heldout_mask: without units, one draw per anchor (the earlier rule, its draws in the same order); with units,
+    each (condition, unit) is held out whole and the lowest anchor's unit never is."""
+    import numpy as np
+    from data_processing.build_noised_prior import heldout_mask
+    groups = torch.tensor([0] * 6 + [1] * 4)
+    e = torch.tensor([3.0, 1.0, 2.0, 5.0, 4.0, 6.0, 0.5, 2.0, float('nan'), 1.0])
+    plain = heldout_mask(groups, e, 0.5, np.random.default_rng(0))
+    lowest = [1, 6]
+    ref = torch.as_tensor(np.random.default_rng(0).random(10) < 0.5)
+    ref[lowest] = False
+    assert plain.tolist() == ref.tolist()
+    units = torch.tensor([0, 0, 1, 1, 2, 2, 0, 0, 1, 1])
+    held = heldout_mask(groups, e, 0.9, np.random.default_rng(1), units=units)
+    for g, u in {(int(a), int(b)) for a, b in zip(groups, units)}:
+        sel = (groups == g) & (units == u)
+        assert len(set(held[sel].tolist())) == 1  # whole groups
+    assert not bool(held[(groups == 0) & (units == 0)].any()) and not bool(held[(groups == 1) & (units == 0)].any())
+    assert bool(held.any())
