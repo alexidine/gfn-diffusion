@@ -74,6 +74,10 @@ NF_DEFAULTS = dict(
 NF_PENDING_DEFAULTS = dict(
     tf_mlp_ratio=4,                 # each transformer layer's MLP is tf_width -> tf_mlp_ratio x tf_width -> tf_width
     level_hidden=256,               # the level head's (log Z(c)) residual MLP width (conditional route)
+    cond_bottleneck=0,              # > 0 (molecule route with an atom encoder): each pooled molecule vector is projected
+                                    # to this width and bounded by tanh before the context and the level head read it
+    cond_noise=0.0,                 # with cond_bottleneck: N(0, cond_noise^2) added to it per row in training mode (at
+                                    # most cond_bottleneck x 1/2 log(1 + 1/cond_noise^2) nats of the molecule per vector)
     rotate_frames=False,            # True (molecule route with an atom encoder, FD chart, no K-cut group): every training-
                                     # mode step presents each row's molecule in a fresh random frame R0 (uniform on
                                     # SO(3)): the encoder reads the atoms rotated by R0 (the quaternion rides in the
@@ -318,8 +322,15 @@ class NFPolicy(nn.Module):
                                    'none' if s['atom_tokens'] == 'scalars' else 'xyz'),
                           cross=s['atom_tokens'] not in ('split_pooled', 'scalars'),
                           mol_scalars=len(MOL_SCALARS) if s['mol_scalars'] else 0,
-                          sym_ops=sym_w if e_g else 0, sym_hidden=sym_h, sym_tokens=s['sym_ops'] == 'tokens')
+                          sym_ops=sym_w if e_g else 0, sym_hidden=sym_h, sym_tokens=s['sym_ops'] == 'tokens',
+                          bottleneck=int(s['cond_bottleneck'] or 0), bottleneck_noise=float(s['cond_noise'] or 0.0))
                      if s['atom_tokens'] else None)
+            if (s['cond_bottleneck'] or s['cond_noise']) and (atoms is None or atoms['encoder'] == 'none'):
+                raise ValueError("flow cond_bottleneck and cond_noise squeeze the pooled molecule vectors: they need "
+                                 "atom_tokens True, 'split' or 'split_pooled'")
+            if float(s['cond_noise'] or 0.0) > 0 and not int(s['cond_bottleneck'] or 0):
+                raise ValueError("flow cond_noise is added to the tanh-bounded bottleneck: it needs cond_bottleneck > 0 "
+                                 "(unbounded vectors could outgrow any noise)")
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
                 atoms['chirality'] = CHIRAL_CHANNELS if s['atom_chirality'] else 0

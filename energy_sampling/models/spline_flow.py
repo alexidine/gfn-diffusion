@@ -616,6 +616,12 @@ class _ContextFlow(nn.Module):
         # atoms['mol_scalars']: the width of per-molecule invariant scalars (set_mol_scalars) read by the level head and
         # the context beside the pooled molecule; 0 = none
         self.n_mol_scalars = int(atoms.pop('mol_scalars', 0)) if atoms is not None else 0
+        # atoms['bottleneck'] (> 0): each pooled molecule vector (the split encoder's s and p, the xyz encoder's pool)
+        # is projected to that width and bounded by tanh before anything reads it; atoms['bottleneck_noise'] adds
+        # N(0, noise^2) to it per row in training mode, so at most bottleneck x 1/2 log(1 + 1/noise^2) nats of the
+        # molecule pass per vector. 0 = the pooled vectors as the encoder gives them
+        self.bottleneck = int(atoms.pop('bottleneck', 0) or 0) if atoms is not None else 0
+        self.bottleneck_noise = float(atoms.pop('bottleneck_noise', 0.0) or 0.0) if atoms is not None else 0.0
         # atoms['sym_ops']: the width of e_g (models/sym_ops.py::SymOpEncoder over the row's space group's operations),
         # read by the level head and the context beside the pooled molecule; 0 = none. Option A of the design: with g
         # given, the level is log Z(m, g)
@@ -684,6 +690,11 @@ class _ContextFlow(nn.Module):
                                      else AtomEncoder(width, **atoms))
                 pooled = (self.atom_encoder.s_out if self.encoder == 'split'
                           else self.atom_encoder.pool_out).out_features
+                if self.bottleneck:
+                    self.bn_s = nn.Linear(pooled, self.bottleneck)
+                    if self.encoder == 'split':
+                        self.bn_p = nn.Linear(self.atom_encoder.p_out.out_features, self.bottleneck)
+                    pooled = self.bottleneck
             # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
             n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars + self.n_sym
             if self.n_sym:
@@ -696,7 +707,8 @@ class _ContextFlow(nn.Module):
                                      "a cross-attending conditioner")
                 self.op_tok = nn.Linear(sym_hidden, width)          # an operation's state -> a memory token
                 self.op_seg = nn.Parameter(0.02 * torch.randn(width))   # tells an operation token from an atom's
-            n_ctx = n_in + (self.atom_encoder.p_out.out_features if self.encoder == 'split' else 0)
+            n_ctx = n_in + ((self.bottleneck or self.atom_encoder.p_out.out_features) if self.encoder == 'split'
+                            else 0)
             for name in ('atom_z', 'atom_pos', 'atom_n', 'atom_scalars'):
                 self.register_buffer(name, None, persistent=False)
         self.context = _ResMLP(n_ctx, context_hidden, context_dim)
@@ -821,17 +833,30 @@ class _ContextFlow(nn.Module):
             return self.context(rest), rest
         if self.encoder == 'split':
             tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
-            s = torch.cat([s_inv[inv], rest], -1)
-            vec = self.context(torch.cat([s_inv[inv], p[inv], rest], -1))
+            s_row, p_row = s_inv[inv], p[inv]
+            if self.bottleneck:
+                s_row, p_row = self._squeeze(self.bn_s, s_row), self._squeeze(self.bn_p, p_row)
+            s = torch.cat([s_row, rest], -1)
+            vec = self.context(torch.cat([s_row, p_row, rest], -1))
         else:
             tokens, mask, pooled = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
-            s = torch.cat([pooled[inv], rest], -1)
+            pooled_row = pooled[inv]
+            if self.bottleneck:
+                pooled_row = self._squeeze(self.bn_s, pooled_row)
+            s = torch.cat([pooled_row, rest], -1)
             vec = self.context(s)
         if self.cross and self.sym_tokens:   # the row's group's operations beside its molecule's atoms
             ops, op_mask = self.sym_encoder.op_states(groups.tolist())
             op_tokens = (self.op_tok(ops.to(dtype)) + self.op_seg.to(dtype))[ginv]
             return (vec, torch.cat([tokens[inv], op_tokens], 1), torch.cat([mask[inv], op_mask[ginv]], 1)), s
         return ((vec, tokens[inv], mask[inv]) if self.cross else vec), s
+
+    def _squeeze(self, lin, v):
+        """atoms['bottleneck']: tanh(lin(v)), plus N(0, bottleneck_noise^2) per row in training mode."""
+        v = torch.tanh(lin(v))
+        if self.training and self.bottleneck_noise > 0:
+            v = v + self.bottleneck_noise * torch.randn_like(v)
+        return v
 
     def set_scaler(self, x):
         """Standardise the LINEAR dims only; wrapped dims must stay on the circle, and bounded dims on their
