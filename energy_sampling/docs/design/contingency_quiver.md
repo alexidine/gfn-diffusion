@@ -25,6 +25,13 @@ over a scrambled-condition model, per-condition KL, ESS and Pareto k̂.
 - *Deploy when:* conditional MLE fits and transfers, but phase 2 cannot close the remaining stored-row gap. The likely
   form is a global λ whose step is set by a high quantile of the pooled per-condition variance.
 - *Caveat:* if q_MLE has memorised training rows, the path starts from a memorised distribution.
+- *λ = 0 leg with the NF policy (owner, 2026-11-08: the simplest choice):* a frozen copy of the stage-1 NF policy
+  itself, not a separately fitted proxy. Phase 2 then starts at zero loss on every condition, held-out molecules
+  included, with no refit error. *Not wired:* `PriorFlow.log_prob(x)` (`energies/prior_flow.py`) takes no condition,
+  so the frozen conditional NF has to be evaluated in its place.
+- *Unbounded wait:* λ advances only after every balance rule has been clean for `anneal_patience` ticks outside the
+  cooldown. Nothing bounds or reports a rule that never comes clean, so λ can stall silently. The rules were never
+  tuned for this, because convergence was poor at the time. A termination proof is owed before the route is relied on.
 
 **A2. Temperature annealing (owner, 2026-11-03), with analysis.**
 - *Idea:* after MLE, raise T until J_B − J_F falls below the VarGrad noise, then anneal T down.
@@ -115,6 +122,19 @@ frequencies and learned as a benchmark ablation on coverage per energy call.
 **C3. Two-stage evaluation sampler (fallback if C2 is not accurate enough):** draw a pilot of K samples per space
 group, estimate each Ẑ_g by importance sampling with a defensive mixture, then allocate the remaining budget in
 proportion. It costs energy calls at evaluation, which counts against the efficiency metric.
+
+**C4. Physical-energy regression head (owner, 2026-11-08).**
+- *Idea:* a head that predicts the physical energy E(x | c) of each draw, trained by regression on the energies phase
+  2 already computes. It adds no energy calls.
+- *Why:* a converged q implies E only up to −kT log q, which pointwise also carries the FD chart's log-Jacobian and the
+  condition's log Z. A direct head separates the physical term from the chart term. It could rank draws for
+  refinement better than q does.
+- *Scope:* this helps pointwise ranking of draws. It does not help the basin-mass ranking, because a basin mass is an
+  integral and the chart drops out of it.
+- *Deploy when:* the benchmark's max strategy needs to pick refinement candidates from free model draws, and ranking
+  by q alone selects poorly.
+- *Cheapest test:* on held-out molecules, compare the rank correlation with the true E of the head's predictions and
+  of −kT log q, over raw draws.
 
 ## D. Added 2026-11-04 from `conditional_convergence_afresh.md`
 
