@@ -81,7 +81,9 @@ def build_parser():
     p.add_argument('--config', required=True)
     p.add_argument('--source', default=None, help='a train.py prior file (its equalized_prior rows are the anchors)')
     p.add_argument('--basins', default=None, help='a basin set (mxtaltools crystal_search.basin_set, '
-                   'docs/design/basin_set.md): its rows are the anchors, each tagged with its basin; exclusive of --source')
+                   'docs/design/basin_set.md), or a text file listing basin-set folders one per line (one set per '
+                   'search task, e.g. one band set per task of a conditional battery): their rows are the anchors, each tagged '
+                   'with its basin; exclusive of --source')
     p.add_argument('--thermal_scaling_factor', type=float, default=None,
                    help="with --basins on eLJ: the run's lj scale (a --source prior carries its own)")
     p.add_argument('--energy_tol', type=float, default=0.05,
@@ -373,7 +375,12 @@ def load_basin_anchors(args, run_args):
         raise SystemExit('--harvest is not a basin-set input (owner 2026-10-30)')
     if args.anchors != 'all' or args.molecule_fraction < 1.0:
         raise SystemExit('--anchors and --molecule_fraction apply to --source only')
-    ds, header = read_basin_set(args.basins)
+    paths = basin_set_paths(args.basins)
+    sets = [read_basin_set(p_) for p_ in paths]
+    header = sets[0][1]
+    for p_, (_, h_) in zip(paths[1:], sets[1:]):
+        if h_['energy'] != header['energy'] or h_['search'].get('kT') != header['search'].get('kT')                 or h_.get('kind') != header.get('kind'):
+            raise SystemExit(f"basin set {p_}: its energy record, search kT or kind differs from {paths[0]}'s")
     energy = header['energy']
     if energy.get('target') != run_args.energy_function:
         raise SystemExit(f"basin set energy {energy.get('target')!r} is not the run's {run_args.energy_function!r}: "
@@ -391,19 +398,45 @@ def load_basin_anchors(args, run_args):
         if tsf is not None:
             raise SystemExit('--thermal_scaling_factor is for eLJ only')
         factor = 1.0
-    usable = torch.tensor([ds.status_names[int(c)] in ('canonical', 'special_metric') for c in ds.status])
-    ds = ds.select(usable)
-    rows = ds.to_mol_crystal_data(mode='body')
+    rows, cols, n_usable, n_rows = [], [], 0, 0
+    for ds, _ in sets:
+        usable = torch.tensor([ds.status_names[int(c)] in ('canonical', 'special_metric') for c in ds.status])
+        n_rows += int(usable.numel())
+        ds = ds.select(usable)
+        n_usable += len(ds)
+        rows.extend(ds.to_mol_crystal_data(mode='body'))
+        cols.append(ds.columns)
+    del sets
     anchors = collate_data_list(rows)
     anchors['smiles'] = None
-    c = ds.columns
+    names = set(cols[0])
+    if any(set(c_) != names for c_ in cols):
+        raise SystemExit('the basin sets carry different columns')
+    c = {k: torch.cat([torch.as_tensor(c_[k]) for c_ in cols]) for k in names}
     if args.child_kernel == 'basin' and 'H' not in c:
         raise SystemExit(f"--child_kernel basin draws from each basin's Hessian; {args.basins} has none "
                          f"(kind {header.get('kind', 'minima')!r}): use --child_kernel iso or metric")
     tags = basin_tags(c, factor)
-    what = (f"basin set {args.basins}: {len(ds)} usable of {int(usable.numel())} rows "
-            f"({energy.get('target')}, x {factor:g} to run units, search kT {header['search'].get('kT')})")
+    what = (f"{'basin set' if len(paths) == 1 else f'{len(paths)} basin sets of'} {args.basins}: {n_usable} usable "
+            f"of {n_rows} rows ({energy.get('target')}, x {factor:g} to run units, search kT "
+            f"{header['search'].get('kT')})")
+    header = header if len(paths) == 1 else dict(header, sets=len(paths), first_set=os.path.abspath(paths[0]))
     return anchors, tsf, what, dict(tags=tags, header=header, factor=factor, path=os.path.abspath(args.basins))
+
+
+def basin_set_paths(arg):
+    """The basin-set folders of --basins: the folder itself, or the non-blank, non-# lines of a list file (relative
+    paths from the list file's folder)."""
+    if os.path.isdir(arg):
+        return [arg]
+    if not os.path.isfile(arg):
+        raise SystemExit(f'--basins {arg}: neither a basin-set folder nor a list file')
+    base = os.path.dirname(os.path.abspath(arg))
+    with open(arg) as fh:
+        paths = [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith('#')]
+    if not paths:
+        raise SystemExit(f'--basins {arg}: the list names no basin set')
+    return [p_ if os.path.isabs(p_) else os.path.join(base, p_) for p_ in paths]
 
 
 def basin_tags(columns, factor):
@@ -640,6 +673,9 @@ def main(argv=None):
         rest.add_graph_attr(torch.zeros(n_h), 'noised_radius')
         parts.append(rest)
     out = collate(parts)
+    # the build's own view of the load-time window, for the record (before the FD attributes go: on the FD chart the
+    # reward reads fd_log_reference)
+    e_all = seed_energy(ef, out, T, args.device)
     # an FD build's analysis leaves each row's chart point packed in THIS build's slot layout (its space_groups); a run
     # over other groups packs them differently, and readers reuse a stored fd_state, so it is not written: the trainer
     # attaches its own (Modeller._attach_fd_reference)
@@ -647,8 +683,6 @@ def main(argv=None):
         if key in out.keys():
             delattr(out, key)
 
-    # the build's own view of the load-time window, for the record
-    e_all = seed_energy(ef, out, T, args.device)
     groups_all = NP.condition_groups(out)
     kind, spl = NP.tag(out, 'noised_kind'), NP.tag(out, 'noised_split')
     we = NP.window_energy(e_all, kind, groups_all, getattr(out, 'basin_id', None), {'child_kernel': args.child_kernel})
