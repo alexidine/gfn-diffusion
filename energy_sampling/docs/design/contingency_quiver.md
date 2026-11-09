@@ -154,6 +154,72 @@ Each idea is derived there and checked only on CPU toys.
 - **D8. Empirical-Bayes shrinkage of the head** toward group means, and contrastive Δlog Z (evidence networks) as
   monitors. Not evaluated.
 
+## E. Added 2026-11-09: active learning and point-level memorisation
+
+From discussion between the hub and the owner on 2026-11-08 and 2026-11-09. Analysis only; nothing built or run.
+
+**E1. Phase 2 cast as active learning.**
+- *Idea:* separate three roles that phase 2 currently treats as one:
+  - the query policy: where energy calls go;
+  - the learner: what is fitted to the labels;
+  - the label store: every scored state kept as a permanent row.
+- *Why the split is safe:* log-ratio regression within a condition has π as its fixed point under any query
+  distribution that covers the support. Pooled VarGrad within a condition is that regression over all pairs in the
+  batch. So the query mix changes efficiency, not the fixed point. MLE fits the query distribution, so on actively
+  chosen data it is biased by construction: it serves as round 0, a warm start.
+- *Query source chosen by each condition's symptom:*
+
+  | symptom | error | source that can find it |
+  |---|---|---|
+  | high Var(log w) on q draws | q has mass where π has none | q draws; relaxing them |
+  | stored-row log q falling | a basin being abandoned | thermal kicks around stored minima |
+  | search stop rule unmet | basins never found | search restarts |
+
+  q draws alone can never reveal a dropped basin.
+- *Which conditions to revisit, at a fixed molecule count:* a bandit scored by level-free improvement per call
+  (per-condition ΔJ_F, D5), with a floor and a cap on each condition's share so the allocation terminates.
+- *Gaps as of 2026-11-09:*
+  - the forward branch trains the level only (`freeze_policy: 1.0`);
+  - the store does not keep every scored row;
+  - there is no allocation rule.
+- *Hazards:*
+  - an exact-density flow has no built-in uncertainty, so any acquisition by disagreement needs ensembles or heads;
+  - regression alone leaves the unlabelled region free, so q's own draws must stay in the pool.
+
+**E2. Spike index, a per-point memorisation readout.**
+- *Definition:* S_i(σ) = [log q(x_i) − E_δ log q(x_i + σδ)] / [β σ² tr(H_i) / 2]. The denominator is π's own drop over
+  the ball in the harmonic approximation.
+- *Reading:* S ≈ 1 means q is as sharp as the target; S ≫ 1 means a memorised spike. A sharp true minimum is not
+  flagged, because the denominator scales with its curvature.
+- *Without stored Hessians:* use stored forces on the noised children. ∇E(x+δ) − ∇E(x) ≈ Hδ gives the curvature
+  along each sampled direction, and so a per-direction index.
+- *Hessian-free reference:* compare the S distribution on training rows, unseen basins of training molecules, and
+  held-out molecules.
+- *Cheapest test:* the Hessian form on an existing norbornane checkpoint (Hessians exist for those minima). It needs
+  no energy calls.
+
+**E3. Score (force) matching in the noise ball, as a regulariser.**
+- *Loss:* λ·E_δ ‖∇ₓ log q(x+δ) + β∇E(x+δ)‖², in the model's own coordinates, with the chart log-Jacobian gradient added.
+- *Contains no Z.* It is the one energy-aware loss on stored rows with no level problem.
+- *What it fixes:* local shape, which rules out spikes. Score matching is blind to relative mass between separated
+  basins, so it complements MLE (coverage) and log-ratio regression (basin weights); it replaces neither.
+- *Evaluate in the ball, not at the minimum:* the force is zero there, and so is a spike's score at its peak.
+- *Costs:*
+  - a second-order backward through the flow, roughly 2-3× the step cost (estimate);
+  - forces mapped into model coordinates;
+  - a Huber cap for high-energy children;
+  - care at the walls of bounded coordinates.
+- *Deploy when:* forces are stored on the noised children (planned as of 2026-11-09).
+
+**E4. Acting on per-point flags.**
+- *S ≫ 1 with few or narrow children:* the data is too sparse there. Rebuild that parent's children wider or more
+  numerous, offline (MLE uses pre-built noised rows).
+- *S ≫ 1 with adequate children:* capacity is going on memorisation. De-weight the parent's rows in MLE. This leaves
+  the log-ratio regression fixed point unchanged.
+- *The per-direction index* says which directions need noise. It is the model-side form of the per-direction
+  corrected-ellipsoid test proposed by the search session.
+- *Termination:* cap the flag-and-rebuild loop at a fixed number of rounds.
+
 ## Sources
 
 Review lane reports from 2026-11-02 (hub scratchpad `review/`): `zc/zc_map.md`, `ar/critic_conditioner.md`,
