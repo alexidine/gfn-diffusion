@@ -640,6 +640,12 @@ def main(argv=None):
         rest.add_graph_attr(torch.zeros(n_h), 'noised_radius')
         parts.append(rest)
     out = collate(parts)
+    # an FD build's analysis leaves each row's chart point packed in THIS build's slot layout (its space_groups); a run
+    # over other groups packs them differently, and readers reuse a stored fd_state, so it is not written: the trainer
+    # attaches its own (Modeller._attach_fd_reference)
+    for key in ('fd_state', 'fd_log_reference'):
+        if key in out.keys():
+            delattr(out, key)
 
     # the build's own view of the load-time window, for the record
     e_all = seed_energy(ef, out, T, args.device)
