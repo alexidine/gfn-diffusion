@@ -205,7 +205,41 @@ def radius_of_gyration(batch):
     return torch.sqrt(torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, d2) / cnt)
 
 
-def metric_kick(batch, log_lo, log_hi, eps=1e-6, generator=None):
+def fd_chart_points(ef, batch):
+    """([n] bool has a chart point, [n, data_ndim] chart rows s packed in the run's FD slot layout, zero where none,
+    [n] log reference density on s, zero where none) of the crystals of `batch` (any description of each), through
+    the FD chart of each row's (space group, molecule radius) on the energy function `ef` (crystal_coordinates 'fd').
+    A row has no point when it does not canonicalise or its canonical cell is outside the chart's length box. Shared
+    by the trainer (train.py::Modeller._fd_chart_points) and the builder (data_processing/build_noised_prior.py)."""
+    params = batch.full_cell_parameters().detach().cpu()
+    hand = batch.aunit_handedness.reshape(-1).detach().cpu()
+    sg = batch.sg_ind.reshape(-1).cpu()
+    radius = batch.radius.reshape(-1).detach().cpu().double()
+    n = len(sg)
+    ok = torch.zeros(n, dtype=torch.bool)
+    log_ref = torch.zeros(n, dtype=torch.float32)
+    state = torch.zeros(n, int(ef.data_ndim), dtype=torch.float32)
+    for g in sorted(set(sg.tolist())):
+        for lo in range(0, n, 50000):   # one chart per space group and chunk, each row at its own radius
+            rows = torch.nonzero(sg == g).flatten()
+            rows = rows[(rows >= lo) & (rows < lo + 50000)]
+            if rows.numel() == 0:
+                continue
+            fc = ef.fd_coordinates_rows(int(g), radius[rows])
+            r = fc.from_params(params[rows], hand[rows])
+            good = rows[r.ok]
+            ok[good] = True
+            state[good] = ef.fd_layout.pack(int(g), r.s[r.ok].float())
+            if good.numel():
+                _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
+                log_ref[good] = lr.float()
+    return ok, state, log_ref
+
+
+KICK_CHARTS = ('latent', 'fd')
+
+
+def metric_kick(batch, log_lo, log_hi, eps=1e-6, generator=None, chart='latent'):
     """Displace each Z' = 1 crystal of `batch` by a step isotropic in the FD identity metric (mxtaltools
     crystal_fd.metric: every coordinate in Angstrom), of length 10^U(log_lo, log_hi) Angstrom; IN PLACE. Returns [n]
     the step lengths (Angstrom).
@@ -218,10 +252,16 @@ def metric_kick(batch, log_lo, log_hi, eps=1e-6, generator=None):
     each at the crystal before the step. The direction is uniform on the unit sphere of the row's live coordinates
     (_metric_projector: the crystal system's tied and fixed cell parameters), so in every live direction a step of
     length rho moves the crystal rho in the metric to first order. A free polar axis of the space group is not
-    removed: a step along it moves nothing physical. After the step the row goes through the same three primitives as
-    the latent iso kick (MolCrystalOps.log_noise_latent_parameters): latent_params, clipped to [-1 + eps, 1 - eps],
-    latent_to_cell_params, clean_cell_parameters(mode='hard'), so a kicked crystal is one the trainer latent can
-    hold. The draws use `generator` (None: the global torch generator)."""
+    removed: a step along it moves nothing physical. chart 'latent': after the step the row goes through the same three
+    primitives as the latent iso kick (MolCrystalOps.log_noise_latent_parameters): latent_params, clipped to
+    [-1 + eps, 1 - eps], latent_to_cell_params, clean_cell_parameters(mode='hard'), so a kicked crystal is one the
+    trainer latent can hold (the hard clean also folds the centroid into the latent's asymmetric-unit box, which on
+    P2_1/c is y <= 1/4: a molecule the search placed past it becomes another crystal). chart 'fd': the stepped
+    parameters are written as they are, any description of the crystal; the caller canonicalises them through the FD
+    chart (fd_chart_points), which drops a row with no chart point. The draws use `generator` (None: the global torch
+    generator)."""
+    if chart not in KICK_CHARTS:
+        raise ValueError(f"metric_kick: chart must be one of {KICK_CHARTS}, got {chart!r}")
     from mxtaltools.common.geometry_utils import init_sym_info, rotmat2rotvec_stable
     from mxtaltools.crystal_building.utils import canonicalize_rotvec
     if int(batch.max_z_prime) != 1:
@@ -248,6 +288,8 @@ def metric_kick(batch, log_lo, log_hi, eps=1e-6, generator=None):
     # [0, pi] from rotmat2rotvec_stable need not be: the round trip below would clip z, a different rotation
     q[:, 9:12] = canonicalize_rotvec(rotmat2rotvec_stable(_rodrigues(w) @ _rodrigues(p[:, 9:12])).to(F))
     batch.set_cell_parameters(q.to(batch.cell_lengths.dtype))
+    if chart == 'fd':
+        return rho
     lat = batch.latent_params(gauge_fix_free_axes=False)
     batch.latent_to_cell_params(lat.clip(min=-1 + eps, max=1 - eps))
     batch.clean_cell_parameters(mode='hard')

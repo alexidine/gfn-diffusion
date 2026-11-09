@@ -4511,31 +4511,8 @@ class Modeller:
     def _fd_chart_points(self, batch):
         """crystal_coordinates 'fd': ([n] bool has a chart point, [n, data_ndim] chart rows s, zero where none, [n] log
         reference density on s, zero where none) of the crystals of a stored batch, canonicalised through the chart of
-        each row's (space group, molecule radius)."""
-        ef = self.energy_function
-        params = batch.full_cell_parameters().detach().cpu()
-        hand = batch.aunit_handedness.reshape(-1).detach().cpu()
-        sg = batch.sg_ind.reshape(-1).cpu()
-        radius = batch.radius.reshape(-1).detach().cpu().double()
-        n = len(sg)
-        ok = torch.zeros(n, dtype=torch.bool)
-        log_ref = torch.zeros(n, dtype=torch.float32)
-        state = torch.zeros(n, int(ef.data_ndim), dtype=torch.float32)
-        for g in sorted(set(sg.tolist())):
-            for lo in range(0, n, 50000):   # one chart per space group and chunk, each row at its own radius
-                rows = torch.nonzero(sg == g).flatten()
-                rows = rows[(rows >= lo) & (rows < lo + 50000)]
-                if rows.numel() == 0:
-                    continue
-                fc = ef.fd_coordinates_rows(int(g), radius[rows])
-                r = fc.from_params(params[rows], hand[rows])
-                good = rows[r.ok]
-                ok[good] = True
-                state[good] = ef.fd_layout.pack(int(g), r.s[r.ok].float())
-                if good.numel():
-                    _, _, lr = ef.fd_coordinates_rows(int(g), radius[good]).to_params(r.s[r.ok].double())
-                    log_ref[good] = lr.float()
-        return ok, state, log_ref
+        each row's (space group, molecule radius): noised_prior.fd_chart_points, shared with the prior builder."""
+        return noised_prior.fd_chart_points(self.energy_function, batch)
 
     def _fd_chart_points_cached(self, batch, prior_path):
         """_fd_chart_points of a whole pre-noised prior file's batch, through the sidecar cache beside `prior_path`

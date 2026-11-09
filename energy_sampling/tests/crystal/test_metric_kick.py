@@ -166,3 +166,21 @@ def test_the_trainer_seam_runs_the_metric_tile_and_refuses_the_rest():
     _, seam = _seam('isotropic')
     with pytest.raises(ValueError, match="'iso', 'metric' or 'shaped'"):
         seam(b.clone(), (-2.5, -1.5))
+
+
+def test_the_fd_chart_writes_the_step_without_folding_into_the_latent_box():
+    """chart 'fd': the stepped parameters are written as they are. A P2_1/c molecule placed past the latent's
+    asymmetric-unit box (y > 1/4) keeps its centroid through a zero step on 'fd'; on 'latent' the round trip and the
+    hard clean move it back inside the box, which is another crystal."""
+    b = _rows((14,), per=3)
+    b.aunit_centroid[:, 1] = 0.4
+    p0 = b.full_cell_parameters().clone()
+    torch.manual_seed(3)
+    NP.metric_kick(b, -12.0, -12.0, chart='fd')
+    assert torch.allclose(b.full_cell_parameters()[:, :9], p0[:, :9], atol=1e-6)
+    c = _rows((14,), per=3)
+    c.aunit_centroid[:, 1] = 0.4
+    NP.metric_kick(c, -12.0, -12.0, chart='latent')
+    assert bool((c.aunit_centroid[:, 1] <= 0.25 + 1e-4).all())
+    with pytest.raises(ValueError, match='chart must be one of'):
+        NP.metric_kick(_rows((14,), per=1), -2.0, -2.0, chart='asu')

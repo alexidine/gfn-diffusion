@@ -39,6 +39,15 @@ IMAGES (owner rule 2026-09-28: noise first, then the normaliser images). On spac
 uniformly (the four y/z half shifts; eight on an x face), so the child set is image-symmetric in distribution.
 Only aunit_centroid changes; stored energies carry over (symmetrize_prior proves them equal), and the trainer's entry
 check re-scores a stratified sample of rows against them. --images off writes children as kicked.
+
+CHART (check_chart). The build scores and kicks on the run's energy_config.crystal_coordinates. 'fd' is end to end on
+the FD chart: every anchor and child is analysed from its FD chart point (noised_prior.fd_chart_points, as the
+trainer reads a stored row), so any description of a crystal scores as that crystal, and the metric kick writes its
+stepped parameters without the latent round trip; a row with no chart point is dropped and counted (manifest
+counts.anchors_no_chart_point, children_no_chart_point). Only --child_kernel metric, no images. 'latent' (the
+parallel option) builds through the trainer latent as before: a crystal outside the latent's length box or
+asymmetric-unit box (P2_1/c: y <= 1/4) is clipped into another, which --basins catches as a rescoring miss. The
+manifest records the chart; the stored terms are the crystal's either way (noised_prior.identity).
 """
 import argparse
 import datetime
@@ -127,21 +136,38 @@ def collate(batches):
 
 
 def score(ef, batch, T, device, chunk):
-    """The analysed batch (on the CPU) of every row of `batch`, through the energy function's own scoring of a stored
-    prior row (train.py::Modeller._score_prior_rows), chunk rows at a time."""
-    out = []
+    """(the analysed batches, on the CPU, [n] bool the rows of `batch` they hold): every row through the energy
+    function's own scoring of a stored prior row (train.py::Modeller._score_prior_rows), chunk rows at a time, from
+    the state the run's chart gives it. FD chart (energy_config.crystal_coordinates 'fd'): the row's FD chart point
+    (noised_prior.fd_chart_points, as the trainer reads a stored row), so any description of a crystal scores as that
+    crystal; a row with no chart point is dropped. Latent chart: the row's latent_params, every row kept (a cell or
+    centroid outside the latent's boxes is clipped into another crystal, which check_basin_energies catches)."""
+    fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+    out, kept = [], torch.ones(batch.num_graphs, dtype=torch.bool)
     for lo in range(0, batch.num_graphs, chunk):
-        c = batch.subsample_new_batch(torch.arange(lo, min(lo + chunk, batch.num_graphs))).to(device)
+        idx = torch.arange(lo, min(lo + chunk, batch.num_graphs))
+        c = batch.subsample_new_batch(idx)
+        if fd:
+            ok, state, _ = NP.fd_chart_points(ef, c)
+            kept[idx[~ok]] = False
+            if not bool(ok.any()):
+                continue
+            if not bool(ok.all()):
+                c = c.subsample_new_batch(torch.nonzero(ok).flatten())
+            x = state[ok].to(device)
+            c = c.to(device)
+        else:
+            c = c.to(device)
+            x = c.latent_params(gauge_fix_free_axes=True)
         with torch.no_grad(), ef.allow_unreferenced():
             _, c = ef.batched_analyze_crystal_batch(
-                c.latent_params(gauge_fix_free_axes=True), c,
-                T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
+                x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
                 return_batch=True, internal_oom_recovery=True)
         out.append(c.cpu())
         del c
         if str(device).startswith('cuda'):
             torch.cuda.empty_cache()
-    return out
+    return out, kept
 
 
 def seed_energy(ef, batch, T, device, chunk=8192):
@@ -177,12 +203,13 @@ def load_harvest(pattern, identity, keys, molecules):
     return (collate(parts) if parts else None), files
 
 
-def kick(batch, lo, hi, device, kernel='iso'):
+def kick(batch, lo, hi, device, kernel='iso', chart='latent'):
     """(batch on device, [n] radii): each row kicked by the --child_kernel's iso draw at 10^U(lo, hi), 'iso' in the
-    trainer latent (log_noise_latent_parameters), 'metric' in the FD identity metric (noised_prior.metric_kick)."""
+    trainer latent (log_noise_latent_parameters), 'metric' in the FD identity metric (noised_prior.metric_kick, ending
+    in the run's chart: the latent round trip, or on 'fd' the stepped parameters as they are)."""
     b = batch.to(device)
     if kernel == 'metric':
-        return b, NP.metric_kick(b, lo, hi)
+        return b, NP.metric_kick(b, lo, hi, chart=chart)
     if kernel != 'iso':
         raise ValueError(f"kick: kernel 'iso' or 'metric', got {kernel!r}")
     mag = b.log_noise_latent_parameters(lo, hi)
@@ -246,9 +273,11 @@ def calibrate(ef, anchors, e_anchor, train_idx, T, args, rng):
     table = []
     for h in grid:
         torch.manual_seed(args.seed + 11)
-        b, _ = kick(base.subsample_new_batch(torch.arange(base.num_graphs)), h, h, args.device, args.child_kernel)
-        scored = collate(score(ef, b, T, args.device, args.chunk))
-        du = (seed_energy(ef, scored, T, args.device) - e_anchor[torch.as_tensor(pick)]) / T
+        b, _ = kick(base.subsample_new_batch(torch.arange(base.num_graphs)), h, h, args.device, args.child_kernel,
+                    chart_of(ef))
+        scored, kept = score(ef, b, T, args.device, args.chunk)
+        scored = collate(scored)
+        du = (seed_energy(ef, scored, T, args.device) - e_anchor[torch.as_tensor(pick)][kept]) / T
         ok = torch.isfinite(du)
         q = torch.quantile(du[ok], torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)).tolist() if ok.any() else [math.nan] * 3
         inside = float((du[ok] <= args.window_kT).double().mean()) if ok.any() else math.nan
@@ -281,14 +310,25 @@ def choose_images(batch, rng):
     return int(face.sum())
 
 
-def refuse_unscored_chart(run_args):
-    """score() hands the analysis each row's trainer latent (latent_params) as x, which a run on
-    energy_config.crystal_coordinates 'fd' would decode as an FD chart row: every row mis-built (seen 2026-10-30:
-    packing coefficients 2.6-14). Build on the latent chart; the trainer's FD loader re-describes the rows."""
-    chart = getattr(run_args.energy_config, 'crystal_coordinates', 'latent')
-    if chart != 'latent':
-        raise SystemExit(f"build_noised_prior scores rows on the latent chart only; got energy_config.crystal_coordinates "
-                         f"{chart!r}. Build without it: an FD run loads a latent-scored build")
+def chart_of(ef) -> str:
+    """The chart the build scores and kicks in: the energy function's energy_config.crystal_coordinates."""
+    return 'fd' if getattr(ef, 'crystal_coordinates', 'latent') == 'fd' else 'latent'
+
+
+def check_chart(run_args, args):
+    """The build's chart, energy_config.crystal_coordinates ('latent' when absent). 'fd' builds end to end on the FD
+    chart: anchors and children are scored from their FD chart points (score) and the metric kick ends in the stepped
+    parameters (noised_prior.metric_kick chart 'fd'), so no row passes through the latent's boxes. The 'iso' and
+    'basin' kernels draw in the trainer latent and are refused there; --images (normaliser images of a latent
+    description) is not applied, the FD chart holding one description per crystal."""
+    chart = getattr(run_args.energy_config, 'crystal_coordinates', 'latent') or 'latent'
+    if chart not in NP.KICK_CHARTS:
+        raise SystemExit(f"build_noised_prior builds on the latent or FD chart; got energy_config.crystal_coordinates "
+                         f"{chart!r}")
+    if chart == 'fd' and args.k > 0 and args.child_kernel != 'metric':
+        raise SystemExit(f"--child_kernel {args.child_kernel!r} draws in the trainer latent; an FD build kicks with "
+                         f"--child_kernel metric")
+    return chart
 
 
 def load_source_anchors(args, run_args, ef):
@@ -405,9 +445,10 @@ def heldout_mask(groups, e_anchor, frac, rng, units=None):
 
 def check_basin_energies(anchors, basins, tol):
     """[B] bool, the anchors that rescore to their basin's converted search energy within ``tol`` (run units). A row
-    that does not has no faithful chart point: score() builds from the trainer latent, which clips a cell outside the
-    trainer's length box into another crystal. Such rows are dropped and counted, never kept clipped; more than 20%
-    of rows off refuses the set (frame, chart or energy definition differs)."""
+    that does not has no faithful chart point: on the latent chart score() builds from the trainer latent, which clips
+    a cell outside the trainer's length box, or a centroid outside the latent's asymmetric-unit box, into another
+    crystal. Such rows are dropped and counted, never kept clipped; more than 20% of rows off refuses the set (frame,
+    chart or energy definition differs)."""
     got = torch.as_tensor(anchors.mol_energy, dtype=torch.float64).reshape(-1)
     want = basins['tags']['basin_E'].reshape(-1)
     off = (got - want).abs()
@@ -431,7 +472,7 @@ def main(argv=None):
     run_args = get_train_args(['--config', args.config])
     apply_overrides(run_args, args.overrides)
     T = float(run_args.energy_config.temperature)
-    refuse_unscored_chart(run_args)
+    chart = check_chart(run_args, args)
     ef = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
 
     if (args.source is None) == (args.basins is None):
@@ -460,7 +501,14 @@ def main(argv=None):
               f"{len(harvest_files)} shard(s)", flush=True)
 
     t0 = time.time()
-    anchors = collate(score(ef, anchors, T, args.device, args.chunk))
+    scored, kept = score(ef, anchors, T, args.device, args.chunk)
+    anchors_no_point = int((~kept).sum())
+    if anchors_no_point:
+        print(f"anchors: {anchors_no_point} of {kept.numel()} rows have no {chart} chart point; dropped", flush=True)
+        n_src = int(kept[:n_src].sum())
+        if basins is not None:
+            basins['tags'] = {k: v[kept] for k, v in basins['tags'].items()}
+    anchors = collate(scored)
     e_anchor = seed_energy(ef, anchors, T, args.device)
     if basins is not None:
         keep = check_basin_energies(anchors, basins, args.energy_tol)
@@ -519,15 +567,18 @@ def main(argv=None):
     sg = set(torch.as_tensor(anchors.sg_ind).reshape(-1).tolist())
     zp = set(torch.as_tensor(anchors.z_prime).reshape(-1).tolist())
     hand = set(torch.as_tensor(anchors.aunit_handedness).reshape(-1).tolist())
-    images = not basin_children and args.images == 'auto' and sg == {2} and zp == {1} and hand == {1.0}
-    if args.images == 'auto' and not images and not basin_children:
+    images = (chart == 'latent' and not basin_children and args.images == 'auto' and sg == {2} and zp == {1}
+              and hand == {1.0})
+    if chart == 'fd' and args.images == 'auto':
+        print("images: not applied (FD chart: one description per crystal)", flush=True)
+    elif args.images == 'auto' and not images and not basin_children:
         print(f"images: not applied (space groups {sorted(sg)}, Z' {sorted(zp)}, handedness {sorted(hand)}: outside "
               f"symmetrize_prior's scope)", flush=True)
 
     t0 = time.time()
     torch.manual_seed(args.seed + 1)
     gen = torch.Generator().manual_seed(args.seed + 1)
-    children, parents, mags, n_face = [], [], [], 0
+    children, parents, mags, n_face, children_no_point = [], [], [], 0, 0
     misses = torch.zeros(anchors.num_graphs, dtype=torch.long)
     per_call = max(1, args.chunk // max(args.k, 1))
     for lo in range(0, anchors.num_graphs if args.k > 0 else 0, per_call):
@@ -538,8 +589,12 @@ def main(argv=None):
             misses += miss
             mag = torch.zeros(len(rep))
         else:
-            b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device, args.child_kernel)
-        scored = score(ef, b, T, args.device, args.chunk)
+            b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device, args.child_kernel,
+                          chart)
+        scored, kept = score(ef, b, T, args.device, args.chunk)
+        if not bool(kept.all()):   # a kicked crystal with no chart point: dropped with its parent and radius
+            children_no_point += int((~kept).sum())
+            rep, mag = rep[kept], mag[kept.to(mag.device)]
         for s in scored:
             if images:
                 n_face += choose_images(s, rng)
@@ -555,7 +610,9 @@ def main(argv=None):
     print(f"children scored in {time.time() - t0:.0f} s: {0 if children is None else children.num_graphs} rows"
           + (f", images drawn ({n_face} on an x face)" if images else "")
           + (f"; {int(misses.sum())} draws with no chart point dropped (most of one basin: {int(misses.max())})"
-             if basin_children and anchors.num_graphs else ""), flush=True)
+             if basin_children and anchors.num_graphs else "")
+          + (f"; {children_no_point} kicked rows with no {chart} chart point dropped" if children_no_point else ""),
+          flush=True)
     if kernel is not None:
         kernel.update(misses=int(misses.sum()), misses_max_per_basin=int(misses.max()) if misses.numel() else 0)
 
@@ -605,14 +662,15 @@ def main(argv=None):
         basin_set=None if basins is None else dict(path=basins['path'], header=basins['header'],
                                                    to_run_units=basins['factor'],
                                                    dropped_off_chart=basins['dropped_off_chart']),
-        child_kernel=args.child_kernel, basin_kernel=kernel,
+        chart=chart, child_kernel=args.child_kernel, basin_kernel=kernel,
         k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
         kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,
         temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),
         counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(set(groups.tolist())),
-                    children_within_window=inside, children_far_below_parent=int(below_parent.sum())),
+                    children_within_window=inside, children_far_below_parent=int(below_parent.sum()),
+                    anchors_no_chart_point=anchors_no_point, children_no_chart_point=children_no_point),
         commits=dict(gfn=git_commit(HERE), mxtaltools=git_commit(os.path.dirname(os.path.dirname(
             __import__('mxtaltools').__file__)))),
         built=datetime.datetime.now().isoformat(timespec='seconds'),

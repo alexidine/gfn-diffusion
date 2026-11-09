@@ -184,14 +184,22 @@ def test_harvest_keeps_high_error_rows_and_records_and_drops_the_rest():
     assert NP.harvest_mask(resid, log_r, 2.0, 1.0).tolist() == [False, True, False, False, False]
 
 
-def test_the_builder_refuses_a_non_latent_chart():
-    """build_noised_prior.score feeds latent_params as x; on the FD chart that would mis-build every row."""
+def test_the_builder_builds_on_the_latent_or_fd_chart_and_fd_takes_the_metric_kick_only():
+    """build_noised_prior.check_chart: the chart is energy_config.crystal_coordinates ('latent' when absent); an FD
+    build kicks with --child_kernel metric only (iso and basin draw in the trainer latent); any other chart refuses."""
     from types import SimpleNamespace
-    from energy_sampling.data_processing.build_noised_prior import refuse_unscored_chart
-    refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace(crystal_coordinates='latent')))
-    refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace()))
-    with pytest.raises(SystemExit, match="crystal_coordinates 'fd'"):
-        refuse_unscored_chart(SimpleNamespace(energy_config=SimpleNamespace(crystal_coordinates='fd')))
+    from energy_sampling.data_processing.build_noised_prior import check_chart
+    cfg = lambda **ec: SimpleNamespace(energy_config=SimpleNamespace(**ec))
+    arg = lambda kernel, k=10: SimpleNamespace(child_kernel=kernel, k=k)
+    assert check_chart(cfg(crystal_coordinates='latent'), arg('iso')) == 'latent'
+    assert check_chart(cfg(), arg('basin')) == 'latent'
+    assert check_chart(cfg(crystal_coordinates='fd'), arg('metric')) == 'fd'
+    assert check_chart(cfg(crystal_coordinates='fd'), arg('iso', k=0)) == 'fd'      # no children, no kick
+    for kernel in ('iso', 'basin'):
+        with pytest.raises(SystemExit, match='an FD build kicks with --child_kernel metric'):
+            check_chart(cfg(crystal_coordinates='fd'), arg(kernel))
+    with pytest.raises(SystemExit, match='latent or FD chart'):
+        check_chart(cfg(crystal_coordinates='asu'), arg('metric'))
 
 
 def test_basin_rows_that_do_not_rescore_are_dropped_and_too_many_refuse():
