@@ -9026,30 +9026,57 @@ class Modeller:
           eval_bwd/tb_heldout_rows      mean delta over prior_heldout_batch rows (a pre-noised prior's held-out anchor
                                         groups: training molecules, crystals never trained on)
           eval_bwd/tb_train_rows        mean delta over prior_dataset rows
-          eval_bwd/tb_{heldout,train}_rows_std   std of delta over the same rows (log Z-invariant)
+          eval_bwd/tb_{heldout,train}_rows_std   std of delta over the same rows (mixes conditions, so on a
+                                        conditional run it carries the spread of per-condition log Z)
+          eval_bwd/tb_{heldout,train}_rows_std_within   mean over conditions holding >= 2 of the rows of the std of
+                                        delta within the condition (log Z-invariant on any run)
           eval_bwd/tb_heldout_gap       tb_train_rows - tb_heldout_rows, nats; > 0 = held-out crystals worse fit
-        On an unconditional run log Z is one number, so the gap does not depend on it; on a conditional run the two
-        sets mix conditions differently and per-condition log Z does not cancel. log Z is the policy's own (log_flow
-        at the source), as bwd_eval_sampling reads it. tau is drawn afresh each eval, so the curves carry rollout noise
-        on fixed rows. Absent without held-out rows (a prior that is not a pre-noised build with held-out groups)."""
+        And, when the run has test molecules (test_molecules_path), the same on their stored crystals -- molecules never
+        trained on, so log Z is whatever the policy's Z(c) head gives a new condition -- on its own fixed rows
+        (n = min(the eval draw at the first readout, the test rows), seed + 7):
+          eval_test/tb_rows, eval_test/tb_rows_std, eval_test/tb_rows_std_within   as above
+          eval_test/tb_rows_gap         tb_train_rows - eval_test/tb_rows, nats; > 0 = held-out molecules worse fit
+        On an unconditional run log Z is one number, so the gap does not depend on it; on a conditional run the sets
+        mix conditions differently and per-condition log Z does not cancel (std_within is the part that does not see
+        it). log Z is the policy's own (log_flow at the source), as bwd_eval_sampling reads it. tau is drawn afresh
+        each eval, so the curves carry rollout noise on fixed rows. The held-out/train pair is absent without held-out
+        rows (a prior that is not a pre-noised build with held-out groups); the test set without test molecules."""
         held = getattr(self, 'prior_heldout_batch', None)
-        if held is None or int(held.num_graphs) == 0:
+        test = getattr(getattr(self, 'test_mol_dataset', None), 'batch', None)
+        sets = {}
+        if held is not None and int(held.num_graphs) > 0:
+            sets.update(heldout_rows=held, train_rows=self.prior_dataset.batch)
+        if test is not None and int(test.num_graphs) > 0:
+            sets['test_rows'] = test
+        if not sets:
             return {}
-        sets = {'heldout_rows': held, 'train_rows': self.prior_dataset.batch}
         if getattr(self, '_bwd_readout_rows', None) is None:
-            n = min(int(self.eval_draw_size()), *(int(b.num_graphs) for b in sets.values()))
+            self._bwd_readout_rows = {}
+        rows = self._bwd_readout_rows
+        pair = [k for k in ('heldout_rows', 'train_rows') if k in sets and k not in rows]
+        if pair:   # the held-out and training sets on one row count, so their means compare
+            n = min(int(self.eval_draw_size()), *(int(sets[k].num_graphs) for k in pair))
             g = torch.Generator().manual_seed(int(self.args.seed) + 7)
-            self._bwd_readout_rows = {k: torch.randperm(int(b.num_graphs), generator=g)[:n].sort().values
-                                      for k, b in sets.items()}
+            rows.update({k: torch.randperm(int(sets[k].num_graphs), generator=g)[:n].sort().values for k in pair})
+        if 'test_rows' in sets and 'test_rows' not in rows:
+            g = torch.Generator().manual_seed(int(self.args.seed) + 7)
+            n = min(int(self.eval_draw_size()), int(test.num_graphs))
+            rows['test_rows'] = torch.randperm(int(test.num_graphs), generator=g)[:n].sort().values
+        fd = getattr(self.energy_function, 'crystal_coordinates', 'latent') == 'fd'
+        keys = {'heldout_rows': 'eval_bwd/tb_heldout_rows', 'train_rows': 'eval_bwd/tb_train_rows',
+                'test_rows': 'eval_test/tb_rows'}
         out = {}
         for name, batch in sets.items():
-            idx = self._bwd_readout_rows[name]
-            deltas, i, retries = [], 0, 0
+            idx = rows[name]
+            deltas, cids, i, retries = [], [], 0, 0
             while i < idx.numel():
                 chunk = max(1, int(self.eval_draw_size()))
                 try:
                     sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device))
-                    _, _, _, log_pfs, log_pbs, log_z, _, log_r = self._bwd_eval_draw(sub, discretizer)
+                    ok = None
+                    if fd and not hasattr(sub, 'fd_state'):
+                        ok = self._attach_fd_reference(sub).reshape(-1).cpu()   # on this sub-batch only
+                    _, cid, _, log_pfs, log_pbs, log_z, _, log_r = self._bwd_eval_draw(sub, discretizer)
                 except (RuntimeError, ValueError) as e:
                     self.handle_train_epoch_error(e, 'eval_bwd')   # re-raises anything but a CUDA OOM
                     retries += 1
@@ -9059,19 +9086,30 @@ class Modeller:
                         deltas = None
                         break
                     continue
-                deltas.append((log_z.reshape(-1) + log_pfs.sum(-1) - log_r.reshape(-1)
-                               - log_pbs.sum(-1)).float().flatten().cpu())
+                d = (log_z.reshape(-1) + log_pfs.sum(-1) - log_r.reshape(-1) - log_pbs.sum(-1)).float().flatten().cpu()
+                c = torch.as_tensor(cid).reshape(-1).cpu().long()
+                if ok is not None:   # a row with no FD chart point has no state to score
+                    d, c = d[ok], c[ok]
+                deltas.append(d)
+                cids.append(c)
                 i += chunk
             if not deltas:
                 continue
-            d = torch.cat(deltas)
-            d = d[torch.isfinite(d)]
+            d, c = torch.cat(deltas), torch.cat(cids)
+            fin = torch.isfinite(d)
+            d, c = d[fin], c[fin]
             if d.numel() == 0:
                 continue
-            out[f'eval_bwd/tb_{name}'] = float(d.mean())
-            out[f'eval_bwd/tb_{name}_std'] = float(d.std()) if d.numel() > 1 else 0.0
+            key = keys[name]
+            out[key] = float(d.mean())
+            out[f'{key}_std'] = float(d.std()) if d.numel() > 1 else 0.0
+            stds = [float(d[c == u].std()) for u in torch.unique(c) if int((c == u).sum()) >= 2]
+            if stds:
+                out[f'{key}_std_within'] = sum(stds) / len(stds)
         if 'eval_bwd/tb_heldout_rows' in out and 'eval_bwd/tb_train_rows' in out:
             out['eval_bwd/tb_heldout_gap'] = out['eval_bwd/tb_train_rows'] - out['eval_bwd/tb_heldout_rows']
+        if 'eval_test/tb_rows' in out and 'eval_bwd/tb_train_rows' in out:
+            out['eval_test/tb_rows_gap'] = out['eval_bwd/tb_train_rows'] - out['eval_test/tb_rows']
         return out
 
     @torch.no_grad()

@@ -7,7 +7,10 @@ rows, a stub energy function and a stub policy. What each test would catch:
   * the rows redrawn between evals (the curve would carry row-sampling noise), including when the eval draw shrinks;
   * the readout present on a run with no held-out rows;
   * an OOM that never shrinks the eval draw (step 0) spinning the readout forever;
-  * a non-OOM error swallowed.
+  * a non-OOM error swallowed;
+  * the test molecules' crystals (eval_test/tb_rows) missing, read on the held-out/train row count, or their gap's
+    sign wrong; the test set dropped on a run with no held-out rows;
+  * the within-condition std mixing conditions (it must not see a per-condition log Z offset).
 
 CPU, synthetic rows, no energy computed.
 
@@ -43,9 +46,10 @@ class _Rows:
 
 
 class _Ef:
+    """Condition id = x[:, 2] (0 unless a test sets it)."""
     def condition_samples(self, mol_batch, temperature, **kw):
         n = int(mol_batch.num_graphs)
-        return mol_batch, torch.log10(temperature), torch.zeros(n, 1), torch.zeros(n, dtype=torch.long)
+        return mol_batch, torch.log10(temperature), torch.zeros(n, 1), mol_batch.x[:, 2].long()
 
     def prebuilt_sample_to_reward(self, mol_batch, temperature):
         return mol_batch.log_r
@@ -77,7 +81,7 @@ def _rows(n, delta, offset):
     return _Rows(x, log_r)
 
 
-def _modeller(n_held=7, n_train=20, batch_size=16, fail=None, step_ind=5):
+def _modeller(n_held=7, n_train=20, batch_size=16, fail=None, step_ind=5, n_test=0):
     m = Modeller.__new__(Modeller)
     m.args = SimpleNamespace(seed=0, energy_config=SimpleNamespace(temperature=1.0), oom_batch_shrink_factor=0.5)
     m.gfn_model = _Policy(fail)
@@ -88,14 +92,17 @@ def _modeller(n_held=7, n_train=20, batch_size=16, fail=None, step_ind=5):
     m._batch_latents = lambda b: b.x
     m.prior_heldout_batch = _rows(n_held, -2.0, 1000.0) if n_held else None
     m.prior_dataset = SimpleNamespace(batch=_rows(n_train, 0.0, 0.0))
+    if n_test:
+        m.test_mol_dataset = SimpleNamespace(batch=_rows(n_test, -3.0, 2000.0))
     return m
 
 
 def test_gap_is_train_minus_heldout_on_equal_row_counts():
     m = _modeller()
     out = m.bwd_heldout_readouts(None)
-    assert set(out) == {'eval_bwd/tb_heldout_rows', 'eval_bwd/tb_heldout_rows_std', 'eval_bwd/tb_train_rows',
-                        'eval_bwd/tb_train_rows_std', 'eval_bwd/tb_heldout_gap'}
+    assert set(out) == {'eval_bwd/tb_heldout_rows', 'eval_bwd/tb_heldout_rows_std',
+                        'eval_bwd/tb_heldout_rows_std_within', 'eval_bwd/tb_train_rows', 'eval_bwd/tb_train_rows_std',
+                        'eval_bwd/tb_train_rows_std_within', 'eval_bwd/tb_heldout_gap'}
     assert math.isclose(out['eval_bwd/tb_heldout_rows'], -2.0, abs_tol=1e-5)
     assert math.isclose(out['eval_bwd/tb_train_rows'], 0.0, abs_tol=1e-5)
     assert math.isclose(out['eval_bwd/tb_heldout_gap'], 2.0, abs_tol=1e-5)      # > 0: held-out rows fit worse
@@ -134,3 +141,35 @@ def test_a_non_oom_error_is_raised():
     m = _modeller(fail=ValueError('bad condition'))
     with pytest.raises(ValueError, match='bad condition'):
         m.bwd_heldout_readouts(None)
+
+
+def test_test_molecules_read_on_their_own_rows_with_their_gap():
+    m = _modeller(n_test=11)
+    out = m.bwd_heldout_readouts(None)
+    assert math.isclose(out['eval_test/tb_rows'], -3.0, abs_tol=1e-5)
+    assert math.isclose(out['eval_test/tb_rows_gap'], 3.0, abs_tol=1e-5)       # > 0: held-out molecules worse
+    assert math.isclose(out['eval_bwd/tb_heldout_gap'], 2.0, abs_tol=1e-5)      # the pair is unchanged by the third set
+    held, train, test = m.gfn_model.seen
+    assert held.shape[0] == train.shape[0] == 7                                  # the pair's n ignores the test set
+    assert test.shape[0] == 11 and bool((test[:, 1] >= 2000).all())              # n = min(draw 16, 11)
+
+
+def test_test_molecules_read_without_heldout_rows():
+    m = _modeller(n_held=0, n_test=5)
+    out = m.bwd_heldout_readouts(None)
+    assert set(out) == {'eval_test/tb_rows', 'eval_test/tb_rows_std', 'eval_test/tb_rows_std_within'}
+    assert len(m.gfn_model.seen) == 1
+
+
+def test_std_within_ignores_a_per_condition_offset():
+    """Two conditions whose residuals sit 10 nats apart (a per-condition log Z error), each with an internal spread of
+    exactly 1: the pooled std sees the offset, std_within does not."""
+    m = _modeller(n_held=0, n_test=8)
+    b = m.test_mol_dataset.batch
+    b.x[:, 2] = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.float32)
+    spread = torch.tensor([-1.0, 1.0, -1.0, 1.0, 9.0, 11.0, 9.0, 11.0])        # condition 1 sits 10 nats higher
+    b.x[:, 0] = b.log_r - LOG_Z + spread
+    out = m.bwd_heldout_readouts(None)
+    within = float(torch.tensor([-1.0, 1.0, -1.0, 1.0]).std())
+    assert math.isclose(out['eval_test/tb_rows_std_within'], within, abs_tol=1e-5)
+    assert out['eval_test/tb_rows_std'] > 4.0
