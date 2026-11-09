@@ -69,7 +69,7 @@ def test_unknown_tb_z_source_is_refused_everywhere():
 
 
 def test_pooled_center_lives_on_fwd_and_takes_a_known_value():
-    assert POOLED_CENTERS == ('mean', 'head', 'head_stored')
+    assert POOLED_CENTERS == ('mean', 'head', 'head_stored', 'mean_detached')
     with pytest.raises(ValueError, match='pooled_center'):
         Stage({**FUSED, 'loss_coeffs': {'bwd': {'pooled_center': 'head'}}}, 0)
     with pytest.raises(ValueError, match='pooled_center'):

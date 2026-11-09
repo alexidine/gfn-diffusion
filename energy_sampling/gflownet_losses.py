@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.utils import collate_data_list
 from buffer import N_FORCE_LEGS
-from protocol import POOLED_CENTERS
+from protocol import POOLED_CENTERS, HEAD_CENTERS
 from utils import compute_sample_overlap
 
 
@@ -1583,7 +1583,7 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
 def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
                              min_group_count: int = 2, ratio=None,
                              bridge_only: bool = False, thin_by_condition: bool = True,
-                             center: str = 'mean'):
+                             center: str = 'mean', beta_fwd=None):
     """
     CROSS-BRANCH VarGrad: one per-condition group spanning BOTH the forward
     rollouts and the backward/buffer draws.
@@ -1620,8 +1620,25 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
                      `log_z`, detached)
       'head_stored'  L(c) = 1/2 head(c) + 1/2 the mean u of the group's stored
                      (bwd) rows; a group with no stored row falls back to head(c)
-    Same rows, same min_group_count gate and same knee as 'mean', so the three
-    differ only in L. Both need the stashes' `log_z` and raise without it.
+      'mean_detached'  L(c) = the group's own row mean, detached: 'mean''s level
+                     without its zero-sum coupling
+    Same rows, same min_group_count gate and same knee as 'mean', so the four
+    differ only in L. 'head' and 'head_stored' need the stashes' `log_z` and raise
+    without it.
+
+    A SEPARATE FIRST-SIDE KNEE (`beta_fwd`, fwd_loss_coeffs.pooled_beta_fwd; None =
+    `beta`): the first side's rows (the replayed or forward draws, the policy's own
+    samples) are scored at knee beta_fwd and the stored rows at beta, so a row's
+    influence is at most its side's knee. Detached centres only: with 'mean' in the
+    graph every row's coefficient carries the shared psi_bar, and the sides' pulls
+    still balance whatever one side's knee (2 + 2 rows 40 nats either side of the
+    centre, knees 5 and 40: each own sample is pushed at 22.5, not 5), so 'mean'
+    refuses it. Its use: while the stored rows sit far above the policy's samples
+    (the J_B - J_F gap after MLE, ~85 nats on norbornane), a mid-gap level pushes the
+    policy's own samples down hard and the flow vacates what it samples; a small
+    first-side knee keeps that push bounded while the stored rows' saturated pull
+    (beta) still lifts the minima, and once the gap closes inside both knees the term
+    is TB against the group mean.
 
     Returns (loss_rows, stats). `pooled_mixed_frac` is the load-bearing health
     check: a condition present in only one branch's batch forms a single-source
@@ -1630,6 +1647,10 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
     """
     if center not in POOLED_CENTERS:
         raise ValueError(f"pooled_condition_vargrad: center={center!r}; must be one of {POOLED_CENTERS}")
+    if beta_fwd is not None and center == 'mean':
+        raise ValueError("pooled_condition_vargrad: beta_fwd (a separate first-side knee) needs a detached centre: "
+                         "with 'mean' in the graph the sides' pulls balance whatever one side's knee; use "
+                         "'mean_detached'")
     need = ('log_r', 'log_pb', 'log_pf', 'condition_id')
     if not live_fwd or not live_bwd:
         return None, {}
@@ -1710,7 +1731,7 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
             min_group_count=min_group_count, detach_center=False)
     if 'log_z' in lf and 'log_z' in lb:
         head = cat('log_z').detach()
-    elif center != 'mean':
+    elif center in HEAD_CENTERS:
         raise ValueError(f"pooled_condition_vargrad: center={center!r} needs the stashes' "
                          f"'log_z' (the Z(c) head at each row); a stash without it was "
                          f"written by a caller that predates the detached centres")
@@ -1777,7 +1798,7 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
         gap_signed = ((bmean - fmean) * m).sum() / denom
         if head is not None:
             hmean = torch.zeros(k, device=dev).scatter_add_(0, inv, head) / counts_all.clamp(min=1)
-        if center == 'mean':
+        if center in ('mean', 'mean_detached'):
             level = gmean
         elif center == 'head':
             level = hmean
@@ -1785,16 +1806,22 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
             level = torch.where(nb > 0, 0.5 * hmean + 0.5 * bmean, hmean)
 
     live_m = (counts_all >= min_group_count).float()[inv]
+    # each row's knee: beta, or beta_fwd on the first side's rows
+    knee = torch.full_like(u, float(beta))
+    if beta_fwd is not None:
+        knee[:n_f] = float(beta_fwd)
     if center == 'mean':
         # exactly 0 already on a singleton (smooth_l1(x, x)); the mask makes min_group_count > 2 mean the same here
         vg = vg * live_m
     else:
-        # per-row TB against the detached level, on the rows 'mean' scores
-        vg = beta * F.smooth_l1_loss(level[inv], log_r + log_pb - log_pf,
-                                     reduction='none', beta=beta) * live_m
+        # per-row TB against the detached level, on the rows 'mean' scores: knee * smooth_l1(L, u, knee), i.e. d^2/2
+        # inside the knee and knee * (|d| - knee/2) past it, so a row's slope is capped at its own knee
+        d = level[inv] - (log_r + log_pb - log_pf)
+        ad = d.abs()
+        vg = torch.where(ad < knee, 0.5 * d ** 2, knee * (ad - 0.5 * knee)) * live_m
     with torch.no_grad():
         n_live = live_m.sum()
-        knee_frac = (((u - level[inv]).abs() > beta).float() * live_m).sum() / n_live
+        knee_frac = (((u - level[inv]).abs() > knee).float() * live_m).sum() / n_live
         center_minus_head = ((level[inv] - head) * live_m).sum() / n_live if head is not None else None
 
     # THE POOLED ANALOGUE OF `vg_live_frac`. A group below min_group_count

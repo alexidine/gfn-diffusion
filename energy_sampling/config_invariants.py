@@ -1856,6 +1856,15 @@ def replay_seat_problems(stage, coeff, glob) -> list[str]:
     elif center != 'mean' and not (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0:
         out.append(f"fwd pooled_center {center!r} with {CROSS_BRANCH_VARGRAD_COEFF} off; the "
                    f"centre only scores the pooled term's rows, so it is a dead key here.")
+    beta_fwd = coeff('fwd', 'pooled_beta_fwd')
+    if beta_fwd is not None and (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0:
+        if center == 'mean':
+            out.append("fwd pooled_beta_fwd (a separate first-side knee) with pooled_center 'mean': in the graph the "
+                       "sides' pulls balance whatever one side's knee, so it would not bound the push on the "
+                       "policy's own samples; use pooled_center 'mean_detached' (gflownet_losses."
+                       "pooled_condition_vargrad).")
+        elif not (_num(beta_fwd) or 0.0) > 0:
+            out.append(f"fwd pooled_beta_fwd={beta_fwd!r}; a knee must be > 0 (absent = pooled_beta).")
 
     src = coeff('fwd', 'pooled_source')
     src = 'fwd' if src is None else src

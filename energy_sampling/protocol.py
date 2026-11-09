@@ -159,9 +159,12 @@ POOLED_SOURCES = ('fwd', 'replay')
 # fwd_loss_coeffs.pooled_center: what each pooled group's rows are scored against
 # (gflownet_losses.pooled_condition_vargrad). 'mean' = the group's own row mean, in the
 # graph (VarGrad); 'head' = the detached Z(c) head; 'head_stored' = the detached
-# 1/2 head + 1/2 mean of the group's stored (bwd) rows. The two detached centres make
-# the term per-row TB against that level.
-POOLED_CENTERS = ('mean', 'head', 'head_stored')
+# 1/2 head + 1/2 mean of the group's stored (bwd) rows; 'mean_detached' = the group's
+# own row mean, detached. The three detached centres make the term per-row TB against
+# that level (and only they take a separate first-side knee, fwd pooled_beta_fwd).
+POOLED_CENTERS = ('mean', 'head', 'head_stored', 'mean_detached')
+#: the pooled centres that score against the stashed Z(c) head
+HEAD_CENTERS = ('head', 'head_stored')
 # {mode}_loss_coeffs.tb_z_source: the Z a branch's TB term reads (gflownet_losses.py)
 TB_Z_SOURCES = ('learned', 'persistent', 'batch_root')
 # stage condition_draw.pick: how the aligned per-condition draw chooses its C

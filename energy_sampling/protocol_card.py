@@ -17,7 +17,8 @@ import config_snapshot as cs
 
 _CENTRES = {'mean': "its condition group's mean log w, in the graph (VarGrad)",
             'head': 'the detached Z(c) head (per-row TB)',
-            'head_stored': "½ the detached Z(c) head + ½ the group's stored-row mean (per-row TB)"}
+            'head_stored': "½ the detached Z(c) head + ½ the group's stored-row mean (per-row TB)",
+            'mean_detached': "the group's own mean log w, detached (per-row TB)"}
 
 
 def _get(node, dotted, default=None):
@@ -160,7 +161,9 @@ def stage_card(spec: dict, index: int, args, *, successor: Optional[str] = None,
                            centre=_CENTRES.get(centre, str(centre)),
                            detail=f"weight {_n(fc['pooled_vg'])}; bwd {_n(fc.get('pooled_ratio', 0.5))} of each group"
                                   + (f"; Huber knee {_n(knee)} nats: a residual past it pushes with constant force"
-                                     if knee is not None else ''))
+                                     if knee is not None else '')
+                                  + (f"; the {fc.get('pooled_source', 'fwd')} rows' own knee {_n(fc['pooled_beta_fwd'])} nats"
+                                     if fc.get('pooled_beta_fwd') is not None else ''))
     mech = []
     if st.train_mode == 'fused':
         if st.fwd_rollout_every > 0:

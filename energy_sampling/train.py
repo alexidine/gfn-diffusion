@@ -6371,7 +6371,9 @@ class Modeller:
                     self.args.fwd_loss_coeffs, 'pooled_bridge_only', 0.0) or 0.0) > 0.5,
                 thin_by_condition=float(getattr(
                     self.args.fwd_loss_coeffs, 'pooled_thin_by_condition', 1.0)) > 0.5,
-                center=getattr(self.args.fwd_loss_coeffs, 'pooled_center', 'mean') or 'mean')
+                center=getattr(self.args.fwd_loss_coeffs, 'pooled_center', 'mean') or 'mean',
+                beta_fwd=(None if getattr(self.args.fwd_loss_coeffs, 'pooled_beta_fwd', None) is None
+                          else float(self.args.fwd_loss_coeffs.pooled_beta_fwd)))
             # ANNOUNCED ONCE PER STATE, not once per process: at a stage entry the
             # aligned draw has no eligible condition (the replay buffer's first
             # rows land at the end of step 0), so a once-only line reads INERT

@@ -24,10 +24,10 @@ def _group(replay_u, stored_u, head, cid=0):
     return side(replay_u), side(stored_u)
 
 
-def _coeffs(center, replay_u, stored_u, head=0.0):
+def _coeffs(center, replay_u, stored_u, head=0.0, beta_fwd=None):
     """d loss / d log_pf per row, replay rows first: the sign is the direction descent moves log q there."""
     rep, sto = _group(replay_u, stored_u, head)
-    rows, stats = pooled_condition_vargrad(rep, sto, beta=BETA, ratio=0.5, center=center)
+    rows, stats = pooled_condition_vargrad(rep, sto, beta=BETA, ratio=0.5, center=center, beta_fwd=beta_fwd)
     rows.sum().backward()
     return torch.cat([rep['log_pf'].grad, sto['log_pf'].grad]), stats
 
@@ -40,7 +40,7 @@ def test_mean_coefficients_sum_to_zero_and_a_bad_row_spills():
     assert torch.allclose(-bad[1:], torch.full((3,), BETA / 2), atol=1e-3)
 
 
-@pytest.mark.parametrize('center', ['head', 'head_stored'])
+@pytest.mark.parametrize('center', ['head', 'head_stored'])   # not 'mean_detached': its level is the group mean
 def test_detached_centres_keep_a_bad_row_to_itself(center):
     healthy, _ = _coeffs(center, [-2.0, -2.0], [2.0, 2.0], head=0.0)
     bad, _ = _coeffs(center, [-202.0, -2.0], [2.0, 2.0], head=0.0)
@@ -82,3 +82,25 @@ def test_unknown_centre_and_a_stash_without_the_head_raise():
     assert rows is not None and 'pooled_center_minus_head' not in stats
     with pytest.raises(ValueError, match="'log_z'"):
         pooled_condition_vargrad(rep, sto, center='head')
+
+
+def test_a_first_side_knee_bounds_the_push_on_own_samples_only_with_a_detached_mean():
+    """The worked case: 2 replay rows 40 nats below the group mean and 2 stored rows 40 above, replay knee 5, stored
+    knee 40. Detached: each replay row's log q is pushed down at 5, each stored row's raised at 40. 'mean' in the
+    graph would balance the sides (22.5 each), so it refuses the knee."""
+    g, stats = _coeffs('mean_detached', [-40.0, -40.0], [40.0, 40.0], beta_fwd=5.0)
+    # u = log_r - log_pf; a replay row 40 below the level: d loss/d log_pf = +knee (descent lowers its log q)
+    assert torch.allclose(g, torch.tensor([5.0, 5.0, -40.0, -40.0]), atol=1e-4)
+    assert float(stats['pooled_knee_frac']) == pytest.approx(0.5), 'replay rows past their 5-nat knee, stored at 40'
+    with pytest.raises(ValueError, match='detached centre'):
+        _coeffs('mean', [-40.0, -40.0], [40.0, 40.0], beta_fwd=5.0)
+
+
+def test_mean_detached_is_mean_without_the_coupling():
+    inside, _ = _coeffs('mean_detached', [-2.0, -1.0], [1.0, 2.0])
+    ref, _ = _coeffs('mean', [-2.0, -1.0], [1.0, 2.0])
+    # inside the knee the squared loss has no shared term (deviations sum to 0), so the two agree
+    assert torch.allclose(inside, ref, atol=1e-4)
+    past, _ = _coeffs('mean_detached', [-202.0, -2.0], [2.0, 2.0])
+    coupled, _ = _coeffs('mean', [-202.0, -2.0], [2.0, 2.0])
+    assert not torch.allclose(past, coupled, atol=1e-2), 'past the knee only the in-graph mean couples the rows'
