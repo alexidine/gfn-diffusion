@@ -595,7 +595,7 @@ class _ContextFlow(nn.Module):
 
     def __init__(self, wrap_mask, cond_dim, context_dim, context_hidden, n_blocks, n_bins, hidden, bound, seed,
                  transformer=None, atoms=None, bounded_mask=None, frames=False, describer=None, mlp_ratio=4,
-                 level_hidden=256):
+                 level_hidden=256, mirror=False):
         super().__init__()
         d = len(wrap_mask)
         # bounded dims (see _Block) are not standardised and take a uniform base, as wrapped dims do
@@ -606,7 +606,8 @@ class _ContextFlow(nn.Module):
         # atoms: AtomEncoder settings (dict). The condition is then the molecule itself: column 0 of c is the condition
         # id, looked up in an atom table (set_atom_table), and any further columns (temperature) pass through.
         # frames: columns 1-4 of c are a unit quaternion, the frame the row's molecule is presented in (its atoms are
-        # rotated by it before encoding)
+        # rotated by it before encoding); mirror (with frames): column 5 is the frame's parity, -1 reflecting the
+        # atoms through x -> -x before the rotation
         # atoms['encoder']: 'xyz' (AtomEncoder: coordinates in the node input; one pooled vector feeds the context and
         # the level head) or 'split' (SplitAtomEncoder: the level head reads the invariant pool s, the context reads
         # s and the point pool p). atoms['cross']: the blocks cross-attend to the atom tokens (False: pooled only)
@@ -639,8 +640,12 @@ class _ContextFlow(nn.Module):
                 atoms.pop(k, None)   # the encoder's settings: nothing reads them
         self.atoms = atoms is not None
         self.frames = bool(frames)
+        self.mirror = bool(mirror)
+        if self.mirror and not self.frames:
+            raise ValueError("a frame's parity column (mirror) rides with the frame's quaternion: it needs frames")
         if self.frames and not self.atoms:
             raise NotImplementedError("molecule frames need the atom-token condition")
+        self.frame_cols = 4 * int(self.frames) + int(self.mirror)   # condition columns after the id that are the frame
         self.d, self.bound = d, bound
         self.register_buffer('is_wrap', torch.tensor(wrap_mask, dtype=torch.bool))
         self.register_buffer('mu', torch.zeros(d))
@@ -696,7 +701,7 @@ class _ContextFlow(nn.Module):
                         self.bn_p = nn.Linear(self.atom_encoder.p_out.out_features, self.bottleneck)
                     pooled = self.bottleneck
             # pooled molecule + the columns after the id (and after the frame); the split encoder's context also reads p
-            n_in = pooled + cond_dim - 1 - 4 * int(self.frames) + self.n_mol_scalars + self.n_sym
+            n_in = pooled + cond_dim - 1 - self.frame_cols + self.n_mol_scalars + self.n_sym
             if self.n_sym:
                 from models.sym_ops import SymOpEncoder
                 self.sym_encoder = SymOpEncoder(out_dim=self.n_sym, hidden=sym_hidden)
@@ -809,11 +814,16 @@ class _ContextFlow(nn.Module):
             pos = self.atom_pos.to(dtype)
             first = 1
         elif self.frames:
-            # one encoding per (molecule, frame), the atoms rotated into the row's frame
-            uniq, inv = torch.unique(c[:, :5], dim=0, return_inverse=True)
+            # one encoding per (molecule, frame), the atoms (reflected, for a parity -1 frame, then) rotated into the
+            # row's frame
+            first = 1 + self.frame_cols
+            uniq, inv = torch.unique(c[:, :first], dim=0, return_inverse=True)
             mol = uniq[:, 0].round().long()
-            pos = self.atom_pos[mol].to(dtype) @ quat_to_rotmat(uniq[:, 1:5].to(dtype)).transpose(1, 2)
-            first = 5
+            pos = self.atom_pos[mol].to(dtype)
+            if self.mirror:
+                parity = torch.where(uniq[:, 5] < 0, -1.0, 1.0).to(dtype)
+                pos = torch.cat([pos[..., :1] * parity[:, None, None], pos[..., 1:]], -1)
+            pos = pos @ quat_to_rotmat(uniq[:, 1:5].to(dtype)).transpose(1, 2)
         else:
             mol, inv = torch.unique(cid, return_inverse=True)
             pos = self.atom_pos[mol].to(dtype)
@@ -878,7 +888,7 @@ class ConditionalLatentFlow(nn.Module):
 
     def __init__(self, dim, wrap_mask, dead_rows, cond_dim, context_dim, context_hidden,
                  n_blocks, n_bins, hidden, bound, seed, transformer=None, atoms=None, bounded_rows=(), frames=False,
-                 describer=None, mlp_ratio=4, level_hidden=256):
+                 describer=None, mlp_ratio=4, level_hidden=256, mirror=False):
         super().__init__()
         dead = {int(d) for d in dead_rows}
         live = [i for i in range(dim) if i not in dead]
@@ -891,7 +901,7 @@ class ConditionalLatentFlow(nn.Module):
         self.flow = _ContextFlow([bool(wrap_mask[i]) for i in live], cond_dim, context_dim, context_hidden,
                                  n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
                                  bounded_mask=[i in self.bounded_rows for i in live], frames=frames,
-                                 describer=describer, mlp_ratio=mlp_ratio, level_hidden=level_hidden)
+                                 describer=describer, mlp_ratio=mlp_ratio, level_hidden=level_hidden, mirror=mirror)
 
     def to_base(self, x, c, detach_context: bool = False):
         f = self.flow

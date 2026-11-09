@@ -85,6 +85,14 @@ NF_PENDING_DEFAULTS = dict(
                                     # (R -> R R0^T, energies/fd_coordinates.py::rotate_orientation); states, log q and
                                     # everything outside the step stay in the standard frame (log q carries the map's
                                     # Haar Jacobian). Eval mode (readouts, eval draws) presents the standard frame
+    mirror_frames=False,            # True (as rotate_frames: molecule route with an atom encoder, FD chart; groups with
+                                    # a measured map, energies/fd_coordinates.py::MIRROR_MAPS): a training-mode step's
+                                    # frame is improper with probability 1/2: the molecule is reflected, X -> diag(-1,
+                                    # 1, 1) X, before its frame rotation (identity unless rotate_frames), the encoder
+                                    # reads the reflected atoms (the parity rides in the condition after the quaternion)
+                                    # and the flow models the row's mirror image (fd_coordinates.py::mirror_state, then
+                                    # the rotation); same condition, same log Z(c). Eval mode presents the standard
+                                    # frame; train.py::Modeller.density_readouts logs <set>_mirror_shift
 )
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
@@ -247,6 +255,9 @@ class NFPolicy(nn.Module):
         describer = None
         self.fd_slots = None
         self.orientation_rows = None   # rotate_frames: the FD orientation rows (theta, phi, r) a frame re-expresses
+        self.mirror_maps = None        # mirror_frames: fd_coordinates.py::mirror_rows of the run's groups
+        self._one_group = None         # mirror_frames on a one-group FD state: that group
+        self._frame_groups = None      # mirror_frames on a mixed-group state: the last _context call's row groups
         if fd_space_groups is not None and len(set(int(g) for g in fd_space_groups)) > 1:
             from energies.fd_coordinates import FDSlotLayout
             self.fd_slots = FDSlotLayout(fd_space_groups)
@@ -343,26 +354,30 @@ class NFPolicy(nn.Module):
                 raise ValueError("flow sym_ops are read beside the molecule's atoms: they need atom_tokens")
             if self.conditions_type == 'molecule' and atoms is None:
                 raise NotImplementedError("molecule conditioning on the flow policy needs flow atom_tokens true")
-            if s['rotate_frames']:
-                from energies.fd_coordinates import frame_rows
+            if self._framed:
+                from energies.fd_coordinates import frame_rows, mirror_rows
+                which = 'rotate_frames' if s['rotate_frames'] else 'mirror_frames'
                 if atoms is None or atoms['encoder'] == 'none':
-                    raise ValueError("flow rotate_frames rotate the atoms an encoder reads: they need atom_tokens "
-                                     "True, 'split' or 'split_pooled'")
+                    raise ValueError(f"flow {which} present the atoms an encoder reads in a frame: they need "
+                                     f"atom_tokens True, 'split' or 'split_pooled'")
                 groups = (self.fd_slots.groups if self.fd_slots is not None
                           else [fd_space_group] if fd_space_group is not None else None)
                 if groups is None:
-                    raise NotImplementedError("flow rotate_frames re-express the FD chart's orientation rows: they "
-                                              "need energy_config.crystal_coordinates fd")
+                    raise NotImplementedError(f"flow {which} re-express the FD chart's rows: they need "
+                                              f"energy_config.crystal_coordinates fd")
                 self.orientation_rows = frame_rows(groups)   # raises for the K-cut groups (6-9)
+                if s['mirror_frames']:
+                    self.mirror_maps = mirror_rows(groups)   # raises for a group without a measured map
+                    self._one_group = None if self.fd_slots is not None else int(groups[0])
             # molecule mode: the row id, then the condition vector's columns (temperature, space group, Z')
-            cond_dim = (1 + 4 * int(bool(s['rotate_frames'])) + self.conditions_dim if atoms is not None
-                        else self.conditions_dim)   # the row id (and the frame's quaternion), then the columns
+            cond_dim = (1 + self._frame_cols + self.conditions_dim if atoms is not None
+                        else self.conditions_dim)   # the row id (and the frame), then the columns
             self.sampler = ConditionalLatentFlow(self.dim, wrap_mask, self.dead_rows, cond_dim, s['context_dim'],
                                                  s['context_hidden'], *shape, seed=int(seed),
                                                  transformer=transformer, atoms=atoms, bounded_rows=bounded,
                                                  describer=describer, mlp_ratio=int(s['tf_mlp_ratio']),
                                                  level_hidden=int(s['level_hidden']),
-                                                 frames=bool(s['rotate_frames']))
+                                                 frames=self._framed, mirror=bool(s['mirror_frames']))
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -437,25 +452,80 @@ class NFPolicy(nn.Module):
 
     # -- the condition -------------------------------------------------------------------------------------------
 
+    @property
+    def _framed(self):
+        """rotate_frames or mirror_frames: the condition carries each row's frame."""
+        return bool(self.settings.get('rotate_frames')) or bool(self.settings.get('mirror_frames'))
+
+    @property
+    def _frame_cols(self):
+        """Condition columns after the row id that are its frame: the quaternion, then (mirror_frames) the parity."""
+        return 4 * int(self._framed) + int(bool(self.settings.get('mirror_frames')))
+
     def _lead_columns(self):
         """Columns of the molecule-mode condition before the condition vector: the row id, and the frame."""
-        return 1 + 4 * int(bool(self.settings.get('rotate_frames')))
+        return 1 + self._frame_cols
 
     def _frames(self, n):
-        """rotate_frames in training mode: n unit quaternions (w, x, y, z), uniform on SO(3); else None."""
-        if not (self.settings.get('rotate_frames') and self.training):
+        """Training mode with rotate_frames or mirror_frames: n frames, [n, 4] unit quaternions (w, x, y, z), uniform
+        on SO(3) under rotate_frames and the identity otherwise, with mirror_frames a fifth column, the parity, -1
+        with probability 1/2; else None."""
+        if not (self._framed and self.training):
             return None
-        q = torch.randn(n, 4, device=self.device, dtype=torch.float64)
-        q = q / q.norm(dim=1, keepdim=True)
-        return torch.where(q[:, :1] < 0, -q, q)
+        if self.settings.get('rotate_frames'):
+            q = torch.randn(n, 4, device=self.device, dtype=torch.float64)
+            q = q / q.norm(dim=1, keepdim=True)
+            q = torch.where(q[:, :1] < 0, -q, q)
+        else:
+            q = torch.zeros(n, 4, device=self.device, dtype=torch.float64)
+            q[:, 0] = 1.0
+        if self.settings.get('mirror_frames'):
+            parity = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0).to(torch.float64)
+            q = torch.cat([q, parity[:, None]], 1)
+        return q
 
     def _present(self, x, q, inverse=False):
-        """(x re-expressed for frame q (standard -> presented; inverse: presented -> standard), log |dx'/dx|)."""
-        from energies.fd_coordinates import rotate_orientation
+        """(x re-expressed for frame q (standard -> presented; inverse: presented -> standard), log |dx'/dx|). A
+        frame of parity -1 (mirror_frames, q's fifth column) presents the reflected molecule: the row's mirror image
+        (fd_coordinates.py::mirror_state, an involution) and then the rotation; inverse undoes the rotation first."""
+        from energies.fd_coordinates import mirror_state, rotate_orientation
         from models.spline_flow import quat_to_rotmat
-        R0 = quat_to_rotmat(q)
-        y, lj = rotate_orientation(x, R0.transpose(1, 2) if inverse else R0, rows=self.orientation_rows)
-        return self._wrap_ang(y), lj
+        q = q.to(self.device, torch.float64)
+        rotate = bool(self.settings.get('rotate_frames'))
+        mirrored = (torch.nonzero(q[:, 4] < 0).flatten() if q.shape[1] > 4
+                    else torch.zeros(0, dtype=torch.long, device=self.device))
+
+        def mirror(v):
+            if not mirrored.numel():
+                return v, None
+            out = v.clone()
+            part, lj_m = mirror_state(v[mirrored], self._row_groups_for(mirrored), self.mirror_maps,
+                                      self.orientation_rows)
+            out[mirrored] = part
+            full = torch.zeros(v.shape[0], dtype=v.dtype, device=v.device)
+            full[mirrored] = lj_m.to(v.dtype)
+            return out, full
+
+        def turn(v):
+            if not rotate:
+                return v, None
+            R0 = quat_to_rotmat(q[:, :4])
+            return rotate_orientation(v, R0.transpose(1, 2) if inverse else R0, rows=self.orientation_rows)
+
+        lj = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+        for step in ((turn, mirror) if inverse else (mirror, turn)):
+            x, l_ = step(x)
+            if l_ is not None:
+                lj = lj + l_.to(lj.dtype)
+        return self._wrap_ang(x), lj
+
+    def _row_groups_for(self, rows):
+        """[k] space groups of the rows ``rows`` of the last _context call (mirror_frames)."""
+        if self._one_group is not None:
+            return torch.full((rows.numel(),), self._one_group, dtype=torch.long, device=self.device)
+        if self._frame_groups is None:
+            raise RuntimeError("mirror_frames on a mixed-group state: no row groups (mol_batch.sg_ind) were set")
+        return self._frame_groups.to(self.device)[rows]
 
     def _context(self, condition, mol_batch, n, frames=None):
         """The flow's condition input for n rows: the condition vector (vector mode), or row indices into an atom
@@ -490,6 +560,7 @@ class NFPolicy(nn.Module):
             if sg is None:
                 raise ValueError("a mixed-group FD state needs each row's space group (sg_ind on mol_batch)")
             sg = torch.as_tensor(sg).reshape(-1).long()
+            self._frame_groups = sg
             self.sampler.flow.set_row_live(self.fd_slots.live_mask(sg).to(self.device))
             if self.sampler.flow.describer is not None:
                 self.sampler.flow.describer.set_row_groups(sg)
@@ -513,9 +584,13 @@ class NFPolicy(nn.Module):
             self.sampler.flow.set_row_radius(radius, mol)
         ids = (torch.arange(n, device=self.device, dtype=torch.float32) if row_mol is None
                else row_mol.to(torch.float32))[:, None]
-        if self.settings.get('rotate_frames'):   # the frame each row's molecule is presented in (identity: standard)
-            q = (torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(n, 4) if frames is None
+        if self._framed:   # the frame each row's molecule is presented in (identity: standard)
+            ident = [1.0, 0.0, 0.0, 0.0] + [1.0] * int(bool(self.settings.get('mirror_frames')))
+            q = (torch.tensor(ident, device=self.device).expand(n, len(ident)) if frames is None
                  else frames.to(self.device, torch.float32))
+            if q.shape[1] != len(ident):
+                raise ValueError(f"frames of {q.shape[1]} columns; this policy's frames have {len(ident)} "
+                                 f"(quaternion, then parity under mirror_frames)")
             ids = torch.cat([ids, q], -1)
         if self.conditions_dim == 0:
             return ids

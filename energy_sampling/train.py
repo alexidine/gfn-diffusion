@@ -88,10 +88,13 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
-#: model.nf rotate_frames: density_readouts also scores the first FRAME_SPREAD_ROWS fixed rows of each set in
-#: FRAME_SPREAD_K random frames (fixed per eval by the seed) and logs <set>_frame_spread, the mean over rows of the std
-#: of -log q across the frames, and <set>_frame_shift, the mean over rows of (mean over frames - standard frame), nats.
-#: Both are 0 for a flow whose density does not depend on the frame the molecule is presented in.
+#: model.nf rotate_frames / mirror_frames: density_readouts also scores the first FRAME_SPREAD_ROWS fixed rows of each
+#: set in FRAME_SPREAD_K frames (fixed per eval by the seed; random rotations under rotate_frames, else the identity;
+#: under mirror_frames every second frame reflected) and logs <set>_frame_spread, the mean over rows of the std of
+#: -log q across the frames, and <set>_frame_shift, the mean over rows of (mean over frames - standard frame), nats;
+#: under mirror_frames also <set>_mirror_shift, the mean over rows of (-log q with the molecule reflected, no
+#: rotation - standard frame). All are 0 for a flow whose density does not depend on the frame (or the mirror image)
+#: the molecule is presented in.
 FRAME_SPREAD_K, FRAME_SPREAD_ROWS = 4, 1024
 
 #: WALL-CLOCK SECONDS a set of occupancy readings must span before their mean is
@@ -10279,8 +10282,10 @@ class Modeller:
                 ef, T = self.energy_function, float(self.args.energy_config.temperature)
                 fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
                 nll, log_ref, row_sg = [], [], []
-                spread_k = FRAME_SPREAD_K if (getattr(policy, 'settings', {}) or {}).get('rotate_frames') else 0
-                framed = ([], [])   # the standard-frame -log q, and [rows, K] -log q in K random frames
+                pol_set = getattr(policy, 'settings', {}) or {}
+                rot_f, mir_f = bool(pol_set.get('rotate_frames')), bool(pol_set.get('mirror_frames'))
+                spread_k = FRAME_SPREAD_K if (rot_f or mir_f) else 0
+                framed = ([], [], [])   # the standard-frame -log q, [rows, K] -log q in K frames, the mirrored -log q
                 for i in range(0, idx.numel(), chunk):
                     sub = batch.subsample_new_batch(idx[i:i + chunk].to(batch.ptr.device)).to(self.device)
                     if fd and not hasattr(sub, 'fd_state'):
@@ -10299,12 +10304,24 @@ class Modeller:
                         m = min(int(sub.num_graphs), FRAME_SPREAD_ROWS - i)
                         framed[0].append(nll[-1][:m])
                         g = torch.Generator().manual_seed(int(self.args.seed) + 7 + i)
-                        q = torch.randn(spread_k, m, 4, generator=g, dtype=torch.float64)
-                        q = q / q.norm(dim=-1, keepdim=True)
-                        cols = [-policy.log_density(x[:m], condition[:m], sub.subsample_new_batch(
-                            torch.arange(m, device=sub.ptr.device)), frames=q[k]).float().flatten().cpu()
-                            for k in range(spread_k)]
+                        if rot_f:
+                            q = torch.randn(spread_k, m, 4, generator=g, dtype=torch.float64)
+                            q = q / q.norm(dim=-1, keepdim=True)
+                        else:
+                            q = torch.zeros(spread_k, m, 4, dtype=torch.float64)
+                            q[..., 0] = 1.0
+                        if mir_f:   # every second frame reflected
+                            par = torch.tensor([1.0 if k % 2 == 0 else -1.0 for k in range(spread_k)],
+                                               dtype=torch.float64)[:, None, None].expand(spread_k, m, 1)
+                            q = torch.cat([q, par], -1)
+                        sub_m = sub.subsample_new_batch(torch.arange(m, device=sub.ptr.device))
+                        cols = [-policy.log_density(x[:m], condition[:m], sub_m, frames=q[k]).float().flatten().cpu()
+                                for k in range(spread_k)]
                         framed[1].append(torch.stack(cols, 1))
+                        if mir_f:   # the molecule reflected, no rotation
+                            mq = torch.tensor([[1.0, 0.0, 0.0, 0.0, -1.0]], dtype=torch.float64).expand(m, 5)
+                            framed[2].append(-policy.log_density(x[:m], condition[:m], sub_m, frames=mq)
+                                             .float().flatten().cpu())
                 nll, log_ref = torch.cat(nll), torch.cat(log_ref)
                 if framed[1]:
                     f_std, f_all = torch.cat(framed[0]), torch.cat(framed[1])
@@ -10312,6 +10329,11 @@ class Modeller:
                     if bool(okf.any()):
                         out[f'{key}_frame_spread'] = float(f_all[okf].std(1).mean())
                         out[f'{key}_frame_shift'] = float((f_all[okf].mean(1) - f_std[okf]).mean())
+                    if framed[2]:
+                        f_mir = torch.cat(framed[2])
+                        okm = torch.isfinite(f_mir) & torch.isfinite(f_std)
+                        if bool(okm.any()):
+                            out[f'{key}_mirror_shift'] = float((f_mir[okm] - f_std[okm]).mean())
                 ok = torch.isfinite(nll)
                 if bool(ok.any()):
                     out[key] = float(nll[ok].mean())
@@ -10329,7 +10351,7 @@ class Modeller:
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',
-                   'mle_bank', '_ref', '_gap', '_frame_spread'))), flush=True)
+                   'mle_bank', '_ref', '_gap', '_frame_spread', '_frame_shift', '_mirror_shift'))), flush=True)
         return out
 
     #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature

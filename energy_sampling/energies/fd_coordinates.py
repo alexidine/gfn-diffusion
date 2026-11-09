@@ -217,6 +217,29 @@ KCUT_GROUPS = (6, 7, 8, 9)
 HEMISPHERE_BOUNDS = ((0.0, math.pi / 2), (-math.pi, math.pi), (0.0, 2 * math.pi))
 
 
+def _orientation_map(s: torch.Tensor, left, right, rows):
+    """(s' [n, d], log |ds'/ds| [n]) of FD chart rows s with the orientation R of rows (theta, phi, r) mapped to
+    left R right (left, right [n, 3, 3] or None for the identity, their determinants' product +1, so the result is a
+    rotation), every other row unmoved; the rotation in float64. The map preserves Haar measure, so log |ds'/ds| =
+    log rho(y) - log rho(y'), rho the hemisphere chart's Haar density (the unit map's constant scale cancels)."""
+    from mxtaltools.crystal_fd import so3
+    rows = list(rows)
+    lo = torch.tensor([b[0] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
+    hi = torch.tensor([b[1] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
+    y = lo + (s[:, rows].to(F64) + 1) / 2 * (hi - lo)
+    R = so3.hemisphere_to_matrix(y)
+    if left is not None:
+        R = left.to(device=s.device, dtype=F64) @ R
+    if right is not None:
+        R = R @ right.to(device=s.device, dtype=F64)
+    y2 = so3.matrix_to_hemisphere(R)
+    y2[:, 1] = torch.remainder(y2[:, 1] - lo[1], 2 * math.pi) + lo[1]          # phi on its circle
+    out = s.clone()
+    out[:, rows] = (2 * (y2 - lo) / (hi - lo) - 1).to(s.dtype)
+    log_jac = so3.haar_log_density('hemisphere', y) - so3.haar_log_density('hemisphere', y2)
+    return out, log_jac.to(s.dtype)
+
+
 def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
     """(s' [n, d], log |ds'/ds| [n]) of FD chart rows s [n, d] with the molecule presented as R0 [n, 3, 3] applied to
     its standard-frame coordinates: the orientation R becomes R R0^T and no other row moves, on any group whose
@@ -225,18 +248,65 @@ def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
     dtype; the rotation in float64.
     The map preserves Haar measure, so log |ds'/ds| = log rho(y) - log rho(y'), rho the hemisphere chart's Haar
     density (the unit map's constant scale cancels)."""
-    from mxtaltools.crystal_fd import so3
-    rows = list(rows)
-    lo = torch.tensor([b[0] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
-    hi = torch.tensor([b[1] for b in HEMISPHERE_BOUNDS], dtype=F64, device=s.device)
-    y = lo + (s[:, rows].to(F64) + 1) / 2 * (hi - lo)
-    R = so3.hemisphere_to_matrix(y)
-    y2 = so3.matrix_to_hemisphere(R @ R0.to(device=s.device, dtype=F64).transpose(1, 2))
-    y2[:, 1] = torch.remainder(y2[:, 1] - lo[1], 2 * math.pi) + lo[1]          # phi on its circle
+    return _orientation_map(s, None, torch.as_tensor(R0).transpose(1, 2), rows)
+
+
+#: The mirror image of a chart row: the molecule reflected, X -> diag(-1, 1, 1) X (its standard-frame coordinates),
+#: and the crystal re-described for it (in Sohncke-free groups the same crystal, the reflected molecule being its
+#: inverted copy). Per space group: (the centroid chart rows negated, A, B), the orientation R -> A R B, every other
+#: row unmoved. Measured 2026-11-09 against crystal_fd's canonicaliser on the same crystals with the handedness
+#: flipped (canon.canonicalize(desc.replace(h=-h), sheet=1)): every row of MIPCAS's P-1 eLJ band set (42,258) and
+#: NEHZOR's P2_1/c set (73,073) in description terms, and 4,000 of each in chart terms; tests/crystal/test_fd_mirror.py
+#: pins it on random chart points. A group not listed is refused (mirror_rows).
+MIRROR_MAPS = {
+    2: (('t_x', 't_y', 't_z'), (1.0, 1.0, 1.0), (1.0, -1.0, -1.0)),     # t -> 1/2 - t,  R -> R diag(1, -1, -1)
+    14: (('t_y',), (1.0, -1.0, 1.0), (-1.0, 1.0, 1.0)),                 # t_y -> 1/2 - t_y,  R -> diag(1,-1,1) R diag(-1,1,1)
+}
+
+
+def mirror_rows(groups):
+    """{sg: (flip [k] long chart-row indices, A [3, 3], B [3, 3])} for a run over ``groups`` (one group's chart rows,
+    or the shared slots of several groups' FDSlotLayout): the inputs of mirror_state. Raises NotImplementedError for
+    a group without a measured map (MIRROR_MAPS) or a K-cut group (frame_rows)."""
+    groups = sorted({int(g) for g in groups})
+    frame_rows(groups)   # the orientation rows must be the shared hemisphere chart
+    missing = [g for g in groups if g not in MIRROR_MAPS]
+    if missing:
+        raise NotImplementedError(f"no mirror map for sg {missing} (energies/fd_coordinates.py::MIRROR_MAPS: derive "
+                                  f"it against crystal_fd's canonicaliser and pin it in tests/crystal/test_fd_mirror.py)")
+    names = ({groups[0]: FDCoordinates(groups[0], 3.0).names} if len(groups) == 1
+             else FDSlotLayout(groups).group_names)
+    out = {}
+    for g in groups:
+        flip, A, B = MIRROR_MAPS[g]
+        out[g] = (torch.tensor([names[g].index(k) for k in flip], dtype=torch.long),
+                  torch.diag(torch.tensor(A, dtype=F64)), torch.diag(torch.tensor(B, dtype=F64)))
+    return out
+
+
+def mirror_state(s: torch.Tensor, sg: torch.Tensor, maps: dict, rows):
+    """(s' [n, d], log |ds'/ds| [n]) of chart rows s [n, d] of space groups sg [n] (one per row): each row's mirror
+    image (MIRROR_MAPS; maps from mirror_rows, rows the orientation rows of frame_rows). The map is an involution and
+    preserves the chart's reference measure on the centroid (a sign change) and Haar measure on the orientation."""
+    sg = torch.as_tensor(sg).reshape(-1).to(s.device)
+    bad = ~torch.isin(sg, torch.tensor(list(maps), device=s.device, dtype=sg.dtype))
+    if bool(bad.any()):
+        raise ValueError(f"mirror_state: rows of sg {sorted(set(sg[bad].tolist()))} without a map")
     out = s.clone()
-    out[:, rows] = (2 * (y2 - lo) / (hi - lo) - 1).to(s.dtype)
-    log_jac = so3.haar_log_density('hemisphere', y) - so3.haar_log_density('hemisphere', y2)
-    return out, log_jac.to(s.dtype)
+    log_jac = torch.zeros(s.shape[0], dtype=s.dtype, device=s.device)
+    for g, (flip, A, B) in maps.items():
+        m = sg == int(g)
+        if not bool(m.any()):
+            continue
+        idx = torch.nonzero(m).flatten()
+        part = out[idx]
+        f = flip.to(s.device)
+        part[:, f] = -part[:, f]
+        k = idx.numel()
+        part, lj = _orientation_map(part, A.to(s.device).expand(k, 3, 3), B.to(s.device).expand(k, 3, 3), rows)
+        out[idx] = part
+        log_jac[idx] = lj
+    return out, log_jac
 
 
 def frame_rows(groups):
