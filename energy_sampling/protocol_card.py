@@ -15,24 +15,73 @@ from typing import Optional
 
 import config_snapshot as cs
 
-_DATA = {'fwd': 'own on-policy rollouts', 'replay': 'stored forward rollouts (replay buffer)'}
-_BWD_DATA = {'dataset': 'prior dataset rows', 'prior': 'prior buffer rows'}
-_CENTRES = {'mean': 'VarGrad: the group mean', 'head': 'TB against the detached Z(c) head',
-            'head_stored': 'TB against ½ Z(c) head + ½ stored-row mean'}
+_CENTRES = {'mean': "its condition group's mean log w, in the graph (VarGrad)",
+            'head': 'the detached Z(c) head (per-row TB)',
+            'head_stored': "½ the detached Z(c) head + ½ the group's stored-row mean (per-row TB)"}
+
+
+def _get(node, dotted, default=None):
+    for k in dotted.split('.'):
+        node = node.get(k) if isinstance(node, dict) else getattr(node, k, None)
+        if node is None:
+            return default
+    return node
+
+
+def _base(path) -> str:
+    return str(path).replace('\\', '/').rsplit('/', 1)[-1] if path else 'none'
+
+
+def _rows(mode: str, st, args, c: dict) -> tuple[str, str]:
+    """(chip, detail line): where a branch's rows come from, with the rule that selects or keeps them."""
+    np_ = cs._to_plain(getattr(args, 'noised_prior', None)) or {}
+    win = (f"within {_n(np_.get('window_kT'))} kT of each molecule's floor (read per {np_.get('window_by', 'row')})"
+           + (f", packing {tuple(np_['packing_window'])}" if np_.get('packing_window') else ''))
+    prior = _base(getattr(args, 'prior_path', None))
+    if mode == 'bwd' and st.bwd_sampling_mode == 'dataset':
+        noise = np_.get('live_kernel')
+        return ('prior dataset (MLE draw)',
+                f"{prior}: rows of kind {', '.join(np_.get('train_kinds') or [])} {win}; "
+                + ('no noise added in the run (rows as built)' if noise is None
+                   else f'live {noise} kernel added to each draw'))
+    if mode == 'bwd':
+        pb = _get(args, 'buffers.prior_buffer')
+        static = bool(_get(pb, 'static', False))
+        return ('prior buffer',
+                f"{prior}: on a pre-noised build, seeded once from every scored training row (anchors AND children, "
+                f"same windows), so wider than the MLE draw; "
+                + ('static: nothing admitted, churned or expired' if static
+                   else f"churned (source {_get(pb, 'source')}, cap {_get(pb, 'max_size'):,})"))
+    if mode == 'replay':
+        rb = _get(args, 'buffers.replay_buffer')
+        churn = _get(rb, 'churn_rate', 0)
+        pri = bool(_get(rb, 'prioritise.enabled', False))
+        return ('replay buffer',
+                f"admits {'batch_size' if not churn else churn} of each rollout's rows (uniform), "
+                + ('eval rollouts too' if _get(rb, 'admit_from_eval', False) else 'not eval rollouts')
+                + f"; evicted at random, mean residence {_get(rb, 'mean_residence_steps')} steps; "
+                f"cap {_get(rb, 'max_size'):,}; draw " + ('loss-prioritised' if pri else 'uniform')
+                + (f"; {_n(_get(rb, 'val_frac'))} held out" if _get(rb, 'val_frac', 0) else ''))
+    return ('own rollouts',
+            f"on-policy, {_n(c.get('repeats', 1))} per condition, conditions taken "
+            f"{_get(args, 'condition_log_z.rollout_condition_draw', 'iid')}")
 
 
 def _n(v) -> str:
     return cs._num_text(v)
 
 
-def _terms(c: dict) -> list[str]:
-    """Nonzero loss-term weights. vg_by_condition only says how a VarGrad term groups its rows, so it is shown only
-    beside a VarGrad term it modifies."""
+def _terms(c: dict, mode: str = 'bwd') -> list[str]:
+    """Nonzero loss-term weights. vg_by_condition is not a weight: it makes vg_lb / vg_lme (and fwd emp_z) pool every
+    batch row of a condition into one group (gflownet_losses), so it is shown as 'by condition' on the terms it
+    changes and nowhere else."""
     def on(k):
         v = c.get(k)
         return isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) != 0.0
-    vg = on('vg_lb') or on('vg_lme')
-    return [f'{k} {_n(c[k])}' for k in cs._LOSS_TERMS if on(k) and (k != 'vg_by_condition' or vg)]
+    grouped = {'vg_lb', 'vg_lme'} | ({'emp_z'} if mode == 'fwd' else set())
+    by = on('vg_by_condition')
+    return [f'{k} {_n(c[k])}' + (' · by condition' if by and k in grouped else '')
+            for k in cs._LOSS_TERMS if on(k) and k != 'vg_by_condition']
 
 
 def _trains(c: dict) -> list[str]:
@@ -77,8 +126,9 @@ def stage_card(spec: dict, index: int, args, *, successor: Optional[str] = None,
     branches = []
     if st.train_mode == 'bwd':
         c = eff.get('bwd') or {}
-        branches.append(dict(mode='bwd', rows=_BWD_DATA[st.bwd_sampling_mode], terms=_terms(c),
-                             trains=_trains(c), share='all', inert=False, sidecar=False))
+        chip, detail = _rows('bwd', st, args, c)
+        branches.append(dict(mode='bwd', rows=chip, detail=detail, terms=_terms(c), trains=_trains(c), share='all',
+                             inert=False, sidecar=False))
     else:
         total = float(sum(st.fracs.values())) if st.fracs else 0.0
         thr = st.deactivate_threshold
@@ -87,28 +137,30 @@ def stage_card(spec: dict, index: int, args, *, successor: Optional[str] = None,
             thr = 0.01 if thr is None else float(thr)
         for mode in cs.MODES:
             c = eff.get(mode) or {}
-            rows = _DATA.get(mode) or _BWD_DATA[st.bwd_sampling_mode]
-            terms = _terms(c)
+            chip, detail = _rows(mode, st, args, c)
+            terms = _terms(c, mode)
             if mode in pooled_modes:
                 terms = terms + ['pooled term']
             if mode == 'fwd' and st.fwd_z_sidecar:
-                branches.append(dict(mode=mode, rows=rows, terms=terms, trains=_trains(c),
+                branches.append(dict(mode=mode, rows=chip, detail=detail, terms=terms, trains=_trains(c),
                                      share='sidecar ×1', inert=False, sidecar=True))
                 continue
             share = float(st.fracs.get(mode, 0.0)) / total if total > 0 else None
             weighted = (share is None or share >= thr or float(st.min_fracs.get(mode, 0.0)) >= thr
                         or st.balance_can_raise(mode, thr))
-            branches.append(dict(mode=mode, rows=rows, terms=terms if weighted else [],
+            branches.append(dict(mode=mode, rows=chip, detail=detail, terms=terms if weighted else [],
                                  trains=_trains(c) if weighted else [],
                                  share=('carried' if share is None else f'{share:.2f}') if weighted else '0',
                                  inert=not weighted, sidecar=False))
     pooled_info = None
     if pooled:
         centre = fc.get('pooled_center', 'mean')
-        pooled_info = dict(pairs=f"{fc.get('pooled_source', 'fwd')} rows with bwd rows",
+        knee = fc.get('pooled_beta')
+        pooled_info = dict(pairs=f"{fc.get('pooled_source', 'fwd')} rows with bwd rows of the same condition",
                            centre=_CENTRES.get(centre, str(centre)),
-                           detail=f"pooled_vg {_n(fc['pooled_vg'])}, bwd share {_n(fc.get('pooled_ratio', 0.5))}"
-                                  + (f", beta {_n(fc['pooled_beta'])}" if 'pooled_beta' in fc else ''))
+                           detail=f"weight {_n(fc['pooled_vg'])}; bwd {_n(fc.get('pooled_ratio', 0.5))} of each group"
+                                  + (f"; Huber knee {_n(knee)} nats: a residual past it pushes with constant force"
+                                     if knee is not None else ''))
     mech = []
     if st.train_mode == 'fused':
         if st.fwd_rollout_every > 0:
@@ -132,11 +184,20 @@ def stage_card(spec: dict, index: int, args, *, successor: Optional[str] = None,
         btext, _ = cs._balance_text(spec.get('balance') or {}, st.balance)
         ann = st.balance.get('anneal_coeffs') or {}
         ec = getattr(args, 'energy_config', None)
-        inert = bool(ann) and all(
-            getattr(ec, k, None) is not None and float(getattr(ec, k)) >= float(v['target']) for k, v in ann.items())
-        if inert:
-            btext += ' — anneal inert: ' + ', '.join(f'{k} already {_n(getattr(ec, k))}' for k in ann)
-        mech.append(('balance', btext, inert))
+        ann_inert = all(getattr(ec, k, None) is not None and float(getattr(ec, k)) >= float(v['target'])
+                        for k, v in ann.items())
+        default = st.balance.get('default_boost')
+        fixed = st.balance.get('kind') == 'lexicographic' and all(
+            r.get('boost') == default for r in st.balance.get('rules') or [])
+        if fixed and ann_inert:
+            shares = ', '.join(f'{k} {_n(v)}' for k, v in st.fracs.items() if v)
+            mech.append(('balance', f'OFF: the split stays {shares} (every rule boosts the default mix'
+                         + (f"; its anneal is inert, {', '.join(f'{k} already {_n(getattr(ec, k))}' for k in ann)}"
+                            if ann else '') + ')', True))
+        else:
+            if ann and ann_inert:
+                btext += ' — anneal inert: ' + ', '.join(f'{k} already {_n(getattr(ec, k))}' for k in ann)
+            mech.append(('balance', btext, False))
     for name, s in st.coeff_schedule.items():
         mech.append(('schedule', f"{name} → {_n(s['target'])} over {s['steps']} steps ({s['kind']})", False))
     mech.append(('learning rate', _lr_text(spec, args), False))
@@ -203,10 +264,11 @@ td{padding:9px 18px;border-top:1px solid var(--line);vertical-align:top}
 td.b{font-weight:700;width:86px;font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;font-size:14px}
 td.sh{width:120px;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600}
 tr.inert td{color:var(--inert)}tr.inert td.b{text-decoration:line-through}
-.chip{display:inline-block;border-radius:6px;padding:1px 8px;margin:1px 4px 1px 0;font-size:13px;font-weight:550}
+.chip{display:inline-block;white-space:nowrap;border-radius:6px;padding:1px 8px;margin:1px 4px 1px 0;font-size:13px;font-weight:550}
 .data{background:var(--data-bg);color:var(--data)}.term{background:var(--term-bg);color:var(--term)}
 .pol{background:var(--policy-bg);color:var(--policy)}.lz{background:var(--z-bg);color:var(--z)}
 .none{color:var(--inert);font-style:italic;font-size:13px}
+.det{color:var(--mute);font-size:12.5px;margin-top:4px;line-height:1.35}
 .pooled{margin:0 18px 12px;padding:9px 12px;border-left:3px solid var(--term);background:var(--term-bg);
 border-radius:6px;font-size:13.5px}
 .grid{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;padding:12px 18px 14px;border-top:1px solid var(--line);
@@ -252,13 +314,13 @@ def render_html(args, name: Optional[str] = None, title: Optional[str] = None) -
                              for p in b['trains']) or '<span class="none">nothing</span>'
             terms = _chips(b['terms'], 'term') or '<span class="none">no term</span>'
             out.append(f'<tr class="{"inert" if b["inert"] else ""}"><td class="b">{e(b["mode"])}</td>'
-                       f'<td>{_chips([b["rows"]], "data")}</td><td>{terms}</td><td>{trains}</td>'
+                       f'<td>{_chips([b["rows"]], "data")}<div class="det">{e(b["detail"])}</div></td><td>{terms}</td><td>{trains}</td>'
                        f'<td class="sh">{e(b["share"])}</td></tr>')
         out.append('</table>')
         if c['pooled']:
             p = c['pooled']
-            out.append(f'<div class="pooled"><b>pooled term</b> pairs {e(p["pairs"])} · centre: '
-                       f'<b>{e(p["centre"])}</b> · <span style="opacity:.8">{e(p["detail"])}</span></div>')
+            out.append(f'<div class="pooled"><b>pooled term</b>: pairs {e(p["pairs"])}; scores each against '
+                       f'<b>{e(p["centre"])}</b><br><span style="opacity:.85">{e(p["detail"])}</span></div>')
         rows = [(k, v, inert) for k, v, inert in c['mech']] + [(k, v, inert) for k, v, inert in c['entry']
                                                                if k != 'skipped when']
         out.append('<div class="grid">' + ''.join(

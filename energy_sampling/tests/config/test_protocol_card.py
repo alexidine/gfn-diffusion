@@ -4,7 +4,9 @@ each test would catch:
   * a declared mk_dev protocol that fails to render, or a stage panel missing;
   * the card disagreeing with describe_stage about which parameters a branch trains (both read the same overlay);
   * a lambda anneal shown as live when lambda_mix already sits at its target;
-  * vg_by_condition, a grouping switch, shown as a loss term without a VarGrad term beside it.
+  * vg_by_condition, a grouping switch, shown as a loss term instead of a note on the terms it groups;
+  * a balance whose rules all boost the default mix and whose anneal is inert shown as live;
+  * the stage-1 MLE draw and the stage-2 prior buffer given the same row source.
 
     python -m pytest -q tests/config/test_protocol_card.py
 """
@@ -55,9 +57,26 @@ def test_anneal_at_its_target_is_marked_inert(args):
     bal = [m for c in cards for m in c['mech'] if m[0] == 'balance']
     assert bal, 'conditional_vargrad declares a lambda anneal'
     if float(args.energy_config.lambda_mix) >= 1.0:
-        assert all(inert for _, _, inert in bal) and 'anneal inert' in bal[0][1]
+        assert all(inert for _, _, inert in bal) and 'inert' in bal[0][1]
 
 
 def test_vg_by_condition_is_not_a_term_on_its_own():
     assert pc._terms({'mle': 1.0, 'vg_by_condition': 1.0}) == ['mle 1']
-    assert pc._terms({'vg_lb': 1.0, 'vg_by_condition': 1.0}) == ['vg_lb 1', 'vg_by_condition 1']
+    assert pc._terms({'vg_lb': 1.0, 'vg_by_condition': 1.0}) == ['vg_lb 1 · by condition']
+    assert pc._terms({'emp_z': 1.0, 'vg_by_condition': 1.0}, 'fwd') == ['emp_z 1 · by condition']
+    assert pc._terms({'emp_z': 1.0, 'vg_by_condition': 1.0}, 'bwd') == ['emp_z 1']
+
+
+def test_a_fixed_split_balance_with_an_inert_anneal_reads_off(args):
+    _, cards = pc.protocol_cards(args, 'conditional_vargrad')
+    bal = [m for c in cards for m in c['mech'] if m[0] == 'balance']
+    if float(args.energy_config.lambda_mix) >= 1.0:
+        assert bal[0][1].startswith('OFF'), bal[0][1]
+
+
+def test_each_branch_says_where_its_rows_come_from(args):
+    _, cards = pc.protocol_cards(args, 'conditional_vargrad')
+    rows = {b['mode']: b['rows'] for c in cards for b in c['branches']}
+    assert rows['replay'] == 'replay buffer' and rows['fwd'] == 'own rollouts'
+    chips = [b['rows'] for c in cards for b in c['branches'] if b['mode'] == 'bwd']
+    assert chips == ['prior dataset (MLE draw)', 'prior buffer']
