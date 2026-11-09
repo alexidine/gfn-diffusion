@@ -726,10 +726,26 @@ def _main():
     ap.add_argument('--against', metavar='PATH', help='compare against a saved snapshot')
     ap.add_argument('--check', action='store_true',
                     help='validate a canonical config and print a concise operational summary')
+    ap.add_argument('--card', metavar='PATH',
+                    help='validate the config and write its active protocol as an HTML card (protocol_card.py)')
     a = ap.parse_args()
 
     if a.check and (a.other or a.save or a.against):
         ap.error('--check cannot be combined with comparison or snapshot-output options')
+
+    if a.card:
+        import os
+        import protocol_card
+        checked, issues, args = _contract(a.config)
+        if issues:
+            print(f'{a.config}: contract FAILED')
+            for issue in issues:
+                print(f'  - {issue}')
+            return 1
+        with open(a.card, 'w', encoding='utf-8') as f:
+            f.write(protocol_card.render_html(args, title=os.path.splitext(os.path.basename(a.config))[0]))
+        print(f'wrote {a.card}')
+        return 0
 
     if a.check:
         import textwrap
