@@ -8,6 +8,19 @@ source; **[check]** a CPU check of a few seconds run for this document (random w
 session scratchpad, not in the repo); **[derived]**; **[proposed]**; **[lead]** a navigation lead that was not
 re-verified.
 
+**Amended 2026-11-08 after an adversarial review** (notes: `conditioner_ae_review_2026-11-08.md` in the session-family
+notes folder, outside the repo; check scripts in the session scratchpad `review/`). Corrected in place:
+- the proper-frame formula (§3.1);
+- the symmetry obstruction and augmentation rule (§2.3);
+- the SVD gradient hazard (§3.1);
+- the consistency term's claims and distance (§3.3);
+- a decoder initialisation rule (§3.2);
+- the chirality bit, now dropped from the first experiment (§2.2, §7.3);
+- the eval-mode wiring of the learned frame (§7.1);
+- the first experiment's controls and seeds (§7.2).
+
+Checks quoted from the review are tagged **[review check]**.
+
 Why now (owner, 2026-11-08). On the norbornane P-1 set (117 training molecules, 35 held out), the molecule
 conditioner learns molecule identity when it is co-trained with the flow. At matched training fit (train mean
 −log q = −2 nats) the held-out-molecule gap is 0.66 nats with about 7 molecule scalars as the condition, and 0.80–0.85
@@ -16,12 +29,12 @@ frozen conditioner separates the embedding from the policy's memorisation.
 
 The proposal in one paragraph **[proposed]**:
 - **Keep SplitAtomEncoder's invariant trunk as the scalar channel `s`.** It is exactly invariant by construction.
-- **Give the point stream a vector readout and reduce it to one molecular frame F in O(3).** That is three
-  rotational degrees of freedom and one handedness bit.
+- **Give the encoder an exact polar-plus-pseudovector readout and reduce it to one molecular frame F in SO(3)** by the
+  special Procrustes projection. That is three rotational degrees of freedom.
 - **Decode as F · D(s).** D(s) is a canonical-pose point cloud built from `s` alone.
-- **Train with random proper rotations and a decoder-free consistency term** over rotated copies.
-- **Downstream, the flow reads frozen `s` (plus the handedness bit).** It models orientation relative to the learned
-  frame, so the policy needs no vector input at all.
+- **Train with random rotations and a decoder-free consistency term** over rotated copies.
+- **Downstream, the flow reads frozen `s`.** It models orientation relative to the learned frame, so the policy needs
+  no vector input at all. The frame is precomputed per molecule and applied in every mode (§7.1).
 
 The sections below argue each step.
 
@@ -160,8 +173,8 @@ so Q is invariant. Three results follow:
 - Right-multiplication preserves Haar measure, so only the chart's own density ratio enters log q. That is the term
   `rotate_orientation` already returns.
 - Equivalently, present the molecule in its own frame, x̃ = F(x)ᵀ x, and keep the flow as it is. This is a *learned
-  standard frame* replacing `orient_molecule(mode='standard')`. It runs through the existing `rotate_frames` plumbing
-  with a deterministic R0 = F(x_std)ᵀ in place of a random one.
+  standard frame* replacing `orient_molecule(mode='standard')`, with a deterministic R0 = F(x_std)ᵀ per molecule. It
+  must be applied in every mode, so it cannot reuse the `rotate_frames` path, which is training-mode only (§7.1).
 
 The alternative is to hand the flow equivariant vectors V and let it learn the action. The AR spline flow's conditional
 would then have to satisfy q(R R0ᵀ | R0 V) = q(R | V) for every R0. The flow has no structure that represents this
@@ -177,48 +190,64 @@ shape is everything a distance-only GNN can see. So:
   - This includes composition, topology as seen through distances, conformation and size.
   - It is read by the level head and the flow context.
   - It is mirror-blind if built from distances alone.
-- **Vector channel: the pose F, plus one handedness bit χ = det F.** Anything else in it duplicates `s`. Its
-  information content is three rotational degrees of freedom and one bit.
+- **Vector channel: the pose F ∈ SO(3).** Anything else in it duplicates `s`. Its information content is three
+  rotational degrees of freedom.
   - **Downstream, F is consumed by canonicalising, never as a context input.**
-  - **χ is a pseudoscalar.** The flow may read it beside `s` as a ±1 input.
-  - That puts chirality in the vector channel as the owner asks, and it stays out of `s`. The existing alternative,
-    `ChiralChannels` inside `s`, carries the same bit as a scalar; the choice between them is an owner decision (§7).
-- **"Global" information has nothing beyond F and χ.** Under the pinned standard frame (no `rotate_frames`), the pose
+  - **Chirality is not a bit of the frame.** The first draft took χ = sign det M as a handedness bit. That is wrong:
+    det M ≈ 0 for every planar molecule and every mirror-symmetric one, so χ is the sign of rounding noise there (§3.1).
+  - With the pseudovector readout of §3.1, F is SO(3)-equivariant only. An enantiomer pair then gets unrelated frames
+    under the same mirror-blind `s`, so chirality must enter the condition through `s`, via `ChiralChannels` (:494),
+    a continuous per-atom pseudoscalar field. The choice is an owner decision (§7.3).
+  - **[review check]** In GFN's stored frame (`orient_molecule(mode='std')`, handedness +1) the stored enantiomer is
+    chosen by the principal axes, so a frame-derived handedness bit would report a PCA artefact. No χ input in the
+    first P-1 experiment.
+- **"Global" information has nothing beyond F.** Under the pinned standard frame (no `rotate_frames`), the pose
   is fixed by convention. The vector channel then carries no information beyond `s` *in principle*. What it supplies is
   computability: the principal-axes frame is a discontinuous function of shape that the flow would otherwise have to
   learn from `s`. Today's `p` (an MLP of standard-frame coordinates) mostly supplies this.
 
 ### 2.3 The obstruction, and why it is benign here [derived]
 
-No continuous equivariant frame exists on all shapes. A molecule with point-group stabiliser G_m ⊂ SO(3) has
-g x = x as a point set. A permutation-invariant encoder therefore gives E(gx) = E(x), while equivariance demands
-F(gx) = g F(x).
+No continuous SO(3)-equivariant frame exists on all shapes. A molecule with a proper rotational stabiliser
+G_m ⊂ SO(3) has g x = x as a point set. A permutation-invariant encoder therefore gives E(gx) = E(x), while
+equivariance demands F(gx) = g F(x). Only proper symmetry elements obstruct an SO(3) frame: the C_n axes, and linear
+molecules. Mirror planes, inversion centres and S_n axes do not.
 
-**[check]** An exactly equivariant invariant-weighted readout V = Σ_i a(h_i) x_i, the cheapest exact construction
-(§3.1), shows the obstruction directly:
+**[check]** An exactly equivariant invariant-weighted *polar* readout V = Σ_i a(h_i) x_i shows the obstruction, and
+also an artefact of using polar vectors only:
 - it is equivariant to 5e-16 under proper and improper rotations;
-- it is exactly zero (1e-15) on a centrosymmetric toy molecule;
-- it lies exactly on the axis of a C2 toy molecule (off-axis fraction 5e-17).
+- it lies exactly on the axis of a C2 toy molecule (off-axis fraction 5e-17), which is the genuine obstruction;
+- it is exactly zero (1e-15) on a centrosymmetric toy molecule. This is not an obstruction to an SO(3) frame. A polar
+  vector must vanish under inversion, but a pseudovector need not.
 
-This is the owner's symmetry problem with L1 encoders. Near-symmetric molecules add the boundary problem: F is
-ill-conditioned and jumps under small changes. Dym, Lawrence & Siegel (ICML 2024, "Equivariant frames and the
-impossibility of continuous canonicalization") prove that no continuous canonicaliser avoids this. The PCA standard
-frame has the same defect: degenerate moments and sign flips, the 13–63% flips of the lead in §1.1.
+**[review check]** Adding pseudovectors P = Σ_ij b(h_i, h_j, d_ij)(x_i − x̄) × (x_j − x̄) gives exact, noise-stable
+SO(3) frames (special Procrustes, §3.1) on C1, Cs, Ci and planar toys: equivariance error ≤ 3e-14, change under 1e-6 Å
+noise ≤ 7e-5. Only the C2 toy still fails (error 1.88). The weights must depend on d_ij; with b(h_i, h_j) alone the
+Ci terms cancel exactly.
+
+Near-symmetric molecules add the boundary problem: F is ill-conditioned and jumps under small changes. Dym, Lawrence &
+Siegel (ICML 2024, "Equivariant frames and the impossibility of continuous canonicalization") prove that no continuous
+canonicaliser avoids this. The PCA standard frame has the same defect: degenerate moments and sign flips, the 13–63%
+flips of the lead in §1.1.
 
 **It is benign for the crystal target, if equivariance is defined up to the molecule's symmetry.**
-- If F jumps to F g with g ∈ G_m, then Q → Q g, and the crystal Q g c = Q c is unchanged (c = Fᵀ x, g c = c as a set).
+- If F jumps to F g with g ∈ G_m, then Q → Q g and the canonical cloud c = Fᵀ x → gᵀ c. The crystal
+  Q g · gᵀ c = Q c is unchanged.
 - The target density over Q is therefore exactly right-G_m-invariant, so any frame choice among the |G_m| equivalent
   ones is correct.
 - For a near-symmetric molecule, a seam crossing permutes near-equivalent modes of Q. The cost is of order the target's
   asymmetry under the near-symmetry.
 
-This fixes two design rules:
+Design rules:
 - **Measure equivariance up to G_m.** A loss ‖F(R0x) − R0F(x)‖ is wrong for symmetric molecules. It penalises
-  harmless frame choices and pulls vectors toward zero.
-- **Use proper rotations only (SO(3)) in augmentation.** Leave reflection behaviour free, and let χ carry it.
-  - Under O(3) augmentation, a centrosymmetric molecule forces every polar vector to zero.
-  - Under SO(3) it imposes nothing, because inversion is improper.
-  - Mo3ENet augments with inversions (`include_inversion=True`); this design should not.
+  harmless frame choices, and a vector-valued version ‖V(R0x) − R0V(x)‖ is minimised by V → 0.
+- **The augmentation group is a free choice, not a correctness rule.** The first draft required SO(3)-only
+  augmentation because "O(3) augmentation forces polar vectors to zero on centrosymmetric molecules". That was
+  misattributed. The proposed losses (factorised reconstruction, §3.2(d); consistency, §3.3) compare frames up to the
+  stabiliser, and under them O(3) augmentation of a centrosymmetric molecule demands nothing new, since −x = x as a set.
+  Zero-forcing happens only under the vector-valued loss above, which this design does not use.
+- **Mask proper-symmetric molecules (C_n, linear) out of the frame losses.** Their frame is arbitrary by symmetry, and
+  the target is invariant to the choice. The singular values of M detect them (§3.1).
 
 ---
 
@@ -228,26 +257,40 @@ This fixes two design rules:
 
 Give the point stream a 3-index output. In increasing order of how much structure it imposes:
 
-| readout | exact O(3) equivariance | can break molecular symmetry | cost |
+| readout | exact equivariance | frames it fails on | cost |
 |---|---|---|---|
-| V2: a plain MLP of `p`, reshaped to [3, k] | none; the loss must create it from scratch | yes | trivial |
-| V1: V_k = Σ_i a_ik(h_i, pt_i) (x_i − x̄) | exact while a reads only h_i | through the frame-dependent pt_i | one linear layer |
-| L1 equivariant GNN (Mo3ENet) | exact | no | large |
+| V2: a plain MLP of `p`, reshaped to [3, k] | none; the loss must create it from scratch | — (no guarantee anywhere) | trivial |
+| V1 polar: V_k = Σ_i a_ik(h_i) (x_i − x̄) | O(3) | C_n, linear; also Ci (V = 0), Cs and planar (rank ≤ 2) | one linear layer |
+| V1 polar + pseudovector: V1 plus P_k = Σ_ij b_k(h_i, h_j, d_ij)(x_i − x̄) × (x_j − x̄) | SO(3) | C_n, linear only | one pair MLP on the radius graph's edges |
+| L1 equivariant GNN (Mo3ENet) | O(3) | as V1 polar | large |
 
-Caption: readouts compared by construction, not measured. h_i are the invariant trunk features, pt_i the point
-stream's frame-dependent ones, x̄ the centroid convention the FD chart uses.
+Caption: readouts compared by construction; the failure column for the two V1 rows is the [review check] of §2.3
+(toy molecules, random weights). h_i are the invariant trunk features, d_ij interatomic distances, x̄ the centroid
+convention the FD chart uses.
 
-**Recommended: V1, with k = 3 or 4 vectors.**
-- The invariant part of the weights gives exact equivariance wherever it suffices.
-- The pt_i part (which reads `MLP(x)`) supplies the symmetry breaking §2.3 requires. The consistency loss (§3.2)
-  decides how much of it is used.
+**Recommended: V1 polar + pseudovector, with k = 3 or 4 vectors of each kind.**
+- Exact SO(3) equivariance everywhere except at proper symmetries, which no continuous frame can handle (§2.3).
 - No L1 machinery and no tensor products. The vectors live in the molecule's span and scale with its size.
+- The first draft added a frame-dependent pt_i term to the weights, to break symmetry. With pseudovectors it is needed
+  only for C_n molecules, whose frame is arbitrary anyway. Drop it from the first build. If it is kept, initialise it at
+  zero (§3.2(d)).
+- The pseudovectors give up the enantiomer relation a polar-only frame has. Chirality then enters through `s` (§2.2).
 
 **F from V.**
-- F̃ = U Wᵀ from the SVD of the 3×3 matrix M = V A. A is a learned k×3 mix.
-- This is the orthogonal Procrustes projection. Its special-orthogonal variant flips the last singular vector. It is
-  smoother than Gram–Schmidt (Levinson et al., NeurIPS 2020, "An analysis of SVD for deep rotation estimation").
-- Keep det M: F̃ ∈ O(3), with χ = sign det M, and the proper frame F = F̃ diag(1, 1, χ).
+- Stack the readout into the 3×3 matrix M = [V P] A, with A a learned mix, and take M = U Σ Wᵀ.
+- **F = U diag(1, 1, det(U Wᵀ)) Wᵀ**, the special orthogonal Procrustes projection (SVD+ in Levinson et al., NeurIPS
+  2020, "An analysis of SVD for deep rotation estimation"). It is continuous wherever σ2 > 0.
+- **Corrected.** The first draft set F = U Wᵀ diag(1, 1, sign det M), which flips the output basis instead. As det M
+  passes through zero it jumps by a rotation that is not a symmetry. **[review check]** On polar-only Cs and planar
+  toys it gave equivariance error 1.86–1.88 and a change of 1.9–2.0 under 1e-6 Å noise, against 1e-14 and 3e-5 to
+  2e-4 for the special projection.
+- **Gradients diverge near degeneracy.** The polar factor's derivative carries 1/(σ_i + σ_j).
+  - **[review check]** On a C2 toy displaced δ off the symmetry, ‖dF/dx‖ grew as 1/δ: 3.4e2 at 0.1 Å, 1.9e7 at 1e-6 Å.
+  - Torch's SVD backward also fails where the polar factor is smooth: NaN in float32 for two singular values within
+    1e-7, and a wrong directional derivative in float64 at an exact tie (0.944 against a finite difference of 0.619).
+    A learned M will produce near-ties without any molecular symmetry.
+  - So: use a polar factor with a stable custom backward (the 1/(σ_i + σ_j) form), or Björck / Newton–Schulz
+    orthogonalisation. Gate the frame losses by σ2 + σ3, and mask molecules below a floor (§2.3).
 - The singular values of M are invariants that report how well defined the frame is. Feed them to `s`'s readers as a
   frame-confidence input.
 
@@ -277,11 +320,16 @@ same bias toward shape in the vector track, at lower cost.
 
 **(d) Factorised decoder (recommended): x̂ = F̃ · D(s).**
 - D is any network of `s` alone. It emits a canonical-pose swarm: positions, type logits and weights, as Mo3ENet's
-  decoder does. F̃ rotates (and, if χ = −1, reflects) it.
+  decoder does. F rotates it.
 - **Equivariance is induced, up to symmetry.** With `s` invariant, D(s) is the same for every presentation. Perfect
   reconstruction gives F̃(R0x) D(s) = R0 F̃(x) D(s), so F̃(R0 x) = R0 F̃(x) g with g in the stabiliser of D(s). That
   is exactly the symmetry-aware equivariance of §2.3. The loss is indifferent among the |G_m| frames, so the symmetry
   obstruction never enters the objective.
+- **It also holds at imperfect reconstruction [review, derived].** argmin_F overlap(F · D, R0 x) =
+  R0 · argmin_F overlap(F · D, x), so the optimal aligner is equivariant whatever the quality of D.
+- **Initialisation rule.** If F starts inconsistent across poses, the best D(s) for random presentations is the
+  rotation-averaged blob, and for a blob every F is optimal: a stationary bad point. Start F exactly equivariant: the
+  readout of §3.1 is, and any frame-dependent term is initialised at zero.
 - **Intramolecular information must flow through `s`.** F̃ is a 3×3 orthogonal matrix and cannot carry shape.
 - **Its cost: D(s)'s canonical pose must be a function of shape.** By §2.3 that function is discontinuous somewhere.
   An MLP is continuous, so reconstructions will blur near the seams. Expect higher reconstruction error on
@@ -305,16 +353,26 @@ same bias toward shape in the vector track, at lower cost.
 Put K rotated copies of each molecule in a batch, x_a = R_a x with R_a uniform on SO(3). K = 2 is enough, and 4
 tightens the estimate. Then
 
-  L_cons = Σ_{a<b} overlap_distance(F̃(x_a)ᵀ x_a, F̃(x_b)ᵀ x_b),
+  L_cons = Σ_{a<b} d(F(x_a)ᵀ x_a, F(x_b)ᵀ x_b),
 
-the reconstruction overlap distance between the *canonicalised input* point clouds.
+a distance between the *canonicalised input* point clouds.
 - **Decoder-free.** No D pass.
 - **Symmetry-aware.** Two canonical clouds that differ by g ∈ G_m are the same set, so the term is zero.
-- **Cannot collapse.** F̃ is orthogonal, unlike a raw ‖V(R0x) − R0V(x)‖² term, which is minimised by V → 0.
+- **Cannot collapse.** F is orthogonal, unlike a raw ‖V(R0x) − R0V(x)‖² term, which is minimised by V → 0.
+- **The distance d.** The first draft named MXtalTools' overlap distance. That is unsuitable: `ae_reconstruction_loss`
+  (`autoencoder_utils.py:475`) is asymmetric (decoded density at each true atom against the self-overlap), and its
+  resolution moves with the σ schedule. Use a symmetric typed-kernel MMD at a fixed small σ, which is zero exactly when
+  the typed sets coincide. For molecules with trivial G_m (every norbornane, §7.2), a matched-index RMSD is exact,
+  cheaper and needs no σ.
 
-Reconstruction implies consistency only in the limit of perfect reconstruction. L_cons enforces consistency while D is
-still poor, and it costs nothing in D. It is the owner's "rotated copies should agree" term, stated so that it is
-correct for symmetric molecules.
+**What it does not do [review, derived].** The first draft overclaimed it:
+- With an exactly equivariant readout (§3.1), L_cons is zero up to float error and gives no gradient. It polices only
+  a frame-dependent term, under noise and conformer change (§5 item 3), or a non-exact readout such as V2.
+- Any equivariant frame satisfies it, the PCA frame included away from its flips. It does not select a frame that
+  makes D(s) smooth. Only reconstruction does that.
+
+So it is a cheap guard and diagnostic, not the mechanism. It is the owner's "rotated copies should agree" term, stated
+so that it is correct for symmetric molecules.
 
 ---
 
@@ -331,7 +389,7 @@ The two options:
   channel from carrying shape too. A shared decoder will use whichever channel is easier, and with (a) or (c) that is
   the vector one.
 - **(ii) separates them by an information bottleneck.** After the SVD projection the vector channel has three
-  continuous degrees of freedom and one bit. Shape cannot pass through it.
+  continuous degrees of freedom. Shape cannot pass through it.
 - **(ii) also removes the one remaining frame-dependent input from the policy.** The flow conditions on invariants
   only (§2.1).
 
@@ -413,8 +471,9 @@ come from pool v1.
 
 ### 6.2 Plan [proposed]
 
-**The constraint: QM9 alone does not cover the test molecules.** Norbornanes have up to 11 heavy atoms, with median
-11; QM9 stops at 9. That puts most of the 35 held-out molecules outside the pretraining size range. The owner also
+**The constraint: QM9 alone does not cover the test molecules.** Norbornanes have 8–11 heavy atoms (training median
+11, held-out median 10; **[review check]** on the 117/35 split); QM9 stops at 9. That puts most of the 35 held-out
+molecules outside the pretraining size range. The owner also
 recalls that earlier work overfit QM9. So the first round goes beyond QM9 from the start.
 
 1. **Measure conformer cost first.** Embed 1,000 pool-v1 molecules (8–14 heavy atoms) with ETKDGv3 plus MMFF on one
@@ -452,20 +511,38 @@ recalls that earlier work overfit QM9. So the first round goes beyond QM9 from t
 
 ### 7.1 Build (about half a day) [proposed]
 
-1. **`models/conditioner_ae.py`.** The encoder is `SplitAtomEncoder` unchanged, plus the V1 readout and the SVD frame
-   (§3.1). The decoder is factorised (§3.2(d)), with D an MLP of `s` emitting a 64-node swarm. The loss is MXtalTools'
-   reconstruction loss plus L_cons with K = 2.
-2. **A pretraining script.** It runs on the first-round set of §6, with SO(3) augmentation and 0.01 Å noise. It saves an
+1. **`models/conditioner_ae.py`.**
+   - The encoder is `SplitAtomEncoder` unchanged, plus the polar + pseudovector readout and the special Procrustes
+     frame with a stable backward (§3.1).
+   - The decoder is factorised (§3.2(d)), with D an MLP of `s` emitting a 64-node swarm.
+   - The loss is MXtalTools' reconstruction loss plus L_cons with K = 2, its distance as in §3.3, with proper-symmetric
+     molecules masked out of both frame terms.
+2. **A pretraining script.** It runs on the first-round set of §6, with random rotations and 0.01 Å noise. It saves an
    encoder file that carries its own widths, as `sym_ops_init` does (`nf_policy.py:68`).
-3. **Policy wiring, two settings in `NF_PENDING_DEFAULTS`, so `mk_dev.yaml` is untouched:**
+3. **Policy wiring, settings in `NF_PENDING_DEFAULTS`, so `mk_dev.yaml` is untouched.**
    - `atom_encoder_init`: a pretrained encoder file, frozen by default.
-   - `atom_frame: learned`: the molecule is presented in its learned frame. This is the `rotate_frames` path with a
-     deterministic R0 = F(x_std)ᵀ per molecule, computed once from the frozen encoder; χ joins the context.
+   - `atom_frame`: `standard` (today), `learned` or `core` (the hand-built frame of §7.2's `core_frame` arm).
+   - **Corrected wiring.** The first draft reused `rotate_frames` with a deterministic R0. That path is training-mode
+     only: `_frames` returns None unless `self.training` (`nf_policy.py:444-450`; comment at :86-87), and
+     `log_density` presents the standard frame when `frames is None` (:705-718). A flow trained on Q would be scored and
+     sampled as if its rows were R in every eval readout, including the primary gap. Frames also switch off the keyed
+     per-molecule atom table (`nf_policy.py:559`) and the cached atom graph (`spline_flow.py:831`).
+   - **Instead:** precompute `s` and F once per molecule from the frozen encoder. Apply the fixed map R → R F, with
+     `rotate_orientation`'s Jacobian, at the policy boundary in **every** mode: training, `log_density` and sampling,
+     where draws map back by R = Q Fᵀ. The flow reads `s` through the existing per-molecule vector route
+     (`set_mol_scalars` with encoder `'none'` is nearly this). The encoder never runs in the policy unless point tokens
+     are on.
 4. **Tests.**
    - `s` invariance.
-   - Equivariance of F to float precision where a(h) dominates, measured as the canonical-cloud overlap.
+   - F: SO(3) equivariance to float precision on C1, Cs, Ci and planar toys; continuity under 1e-6 Å noise; a finite
+     gradient in float32 at a near-tie of singular values.
    - A frozen encoder receives no gradient.
    - The learned-frame round trip: a row re-expressed and back is bit-identical, and log q includes the Jacobian.
+   - The frame is applied in eval: `log_density` of a row in eval mode equals its training-mode value with the same
+     frame.
+   - A `rotate_frames`-equivalence check replaces the old `ae_s_rot` arm: Q is unchanged when the molecule is presented
+     rotated and F is recomputed. **[review check]** through `rotate_orientation` on 2,000 random sg-2 rows: max row
+     difference 5.2e-15, max log-Jacobian difference 8.9e-15.
 
 ### 7.2 Runs [proposed]
 
@@ -473,16 +550,45 @@ recalls that earlier work overfit QM9. So the first round goes beyond QM9 from t
 - **Downstream.** The norbornane P-1 conditional MLE recipe of the `norb_mle_nov05` battery: base prior, batch 500,
   14–20k steps. At most one data-on-GPU run at a time locally (memory lead), or as a cluster battery.
 
+**What the test set does and does not exercise [review check].** All 152 norbornanes are C1. Each is at least 1.06 Å
+from any principal-axis C2, mirror or inversion, and none forms an exact enantiomer pair. The symmetry machinery of
+§2.3 never binds here. What a frame can change on this set is the alignment *across* molecules. In the stored frame,
+the shared bicyclo[2.2.1] core sits in 22 distinct poses across the 117 training molecules (45° clustering threshold;
+50 at 20°). Each held-out molecule's nearest training core pose is 0–33° away, median about 14°.
+
+**A note on the key.** A frozen 128-d `s` is still an exact molecule key: it separates the 117 training molecules, and
+the context MLP and transformer can memorise through it. The frozen 7-scalar arm already shows a 0.66 gap. Freezing is
+therefore not the mechanism; the geometry and information content of the key are. The controls below separate these.
+
+**Stage A: no pretraining needed** (can run before the autoencoder exists).
+
 | arm | condition read by the flow | frame | what it isolates |
 |---|---|---|---|
-| `base` (existing) | co-trained split encoder s, p | PCA standard | reference: about 0.80–0.85 nats at matched fit −2 |
-| `scalars` (existing) | about 7 molecule scalars | PCA standard | reference: 0.66 |
-| `ae_s` | frozen pretrained s | PCA standard | does a pretrained invariant channel transfer better? |
-| `ae_s_frame` | frozen s, χ, frame confidence | learned F | does the learned frame help at matched fit? |
-| `ae_s_rot` | as `ae_s_frame`, plus `rotate_frames` on | learned F after a random R0 | frame-independence: should match `ae_s_frame` to within the equivariance error |
+| `base` | co-trained split encoder s, p | PCA standard | reference: about 0.80–0.85 nats at matched fit −2 (single seed) |
+| `scalars` | about 7 molecule scalars | PCA standard | reference: 0.66 (single seed) |
+| `s_only` | co-trained split encoder s, no p | PCA standard | the p channel against the rest of the encoder |
+| `rand_s` | frozen randomly initialised SplitAtomEncoder s | PCA standard | freezing alone, without pretraining |
+| `core_frame` | co-trained s, p | hand-built core frame | does cross-molecule core alignment lower the gap, at zero pretraining cost? |
+| `trunk_s` | frozen IntraTrunk pool (`pretrain_intra_trunk.py`, MMFF energy and force pretraining over QM9) | PCA standard | a ready pretrained invariant; energy/force pretraining against reconstruction |
 
-Caption: proposed arms, nothing run. The two reference rows are owner-quoted readings of the existing battery (single
-seed). They are reused only if the recipe matches exactly, otherwise rerun.
+**Stage B: after pretraining.**
+
+| arm | condition read by the flow | frame | what it isolates |
+|---|---|---|---|
+| `ae_s` | frozen pretrained s | PCA standard | reconstruction pretraining, against `rand_s` and `trunk_s` |
+| `ae_s_b8` | frozen pretrained s through `cond_bottleneck` about 8 wide | PCA standard | information-matched to `scalars` |
+| `ae_s_frame` | frozen s, frame confidence | learned F | the learned frame, against `ae_s` and `core_frame` |
+
+Caption: proposed arms, nothing run. Each row is a norbornane P-1 conditional MLE run on the recipe above. `base` and
+`scalars` are rerun with seeds on the exact recipe; the owner-quoted single-seed readings are only a prior. The first
+draft's `ae_s_rot` arm is dropped: with F recomputed on the rotated presentation it equals `ae_s_frame` to float error,
+so it is a unit test (§7.1 item 4); with F fixed and a random R0 applied after it, the flow cannot see R0 and the
+orientation target collapses to the Haar marginal.
+
+- `core_frame` needs a deterministic core frame: u toward the one-carbon bridge (C7), v along the bridgehead axis. The
+  core's own C2 leaves a two-fold choice; the substituents break it, so a fixed substituent rule must pick one. It runs
+  through the §7.1 wiring with `atom_frame: core`.
+- `trunk_s`: the script exists (commit `92b8d730`); whether a usable checkpoint exists was not checked **[lead]**.
 
 **Readouts.**
 1. **Primary: the held-out-molecule gap at matched training fit.** Held-out `eval_test/mle` minus training-row
@@ -496,25 +602,35 @@ seed). They are reused only if the recipe matches exactly, otherwise rerun.
    - Jitter sensitivity of `s` at 0.0005–0.02 Å, against Mo3ENet's 2.6–123% lead.
    - The `s`-space distance of each held-out norbornane to its nearest training norbornane and to its nearest
      pretraining molecule.
+   - The core-pose dispersion of the learned frame across the 117 training molecules, against the 22 clusters of the
+     stored frame. If reconstruction does not align cores, `ae_s_frame` cannot be expected to beat `core_frame`.
 
 **Resolution.**
 - Seed spread on this test is about 0.07 nats (two seeds, smoothed).
-- Held-out n is effectively 11 constitutions.
+- Held-out n is effectively 11 constitutions (`norbornane_p1_split.json`: 35 molecules in 11 constitutions held out;
+  117 molecules in 43 constitutions for training). The `test_split` column of `norbornane.csv` is an older 119/33 split;
+  do not use it.
 - Differences of 0.1–0.25 nats are unresolved (sibling review, `docs/design/conditional_learning_review_2026-11-08.md`
-  §6).
-- A gap change smaller than about 0.2 nats is noise. A result worth acting on would be the gap at −2 falling from
-  about 0.8 toward or below the scalars' 0.66.
+  §6). The two reference readings differ from each other by 0.15–0.19 nats, about that floor.
+- The SE of a difference between two single-seed arms is about √2 × 0.07 ≈ 0.10 nats. So every arm needs at least 3
+  seeds, or the comparison is a per-molecule paired analysis with a bootstrap over held-out constitutions.
+- A result worth acting on would be the gap at −2 falling from about 0.8 toward or below the scalars' 0.66, by more
+  than twice the paired SE.
 
 ### 7.3 Open owner decisions (recommended default first)
 
 1. **Vector channel shape: a frame bottleneck with the factorised decoder (default), or a free k-vector latent with an
    equivariant decoder (Mo3ENet-like).** The bottleneck enforces the channel separation and makes the flow's input
    invariant. The free latent reconstructs better but entangles shape with pose (§3.2).
-2. **Where chirality lives: χ = det F̃ in the vector channel, with `s` mirror-blind (default), or `ChiralChannels` in
-   `s` with a proper F.**
-   - The default follows the stated channel split.
-   - On P-1, which contains inversion, enantiomers have the same landscape, so either is safe for the first experiment.
-   - The choice matters for the Sohncke groups.
+2. **Chirality: none for the first P-1 experiment (default); `ChiralChannels` in `s` for the Sohncke groups.**
+   - The first draft's default, a bit χ = sign det M in the vector channel, is withdrawn: it is noise on planar and
+     mirror-symmetric molecules, and a PCA artefact in GFN's stored frame (§2.2, §3.1).
+   - On P-1, which contains inversion, enantiomers have the same landscape, and the norbornane set has no exact
+     enantiomer pairs.
+   - With an SO(3)-only frame, enantiomers get unrelated targets under a mirror-blind `s`, so any chiral space group
+     needs `ChiralChannels` (`chirality > 0`).
+   - Alternative: a polar-only frame keeps the enantiomer relation exactly, at the cost of failing on Ci, Cs and planar
+     molecules (§3.1).
 3. **Frozen or slow fine-tune.** Frozen for the first experiment (default). A fine-tune arm at about 0.01× the policy
    LR comes second, only if frozen is not worse at matched fit.
 4. **Pretraining set: exclude all 152 norbornanes (default), or include the training ones.** Excluding all keeps
@@ -525,5 +641,11 @@ seed). They are reused only if the recipe matches exactly, otherwise rerun.
    tokens could be canonical-frame atom coordinates. That is a later arm.
 7. **Where the code lives: GFN `models/` (default).** The encoder is GFN's. MXtalTools is used only as a library (its
    loss and `ScalarGNN`), so no reverse dependency is added.
+8. **Run order: Stage A first (default), or Stage A and B together.** Stage A needs no autoencoder and tests the
+   frame hypothesis (`core_frame`) and the freezing and p-channel controls directly. If `core_frame` and `rand_s` move
+   nothing, the autoencoder's case rests on reconstruction pretraining alone, and Stage B can be resized before the
+   build.
+9. **Seeds: 3 per arm (default), or 1 seed per arm with a constitution-bootstrapped paired analysis.** Three seeds
+   resolve about 0.1 nats; the paired analysis is cheaper but rests on 11 constitutions.
 
 Settings proposed here go in `NF_PENDING_DEFAULTS` until the owner adds them to `mk_dev.yaml`.
