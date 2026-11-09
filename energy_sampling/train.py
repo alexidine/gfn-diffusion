@@ -385,6 +385,23 @@ def equipartition_bar(k, p: float, window: float) -> torch.Tensor:
     return out + float(window)
 
 
+def group_split_means(key, values, sg, ok, args, stat='mean'):
+    """{'sg<g>/<key>': the mean (stat 'median': the interpolated median, as torch.quantile) of `values` over the rows of space group g where `ok` (None:
+    the finite rows), for each group the rows hold}, on a run over more than one space group (cfg:space_groups); {}
+    otherwise. The space-group view of a pooled readout: one group lagging another does not show in the pooled number."""
+    if len([int(g) for g in getattr(args, 'space_groups', None) or []]) < 2:
+        return {}
+    v = torch.as_tensor(values).detach().reshape(-1).cpu().double()
+    s = torch.as_tensor(sg).detach().reshape(-1).long().cpu()
+    m = torch.isfinite(v) if ok is None else torch.as_tensor(ok).reshape(-1).bool().cpu() & torch.isfinite(v)
+    out = {}
+    for g in sorted(set(s.tolist())):
+        sel = (s == g) & m
+        if bool(sel.any()):
+            out[f'sg{g}/{key}'] = float(torch.quantile(v[sel], 0.5) if stat == 'median' else v[sel].mean())
+    return out
+
+
 def row_dof_count(sample_batch, n_rows: int, n_dof) -> torch.Tensor:
     """
     Per-row real degree-of-freedom count, [n_rows] long.
@@ -9045,7 +9062,7 @@ class Modeller:
         out = {}
         for name, batch in sets.items():
             idx = rows[name]
-            deltas, cids, i, retries = [], [], 0, 0
+            deltas, cids, sgs, i, retries = [], [], [], 0, 0
             while i < idx.numel():
                 chunk = max(1, int(self.eval_draw_size()))
                 try:
@@ -9065,20 +9082,23 @@ class Modeller:
                     continue
                 d = (log_z.reshape(-1) + log_pfs.sum(-1) - log_r.reshape(-1) - log_pbs.sum(-1)).float().flatten().cpu()
                 c = torch.as_tensor(cid).reshape(-1).cpu().long()
+                s = torch.as_tensor(getattr(sub, 'sg_ind', torch.zeros(d.numel()))).reshape(-1).cpu().long()
                 if ok is not None:   # a row with no FD chart point has no state to score
-                    d, c = d[ok], c[ok]
+                    d, c, s = d[ok], c[ok], s[ok]
                 deltas.append(d)
                 cids.append(c)
+                sgs.append(s)
                 i += chunk
             if not deltas:
                 continue
-            d, c = torch.cat(deltas), torch.cat(cids)
+            d, c, s = torch.cat(deltas), torch.cat(cids), torch.cat(sgs)
             fin = torch.isfinite(d)
-            d, c = d[fin], c[fin]
+            d, c, s = d[fin], c[fin], s[fin]
             if d.numel() == 0:
                 continue
             key = keys[name]
             out[key] = float(d.mean())
+            out.update(group_split_means(key, d, s, None, self.args))
             out[f'{key}_std'] = float(d.std()) if d.numel() > 1 else 0.0
             stds = [float(d[c == u].std()) for u in torch.unique(c) if int((c == u).sum()) >= 2]
             if stds:
@@ -9760,6 +9780,16 @@ class Modeller:
 
         sample_is_good = self._reasonable_sample_mask(sample_batch)
         metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
+        # per space group (a run over several): the reasonable fraction and the forward Jensen estimate mean log w
+        # (eval_fwd/jensen_z's definition, utils.quick_tb_stats) over each group's rows
+        sg_rows = getattr(sample_batch, 'sg_ind', None)
+        if sg_rows is not None:
+            metrics.update(group_split_means('Reasonable Sample Fraction', sample_is_good.float(), sg_rows, None,
+                                             self.args))
+            if all(k in fwd_stats for k in ('log_r', 'log_pfs', 'log_pbs')):
+                log_w = (fwd_stats['log_r'].reshape(-1) + fwd_stats['log_pbs'].sum(-1).reshape(-1)
+                         - fwd_stats['log_pfs'].sum(-1).reshape(-1))
+                metrics.update(group_split_means('eval_fwd/jensen_z', log_w, sg_rows, None, self.args))
 
         # ...and the same indicator read PER CONDITION rather than pooled: a
         # batch fraction of 0.5 is a different (much worse) model when half the
@@ -9981,6 +10011,10 @@ class Modeller:
                                     getattr(self.args, 'nonthermal_cond_bar', 0.1),
                                     higher_is_worse=True)
         q = torch.quantile(u, torch.tensor([0.5, 0.9, 0.99], dtype=u.dtype))
+        if sample_batch is not None and getattr(sample_batch, 'sg_ind', None) is not None:
+            sg_seen = torch.as_tensor(sample_batch.sg_ind).detach().reshape(-1).cpu()[seen]
+            metrics.update(group_split_means('Excess Energy Nats P50', u, sg_seen, None, self.args, stat='median'))
+            metrics.update(group_split_means('Excess Energy Nats Mean', u, sg_seen, None, self.args))
         metrics['Excess Energy Nats Mean'] = u.mean().item()
         metrics['Excess Energy Nats P50'] = q[0].item()
         metrics['Excess Energy Nats P90'] = q[1].item()
@@ -10242,7 +10276,7 @@ class Modeller:
                 idx = self._readout_rows[key]
                 ef, T = self.energy_function, float(self.args.energy_config.temperature)
                 fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
-                nll, log_ref = [], []
+                nll, log_ref, row_sg = [], [], []
                 spread_k = FRAME_SPREAD_K if (getattr(policy, 'settings', {}) or {}).get('rotate_frames') else 0
                 framed = ([], [])   # the standard-frame -log q, and [rows, K] -log q in K random frames
                 for i in range(0, idx.numel(), chunk):
@@ -10258,6 +10292,7 @@ class Modeller:
                     sub, _, condition, _ = ef.condition_samples(
                         sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
                     nll.append(-policy.log_density(x, condition, sub).float().flatten().cpu())
+                    row_sg.append(sub.sg_ind.reshape(-1).long().cpu())
                     if spread_k and i < FRAME_SPREAD_ROWS:   # model.nf rotate_frames: the same rows in K frames
                         m = min(int(sub.num_graphs), FRAME_SPREAD_ROWS - i)
                         framed[0].append(nll[-1][:m])
@@ -10278,6 +10313,7 @@ class Modeller:
                 ok = torch.isfinite(nll)
                 if bool(ok.any()):
                     out[key] = float(nll[ok].mean())
+                    out.update(group_split_means(key, nll, torch.cat(row_sg), ok, self.args))
                     out[f'{key}_p90'] = float(torch.quantile(nll[ok].double(), 0.9))
                     ref = nll + log_ref
                     ok_ref = torch.isfinite(ref)

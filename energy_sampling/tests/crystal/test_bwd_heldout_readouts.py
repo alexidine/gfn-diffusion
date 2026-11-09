@@ -10,7 +10,9 @@ rows, a stub energy function and a stub policy. What each test would catch:
   * a non-OOM error swallowed;
   * the test molecules' crystals (eval_test/tb_rows) missing, read on the held-out/train row count, or their gap's
     sign wrong; the test set dropped on a run with no held-out rows;
-  * the within-condition std mixing conditions (it must not see a per-condition log Z offset).
+  * the within-condition std mixing conditions (it must not see a per-condition log Z offset);
+  * on a run over several space groups, a group's sg<g>/ mean taken over another group's rows, or the split shown on a
+    single-group run (train.group_split_means).
 
 CPU, synthetic rows, no energy computed.
 
@@ -39,7 +41,10 @@ class _Rows:
         self.ptr = torch.arange(self.num_graphs + 1)
 
     def subsample_new_batch(self, idx):
-        return _Rows(self.x[idx], self.log_r[idx])
+        out = _Rows(self.x[idx], self.log_r[idx])
+        if hasattr(self, 'sg_ind'):
+            out.sg_ind = self.sg_ind[idx]
+        return out
 
     def to(self, device):
         return self
@@ -173,3 +178,28 @@ def test_std_within_ignores_a_per_condition_offset():
     within = float(torch.tensor([-1.0, 1.0, -1.0, 1.0]).std())
     assert math.isclose(out['eval_test/tb_rows_std_within'], within, abs_tol=1e-5)
     assert out['eval_test/tb_rows_std'] > 4.0
+
+
+def test_group_split_means_is_per_space_group_and_only_on_multi_group_runs():
+    from types import SimpleNamespace
+    from energy_sampling.train import group_split_means
+    v = torch.tensor([1.0, 3.0, 10.0, 20.0, float('nan')])
+    sg = torch.tensor([2, 2, 14, 14, 14])
+    two = SimpleNamespace(space_groups=[2, 14])
+    assert group_split_means('k', v, sg, None, two) == {'sg2/k': 2.0, 'sg14/k': 15.0}
+    assert group_split_means('k', v, sg, torch.tensor([True, False, True, True, True]), two) == {'sg2/k': 1.0,
+                                                                                                'sg14/k': 15.0}
+    assert group_split_means('k', v, sg, None, two, stat='median')['sg14/k'] == 15.0
+    assert group_split_means('k', v, sg, None, SimpleNamespace(space_groups=[2])) == {}
+
+
+def test_tb_readouts_split_by_space_group_on_a_multi_group_run():
+    m = _modeller(n_test=6)
+    m.args.space_groups = [2, 14]
+    for b, sgs in ((m.prior_heldout_batch, [2] * 7), (m.prior_dataset.batch, [2] * 10 + [14] * 10),
+                   (m.test_mol_dataset.batch, [14] * 6)):
+        b.sg_ind = torch.tensor(sgs)
+    out = m.bwd_heldout_readouts(None)
+    assert math.isclose(out['sg2/eval_bwd/tb_heldout_rows'], -2.0, abs_tol=1e-5)
+    assert math.isclose(out['sg14/eval_test/tb_rows'], -3.0, abs_tol=1e-5)
+    assert {k for k in out if k.startswith('sg')} >= {'sg2/eval_bwd/tb_train_rows', 'sg14/eval_bwd/tb_train_rows'}
