@@ -124,9 +124,56 @@ def adjust_fig_filesize(fig_dict):
             pass
 
 
-def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), trace_index=2):
+GROUP_COLOURS = ('#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e', '#17becf', '#8c564b', '#e377c2')
+
+
+def _discrete_scale(n):
+    """A plotly colorscale of n flat bands over [0, 1], one GROUP_COLOURS entry each (cycled), for a field holding the
+    integers 0 .. n - 1."""
+    out = []
+    for i in range(n):
+        c = GROUP_COLOURS[i % len(GROUP_COLOURS)]
+        out += [[i / n, c], [(i + 1) / n, c]]
+    return out
+
+
+def group_dropdown_figure(figs):
+    """One figure holding every figure of `figs` ({label: plotly Figure}, e.g. one per space group), with a dropdown
+    that shows one at a time: each button sets its figure's traces visible and the others hidden, and swaps in its
+    axes, subplot titles and shapes (an axis another figure has and this one lacks is hidden). One figure returns as
+    it is. Any updatemenus of the inputs are dropped."""
+    labels = list(figs)
+    if len(labels) == 1:
+        return figs[labels[0]]
+    out = go.Figure(layout=figs[labels[0]].layout)
+    owner = []
+    for i, lab in enumerate(labels):
+        for tr in figs[lab].data:
+            out.add_trace(tr.update(visible=(i == 0)))
+            owner.append(i)
+    keep = ('annotations', 'shapes', 'title')
+    per = {}
+    for lab in labels:
+        js = figs[lab].layout.to_plotly_json()
+        per[lab] = {k: v for k, v in js.items() if k.startswith(('xaxis', 'yaxis')) or k in keep}
+    axes = set().union(*(k for k in (set(p) for p in per.values())))
+    axes = {k for k in axes if k.startswith(('xaxis', 'yaxis'))}
+    buttons = []
+    for i, lab in enumerate(labels):
+        lay = {k: per[lab].get(k, [] if k != 'title' else {}) for k in keep}
+        lay.update({k: v for k, v in per[lab].items() if k.startswith(('xaxis', 'yaxis'))})
+        lay.update({f'{k}.visible': False for k in axes - set(per[lab])})
+        buttons.append(dict(label=lab, method='update', args=[{'visible': [o == i for o in owner]}, lay]))
+    out.update_layout(updatemenus=[dict(buttons=buttons, direction='down', showactive=True, active=0,
+                                        x=0.0, xanchor='left', y=1.08, yanchor='bottom')])
+    return out
+
+
+def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), trace_index=2, ranges=None, ticks=None):
     # trace_index = index of the scatter you want to recolor
     # (0 = identity line, 1 = fit line, 2 = scatter)
+    # ranges: {field: (cmin, cmax)} in place of the clip percentiles (a categorical field's full span);
+    # ticks: {field: (tickvals, ticktext)} labels its colorbar (a categorical field's names)
 
     # restyle args live in an untyped layout dict, so plotly can't base64 these
     # the way it does trace arrays -- they serialize as literal JSON lists.
@@ -135,6 +182,9 @@ def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), tra
     color_fields = {k: np.round(_np(v, dtype=np.float64), 3) for k, v in color_fields.items()}
     cmins = {k: np.percentile(v, clip[0]) for k, v in color_fields.items()}
     cmaxs = {k: np.percentile(v, clip[1]) for k, v in color_fields.items()}
+    for k, (lo, hi) in (ranges or {}).items():
+        cmins[k], cmaxs[k] = float(lo), float(hi)
+    ticks = ticks or {}
 
     if len(color_fields) == 1:
         # nothing to switch between: colour the trace directly, which both
@@ -163,6 +213,9 @@ def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), tra
                     "marker.cmax": cmaxs[name],
                     "marker.colorscale": (colorscales or {}).get(name, "Viridis"),
                     "marker.colorbar.title": name,
+                    # None restores plotly's own ticks when switching away from a labelled field
+                    "marker.colorbar.tickvals": [list(ticks[name][0])] if name in ticks else None,
+                    "marker.colorbar.ticktext": [list(ticks[name][1])] if name in ticks else None,
                 },
                 [trace_index],  # IMPORTANT
             ],
@@ -238,9 +291,9 @@ def conditional_eval_step(energy_function,
 
 
 def _tb_direction_figs(fig_dict, prefix, log_r, log_pfs, log_pbs, log_flow,
-                       flow_states, cond_inds=None):
+                       flow_states, cond_inds=None, sg_inds=None):
     fig_dict[f'{prefix} TB Parity Plot'], _ = flow_parity_plot(
-        log_r, log_flow, log_pbs, log_pfs, cond_inds=cond_inds)
+        log_r, log_flow, log_pbs, log_pfs, cond_inds=cond_inds, sg_inds=sg_inds)
     # _, fig_dict[f'{prefix} Pf Parity R Value'] = pf_parity_plot(
     #     log_pfs, log_pbs, log_r, log_flow)
 
@@ -291,6 +344,7 @@ def eval_figs(fwd_stats,
             log_flow=fwd_stats['log_Z_learned'],
             flow_states=fwd_stats['flow_states'],
             cond_inds=fwd_stats.get('condition_id'),
+            sg_inds=getattr(sample_batch, 'sg_ind', None),
         )
     with fig_guard('Backward TB diagnostics'):
         _tb_direction_figs(
@@ -301,6 +355,7 @@ def eval_figs(fwd_stats,
             log_flow=bwd_stats['log_Z_learned'],  # constant log Z stands in for per-state flow
             flow_states=bwd_stats['flow_states'],
             cond_inds=bwd_stats.get('condition_id'),
+            sg_inds=bwd_stats.get('sg_ind'),
         )
 
     with fig_guard('Fwd traj params'):
@@ -359,6 +414,7 @@ def eval_figs(fwd_stats,
             ref_sg = torch.as_tensor(fd_groups['ref']).reshape(-1).cpu()
             aux_sg = fd_groups.get('aux')
             ref = torch.as_tensor(prior_latent_params).cpu()
+            per_group = {}
             for g in sorted(set(sgs.tolist())):
                 sel = torch.nonzero(sgs == g).flatten()
                 aux = None
@@ -367,11 +423,12 @@ def eval_figs(fwd_stats,
                     if bool(a_rows.any()):
                         aux = [layout.unpack(g, torch.as_tensor(anchor_latents)[a_rows]).numpy()]
                 sub = sample_batch.subsample_new_batch(sel)
-                fig_dict[f'Lattice Latents Distribution sg{g}'] = sub.plot_batch_cell_params(
+                per_group[f'sg{g}'] = sub.plot_batch_cell_params(
                     space=chart, ref_dist=layout.unpack(g, ref[ref_sg == g]).numpy(), quantiles=[0.1],
                     show=False, return_fig=True, override_energy=scaled_energy[sel],
                     gauge_fix_free_axes=is_crystal_energy(energy_function), aux_dists=aux,
                     samples=layout.unpack(g, rows[sel].cpu()))
+            fig_dict['Lattice Latents Distribution'] = group_dropdown_figure(per_group)
     with fig_guard('Sample Scatter'):
         # subsampled: the funnel is a density scatter and reads the same at 2k
         # points as at the full eval batch, but plotly serializes every marker
@@ -1440,7 +1497,9 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     return fig
 
 
-def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None):
+def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None, sg_inds=None):
+    """sg_inds: [n] space group of each row; when the rows hold more than one group, 'Space group' joins the colour
+    switcher (a categorical scale, one colour per group)."""
     # Compute x and y
     x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
     y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
@@ -1456,10 +1515,19 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None):
     slope, intercept = np.polyfit(x, y, deg=1)
 
     color_fields = {"Reward": log_r}
-    colorscales = {}
+    colorscales, ranges, ticks = {}, {}, {}
     if cond_inds is not None:
         color_fields["Condition"] = cond_inds
         colorscales["Condition"] = "Rainbow"
+    if sg_inds is not None:
+        sg = _np(sg_inds, dtype=np.float64).reshape(-1)
+        groups = np.unique(sg)
+        if len(groups) > 1 and len(sg) == len(x):
+            # a group's index among the run's groups, so the scale's discrete bands fall one per group
+            color_fields["Space group"] = np.searchsorted(groups, sg).astype(np.float64)
+            colorscales["Space group"] = _discrete_scale(len(groups))
+            ranges["Space group"] = (0, len(groups) - 1)
+            ticks["Space group"] = (list(range(len(groups))), [f'sg{int(g)}' for g in groups])
 
     # all summary stats above are computed on the full sample; only the drawn
     # points are thinned, and every color field is thinned by the same index
@@ -1512,7 +1580,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None):
         # height=600,
         template='plotly_white'
     )
-    fig = add_color_switcher(fig, color_fields, colorscales=colorscales)
+    fig = add_color_switcher(fig, color_fields, colorscales=colorscales, ranges=ranges, ticks=ticks)
 
     return fig, r_value
 

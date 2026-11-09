@@ -775,7 +775,9 @@ class Modeller:
         defaults to zero, so the conformer override returns nothing rather than inventing
         a column of NaNs that would then be averaged into a metric.
         """
-        return {'packing_coeff': mol_batch.packing_coeff}
+        return {'packing_coeff': mol_batch.packing_coeff,
+                # the rows' space group: the backward parity plots colour by it on a run over several groups
+                'sg_ind': mol_batch.sg_ind.reshape(-1)}
 
     def log_physical_properties(self, metrics, sample_batch, val, arr):
         """The domain's own physical-plausibility metrics.
