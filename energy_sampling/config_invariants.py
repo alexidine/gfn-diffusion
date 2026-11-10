@@ -1869,6 +1869,14 @@ def replay_seat_problems(stage, coeff, glob) -> list[str]:
     src = coeff('fwd', 'pooled_source')
     src = 'fwd' if src is None else src
     pooled_on = (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0
+    if center == 'fwd_mean' and pooled_on:
+        draw = getattr(stage, 'condition_draw', None) or {}
+        if src != 'replay' or not ((draw.get('replay_rows') or 0) > 0 and (draw.get('prior_rows') or 0) > 0):
+            out.append(f"fwd pooled_center 'fwd_mean' with pooled_source {src!r} and condition_draw {draw or None}. "
+                       f"The level is each group's first-side mean, so every group must hold a first-side row; only "
+                       f"pooled_source 'replay' with a condition_draw of replay_rows > 0 and prior_rows > 0 draws "
+                       f"each condition on both sides. Elsewhere a stored row without a partner would sit out "
+                       f"silently.")
     if src not in POOLED_SOURCES:
         out.append(f"fwd pooled_source={src!r}; must be one of {POOLED_SOURCES}.")
     elif src == 'replay':

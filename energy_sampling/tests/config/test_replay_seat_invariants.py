@@ -168,3 +168,16 @@ def test_set_loss_coeffs_raises_at_step_0_on_a_later_stage():
 def test_set_loss_coeffs_is_silent_on_the_intended_shape_and_the_shipped_route():
     _modeller(_s7_cfg()).set_loss_coeffs()
     _modeller(_mk_dev()).set_loss_coeffs()
+
+
+def test_fwd_mean_needs_the_aligned_draw_on_both_sides():
+    """pooled_center 'fwd_mean' levels each group at its first-side mean, so a group must hold a first-side row: clean
+    under the replay source with the aligned draw, refused under the forward source or with no stored rows drawn."""
+    cfg = _s7_cfg()
+    st = _stage(cfg)
+    assert (st.get('condition_draw') or {}).get('replay_rows', 0) > 0
+    st['loss_coeffs']['fwd']['pooled_center'] = 'fwd_mean'
+    assert _msgs(cfg) == []
+    fwd_src = copy.deepcopy(cfg)
+    _stage(fwd_src)['loss_coeffs']['fwd']['pooled_source'] = 'fwd'
+    assert any("'fwd_mean'" in m for m in _msgs(fwd_src))
