@@ -8,8 +8,9 @@ energy, then the polish to minima with Hessians, merged into a library. Modes:
     seeds   num_samples 0: only the rows of a seeds file are relaxed (they start in the last stage) and polished;
             the MLIP leg of the exp-6 and eLJ arms, and the anchors
 
-Energies: 'elj' (its search kT, as MIPCAS), 'exp6' (FIT + MMFF charges, kJ/mol per molecule), 'uma' (eSEN-S
-esen_s.pt through the uma route, lattice energy in kJ/mol per molecule). kT for the kJ/mol energies is RT at 300 K.
+Energies: 'elj' (its search kT, as MIPCAS), 'exp6' (FIT + MMFF charges, kJ/mol per molecule), 'uma' (UMA-s 1.1,
+uma-s-1p1.pt, through the uma route, lattice energy in kJ/mol per molecule; the owner's reference, 2026-11-10, after
+eSEN-S was found to compress aromatic crystals). kT for the kJ/mol energies is RT at 300 K.
 
 usage:
     python -m eval.exp6_recall.make_configs PANEL_DIR OUT_DIR MODE ENERGY[,ENERGY] [--seeds PATTERN] [--n N]
@@ -25,8 +26,8 @@ import yaml
 KT_KJ = 2.494339  # RT at 300 K, kJ/mol
 KT = {'elj': 6.859493755713105, 'exp6': KT_KJ, 'uma': KT_KJ}
 SITES = {
-    'local': dict(esen='D:/crystal_datasets/esen_s.pt'),
-    'cluster': dict(esen='/scratch/mk8347/models/uma/esen_s.pt'),
+    'local': dict(uma='D:/crystal_datasets/uma-s-1p1.pt'),
+    'cluster': dict(uma='/scratch/mk8347/models/uma/uma-s-1p1.pt'),
 }
 SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96}  # starts in flight; the MLIP holds far fewer rows per call
 # the polish's tolerance (kT); None: MXtalTools' default (1e-4, MLIP_TOL on an MLIP). exp-6's float32 energy repeats to
@@ -59,7 +60,7 @@ def config(name, sg, energy, mode, panel_dir, out_dir, site, n=2000, seeds=None,
                          stop_band_kT=stop_band_kT),  # also the band the conditions file reports (None raises)
              opt=stages(energy))
     if energy == 'uma':
-        c['uma_predictor_path'] = SITES[site]['esen']
+        c['uma_predictor_path'] = SITES[site]['uma']
         c['uma_activation_checkpointing'] = False
     return run, c
 

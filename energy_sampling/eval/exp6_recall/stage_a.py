@@ -1,10 +1,10 @@
 """Stage A of the exp-6 recall test: what each energy does to the experimental anchors.
 
-For each panel molecule with an anchor, and each energy (eLJ, exp-6, eSEN-S), from the anchor-seeded runs in
+For each panel molecule with an anchor, and each energy (eLJ, exp-6, UMA-s 1.1), from the anchor-seeded runs in
 STAGE_DIR (``make_configs`` mode seeds): the energy at the experimental structure and at the polished end, the
 polish status, the symmetry-aware FD distance from the anchor to the end (``basins.SymFD``) and the end's closest
-intermolecular contact. With RERELAX dirs (eSEN-S runs seeded by the exp-6 or eLJ anchor ends), also whether the
-eSEN-S relaxation of the cheap end lands in the eSEN-S basin of the anchor.
+intermolecular contact. With RERELAX dirs (UMA-s 1.1 runs seeded by the exp-6 or eLJ anchor ends), also whether the
+UMA-s relaxation of the cheap end lands in the UMA-s basin of the anchor.
 
 usage: python -m eval.exp6_recall.stage_a PANEL_DIR STAGE_DIR [RERELAX_EXP6_DIR RERELAX_ELJ_DIR]
 """
@@ -17,7 +17,7 @@ import torch
 from eval.exp6_recall.basins import SymFD
 from eval.exp6_recall.make_configs import KT
 
-ENERGIES = ('elj', 'exp6', 'uma')
+ENERGIES = ('elj', 'exp6', 'uma')  # 'uma' = UMA-s 1.1
 UNIT = {'elj': 'eLJ', 'exp6': 'kJ/mol', 'uma': 'kJ/mol'}
 
 
@@ -44,7 +44,7 @@ def load_end(path):
 def main(panel_dir, stage_dir, rerelax=None):
     from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
     torch.cuda.set_per_process_memory_fraction(0.4, 0)
-    pred = init_uma_crystal_predictor('D:/crystal_datasets/esen_s.pt', device='cuda', activation_checkpointing=False,
+    pred = init_uma_crystal_predictor('D:/crystal_datasets/uma-s-1p1.pt', device='cuda', activation_checkpointing=False,
                                       tf32=False)
     panel = json.load(open(os.path.join(panel_dir, 'panel.json')))
     out = {}
@@ -100,9 +100,9 @@ def print_tables(out):
             r = res[e]
             print(f"{name:13s} | {e:6s} | {r['status']:6d} | {r['E_anchor']:10.2f} | {r['E_end']:10.2f} | "
                   f"{r['E_end'] - r['E_anchor']:9.2f} | {res['fd_A']['anchor'][e]:18.3f} | {r['contact_A']:11.2f}")
-    print('\nTable 2. eSEN-S relaxation of each cheap energy\'s anchor end: FD (A) from the eSEN-S anchor end '
-          '(< 0.05 = same basin) and its eSEN-S energy above the anchor end (kJ/mol).')
-    print(f"{'molecule':13s} | {'seed':10s} | {'status':6s} | {'FD to eSEN-S anchor end (A)':>27s} | "
+    print('\nTable 2. UMA-s relaxation of each cheap energy\'s anchor end: FD (A) from the UMA-s anchor end '
+          '(< 0.05 = same basin) and its UMA-s energy above the anchor end (kJ/mol).')
+    print(f"{'molecule':13s} | {'seed':10s} | {'status':6s} | {'FD to UMA-s anchor end (A)':>27s} | "
           f"{'E - E(anchor end)':>17s}")
     for name, res in out.items():
         for tag in ('exp6', 'elj'):

@@ -1,8 +1,8 @@
 # Exp-6 recall test: plan (draft for owner approval, 2026-11-10)
 
-Status: **proposal. Stage A done (2026-11-10). The owner chose eSEN-S as the reference on 2026-11-10; stage A then
-found that eSEN-S compresses aromatic crystals (below), so the reference is back with the owner. Stages B and C are
-not approved.** It runs the test that `contingency_quiver.md` F3 states; its
+Status: **proposal. Reference MLIP: UMA-s 1.1 (owner, 2026-11-10, after stage A found that eSEN-S compresses
+aromatic crystals). Stage A is rerun under UMA-s. One owner decision is open before stage B: the UMA-s gas-phase
+reference is not mirror-invariant (below). Stages B and C are not approved.** It runs the test that `contingency_quiver.md` F3 states; its
 answer feeds F1 (cheap-energy search, then MLIP relaxation of the kept picks) and the cheap-energy windowing of
 noised children. The result note goes to `docs/research/exp6_recall_<date>.md`.
 
@@ -136,3 +136,31 @@ Reading: exp-6 holds four of the seven experimental forms near their own geometr
 naphthalene and acridine are compressed artefacts. eSEN-S's absolute lattice energies are 1.3–3.3× experimental
 sublimation enthalpies, which is likely its isolated-molecule reference; that is constant for a rigid conformer and
 harmless to rankings.
+
+### Under UMA-s 1.1 (2026-11-10, after the owner's choice)
+
+| molecule | UMA-s: FD anchor→end (Å) | ΔE relax (kJ/mol) | polish status |
+|---|---|---|---|
+| imidazole | 0.45 | −0.9 | converged |
+| 2-pyridone | 0.46 | −9.1 | stalled |
+| uracil | 0.91 | −14.2 | converged |
+| benzoic acid | 3.62 | −25.0 | converged (closest H···O 1.28 Å) |
+| acetic acid | 0.49 | +1.8 | converged |
+| naphthalene | 2.38 | −22.2 | converged |
+| acridine | 1.39 | −10.5 | converged |
+
+Caption: UMA-s 1.1 relaxing each experimental structure, after the polar-axis fix (MXtalTools: `StageEnergy.held`
+also holds a polar group's free centre coordinate, and `fgh` zeroes held rows, so minima in P2₁ and Pna2₁ no longer
+stall on Hessian noise). FD is symmetry-aware (Å). Before the fix, exp-6's anchor minimum relaxed under UMA-s into the
+UMA-s anchor basin (FD ≤ 0.06 Å) for all six molecules where exp-6 converged, and eLJ's did not for imidazole and
+benzoic acid. That table was not rerun after the fix.
+
+**Open defect: parity.** UMA-s and eSEN-S are rotation-invariant but not mirror-invariant. Isolated rigid acetic acid
+and its mirror image differ by 7.5 kJ/mol under UMA-s (5.4 under eSEN-S), uracil by 0.6 and 2-pyridone by 0.3, against
+≤ 0.02 kJ/mol over proper rotations; MACE-OFF24 is exactly invariant. The 2026-10-21 owner note on this said to leave
+it alone. It now matters for the polish: the identity description moves the handedness to +1 where the group has an
+improper element. That swaps which enantiomer the asymmetric unit holds, and with it the gas-phase leg of the lattice
+energy, while the periodic energy is unchanged. So one acetic acid crystal scores −157.9 in its own description and
+−150.4 in the identity description, and the acetic acid "relaxation" above ends 1.8 kJ/mol higher than it started.
+The proposed fix: for a rigid search, a gas reference that is a constant per molecule, the mean of the conformer and
+its mirror image. It is the owner's call because of the 2026-10-21 decision.
