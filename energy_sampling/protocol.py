@@ -160,9 +160,10 @@ POOLED_SOURCES = ('fwd', 'replay')
 # (gflownet_losses.pooled_condition_vargrad). 'mean' = the group's own row mean, in the
 # graph (VarGrad); 'head' = the detached Z(c) head; 'head_stored' = the detached
 # 1/2 head + 1/2 mean of the group's stored (bwd) rows; 'mean_detached' = the group's
-# own row mean, detached. The three detached centres make the term per-row TB against
+# own row mean, detached; 'fwd_mean' = the detached mean of the group's first-side (replay
+# or forward) rows alone. The four detached centres make the term per-row TB against
 # that level (and only they take a separate first-side knee, fwd pooled_beta_fwd).
-POOLED_CENTERS = ('mean', 'head', 'head_stored', 'mean_detached')
+POOLED_CENTERS = ('mean', 'head', 'head_stored', 'mean_detached', 'fwd_mean')
 #: the pooled centres that score against the stashed Z(c) head
 HEAD_CENTERS = ('head', 'head_stored')
 # {mode}_loss_coeffs.tb_z_source: the Z a branch's TB term reads (gflownet_losses.py)
@@ -2431,7 +2432,9 @@ class StageProtocol:
             # winsorized-Huber root -- the same estimator every cadenced fill
             # uses, and the one the TB loss actually optimises. Under rarer
             # rollouts that is the right seed: phase 1 leaves the scalar at 0.0,
-            # and the fill is then the only thing that moves it.
+            # and the fill is then the only thing that moves it. A conditional
+            # level head (no scalar) takes the same draw per condition: it feeds
+            # the tracker, then the bare action's regression runs on it.
             if arg.startswith('rollout'):
                 parts = arg.split(':')
                 self.m.bootstrap_z_by_rollout(int(parts[1]) if len(parts) > 1 else None)

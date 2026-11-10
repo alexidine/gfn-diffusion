@@ -7704,18 +7704,15 @@ class Modeller:
             self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False)
         logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
                 - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
-        logw = logw[torch.isfinite(logw)]
-        if logw.numel() < 2:
-            print(f"bootstrap_z_by_rollout: {n} samples produced {logw.numel()} finite "
+        finite = torch.isfinite(logw)
+        if int(finite.sum()) < 2:
+            print(f"bootstrap_z_by_rollout: {n} samples produced {int(finite.sum())} finite "
                   f"log w -- log Z left at its checkpoint value")
             return
-        before = float(self.gfn_model.flow_model.scalar.detach())
-        self._z_fill_P = None            # re-open the filter: take the whole gap
-        self._z_fill_last_step = None    # and bypass any cooldown
-        self.z_level_fill(logw=logw, source='boot', apply=True)
-        after = float(self.gfn_model.flow_model.scalar.detach())
-        print(f"bootstrap_z_by_rollout: log Z {before:.3f} -> {after:.3f} "
-              f"from {logw.numel()} forward samples")
+        if not hasattr(self.gfn_model.flow_model, 'scalar'):
+            self._bootstrap_head_by_rollout(fwd_stats, logw, finite, n)
+        else:
+            self._bootstrap_scalar_by_rollout(logw[finite])
         if self.protocol.flag('buffers_active'):
             # on_policy: the live gfn_model, so log_pf is the training policy's
             # own score. ORIGIN_BOOTSTRAP all the same -- this is a one-off
@@ -7723,6 +7720,30 @@ class Modeller:
             # whose buffer is mostly bootstrap rows is reading one instant.
             self.manage_replay_buffer(fwd_stats, sample_batch, on_policy=True,
                                       origin=ORIGIN_BOOTSTRAP)
+
+    def _bootstrap_head_by_rollout(self, fwd_stats, logw, finite, n):
+        """A conditional level head log Z(c) (no global scalar): the rollout's log w goes to condition_log_z as one
+        forward update, so each condition's ema_logw is its own samples' trimmed mean log w, and bootstrap_log_z fits
+        the head onto those. A condition with fewer than condition_log_z.min_visits rows in the draw stays out of the
+        fit; the head generalises to it from the others."""
+        cid = fwd_stats['condition_id'].detach().flatten().cpu()[finite.cpu()]
+        lw = logw[finite].float().cpu()
+        tracker = self.condition_log_z
+        tracker.update(cid, lw, step=self.step_ind)
+        rows = torch.nonzero((tracker.count >= tracker.min_visits) & ~torch.isnan(tracker.ema_logw)).flatten()
+        target = float(tracker.ema_logw[rows].mean()) if rows.numel() else float('nan')
+        print(f"bootstrap_z_by_rollout: {n} forward samples, {lw.numel()} finite, {cid.unique().numel()} conditions, "
+              f"{rows.numel()} with >= {tracker.min_visits} rows; mean per-condition log w {target:.3f}; fitting the head")
+        self.bootstrap_log_z()
+
+    def _bootstrap_scalar_by_rollout(self, logw):
+        before = float(self.gfn_model.flow_model.scalar.detach())
+        self._z_fill_P = None            # re-open the filter: take the whole gap
+        self._z_fill_last_step = None    # and bypass any cooldown
+        self.z_level_fill(logw=logw, source='boot', apply=True)
+        after = float(self.gfn_model.flow_model.scalar.detach())
+        print(f"bootstrap_z_by_rollout: log Z {before:.3f} -> {after:.3f} "
+              f"from {logw.numel()} forward samples")
 
     def _eval_z_fill(self, fwd_stats):
         """Feed the eval rollout's log w to z_level_fill (z_calibration.fill_from_eval).

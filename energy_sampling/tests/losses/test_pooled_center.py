@@ -104,3 +104,26 @@ def test_mean_detached_is_mean_without_the_coupling():
     past, _ = _coeffs('mean_detached', [-202.0, -2.0], [2.0, 2.0])
     coupled, _ = _coeffs('mean', [-202.0, -2.0], [2.0, 2.0])
     assert not torch.allclose(past, coupled, atol=1e-2), 'past the knee only the in-graph mean couples the rows'
+
+
+def test_fwd_mean_ranks_own_samples_and_pulls_stored_rows_to_their_level():
+    """'fwd_mean': the level is the replay rows' own mean. Replay at -3 and +1 (mean -1) rank about it with
+    coefficients summing to zero; stored rows 80 and 90 nats up are saturated at the knee and pulled up at 40 each."""
+    g, stats = _coeffs('fwd_mean', [-3.0, 1.0], [80.0, 90.0], head=50.0)
+    assert torch.allclose(g[:2], torch.tensor([2.0, -2.0]), atol=1e-5), 'u - L = -2, +2: pure ranking'
+    assert abs(float(g[:2].sum())) < 1e-6, 'no level push on the policy samples'
+    assert torch.allclose(g[2:], torch.full((2,), -BETA), atol=1e-4), 'stored rows pulled up at the knee'
+    assert float(stats['pooled_center_minus_head']) == pytest.approx(-51.0)   # the head plays no part
+
+
+def test_fwd_mean_drops_a_group_with_no_policy_sample():
+    """A condition present only among the stored rows has no level: its rows carry no loss, while a paired group in
+    the same batch still trains."""
+    rep, sto = _group([-3.0, 1.0], [80.0, 90.0], head=0.0, cid=0)
+    _, lone = _group([0.0], [70.0, 75.0], head=0.0, cid=1)
+    sto = {k: torch.cat([sto[k], lone[k]]) if k != 'log_pf' else None for k in sto}
+    sto['log_pf'] = torch.zeros(4, requires_grad=True)
+    rows, _ = pooled_condition_vargrad(rep, sto, beta=BETA, center='fwd_mean')
+    rows.sum().backward()
+    assert torch.allclose(sto['log_pf'].grad[2:], torch.zeros(2)), 'the unpaired group sits out'
+    assert torch.allclose(sto['log_pf'].grad[:2], torch.full((2,), -BETA), atol=1e-4)

@@ -18,7 +18,8 @@ import config_snapshot as cs
 _CENTRES = {'mean': "its condition group's mean log w, in the graph (VarGrad)",
             'head': 'the detached Z(c) head (per-row TB)',
             'head_stored': "½ the detached Z(c) head + ½ the group's stored-row mean (per-row TB)",
-            'mean_detached': "the group's own mean log w, detached (per-row TB)"}
+            'mean_detached': "the group's own mean log w, detached (per-row TB)",
+            'fwd_mean': "the group's first-side (policy-sample) mean log w, detached (per-row TB)"}
 
 
 def _get(node, dotted, default=None):

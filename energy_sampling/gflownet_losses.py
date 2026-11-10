@@ -1622,7 +1622,14 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
                      (bwd) rows; a group with no stored row falls back to head(c)
       'mean_detached'  L(c) = the group's own row mean, detached: 'mean''s level
                      without its zero-sum coupling
-    Same rows, same min_group_count gate and same knee as 'mean', so the four
+      'fwd_mean'     L(c) = the mean u of the group's FIRST-side rows only,
+                     detached. The first side's rows then sum to zero about it
+                     (VarGrad on the policy's own samples: ranking, no level push),
+                     and the stored rows are scored against the policy's own
+                     level, saturated at their knee while far above it. A group
+                     with no first-side row has no level and its rows carry no
+                     loss that step.
+    Same rows, same min_group_count gate and same knee as 'mean', so the five
     differ only in L. 'head' and 'head_stored' need the stashes' `log_z` and raise
     without it.
 
@@ -1800,12 +1807,16 @@ def pooled_condition_vargrad(live_fwd, live_bwd, beta: float = 40.0,
             hmean = torch.zeros(k, device=dev).scatter_add_(0, inv, head) / counts_all.clamp(min=1)
         if center in ('mean', 'mean_detached'):
             level = gmean
+        elif center == 'fwd_mean':
+            level = fmean
         elif center == 'head':
             level = hmean
         else:
             level = torch.where(nb > 0, 0.5 * hmean + 0.5 * bmean, hmean)
 
     live_m = (counts_all >= min_group_count).float()[inv]
+    if center == 'fwd_mean':   # a group with no first-side row has no level: its rows sit out this step
+        live_m = live_m * (nf > 0).float()[inv]
     # each row's knee: beta, or beta_fwd on the first side's rows
     knee = torch.full_like(u, float(beta))
     if beta_fwd is not None:
