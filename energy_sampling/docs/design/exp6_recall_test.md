@@ -1,6 +1,8 @@
 # Exp-6 recall test: plan (draft for owner approval, 2026-11-10)
 
-Status: **proposal, not approved, nothing run.** It runs the test that `contingency_quiver.md` F3 states; its
+Status: **proposal. Stage A done (2026-11-10). The owner chose eSEN-S as the reference on 2026-11-10; stage A then
+found that eSEN-S compresses aromatic crystals (below), so the reference is back with the owner. Stages B and C are
+not approved.** It runs the test that `contingency_quiver.md` F3 states; its
 answer feeds F1 (cheap-energy search, then MLIP relaxation of the kept picks) and the cheap-energy windowing of
 noised children. The result note goes to `docs/research/exp6_recall_<date>.md`.
 
@@ -89,3 +91,48 @@ Totals for B and C (estimated; MLIP rates measured on acridine at batch 96, so s
 
 **Not in scope:** flexible molecules, Z′ > 1, more than one space group per molecule (P-1 for all eight is the
 natural extension), any training.
+
+## Stage A observations (2026-11-10, local GPU at 40%)
+
+Code: `eval/exp6_recall/` (`panel.py`, `make_configs.py`, `run_capped.py`, `basins.py`, `stage_a.py`). Data:
+`D:/crystal_datasets/exp6_recall_nov10/` (`panel/`, `stageA_anchors/stage_a.json`). Anchor changes from the panel
+table: BENZAC12 (BENZAC04 has no coordinates) and ACRDIN04 (ACRDIN11 has R = 20.6%). All seven anchors convert to
+Z' = 1 in the searched group with residual ≤ 0.001 Å.
+
+Two defects found and fixed on the way. First, the MLIP polish let a monoclinic cell's α and γ drift, so every eSEN-S
+minimum in P2₁/c failed the cell-box check: MXtalTools `minima.py::StageEnergy.held`, see the
+[crystal-search-method](../wiki/crystal-search-method.md) wiki page. Second, exp-6's float32 energy repeats only to
+5.5×10⁻⁵ kT, so its polish stalled at the default tolerance of 10⁻⁴ kT; these configs set 10⁻³ kT.
+
+| molecule | eLJ: FD anchor→end (Å) | exp-6: FD (Å) / ΔE (kJ/mol) | eSEN-S: FD (Å) / ΔE (kJ/mol) |
+|---|---|---|---|
+| imidazole | 1.86 | 0.32 / −3.8 | 0.28 / −0.8 |
+| 2-pyridone | 3.25 | 3.28 / −2.6 | 0.84 / −15.9 |
+| uracil | 1.22 | 1.12 / −8.2 | 0.48 / −15.9 |
+| benzoic acid | 2.78 | 0.77 / −7.6 | 0.64 / −31.5 |
+| acetic acid | 1.65 | 0.99 / −3.8 | 0.39 / −19.9 |
+| naphthalene | 1.08 | 0.37 / −0.9 | 2.25 / −85.5 (stalled) |
+| acridine | 1.39 | 0.25 / −1.6 (stalled) | 1.54 / −48.8 |
+
+Caption: each energy relaxing the experimental structure. Rigid conformer, H normalised, one relaxation per cell. FD
+is the symmetry-aware identity distance from the anchor to the polished end; 0.05 Å means the same structure. ΔE is
+the end's energy minus the anchor's, per molecule. Compare the columns: how far each energy pulls the experimental
+form.
+
+| molecule | cell scale | eSEN-S, our route | eSEN-S, stock fairchem | UMA-s 1.1, stock fairchem |
+|---|---|---|---|---|
+| naphthalene | 0.97 / 0.94 / 0.91 | −21.4 / −38.1 / −40.9 | −21.4 / −38.1 / −40.9 | −7.3 / +29.1 / +98.6 |
+| acridine | 0.97 / 0.94 / 0.91 | −22.2 / −35.6 / −16.9 | −22.2 / −35.6 / −16.9 | −6.5 / +18.0 / +104.9 |
+| imidazole | 0.97 / 0.94 / 0.91 | +12.5 / +25.6 / +64.2 | +12.5 / +25.6 / +64.2 | +9.8 / +26.0 / +63.5 |
+
+Caption: periodic energy per molecule (kJ/mol) relative to the experimental cell, with the cell lengths scaled
+uniformly at fixed fractional centres and orientations. "Stock" is fairchem's `FAIRChemCalculator` (task `omc`) on
+the same unit-cell atoms. Compare eSEN-S with UMA-s 1.1: eSEN-S's energy keeps falling down to about 25% volume
+compression for the two aromatics, not for imidazole. Our route matches stock to 0.01 kJ/mol, so this is the
+checkpoint's behaviour, not our code's.
+
+Reading: exp-6 holds four of the seven experimental forms near their own geometry (FD ≤ 0.4 Å). It loses 2-pyridone
+(3.3 Å) and moves uracil and acetic acid about 1 Å. eLJ moves every one by more than 1 Å. eSEN-S's minima for
+naphthalene and acridine are compressed artefacts. eSEN-S's absolute lattice energies are 1.3–3.3× experimental
+sublimation enthalpies, which is likely its isolated-molecule reference; that is constant for a rigid conformer and
+harmless to rankings.
