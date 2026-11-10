@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=192G
 #SBATCH --cpus-per-task=8
@@ -20,7 +20,8 @@
 # eLJ scale 0.36358, the MIPCAS and norbornane priors' (the search kT 6.86 raw eLJ x 0.36358 = 2.49 kJ/mol ~ T 2.5).
 # K is required at submit:  K=4 sbatch configs/pool8_prior_nov09/build_pool8_prior.sbatch
 # A step whose output exists is skipped, so resubmitting finishes what is left.
-# Local check (task 0, CPU, 2026-11-09): 660 anchors -> 3,300 rows at K 4 in 49 s, 1.1 KB per row on disk.
+# Local check (task 0, 2026-11-09): 1.1 KB per row on disk; load 2.5 ms per anchor (one CPU core), child scoring
+# ~0.8 ms per row on a shared GPU, builder peak RAM ~3.2 GB + ~1.8 KB per row: K 4 ~5 h, K 10 ~8 h projected.
 module purge
 
 K=${K:?set K, children per anchor: K=4 sbatch ...}
