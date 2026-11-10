@@ -21,8 +21,12 @@ ENERGIES = ('elj', 'exp6', 'uma')  # 'uma' = UMA-s 1.1
 UNIT = {'elj': 'eLJ', 'exp6': 'kJ/mol', 'uma': 'kJ/mol'}
 
 
-def energy_at(row, key, predictor=None):
+def energy_at(row, key, predictor=None, cfg_path=None):
     from mxtaltools.crystal_search.minima import StageEnergy
+    if cfg_path is not None:  # the run's own energy definition (uma: its mirror-parity keys)
+        from mxtaltools.crystal_search.run_search import attach_mlip_parity, dict2namespace, load_yaml
+        row = row.clone()
+        attach_mlip_parity(dict2namespace(load_yaml(cfg_path)), [row], 'cuda')
     E = StageEnergy([row], key, KT[key], predictor=predictor, device='cuda', chunk=4, lj_envelope=1.0)
     x = row.full_cell_parameters().double()
     return float(E.f(x, [0])[0]) * KT[key]
@@ -60,7 +64,8 @@ def main(panel_dir, stage_dir, rerelax=None):
             if r is None:
                 continue
             ends[e] = r
-            res[e] = dict(status=int(r.polish_status), E_anchor=energy_at(a, e, pred if e == 'uma' else None),
+            res[e] = dict(status=int(r.polish_status), E_anchor=energy_at(a, e, pred if e == 'uma' else None,
+                                                                os.path.join(stage_dir, f'{name}_{e}_seeds.yaml') if e == 'uma' else None),
                           E_end=float(r.minimum_f) * KT[e], contact_A=contact(r))
         for tag, d in (rerelax or {}).items():
             r = load_end(os.path.join(d, f'{name}_uma_seeds.pt'))

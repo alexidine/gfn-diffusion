@@ -33,6 +33,9 @@ SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96}  # starts in flight; the MLIP holds
 # the polish's tolerance (kT); None: MXtalTools' default (1e-4, MLIP_TOL on an MLIP). exp-6's float32 energy repeats to
 # 5.5e-5 kT (imidazole, 2026-11-10), so at 1e-4 its polish stalled short of the test
 POLISH_TOL = {'elj': None, 'exp6': 1e-3, 'uma': None}
+# the 65 Sohncke space groups (no improper element): a crystal and its mirror image are different crystals
+SOHNCKE = {1, 3, 4, 5, *range(16, 25), *range(75, 81), *range(89, 99), *range(143, 147), *range(149, 156),
+           *range(168, 174), *range(177, 183), *range(195, 200), *range(207, 215)}
 
 
 def stages(energy):
@@ -62,6 +65,11 @@ def config(name, sg, energy, mode, panel_dir, out_dir, site, n=2000, seeds=None,
     if energy == 'uma':
         c['uma_predictor_path'] = SITES[site]['uma']
         c['uma_activation_checkpointing'] = False
+        # UMA-s is not reflection-equivariant (owner, 2026-11-10): a mirror-mean gas reference everywhere, and the
+        # periodic energy averaged over the crystal and its mirror image in chiral (Sohncke) groups only, where the
+        # two are different crystals; in a group with an improper element the crystal is its own mirror image
+        c['mlip_gas_reference'] = 'mirror_mean'
+        c['mlip_mirror_average'] = int(sg) in SOHNCKE
     return run, c
 
 

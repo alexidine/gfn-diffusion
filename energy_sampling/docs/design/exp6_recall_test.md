@@ -1,8 +1,8 @@
 # Exp-6 recall test: plan (draft for owner approval, 2026-11-10)
 
 Status: **proposal. Reference MLIP: UMA-s 1.1 (owner, 2026-11-10, after stage A found that eSEN-S compresses
-aromatic crystals). Stage A is rerun under UMA-s. One owner decision is open before stage B: the UMA-s gas-phase
-reference is not mirror-invariant (below). Stages B and C are not approved.** It runs the test that `contingency_quiver.md` F3 states; its
+aromatic crystals), with the parity corrections below (owner, 2026-11-10). Stage A is done under them. Stages B and C
+are not approved.** It runs the test that `contingency_quiver.md` F3 states; its
 answer feeds F1 (cheap-energy search, then MLIP relaxation of the kept picks) and the cheap-energy windowing of
 noised children. The result note goes to `docs/research/exp6_recall_<date>.md`.
 
@@ -155,12 +155,29 @@ stall on Hessian noise). FD is symmetry-aware (Å). Before the fix, exp-6's anch
 UMA-s anchor basin (FD ≤ 0.06 Å) for all six molecules where exp-6 converged, and eLJ's did not for imidazole and
 benzoic acid. That table was not rerun after the fix.
 
-**Open defect: parity.** UMA-s and eSEN-S are rotation-invariant but not mirror-invariant. Isolated rigid acetic acid
-and its mirror image differ by 7.5 kJ/mol under UMA-s (5.4 under eSEN-S), uracil by 0.6 and 2-pyridone by 0.3, against
-≤ 0.02 kJ/mol over proper rotations; MACE-OFF24 is exactly invariant. The 2026-10-21 owner note on this said to leave
-it alone. It now matters for the polish: the identity description moves the handedness to +1 where the group has an
-improper element. That swaps which enantiomer the asymmetric unit holds, and with it the gas-phase leg of the lattice
-energy, while the periodic energy is unchanged. So one acetic acid crystal scores −157.9 in its own description and
-−150.4 in the identity description, and the acetic acid "relaxation" above ends 1.8 kJ/mol higher than it started.
-The proposed fix: for a rigid search, a gas reference that is a constant per molecule, the mean of the conformer and
-its mirror image. It is the owner's call because of the 2026-10-21 decision.
+**Parity (resolved for this test, owner 2026-11-10).** UMA-s and eSEN-S are rotation- but not
+reflection-equivariant: isolated rigid acetic acid and its mirror image differ by 7.5 kJ/mol under UMA-s, and a
+2-pyridone P2₁2₁2₁ crystal and its mirror image by 3.9 kJ/mol per molecule. MXtalTools search keys (97061eb7):
+`mlip_gas_reference: mirror_mean` on every UMA-s run, a constant mirror-mean isolated-molecule reference, so a
+crystal's energy no longer depends on the description; `mlip_mirror_average: true` in the two chiral groups (P2₁,
+P2₁2₁2₁), which averages the periodic energy over the crystal and its mirror image at 2× cost for those molecules.
+In groups with an improper element no averaging is needed: the crystal is its own mirror image, so the part of the
+error that changes sign under a mirror vanishes exactly. The part that doesn't is invisible to this check.
+
+| molecule | UMA-s: FD anchor→end (Å) | ΔE relax (kJ/mol) | exp-6 end → UMA-s: FD (Å) / ΔE (kJ/mol) | eLJ end → UMA-s: FD (Å) / ΔE (kJ/mol) |
+|---|---|---|---|---|
+| imidazole | 0.45 | −0.9 | 0.024 / 0.00 | 0.546 / +0.28 |
+| 2-pyridone | 0.85 | −8.5 | 0.057 / 0.00 | 0.127 / 0.00 |
+| uracil | 0.91 | −14.2 | 0.022 / 0.00 | 0.017 / 0.00 |
+| benzoic acid | 3.65 | −25.0 | 0.020 / 0.00 | 7.710 / +1.32 |
+| acetic acid | 0.49 | −5.7 | 0.014 / +0.01 | 0.015 / 0.00 |
+| naphthalene | 2.37 | −22.2 | 0.024 / 0.00 | 0.036 / 0.00 |
+| acridine | 1.41 | −10.5 | 0.026 / 0.00 (from exp-6's stalled end) | 0.049 / 0.00 |
+
+Caption: UMA-s 1.1 with both parity keys and both polish fixes. Second column: UMA-s relaxing the experimental
+structure (all seven converged). Last two columns: UMA-s relaxing the minimum that exp-6 or eLJ reached from the
+experimental structure, as FD (Å) and energy relative to UMA-s's own minimum from the experimental structure; under
+0.05 Å is the same basin. One relaxation per cell. Reading: from the experimental structure, exp-6 always hands UMA-s
+a start in UMA-s's experimental basin; eLJ fails for imidazole and benzoic acid. This is the F1 question at one start
+per molecule, not the test. Open on UMA-s itself: benzoic acid (3.65 Å, closest H···O 1.28 Å) and naphthalene
+(2.37 Å) move far from experiment under the rigid-molecule UMA-s surface.
