@@ -7,12 +7,13 @@ conditioning (atom tokens), prefix FD rows, the prior's training children inside
 LR schedule, MLE ONLY (no exit, STEPS steps, then stop). Readouts: eval_test/mle and eval_test/mle_gap (held-out
 molecules, against the training anchors), eval_bwd/mle_heldout_gap (held-out crystals of training molecules).
 
-Files (DATA, built on the cluster):
-  PRIOR       the training prior (build_noised_prior.py; its children train, its anchors are the training anchors)
+Files (DATA), all built on the cluster by configs/pool8_prior_nov09/build_pool8_prior.sbatch:
+  PRIOR       pool8_p1_train_k<K>_metric.pt (build_noised_prior.py; its children train, its anchors are the
+              training anchors)
   CONDITIONS  data_processing/molecule_split_files.py conditions PRIOR CONDITIONS
-  TEST        data_processing/molecule_split_files.py heldout <held-out anchors file> <stem> 5 --per_molecule 8
-              --max_molecules 500
-PRIOR is None until the prior is built; make.py then refuses to write the sbatch.
+  TEST        data_processing/molecule_split_files.py heldout pool8_p1_heldout_anchors.pt pool8_p1_test 5
+              --per_molecule 8 --max_molecules 500
+K is None until the owner sets it; make.py then refuses to write the sbatch.
 
 usage: python configs/pool8_mle_nov10/make.py            (writes <arm>.yaml and submit_pool8_mle_nov10.sbatch here)
        python configs/pool8_mle_nov10/make.py --local DIR (every arm on the local norbornane files, into DIR: a
@@ -27,9 +28,15 @@ ROOT = '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling'
 DATA = '/scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors'
 TAG = 'pool8_mle_nov10'
 STEPS = 50000
-PER_GPU = 4
-# the files every arm reads; -1 = built on the cluster, the sbatch checks it exists and is not empty
-PRIOR = None          # e.g. 'pool8_p1_train_k4_metric.pt' -- set when the prior is built
+# the prior's children per minimum (configs/pool8_prior_nov09/build_pool8_prior.sbatch); None until the owner sets it
+K = None
+# arms per A100 job. Peak trainer RAM measured locally (2026-11-09, norbornane P-1 priors of 0.79 and 2.33 GB): about
+# 2.9 GB + 2.0 x the prior file. pool8 files are ~1.1 KB per row, 2.32M minima x (K + 1) rows: K 4 -> ~28 GB per arm
+# (4 per 192 GB node), K 10 -> ~58 GB (2 per node).
+PER_GPU = None if K is None else (4 if K <= 4 else 2)
+# the files every arm reads, all built on the cluster by build_pool8_prior.sbatch (-1: the sbatch checks each exists
+# and is not empty)
+PRIOR = None if K is None else f'pool8_p1_train_k{K}_metric.pt'
 CONDITIONS = 'pool8_p1_train_conditions.pt'
 TEST = 'pool8_p1_test_w5.pt'
 LOCAL = {'prior': 'D:/crystal_datasets/conditional/norbornane_nov04/priors/norbornane_p1_train_k100_metric.pt',
@@ -105,9 +112,10 @@ def arm_config(arm, files):
     return cfg
 
 
-def groups():
+def groups(per=None):
+    per = per or PER_GPU or 4
     names = list(ARMS)
-    out = [names[i:i + PER_GPU] for i in range(0, len(names), PER_GPU)]
+    out = [names[i:i + per] for i in range(0, len(names), per)]
     for g in out:
         share = sum(ARMS[a][0].get('cuda_memory_fraction', BASE['cuda_memory_fraction']) for a in g)
         assert share <= 1.0 + 1e-9, f'group {g}: cuda_memory_fraction sums to {share:.2f} > 1'
@@ -139,8 +147,8 @@ if __name__ == '__main__':
             (out / f'{arm}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
         print(f'{len(ARMS)} local arms in {out}')
     else:
-        if PRIOR is None:
-            raise SystemExit('PRIOR is None: set it to the training prior file name (in DATA) once the prior is built')
+        if K is None:
+            raise SystemExit('K is None: set it to the children per minimum of the prior once the owner chooses it')
         files = {'prior': f'{DATA}/{PRIOR}', 'conditions': f'{DATA}/{CONDITIONS}', 'test': f'{DATA}/{TEST}'}
         for arm in ARMS:
             (HERE / f'{arm}.yaml').write_text(yaml.safe_dump(arm_config(arm, files), sort_keys=False),
