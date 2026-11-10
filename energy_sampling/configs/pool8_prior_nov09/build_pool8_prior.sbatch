@@ -56,7 +56,9 @@ srun singularity exec --nv \
     /bin/bash -c "
         set -e
         source /ext3/env.sh
-        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:${WORKDIR}:\$PYTHONPATH
+        # not ${WORKDIR}: the data_processing scripts put it first themselves only when it is absent; on PYTHONPATH it
+        # sits behind the script's folder and data_processing/utils.py shadows energy_sampling/utils.py
+        export PYTHONPATH=${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
         B='python -u data_processing/build_noised_prior.py --config configs/mk_dev.yaml
            --set energy_config.crystal_coordinates=fd --thermal_scaling_factor ${TSF} --device cuda'
