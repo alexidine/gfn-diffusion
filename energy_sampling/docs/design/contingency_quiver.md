@@ -220,6 +220,34 @@ From discussion between the hub and the owner on 2026-11-08 and 2026-11-09. Anal
   corrected-ellipsoid test proposed by the search session.
 - *Termination:* cap the flag-and-rebuild loop at a fixed number of rounds.
 
+## F. Added 2026-11-10: spending an MLIP budget
+
+From discussion between the hub and the owner on 2026-11-10. Nothing here is built or run. Pool8 measured: P-1 eLJ
+search ~1,000 core-h (72,464 molecules × 100 starts); K = 4 build ~8M scored rows.
+
+**F1. Cheap-energy search, MLIP re-relax of the banded picks only.**
+- *Idea:* search and band with a cheap energy; relax only the kept picks (32 per molecule in pool8) with the MLIP.
+- *Owner caveat (2026-11-10):* only as good as the cheap energy's recall. eLJ is systematically wrong and misses
+  real configurations; exp-6 at least has a hope.
+- *Test it needs:* on a few molecules, the fraction of an MLIP-only search's low-energy minima that the cheap route
+  recovers after re-relaxing. Day's MACE-reoptimised landscapes were reached from FIT starts, so they can show how
+  the ranking shifts but not what the cheap energy missed.
+- *Same caveat for the children:* windowing the noised children by a cheap energy is the same bet, though a wrong
+  window costs less than a missed basin.
+
+**F2. Unconditional prior per space group, conditional sharpening by MLIP in phase 2.**
+- *Idea (owner, 2026-11-10, "an idea we should pursue"):* build a cheap unconditional prior per space group, warm
+  start on it, and spend every MLIP call in phase 2, where the sampler's own draws choose the queries.
+- *What it needs first:*
+  - practice converging from an unconditional prior (the λ-annealing route in `lambda-annealing.md`);
+  - a protocol written in the frame of E1: the query policy, the learner and the store as separate parts.
+- *Known blockers in the current stage 2:*
+  - fresh draws train only the level (E1 gaps);
+  - basins a molecule's draws never reach need queries not drawn from q (E1 symptom table);
+  - there is no rule for allocating calls across molecules (E1, D5).
+- *Practice bed:* norbornane, whose P-1 and P2_1/c searches give the reference landscape, with eLJ standing in for
+  the MLIP before any MLIP call is spent.
+
 ## Sources
 
 Review lane reports from 2026-11-02 (hub scratchpad `review/`): `zc/zc_map.md`, `ar/critic_conditioner.md`,
