@@ -29,7 +29,7 @@ DATA = '/scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors'
 TAG = 'pool8_mle_nov10'
 STEPS = 50000
 # the prior's children per minimum (configs/pool8_prior_nov09/build_pool8_prior.sbatch); None until the owner sets it
-K = None
+K = 4
 # arms per A100 job. Peak trainer RAM measured locally (2026-11-09, norbornane P-1 priors of 0.79 and 2.33 GB): about
 # 2.9 GB + 2.0 x the prior file. pool8 files are ~1.1 KB per row, 2.32M minima x (K + 1) rows: K 4 -> ~28 GB per arm
 # (4 per 192 GB node), K 10 -> ~58 GB (2 per node).
