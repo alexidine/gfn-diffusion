@@ -150,7 +150,7 @@ def score(ef, batch, T, device, chunk):
         idx = torch.arange(lo, min(lo + chunk, batch.num_graphs))
         c = batch.subsample_new_batch(idx)
         if fd:
-            ok, state, _ = NP.fd_chart_points(ef, c)
+            ok, state, _ = NP.fd_chart_points(ef, c, device=device)   # canonicalised on the scoring device
             kept[idx[~ok]] = False
             if not bool(ok.any()):
                 continue

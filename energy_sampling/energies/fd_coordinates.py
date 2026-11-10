@@ -28,6 +28,7 @@ canonicalise (status other than ``OK_STATUS``), or whose canonical cell lies out
 in ``ok`` and its s is NaN.
 """
 import math
+from dataclasses import replace
 from typing import NamedTuple
 
 import torch
@@ -139,15 +140,20 @@ class FDCoordinates:
         L, A, t, rv, h = desc.crystal_params()
         return torch.cat([L, A, t, rv], 1).float(), h.reshape(-1).float(), log_ref
 
-    def from_params(self, params: torch.Tensor, handedness: torch.Tensor) -> FDRows:
-        """s of stored rows ([B, 12] cell parameters, [B] handedness): canonicalised first (module docstring)."""
+    def from_params(self, params: torch.Tensor, handedness: torch.Tensor, device=None) -> FDRows:
+        """s of stored rows ([B, 12] cell parameters, [B] handedness): canonicalised first (module docstring).
+        `device`: where the canonicalisation runs (its triclinic reduction tries 3,480 bases per lattice in float64,
+        the bulk of the cost; None = the CPU). The chart map after it, and the result, are on the CPU."""
+        dev = torch.device('cpu') if device is None else torch.device(device)
         params = torch.as_tensor(params)
         B = params.shape[0]
         self._check_rows(B)
-        p = params.to(F64)
+        p = params.to(dev, F64)
         desc = CrystalDescription.from_crystal_params(self.sg, p[:, :3], p[:, 3:6], p[:, 6:9], p[:, 9:12],
-                                                      torch.as_tensor(handedness).to(F64).reshape(-1, 1))
+                                                      torch.as_tensor(handedness).to(dev, F64).reshape(-1, 1))
         c = canon.canonicalize(desc)
+        if dev.type != 'cpu':
+            c = replace(c, desc=c.desc.to('cpu'), status=c.status.cpu())
         status = c.names()
         good = torch.tensor([st in OK_STATUS for st in status], dtype=torch.bool)
         s = torch.full((B, self.dim), float('nan'), dtype=F64)

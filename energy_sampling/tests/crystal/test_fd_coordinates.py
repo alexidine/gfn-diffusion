@@ -158,3 +158,16 @@ def test_a_chart_with_a_radius_per_row_equals_a_chart_per_radius(sg):
         assert torch.equal(back.s[i:i + 1], one.s)
     with pytest.raises(ValueError, match='per-row length boxes'):
         per_row.to_params(s[:3])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
+@pytest.mark.parametrize('sg', GROUPS)
+def test_canonicalising_on_the_gpu_matches_the_cpu(sg):
+    """from_params(device=...) runs only the canonicalisation there: rows, statuses and chart points equal the CPU's,
+    on the CPU."""
+    fc = FDCoordinates(sg, RADIUS)
+    p, h, _ = fc.to_params(_s(fc, 256, sg + 100))
+    cpu, gpu = fc.from_params(p, h), fc.from_params(p, h, device='cuda')
+    assert gpu.s.device.type == 'cpu' and gpu.ok.device.type == 'cpu'
+    assert torch.equal(cpu.ok, gpu.ok) and cpu.status == gpu.status
+    assert float((cpu.s[cpu.ok] - gpu.s[gpu.ok]).abs().max()) < 1e-10

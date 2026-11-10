@@ -4533,8 +4533,9 @@ class Modeller:
     def _fd_chart_points(self, batch):
         """crystal_coordinates 'fd': ([n] bool has a chart point, [n, data_ndim] chart rows s, zero where none, [n] log
         reference density on s, zero where none) of the crystals of a stored batch, canonicalised through the chart of
-        each row's (space group, molecule radius): noised_prior.fd_chart_points, shared with the prior builder."""
-        return noised_prior.fd_chart_points(self.energy_function, batch)
+        each row's (space group, molecule radius): noised_prior.fd_chart_points, shared with the prior builder, its
+        canonicalisation on the run's device."""
+        return noised_prior.fd_chart_points(self.energy_function, batch, device=self.device)
 
     def _fd_chart_points_cached(self, batch, prior_path):
         """_fd_chart_points of a whole pre-noised prior file's batch, through the sidecar cache beside `prior_path`

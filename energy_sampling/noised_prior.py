@@ -205,12 +205,14 @@ def radius_of_gyration(batch):
     return torch.sqrt(torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, d2) / cnt)
 
 
-def fd_chart_points(ef, batch):
+def fd_chart_points(ef, batch, device=None):
     """([n] bool has a chart point, [n, data_ndim] chart rows s packed in the run's FD slot layout, zero where none,
     [n] log reference density on s, zero where none) of the crystals of `batch` (any description of each), through
     the FD chart of each row's (space group, molecule radius) on the energy function `ef` (crystal_coordinates 'fd').
     A row has no point when it does not canonicalise or its canonical cell is outside the chart's length box. Shared
-    by the trainer (train.py::Modeller._fd_chart_points) and the builder (data_processing/build_noised_prior.py)."""
+    by the trainer (train.py::Modeller._fd_chart_points) and the builder (data_processing/build_noised_prior.py).
+    `device`: where the canonicalisation runs (its triclinic reduction tries 3,480 bases per lattice in float64, the
+    bulk of the cost; None = the CPU); the results are on the CPU either way."""
     params = batch.full_cell_parameters().detach().cpu()
     hand = batch.aunit_handedness.reshape(-1).detach().cpu()
     sg = batch.sg_ind.reshape(-1).cpu()
@@ -226,7 +228,7 @@ def fd_chart_points(ef, batch):
             if rows.numel() == 0:
                 continue
             fc = ef.fd_coordinates_rows(int(g), radius[rows])
-            r = fc.from_params(params[rows], hand[rows])
+            r = fc.from_params(params[rows], hand[rows], device=device)
             good = rows[r.ok]
             ok[good] = True
             state[good] = ef.fd_layout.pack(int(g), r.s[r.ok].float())
