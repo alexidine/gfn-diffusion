@@ -247,6 +247,30 @@ search ~1,000 core-h (72,464 molecules × 100 starts); K = 4 build ~8M scored ro
   - there is no rule for allocating calls across molecules (E1, D5).
 - *Practice bed:* norbornane, whose P-1 and P2_1/c searches give the reference landscape, with eLJ standing in for
   the MLIP before any MLIP call is spent.
+- *Acquisition loop (owner, 2026-11-10):* design the acquisition function, generate candidates, score them, select,
+  then spend the energy calls. Steps 1 and 2 are the hard ones, and the candidate set crosses molecules and space
+  groups, so it can only be subsampled.
+- *Owner caveats on a cheap scorer (2026-11-10):*
+  - on-policy candidates are biased against the regions that most need supersampling;
+  - an FD-metric novelty works within one condition only, because there is no distance between conditions short of
+    a conditioner embedding, which moves unless pretrained;
+  - an under-weighting estimate needs energies, or a proxy such as exp-6 if exp-6 proves reliable.
+- *Ways around them (hub, untested):*
+  - draw candidates from a mixture of q and the space-group prior; both densities are known, so every candidate's
+    proposal density is too;
+  - allocate across conditions by a per-condition statistic and use FD novelty only within a condition, so no
+    cross-condition distance is needed;
+  - follow the GFlowNet exploration literature: adaptive teachers trained on the student's loss, ensemble and
+    Thompson-sampling heads, and multi-fidelity acquisition with a cheap energy.
+
+**F3. The exp-6 question, stated as a test (owner, 2026-11-10).**
+- *Question:* does coarse exp-6 sampling followed by MLIP relaxation recover every MLIP basin of a real system?
+  Equivalently, does a Buckingham-type field with charges systematically exclude a physical motif that the MLIP
+  captures: dense packing, directional hydrogen bonding, π-stacking?
+- *Reference needed:* an MLIP-only search on a small panel chosen by motif, with experimental structures as
+  anchors. The FD identity cut decides basin matches.
+- *Readouts:* MLIP-basin recall of the exp-6-seeded set within an energy window; how many exp-6 picks funnel into
+  each MLIP basin.
 
 ## Sources
 
