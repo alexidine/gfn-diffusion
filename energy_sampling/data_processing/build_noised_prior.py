@@ -165,7 +165,14 @@ def score(ef, batch, T, device, chunk):
             _, c = ef.batched_analyze_crystal_batch(
                 x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
                 return_batch=True, internal_oom_recovery=True)
-        out.append(c.cpu())
+        c = c.cpu()
+        # its own bookkeeping dicts: the analysis returns a batch whose _slice_dict / _inc_dict objects a later
+        # analysis call writes into, so an earlier result's atom pointers went stale (a K 0 build's anchors, after the
+        # pilot scored its kicks; 2026-11-11, pool8 held-out anchors)
+        for d in ('_slice_dict', '_inc_dict'):
+            if d in c.__dict__:
+                c.__dict__[d] = dict(c.__dict__[d])
+        out.append(c)
         del c
         if str(device).startswith('cuda'):
             torch.cuda.empty_cache()

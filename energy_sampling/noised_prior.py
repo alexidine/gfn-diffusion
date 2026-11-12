@@ -558,6 +558,20 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
 
 
+def refuse_stale_atom_pointers(b, path):
+    """Raise unless every atom-level value's batch bookkeeping (_slice_dict entry) equals ptr. A K 0 build written
+    before build_noised_prior.score kept its own bookkeeping (2026-11-11) carries another batch's atom pointers, and
+    subsample_new_batch then gathers atoms from the wrong rows."""
+    sd = b.__dict__.get('_slice_dict', {})
+    n_nodes = int(b.ptr[-1])
+    bad = [k for k, v in sd.items() if torch.is_tensor(v) and k in b.keys() and torch.is_tensor(b[k])
+           and b[k].dim() > 0 and b[k].shape[0] == n_nodes and n_nodes != b.num_graphs
+           and v.numel() == b.num_graphs + 1 and not torch.equal(v.cpu(), b.ptr.cpu())]
+    if bad:
+        raise ValueError(f"{path}: the atom pointers of {bad[:5]} are not this batch's (a K 0 build from before "
+                         f"2026-11-11): rebuild the file with the current build_noised_prior.py")
+
+
 def strip_analysis_helpers(b):
     """Drop what the analysis leaves on a batch that is not row data: the lazy space-group tables, and its
     dict-valued attributes (`computes` holds bound methods, which pickle the whole batch object they belong to, on

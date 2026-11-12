@@ -42,6 +42,7 @@ def _in_window(b):
 def conditions(src, out):
     d = torch.load(src, weights_only=False, map_location='cpu')
     b = d['prior']
+    NP.refuse_stale_atom_pointers(b, src)
     e = _energy(b)
     ok = ((NP.tag(b, 'noised_kind') == NP.KIND_ANCHOR) & (NP.tag(b, 'noised_split') == NP.SPLIT_TRAIN)
           & _in_window(b) & torch.isfinite(e))
@@ -63,6 +64,7 @@ def conditions(src, out):
 def heldout(src, stem, windows, per_molecule=None, max_molecules=None, seed=0):
     d = torch.load(src, weights_only=False, map_location='cpu')
     b = d['prior']
+    NP.refuse_stale_atom_pointers(b, src)
     e = _energy(b)
     inpk = _in_window(b)
     groups = NP.condition_groups(b)
