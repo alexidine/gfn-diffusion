@@ -10399,9 +10399,12 @@ class Modeller:
         ef = self.energy_function
         chart = 'fd' if getattr(ef, 'crystal_coordinates', 'latent') == 'fd' else 'latent'
         out = {}
+        # the kernel sets draw from each basin's Hessian: a band-set build (kind 'band', no Hessians) has none, so it
+        # gets neither set (2026-11-12, the pool8 band sets crashed the first eval here)
+        has_hessian = hasattr(b, 'basin_H')
         for key, batch in (('eval_bwd/mle_kernel', b),
                            ('eval_bwd/mle_kernel_heldout', getattr(self, 'prior_heldout_batch', None))):
-            if batch is None or int(batch.num_graphs) == 0:
+            if not has_hessian or batch is None or int(batch.num_graphs) == 0:
                 continue
             if key not in self._readout_rows:
                 g = torch.Generator().manual_seed(int(self.args.seed) + 5)
