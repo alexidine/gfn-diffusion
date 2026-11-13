@@ -42,7 +42,7 @@ Fifty-three pages, each drafted from the code and the derivation notes, verified
 
 ## Exact-density sampler
 
-- [ar-spline-flow](ar-spline-flow.md) — mixed page: the masked autoregressive rational-quadratic spline flow behind `inn_modeller.py`, its wrapped, linear and bounded rows and their bases, the half-period fold and mixture layer, block orders and the MADE and causal-transformer conditioners, the exact log-density and the d-pass inverse, the in-bin map and its derivative, the bin-height floor and when a height is a mass, free and tied knot derivatives with their bounds, and which settings live in the weights.
+- [ar-spline-flow](ar-spline-flow.md) — mixed page: the masked autoregressive rational-quadratic spline flow behind `inn_modeller.py` and the trainer's NF policy route (`cfg:model.kind` `nf`), its wrapped, linear and bounded rows and their bases, the half-period fold and mixture layer, block orders and the MADE and causal-transformer conditioners, the exact log-density and the d-pass inverse, the in-bin map and its derivative, the bin-height floor and when a height is a mass, free and tied knot derivatives with their bounds, which settings live in the weights, the conditional flow, and how the NF route draws and scores a state.
 
 ## Compute and energy
 
@@ -55,7 +55,7 @@ Fifty-three pages, each drafted from the code and the derivation notes, verified
 
 ## Crystal physics
 
-- [cell-fundamental-domains](cell-fundamental-domains.md) — theory page: the unit-cell fundamental domain per setting class, the walls the code evaluates, and where derivation and code differ.
+- [cell-fundamental-domains](cell-fundamental-domains.md) — theory page: the unit-cell fundamental domain per setting class, the walls the code evaluates, which mechanism holds the cell in its domain on the `latent` and `fd` coordinate routes, and where derivation and code differ.
 - [asymmetric-unit-reduction](asymmetric-unit-reduction.md) — theory page: the pose redundancy of the asymmetric unit under the Euclidean normaliser, its discrete cosets and free translation axes, the fold the code implements, the standard-frame convention, and where derivation and code differ.
 - [latent-dimension-structure](latent-dimension-structure.md) — code-bound page: the crystal latent row by row, the clamps and physical maps, the rows the build discards and how they are held out of the SDE, and the wrapped rows and their scoring.
 - [landscape-structure](landscape-structure.md) — theory page: basins as relaxation endpoints under an identity cut, the coverage, richness and rarefaction estimators over captures, occupancy versus depth, what a two-dimensional embedding measures, the dimensional cost of hitting a named basin, and the packing-motif descriptors.
