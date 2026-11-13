@@ -13,7 +13,7 @@ from energy_sampling import noised_prior
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, keeps_ema_copy, normalize_problem_def, trajectory_T
 from models import GFN
-from models.nf_policy import PRECISION_ONLY_KEYS, resolve_policy_entry
+from models.nf_policy import FRAME_ONLY_KEYS, PRECISION_ONLY_KEYS, resolve_policy_entry
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
@@ -827,7 +827,7 @@ class Checkpointer:
         builder = getattr(self.modeller, 'gfn_from_config', None)
         return builder(config) if builder is not None else GFN(**config)
 
-    def _gfn_config_from(self, checkpoint):
+    def _gfn_config_from(self, checkpoint, frames_follow_run: bool = False):
         """
         The checkpoint's gfn_config, with RECONFIGURABLE_GFN_KEYS re-derived
         from THIS run's config. The in-rollout variance schedule adds no
@@ -835,6 +835,12 @@ class Checkpointer:
         rather than architecture -- a battery that varies it while resuming a
         shared snapshot would otherwise inherit the parent's value and run
         every arm as the control. Changes print, so a silent miss can't happen.
+
+        `frames_follow_run` (the weights-only warm start): the NF frame flags
+        (models/nf_policy.py::FRAME_ONLY_KEYS) are not compared either and
+        follow this run's config. They change what a training step presents and
+        no parameter's shape; the caller re-lays the condition scaler for them
+        (_reframed_state). A full resume still compares them.
         """
         config = dict(checkpoint['gfn_config'])
         # the policy is architecture: the stored entry decides what loads, so a run asking for another kind or other flow
@@ -851,12 +857,14 @@ class Checkpointer:
         asked = resolve_policy_entry(mine, config)
         held = resolve_policy_entry(config.get('policy'), config)
 
+        follow = PRECISION_ONLY_KEYS + (FRAME_ONLY_KEYS if frames_follow_run else ())
+
         def strip(e):
             if e is None:
                 return None
             e = {k: v for k, v in e.items() if k != 'seed'}
             if 'nf' in e:
-                e['nf'] = {k: v for k, v in e['nf'].items() if k not in PRECISION_ONLY_KEYS}
+                e['nf'] = {k: v for k, v in e['nf'].items() if k not in follow}
             return e
 
         if strip(asked) != strip(held):
@@ -865,7 +873,7 @@ class Checkpointer:
                              f"load and train")
         if held is not None and 'nf' in held:
             nf = dict(held['nf'])
-            for key in PRECISION_ONLY_KEYS:
+            for key in follow:
                 if nf.get(key) != asked['nf'].get(key):
                     print(f"gfn_config['policy']['nf']['{key}']: checkpoint {nf.get(key)!r} -> "
                           f"config {asked['nf'].get(key)!r}")
@@ -898,6 +906,37 @@ class Checkpointer:
             config[key] = current[key]
         self._assert_dead_rows_match(config)
         return config
+
+    @staticmethod
+    def _reframed_state(model, state, what):
+        """`state` with each NF conditional flow's condition scaler (c_mu, c_sd) re-laid for the model's frame
+        columns, when the checkpoint was written with other frame flags (FRAME_ONLY_KEYS; a weights-only warm start).
+
+        The scaler spans the condition vector [row id, frame columns, condition columns], and only the condition
+        columns' entries are read (models/nf_policy.py::NFPolicy._context, c_mu[lead:]). So the id's and the
+        condition columns' entries carry over unchanged and the frame columns get the identity (0, 1), entries
+        nothing reads. Appending instead would shift every condition column's mean and scale. Every parameter has the
+        same shape with or without frames, so nothing else moves. Prints what it re-laid."""
+        from models.spline_flow import _ContextFlow
+        out = None
+        for name, mod in model.named_modules():
+            if not isinstance(mod, _ContextFlow):
+                continue
+            for buf, fill in (('c_mu', 0.0), ('c_sd', 1.0)):
+                key = f'{name}.{buf}' if name else buf
+                if key not in state or state[key].shape == getattr(mod, buf).shape:
+                    continue
+                old, k_new = state[key], int(mod.frame_cols)
+                k_old = k_new - (getattr(mod, buf).numel() - old.numel())
+                if old.dim() != 1 or k_old not in (0, 4, 5) or old.numel() < 1 + k_old:
+                    raise RuntimeError(f"{what}: {key} has {old.numel()} entries and this model's {getattr(mod, buf).numel()} "
+                                       f"({k_new} frame columns); no frame setting accounts for the difference")
+                pad = torch.full((k_new,), fill, dtype=old.dtype, device=old.device)
+                out = dict(state) if out is None else out
+                out[key] = torch.cat([old[:1], pad, old[1 + k_old:]])
+                print(f"{what}: {key} re-laid for {k_new} frame columns (checkpoint {k_old}); the condition "
+                      f"columns' scaling carries over")
+        return state if out is None else out
 
     def _load_state(self, model, state, what, in_place: bool = False):
         """load_state_dict, strict but for the force gates (FORCE_GATE_KEY) a checkpoint predates.
@@ -1117,9 +1156,10 @@ class Checkpointer:
                   f"match for weights-only load of {path} -- asserting these describe "
                   f"the same target. Buffers, optimizers and step count start fresh.")
         self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
-        m.gfn_config = self._gfn_config_from(checkpoint)
+        m.gfn_config = self._gfn_config_from(checkpoint, frames_follow_run=True)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        self._load_state(m.gfn_model, checkpoint['model_train'], f'{path} (model_train)')
+        self._load_state(m.gfn_model, self._reframed_state(m.gfn_model, checkpoint['model_train'], path),
+                         f'{path} (model_train)')
         self._install_ema(checkpoint, path)
         self._restore_pb_snapshot(checkpoint)
 

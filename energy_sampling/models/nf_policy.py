@@ -140,6 +140,10 @@ def resolve_flow_settings(s: dict, conditional: bool, live_rows=None) -> dict:
 # settings that set the flow's arithmetic precision and no parameter: a resume takes them from the run's config
 # (checkpointing.py::Checkpointer._gfn_config_from)
 PRECISION_ONLY_KEYS = ('tf_fp32',)
+# settings that change what a training step presents (the molecule in a random frame) and no parameter's shape: a
+# weights-only warm start takes them from the run's config; the condition scaler (c_mu, c_sd), which spans the frame
+# columns, is re-laid for them on load (checkpointing.py::Checkpointer._reframed_state)
+FRAME_ONLY_KEYS = ('rotate_frames', 'mirror_frames')
 
 
 def resolve_policy_entry(policy, gfn_config: dict):
