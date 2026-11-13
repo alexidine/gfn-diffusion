@@ -1497,12 +1497,25 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     return fig
 
 
+def _tb_axis_titles(log_pbs, log_pfs):
+    """The parity axes' titles, read off the terms: a one-step flow policy (models/nf_policy.py) has one P_F step, the
+    exact log q(x | c), and log P_B = 0, so its axes are log R and log Z + log q(x); a T-step SDE's are the sums."""
+    one_step = log_pfs.dim() == 2 and log_pfs.shape[-1] == 1
+    pb_zero = bool((log_pbs == 0).all())
+    x = 'log R(x)' if pb_zero else 'log R + Σ log P_B'
+    y = 'log Z + log q(x)' if one_step else 'log Z + Σ log P_F'
+    if pb_zero:
+        x += '   (log P_B ≡ 0)'
+    return x, y
+
+
 def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None, sg_inds=None):
     """sg_inds: [n] space group of each row; when the rows hold more than one group, 'Space group' joins the colour
     switcher (a categorical scale, one colour per group)."""
     # Compute x and y
     x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
     y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
+    x_title, y_title = _tb_axis_titles(log_pbs, log_pfs)
 
     # Get symmetric limits
     min_val = min(x.min(), y.min())
@@ -1574,8 +1587,8 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None, sg_
     # Layout adjustments
     fig.update_layout(
         title='Parity Plot',
-        xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
+        xaxis=dict(title=x_title, range=[lim_low, lim_high]),
+        yaxis=dict(title=y_title, range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'
@@ -1599,6 +1612,7 @@ def conditional_flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_in
     mae = np.mean(np.abs(x - y))
     r_value, _ = pearsonr(x, y)
     slope, intercept = np.polyfit(x, y, deg=1)
+    x_title, y_title = _tb_axis_titles(log_pbs, log_pfs)
     # Build figure
     fig = go.Figure()
 
@@ -1632,8 +1646,8 @@ def conditional_flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_in
     # Layout adjustments
     fig.update_layout(
         title='Parity Plot',
-        xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
+        xaxis=dict(title=x_title, range=[lim_low, lim_high]),
+        yaxis=dict(title=y_title, range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'
