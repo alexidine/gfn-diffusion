@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import gc
 import math
@@ -13103,10 +13104,14 @@ class Modeller:
                                                                                  dtype=torch.float32,
                                                                                  device=self.device)
 
-                out = sample_eval_fwd_trajs(init_state, model, eval_discretizer,
-                                            self.energy_function, mol_batch,
-                                            no_conditioning=False,
-                                            temperatures=temperatures)
+                # the policy stays in training mode here; under NF frames the draws present the standard frame
+                # (NFPolicy.standard_frames), as the density readouts' eval mode does
+                frame = getattr(model, 'standard_frames', None)
+                with (frame() if frame is not None else contextlib.nullcontext()):
+                    out = sample_eval_fwd_trajs(init_state, model, eval_discretizer,
+                                                self.energy_function, mol_batch,
+                                                no_conditioning=False,
+                                                temperatures=temperatures)
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue

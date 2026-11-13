@@ -62,3 +62,29 @@ def test_a_state_already_laid_for_the_model_passes_through():
     pol = _policy(BOTH, scaler_seed=7)
     state = pol.state_dict()
     assert Checkpointer._reframed_state(pol, state, 'test') is state
+
+
+def test_standard_frames_makes_a_training_mode_draw_the_eval_mode_draw():
+    """The eval draws (train.py::Modeller.fwd_eval_sampling) run in training mode; inside NFPolicy.standard_frames a
+    framed policy draws and scores exactly as in eval mode (the standard frame), and outside it draws in random
+    frames."""
+    pol = _policy(BOTH, scaler_seed=7)
+    mb = _mols(N, 2)
+    cond = torch.randn(N, 4, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
+
+    def draw():
+        torch.manual_seed(11)
+        with torch.no_grad():
+            states, log_pf, _, _ = pol.get_traj_fwd(torch.zeros(N, pol.dim), None, 0.0, cond, mb)
+        return states[:, -1], log_pf[:, 0]
+
+    pol.eval()
+    x_eval, lp_eval = draw()
+    pol.train()
+    with pol.standard_frames():
+        assert pol._frames(N) is None
+        x_std, lp_std = draw()
+    assert pol._frames(N) is not None   # the switch is undone on exit
+    x_rand, _ = draw()
+    assert torch.equal(x_std, x_eval) and torch.equal(lp_std, lp_eval)
+    assert float((x_rand - x_eval).abs().max()) > 1e-3

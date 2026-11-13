@@ -435,6 +435,7 @@ class NFPolicy(nn.Module):
         self.path_grad_scale_live = False
         self.traj_checkpoint, self.traj_checkpoint_modes = False, None   # runtime flags train.py sets on every build
         self.register_buffer('scalers_fitted', torch.tensor(False))   # persistent: a restored checkpoint keeps its own
+        self._standard_frames = False   # standard_frames(): training mode presents the standard frame
         self.to(self.device)
 
     # -- data-dependent set-up the trainer calls once the prior is loaded ------------------------------------------
@@ -461,6 +462,17 @@ class NFPolicy(nn.Module):
         """rotate_frames or mirror_frames: the condition carries each row's frame."""
         return bool(self.settings.get('rotate_frames')) or bool(self.settings.get('mirror_frames'))
 
+    @contextlib.contextmanager
+    def standard_frames(self):
+        """Inside, a training-mode call presents the standard frame (_frames gives None), as eval mode does, and
+        every other training-mode behaviour is kept. For the eval draws (train.py::Modeller.fwd_eval_sampling), which
+        run in training mode: under rotate_frames / mirror_frames they would otherwise be drawn in random frames."""
+        prev, self._standard_frames = self._standard_frames, True
+        try:
+            yield
+        finally:
+            self._standard_frames = prev
+
     @property
     def _frame_cols(self):
         """Condition columns after the row id that are its frame: the quaternion, then (mirror_frames) the parity."""
@@ -474,7 +486,7 @@ class NFPolicy(nn.Module):
         """Training mode with rotate_frames or mirror_frames: n frames, [n, 4] unit quaternions (w, x, y, z), uniform
         on SO(3) under rotate_frames and the identity otherwise, with mirror_frames a fifth column, the parity, -1
         with probability 1/2; else None."""
-        if not (self._framed and self.training):
+        if not (self._framed and self.training) or self._standard_frames:
             return None
         if self.settings.get('rotate_frames'):
             q = torch.randn(n, 4, device=self.device, dtype=torch.float64)
