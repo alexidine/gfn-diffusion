@@ -70,7 +70,7 @@ from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
     cal_subtb_coef_matrix, per_condition_fraction, trajectory_T
-from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
+from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate, combine_block_grads,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj, untrusted_z_for,
                              bwd_loss_reads_reward)
 from progress_metrics import parse_heldout_gate, resolve_heldout_source, heldout_plateau, HELDOUT_AUTO_SOURCES
@@ -6955,7 +6955,18 @@ class Modeller:
         return out
 
     def step_loss(self, step_type, loss, do_step: bool = True):
-        loss.backward()
+        parts = getattr(self.gfn_model, '_mle_parts', None)
+        if parts is not None:
+            self.gfn_model._mle_parts = None
+        if parts is not None and (step_type == 'fused' or not do_step):
+            # a fused step's loss is a weighted sum of branches (and may be scaled for accumulation): the blocks' unit
+            # gradients would replace every other branch's gradient
+            raise NotImplementedError("nf orient_grad_balance on a fused step: it rebalances one bwd or replay "
+                                      "branch's MLE gradient")
+        if parts is not None and parts[0] is loss:
+            self._balanced_backward(*parts[1:])
+        else:
+            loss.backward()
         if not do_step:
             return  # mid-accumulation: keep piling up gradients, don't clip/step yet
 
@@ -6964,6 +6975,7 @@ class Modeller:
         # the LAST branch to reach an optimizer step, not their sum.
         if self.step_ind % 10 == 0:
             self._last_grad_norms = self._submodel_grad_norms()
+            self._last_grad_norms.update(getattr(self, '_grad_balance_stats', None) or {})
 
         # THE BAR IS PER-BRANCH when grad_clip_guard is enabled: fwd/bwd/replay/
         # fused reach their own optimizer step here and an MLE gradient and a TB
@@ -7037,6 +7049,21 @@ class Modeller:
         # skipped them, so there's no spurious update to guard against.
         if 'flow' in self.optimizers and step_type != 'fused':
             self.optimizers['flow'].step()
+
+    def _balanced_backward(self, loss_c, loss_o, rho: float, pcgrad: bool):
+        """nf orient_grad_balance: each parameter's gradient is rho g_O/|g_O| + g_C/|g_C| (gflownet_losses.py::
+        combine_block_grads), g_C / g_O the gradients of the MLE term's other-row / orientation-row batch means, in place
+        of loss.backward(). Logs gradbal/norm_C, norm_O, cos and ratio (|g_C| / |g_O|) on the 1-in-10 clock."""
+        params = [q for q in self.gfn_model.parameters() if q.requires_grad]
+        g_c = torch.autograd.grad(loss_c, params, retain_graph=True, allow_unused=True)
+        g_o = torch.autograd.grad(loss_o, params, allow_unused=True)
+        grads, stats = combine_block_grads(g_c, g_o, rho=rho, pcgrad=pcgrad)
+        for q, g in zip(params, grads):
+            if g is not None:
+                q.grad = g.detach() if q.grad is None else q.grad + g.detach()
+        if self.step_ind % 10 == 0:
+            stats['ratio'] = stats['norm_C'] / max(stats['norm_O'], 1e-30)
+            self._grad_balance_stats = {f'gradbal/{k}': v for k, v in stats.items()}
 
     def z_calibration_tick(self, step_type):
         """

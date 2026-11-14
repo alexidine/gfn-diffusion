@@ -1177,6 +1177,26 @@ def test_a_malformed_heldout_gate_is_an_error(canonical):
     assert _fires(cfg, 'heldout_gate_is_well_formed', severity=ERROR)
 
 
+def test_malformed_or_inert_nf_orient_split_is_an_error(canonical):
+    """Full coverage of the split itself: tests/models/test_nf_orient_split.py."""
+    cfg = copy.deepcopy(canonical)
+    cfg['policy']['kind'] = 'nf'
+    cfg['gradient_norm_clip'] = 10.0
+    rule = 'nf_orient_split_is_well_formed'
+    assert not _fires(cfg, rule)                                          # defaults
+    cfg['policy'].setdefault('nf', {})['orient_loss_weight'] = -1.0
+    assert _fires(cfg, rule, severity=ERROR)                              # malformed
+    cfg['policy']['nf'].update(orient_loss_weight=1.0, orient_grad_balance='norm', orient_grad_rho=3.0)
+    assert not _fires(cfg, rule)                                          # train_prior: bwd mle 1.0, bwd steps
+    stages = cfg['protocols'][cfg['protocol']]['stages']
+    prior = next(st for st in stages if st['name'] == 'train_prior')
+    prior['train_mode'] = 'fused'
+    assert _fires(cfg, rule, severity=ERROR)                              # balance in fused steps
+    prior['train_mode'] = 'bwd'
+    prior['loss_coeffs']['bwd']['mle'] = 0.0
+    assert _fires(cfg, rule, severity=ERROR)                              # no stage trains MLE: inert
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check

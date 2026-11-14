@@ -101,6 +101,16 @@ NF_PENDING_DEFAULTS = dict(
                                     # models the orientation rows re-expressed for it (R -> R F, Haar log-Jacobian); the
                                     # presented frame then cancels, so rotate_frames leaves log q unchanged
                                     # (models/spline_flow.py::ConditionalLatentFlow.set_row_frame). 'none' = off
+    orient_loss_weight=1.0,         # the MLE term (bwd/replay `mle`) per row is -(log q(x_C | c) + w log q(x_O | x_C, c))
+                                    # with w this: x_O the FD orientation rows (energies/fd_coordinates.py::frame_rows),
+                                    # x_C every other row. 1 = -log q. bwd/mle still logs -log q, bwd/mle_orient
+                                    # -log q(x_O | x_C, c). Needs a conditional policy on the FD chart with n_blocks 1
+    orient_grad_balance='off',      # 'norm' / 'pcgrad' (same route): an MLE step's gradient is rho g_O/|g_O| + g_C/|g_C|,
+                                    # g_O and g_C the gradients of the batch-mean -log q(x_O | x_C, c) and
+                                    # -log q(x_C | c) on every parameter; 'pcgrad' first removes from each unit gradient
+                                    # its component along the other when they conflict (cos < 0)
+                                    # (gflownet_losses.py::combine_block_grads; train.py::Modeller.step_loss)
+    orient_grad_rho=1.0,            # rho above
 )
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
@@ -152,6 +162,11 @@ PRECISION_ONLY_KEYS = ('tf_fp32',)
 # weights-only warm start takes them from the run's config; the condition scaler (c_mu, c_sd), which spans the frame
 # columns, is re-laid for them on load (checkpointing.py::Checkpointer._reframed_state)
 FRAME_ONLY_KEYS = ('rotate_frames', 'mirror_frames')
+# settings that shape the MLE term's gradient and no parameter: a resume and a weights-only warm start both take them
+# from the run's config (checkpointing.py::Checkpointer._gfn_config_from)
+LOSS_ONLY_KEYS = ('orient_loss_weight', 'orient_grad_balance', 'orient_grad_rho')
+# the parser lives with the loader's rule (no torch): config_invariants.py::nf_orient_split_is_well_formed
+from config_invariants import orient_split_active, orient_split_problems  # noqa: E402
 
 
 def resolve_policy_entry(policy, gfn_config: dict):
@@ -260,6 +275,10 @@ class NFPolicy(nn.Module):
         del probe
         s = resolve_flow_settings(s, self.conditional, self.live_idx.tolist())
         self.settings = s
+        bad = orient_split_problems(s)
+        if bad:
+            raise ValueError('; '.join(bad))
+        self.orient_cols = None   # orientation split: the flow positions of the FD orientation rows
         if s['atom_tokens'] not in ATOM_TOKEN_MODES:
             raise ValueError(f"flow atom_tokens {s['atom_tokens']!r}: one of {ATOM_TOKEN_MODES}")
         if s['atom_tokens'] and not (self.conditional and self.conditions_type == 'molecule'):
@@ -407,6 +426,22 @@ class NFPolicy(nn.Module):
                 if self.orientation_rows is None:
                     self.orientation_rows = frame_rows(groups)   # raises for the K-cut groups (6-9)
                 self.sampler.set_row_frame(self.orientation_rows)
+            if orient_split_active(s):
+                from energies.fd_coordinates import frame_rows
+                groups = (self.fd_slots.groups if self.fd_slots is not None
+                          else [fd_space_group] if fd_space_group is not None else None)
+                if groups is None:
+                    raise NotImplementedError("flow orient_loss_weight / orient_grad_balance split the FD chart's "
+                                              "orientation rows: they need energy_config.crystal_coordinates fd")
+                if int(s['n_blocks']) != 1:
+                    raise NotImplementedError("flow orient_loss_weight / orient_grad_balance: a row's log-derivative "
+                                              "is its conditional only in one block in the chart's own order "
+                                              "(n_blocks 1)")
+                live = self.live_idx.tolist()
+                self.orient_cols = [live.index(r) for r in frame_rows(groups)]
+                if self.orient_cols != list(range(len(live) - len(self.orient_cols), len(live))):
+                    raise NotImplementedError(f"flow orientation split: the orientation rows {self.orient_cols} "
+                                              f"must be the last rows of the chart's order")
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
@@ -419,6 +454,9 @@ class NFPolicy(nn.Module):
                     load_encoder_into(self.sampler.flow.sym_encoder, s['sym_ops_init'])
             self.conditions_embedding_model = embed
         else:
+            if orient_split_active(s):
+                raise NotImplementedError("flow orient_loss_weight / orient_grad_balance are built for the "
+                                          "conditional route's flow (ConditionalLatentFlow.log_prob rows)")
             self.sampler = LatentFlow(self.dim, wrap_mask, self.dead_rows, *shape, seed=int(seed),
                                       transformer=transformer, block_orders=orders, half_rows=half_rows,
                                       bounded_rows=bounded, mix_k=int(s['mix_k']), describer=describer,
@@ -456,6 +494,9 @@ class NFPolicy(nn.Module):
         self._stash_live_branches = False
         self._live_fwd = self._live_bwd = self._live_replay = None
         self._z_cal_embedding = None
+        self._split_orient = False   # mle_orient_split armed the next backward/replay step to score x_O apart
+        self._orient_log_q = None    # that step's [n] log q(x_O | x_C, c) (take_orient_log_q)
+        self._mle_parts = None       # (loss, L_C, L_O) of a balanced MLE step (get_gfn_backward_loss -> step_loss)
         self._force_stats = self._reward_grad_stats = self._path_grad_stats = self._replay_force_stats = None
         self.path_grad_scale_live = False
         self.traj_checkpoint, self.traj_checkpoint_modes = False, None   # runtime flags train.py sets on every build
@@ -793,18 +834,28 @@ class NFPolicy(nn.Module):
     # -- the trajectory interface ---------------------------------------------------------------------------------
 
     def _one_step(self, s0, x, c, freeze_policy, return_gauss_params, scrambled: bool = False, x_model=None,
-                  log_jac=None):
+                  log_jac=None, split: bool = False):
         """x: the standard-frame state; x_model: what the flow scores (x re-expressed for the row's frame under
-        rotate_frames, else x), log_jac: log |d x_model / d x|, so log q(x) = log q_flow(x_model) + log_jac."""
+        rotate_frames, else x), log_jac: log |d x_model / d x|, so log q(x) = log q_flow(x_model) + log_jac. split
+        (armed by mle_orient_split): also keep log q(x_O | x_C, c) for take_orient_log_q; log q is computed as
+        without."""
         n = x.shape[0]
         xm = x if x_model is None else x_model
+        log_q_o = None
         with (torch.no_grad() if freeze_policy else contextlib.nullcontext()):
-            log_q = (self.sampler.log_prob(xm, c, detach_context=scrambled) if self.conditional
-                     else self.sampler.log_prob(xm))
+            if split:
+                log_q, log_q_o = self.sampler.log_prob(xm, c, detach_context=scrambled, rows=self.orient_cols)
+            else:
+                log_q = (self.sampler.log_prob(xm, c, detach_context=scrambled) if self.conditional
+                         else self.sampler.log_prob(xm))
         if log_jac is not None:
             log_q = log_q + log_jac.to(log_q.dtype)
+            if log_q_o is not None:   # a frame's map moves the orientation rows alone (fd_coordinates.py::
+                log_q_o = log_q_o + log_jac.to(log_q_o.dtype)   # _orientation_map; mirror_state's flip: unit)
         if freeze_policy:
             log_q = log_q.detach()
+            log_q_o = None if log_q_o is None else log_q_o.detach()
+        self._orient_log_q = log_q_o
         states = torch.stack([s0.to(x.dtype), x], 1)
         log_pfs = log_q.reshape(n, 1)
         log_pbs = torch.zeros_like(log_pfs)
@@ -816,6 +867,27 @@ class NFPolicy(nn.Module):
             gp = {k: torch.zeros(n, 1, device=x.device) for k in self.GAUSS_PARAM_KEYS}
             return states, log_pfs, log_pbs, log_flow, gp
         return states, log_pfs, log_pbs, log_flow
+
+    def mle_orient_split(self):
+        """(orientation weight, balance, rho) of the MLE term (nf orient_loss_weight / orient_grad_balance /
+        orient_grad_rho), or None: -log q unsplit. A non-None result arms the next get_traj_bwd / get_traj_replay call
+        to score the orientation rows apart (take_orient_log_q). Read by gflownet_losses.py::get_gfn_backward_loss
+        before its trajectory call."""
+        if self.orient_cols is None:
+            return None
+        self._split_orient = True
+        s = self.settings
+        b = s['orient_grad_balance'] if s['orient_grad_balance'] not in (None, False) else 'off'
+        return float(s['orient_loss_weight']), b, float(s['orient_grad_rho'])
+
+    def take_orient_log_q(self, n: int):
+        """The armed backward/replay step's [n] log q(x_O | x_C, c) of its rows (with its gradient and the frame map's
+        log-Jacobian); cleared on read."""
+        t, self._orient_log_q = self._orient_log_q, None
+        if t is None or t.shape[0] != n:
+            raise RuntimeError(f"take_orient_log_q({n}): no armed backward/replay step left one "
+                               f"({None if t is None else tuple(t.shape)})")
+        return t
 
     @torch.no_grad()
     def log_density(self, x, condition, mol_batch, frames=None):
@@ -863,8 +935,9 @@ class NFPolicy(nn.Module):
         c = self._scramble(self._context(condition, mol_batch, n, frames=q), n, scramble_condition_tiles)
         s0 = torch.zeros_like(x)
         xm, lj = self._present(x, q) if q is not None else (None, None)
+        split, self._split_orient = self._split_orient, False
         return self._one_step(s0, x, c, freeze_policy, return_gauss_params, scrambled=scramble_condition_tiles > 0,
-                              x_model=xm, log_jac=lj)
+                              x_model=xm, log_jac=lj, split=split)
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch, return_gauss_params: bool = False,
                         freeze_policy: bool = False, scramble_condition_tiles: int = 0, resample_last_k: int = 0,
@@ -878,8 +951,10 @@ class NFPolicy(nn.Module):
             raise NotImplementedError("rotate_frames with scramble_conditions: the frame belongs to the row's state")
         c = self._scramble(self._context(condition, mol_batch, n, frames=q), n, scramble_condition_tiles)
         xm, lj = self._present(x, q) if q is not None else (None, None)
+        split, self._split_orient = self._split_orient, False
         return self._one_step(trajectory[:, 0].detach().to(self.device, torch.float32), x, c, freeze_policy,
-                              return_gauss_params, scrambled=scramble_condition_tiles > 0, x_model=xm, log_jac=lj)
+                              return_gauss_params, scrambled=scramble_condition_tiles > 0, x_model=xm, log_jac=lj,
+                              split=split)
 
     # -- P_B snapshots and the SDE-only calls ------------------------------------------------------------------------
 

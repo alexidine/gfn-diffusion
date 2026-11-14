@@ -13,7 +13,7 @@ from energy_sampling import noised_prior
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, keeps_ema_copy, normalize_problem_def, trajectory_T
 from models import GFN
-from models.nf_policy import FRAME_ONLY_KEYS, PRECISION_ONLY_KEYS, resolve_policy_entry
+from models.nf_policy import FRAME_ONLY_KEYS, LOSS_ONLY_KEYS, PRECISION_ONLY_KEYS, resolve_policy_entry
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
@@ -857,7 +857,7 @@ class Checkpointer:
         asked = resolve_policy_entry(mine, config)
         held = resolve_policy_entry(config.get('policy'), config)
 
-        follow = PRECISION_ONLY_KEYS + (FRAME_ONLY_KEYS if frames_follow_run else ())
+        follow = PRECISION_ONLY_KEYS + LOSS_ONLY_KEYS + (FRAME_ONLY_KEYS if frames_follow_run else ())
 
         def strip(e):
             if e is None:

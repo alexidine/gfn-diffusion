@@ -1335,6 +1335,85 @@ def nf_policy_refuses_sde_only_settings(cfg: dict) -> list[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# NF MLE orientation split (models/nf_policy.py NF_PENDING_DEFAULTS orient_loss_weight / orient_grad_balance /
+# orient_grad_rho): the MLE term per row is -(log q(x_C | c) + w log q(x_O | x_C, c)), x_O the FD orientation rows,
+# or its gradient is rebalanced to rho g_O/|g_O| + g_C/|g_C| (gflownet_losses.py::combine_block_grads).
+# ---------------------------------------------------------------------------
+ORIENT_SPLIT_DEFAULTS = dict(orient_loss_weight=1.0, orient_grad_balance='off', orient_grad_rho=1.0)
+ORIENT_GRAD_BALANCE = ('off', 'norm', 'pcgrad')
+
+
+def _orient_split_get(nf):
+    if nf is None:
+        nf = {}
+    if isinstance(nf, dict):
+        return lambda k: nf.get(k, ORIENT_SPLIT_DEFAULTS[k])
+    return lambda k: getattr(nf, k, ORIENT_SPLIT_DEFAULTS[k])
+
+
+def orient_split_problems(nf) -> list:
+    """Why the nf orient_loss_weight / orient_grad_balance / orient_grad_rho values are malformed ([] when well
+    formed). nf: the nf settings, a dict or a Namespace (an absent key reads ORIENT_SPLIT_DEFAULTS)."""
+    get = _orient_split_get(nf)
+    out = []
+    for k in ('orient_loss_weight', 'orient_grad_rho'):
+        v = get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            out.append(f"model.nf.{k} = {v!r}: a finite number > 0")
+    b = get('orient_grad_balance')
+    if b in (None, False):
+        b = 'off'
+    if b not in ORIENT_GRAD_BALANCE:
+        out.append(f"model.nf.orient_grad_balance = {b!r}: one of {ORIENT_GRAD_BALANCE}")
+    if out:
+        return out
+    if b != 'off' and float(get('orient_loss_weight')) != 1.0:
+        out.append("model.nf.orient_loss_weight with orient_grad_balance on: the balance sets each block's share "
+                   "(orient_grad_rho), so a weight would be normalised away")
+    if b == 'off' and float(get('orient_grad_rho')) != 1.0:
+        out.append("model.nf.orient_grad_rho with orient_grad_balance off: it scales nothing")
+    return out
+
+
+def orient_split_active(nf) -> bool:
+    """Whether the MLE term is split into its orientation and other-row parts (a weight off 1 or a balance on).
+    Assumes orient_split_problems(nf) == []."""
+    get = _orient_split_get(nf)
+    return float(get('orient_loss_weight')) != 1.0 or get('orient_grad_balance') not in ('off', None, False)
+
+
+def nf_orient_split_is_well_formed(cfg: dict) -> list[Violation]:
+    """model.nf orient_loss_weight / orient_grad_balance / orient_grad_rho (the NF MLE term's orientation split):
+    malformed values; a split set while no active stage has a bwd or replay mle > 0 (inert); a balance on a stage that
+    trains MLE in fused steps (the balance replaces one branch's gradient: train.py::Modeller.step_loss refuses it
+    mid-run). The route (conditional, FD chart, one flow block) is refused where the policy is built
+    (models/nf_policy.py::NFPolicy). Absent policy block or kind sde: nothing to judge; unresolvable stages: abstains."""
+    cfg = canonical_model_section(cfg)
+    if _get(cfg, 'policy.kind', 'sde') != 'nf':
+        return []
+    rule = 'nf_orient_split_is_well_formed'
+    nf = _get(cfg, 'policy.nf') or {}
+    out = [Violation(ERROR, rule, p) for p in orient_split_problems(nf)]
+    if out or not orient_split_active(nf):
+        return out
+    stages = active_stages(cfg)
+    if not stages:
+        return out
+    mle = [st for st in stages if any((_coeff(cfg, st, b, 'mle') or 0.0) > 0 for b in ('bwd', 'replay'))]
+    if not mle:
+        out.append(Violation(ERROR, rule, "model.nf orient_loss_weight / orient_grad_balance are set and no active "
+                                          "stage has a bwd or replay mle > 0: they would act on nothing"))
+    get = _orient_split_get(nf)
+    if get('orient_grad_balance') not in ('off', None, False):
+        for st in mle:
+            if st.get('train_mode') == 'fused':
+                out.append(Violation(ERROR, rule, f"stage '{st.get('name', '?')}' trains its MLE in fused steps: "
+                                                  f"orient_grad_balance rebalances one bwd or replay branch's "
+                                                  f"gradient"))
+    return out
+
+
 #: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
 #: An absent key reads its default; an unknown key is refused.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
@@ -2676,6 +2755,7 @@ RULES = (
     static_prior_buffer_is_seeded,
     condition_draw_is_well_formed,
     nf_policy_refuses_sde_only_settings,
+    nf_orient_split_is_well_formed,
     # returns [] when buffers.store is absent or off
     row_store_is_well_formed,
     # every route but the conformer one; returns [] on energy_function conformer_torsions

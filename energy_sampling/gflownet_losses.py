@@ -247,6 +247,34 @@ def soft_clip(x, cutoff):
     return torch.where(abs_x <= cutoff, x, sign_x * clipped)
 
 
+def combine_block_grads(g_c, g_o, rho: float = 1.0, pcgrad: bool = False):
+    """The balanced MLE step's gradient (nf orient_grad_balance; train.py::Modeller.step_loss): rho g_O/|g_O| +
+    g_C/|g_C| over one parameter list (None entries: no gradient), |.| the global norm over every entry. pcgrad: when
+    the unit gradients conflict (cos < 0) each first loses its component along the other. A zero gradient stays zero.
+    Returns (gradients, a list with None where both inputs are None; stats: norm_C, norm_O, cos)."""
+    def flat_norm(gs):
+        return torch.sqrt(sum((g.double() ** 2).sum() for g in gs if g is not None) + 0.0)
+
+    n_c, n_o = flat_norm(g_c), flat_norm(g_o)
+    dot = sum((a.double() * b.double()).sum() for a, b in zip(g_c, g_o) if a is not None and b is not None) + 0.0
+    tiny = 1e-30
+    cos = dot / torch.clamp(n_c * n_o, min=tiny)
+    s_c, s_o = 1.0 / torch.clamp(n_c, min=tiny), 1.0 / torch.clamp(n_o, min=tiny)
+    # unit gradients u_C = s_c g_C, u_O = s_o g_O; pcgrad: u_C - cos u_O and u_O - cos u_C (cos < 0 only)
+    k = cos if (pcgrad and float(cos) < 0) else torch.zeros_like(cos)
+    c_on_c, c_on_o = s_c - rho * k * s_c, rho * s_o - k * s_o   # coefficients of g_C and g_O in the result
+    out = []
+    for a, b in zip(g_c, g_o):
+        if a is None and b is None:
+            out.append(None)
+            continue
+        t = (torch.zeros_like(b) if a is None else a * c_on_c.to(a.dtype))
+        if b is not None:
+            t = t + b * c_on_o.to(b.dtype)
+        out.append(t)
+    return out, {'norm_C': float(n_c), 'norm_O': float(n_o), 'cos': float(cos)}
+
+
 def combine_branch_terms(losses, loss_clip):
     """
     Combine a branch's per-row loss TERMS into one per-row loss.
@@ -752,6 +780,9 @@ def get_gfn_backward_loss(loss_coeffs,
                          f"{BWD_REWARD_TERMS} at 0, no stored trajectory and no pooled stash")
     freeze_policy = getattr(loss_coeffs, 'freeze_policy', 0) > 0.5
     freeze_z = getattr(loss_coeffs, 'freeze_z', 0) > 0.5
+    # an NF policy's orientation split of the MLE term (nf orient_loss_weight / orient_grad_balance), read before the
+    # trajectory call it arms; None on every other policy and at the defaults
+    mle_split = (gfn.mle_orient_split() if loss_coeffs.mle > 0 and hasattr(gfn, 'mle_orient_split') else None)
 
     replay_force_stats = None
     if trajectories is not None:
@@ -1060,6 +1091,7 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         emp_z_persistent_loss = None
 
+    mle_row_stats, mle_parts = None, None
     if loss_coeffs.mle > 0:
         mle_loss = terminal_mle(
             log_pf, log_pb,
@@ -1068,6 +1100,22 @@ def get_gfn_backward_loss(loss_coeffs,
             estimator='exact' if repeats > 1 else 'bound',
             dreg=True
         )
+        mle_nll = mle_loss   # -log q per row, unweighted: what loss_dict['mle'] (bwd/mle: sensors, gates) reports
+        if mle_split is not None:
+            if repeats > 1:
+                raise NotImplementedError("the MLE orientation split with repeats > 1 (a one-step flow's backward "
+                                          "copies are identical: K = 1)")
+            orient_w, balance, rho = mle_split
+            lq_o = gfn.take_orient_log_q(log_pf.shape[0]).to(mle_nll.dtype)
+            if freeze_policy:
+                lq_o = lq_o.detach()
+            # -(log q(x_C | c) + w log q(x_O | x_C, c)) = -log q - (w - 1) log q(x_O | x_C, c)
+            if orient_w != 1.0:
+                mle_loss = mle_nll - (orient_w - 1.0) * lq_o
+            if balance != 'off':   # the two blocks' batch-mean losses, for train.py::Modeller.step_loss
+                mle_parts = ((mle_nll + lq_o).mean() * loss_coeffs.mle, (-lq_o).mean() * loss_coeffs.mle, rho,
+                             balance == 'pcgrad')
+            mle_row_stats = {'mle_orient': -lq_o.detach().mean(), 'mle_rest': (mle_nll + lq_o).detach().mean()}
         losses.append(mle_loss * loss_coeffs.mle)
 
     tbc_coeff = getattr(loss_coeffs, 'tbc', 0)
@@ -1114,6 +1162,15 @@ def get_gfn_backward_loss(loss_coeffs,
         denom = w.sum()
         loss = (combined_losses.flatten() * w).sum() / torch.clamp(denom, min=1e-12)
 
+    if mle_parts is not None:
+        # the balanced step replaces this loss's gradient by the blocks' unit gradients: exact only when the MLE term
+        # is the branch's one term, unclipped and unweighted
+        if len(losses) != 1 or sample_weights is not None or loss_coeffs.loss_clip != -1 and float(
+                combined_losses.detach().abs().max()) >= 0.01 * float(loss_coeffs.loss_clip):
+            raise NotImplementedError("orient_grad_balance: the MLE term must be the branch's only term, with no "
+                                      "sample weights and no binding loss_clip")
+        gfn._mle_parts = (loss,) + mle_parts if torch.is_grad_enabled() and loss.requires_grad else None
+
     if report_losses:
         loss_dict = {'losses': combined_losses.detach(),
                      'log_pf': log_pf.detach(), 'log_pb': log_pb.detach(),
@@ -1141,7 +1198,9 @@ def get_gfn_backward_loss(loss_coeffs,
         if loss_coeffs.emp_z > 0:
             loss_dict['emp_z'] = emp_z_loss.mean().detach()
         if loss_coeffs.mle > 0:
-            loss_dict['mle'] = mle_loss.mean().detach()
+            loss_dict['mle'] = mle_nll.mean().detach()
+            if mle_row_stats is not None:
+                loss_dict.update(mle_row_stats)
         if tbc_loss is not None:
             loss_dict['tbc'] = tbc_loss.mean().detach()
         if loss_coeffs.db > 0:

@@ -389,10 +389,11 @@ class _ContextBlock(_Block):
              ).view(x.shape[0], self.d, self.n_params)
         return p[..., -1], p[..., :3 * self.n_bins].view(x.shape[0], self.d, 3, self.n_bins)
 
-    def forward(self, x, ctx, extra=None, live=None):
+    def forward(self, x, ctx, extra=None, live=None, per_row: bool = False):
         """live: [b, d] bool, False on a row's pad slots (a mixed-group FD state): they go in and come out as 0 and
         add nothing to the log-det, so the block is a map of the live rows alone and the pads, constant given the
-        row's group, tell later rows nothing. None: every row live."""
+        row's group, tell later rows nothing. None: every row live. per_row: the log-det per row [b, d] (pads 0) in
+        place of its sum (ConditionalLatentFlow.log_prob rows)."""
         x = _pin(x, live)
         shift, sp = self.spline_params(x, ctx, extra)
         if self.has_bounded:
@@ -403,7 +404,8 @@ class _ContextBlock(_Block):
             z = x + shift
             z = torch.where(self.is_wrap, _wrap(z), z)
             y, ld = _rq_spline(z, sp, self.bound, self.is_wrap, min_height=self.min_height, tied=self.tied)
-        return _pin(y, live), _pin(ld, live).sum(-1)
+        ld = _pin(ld, live)
+        return _pin(y, live), (ld if per_row else ld.sum(-1))
 
     @torch.no_grad()
     def invert(self, y, ctx, extra_of=None, live=None):
@@ -1053,7 +1055,11 @@ class ConditionalLatentFlow(nn.Module):
         xt, lj = rotate_orientation(x, F if inverse else F.transpose(1, 2), rows=self._frame_rows)
         return xt.to(x.dtype), lj.to(x.dtype)
 
-    def to_base(self, x, c, detach_context: bool = False):
+    def to_base(self, x, c, detach_context: bool = False, per_row: bool = False):
+        """(z, log-det [n]); per_row: (z, log-det, each row's own part of it [n, d], the canonical frame's
+        log-Jacobian [n] or None). A row's part is its standardisation and its log-derivative in every block (pads 0);
+        the log-det is computed as without per_row. With one block in the chart's own order, a row's part plus its
+        base term is log q(x_j | x_<j, c) in the canonical frame (the frame map moves the orientation rows alone)."""
         f = self.flow
         full, F = f.context_frame(c)
         ctx = full[0]
@@ -1070,29 +1076,49 @@ class ConditionalLatentFlow(nn.Module):
         else:
             ld = -_pin(torch.where(f.is_wrap, torch.zeros_like(f.sd), torch.log(f.sd)).expand_as(z), live).sum(-1)
         extra = f.row_extra(z, c)   # typed rows: one block, reading the data rows (no standardisation)
+        lr = None
+        if per_row:
+            lr = -torch.where(f.is_wrap, torch.zeros_like(f.sd), torch.log(f.sd)).expand_as(z)
+            lr = lr if live is None else _pin(lr, live)
         for blk in f.blocks:
-            z, l = blk(z, ctx, extra) if live is None else blk(z, ctx, extra, live)
+            if per_row:
+                z, l = blk(z, ctx, extra, per_row=True) if live is None else blk(z, ctx, extra, live, per_row=True)
+                lr = lr + l
+                l = l.sum(-1)
+            else:
+                z, l = blk(z, ctx, extra) if live is None else blk(z, ctx, extra, live)
             ld = ld + l
         if lj_frame is not None:
             ld = ld + lj_frame
-        return z, ld
+        return (z, ld, lr, lj_frame) if per_row else (z, ld)
 
-    def log_prob(self, x, c, detach_context: bool = False):
+    def log_prob(self, x, c, detach_context: bool = False, rows=None):
         """log q(x | c); on a mixed-group FD state (_ContextFlow.set_row_live) the density of each row's live slots
-        alone."""
+        alone. rows (flow positions, a list): (log q, [n] the part of log q on those rows: their base terms,
+        standardisation and log-derivatives, plus a canonical frame's log-Jacobian), log q computed as without rows.
+        One block in the chart's own order with the rows last (NFPolicy's orientation split): the part is
+        log q(x_rows | x_earlier, c)."""
         f = self.flow
-        z, ld = self.to_base(x, c, detach_context=detach_context)
+        if rows is None:
+            z, ld = self.to_base(x, c, detach_context=detach_context)
+        else:
+            z, ld, lr, lj_frame = self.to_base(x, c, detach_context=detach_context, per_row=True)
         live = f.live_rows(z.shape[0])
         if live is None:
             zl = z[:, ~f.unit_base]
             base = (-math.log(2.0) * int(f.unit_base.sum())
                     - 0.5 * (zl * zl).sum(-1) - 0.5 * math.log(2 * math.pi) * zl.shape[1])
+        else:
+            unit, gauss = f.unit_base & live, ~f.unit_base & live
+            zl = torch.where(gauss, z, torch.zeros_like(z))
+            base = (-math.log(2.0) * unit.sum(-1) - 0.5 * (zl * zl).sum(-1)
+                    - 0.5 * math.log(2 * math.pi) * gauss.sum(-1))
+        if rows is None:
             return base + ld
-        unit, gauss = f.unit_base & live, ~f.unit_base & live
-        zl = torch.where(gauss, z, torch.zeros_like(z))
-        base = (-math.log(2.0) * unit.sum(-1) - 0.5 * (zl * zl).sum(-1)
-                - 0.5 * math.log(2 * math.pi) * gauss.sum(-1))
-        return base + ld
+        b_row = torch.where(f.unit_base, torch.full_like(z, -math.log(2.0)), -0.5 * z * z - 0.5 * math.log(2 * math.pi))
+        b_row = b_row if live is None else _pin(b_row, live)
+        part = (lr + b_row)[:, list(rows)].sum(-1)
+        return base + ld, (part if lj_frame is None else part + lj_frame)
 
     @torch.no_grad()
     def sample(self, n, c, return_base: bool = False):
