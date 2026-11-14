@@ -529,6 +529,8 @@ class ChiralChannels(nn.Module):
 #: frame, and its learned axes collapse onto the symmetry axis or vanish)
 FRAME_FLOOR = 1e-2
 CANONICAL_FRAMES = ('none', 'inertial', 'learned')
+#: inertial_frame's far-direction softmax temperature (Angstrom): atoms within a few FAR_TAU of the farthest share it
+FAR_TAU = 1e-3   # well above float32 coordinate noise (~1e-6 A), well below real farthest-atom gaps
 
 
 def _scatter_sum(v, batch, u):
@@ -537,9 +539,9 @@ def _scatter_sum(v, batch, u):
 
 def inertial_frame(pf, heavy, batch, u):
     """(centre [u, 3], F [u, 3, 3], r_mol [u]) per molecule of a flat atom list, float64, no gradient: the heavy-atom
-    centroid and principal axes (columns e1, e2, e3 by ascending moment), each signed toward the farthest heavy atom
-    (lowest atom index on an exact tie) except the one least aligned with it, which is the cross product of the other
-    two, so F is proper. Equivariant, F(Q y) = Q F(y) for a rotation Q, except on exact ties (equal moments, equal
+    centroid and principal axes (columns e1, e2, e3 by ascending moment), each signed toward the far direction (a
+    softmax over heavy-atom distances at FAR_TAU, so near-ties for farthest share it) except the one least aligned with
+    it, which is the cross product of the other two, so F is proper. Equivariant, F(Q y) = Q F(y) for a rotation Q, except on exact ties (equal moments, equal
     farthest radii, or two axes orthogonal to the farthest atom: the symmetric molecules). On atoms already
     in mxtaltools' standard frame (align_mol_batch_to_standard_axes) it is the identity to about 1e-6. A molecule with
     fewer than three heavy atoms (no defined heavy-atom axes) uses all its atoms."""
@@ -556,11 +558,12 @@ def inertial_frame(pf, heavy, batch, u):
         _, V = torch.linalg.eigh(inertia)                     # ascending moments, axes as columns
         r = torch.where(w > 0, d.norm(dim=-1), torch.full_like(d[:, 0], -1.0))
         rmax = torch.full((u,), -2.0, dtype=p.dtype, device=p.device).scatter_reduce(0, batch, r, 'amax')
-        idx = torch.arange(p.shape[0], device=p.device)
-        cand = torch.where(r == rmax[batch], idx, torch.full_like(idx, p.shape[0] + 1))
-        far_i = torch.full((u,), p.shape[0] + 1, dtype=torch.long, device=p.device).scatter_reduce(0, batch, cand,
-                                                                                                    'amin')
-        far = d[far_i.clamp_max(p.shape[0] - 1)]
+        # the far direction: a softmax over the weighted atoms' distances (temperature FAR_TAU, Angstrom), not one
+        # farthest atom. The weights depend on distances only, so the direction is exactly equivariant even when two
+        # atoms tie for farthest (a lowest-index pick flips under float32 rotation there); where the farthest atom leads
+        # by several FAR_TAU it is that atom's direction, as in mxtaltools' rule
+        a = torch.where(w > 0, torch.exp((r - rmax[batch]) / FAR_TAU), torch.zeros_like(r))
+        far = _scatter_sum(a[:, None] * d, batch, u) / _scatter_sum(a, batch, u).clamp_min(1e-300)[:, None]
         overlap = torch.einsum('uki,uk->ui', V, far)
         V = V * torch.where(overlap < 0, -1.0, 1.0).to(p.dtype)[:, None, :]
         # the axis least aligned with the farthest atom (a planar molecule's normal: overlap exactly 0) is rebuilt as

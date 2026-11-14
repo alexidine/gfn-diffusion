@@ -132,3 +132,34 @@ def test_the_setting_is_refused_where_it_cannot_hold():
         _typed_policy(2, scale=0.0, atom_tokens='split', canonical_frame='sideways')
     with pytest.raises(NotImplementedError):
         _typed_policy(7, scale=0.0, atom_tokens='split', canonical_frame='inertial')     # a K-cut group
+
+
+def _near_tie_molecule():
+    """Six heavy atoms whose two farthest from the centroid, at opposite ends of the long axis, tie to ~1e-12 A (atom 1
+    moved along its own radius until its distance matches atom 0's; the centroid is recomputed each pass)."""
+    g = torch.Generator().manual_seed(21)
+    y = torch.randn(6, 3, generator=g, dtype=torch.float64) * 0.6
+    # the two farthest atoms at opposite ends of the long axis, so which one counts as farthest decides that axis's sign
+    y[0] = torch.tensor([2.6, 0.4, -0.3], dtype=torch.float64)
+    y[1] = torch.tensor([-2.5, 0.7, 0.5], dtype=torch.float64)
+    for _ in range(60):
+        c = y.mean(0)
+        d0, d1 = (y[0] - c).norm(), (y[1] - c).norm()
+        y[1] = c + (y[1] - c) * (d0 / d1)
+    c = y.mean(0)
+    assert abs(float((y[0] - c).norm() - (y[1] - c).norm())) < 1e-9
+    return y
+
+
+def test_the_inertial_frame_is_equivariant_on_a_near_tie_for_farthest_atom():
+    y = _near_tie_molecule()
+    z = torch.full((6,), 6)
+    batch = torch.zeros(6, dtype=torch.long)
+    _, F, _ = inertial_frame(y.float(), z > 1, batch, 1)
+    Q = quat_to_rotmat(_quats(64, 3))
+    worst = 0.0
+    for k in range(64):
+        yr = (y @ Q[k].T).float()          # float32 presented atoms, as the trainer builds them
+        _, Fr, _ = inertial_frame(yr, z > 1, batch, 1)
+        worst = max(worst, float((Fr[0] - Q[k] @ F[0]).abs().max()))
+    assert worst < 1e-3, worst
