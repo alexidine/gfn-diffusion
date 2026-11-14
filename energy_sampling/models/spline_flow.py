@@ -523,6 +523,69 @@ class ChiralChannels(nn.Module):
         return torch.asinh(trip)
 
 
+#: canonical_frame 'learned': a molecule whose learned axes are shorter than this fraction of its heavy-atom radius
+#: (sigma = min(|v1|, |u2|) / r_mol, rotation invariant, so the decision is the same in every presented frame) falls back
+#: to its inertial frame, with no gradient (a molecule with a proper point-group symmetry has no continuous equivariant
+#: frame, and its learned axes collapse onto the symmetry axis or vanish)
+FRAME_FLOOR = 1e-2
+CANONICAL_FRAMES = ('none', 'inertial', 'learned')
+
+
+def _scatter_sum(v, batch, u):
+    return v.new_zeros((u,) + v.shape[1:]).index_add_(0, batch, v)
+
+
+def inertial_frame(pf, heavy, batch, u):
+    """(centre [u, 3], F [u, 3, 3], r_mol [u]) per molecule of a flat atom list, float64, no gradient: the heavy-atom
+    centroid and principal axes (columns e1, e2, e3 by ascending moment), each signed toward the farthest heavy atom
+    (lowest atom index on an exact tie) except the one least aligned with it, which is the cross product of the other
+    two, so F is proper. Equivariant, F(Q y) = Q F(y) for a rotation Q, except on exact ties (equal moments, equal
+    farthest radii, or two axes orthogonal to the farthest atom: the symmetric molecules). On atoms already
+    in mxtaltools' standard frame (align_mol_batch_to_standard_axes) it is the identity to about 1e-6. A molecule with
+    fewer than three heavy atoms (no defined heavy-atom axes) uses all its atoms."""
+    with torch.no_grad():
+        p = pf.to(torch.float64)
+        w = heavy.to(torch.float64)
+        few = _scatter_sum(w, batch, u) < 3
+        w = torch.where(few[batch], torch.ones_like(w), w)
+        wc = _scatter_sum(w, batch, u).clamp_min(1.0)
+        centre = _scatter_sum(p * w[:, None], batch, u) / wc[:, None]
+        d = (p - centre[batch]) * w[:, None]
+        C = _scatter_sum(d[:, :, None] * d[:, None, :], batch, u)
+        inertia = C.diagonal(dim1=1, dim2=2).sum(-1)[:, None, None] * torch.eye(3, dtype=p.dtype, device=p.device) - C
+        _, V = torch.linalg.eigh(inertia)                     # ascending moments, axes as columns
+        r = torch.where(w > 0, d.norm(dim=-1), torch.full_like(d[:, 0], -1.0))
+        rmax = torch.full((u,), -2.0, dtype=p.dtype, device=p.device).scatter_reduce(0, batch, r, 'amax')
+        idx = torch.arange(p.shape[0], device=p.device)
+        cand = torch.where(r == rmax[batch], idx, torch.full_like(idx, p.shape[0] + 1))
+        far_i = torch.full((u,), p.shape[0] + 1, dtype=torch.long, device=p.device).scatter_reduce(0, batch, cand,
+                                                                                                    'amin')
+        far = d[far_i.clamp_max(p.shape[0] - 1)]
+        overlap = torch.einsum('uki,uk->ui', V, far)
+        V = V * torch.where(overlap < 0, -1.0, 1.0).to(p.dtype)[:, None, :]
+        # the axis least aligned with the farthest atom (a planar molecule's normal: overlap exactly 0) is rebuilt as
+        # the cross product of the other two, in cyclic order, so F is proper and its sign never rests on a vanishing
+        # overlap (mxtaltools' standard-axes rule, made proper)
+        k = (overlap.abs() / far.norm(dim=-1, keepdim=True).clamp_min(1e-12)).argmin(-1)
+        e1, e2, e3 = V[:, :, 0], V[:, :, 1], V[:, :, 2]
+        c1, c2, c3 = torch.linalg.cross(e2, e3), torch.linalg.cross(e3, e1), torch.linalg.cross(e1, e2)
+        e1 = torch.where((k == 0)[:, None], c1, e1)
+        e2 = torch.where((k == 1)[:, None], c2, e2)
+        e3 = torch.where((k == 2)[:, None], c3, e3)
+        F = torch.stack([e1, e2, e3], -1)
+        return centre, F, rmax.clamp_min(1e-6)
+
+
+def _nan_safe(t):
+    """t with its incoming gradient's non-finite entries zeroed (backward only). The learned frame's gradient runs
+    through rotate_orientation's matrix-to-quaternion step (mxtaltools crystal_fd so3, a sqrt under torch.where), which
+    is NaN where the turned orientation is exactly the identity or a half turn about an axis; those rows then pass no
+    gradient into the frame head rather than poisoning the step."""
+    if t.requires_grad:
+        t.register_hook(lambda g: torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0))
+    return t
+
+
 class SplitAtomEncoder(nn.Module):
     """A molecule as an invariant trunk and a point stream (docs/design/conditional_ar_architecture.md §5.1).
 
@@ -538,10 +601,22 @@ class SplitAtomEncoder(nn.Module):
     level head included, can)."""
 
     def __init__(self, width, node_dim=128, convs=3, cutoff=10.0, radial=32, pooled_dim=128, max_neighbors=64,
-                 point_convs=None, chirality=0):
+                 point_convs=None, chirality=0, canonical='none'):
         super().__init__()
         from mxtaltools.models.graph_models.graph_neural_network import ScalarGNN
         from mxtaltools.models.modules.augmented_softmax_aggregator import AugSoftmaxAggregation
+        if canonical not in CANONICAL_FRAMES:
+            raise ValueError(f"canonical frame {canonical!r}: one of {CANONICAL_FRAMES}")
+        # canonical 'inertial' / 'learned' (nf canonical_frame): the point stream reads the atoms in a frame F computed
+        # from them (inertial_frame; 'learned' adds per-atom weighted displacement vectors from the invariant trunk,
+        # Gram-Schmidt, the head's last layer zero so it starts at the inertial frame), and forward(..., return_frame=
+        # True) also returns F, which the flow uses to re-express the orientation rows (ConditionalLatentFlow.to_base)
+        self.canonical = canonical
+        if canonical == 'learned':
+            self.frame_head = nn.Sequential(nn.Linear(node_dim + 1, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(),
+                                            nn.Linear(64, 2))
+            nn.init.zeros_(self.frame_head[-1].weight)
+            nn.init.zeros_(self.frame_head[-1].bias)
         self.cutoff, self.max_neighbors = float(cutoff), int(max_neighbors)
         point_convs = convs if point_convs is None else int(point_convs)
         gnn = dict(node_dim=node_dim, fcs_per_gc=1, message_dim=node_dim // 2, embedding_dim=node_dim,
@@ -557,19 +632,55 @@ class SplitAtomEncoder(nn.Module):
         self.p_out = nn.Linear(node_dim, pooled_dim)
         self.tok = nn.Linear(node_dim, width)
 
-    def forward(self, z, pos, n, key=None):
+    def forward(self, z, pos, n, key=None, return_frame=False):
         """z [u, a] atomic numbers (0 = padding), pos [u, a, 3], n [u] atoms per molecule -> point tokens
-        [u, a, width], mask [u, a], s [u, pooled_dim] (invariant), p [u, pooled_dim] (frame-dependent). key: the atom
-        table's molecule-set key (_atom_graph)."""
+        [u, a, width], mask [u, a], s [u, pooled_dim] (invariant), p [u, pooled_dim] (frame-dependent; invariant too
+        under a canonical frame), and with return_frame the frame F [u, 3, 3] (float64, proper; the identity when
+        canonical is 'none'). key: the atom table's molecule-set key (_atom_graph)."""
         u, a = z.shape
         mask, batch, zf, pf, ptr, edges, flat = _atom_graph(self, z, pos, n, key)
         zf = zf.to(pos.dtype)[:, None]
         x0 = zf if self.chiral is None else torch.cat([zf, self.chiral(pf, edges)], -1)
         h = self.gnn(x0, pf, batch, edges)                       # [nodes, node_dim], rotation invariant
         s = self.s_out(self.s_pool(h, batch, dim_size=u))
-        pt = self.point(torch.cat([zf, h, self.pos_emb(pf)], -1), pf, batch, edges)  # [nodes, node_dim]
+        F, pc = None, pf
+        if self.canonical != 'none':
+            F, centre = self._frame(h, pf, zf[:, 0] > 1, batch, u)
+            # the atoms in the frame: u_i = F^T (y_i - centre), invariant; the radius graph and the trunk keep the
+            # presented positions (distances only), so _atom_graph's cache stays valid
+            pc = torch.einsum('nij,ni->nj', F[batch], pf.to(torch.float64) - centre[batch]).to(pf.dtype)
+        pt = self.point(torch.cat([zf, h, self.pos_emb(pc)], -1), pc, batch, edges)  # [nodes, node_dim]
         p = self.p_out(self.p_pool(pt, batch, dim_size=u))
-        return self.tok(_scatter_nodes(pt, flat, u, a)), mask, s, p
+        out = (self.tok(_scatter_nodes(pt, flat, u, a)), mask, s, p)
+        if return_frame:
+            if F is None:
+                F = torch.eye(3, dtype=torch.float64, device=pos.device).expand(u, 3, 3)
+            out = out + (F,)
+        return out
+
+    def _frame(self, h, pf, heavy, batch, u):
+        """(F [u, 3, 3] float64 proper, centre [u, 3] float64) of the presented atoms: the inertial frame, or the
+        learned one (falling back to inertial below FRAME_FLOOR, with no gradient)."""
+        centre, F_in, r_mol = inertial_frame(pf, heavy, batch, u)
+        if self.canonical == 'inertial':
+            return F_in, centre
+        d = pf.to(torch.float64) - centre[batch]
+        a = self.frame_head(torch.cat([h, d.norm(dim=-1, keepdim=True).to(h.dtype)], -1)).to(torch.float64)
+        v = _scatter_sum(a[:, :, None] * d[:, None, :], batch, u)            # [u, 2, 3]
+        v1, v2 = F_in[:, :, 0] + v[:, 0], F_in[:, :, 1] + v[:, 1]
+        n1 = v1.norm(dim=-1, keepdim=True)
+        e1 = v1 / n1.clamp_min(1e-9)
+        w2 = v2 - (v2 * e1).sum(-1, keepdim=True) * e1
+        n2 = w2.norm(dim=-1, keepdim=True)
+        e2 = w2 / n2.clamp_min(1e-9)
+        F_l = torch.stack([e1, e2, torch.linalg.cross(e1, e2)], -1)
+        # v1, v2 start as the inertial unit axes; sigma compares the learned axes' lengths with the molecule's size,
+        # in the head's own units (each a_k-weighted sum of displacements, so Angstrom)
+        sigma = torch.minimum(n1[:, 0], n2[:, 0]) / r_mol
+        fall = sigma < FRAME_FLOOR
+        self.last_fallback_frac = float(fall.float().mean()) if u else 0.0
+        F = torch.where(fall[:, None, None], F_in, _nan_safe(F_l))
+        return F, centre
 
 
 class _ResMLP(nn.Module):
@@ -623,6 +734,10 @@ class _ContextFlow(nn.Module):
         # molecule pass per vector. 0 = the pooled vectors as the encoder gives them
         self.bottleneck = int(atoms.pop('bottleneck', 0) or 0) if atoms is not None else 0
         self.bottleneck_noise = float(atoms.pop('bottleneck_noise', 0.0) or 0.0) if atoms is not None else 0.0
+        # atoms['canonical'] (nf canonical_frame; split encoder only): 'inertial' or 'learned' encode the molecule in a
+        # frame F computed from its presented atoms (SplitAtomEncoder), and context_frame returns F per row for the
+        # orientation rows' re-expression (ConditionalLatentFlow.set_row_frame); 'none' = no frame
+        self.canonical = atoms.pop('canonical', 'none') if atoms is not None else 'none'
         # atoms['sym_ops']: the width of e_g (models/sym_ops.py::SymOpEncoder over the row's space group's operations),
         # read by the level head and the context beside the pooled molecule; 0 = none. Option A of the design: with g
         # given, the level is log Z(m, g)
@@ -691,7 +806,7 @@ class _ContextFlow(nn.Module):
             if self.encoder == 'none':   # the molecule route without an encoder: scalars and condition columns only
                 pooled = 0
             else:
-                self.atom_encoder = (SplitAtomEncoder(width, **atoms) if self.encoder == 'split'
+                self.atom_encoder = (SplitAtomEncoder(width, canonical=self.canonical, **atoms) if self.encoder == 'split'
                                      else AtomEncoder(width, **atoms))
                 pooled = (self.atom_encoder.s_out if self.encoder == 'split'
                           else self.atom_encoder.pool_out).out_features
@@ -787,18 +902,26 @@ class _ContextFlow(nn.Module):
         input in atom mode, else the embedded standardised condition and the standardised condition. While
         ConditionalLatentFlow.shared_context is open, a repeat call on the same tensor with gradients enabled returns
         the first such call's result (no-grad calls, the draws', are not kept)."""
+        return self.context_frame(c)[0]
+
+    def context_frame(self, c):
+        """(context_input(c), F [n, 3, 3] float64 per row, or None without a canonical frame): one encoder pass for
+        both, through the same memo."""
         memo = self._shared
         if memo is None or not torch.is_grad_enabled():
-            return self._context_input(c)
+            return self._context_full(c)
         hit = memo.get(id(c))
         if hit is None or hit[0] is not c:
-            hit = memo[id(c)] = (c, self._context_input(c))   # c is held, so its id is not reused inside the block
+            hit = memo[id(c)] = (c, self._context_full(c))   # c is held, so its id is not reused inside the block
         return hit[1]
 
     def _context_input(self, c):
+        return self._context_full(c)[0]
+
+    def _context_full(self, c):
         if not self.atoms:
             s = self.standardise(c)
-            return self.context(s), s
+            return (self.context(s), s), None
         cid = c[:, 0].round().long()
         key = getattr(self, 'atom_key', None)
         if self.atom_z is None:
@@ -840,9 +963,14 @@ class _ContextFlow(nn.Module):
             rest = torch.cat([self.sym_encoder.embed(groups.tolist()).to(dtype)[ginv], rest], -1)
         gkey = key if (key is not None and not self.frames) else None   # the graph is the table's only when unrotated
         if self.encoder == 'none':
-            return self.context(rest), rest
+            return (self.context(rest), rest), None
+        F_rows = None
         if self.encoder == 'split':
-            tokens, mask, s_inv, p = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey)
+            enc_out = self.atom_encoder(self.atom_z[mol], pos, self.atom_n[mol], key=gkey,
+                                        return_frame=self.canonical != 'none')
+            tokens, mask, s_inv, p = enc_out[:4]
+            if self.canonical != 'none':
+                F_rows = enc_out[4][inv]
             s_row, p_row = s_inv[inv], p[inv]
             if self.bottleneck:
                 s_row, p_row = self._squeeze(self.bn_s, s_row), self._squeeze(self.bn_p, p_row)
@@ -858,8 +986,8 @@ class _ContextFlow(nn.Module):
         if self.cross and self.sym_tokens:   # the row's group's operations beside its molecule's atoms
             ops, op_mask = self.sym_encoder.op_states(groups.tolist())
             op_tokens = (self.op_tok(ops.to(dtype)) + self.op_seg.to(dtype))[ginv]
-            return (vec, torch.cat([tokens[inv], op_tokens], 1), torch.cat([mask[inv], op_mask[ginv]], 1)), s
-        return ((vec, tokens[inv], mask[inv]) if self.cross else vec), s
+            return ((vec, torch.cat([tokens[inv], op_tokens], 1), torch.cat([mask[inv], op_mask[ginv]], 1)), s), F_rows
+        return (((vec, tokens[inv], mask[inv]) if self.cross else vec), s), F_rows
 
     def _squeeze(self, lin, v):
         """atoms['bottleneck']: tanh(lin(v)), plus N(0, bottleneck_noise^2) per row in training mode."""
@@ -902,12 +1030,35 @@ class ConditionalLatentFlow(nn.Module):
                                  n_blocks, n_bins, tuple(hidden), bound, seed, transformer=transformer, atoms=atoms,
                                  bounded_mask=[i in self.bounded_rows for i in live], frames=frames,
                                  describer=describer, mlp_ratio=mlp_ratio, level_hidden=level_hidden, mirror=mirror)
+        self._frame_rows = None   # set_row_frame: the orientation rows a canonical frame re-expresses
+
+    def set_row_frame(self, rows):
+        """canonical_frame (NFPolicy): the chart rows (theta, phi, r; energies.fd_coordinates.frame_rows) re-expressed
+        for the frame F the encoder computes per row (_ContextFlow.context_frame). The blocks then model the canonical
+        rows: to_base maps R -> R F (rotate_orientation(x, F^T), its Haar log-Jacobian added to log q), and sample /
+        rsample map a draw back, R_c -> R_c F^T. Every caller's x stays the presented (or standard) row."""
+        if self.flow.canonical == 'none':
+            raise ValueError("set_row_frame needs a flow built with a canonical frame")
+        self._frame_rows = tuple(int(r) for r in rows)
+
+    def _row_turn(self, x, F, inverse: bool):
+        """(x with its orientation rows re-expressed, log |dx'/dx| [n]): to the canonical frame (inverse False,
+        R -> R F) or back from it (inverse True, R -> R F^T)."""
+        from energies.fd_coordinates import rotate_orientation
+        if F is None:
+            raise RuntimeError("a canonical-frame flow got no frame for its rows (context_frame returned none)")
+        xt, lj = rotate_orientation(x, F if inverse else F.transpose(1, 2), rows=self._frame_rows)
+        return xt.to(x.dtype), lj.to(x.dtype)
 
     def to_base(self, x, c, detach_context: bool = False):
         f = self.flow
-        ctx = f.context_input(c)[0]
+        full, F = f.context_frame(c)
+        ctx = full[0]
         if detach_context:   # the blocks train, the condition's encoder does not (scramble_conditions)
             ctx = tuple(t.detach() for t in ctx) if isinstance(ctx, tuple) else ctx.detach()
+        lj_frame = None
+        if self._frame_rows is not None:
+            x, lj_frame = self._row_turn(x, F, inverse=False)
         x = x[:, self.live_idx]
         live = f.live_rows(x.shape[0])
         z = _pin(torch.where(f.is_wrap, _wrap(x), (x - f.mu) / f.sd), live)
@@ -919,6 +1070,8 @@ class ConditionalLatentFlow(nn.Module):
         for blk in f.blocks:
             z, l = blk(z, ctx, extra) if live is None else blk(z, ctx, extra, live)
             ld = ld + l
+        if lj_frame is not None:
+            ld = ld + lj_frame
         return z, ld
 
     def log_prob(self, x, c, detach_context: bool = False):
@@ -942,7 +1095,8 @@ class ConditionalLatentFlow(nn.Module):
     def sample(self, n, c, return_base: bool = False):
         f = self.flow
         dev, dtype = f.mu.device, f.mu.dtype
-        ctx = f.context_input(c)[0]
+        full, F = f.context_frame(c)
+        ctx = full[0]
         live = f.live_rows(n)
         z0 = _pin(torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
                               torch.randn(n, f.d, device=dev, dtype=dtype)), live)
@@ -957,6 +1111,8 @@ class ConditionalLatentFlow(nn.Module):
                 z = blk.invert(z, ctx, extra_of, live)
         x = torch.zeros(n, self.dim, device=dev, dtype=dtype)
         x[:, self.live_idx] = _pin(torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu), live)
+        if self._frame_rows is not None:   # the draw is a canonical row: back to the presented frame
+            x = self._row_turn(x, F, inverse=True)[0]
         return (x, z0) if return_base else x
 
     def set_bf16(self, on: bool):
@@ -979,7 +1135,8 @@ class ConditionalLatentFlow(nn.Module):
     def rsample(self, z0, c):
         """The draw sample() makes from base points z0, differentiable in the parameters."""
         f = self.flow
-        ctx = f.context_input(c)[0]
+        full, F = f.context_frame(c)
+        ctx = full[0]
         live = f.live_rows(z0.shape[0])
         z = _pin(z0, live)
         extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
@@ -987,6 +1144,8 @@ class ConditionalLatentFlow(nn.Module):
             z = invert_differentiable(blk, z, ctx, extra_of, live)
         x = torch.zeros(z0.shape[0], self.dim, device=z0.device, dtype=z0.dtype)
         x[:, self.live_idx] = _pin(torch.where(f.is_wrap, _wrap(z), z * f.sd + f.mu), live)
+        if self._frame_rows is not None:
+            x = self._row_turn(x, F, inverse=True)[0]
         return x
 
     def level(self, c):

@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 
 from models.architectures import LearnableScalar
-from models.spline_flow import ConditionalLatentFlow, LatentFlow
+from models.spline_flow import CANONICAL_FRAMES, ConditionalLatentFlow, LatentFlow
 
 # the flow's settings: inn_modeller.py's flags of the same names, with its defaults, so model.kind nf reproduces
 # its flow. 'auto' / None are resolved per route as it resolves them (resolve_flow_settings)
@@ -93,6 +93,14 @@ NF_PENDING_DEFAULTS = dict(
                                     # and the flow models the row's mirror image (fd_coordinates.py::mirror_state, then
                                     # the rotation); same condition, same log Z(c). Eval mode presents the standard
                                     # frame; train.py::Modeller.density_readouts logs <set>_mirror_shift
+    canonical_frame='none',         # 'inertial' / 'learned' (molecule route, atom_tokens 'split' or 'split_pooled', FD
+                                    # chart, no K-cut group): the split encoder computes a proper frame F from the atoms it
+                                    # is shown (heavy-atom principal axes, signed toward the farthest heavy atom;
+                                    # 'learned' adds weighted displacement vectors from the invariant trunk, starting at
+                                    # the inertial frame), its point stream reads the atoms in that frame, and the flow
+                                    # models the orientation rows re-expressed for it (R -> R F, Haar log-Jacobian); the
+                                    # presented frame then cancels, so rotate_frames leaves log q unchanged
+                                    # (models/spline_flow.py::ConditionalLatentFlow.set_row_frame). 'none' = off
 )
 ROW_TOKENS = ('plain', 'typed', 'prefix')
 CHIRAL_CHANNELS = 8
@@ -346,9 +354,16 @@ class NFPolicy(nn.Module):
             if float(s['cond_noise'] or 0.0) > 0 and not int(s['cond_bottleneck'] or 0):
                 raise ValueError("flow cond_noise is added to the tanh-bounded bottleneck: it needs cond_bottleneck > 0 "
                                  "(unbounded vectors could outgrow any noise)")
+            canon = s['canonical_frame']
+            if canon not in CANONICAL_FRAMES:
+                raise ValueError(f"flow canonical_frame {canon!r}: one of {CANONICAL_FRAMES}")
+            if canon != 'none' and (atoms is None or atoms['encoder'] != 'split'):
+                raise ValueError(f"flow canonical_frame {canon!r} is computed by the split encoder: it needs atom_tokens "
+                                 f"'split' or 'split_pooled'")
             if atoms is not None and atoms['encoder'] == 'split':
                 atoms['point_convs'] = s['atom_point_convs']
                 atoms['chirality'] = CHIRAL_CHANNELS if s['atom_chirality'] else 0
+                atoms['canonical'] = canon
             elif s['atom_point_convs'] is not None:
                 raise ValueError("flow atom_point_convs sets the split encoder's point stream: it needs atom_tokens "
                                  "'split' or 'split_pooled'")
@@ -382,6 +397,16 @@ class NFPolicy(nn.Module):
                                                  describer=describer, mlp_ratio=int(s['tf_mlp_ratio']),
                                                  level_hidden=int(s['level_hidden']),
                                                  frames=self._framed, mirror=bool(s['mirror_frames']))
+            if canon != 'none':
+                from energies.fd_coordinates import frame_rows
+                groups = (self.fd_slots.groups if self.fd_slots is not None
+                          else [fd_space_group] if fd_space_group is not None else None)
+                if groups is None:
+                    raise NotImplementedError("flow canonical_frame re-expresses the FD chart's orientation rows: it "
+                                              "needs energy_config.crystal_coordinates fd")
+                if self.orientation_rows is None:
+                    self.orientation_rows = frame_rows(groups)   # raises for the K-cut groups (6-9)
+                self.sampler.set_row_frame(self.orientation_rows)
             self.flow_model = _LevelHead(self.sampler)
             blocks = self.sampler.flow.blocks
             embed = nn.ModuleDict({'context': self.sampler.flow.context})

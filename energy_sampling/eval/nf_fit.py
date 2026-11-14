@@ -222,6 +222,10 @@ def rows_given_ctx(sampler, x, ctx, extra=None):
     (row_extra; they depend on x and the molecule, not on ctx), as block_context returns them."""
     from models.spline_flow import _rq_spline, _wrap
     f = sampler.flow
+    if getattr(sampler, '_frame_rows', None) is not None:
+        raise NotImplementedError("rows_given_ctx scores rows as given; a canonical-frame flow (nf canonical_frame) "
+                                  "re-expresses the orientation rows first (ConditionalLatentFlow.to_base), so its row "
+                                  "terms would not sum to log q")
     xl = x[:, sampler.live_idx]
     z = torch.where(f.is_wrap, _wrap(xl), (xl - f.mu) / f.sd)
     terms = torch.where(f.is_wrap, torch.zeros_like(f.sd), -torch.log(f.sd)).expand_as(z).clone()
