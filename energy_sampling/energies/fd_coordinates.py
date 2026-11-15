@@ -258,23 +258,39 @@ def rotate_orientation(s: torch.Tensor, R0: torch.Tensor, rows=(9, 10, 11)):
 
 
 #: The mirror image of a chart row: the molecule reflected, X -> diag(-1, 1, 1) X (its standard-frame coordinates),
-#: and the crystal re-described for it (in Sohncke-free groups the same crystal, the reflected molecule being its
-#: inverted copy). Per space group: (the centroid chart rows negated, A, B), the orientation R -> A R B, every other
-#: row unmoved. Measured 2026-11-09 against crystal_fd's canonicaliser on the same crystals with the handedness
-#: flipped (canon.canonicalize(desc.replace(h=-h), sheet=1)): every row of MIPCAS's P-1 eLJ band set (42,258) and
-#: NEHZOR's P2_1/c set (73,073) in description terms, and 4,000 of each in chart terms; tests/crystal/test_fd_mirror.py
-#: pins it on random chart points. A group not listed is refused (mirror_rows).
+#: and the crystal inverted through the origin, described for the reflected molecule. In a group with an improper
+#: operation (2, 14, 15, 61, 33) that is the same crystal, re-described; in a Sohncke group (4, 19) it is the
+#: enantiomorph crystal, so a mirrored row there carries the same energy only under a mirror-invariant energy (eLJ;
+#: not UMA/eSEN). Per space group: (the centroid chart rows negated, A, B), the orientation R -> A R B, every other
+#: row unmoved. 2 and 14 measured 2026-11-09 against crystal_fd's canonicaliser on the same crystals with the
+#: handedness flipped (canon.canonicalize(desc.replace(h=-h), sheet=1)): every row of MIPCAS's P-1 eLJ band set
+#: (42,258) and NEHZOR's P2_1/c set (73,073) in description terms, and 4,000 of each in chart terms. 15, 19, 4, 61 and
+#: 33 derived 2026-11-15 against the inverted crystal, canonicalised (the handedness flip is off_sheet in 4 and 19,
+#: and agrees with the inversion to 1e-15 elsewhere), exact to 6e-14 on 300 interior chart rows per group.
+#: tests/crystal/test_fd_mirror.py pins every entry on random chart points. A group not listed is refused
+#: (mirror_rows); Cc (9) and the other K-cut groups need more than an orientation-row map (KCUT_GROUPS).
 MIRROR_MAPS = {
     2: (('t_x', 't_y', 't_z'), (1.0, 1.0, 1.0), (1.0, -1.0, -1.0)),     # t -> 1/2 - t,  R -> R diag(1, -1, -1)
     14: (('t_y',), (1.0, -1.0, 1.0), (-1.0, 1.0, 1.0)),                 # t_y -> 1/2 - t_y,  R -> diag(1,-1,1) R diag(-1,1,1)
+    15: (('t_y',), (1.0, -1.0, 1.0), (-1.0, 1.0, 1.0)),                 # as 14
+    19: (('t_z',), (1.0, 1.0, -1.0), (-1.0, 1.0, 1.0)),                 # enantiomorph: t_z row negated, R -> diag(1,1,-1) R diag(-1,1,1)
+    4: ((), (1.0, -1.0, 1.0), (-1.0, 1.0, 1.0)),                        # enantiomorph: R -> diag(1,-1,1) R diag(-1,1,1)
+    61: (('t_z',), (1.0, 1.0, -1.0), (-1.0, 1.0, 1.0)),                 # t_z row negated, R -> diag(1,1,-1) R diag(-1,1,1)
+    33: ((), (1.0, 1.0, -1.0), (-1.0, 1.0, 1.0)),                       # R -> diag(1,1,-1) R diag(-1,1,1)
 }
 
 
 def mirror_rows(groups):
     """{sg: (flip [k] long chart-row indices, A [3, 3], B [3, 3])} for a run over ``groups`` (one group's chart rows,
     or the shared slots of several groups' FDSlotLayout): the inputs of mirror_state. Raises NotImplementedError for
-    a group without a measured map (MIRROR_MAPS) or a K-cut group (frame_rows)."""
+    a group without a measured map (MIRROR_MAPS) or a K-cut group (KCUT_GROUPS)."""
     groups = sorted({int(g) for g in groups})
+    kcut = [g for g in groups if g in KCUT_GROUPS]
+    if kcut:
+        raise NotImplementedError(f"no mirror map for the K-cut group sg {kcut}: the canonicaliser's fold can "
+                                  f"re-describe the crystal with a cell automorphism and an origin shift, so a frame "
+                                  f"change is not a map of the orientation rows alone (leave these groups out of "
+                                  f"mirror_frames runs)")
     frame_rows(groups)   # the orientation rows must be the shared hemisphere chart
     missing = [g for g in groups if g not in MIRROR_MAPS]
     if missing:

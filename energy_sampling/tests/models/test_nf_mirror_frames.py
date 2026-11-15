@@ -6,7 +6,7 @@ The molecule is reflected, X -> diag(-1, 1, 1) X, before its frame rotation, the
   * a training-mode backward score is the flow's log q of the mirrored (and rotated) row plus the maps'
     log-Jacobians, and a forward draw maps back to a standard-frame state whose log q is that score;
   * the identity frame of either parity column value +1 is the standard frame;
-  * a group without a measured mirror map is refused.
+  * a group without a measured mirror map, and the K-cut group Cc, are refused.
 
     python -m pytest -q tests/models/test_nf_mirror_frames.py
 """
@@ -59,7 +59,7 @@ def test_a_parity_minus_one_frame_is_the_molecule_reflected():
     assert float((v_q - v_std).abs().max()) > 1e-3   # the encoder sees the reflection
 
 
-@pytest.mark.parametrize('sg', (2, 14))
+@pytest.mark.parametrize('sg', (2, 14, 15, 19, 4, 61, 33))
 def test_a_mirrored_training_step_scores_the_mirror_image_plus_the_jacobian(sg):
     pol, mb, cond, x = _setup(sg)
     q = _mirror_frames()
@@ -107,7 +107,9 @@ def test_the_identity_frame_is_the_standard_frame():
 
 def test_mirror_frames_are_refused_without_a_map():
     with pytest.raises(NotImplementedError, match='no mirror map'):
-        _typed_policy(4, scale=0.0, atom_tokens='split', mirror_frames=True)
+        _typed_policy(1, scale=0.0, atom_tokens='split', mirror_frames=True)
+    with pytest.raises(NotImplementedError, match='K-cut'):   # Cc: refused before any map is looked up
+        _typed_policy(9, scale=0.0, atom_tokens='split', mirror_frames=True)
     with pytest.raises(ValueError, match='mirror_frames'):
         _typed_policy(2, scale=0.0, atom_tokens='scalars', mirror_frames=True)
 

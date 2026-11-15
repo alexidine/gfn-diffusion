@@ -179,6 +179,44 @@ def test_the_fast_rotation_is_exact_on_hemisphere_chart_groups(sg):
     assert float(d.abs().max()) < 1e-4, (sg, float(d.abs().max()))
 
 
+def _same_cell_moved(a, b, tol=1e-3):
+    """_same_cell up to a proper automorphism of a monoclinic (b unique) cell, x -> W x with W diag(1, 1, 1) or
+    diag(-1, 1, -1), and one global fractional shift: the moves the canonicaliser's fold may make on sg 6-9 (an
+    element of the Euclidean normaliser), which leave the crystal itself unchanged."""
+    for w in ((1.0, 1.0, 1.0), (-1.0, 1.0, -1.0)):
+        bw = b * torch.tensor(w, dtype=b.dtype)
+        for j in range(bw.shape[0]):
+            if _same_cell(a, bw + (a[0] - bw[j]), tol):
+                return True
+    return False
+
+
+def test_the_exact_reframe_builds_the_same_crystal_on_the_k_cut_group_cc():
+    """sg 9 (Cc): frame_rows refuses the K-cut orientation chart, so the fast rotation does not apply; the exact
+    reframe (canonicalised) must still give rows that build the same crystal and round-trip. On sg 9 the
+    canonicaliser's fold may re-describe the crystal by a normaliser element (a cell automorphism, an origin shift), so
+    cells are compared up to those moves (_same_cell_moved)."""
+    b = _crystals_sg(9, n=12, seed=9)
+    fd = FDCoordinates(9, RADIUS)
+    r = fd.from_params(b.full_cell_parameters(), b.aunit_handedness.reshape(-1))
+    assert bool(r.ok.all()), r.status
+    R0 = _frames(len(r.s), 49)
+    r2 = fd.reframe(r.s, R0)
+    assert bool(r2.ok.all()), r2.status
+    cell, ref = _frac_cell(b, r.s, fd)
+    cell2, got = _frac_cell(b, r2.s, fd, R0)
+    assert torch.allclose(cell, cell2, atol=1e-4)
+    assert all(_same_cell_moved(a, g) for a, g in zip(ref, got))
+    _, stale = _frac_cell(b, r.s, fd, R0)   # negative control: the row left as it was
+    assert not any(_same_cell_moved(a, g) for a, g in zip(ref, stale))
+    back = fd.reframe(r2.s, R0.transpose(1, 2))
+    assert bool(back.ok.all())
+    d = back.s - r.s
+    wrap = torch.tensor(fd.wrap_mask)
+    d = torch.where(wrap, d - 2 * torch.round(d / 2), d)
+    assert float(d.abs().max()) < 1e-4, float(d.abs().max())
+
+
 def test_frame_rows_refuse_the_k_cut_groups():
     from energies.fd_coordinates import frame_rows
     for sg in (6, 7, 8, 9):

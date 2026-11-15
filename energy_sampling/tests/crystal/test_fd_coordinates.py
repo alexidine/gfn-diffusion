@@ -28,7 +28,7 @@ from energies.fd_coordinates import FDCoordinates  # noqa: E402
 from mxtaltools.crystal_fd import canon, charts, measure  # noqa: E402
 
 F64 = torch.float64
-GROUPS = [1, 2, 7, 14, 92, 148]
+GROUPS = [1, 2, 4, 7, 14, 15, 19, 33, 61, 92, 148]
 RADIUS = 4.0
 
 
