@@ -10291,6 +10291,23 @@ class Modeller:
 
     @torch.no_grad()
     def density_readouts(self, n_rows: int = 4096, chunk: int = 1024):
+        """_density_readouts with an out-of-memory fallback: on a CUDA OOM the cache is emptied and the whole readout
+        is redone at half the chunk (the rows are fixed, so the numbers do not depend on the chunk), down to 32 rows;
+        the smaller chunk is kept for later evals. The training step's batch sizer can leave less free memory than a
+        1024-row chunk of the split atom encoder needs (2026-11-17: an augmented-MLE smoke crashed here at batch 40)."""
+        chunk = min(chunk, int(getattr(self, '_readout_chunk', chunk)))
+        while True:
+            try:
+                return self._density_readouts(n_rows, chunk)
+            except torch.OutOfMemoryError:
+                if chunk <= 32:
+                    raise
+                torch.cuda.empty_cache()
+                chunk //= 2
+                self._readout_chunk = chunk
+                print(f'density readouts: CUDA out of memory, retrying at chunk {chunk}', flush=True)
+
+    def _density_readouts(self, n_rows: int, chunk: int):
         """-log q of stored crystals under a policy with an exact density (policy.log_density; the NF), mean and P90
         per set, under InnModeller's names so the two trainers' curves read alike:
           eval_bwd/mle               the training rows (prior_dataset as loaded and filtered)
