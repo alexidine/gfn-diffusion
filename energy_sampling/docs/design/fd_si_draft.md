@@ -2,9 +2,12 @@
 
 - **Status:** DRAFT, 2026-11-02, documentation only. It is not adopted and has no authority over code, config or
   tests. Nothing here is committed without the owner's yes.
-- **Verified against:** MXtalTools `master` at `adb86928` (`mxtaltools/crystal_fd/` clean) and GFN `conditional`
-  at `2f17b75d`. One file differs in the GFN working tree: `energies/fd_coordinates.py` carries an uncommitted
-  length-box change from another session (§1.6, §5.3).
+- **Verified against:** MXtalTools `master` at `73e924e9`. Its `mxtaltools/crystal_fd/` is unchanged since
+  `adb86928`, the commit the 2026-11-02 attacks of §7 ran against. GFN `conditional` at `70451367`. The length box of
+  §1.6 is GFN `996d7320`.
+- **Revised 2026-11-17:** §7 adds the results of two adversarial attacks, each with its own oracle, on the four
+  properties the owner requires: uniqueness, bounds, metric, and Jacobian / volume accounting. §1.6, §3, §5 and §6 are
+  updated to match.
 - **Purpose:** an explanation of the FD chart that a referee can check, and the basis for SI text on the chart, the
   reduction, the metric, chirality handling, and what a generative model gains from the reduced basis.
 
@@ -261,6 +264,8 @@ ASU(Γ⁺/K), the K-cut face, and the fold's float tolerance band (|slack| ≲ 1
 | cell × pose product | [derived] for generic metrics | §1.2 note; special metrics are flagged, not resolved |
 | chart = FD (a uniform chart draw is its own canonical form) | [tested] | `test_higher_sg_charts.py`: rerun on 11 Day groups, 33/33 (FD audit); stress sweep of 230 groups, 2026-10-26 |
 | invariance under re-description, 26 Day groups | [tested] | FD audit: 40,000 random crystals per group, re-described by a random Γ⁺ element and lattice shift, max \|Δs\| 2.1e-12 |
+| invariance and congruence on real structures, at atom level, with an oracle independent of crystal_fd | [tested] | §7.1: 520 Day structures, each re-described 8 ways (settings, origins, bases, symmetry-equivalent molecule) by independent code; 0 failures; the canonical form is congruent to the CIF crystal to ≤ 1.7e-7 Å |
+| chart bounds = the FD (no face too tight or too loose) | [tested] | §7.2: inside/outside probes of 896 faces in 26 groups; the triclinic and monoclinic chart images equal an independently coded condition set |
 
 **What "exactly once" does not cover** [derived]. The FD quotients the crystal's descriptions, not the molecule's own
 symmetry. A molecule whose proper point group P⁺_mol has order σ appears σ times per crystal, at R and R·p for
@@ -294,16 +299,17 @@ coordinates (`FDCoordinates.wrap_mask`); every other coordinate is a bounded int
 | Pbca seams a = b and a = c, glued by the 3-cycle | glued seam; cone point a = b = c | wall | **no** |
 | cell-length box | support wall (truncation) | wall | n/a |
 
-**The length box is under revision** [open].
+**The length box** [convention, owner 2026-11-02; GFN `996d7320`, `energies/fd_coordinates.py::length_box`].
 
-- The committed adapter (`energies/fd_coordinates.py` at `2f17b75d`) bounds cell lengths with the old trainer
-  latent's per-axis box (`CrystalChart.for_latent_v1`).
-- That box excludes 1,464 of Day's 29,947 low-energy structures (4.9%) and 42 of 1,017 global minima [measured,
-  FD audit Table 5].
-- A replacement rule, one box for all three axes, [2.5 Å, 2Z(r + 3 Å)], with Z the number of molecules in the
-  conventional cell, holds every Day and CSD structure in the same audit [measured, search/prior session note of
-  2026-11-02]. It is pending owner sign-off.
-- An uncommitted implementation of that rule is in the working tree.
+- Every canonical cell length lies in [2.5 Å, 2Z(r + 3 Å)]. Z is the number of molecules in the conventional cell
+  at Z′ = 1 (`len(SYM_OPS[sg])`, centring included), and r is the molecule radius (`MolData.radius`). The same box
+  applies to all three axes.
+- It replaced the old trainer latent's per-axis box (`CrystalChart.for_latent_v1`). That box excluded 1,464 of
+  Day's 29,947 low-energy structures (4.9%) and 42 of 1,017 global minima [measured, FD audit Table 5].
+- Under the new box, every canonical cell of Day's selection (≤ 30 lowest per molecule within 10 kJ/mol; 29,947
+  structures) and of the CSD's Z′ = 1 rows (`csd_fd_v5`, 394,517) lies inside. The longest axis uses at most 0.97 of
+  the upper bound, and the shortest axis seen is 2.96 Å [measured, search/prior session note of 2026-11-02; quoted in
+  the `length_box` docstring].
 
 The FD itself (cell domain × pose) has no support truncation. Only the box truncates.
 
@@ -428,7 +434,9 @@ Each term is an approximate Cartesian displacement of one molecule, so d is a on
 
 **Status** [open]: d is the quotient distance only when the nearest images of the two crystals lie inside the
 expanded set. The class docstring states this as a working assumption to be checked empirically. Farther apart, d is
-an upper bound. The triangle inequality is not proven.
+an upper bound. The triangle inequality is not proven. `GluedFDMetric.distance` is symmetric by construction: it
+takes the smaller of the two one-sided searches, each of which expands one crystal's bases. §7.3 measures where the
+metric's internal correctness holds and where it does not.
 
 ### 3.2 Calibration against COMPACK
 
@@ -557,7 +565,8 @@ Consequences [derived, refutation report §2.1]:
   coordinates; s = −1 and s = +1 are then the same crystal. P-1 is the only Day group whose whole centroid block is a
   torus.
 - **An explicit reference measure with closed-form Jacobians** [derived; tested: gate 5 against autograd and central
-  differences; FD audit's 256 χ² tests on 26 Day groups found no pose-measure error]. The measure is
+  differences; FD audit's 256 χ² tests on 26 Day groups found no pose-measure error; §7.4: volumes and
+  push-forwards with independent samplers]. The measure is
 
   $$d\mu_{\rm ref}=\mathrm{Haar}(dR)\times V\,d^kt\times\mu_{\rm cell}(dc),$$
 
@@ -592,8 +601,8 @@ Consequences [derived, refutation report §2.1]:
     changes Z(P-1)/Z(P2₁/c) by (180/π)².
   - The physical polymorph free energy has no per-space-group constant (theory note §1.2). Slice weights between
     space groups are a declared convention, not a property of the chart.
-- **Support truncation** [open, §1.6]. The length box sets the support, so it changes log Z per (molecule, space
-  group). It is under revision.
+- **Support truncation** [convention, §1.6]. The length box sets the support, so it changes log Z per (molecule,
+  space group). The adopted box holds every Day and CSD structure measured.
 - **Molecular point symmetry** [convention, §4.3]. A symmetric molecule's density has |P⁺_mol| copies of every mode.
 - **Seams split basins** [open]. A basin straddling a twisted seam, the equator, the K cut or a cell face occupies two
   chart regions that the flow sees as walls.
@@ -601,15 +610,13 @@ Consequences [derived, refutation report §2.1]:
   - For Z′ = 2, 4–16% of CSD configurations lie within 0.1 Å of a twisted facet (`zprime_fd.md` Table 1) [measured].
 - **Special metrics** [open, §2.3]. These have measure zero, but they are where real crystals often sit, e.g. a
   float32 β of exactly 90°.
-- **Scope.** Z′ = 1 only. GFN's trainer refuses FD with more than one space group
-  (`MolecularCrystal.__init__`) [tested by reading, FD audit §1].
+- **Scope.** Z′ = 1 only. Since GFN `85707e66` the trainer carries FD state over several space groups
+  (`energies/fd_coordinates.py`, slot layout and mixed-group decode). That code is not reviewed in this draft.
 
 ### 5.3 The support box, stated for the SI
 
-**Under revision.** Today's committed chart is FD(G) ∩ {cell lengths in the trainer latent's per-axis box at the
-molecule radius}, which excludes 4.9% of Day's low-energy structures. A uniform box [2.5 Å, 2Z(r + 3 Å)] that
-excludes none is pending owner sign-off. The SI should give whichever box is adopted, with its coverage on Day and on
-the CSD.
+The chart is FD(G) ∩ {every canonical cell length in [2.5 Å, 2Z(r + 3 Å)]} (§1.6). It holds all 29,947 Day
+low-energy structures and all 394,517 CSD Z′ = 1 rows of the 2026-11-02 measurement.
 
 ---
 
@@ -629,19 +636,195 @@ the CSD.
 6. **No cross-space-group measure.** Relative SG weights rest on a declared slice convention (§5.2) and on a
    counting rule for mirror pairs (§4.3); both are owner decisions [open].
 7. **The cell measure** is a declared prior, not an invariant. It moves basin weights by ~2 nats in P2₁/c (§5.2).
-8. **The support box** is under revision (§5.3).
-9. **The metric:**
-   - it is calibrated on two molecules in two triclinic/monoclinic groups, on boundary-drawn pairs;
-   - axis-order faces are unglued;
+8. **The support box** is a convention (§1.6). Its coverage is measured on Day and the CSD, not on other systems.
+9. **The metric** (§7.3):
+   - it is calibrated against COMPACK on two molecules in two triclinic/monoclinic groups, on boundary-drawn pairs;
+   - orthorhombic axis-order faces are unglued: crystals 0.016 Å apart on a = b measure 4.6 Å (P2₁2₁2₁) and 7.1 Å
+     (Pbca), and 2.2% of Day's low-energy structures in those groups lie within 0.05 Å of such a face;
+   - its cell term depends on the basis: near the monoclinic face |c cos β| = a it reads up to 1.5× the
+     same-basis distance;
+   - for far pairs (d ≳ 1 Å) it is an upper bound and can fail the triangle inequality;
    - proper molecular point symmetry is not quotiented;
-   - it has no direct unit test (`GluedFDMetric` is exercised only through `tests/test_search_minima.py`);
-   - quotient exactness and the triangle inequality are working assumptions.
+   - it has no direct unit test (`GluedFDMetric` is exercised only through `tests/test_search_minima.py`).
+   Fixes are proposed in §7.5, not built.
 10. **Seam mass is unmeasured at Z′ = 1.** How much low-energy mass sits near twisted seams, where the flow sees a
     wall, is not known.
 11. **Day's enantiomer and pair-group coverage** is unverified: which enantiomer was searched, and whether pair
     groups count once (§4.3).
-12. **Modelling evidence is thin.** There are four single-SG phase-1 FD runs with one seed each, no phase-2 FD run,
-    and no multi-SG FD run (FD audit §6).
+12. **Modelling evidence is thin.** As of the FD audit of 2026-11-02, there were four single-SG phase-1 FD runs with
+    one seed each, no phase-2 FD run, and no multi-SG FD run (FD audit §6). This was not re-checked for this revision.
+
+---
+
+## 7. Adversarial verification (attacks of 2026-11-02, rechecked 2026-11-17)
+
+The owner set four conditions for being satisfied:
+1. the FD is unique;
+2. the bounds are what we say they are;
+3. the metric is internally correct;
+4. the Jacobian / volume accounting is correct.
+
+Two attackers each wrote their own oracle:
+- **Attack A:** real Day structures, scrambled and compared at atom level.
+- **Attack B:** chart faces and volumes.
+
+Every failure an attacker claimed was rerun in this session and is either confirmed below or refuted, with the
+reason. The scripts and logs are kept outside the repository, in the hub's session notes
+(`fd_attacks_nov02/{A,B,mine}`). Attack A's oracle imports nothing from crystal_fd for what it checks: CIF parsing,
+pose fitting, scrambling, the atom builder and the congruence fingerprint are its own code. crystal_fd's
+`settings.find_setting` is part of the pipeline under test.
+
+**Verdict** [tested]:
+- Conditions 1, 2 and 4 hold, apart from documented measure-zero exceptions.
+- Condition 3 holds for identity use away from cell faces. It has three measured defects: unglued orthorhombic faces,
+  a basis-dependent cell term near one monoclinic face, and an upper-bound regime for far pairs (§7.3).
+
+### 7.1 Uniqueness and congruence on real structures
+
+*Table 7. Attack A on 520 Day FIT+DMA structures, 20 per space group in all 26 groups, low-energy (within 10 kJ/mol
+of each molecule's minimum).*
+- Each structure was described 9 ways: the CIF, plus 8 random re-descriptions mixing a det +1 basis change that
+  leaves the standard setting, an origin shift on and off the 1/24 grid, a different symmetry-equivalent molecule and
+  a lattice translation.
+- 3,232 re-descriptions needed `find_setting`; 928 stayed in the standard setting.
+- Compare each deviation column against 0. Values near 1e-12 are float64 rounding.
+
+| quantity | value | reference |
+|---|---|---|
+| re-descriptions whose operator set the oracle's own algebra rejects (count) | 0 of 4,160 | 0 |
+| pose fit RMSD to each structure's own molecule (Å) | ≤ 1.7e-14 | rigid fit, ~1e-14 |
+| statuses over 4,680 descriptions (count) | 4,662 canonical, 18 special_metric (one sg 1 and one sg 7 structure, all 9 descriptions each) | – |
+| invariance failures: re-descriptions giving another canonical form (count) | 0 | 0 |
+| largest spread of one structure's canonical forms: cell (Å or rad) / t (fractional) / R (matrix entry) | 6.5e-12 (sg 13) / 1.7e-9 (sg 154) / 1.9e-12 (sg 96) | rounding |
+| canonical crystal vs CIF crystal, own isometry-invariant fingerprint (relative) / direct atom match (Å) | ≤ 4.4e-14 / ≤ 1.7e-7 (sg 154) | 1e-6 |
+| negative controls: canonical form perturbed by a 1e-5 rad rotation, a 1e-3 rad rotation, a handedness flip, a 0.05 shift in t (count detected) | 520 / 520 in each | all detected |
+| idempotence: canonical rows changed by a second canonicalisation (count) | 0 | 0 |
+| glued metric between a structure's canonical form and each re-description's (Å) | ≤ 1.8e-7 over 4,160 pairs | 0 (√ of rounding) |
+| distinctness: pairs of distinct Day structures (33 molecule × group sets, 853 structures, 11,191 pairs) within 0.05 Å (count) | 0, and the oracle calls none the same crystal | 0 |
+
+Notes:
+- The 1.7e-9 spread in sg 154 is numerical, not structural. It is 1.7e-7 Å at the atoms, far below any identity
+  tolerance. `find_setting` recovers arbitrary origin shifts exactly in sg 154 (residual 5.6e-16; sg 152: 3.3e-9).
+  The source of the remaining 1e-9 was not traced [open, negligible].
+- Edge cases built by hand behave as the README documents:
+  - an exact monoclinic face (β = 90°, |c cos β| = a) and exact special metrics give `special_metric`, and on those
+    the pose can depend on the input (2 canonical forms);
+  - 1e-9 rad off the face, all 9 descriptions give one canonical form.
+
+**One claimed failure refuted** (`repro_bc_face.py`). On the triclinic Niggli face b = c, the canonical cell has β
+and γ swapped relative to the input. Rerun: the output is congruent to the input crystal to 5e-15 Å. It is the other
+tie-break representative of the same lattice, chosen by the Gram key as the README documents. All re-descriptions
+still give one canonical form.
+
+### 7.2 Bounds
+
+*Table 8. Attack B, plus a spot check in this session: are the chart's bounds exactly the faces of the FD?*
+- Each probe point was set 1e-4 or 1e-6 inside or outside one face in u, then canonicalised.
+- An inside point must not move.
+- An outside point must move (a real face), cross to the other end (a circle), or stay put only at a length-box end
+  or an orientation-chart seam, which are not FD faces.
+- Groups: all 26 Day groups, length box [2.5, 60] Å.
+
+| check | result | reference |
+|---|---|---|
+| inside probes moved by canonicalisation (too-loose bound) | 0 of 35,840 (896 face × eps keys) | 0 |
+| outside probes left in place at an FD face (too-tight bound) | 0 | 0 |
+| negative controls: a cell, centroid or K-cut bound deliberately loosened or tightened (6 bounds) | detected 40/40, except the K-cut r bound loosened, 28/40: part of that face is the equator seam | detected |
+| spot check, this session (own comparison by description values; 8 groups, 50 points per face) | inside moved 0 at every face; outside moved 50/50 at every FD face; unmoved only at length-box ends and θ, r chart seams | as stated |
+| triclinic chart image vs an independent implementation of the shifted Niggli conditions | 0 disagreements over 200,000 chart draws and a 4,000,000-cell rejection pool (361,059 inside) | 0 |
+| monoclinic chart images (GLIDE sg 14, CENTRED sg 15, FREE sg 4) vs an independent implementation of the walls | 0 disagreements over 200,000 draws and 2,000,000-cell pools each | 0 |
+| `reduce_cell` vs the attacker's own Buerger reduction (LLL, then a [−3, 3] search), 3,000 random lattices | max relative Gram deviation 4.5e-13 | rounding |
+| orthorhombic allowed axis orders, derived independently, vs the chart's class (9 Day groups) | agree in 9/9 | – |
+| chart corners (two coordinates at 1e-6 of their ends) moved by canonicalisation | only points within 1.4e-12 of an ASU(Γ⁺) plane (76, 86, 145, 148, 154, 169) or at the orientation chart's pole; no moved point farther than 1e-8 from a plane | the fold's 1e-9 tolerance band (README) |
+
+### 7.3 The metric's internal correctness
+
+*Table 9. `GluedFDMetric` (default margin 1 Å), measured in this session and by attack A.*
+- "Same-basis distance" is the metric's own formula evaluated with the identity image, in the common unreduced basis
+  of two perturbed descriptions of one crystal.
+- "Clusters" are a crystal plus 12 perturbations, with lengths, angles, t and R perturbed by 0.1% or 1%.
+- Compare the "glued" and "same-basis" columns: a ratio above 1 means the glued distance reads larger than a valid
+  description pair does.
+
+| case | glued d vs same-basis distance | triangle violations | what it means |
+|---|---|---|---|
+| re-descriptions of one crystal (Table 7) | ≤ 1.8e-7 Å | – | invariant |
+| Day clusters in 13 groups (65 clusters, 5 per group) | glued d never above the same-basis distance by more than 1e-13 Å, except one pair (sadbii, sg 14: +1e-3 Å) | 0 in all 65 | correct off faces |
+| triclinic Niggli faces b = c, a = b (sg 1, 2) | ratio ≤ 1.025 (≤ 5.4e-3 Å) | 0 | small |
+| monoclinic face β = 90°, a = c (sg 14) | ratio 1.000 | 0 | glued exactly |
+| monoclinic face \|c cos β\| = a (sg 14, 15, 4) | ratio up to 1.50 (sg 14), 1.31 (sg 15, 4): +0.017 Å at 0.1% perturbation, +0.17 Å at 1% | 0 in this session's rerun; 4 (≤ 0.04 Å) in attack A's | **basis-dependent formula**: widening the search (36 → 76 bases, margin 1 → 8 Å) changes nothing, so no image is missed |
+| orthorhombic a = b, groups with more than one axis order (sg 19, 61) | 0.016 Å apart reads 4.57 Å (sg 19) and 7.14 Å (sg 61); ratios 340 and 593 | 0 | **unglued face**, as documented |
+| the same groups off the face (sg 19, a < b) | ratio 1.000 | 0 | correct |
+| one-axis-order group (sg 33, a = b) | ratio 1.000 | 0 | no face to glue |
+| distinct Day structures, far pairs (min d 0.6–4 Å, median 5–14 Å; 33 sets) | – | up to 6 per set, worst 1.94 Å; a wider image search removes all of them in the 4 monoclinic sets tested and cuts the triclinic one to 2 (0.28 Å) | **upper bound** for far pairs (finite image search), as documented |
+
+*Table 10. How many of Day's low-energy orthorhombic structures sit near an unglued axis-order face.*
+- Selection: ≤ 30 lowest per molecule within 10 kJ/mol, in the groups with more than one allowed axis order.
+- Distance to the face is the gap between the two lengths the face equates.
+- This session's selection, read straight from the CIFs and CSVs (`ortho_exposure.py`).
+- Compare each count column against the structures column.
+
+| space group (axis-order class) | structures (count) | gap < 0.05 Å (count) | gap < 0.1 Å (count) | gap < 0.5 Å (count) |
+|---|---|---|---|---|
+| 18 P2₁2₁2 (a ↔ b) | 138 | 3 | 6 | 12 |
+| 19 P2₁2₁2₁ (all six) | 1,995 | 78 | 122 | 377 |
+| 20 C222₁ (a ↔ b) | 64 | 1 | 2 | 6 |
+| 43 Fdd2 (a ↔ b) | 424 | 9 | 10 | 15 |
+| 56 Pccn (a ↔ b) | 362 | 2 | 3 | 12 |
+| 61 Pbca (cyclic) | 2,854 | 38 | 71 | 308 |
+| all | 5,837 | 131 (2.2%) | 214 (3.7%) | 730 (12.5%) |
+
+What this means for use [derived from Tables 9–10]:
+- As an identity test (cut 0.05 Å), the metric is sound away from cell faces.
+- Near an orthorhombic axis-order face, two copies of one minimum can read several Å apart and fail to merge. That
+  affects a few per cent of Day's orthorhombic structures.
+- Near the monoclinic face |c cos β| = a, a pair 0.047 Å apart in its shared basis can read 0.068 Å (attack A,
+  sg 15), straddling the cut.
+- Beyond about 1 Å, d is an upper bound, not a metric.
+- None of this touches the FD's uniqueness. It concerns only the distance between two FD points.
+
+### 7.4 Jacobian and volume accounting
+
+*Table 11. Integrals of the chart's reference density against independent computations.*
+- Chart integral = E_u[exp(log|det| + Σ log(hi − lo))] over uniform u, divided by vol(ASU) and by the Haar mass.
+- Length box [2.5, 60] Å.
+- ± is one Monte Carlo standard error.
+- Compare the two value columns; the "control" column shows that a deliberately wrong Jacobian fails.
+
+| block (group) | chart integral | independent value | control (wrong Jacobian) |
+|---|---|---|---|
+| triclinic cell (sg 2) | 0.13825 ± 0.00006 (B); 0.1378 ± 0.0003 (this session) | rejection MC with own Niggli conditions: 0.13821 ± 0.00003 and 0.13824 ± 0.00003 (160M each) | drop (1 − Λ): 0.0726; drop log(hi − lo): 0.1206; drop 1/sin: 0.1303 |
+| monoclinic GLIDE cell (sg 14) | 10.143 ± 0.003 (B); 10.154 ± 0.021 (this session) | rejection MC: 10.153 ± 0.007 (B); 10.153 ± 0.010 (this session) | drop 1/sin β: 9.744; wrong class bound: 35.38 |
+| monoclinic CENTRED cell (sg 15) | 10.145 ± 0.003 (B); 10.167 ± 0.021 | 10.155 ± 0.007 (B); 10.151 ± 0.010 | drop 1/sin β: 9.745 |
+| monoclinic FREE cell (sg 4) | 3.592 ± 0.001 (B); 3.587 ± 0.008 | 3.597 ± 0.005 (B); 3.599 ± 0.007 | drop 1/sin β: 3.525 |
+| orthorhombic cell, classes all / a ↔ b / cyclic / one (sg 19, 18, 61, 33) | 5.3494 ± 0.0045, 16.052 ± 0.007, 10.691 ± 0.007, 32.098 (B); sg 33 full chart 32.091 / 32.079 / 32.096 ± 0.021 (this session, 3 seeds) | closed form 5.3497, 16.0492, 10.6995, 32.0984 | drop log(hi − lo) |
+| tetragonal / hexagonal cell (sg 76, 148, 169) | 10.1000 | closed form (log 24)² = 10.1000 | – |
+| centroid ASU, all 26 groups | 1/\|Γ⁺/K\| exactly in box groups; within 1.02 σ in the 6 polytope groups | 1/\|Γ⁺/K\| | sheared 88, 96 without −log 2: 0.0625 vs 0.03125 |
+| centroid tiling, all 26 groups (20,000 random points each) | every point has exactly 1 image in ASU(Γ⁺) (2 in sg 7, 9: the K pair) | 1 (2) | – |
+| orientation, hemisphere chart | quadrature mass 1.0000; χ² vs own Haar sampler p = 0.88 (511 dof) | 1 | drop sin²(r/2) or sin θ: p = 0 |
+| orientation, K cut (sg 7, 9) | MC mass 0.4993 ± 0.0005 / 0.5001 ± 0.0005; χ² p = 0.32 | own Haar draws: P(R₀₀ ≥ 0) = 0.49997 ± 0.00025 | p = 0 |
+| pose push-forward at fixed cell (sg 2, 14, 19, 61, 7, 148): own physical draws (t uniform, Haar R, random h), 200,000 each, canonicalised; 21 marginal and pair tests | no p < 1e-3 (smallest 0.0033, sg 61; 0.083 on a 300,000 rerun) | density ∝ exp(log_reference) | drop sin²(r/2) or sin θ: p = 0 in 6 of 21 tests; drop the centroid term: fails only where that term is not constant (sg 148) |
+| cell push-forward, triclinic: lattices from a basis-invariant (Wishart) law, canonicalised, importance-weighted against the chart density, 200,000 draws | smallest p 0.061 and 0.088 (two Wishart degrees, 21 tests each) | chart density | – |
+
+One quadrature in attack B gave the K cut 0.49981, not 0.5. Its own Monte Carlo and MXtalTools' quadrature
+(`test_k_cut_chart.py`, to 1e-6) both give ½, so this reads as that grid's error at the ρ cusp.
+
+### 7.5 Proposed fixes (not built; FD code unchanged)
+
+- **M1. Glue the orthorhombic axis-order faces in `GluedFDMetric`.**
+  - What: for sg 16–74, expand B over its allowed axis orders, each with its origin shift (`axis_order.axis_orders(sg)`:
+    at most 6 bases). This is the same mechanism the monoclinic setting candidates use.
+  - Acceptance: the Table 9 a = b clusters in sg 19 and 61 read ratio ≤ 1.01, and the off-face rows are unchanged.
+- **M2. Make the cell term basis-independent near glued faces.**
+  - Either evaluate the cell term for both crystals in one common basis, the alternative that minimises it, rather
+    than comparing parameter lists; or replace (Δa, Δb, Δc, Δangles) with the RMS displacement of the three lattice
+    vectors after the basis is matched.
+  - Acceptance: the |c cos β| = a clusters in sg 4, 14 and 15 read ratio ≤ 1.01. Then rerun the COMPACK calibration
+    of §3.2, since the scale factor may move.
+- **M3. Say in the SI that d is an identity test below about 0.5 Å and an upper bound beyond.** This needs no code.
+  The minima library's 0.05 Å cut is inside the sound range, apart from the faces of M1 and M2.
+- **M4. A direct unit test of the metric** (gap 9): re-description invariance, symmetry, the face clusters of Table 9,
+  and the triangle inequality on local clusters.
 
 ---
 
@@ -675,6 +858,24 @@ the FD audit; and the cctbx equality checks, which need cctbx.
   `GroupTable.facets`.
 - GFN FD tests: **not run.** The `csd_mxt_gfn` venv does not import MXtalTools without a path setting, and
   `fd_coordinates.py` was being edited by another session. The FD audit ran them at `2f17b75d`: 55 passed.
+
+## Runs made for the 2026-11-17 revision
+
+All on CPU, each under 30 minutes. Scripts and logs are in the hub notes, `fd_attacks_nov02/mine/` (this session) and
+`A/`, `B/` (the attackers).
+
+- `repro_bc_face.py` (attack A) rerun: the triclinic b = c face output is congruent, 5e-15 Å. The claimed failure is
+  refuted.
+- `repro_sg154_origin.py` (attack A) rerun: `find_setting` origin residual 5.6e-16 in sg 154 and 3.3e-9 in sg 152.
+  The lead is refuted.
+- `analyze.py stage1_ownref.pkl` (attack A) rerun to completion: metric on re-descriptions ≤ 1.8e-7 Å.
+- `spot_faces.py`: an independent face probe in 8 groups.
+- `corners.py`: moved corner points all within 1.4e-12 of an ASU plane.
+- `face_glue.py`: the monoclinic-face excess is unchanged by a wider image search.
+- `tri_wide.py`: far-pair triangle violations removed by a wider image search.
+- `ortho_face.py`: orthorhombic a = b unglued face, and an off-face control.
+- `ortho_exposure.py`: Table 10.
+- `vol_check.py`, `vol33.py`: chart integrals against rejection Monte Carlo and closed forms.
 
 ## Sources
 
