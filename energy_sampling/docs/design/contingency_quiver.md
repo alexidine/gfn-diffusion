@@ -272,6 +272,13 @@ search ~1,000 core-h (72,464 molecules × 100 starts); K = 4 build ~8M scored ro
 - *Readouts:* MLIP-basin recall of the exp-6-seeded set within an energy window; how many exp-6 picks funnel into
   each MLIP basin.
 
+## G. Added 2026-11-17: active learning of the training set
+
+**G1. Outer-loop active learning across conditions (owner, 2026-11-17; candidate paper).** Train with TB on a
+growing D; each round, acquire conditions by a learned per-condition TB-residual head; on-policy draws scored before
+training double as overfitting probes. Refines E1/F2. Full note: `active_learning_loop_2026-11-17.md`. First test:
+retrospective condition-only acquisition on pool8. Nothing built or run.
+
 ## Sources
 
 Review lane reports from 2026-11-02 (hub scratchpad `review/`): `zc/zc_map.md`, `ar/critic_conditioner.md`,
