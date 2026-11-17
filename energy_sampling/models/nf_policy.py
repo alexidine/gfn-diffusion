@@ -243,6 +243,15 @@ class _LevelHead(nn.Module):
 class NFPolicy(nn.Module):
     GAUSS_PARAM_KEYS = ('means_f', 'logvars_f', 'diag_logvars_f', 'rho_f', 'means_b', 'logvars_b')
 
+    @torch.no_grad()
+    def shift_level(self, delta: float):
+        """Add delta to log Z(c) for every condition: the conditional level head's output bias (its last layer is
+        linear, so the shift is exact), or the unconditional scalar. train.py::Modeller.bootstrap_z_offset."""
+        if self.conditional:
+            self.sampler.flow.level.out[-1].bias.add_(float(delta))
+        else:
+            self.flow_model.scalar.add_(float(delta))
+
     def __init__(self, gfn_config: dict, flow: dict, seed: int = 0, fd_space_group=None, fd_space_groups=None,
                  fd_group_in_condition: bool = False):
         """fd_space_group: the one space group of an FD run (typed rows describe its chart). fd_space_groups: the

@@ -327,14 +327,15 @@ def test_gr_fired_reports_the_SLOPE_gate_only_not_the_ratchet():
 # the bare bootstrap_z, which regresses the head onto the tracker's ema_logw).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('arg', ['rollout', 'rollout:4000', 'train_conditioner', ''])
+@pytest.mark.parametrize('arg', ['rollout', 'rollout:4000', 'offset', 'offset:2000', 'train_conditioner', ''])
 def test_bootstrap_z_accepts_its_forms(arg):
     action = f'bootstrap_z:{arg}' if arg else 'bootstrap_z'
     st = _stage(on_enter=['rebuild_prior_by_churn', action])
     assert ('bootstrap_z', arg) in st.on_enter
 
 
-@pytest.mark.parametrize('arg', ['rollout:', 'rollout:many', 'rollouts', 'rollout:4000:2'])
+@pytest.mark.parametrize('arg', ['rollout:', 'rollout:many', 'rollouts', 'rollout:4000:2',
+                                 'offset:', 'offset:many', 'offsets', 'offset:2000:2'])
 def test_bootstrap_z_refuses_a_malformed_rollout_arg(arg):
     with pytest.raises(ValueError, match='bootstrap_z'):
         _stage(on_enter=[f'bootstrap_z:{arg}'])

@@ -1698,12 +1698,12 @@ class Stage:
                                  f"reseed_prior_from_dataset or reseed_prior_from_dataset:flush")
             if name == 'bootstrap_z' and arg and arg != 'train_conditioner':
                 parts = arg.split(':')
-                ok = parts[0] == 'rollout' and (len(parts) == 1
-                                                or (len(parts) == 2 and parts[1].isdigit()))
+                ok = parts[0] in ('rollout', 'offset') and (len(parts) == 1
+                                                            or (len(parts) == 2 and parts[1].isdigit()))
                 if not ok:
                     raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                      f"bootstrap_z, bootstrap_z:train_conditioner, "
-                                     f"bootstrap_z:rollout or bootstrap_z:rollout:<n>")
+                                     f"bootstrap_z:rollout[:<n>] or bootstrap_z:offset[:<n>]")
             if name == 'set_traj_checkpoint':
                 if str(arg).strip().lower() not in TRAJ_CKPT_TRUE + TRAJ_CKPT_FALSE:
                     raise ValueError(
@@ -2435,7 +2435,13 @@ class StageProtocol:
             # and the fill is then the only thing that moves it. A conditional
             # level head (no scalar) takes the same draw per condition: it feeds
             # the tracker, then the bare action's regression runs on it.
-            if arg.startswith('rollout'):
+            # 'offset' / 'offset:<n>': one forward draw sets the head's CONSTANT offset only (every condition shifted
+            # alike), for a TB stage entered from a weights-only load, whose tracker is empty
+            # (train.py::Modeller.bootstrap_z_offset)
+            if arg.startswith('offset'):
+                parts = arg.split(':')
+                self.m.bootstrap_z_offset(int(parts[1]) if len(parts) > 1 else None)
+            elif arg.startswith('rollout'):
                 parts = arg.split(':')
                 self.m.bootstrap_z_by_rollout(int(parts[1]) if len(parts) > 1 else None)
             else:

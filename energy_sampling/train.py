@@ -7770,6 +7770,64 @@ class Modeller:
               f"{rows.numel()} with >= {tracker.min_visits} rows; mean per-condition log w {target:.3f}; fitting the head")
         self.bootstrap_log_z()
 
+    def bootstrap_z_offset(self, n_samples=None):
+        """
+        Stage-entry action bootstrap_z:offset[:<n>]: shift log Z(c) by ONE constant, for every condition, to the
+        winsorized-Huber root (gflownet_losses.py::winsorized_z_root, knee fwd_loss_coeffs.beta) of the residuals
+        log w - log Z(c) over a forward rollout of n samples (default eval_num_samples, else the batch size). The
+        head's per-condition shape is left to its online fit.
+
+        WHY. A weights-only load into a TB stage carries no condition_log_z state, so the bare bootstrap_z (a
+        regression onto the tracker's ema_logw) has nothing to fit, and bootstrap_z:rollout fits only conditions with
+        condition_log_z.min_visits rows in its draw: with tens of thousands of conditions a rollout of a few thousand
+        gives it none. The head then opens where MLE left it, at 0, and walks to the forward level at the rate its
+        optimizer allows: pool8_big2_nov17_tb (wandb dh0y8yvg) opened 21 nats below and closed ~1.4 nats per 1k
+        steps, and its TB error over the first 11k steps was that walk, sqrt(logw_std^2 + gap^2), to 0.1 nats.
+
+        WHY THE HUBER ROOT. The forward emp_z sidecar moves the head with beta * smooth_l1(target, Z(c), beta), so the
+        head's shared offset comes to rest where the residuals' clipped mean is zero: a Huber location with knee beta,
+        not a mean. On a wide, skewed log w the two sit tens of nats apart (a local norbornane smoke: mean -46.7,
+        root -6.6 on one 2000-row eval), and a seed at the mean would hand the sidecar that gap to walk. emp_z's
+        targets are per-condition group means of forward groups of >= 2 rows; a uniform draw over many conditions is
+        nearly all singletons, so the root here is taken over rows, which matches it exactly only when groups are
+        singletons and is otherwise wider than the pair means by the within-condition spread.
+
+        A Z measurement, not an eval: no tracker, anchor or replay-buffer writes. Applied to every policy copy
+        (_policies). Left as loaded, with a line saying so, when the draw has under two finite rows or the root is not
+        identified (winsorized_z_root's ValueError, or a non-finite root).
+        """
+        n = int(n_samples or getattr(self.args, 'eval_num_samples', 0) or self.batch_size)
+        if not all(hasattr(p, 'shift_level') for p in self._policies()):
+            raise NotImplementedError("bootstrap_z:offset needs a policy with shift_level (models/nf_policy.py::"
+                                      "NFPolicy); use bootstrap_z:rollout on this route")
+        eval_discretizer = get_discretizer(trajectory_T(self.args))
+        fwd_stats, _ = self.fwd_eval_sampling(
+            self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False)
+        logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
+                - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
+        head = fwd_stats['log_flow'][:, 0].detach().flatten().double()
+        resid = logw - head
+        finite = torch.isfinite(resid)
+        if int(finite.sum()) < 2:
+            print(f"bootstrap_z_offset: {n} samples produced {int(finite.sum())} finite log w -- log Z left as loaded")
+            return
+        beta = float(self.args.fwd_loss_coeffs.beta)
+        try:
+            delta, se, frac = winsorized_z_root(resid[finite], beta)
+        except ValueError as e:
+            print(f"bootstrap_z_offset: no Huber root on {int(finite.sum())} rows ({e}) -- log Z left as loaded")
+            return
+        delta, se, frac = float(delta), float(se), float(frac)
+        if not math.isfinite(delta):
+            print(f"bootstrap_z_offset: Huber root {delta} on {int(finite.sum())} rows -- log Z left as loaded")
+            return
+        for p in self._policies():
+            p.shift_level(delta)
+        print(f"bootstrap_z_offset: {int(finite.sum())}/{n} finite forward samples; mean log w {float(logw[finite].mean()):.3f}, "
+              f"mean log Z(c) {float(head[finite].mean()):.3f} -> {float(head[finite].mean()) + delta:.3f} "
+              f"(shift {delta:+.3f} = Huber root of log w - log Z(c), knee {beta:g}, se {se:.3f}, "
+              f"{frac:.0%} of rows inside the knee; mean residual {float(resid[finite].mean()):+.3f})")
+
     def _bootstrap_scalar_by_rollout(self, logw):
         before = float(self.gfn_model.flow_model.scalar.detach())
         self._z_fill_P = None            # re-open the filter: take the whole gap
