@@ -8,6 +8,8 @@ Arms (one GPU each; every arm = pool8_big_nov15/make.py's config, the same data,
             runs), the tbhead recipe of the local phase-2 runs: fwd pooled_center 'head', bootstrap_z removed (a weights
             load carries no condition_log_z state), stage LR held at 0.2 x seed from step 0, the conditional buffer
             globals (COND_GLOBALS), fixed batch. Rotation and mirror augmentation off. Source: step 50,000.
+  tb_resume the tb run resumed from its own running checkpoint (same run_name, continue_from_checkpoint), cap
+            TB_RESUME_STEPS. Submit after tb has stopped: sbatch --array=6 submit_pool8_big2_nov17.sbatch.
   aug<N>k   augmented MLE (the local rotation recipe, semiS1): rotate_frames on, mirror off, canonical frame none,
             orient_grad_balance norm, rho 1; the MLE stage kept on the weights load (skip_if removed), its LR held at
             0.2 x seed from step 0 (the source's post-hold LR). AUG_STEPS steps. Source: step N x 1000.
@@ -34,7 +36,8 @@ SOURCE_RUN = 'pool8_big_nov15_big'
 SOURCE_SLUG = 'elj-pool8_p1_train_k4_metric-T2.5-7dae6f'   # utils.problem_slug of pool8_big_nov15/big.yaml
 TB_SOURCE_STEP = 50000
 AUG_SOURCE_STEPS = (10000, 20000, 30000, 40000, 50000)
-TB_STEPS = 60000            # a cap: the 2-day limit ends the run first
+TB_STEPS = 60000            # the tb arm's cap (it reached it in ~17 h at ~1.0 step/s, not the 2-day limit)
+TB_RESUME_STEPS = 200000    # tb_resume: the same run resumed from its own running checkpoint, to this total step
 AUG_STEPS = 15000
 TB_BATCH = 1412             # the source run's landed batch on an A100-80
 COND_GLOBALS = {            # the conditional-arm buffer globals of the local phase-2 (tbhead) runs
@@ -105,6 +108,11 @@ def arms(files, source_for):
         out[f'aug{s // 1000}k'] = aug_config(base, source_for(s))
     for name, cfg in out.items():
         cfg.update(run_name=name, tag=TAG)
+    # tb_resume: the tb run itself, continued (same run_name, so continue_from_checkpoint finds its own 'running'
+    # file; load_full restores optimizers, buffers, condition log Z and the step count), with a higher cap
+    res = copy.deepcopy(out['tb'])
+    res.update(checkpoint_name=None, load_weights_only=False, continue_from_checkpoint=True, epochs=TB_RESUME_STEPS)
+    out['tb_resume'] = res
     return out
 
 
@@ -132,6 +140,8 @@ if __name__ == '__main__':
             for st in proto:
                 if 'max_steps' in st:
                     st['max_steps'] = min(st['max_steps'], a.steps)
+            if name == 'tb_resume':
+                cfg['epochs'] = a.steps + 40
             (out / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
         print(f'local smoke configs in {out}')
     else:

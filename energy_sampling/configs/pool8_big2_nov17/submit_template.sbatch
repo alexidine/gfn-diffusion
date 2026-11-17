@@ -14,7 +14,7 @@
 
 # @TAG@ (make.py, from submit_template.sbatch): continuations of pool8_big_nov15/big (wandb vtba4cf5), weights-only from
 # its step archives, one arm per array task: @ARMS@ (index order). Docstring of make.py for each arm.
-# Submit one arm: sbatch --array=<index> submit_@TAG@.sbatch. Read: eval_test/mle and eval_bwd/mle_heldout_rows (held-out
+# Submit one arm: sbatch --array=<index> submit_@TAG@.sbatch (tb_resume only after tb has stopped). Read: eval_test/mle and eval_bwd/mle_heldout_rows (held-out
 # molecules / crystals), xcond/diag_lift_nats, Reasonable Sample Fraction, Excess Energy Nats P50; TB arm: eval_test/z_gap,
 # eval_fwd/ess_frac, under_coverage; aug arms: bwd/mle_orient and gradbal/*.
 module purge
@@ -44,7 +44,12 @@ fi
 for ARM in ${GROUP}; do
     if [ ! -f ${ARMS}/${ARM}.yaml ]; then echo "FATAL: missing config ${ARMS}/${ARM}.yaml" >&2; exit 1; fi
     SRC=$(awk '/^checkpoint_name:/{print $2}' ${ARMS}/${ARM}.yaml)
-    if [ -z "${SRC}" ] || [ "${SRC}" = "null" ] || [ ! -s ${CKDIR}/${SRC} ]; then
+    if [ "$(awk '/^continue_from_checkpoint:/{print $2}' ${ARMS}/${ARM}.yaml)" = "true" ]; then
+        RUN=$(awk '/^run_name:/{print $2}' ${ARMS}/${ARM}.yaml)
+        if ! ls ${CKDIR}/@TAG@_${RUN}_*_running.pt > /dev/null 2>&1; then
+            echo "FATAL: ${ARM} resumes run @TAG@_${RUN}, but ${CKDIR} has no running checkpoint for it" >&2; exit 1
+        fi
+    elif [ -z "${SRC}" ] || [ "${SRC}" = "null" ] || [ ! -s ${CKDIR}/${SRC} ]; then
         echo "FATAL: ${ARM} loads weights from ${CKDIR}/${SRC}, which is missing" >&2; exit 1
     fi
     cp ${ARMS}/${ARM}.yaml ${LOGS}/${ARM}_${SLURM_JOB_ID}.yaml

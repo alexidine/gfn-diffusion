@@ -9,12 +9,12 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool8big2
-#SBATCH --array=0-5
+#SBATCH --array=0-6
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8_big2_nov17/joblogs/%x_%A_%a.out
 
 # pool8_big2_nov17 (make.py, from submit_template.sbatch): continuations of pool8_big_nov15/big (wandb vtba4cf5), weights-only from
-# its step archives, one arm per array task: tb aug10k aug20k aug30k aug40k aug50k (index order). Docstring of make.py for each arm.
-# Submit one arm: sbatch --array=<index> submit_pool8_big2_nov17.sbatch. Read: eval_test/mle and eval_bwd/mle_heldout_rows (held-out
+# its step archives, one arm per array task: tb aug10k aug20k aug30k aug40k aug50k tb_resume (index order). Docstring of make.py for each arm.
+# Submit one arm: sbatch --array=<index> submit_pool8_big2_nov17.sbatch (tb_resume only after tb has stopped). Read: eval_test/mle and eval_bwd/mle_heldout_rows (held-out
 # molecules / crystals), xcond/diag_lift_nats, Reasonable Sample Fraction, Excess Energy Nats P50; TB arm: eval_test/z_gap,
 # eval_fwd/ess_frac, under_coverage; aug arms: bwd/mle_orient and gradbal/*.
 module purge
@@ -29,7 +29,7 @@ LOGS=${ARMS}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors
 mkdir -p ${LOGS}
 
-ARM_LIST=(tb aug10k aug20k aug30k aug40k aug50k)
+ARM_LIST=(tb aug10k aug20k aug30k aug40k aug50k tb_resume)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 
@@ -44,7 +44,12 @@ fi
 for ARM in ${GROUP}; do
     if [ ! -f ${ARMS}/${ARM}.yaml ]; then echo "FATAL: missing config ${ARMS}/${ARM}.yaml" >&2; exit 1; fi
     SRC=$(awk '/^checkpoint_name:/{print $2}' ${ARMS}/${ARM}.yaml)
-    if [ -z "${SRC}" ] || [ "${SRC}" = "null" ] || [ ! -s ${CKDIR}/${SRC} ]; then
+    if [ "$(awk '/^continue_from_checkpoint:/{print $2}' ${ARMS}/${ARM}.yaml)" = "true" ]; then
+        RUN=$(awk '/^run_name:/{print $2}' ${ARMS}/${ARM}.yaml)
+        if ! ls ${CKDIR}/pool8_big2_nov17_${RUN}_*_running.pt > /dev/null 2>&1; then
+            echo "FATAL: ${ARM} resumes run pool8_big2_nov17_${RUN}, but ${CKDIR} has no running checkpoint for it" >&2; exit 1
+        fi
+    elif [ -z "${SRC}" ] || [ "${SRC}" = "null" ] || [ ! -s ${CKDIR}/${SRC} ]; then
         echo "FATAL: ${ARM} loads weights from ${CKDIR}/${SRC}, which is missing" >&2; exit 1
     fi
     cp ${ARMS}/${ARM}.yaml ${LOGS}/${ARM}_${SLURM_JOB_ID}.yaml
