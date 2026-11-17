@@ -552,6 +552,7 @@ class Modeller:
         `_MAX_LOG_FAILURES` consecutive publishes re-raises -- at that point the
         run is unreadable and continuing would burn the card for nothing.
         """
+        metrics['global_step'] = int(self.step_ind) + int(getattr(self, 'step_offset', 0) or 0)
         try:
             wandb.log(metrics, step=self.step_ind, commit=True)
         except Exception as e:  # noqa: BLE001 - telemetry only
@@ -5135,6 +5136,10 @@ class Modeller:
                          name=self.run_name,
                          tags=[self.args.tag] + (['smoke'] if getattr(self.args, 'smoke', False) else []))):
             self.times['initialization_start'] = time()
+            # every chart's x-axis: the step counted from the weights' origin (checkpointing MODELLER_STATE_DEFAULTS
+            # step_offset); equal to the step on a fresh run
+            wandb.define_metric('global_step')
+            wandb.define_metric('*', step_metric='global_step')
 
             # up before anything else so the occupancy trace covers init too -- the
             # MLIP load and the whole-prior scan are minutes of card time that the

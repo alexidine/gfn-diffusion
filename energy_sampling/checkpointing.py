@@ -17,6 +17,11 @@ from models.nf_policy import FRAME_ONLY_KEYS, LOSS_ONLY_KEYS, PRECISION_ONLY_KEY
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
+    # THE SOURCE'S STEP, for labels only. A weights-only warm start trains from step_ind 0 (stages, schedules and
+    # counters start fresh), but its curves and archives should read on from where the weights came from: wandb logs
+    # global_step = step_ind + step_offset (the x-axis of every chart) and step archives are named by it.
+    # load_weights_only sets it to the source checkpoint's global step, so chains of warm starts accumulate.
+    'step_offset': 0,
     # rows the dataset-mode MLE draw has taken from prior_dataset (data/mle_passes = this / its rows); rides in the
     # checkpoint so a resumed MLE stage keeps counting its passes over the fixed set
     '_mle_rows_drawn': 0,
@@ -739,7 +744,7 @@ class Checkpointer:
         period = int(getattr(m.args, 'archive_period', 0) or 0)
         if period <= 0 or step <= 0 or step % period != 0:
             return None
-        tag = f'step{step}'
+        tag = f'step{step + int(getattr(m, "step_offset", 0) or 0)}'   # global step: a warm start's archives read on
         if step == self.resume_step:
             kept = [p for p in (self.path_for(tag), self.buffers_path(tag)) if os.path.exists(p)]
             if kept:
@@ -1164,6 +1169,10 @@ class Checkpointer:
         self._restore_pb_snapshot(checkpoint)
 
         m.gfn_model.train()
+        src = checkpoint.get('modeller_state') or {}
+        m.step_offset = int(src.get('step_ind', 0) or 0) + int(src.get('step_offset', 0) or 0)
+        print(f"checkpoint: weights from global step {m.step_offset}; this run's curves and step archives continue "
+              f"from there (global_step = step + {m.step_offset}), its training state starts at step 0")
         # read by the protocol's `skip_if: weights_loaded` (StageProtocol.begin): the
         # phase-2 entry from a weights-only warm start. Set only here, after the load
         # succeeded, so a failed load cannot skip a stage.
