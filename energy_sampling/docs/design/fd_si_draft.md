@@ -465,6 +465,15 @@ What the calibration supports [measured]:
   NEHZOR.
 - **It is not a benchmark matcher.** Matching relaxed samples to Day's FIT+DMA minima needs a tolerance of
   0.5–1.5 Å, where P(match) falls from 0.9 to 0.1. COMPACK, or an equivalent, remains the matcher there.
+- **Valid range: d is an identity test below about 0.5 Å and an upper bound beyond** [tested, §7.3].
+  - Below about 0.5 Å, d agrees with the same-basis distance of the pair, is invariant under re-description and
+    satisfies the triangle inequality. This was tested on clusters of up to 1% perturbations (d ≤ 0.4 Å) in 13 groups.
+    The one exception, at the monoclinic face |c cos β| = a, is M2.
+  - From about 1 Å, the nearest images can lie outside the finite search (lattice shifts ±1, bases within 1 Å of a
+    + b + c). d is then an upper bound and can fail the triangle inequality, by up to 1.9 Å among Day's distinct
+    structures.
+  - Use d to decide identity, with the 0.05 Å cut, and to rank near neighbours. Do not use it as a distance between
+    distinct polymorphs.
 - **Coverage is thin** [open]: two molecules in two groups (P-1, P2₁/c). Nothing in sg ≥ 16. No molecule with
   proper point symmetry. No randomly drawn pairs.
 
@@ -645,9 +654,10 @@ low-energy structures and all 394,517 CSD Z′ = 1 rows of the 2026-11-02 measur
      same-basis distance;
    - for far pairs (d ≳ 1 Å) it is an upper bound and can fail the triangle inequality;
    - proper molecular point symmetry is not quotiented;
-   - its only direct unit test is MXT `tests/fd/test_metric_axis_order.py`, which covers the orthorhombic faces;
-     the rest is exercised through `tests/test_search_minima.py`.
-   M2–M4 are proposed in §7.5, not built.
+   - direct unit tests: MXT `tests/fd/test_metric_axis_order.py` (orthorhombic faces) and
+     `tests/fd/test_metric_glued.py` (invariance, symmetry, local triangle inequality, triclinic and monoclinic
+     faces), the latter pinning the M2 excess at today's values.
+   M2 is proposed in §7.5, not built.
 10. **Seam mass is unmeasured at Z′ = 1.** How much low-energy mass sits near twisted seams, where the flow sees a
     wall, is not known.
 11. **Day's enantiomer and pair-group coverage** is unverified: which enantiomer was searched, and whether pair
@@ -754,7 +764,8 @@ still give one canonical form.
 | re-descriptions of one crystal (Table 7) | ≤ 1.8e-7 Å | – | invariant |
 | Day clusters in 13 groups (65 clusters, 5 per group) | glued d never above the same-basis distance by more than 1e-13 Å, except one pair (sadbii, sg 14: +1e-3 Å) | 0 in all 65 | correct off faces |
 | triclinic Niggli faces b = c, a = b (sg 1, 2) | ratio ≤ 1.025 (≤ 5.4e-3 Å) | 0 | small |
-| monoclinic face β = 90°, a = c (sg 14) | ratio 1.000 | 0 | glued exactly |
+| monoclinic face β = 90° (sg 14) | ratio 1.000 | 0 | glued exactly |
+| monoclinic face a = c, a face only of the FREE class (sg 4; M4's test) | ratio up to 1.048 | 0 | basis-dependent formula, small (attack A's "sg 14 a = c" row read 1.000 because a = c is not a face there) |
 | monoclinic face \|c cos β\| = a (sg 14, 15, 4) | ratio up to 1.50 (sg 14), 1.31 (sg 15, 4): +0.017 Å at 0.1% perturbation, +0.17 Å at 1% | 0 in this session's rerun; 4 (≤ 0.04 Å) in attack A's | **basis-dependent formula**: widening the search (36 → 76 bases, margin 1 → 8 Å) changes nothing, so no image is missed |
 | orthorhombic a = b, groups with more than one axis order (sg 19, 61) | before MXT `404e0e8f`: 0.016 Å apart read 4.57 Å (sg 19) and 7.14 Å (sg 61), ratios 340 and 593. Since: ratio 1.000 on a = b (sg 18, 19, 61), b = c (sg 19) and Pbca's a = c seam | 0 | **was an unglued face; fixed by M1** |
 | the same groups off the face (sg 19, a < b) | ratio 1.000 | 0 | correct |
@@ -838,11 +849,19 @@ The remaining fixes are proposed, not built:
     vectors after the basis is matched.
   - Acceptance: the |c cos β| = a clusters in sg 4, 14 and 15 read ratio ≤ 1.01. Then rerun the COMPACK calibration
     of §3.2, since the scale factor may move.
-- **M3. Say in the SI that d is an identity test below about 0.5 Å and an upper bound beyond.** This needs no code.
-  The minima library's 0.05 Å cut is inside the sound range, apart from the faces of M1 and M2.
-- **M4. A direct unit test of the rest of the metric** (gap 9; the orthorhombic faces are covered by M1's test):
-  re-description invariance, symmetry, the monoclinic and triclinic face clusters of Table 9,
-  and the triangle inequality on local clusters.
+- **M3. Say in the SI that d is an identity test below about 0.5 Å and an upper bound beyond. DONE** (owner
+  2026-11-17; §3.2, "Valid range"). The minima library's 0.05 Å cut is inside the sound range, apart from the face of
+  M2.
+- **M4. A direct unit test of the rest of the metric. DONE** (owner go 2026-11-17; MXT `b10e54ff`,
+  `tests/fd/test_metric_glued.py`, 30 tests, ~12 s, local, not pushed):
+  - re-description invariance in 7 groups (Γ⁺ element, lattice shift, setting-group basis change): d < 1e-6 Å;
+  - exact symmetry;
+  - off faces: glued d never exceeds the same-basis distance, and the triangle inequality holds;
+  - on faces: the triclinic Niggli faces within 5% (measured 3.2%); β = 90° exactly; FREE a = c within 10%
+    (measured 4.8%); |c cos β| = a within 1.6× (measured 1.5×, the M2 excess);
+  - control: unglued, every face reads more than 10× (measured 460–620×).
+
+  When M2 lands, tighten the face bounds to about 1.
 
 ---
 
