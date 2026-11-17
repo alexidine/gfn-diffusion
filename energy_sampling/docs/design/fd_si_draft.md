@@ -295,8 +295,8 @@ coordinates (`FDCoordinates.wrap_mask`); every other coordinate is a bounded int
 | hemisphere equator θ = π/2, glued by (φ, r) ↦ (φ + π, −r) | glued seam | wall | yes |
 | sg 6–9 cut face R₀₀ = 0, glued to itself by K | glued seam | wall | yes (Γ⁺ includes K) |
 | triclinic and monoclinic cell faces | glued by a basis change in S(G), or a mirror wall where the lattice on the face has an extra automorphism. Every monoclinic face is a mirror of the setting class, so a cell on it is a special metric | wall | yes: `GluedFDMetric` minimises over near-minimal bases (sg 1–15) |
-| orthorhombic a = b (and b = c in six-order groups) | mirror wall (special metric) | wall | **no**: axis-order faces are not glued |
-| Pbca seams a = b and a = c, glued by the 3-cycle | glued seam; cone point a = b = c | wall | **no** |
+| orthorhombic a = b (and b = c in six-order groups) | mirror wall (special metric) | wall | yes, since MXT `404e0e8f` (allowed axis orders; before it, no) |
+| Pbca seams a = b and a = c, glued by the 3-cycle | glued seam; cone point a = b = c | wall | yes, since MXT `404e0e8f` |
 | cell-length box | support wall (truncation) | wall | n/a |
 
 **The length box** [convention, owner 2026-11-02; GFN `996d7320`, `energies/fd_coordinates.py::length_box`].
@@ -420,7 +420,8 @@ Each term is an approximate Cartesian displacement of one molecule, so d is a on
   the K cut.
 - `GluedFDMetric` also minimises over B's near-minimal bases within `margin` = 1 Å of a + b + c. For sg 1–2 these are
   the 3,480 det +1 matrices with entries in {−1, 0, 1}. For sg 3–15 they are setting-class matrices with entries in
-  {−2, …, 2}, each with its origin shift. This glues the cell faces of sg 1–15.
+  {−2, …, 2}, each with its origin shift. This glues the cell faces of sg 1–15. For sg 16–74 they are the allowed
+  axis orders with their origin shifts (since MXT `404e0e8f`), which glues the axis-order faces and Pbca's seams.
   - The entry-2 range is needed. With entries ±1 only, five NEHZOR (P2₁/c) pairs that COMPACK matches at 0.02–0.09 Å
     measured 2.5–3.5 Å; their cells lie on the face |c cos β| = a, glued by c ↦ c + 2a [measured, 2026-10-28].
 - **Twin.** For a near-planar molecule, `twin_canonical` also compares B with the image of B under the mirror through
@@ -428,7 +429,6 @@ Each term is an approximate Cartesian displacement of one molecule, so d is a on
 
 **Not glued, and not quotiented** [derived]:
 
-- orthorhombic axis-order faces and Pbca's seams (sg ≥ 16 gets the identity basis only);
 - proper molecular point symmetry (C₂, C₃, … axes);
 - crystals related by the enantiomorph map (Γ⁺ only).
 
@@ -465,8 +465,8 @@ What the calibration supports [measured]:
   NEHZOR.
 - **It is not a benchmark matcher.** Matching relaxed samples to Day's FIT+DMA minima needs a tolerance of
   0.5–1.5 Å, where P(match) falls from 0.9 to 0.1. COMPACK, or an equivalent, remains the matcher there.
-- **Coverage is thin** [open]: two molecules in two groups (P-1, P2₁/c). Nothing in sg ≥ 16, where axis-order faces
-  are unglued. No molecule with proper point symmetry. No randomly drawn pairs.
+- **Coverage is thin** [open]: two molecules in two groups (P-1, P2₁/c). Nothing in sg ≥ 16. No molecule with
+  proper point symmetry. No randomly drawn pairs.
 
 ---
 
@@ -639,14 +639,15 @@ low-energy structures and all 394,517 CSD Z′ = 1 rows of the 2026-11-02 measur
 8. **The support box** is a convention (§1.6). Its coverage is measured on Day and the CSD, not on other systems.
 9. **The metric** (§7.3):
    - it is calibrated against COMPACK on two molecules in two triclinic/monoclinic groups, on boundary-drawn pairs;
-   - orthorhombic axis-order faces are unglued: crystals 0.016 Å apart on a = b measure 4.6 Å (P2₁2₁2₁) and 7.1 Å
-     (Pbca), and 2.2% of Day's low-energy structures in those groups lie within 0.05 Å of such a face;
+   - orthorhombic axis-order faces were unglued (crystals 0.016 Å apart on a = b read 4.6 Å in P2₁2₁2₁ and 7.1 Å
+     in Pbca); fixed in MXT `404e0e8f` (M1, §7.5);
    - its cell term depends on the basis: near the monoclinic face |c cos β| = a it reads up to 1.5× the
      same-basis distance;
    - for far pairs (d ≳ 1 Å) it is an upper bound and can fail the triangle inequality;
    - proper molecular point symmetry is not quotiented;
-   - it has no direct unit test (`GluedFDMetric` is exercised only through `tests/test_search_minima.py`).
-   Fixes are proposed in §7.5, not built.
+   - its only direct unit test is MXT `tests/fd/test_metric_axis_order.py`, which covers the orthorhombic faces;
+     the rest is exercised through `tests/test_search_minima.py`.
+   M2–M4 are proposed in §7.5, not built.
 10. **Seam mass is unmeasured at Z′ = 1.** How much low-energy mass sits near twisted seams, where the flow sees a
     wall, is not known.
 11. **Day's enantiomer and pair-group coverage** is unverified: which enantiomer was searched, and whether pair
@@ -676,8 +677,10 @@ pose fitting, scrambling, the atom builder and the congruence fingerprint are it
 
 **Verdict** [tested]:
 - Conditions 1, 2 and 4 hold, apart from documented measure-zero exceptions.
-- Condition 3 holds for identity use away from cell faces. It has three measured defects: unglued orthorhombic faces,
-  a basis-dependent cell term near one monoclinic face, and an upper-bound regime for far pairs (§7.3).
+- Condition 3 holds for identity use away from cell faces. Three defects were measured (§7.3):
+  - unglued orthorhombic axis-order faces, since fixed (M1, MXT `404e0e8f`);
+  - a basis-dependent cell term near one monoclinic face;
+  - an upper-bound regime for far pairs.
 
 ### 7.1 Uniqueness and congruence on real structures
 
@@ -753,12 +756,13 @@ still give one canonical form.
 | triclinic Niggli faces b = c, a = b (sg 1, 2) | ratio ≤ 1.025 (≤ 5.4e-3 Å) | 0 | small |
 | monoclinic face β = 90°, a = c (sg 14) | ratio 1.000 | 0 | glued exactly |
 | monoclinic face \|c cos β\| = a (sg 14, 15, 4) | ratio up to 1.50 (sg 14), 1.31 (sg 15, 4): +0.017 Å at 0.1% perturbation, +0.17 Å at 1% | 0 in this session's rerun; 4 (≤ 0.04 Å) in attack A's | **basis-dependent formula**: widening the search (36 → 76 bases, margin 1 → 8 Å) changes nothing, so no image is missed |
-| orthorhombic a = b, groups with more than one axis order (sg 19, 61) | 0.016 Å apart reads 4.57 Å (sg 19) and 7.14 Å (sg 61); ratios 340 and 593 | 0 | **unglued face**, as documented |
+| orthorhombic a = b, groups with more than one axis order (sg 19, 61) | before MXT `404e0e8f`: 0.016 Å apart read 4.57 Å (sg 19) and 7.14 Å (sg 61), ratios 340 and 593. Since: ratio 1.000 on a = b (sg 18, 19, 61), b = c (sg 19) and Pbca's a = c seam | 0 | **was an unglued face; fixed by M1** |
 | the same groups off the face (sg 19, a < b) | ratio 1.000 | 0 | correct |
 | one-axis-order group (sg 33, a = b) | ratio 1.000 | 0 | no face to glue |
 | distinct Day structures, far pairs (min d 0.6–4 Å, median 5–14 Å; 33 sets) | – | up to 6 per set, worst 1.94 Å; a wider image search removes all of them in the 4 monoclinic sets tested and cuts the triclinic one to 2 (0.28 Å) | **upper bound** for far pairs (finite image search), as documented |
 
-*Table 10. How many of Day's low-energy orthorhombic structures sit near an unglued axis-order face.*
+*Table 10. How many of Day's low-energy orthorhombic structures sat near an unglued axis-order face before M1, i.e.
+the exposure the fix removes.*
 - Selection: ≤ 30 lowest per molecule within 10 kJ/mol, in the groups with more than one allowed axis order.
 - Distance to the face is the gap between the two lengths the face equates.
 - This session's selection, read straight from the CIFs and CSVs (`ortho_exposure.py`).
@@ -776,8 +780,8 @@ still give one canonical form.
 
 What this means for use [derived from Tables 9–10]:
 - As an identity test (cut 0.05 Å), the metric is sound away from cell faces.
-- Near an orthorhombic axis-order face, two copies of one minimum can read several Å apart and fail to merge. That
-  affects a few per cent of Day's orthorhombic structures.
+- Before M1, two copies of one minimum near an orthorhombic axis-order face could read several Å apart and fail to
+  merge, affecting a few per cent of Day's orthorhombic structures. M1 removes this.
 - Near the monoclinic face |c cos β| = a, a pair 0.047 Å apart in its shared basis can read 0.068 Å (attack A,
   sg 15), straddling the cut.
 - Beyond about 1 Å, d is an upper bound, not a metric.
@@ -809,12 +813,25 @@ What this means for use [derived from Tables 9–10]:
 One quadrature in attack B gave the K cut 0.49981, not 0.5. Its own Monte Carlo and MXtalTools' quadrature
 (`test_k_cut_chart.py`, to 1e-6) both give ½, so this reads as that grid's error at the ρ cusp.
 
-### 7.5 Proposed fixes (not built; FD code unchanged)
+### 7.5 Fixes
 
-- **M1. Glue the orthorhombic axis-order faces in `GluedFDMetric`.**
-  - What: for sg 16–74, expand B over its allowed axis orders, each with its origin shift (`axis_order.axis_orders(sg)`:
-    at most 6 bases). This is the same mechanism the monoclinic setting candidates use.
-  - Acceptance: the Table 9 a = b clusters in sg 19 and 61 read ratio ≤ 1.01, and the off-face rows are unchanged.
+- **M1. Glue the orthorhombic axis-order faces in `GluedFDMetric`. BUILT** (owner go 2026-11-17; MXT `404e0e8f`,
+  local, not pushed).
+  - What: for sg 16–74, B is expanded over its allowed axis orders, each with its origin shift
+    (`axis_order.axis_orders(sg)`: 1, 2, 3 or 6 bases). This is the mechanism the monoclinic setting candidates
+    already use. The fold, the chart and canonicalisation are unchanged.
+  - Verified:
+    - the face clusters of Table 9 now read ratio 1.000 on a = b in sg 18, 19 and 61, on b = c in sg 19 and on Pbca's
+      a = c seam;
+    - off-face (sg 19), one-order (sg 33) and triclinic (sg 2) rows are unchanged;
+    - `tests/fd/test_metric_axis_order.py` passes (9 tests; its control, the plain `FDMetric`, reads more than 1 Å
+      across each face);
+    - `tests/test_search_minima.py` 24 passed; GFN `tests/crystal/test_tile_cover.py` 4 passed.
+  - Consequence: the minima library (`crystal_search/minima.py`) now merges orthorhombic copies across these faces,
+    as do GFN's `eval/fd_analysis`, `eval/exp6_recall/basins.py` and `tile_cover.py`, which use the same class.
+    Minima libraries or tile covers built before it in sg 18, 19, 20, 43, 56 and 61 may hold duplicates near a = b.
+
+The remaining fixes are proposed, not built:
 - **M2. Make the cell term basis-independent near glued faces.**
   - Either evaluate the cell term for both crystals in one common basis, the alternative that minimises it, rather
     than comparing parameter lists; or replace (Δa, Δb, Δc, Δangles) with the RMS displacement of the three lattice
@@ -823,7 +840,8 @@ One quadrature in attack B gave the K cut 0.49981, not 0.5. Its own Monte Carlo 
     of §3.2, since the scale factor may move.
 - **M3. Say in the SI that d is an identity test below about 0.5 Å and an upper bound beyond.** This needs no code.
   The minima library's 0.05 Å cut is inside the sound range, apart from the faces of M1 and M2.
-- **M4. A direct unit test of the metric** (gap 9): re-description invariance, symmetry, the face clusters of Table 9,
+- **M4. A direct unit test of the rest of the metric** (gap 9; the orthorhombic faces are covered by M1's test):
+  re-description invariance, symmetry, the monoclinic and triclinic face clusters of Table 9,
   and the triangle inequality on local clusters.
 
 ---
