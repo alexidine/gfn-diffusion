@@ -92,7 +92,8 @@ BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
 #: model.nf rotate_frames / mirror_frames: density_readouts also scores the first FRAME_SPREAD_ROWS fixed rows of each
 #: set in FRAME_SPREAD_K frames (fixed per eval by the seed; random rotations under rotate_frames, else the identity;
 #: under mirror_frames every second frame reflected) and logs <set>_frame_spread, the mean over rows of the std of
-#: -log q across the frames, and <set>_frame_shift, the mean over rows of (mean over frames - standard frame), nats;
+#: -log q across the frames, <set>_frame_shift, the mean over rows of (mean over frames - standard frame), and
+#: <set>_frame_mean / <set>_frame_p90, the mean / 90th percentile over rows of the row's mean over frames, nats (frame_readouts);
 #: under mirror_frames also <set>_mirror_shift, the mean over rows of (-log q with the molecule reflected, no
 #: rotation - standard frame). All are 0 for a flow whose density does not depend on the frame (or the mirror image)
 #: the molecule is presented in.
@@ -175,6 +176,26 @@ def _runs_grouped_vargrad(args, branch_coeffs) -> bool:
     return runs_grouped_vargrad(
         lambda k: float(getattr(branch_coeffs, k, 0) or 0),
         lambda k: float(getattr(fwd, k, 0) or 0))
+
+
+def frame_readouts(key, f_std, f_all) -> dict:
+    """The frame statistics of density_readouts for one readout set: f_std [rows] is each row's -log q in its standard
+    frame, f_all [rows, K] the same rows in K random frames (FRAME_SPREAD_K), nats. Rows with any non-finite value are
+    left out; no finite row, no keys.
+      <key>_frame_spread  mean over rows of the std of -log q across the K frames
+      <key>_frame_shift   mean over rows of (mean over the K frames - standard frame)
+      <key>_frame_mean    mean over rows of the row's mean -log q across the K frames: the random-frame -log q
+      <key>_frame_p90    90th percentile over rows of the row's mean -log q across the K frames: the random-frame
+                          tail, the frame-averaged counterpart of <key>_p90 (which is the standard frame, over all the
+                          set's readout rows rather than the first FRAME_SPREAD_ROWS)"""
+    okf = torch.isfinite(f_all).all(1) & torch.isfinite(f_std)
+    if not bool(okf.any()):
+        return {}
+    rows = f_all[okf]
+    return {f'{key}_frame_spread': float(rows.std(1).mean()),
+            f'{key}_frame_shift': float((rows.mean(1) - f_std[okf]).mean()),
+            f'{key}_frame_mean': float(rows.mean(1).mean()),
+            f'{key}_frame_p90': float(torch.quantile(rows.mean(1).double(), 0.9))}
 
 
 def generalisation_gaps(out, trained=None) -> dict:
@@ -10457,10 +10478,7 @@ class Modeller:
                 nll, log_ref = torch.cat(nll), torch.cat(log_ref)
                 if framed[1]:
                     f_std, f_all = torch.cat(framed[0]), torch.cat(framed[1])
-                    okf = torch.isfinite(f_all).all(1) & torch.isfinite(f_std)
-                    if bool(okf.any()):
-                        out[f'{key}_frame_spread'] = float(f_all[okf].std(1).mean())
-                        out[f'{key}_frame_shift'] = float((f_all[okf].mean(1) - f_std[okf]).mean())
+                    out.update(frame_readouts(key, f_std, f_all))
                     if framed[2]:
                         f_mir = torch.cat(framed[2])
                         okm = torch.isfinite(f_mir) & torch.isfinite(f_std)
@@ -10483,7 +10501,8 @@ class Modeller:
         print(f"density readouts at step {int(getattr(self, 'step_ind', 0))} (-log q, nats, mean over fixed rows): "
               + ', '.join(f"{k} {v:.3f}" for k, v in out.items() if k.count('/') == 1 and k.endswith(
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',
-                   'mle_bank', '_ref', '_gap', '_frame_spread', '_frame_shift', '_mirror_shift'))), flush=True)
+                   'mle_bank', '_ref', '_gap', '_frame_spread', '_frame_shift', '_frame_mean', '_frame_p90', '_mirror_shift'))),
+              flush=True)
         return out
 
     #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature
