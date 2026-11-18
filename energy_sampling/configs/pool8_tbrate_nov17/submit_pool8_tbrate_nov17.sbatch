@@ -9,11 +9,11 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool8tbrate
-#SBATCH --array=0-3
+#SBATCH --array=0-5
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8_tbrate_nov17/joblogs/%x_%A_%a.out
 
 # pool8_tbrate_nov17 (make.py, from submit_template.sbatch): four short TB arms from pool8_big_nov15/big step 50,000 (weights only),
-# each the pool8_big2_nov17 tb arm plus bootstrap_z:offset and one change: control lr4 fresh5 cmean (index order; make.py's docstring).
+# each the pool8_big2_nov17 tb arm plus bootstrap_z:offset and one change: control lr4 fresh5 cmean young bigbuf (index order; make.py's docstring).
 # Submit: sbatch submit_pool8_tbrate_nov17.sbatch (all four), or --array=<index> for one. Read, per 1k steps against control:
 # eval_test/logw_std_within, Excess Energy Nats P50, eval_bwd/jensen_z - eval_fwd/jensen_z; fresh5 also per energy call.
 module purge
@@ -28,7 +28,7 @@ LOGS=${ARMS}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors
 mkdir -p ${LOGS}
 
-ARM_LIST=(control lr4 fresh5 cmean)
+ARM_LIST=(control lr4 fresh5 cmean young bigbuf)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 

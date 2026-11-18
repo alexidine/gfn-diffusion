@@ -9,6 +9,13 @@ walking the head in, and ONE change each:
   fresh5    fwd_rollout_every 5 instead of 20 (replay rows four times fresher, four times the energy calls)
   cmean     fwd pooled_center 'mean' (mk_dev's) instead of 'head'
 
+Added 2026-11-18, after only fresh5 helped: control and fresh5 differ in replay row AGE (mean 1,087 vs 279 steps) and
+in REUSE (each row drawn ~20x vs ~5x), at the same 50k rows. Two arms complete the 2 x 2 in rollout rate x row age:
+  young     control with replay mean_residence_steps YOUNG_TAU: control's rate and reuse, fresh5's age, ~1/4 the rows
+  bigbuf    fresh5 with replay max_size BIGBUF_ROWS: fresh5's rate and reuse, control's age, ~4x the rows
+Age effect: young - control and fresh5 - bigbuf. Reuse effect: bigbuf - control and fresh5 - young. Submit only these
+two: sbatch --array=4,5 submit_pool8_tbrate_nov17.sbatch.
+
 Source: pool8_big_nov15_big step 50,000 (weights only; curves and archives continue from 50,000). STEPS steps each.
 Read, per 1k steps against control over the same steps: eval_test/logw_std_within, Excess Energy Nats P50,
 eval_bwd/jensen_z - eval_fwd/jensen_z; fresh5 also per energy call (rollout/n).
@@ -33,6 +40,8 @@ nov10 = big2.nov10
 TAG = 'pool8_tbrate_nov17'
 SOURCE_STEP = 50000
 STEPS = 10000
+YOUNG_TAU = 280         # fresh5's measured mean replay row age (replay_buffer_mean_age 279)
+BIGBUF_ROWS = 200000    # 4 x 50k: fresh5's admissions held for control's tau 1200 without overflow eviction
 
 
 def _stage(cfg):
@@ -72,6 +81,19 @@ def arms(files, source):
     assert vc['loss_coeffs']['fwd']['pooled_center'] == 'head'
     vc['loss_coeffs']['fwd']['pooled_center'] = 'mean'
     out['cmean'] = cmean
+
+    # the 2 x 2 in rollout rate x replay row age (owner 2026-11-18, after fresh5 alone helped): buffer size = admission
+    # rate x row age (Little), reuse per row = replay draws per step / admissions per step, so control (every 20, tau
+    # 1200) and fresh5 (every 5, the 50k cap evicting at random: mean age ~280) differ in BOTH age and reuse
+    young = copy.deepcopy(out['control'])      # control's rate and reuse, fresh5's age (~1/4 the rows)
+    rb = young['buffers']['replay_buffer']
+    assert rb['mean_residence_steps'] == 1200 and rb['max_size'] == 50000, rb
+    rb['mean_residence_steps'] = YOUNG_TAU
+    out['young'] = young
+
+    bigbuf = copy.deepcopy(out['fresh5'])      # fresh5's rate and reuse, control's age (~4x the rows)
+    bigbuf['buffers']['replay_buffer']['max_size'] = BIGBUF_ROWS
+    out['bigbuf'] = bigbuf
 
     for name, cfg in out.items():
         cfg.update(run_name=name, tag=TAG)
