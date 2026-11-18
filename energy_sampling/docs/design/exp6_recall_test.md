@@ -223,3 +223,13 @@ higher-level reference. Separately, UMA-s absolute lattice energies are inflated
 (naphthalene −151, acetic acid −154 kJ/mol at the experimental structures against reference values near −82 and −73):
 the gas leg uses the `omc` task without periodic boundaries, and OMC25 holds crystals only. For a rigid molecule the
 constant cancels in every within-molecule comparison.
+
+**Across molecules (observation, 2026-11-18; `eval/exp6_recall/csd_parity.py`, outputs
+`D:/crystal_datasets/exp6_recall_nov10/csd_parity_nov18/`, plot `csd_parity.png`).** 2,000 random CSD Z'=1 organic
+crystals (test split of `test_new_prot_csd.pt`, MACE-OFF24's elements, ≤ 60 atoms), single points at the experimental
+geometry: MACE-OFF24 against UMA-s (mirror-averaged in the 573 chiral-group crystals) has Pearson 0.96, Spearman 0.94;
+UMA-s is lower by 26.8 kJ/mol on average with an sd of 12.2 kJ/mol per crystal (the same in achiral and chiral groups).
+The sd mixes the two models' disagreement with UMA-s's per-molecule gas-leg offset, so it does not measure
+within-molecule ranking. UMA-s's mirror error at these experimental structures is small: R(x) − R(σx) has mean −0.03
+and sd 0.59 kJ/mol, tails to ±5, against sd 1.9–2.3 kJ/mol (and an 8 kJ/mol mean for acetic acid) at the exp-6 minima
+of the mirror test above. 3 crystals with a positive lattice energy under either model are left out of the plot.
