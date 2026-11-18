@@ -201,3 +201,25 @@ two hydrogen-bonding molecules it is not an offset: it varies by several kJ/mol 
 structure is lowest, and moves the relaxed minima (some into a different basin, up to 2.6 Å). Raw UMA-s in a chiral
 group is therefore not usable for polar molecules without the mirror average. The part of the error that does not
 change sign under a mirror remains unmeasured.
+
+**MACE-OFF24 against UMA-s 1.1 (observation, 2026-11-18; `eval/exp6_recall/mace_vs_uma.py`, outputs
+`D:/crystal_datasets/exp6_recall_nov10/mace_vs_uma_nov18/`).** Agreement, not correctness: neither is a reference.
+
+| structures compared | n | rank correlation (Spearman) | sd of the difference in relative energy (kJ/mol) | max abs difference (kJ/mol) | same lowest | UMA-s top 10 in MACE top 10 |
+|---|---|---|---|---|---|---|
+| imidazole: UMA-s basin minima within 15 kJ/mol, MACE single points | 164 | 0.61 | 8.1 | 20.4 | no (UMA-s's lowest is MACE's 2nd) | 9 |
+| imidazole: the 30 lowest of those, relaxed under MACE-OFF24 | 30 | 0.69 | 4.1 | 10.5 | yes | 6 |
+| 2-pyridone (P2₁2₁2₁): 60 exp-6 minima, vs mirror-averaged UMA-s | 60 | 0.40 | 12.2 | 29.4 | no | 1 |
+| naphthalene (P2₁): same | 60 | 0.21 | 7.3 | 17.9 | no | 2 |
+| acetic acid (P2₁): same | 60 | 0.65 | 16.8 | 42.4 | no | 5 |
+| for scale: raw vs mirror-averaged UMA-s, acetic acid | 60 | 0.995 | 1.1 | 2.9 | no | 9 |
+
+Caption: relative energy = each model's lattice energy minus its own lowest in the set; sd of (MACE − UMA-s) relative
+energies after removing their mean. One search per molecule. The chiral-group rows are at exp-6 minima, off-minimum for
+both models. Under MACE-OFF24 the 30 imidazole UMA-s minima all move (FD median 0.39 Å, max 1.80 Å) and merge into 19
+minima; both models put the experimental structure lowest after relaxation. Reading: the two models disagree by
+several kJ/mol on relative energies, about ten times the mirror error of UMA-s; the choice between them needs a
+higher-level reference. Separately, UMA-s absolute lattice energies are inflated by a per-molecule constant
+(naphthalene −151, acetic acid −154 kJ/mol at the experimental structures against reference values near −82 and −73):
+the gas leg uses the `omc` task without periodic boundaries, and OMC25 holds crystals only. For a rigid molecule the
+constant cancels in every within-molecule comparison.

@@ -24,15 +24,15 @@ import os
 import yaml
 
 KT_KJ = 2.494339  # RT at 300 K, kJ/mol
-KT = {'elj': 6.859493755713105, 'exp6': KT_KJ, 'uma': KT_KJ}
+KT = {'elj': 6.859493755713105, 'exp6': KT_KJ, 'uma': KT_KJ, 'mace': KT_KJ}
 SITES = {
-    'local': dict(uma='D:/crystal_datasets/uma-s-1p1.pt'),
+    'local': dict(uma='D:/crystal_datasets/uma-s-1p1.pt', mace='D:/crystal_datasets/MACE-OFF24_medium.model'),
     'cluster': dict(uma='/scratch/mk8347/models/uma/uma-s-1p1.pt'),
 }
-SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96}  # starts in flight; the MLIP holds far fewer rows per call
+SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96, 'mace': 96}  # starts in flight; an MLIP holds far fewer rows per call
 # the polish's tolerance (kT); None: MXtalTools' default (1e-4, MLIP_TOL on an MLIP). exp-6's float32 energy repeats to
 # 5.5e-5 kT (imidazole, 2026-11-10), so at 1e-4 its polish stalled short of the test
-POLISH_TOL = {'elj': None, 'exp6': 1e-3, 'uma': None}
+POLISH_TOL = {'elj': None, 'exp6': 1e-3, 'uma': None, 'mace': None}
 # the 65 Sohncke space groups (no improper element): a crystal and its mirror image are different crystals
 SOHNCKE = {1, 3, 4, 5, *range(16, 25), *range(75, 81), *range(89, 99), *range(143, 147), *range(149, 156),
            *range(168, 174), *range(177, 183), *range(195, 200), *range(207, 215)}
@@ -71,6 +71,8 @@ def config(name, sg, energy, mode, panel_dir, out_dir, site, n=2000, seeds=None,
         # two are different crystals; in a group with an improper element the crystal is its own mirror image
         c['mlip_gas_reference'] = 'mirror_mean'
         c['mlip_mirror_average'] = int(sg) in SOHNCKE
+    if energy == 'mace':  # MACE-OFF24 (medium): exactly mirror-invariant, no parity keys
+        c['mace_predictor_path'] = SITES[site]['mace']
     return run, c
 
 
