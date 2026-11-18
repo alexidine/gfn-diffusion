@@ -233,3 +233,23 @@ The sd mixes the two models' disagreement with UMA-s's per-molecule gas-leg offs
 within-molecule ranking. UMA-s's mirror error at these experimental structures is small: R(x) − R(σx) has mean −0.03
 and sd 0.59 kJ/mol, tails to ±5, against sd 1.9–2.3 kJ/mol (and an 8 kJ/mol mean for acetic acid) at the exp-6 minima
 of the mirror test above. 3 crystals with a positive lattice energy under either model are left out of the plot.
+
+**Probe set for the crystal-trained MLIP (built 2026-11-18; `eval/exp6_recall/panel.py ... probes`, outputs
+`D:/crystal_datasets/exp6_recall_nov10/panel_probes_nov18/`).** MACE-CSP-25.2 (Hafizi, Gittins, Taylor, Day, ChemRxiv
+10.26434/chemrxiv.15000584, 2026; weights promised by the authors) is trained on molecules with no CH₃ and at most one
+OH, NH₂ or COOH rotor. On a 100,000-molecule sample of training pool v1, 13% meet those selection rules and 66% carry
+a CH₃. Seven of the eight panel molecules are inside them; acetic acid is not. The probes add Z' = 1 CSD crystals
+outside them, for the basin test once the weights arrive:
+
+| probe | CSD refcode (searched space group) | outside the training selection by | paired inside molecule |
+|---|---|---|---|
+| thymine | THYMIN01 (P2₁/c) | CH₃ | uracil |
+| p-toluic acid | PTOLIC01 (P-1) | CH₃ | benzoic acid |
+| acetanilide | ACANIL05 (Pbca) | CH₃, amide–aryl torsion | – |
+| paracetamol form I | HXACAN28 (P2₁/c) | CH₃, amide–aryl torsion, OH | – |
+| paracetamol form II | HXACAN31 (Pbca) | the same; a second polymorph of one molecule | – |
+
+Caption: every probe ingested exactly into its searched group (fit and residual below 3 × 10⁻⁵ Å), with the
+conformer of its own CSD entry held rigid, so torsions are frozen at the experimental values: the probes test methyl
+and torsion-bearing environments in packing, not torsional energies. MACE-OFF24 lattice energies at the five anchors
+(kJ/mol, unrelaxed): −164.9, −105.1, −112.7, −140.5, −145.1.

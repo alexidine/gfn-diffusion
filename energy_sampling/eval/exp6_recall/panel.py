@@ -11,7 +11,7 @@ Writes to OUT_DIR (a new folder; refuses to overwrite):
     panel.json        per molecule: refcode, CSD space group and Z', searched sg, ingest residual and fit, notes
 
 usage (licensed CSD Python API):
-    python -m eval.exp6_recall.panel OUT_DIR
+    python -m eval.exp6_recall.panel OUT_DIR [panel|probes]
 """
 import io
 import json
@@ -32,6 +32,17 @@ PANEL = [
     ('acridine', 'ACRDIN04', 14, None),  # 185 K, R 3.8%; ACRDIN11 has R 20.6%
     ('norbornane', None, 2, 'C1CC2CCC1C2'),
 ]
+# probes outside MACE-CSP-25.2's training selection (no CH3; at most one OH, NH2 or COOH rotor), each a Z' = 1 CSD
+# crystal: a methyl on an inside molecule (thymine ~ uracil, p-toluic acid ~ benzoic acid), and methyl + amide-aryl
+# torsion (acetanilide; paracetamol, + OH, in its two common forms)
+PROBES = [
+    ('thymine', 'THYMIN01', 14, None),
+    ('p_toluic_acid', 'PTOLIC01', 2, None),  # 100 K, R 2.1%
+    ('acetanilide', 'ACANIL05', 61, None),  # 100 K, R 2.5%
+    ('paracetamol_I', 'HXACAN28', 14, None),  # monoclinic form I, 85 K, R 1.6%
+    ('paracetamol_II', 'HXACAN31', 61, None),  # orthorhombic form II, 100 K, R 1.8%
+]
+SETS = {'panel': PANEL, 'probes': PROBES}
 
 XH = {6: 1.089, 7: 1.015, 8: 0.993}  # A, CSD normalised X-H lengths
 
@@ -76,7 +87,7 @@ def rdkit_mol(name, smiles):
                    radius=(pos.double() - pos.double().mean(0)).norm(dim=1).max().float(), do_mol_analysis=True)
 
 
-def main(out_dir):
+def main(out_dir, which='panel'):
     from ase.io import read
     from ccdc import io as ccdc_io
     from eval.day_bench.p1_ingest import ingest, make_reference, split_molecules
@@ -85,7 +96,7 @@ def main(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     reader = ccdc_io.EntryReader('CSD')
     record = {}
-    for name, refcode, sg, smiles in PANEL:
+    for name, refcode, sg, smiles in SETS[which]:
         rec = dict(refcode=refcode, sg_searched=sg)
         if refcode is None:
             mol = rdkit_mol(name, smiles)
@@ -116,4 +127,4 @@ def main(out_dir):
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(sys.argv[1], *sys.argv[2:3])
