@@ -1,6 +1,6 @@
 # Broadening the FD metric's calibration: plan
 
-- **Status:** PROPOSAL, 2026-11-18; simplified the same day at the owner's request. Nothing is built or run. It has
+- **Status:** RAN 2026-11-18 (owner go): record `docs/results/fd-metric-day-calibration-2026-11-18.md`. Simplified the same day at the owner's request. It has
   no authority over code, config or tests.
 - **Question:** does the glued FD distance (MXtalTools `crystal_fd/metric.py::GluedFDMetric`, MXT `073b821d`) track
   COMPACK beyond the two molecules it was calibrated on, in every crystal family?
