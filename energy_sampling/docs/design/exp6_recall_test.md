@@ -181,3 +181,23 @@ experimental structure, as FD (Å) and energy relative to UMA-s's own minimum fr
 a start in UMA-s's experimental basin; eLJ fails for imidazole and benzoic acid. This is the F1 question at one start
 per molecule, not the test. Open on UMA-s itself: benzoic acid (3.65 Å, closest H···O 1.28 Å) and naphthalene
 (2.37 Å) move far from experiment under the rigid-molecule UMA-s surface.
+
+**Mirror test (observation, 2026-11-18; `eval/exp6_recall/mirror_test.py`, outputs
+`D:/crystal_datasets/exp6_recall_nov10/mirror_test_nov18/`).** Is the part of the error that changes sign under a
+mirror a constant offset in a chiral group? Structures: the 60 lowest minima of a 600-start exp-6 search per molecule.
+R = raw UMA-s 1.1 lattice energy (mirror-mean gas reference), σx = the crystal inverted through the origin (same
+group). Construction check: 2·(averaged energy) − R(x) reproduces R(σx) to ≤ 0.011 kJ/mol.
+
+| molecule (group) | R(σx) − R(x), mean ± sd [range] (kJ/mol), 60 structures | spread of R(x) (kJ/mol) | rank correlation R(x) vs R(σx) | same lowest structure | paired raw-UMA-s minima: FD median / max (Å), pairs > 0.05 Å | minimum-energy difference, mean ± sd [range] (kJ/mol) |
+|---|---|---|---|---|---|---|
+| naphthalene (P2₁) | 0.00 ± 0.08 [−0.30, 0.29] | 16.8 | 0.999 | yes | 0.019 / 0.76, 2 of 20 | 0.02 ± 0.27 [−0.51, 0.51] |
+| 2-pyridone (P2₁2₁2₁) | −0.34 ± 1.88 [−5.34, 4.51] | 36.3 | 0.976 | no | 0.21 / 2.57, 19 of 20 | −0.06 ± 4.38 [−8.48, 9.98] |
+| acetic acid (P2₁) | 7.97 ± 2.28 [2.23, 12.07] | 56.6 | 0.983 | no | 0.13 / 1.75, 19 of 19 | 8.15 ± 3.97 [2.84, 20.05] |
+
+Caption: raw UMA-s single points on 60 structures per molecule, and raw UMA-s relaxations of x and of σx from the 20
+lowest (the mirror of σx's minimum compared with x's minimum; FD = symmetry-aware FD, metric M2, ~1.2× COMPACK RMSD;
+< 0.05 Å = same basin). One search per molecule. Reading: for the non-polar aromatic the error is negligible; for the
+two hydrogen-bonding molecules it is not an offset: it varies by several kJ/mol between structures, changes which
+structure is lowest, and moves the relaxed minima (some into a different basin, up to 2.6 Å). Raw UMA-s in a chiral
+group is therefore not usable for polar molecules without the mirror average. The part of the error that does not
+change sign under a mirror remains unmeasured.
