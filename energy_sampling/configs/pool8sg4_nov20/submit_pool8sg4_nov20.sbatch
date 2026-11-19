@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --mem=256G
+#SBATCH --mem=224G
 #SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
@@ -13,7 +13,7 @@
 
 # pool8sg4_nov20 (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms smoke smoke_cpu mle4 tb4 in index
 # order (make.py's docstring). Smokes first, --array=0,1 (smoke, smoke_cpu), and read them; then --array=2 (mle4);
-# tb4 (--array=3) only after `make.py --tb SOURCE` has written tb4.yaml. An A100 (any partition that has one) and 256 GB: the merged prior
+# tb4 (--array=3) only after `make.py --tb SOURCE` has written tb4.yaml. An A100 (any partition that has one) and 224 GB (the most one A100 job may ask, sbatch --test-only 2026-11-20): the merged prior
 # is ~4x P-1's (RAM) and the GPU holds two copies of its rows (VRAM); the smoke measures both (sacct MaxRSS, _smi.csv).
 module purge
 

@@ -7,7 +7,7 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
 ## Order on the cluster
 
 0. **Test file** (CPU, ~20-30 min, independent of step 1): `sbatch configs/pool8sg_prior_nov17/test4_uniform.sbatch`.
-1. **Check, then merge** (CPU, `prep_pool8sg4_nov20.sbatch`, 256 GB): `check_priors.py` compares the four training
+1. **Check, then merge** (CPU, `prep_pool8sg4_nov20.sbatch`, 256 GB; done 2026-11-20: 40.8M rows, 45.8 GB): `check_priors.py` compares the four training
    priors' manifests memory-mapped (seconds) and stops on anything `merge_noised_priors.py` would refuse; then the
    merge writes `pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt`, P-1 first. The check can also be run alone on
    a login node, before queueing the merge.
