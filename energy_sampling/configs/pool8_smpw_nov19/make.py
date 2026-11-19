@@ -7,7 +7,13 @@ FORCES=1, which writes <stem>_switched.pt), so the control is rerun on the same 
   control      bigbuf, switched energy
   sm<w>        + score matching on fwd, bwd and replay at weight w (score_rows 256 per branch, Huber knee 10; fwd and
                bwd forces live, replay forces recorded at admission)
-  pw<w>        + pathwise reverse KL at weight w (sticking the landing, on the rollout's own draw)
+  pw<w>c<k>    + pathwise reverse KL at weight w (sticking the landing, on the rollout's own draw), each row's gradient
+               norm in x capped at k (pathwise_grad_clip)
+
+Cut to four arms 2026-11-19 (owner, after the local 5k side-by-side on the K=0 setup, batch 120, scratch nov19/local5k):
+score 1e-3 and 1e-2 reshaped the score without moving sample quality in 1k steps; score 1.0 moved it hard (P50 +11
+nats at step 250, recovering after); pathwise 0.03 was inert at 1k; pathwise 0.1 unclipped aborted at step 173 on a
+raw gradient norm of 1.3e6 (the lr_ctrl disaster bar), hence the clip on the strong pathwise arm.
 
 Owner reading rule: for every arm report replay/tb_err against fwd/tb_err (replay below fwd = replay overfitting),
 beside eval_test/logw_std_within, Excess Energy Nats P50 and eval_bwd/jensen_z - eval_fwd/jensen_z per 1k steps
@@ -29,8 +35,8 @@ big, big2 = tbrate.big, tbrate.big2
 
 TAG = 'pool8_smpw_nov19'
 PRIOR = big.PRIOR[:-len('.pt')] + '_switched.pt'
-SM_WEIGHTS = (1e-4, 1e-3, 1e-2)
-PW_WEIGHTS = (0.01, 0.03, 0.1)
+SM_WEIGHTS = (1e-2, 1.0)
+PW_ARMS = ((1.0, 100.0),)        # (weight, pathwise_grad_clip)
 SCORE_ROWS = 256
 SCORE_BETA = 10.0
 
@@ -56,10 +62,11 @@ def arms(files, source):
         for mode in ('fwd', 'bwd', 'replay'):
             lc.setdefault(mode, {}).update(score=w, score_rows=SCORE_ROWS)
         out[f'sm{_tag(w)}'] = cfg
-    for w in PW_WEIGHTS:
+    for w, clip in PW_ARMS:
         cfg = copy.deepcopy(bigbuf)
-        tbrate._stage(cfg).setdefault('loss_coeffs', {}).setdefault('fwd', {})['pathwise'] = w
-        out[f'pw{_tag(w)}'] = cfg
+        tbrate._stage(cfg).setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(pathwise=w,
+                                                                                       pathwise_grad_clip=clip)
+        out[f'pw{_tag(w)}c{_tag(clip)}'] = cfg
     for name, cfg in out.items():
         # the source checkpoint names the unswitched prior; _switched is the same rows re-scored under the switched eLJ
         assert cfg['load_weights_only'] is True

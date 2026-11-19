@@ -9,11 +9,11 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool8smpw
-#SBATCH --array=0-6
+#SBATCH --array=0-3
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8_smpw_nov19/joblogs/%x_%A_%a.out
 
 # pool8_smpw_nov19 (make.py, from submit_template.sbatch): NF score-matching and pathwise reverse-KL arms beside the bigbuf control,
-# each pool8_tbrate_nov17 bigbuf from pool8_big_nov15/big step 50,000 on the switched eLJ: control sm0p0001 sm0p001 sm0p01 pw0p01 pw0p03 pw0p1 (index order).
+# each pool8_tbrate_nov17 bigbuf from pool8_big_nov15/big step 50,000 on the switched eLJ: control sm0p01 sm1 pw1c100 (index order).
 # Submit: sbatch submit_pool8_smpw_nov19.sbatch (all arms), or --array=<index> for one. Read, per 1k steps against control:
 # replay/tb_err vs fwd/tb_err, eval_test/logw_std_within, Excess Energy Nats P50, eval_bwd/jensen_z - eval_fwd/jensen_z.
 module purge
@@ -28,7 +28,7 @@ LOGS=${ARMS}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors
 mkdir -p ${LOGS}
 
-ARM_LIST=(control sm0p0001 sm0p001 sm0p01 pw0p01 pw0p03 pw0p1)
+ARM_LIST=(control sm0p01 sm1 pw1c100)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 
