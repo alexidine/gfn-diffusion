@@ -33,7 +33,10 @@ if [ "${FORCES:-0}" = 1 ]; then SETS="${SETS} --forces"; fi
 if [ ! -s "${IN}" ]; then echo "FATAL: ${IN} missing" >&2; exit 1; fi
 echo "restamp part ${K}/${PARTS} of ${IN}; gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse --short=12 HEAD)"
 
-srun singularity exec \
+# singularity directly, not srun: on some nodes (partition 'all', e.g. ga017) Slurm's environment carries
+# SLURM_CPUS_PER_TASK != SLURM_TRES_PER_TASK and srun refuses to start (restampP 23723658_6..23, 2026-11-19);
+# a one-task job needs no job step
+singularity exec \
     --overlay ${OVERLAY}:ro \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
     --bind /scratch/mk8347/data:/scratch/mk8347/data \

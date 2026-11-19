@@ -67,7 +67,10 @@ echo "merging $(wc -l < ${SHARDS}/shards.txt) shards over ${NSETS} band sets (bu
 RAM_PID=$!
 trap "kill ${RAM_PID} 2>/dev/null" EXIT TERM
 
-srun singularity exec \
+# singularity directly, not srun: on some nodes (partition 'all', e.g. ga017) Slurm's environment carries
+# SLURM_CPUS_PER_TASK != SLURM_TRES_PER_TASK and srun refuses to start (restampP 23723658_6..23, 2026-11-19);
+# a one-task job needs no job step
+singularity exec \
     --overlay ${OVERLAY}:ro \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
     --bind /scratch/mk8347/data:/scratch/mk8347/data \

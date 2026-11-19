@@ -40,7 +40,10 @@ echo "gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse --short=12 
 if [ -s ${SHARDS}/log_hi.txt ]; then echo "log_hi $(cat ${SHARDS}/log_hi.txt) (kept)"; exit 0; fi
 if [ ! -s ${P1_PRIOR} ]; then echo "FATAL: ${P1_PRIOR} (the P-1 prior whose log_hi every group shares) is missing" >&2; exit 1; fi
 
-srun singularity exec \
+# singularity directly, not srun: on some nodes (partition 'all', e.g. ga017) Slurm's environment carries
+# SLURM_CPUS_PER_TASK != SLURM_TRES_PER_TASK and srun refuses to start (restampP 23723658_6..23, 2026-11-19);
+# a one-task job needs no job step
+singularity exec \
     --overlay ${OVERLAY}:ro \
     --bind ${PROJECT_ROOT}:${PROJECT_ROOT} \
     --bind /scratch/mk8347/data:/scratch/mk8347/data \
