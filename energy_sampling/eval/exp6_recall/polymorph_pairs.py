@@ -200,11 +200,10 @@ def relax(out, models):
             cfg = SimpleNamespace(mlip_gas_reference='mirror_mean', mlip_mirror_average=False,
                                   opt=[{'optim_target': 'uma'}], uma_predictor_path=SITES['local']['uma'])
             attach_mlip_parity(cfg, rows, 'cuda')
-            for r, m in zip(rows, meta):
-                if m['sg'] in SOHNCKE:
-                    r.uma_mirror_average = torch.tensor([True])
+            for r, m in zip(rows, meta):  # on every row: collation needs the attribute on all of them
+                r.uma_mirror_average = torch.tensor([m['sg'] in SOHNCKE])
             pred, target, chunk = init_uma_crystal_predictor(SITES['local']['uma'], device='cuda',
-                                                             activation_checkpointing=False, tf32=False), 'uma', 2
+                                                             activation_checkpointing=False, tf32=False), 'uma', 1
         else:
             from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
             disp = dict(xc='pbe', damping='bj') if model == 'mace_csp' else None

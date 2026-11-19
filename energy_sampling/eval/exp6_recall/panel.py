@@ -53,9 +53,11 @@ def normalise_h(atoms):
     heavy = np.nonzero(z > 1)[0]
     pos = atoms.get_positions()
     for i in np.nonzero(z == 1)[0]:
-        d = atoms.get_distances(i, heavy, mic=True, vector=True)
+        d = atoms.get_distances(i, heavy, mic=True, vector=True)  # ASE: positions[heavy] - positions[i]
         k = int(np.argmin(np.linalg.norm(d, axis=1)))
-        v = -d[k]  # from H to the heavy atom, minimum image
+        # from H to the heavy atom, minimum image. Until 2026-11-19 this was -d[k], which put every H at 2r - L from
+        # its heavy atom (X-ray C-H 0.93 A -> 0.77 A); panels and anchors built before then carry that error
+        v = d[k]
         L = XH.get(int(z[heavy[k]]))
         if L is None:
             raise ValueError(f'H bonded to element {z[heavy[k]]}')
