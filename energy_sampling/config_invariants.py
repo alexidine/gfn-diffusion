@@ -1414,6 +1414,85 @@ def nf_orient_split_is_well_formed(cfg: dict) -> list[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# NF score matching and pathwise reverse KL (gflownet_losses.py::score_matching_rows / ::pathwise_rows):
+# <branch>_loss_coeffs.score (fwd, bwd, replay), .score_beta, .score_force (bwd, replay); fwd_loss_coeffs.pathwise,
+# .pathwise_grad_clip. Trained outside the frac mix by train.py::Modeller.fused_train_step.
+# ---------------------------------------------------------------------------
+AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip'),
+                 'bwd': ('score', 'score_beta', 'score_rows', 'score_force'),
+                 'replay': ('score', 'score_beta', 'score_rows', 'score_force')}
+AUX_SCORE_FORCE = ('live', 'stored')
+
+
+def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
+    """<branch>_loss_coeffs score / pathwise (NF score matching and pathwise reverse KL), per active stage: a negative
+    or non-finite weight, knee or clip; pathwise off the fwd branch; score_force not one of AUX_SCORE_FORCE, or
+    'stored' on bwd (the prior's force column is not wired); a term on a stage that does not train fused (only
+    fused_train_step adds them: train.py::Modeller.step_loss raises on a leftover); a term on the SDE policy; a term
+    with rotate_frames / mirror_frames / canonical_frame (standard frame only); a fwd term with reward_grads,
+    traj_grads or path_grad_last_k. Unresolvable stages: abstains."""
+    cfg = canonical_model_section(cfg)
+    rule = 'nf_aux_terms_are_well_formed'
+    out = []
+    stages = active_stages(cfg)
+    if not stages:
+        return out
+    nf = _get(cfg, 'policy.nf') or {}
+    kind = _get(cfg, 'policy.kind', 'sde')
+    for st in stages:
+        name = st.get('name', '?')
+        on = []
+        for mode, keys in AUX_TERM_KEYS.items():
+            for k in ('score', 'pathwise'):
+                v = _coeff_raw(cfg, st, mode, k)
+                if v is None:
+                    continue
+                if mode != 'fwd' and k == 'pathwise':
+                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.pathwise: the pathwise "
+                                                      f"term draws fresh rows, fwd only"))
+                    continue
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.{k} = {v!r}: a finite "
+                                                      f"number >= 0"))
+                elif v > 0:
+                    on.append(f'{mode}.{k}')
+            for k in ('score_beta', 'score_rows', 'pathwise_grad_clip'):
+                v = _coeff_raw(cfg, st, mode, k) if k in keys else None
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                      or not math.isfinite(v) or v < 0):
+                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.{k} = {v!r}: a finite "
+                                                      f"number >= 0"))
+            if 'score_force' in keys:
+                v = _coeff_raw(cfg, st, mode, 'score_force')
+                if v is not None and v not in AUX_SCORE_FORCE:
+                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.score_force = {v!r}: "
+                                                      f"one of {AUX_SCORE_FORCE}"))
+                if (mode == 'bwd' and v == 'stored'
+                        and (_num(_coeff_raw(cfg, st, 'bwd', 'score')) or 0) > 0):
+                    out.append(Violation(ERROR, rule, f"stage '{name}': bwd_loss_coeffs.score_force 'stored': the "
+                                                      f"prior's force column is not wired; use 'live'"))
+        if not on:
+            continue
+        if kind != 'nf':
+            out.append(Violation(ERROR, rule, f"stage '{name}': {on} on the {kind!r} policy: NF only"))
+        if st.get('train_mode') != 'fused':
+            out.append(Violation(ERROR, rule, f"stage '{name}': {on} on a {st.get('train_mode')!r} stage: the "
+                                              f"terms are added by the fused step only"))
+        framed = [k for k in ('rotate_frames', 'mirror_frames') if nf.get(k)]
+        if (nf.get('canonical_frame') or 'none') != 'none':
+            framed.append('canonical_frame')
+        if framed:
+            out.append(Violation(ERROR, rule, f"stage '{name}': {on} with model.nf {framed}: standard frame only"))
+        if any(o.startswith('fwd.') for o in on):
+            bad = [k for k in ('reward_grads', 'traj_grads', 'path_grad_last_k')
+                   if (_coeff(cfg, st, 'fwd', k) or 0) != 0]
+            if bad:
+                out.append(Violation(ERROR, rule, f"stage '{name}': fwd {[o for o in on if o.startswith('fwd.')]} "
+                                                  f"with fwd {bad}: the aux terms own the reward's gradient"))
+    return out
+
+
 #: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
 #: An absent key reads its default; an unknown key is refused.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
@@ -2756,6 +2835,7 @@ RULES = (
     condition_draw_is_well_formed,
     nf_policy_refuses_sde_only_settings,
     nf_orient_split_is_well_formed,
+    nf_aux_terms_are_well_formed,
     # returns [] when buffers.store is absent or off
     row_store_is_well_formed,
     # every route but the conformer one; returns [] on energy_function conformer_torsions

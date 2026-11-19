@@ -313,6 +313,105 @@ def combine_branch_terms(losses, loss_clip):
     return stacked.sum(dim=0)
 
 
+#: <branch>_loss_coeffs.score_force (bwd, replay): where a row's d log R / d x comes from. 'live': a grad-enabled reward
+#: call on the rows this step; 'stored': recorded with the row (replay: the buffer's force column, written at admission
+#: by train.py::Modeller._admission_force_legs; bwd: the prior row's force, not wired yet)
+SCORE_FORCE_SOURCES = ('live', 'stored')
+
+
+def aux_term_coeffs(loss_coeffs):
+    """(score, pathwise) weights of a branch's loss_coeffs (0.0 when absent). The terms are trained OUTSIDE the
+    frac-weighted branch mix (train.py::Modeller.fused_train_step adds gfn._aux_terms), like the pooled term."""
+    return (float(getattr(loss_coeffs, 'score', 0.0) or 0.0), float(getattr(loss_coeffs, 'pathwise', 0.0) or 0.0))
+
+
+def live_reward_force(log_reward_fn, x, mol_batch, log_T_tensor):
+    """(d log R / d x [N, dim], log R [N]), both detached, from one grad-enabled reward call with x as a leaf. A row
+    whose reward or force is not finite keeps NaN (score_matching_rows counts it)."""
+    x = x.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        log_r = log_reward_fn(x, mol_batch, log_T_tensor.to(x.device), False, keep_grads=True)
+        g, = torch.autograd.grad(log_r.sum(), x, allow_unused=True)
+    if g is None:
+        g = torch.zeros_like(x)
+    g = g.detach()
+    bad = ~torch.isfinite(log_r.detach())
+    if bad.any():
+        g[bad] = float('nan')
+    return g, log_r.detach()
+
+
+def score_matching_rows(g_q, g_r, beta: float, live_idx=None):
+    """Score matching per row: r = g_q - g_R on the live rows (live_idx; None = all), Huber of its norm with knee
+    beta: 0.5 |r|^2 for |r| <= beta, beta (|r| - beta / 2) beyond (beta <= 0: no cap). g_R is a target (detached).
+    A row whose g_R is not finite contributes 0. Returns (loss: the mean over the finite rows, stats)."""
+    g_r = g_r.detach().to(g_q.dtype)
+    ok = torch.isfinite(g_r).all(-1)
+    g_r = torch.nan_to_num(g_r, nan=0.0, posinf=0.0, neginf=0.0)
+    if live_idx is not None:
+        g_q, g_r = g_q.index_select(-1, live_idx), g_r.index_select(-1, live_idx)
+    r = g_q - g_r
+    norm = r.norm(dim=-1)
+    rows = (torch.where(norm <= beta, 0.5 * norm * norm, beta * (norm - 0.5 * beta)) if beta > 0
+            else 0.5 * norm * norm)
+    rows = torch.where(ok, rows, torch.zeros_like(rows))
+    n_ok = int(ok.sum())
+    loss = rows.sum() / max(n_ok, 1)
+    with torch.no_grad():
+        nq, nr = g_q.norm(dim=-1), g_r.norm(dim=-1)
+        sel = ok & (nr > 0) & (nq > 0)
+        stats = {'score_bad_frac': 1.0 - ok.float().mean(),
+                 'score_capped_frac': ((norm > beta) & ok).float().mean() if beta > 0 else torch.zeros(()),
+                 'score_gq_norm': nq[ok].mean() if n_ok else torch.zeros(()),
+                 'score_gr_norm': nr[ok].mean() if n_ok else torch.zeros(()),
+                 'score_resid_rel': (norm[sel] / nr[sel]).median() if sel.any() else torch.zeros(()),
+                 'score_cos': ((g_q * g_r).sum(-1)[sel] / (nq * nr)[sel]).mean() if sel.any() else torch.zeros(())}
+    return loss, stats
+
+
+def branch_score_term(loss_coeffs, gfn, x, condition, mol_batch, g_r):
+    """(coeff * score-matching loss, stats) of a branch's rows x (standard frame) against their g_R, or (None, {}) when
+    the branch's `score` is 0. The score is the policy's (gfn.score, graph kept), on `score_rows` rows drawn uniformly
+    without replacement (0 or absent: every row; the double backward costs about twice a log q pass per row)."""
+    coeff = aux_term_coeffs(loss_coeffs)[0]
+    if coeff <= 0:
+        return None, {}
+    k = int(getattr(loss_coeffs, 'score_rows', 0) or 0)
+    if 0 < k < x.shape[0]:
+        idx = torch.randperm(x.shape[0], device=x.device)[:k].sort().values
+        x, condition, g_r = x[idx], condition[idx], g_r.to(x.device)[idx]
+        if mol_batch is not None:
+            mol_batch = mol_batch.subsample_new_batch(idx.to(mol_batch.pos.device) if hasattr(mol_batch, 'pos')
+                                                      else idx)
+    g_q = gfn.score(x, condition, mol_batch)
+    loss, stats = score_matching_rows(g_q, g_r.to(g_q.device), float(getattr(loss_coeffs, 'score_beta', 10.0)),
+                                      live_idx=getattr(gfn, 'live_idx', None))
+    stats['score'] = loss.detach()
+    return coeff * loss, stats
+
+
+def pathwise_rows(log_r_live, log_q_stl, x_live, grad_clip: float = 0.0):
+    """Pathwise reverse KL per row, log q_theta-bar(x) - log R(x) at a reparameterised draw x (sticking the
+    landing: log q's parameters detached, so the gradient is d(log q - log R)/dx . dx/dtheta). Rows with a non-finite
+    reward are dropped. grad_clip > 0 caps each row's own gradient norm in x. Returns (loss: the mean, stats)."""
+    ok = torch.isfinite(log_r_live) & torch.isfinite(log_q_stl)
+    n_ok = int(ok.sum())
+    if grad_clip > 0 and x_live.requires_grad:
+        n = max(n_ok, 1)
+
+        def _clip(g, _c=float(grad_clip), _n=n):
+            gn = g.norm(dim=-1, keepdim=True) * _n
+            return g * torch.clamp(_c / gn.clamp_min(1e-12), max=1.0)
+        x_live.register_hook(_clip)
+    rows = torch.where(ok, log_q_stl - log_r_live, torch.zeros_like(log_r_live))
+    loss = rows.sum() / max(n_ok, 1)
+    with torch.no_grad():
+        stats = {'pathwise': loss.detach(), 'pathwise_bad_frac': 1.0 - ok.float().mean(),
+                 'pathwise_log_r': log_r_live.detach()[ok].mean() if n_ok else torch.zeros(()),
+                 'pathwise_log_q': log_q_stl.detach()[ok].mean() if n_ok else torch.zeros(())}
+    return loss, stats
+
+
 def get_gfn_forward_loss(loss_coeffs,
                          initial_state,
                          gfn,
@@ -380,6 +479,17 @@ def get_gfn_forward_loss(loss_coeffs,
     if _rg_reshape and freeze_policy:
         raise ValueError("fwd_loss_coeffs.reward_grad_gate / reward_grad_force_clip need a trained "
                          "policy on this branch: freeze_policy must be 0")
+    # SCORE MATCHING / PATHWISE REVERSE KL on the fresh draws (fwd_loss_coeffs.score / .pathwise; NF policy). Both
+    # train the policy whatever freeze_policy says (freeze_policy detaches this branch's TB terms only) and both land
+    # in gfn._aux_terms, which fused_train_step adds OUTSIDE the frac mix. One grad-enabled reward call at the draw
+    # serves the TB reward (detached), the rows' force and the pathwise term; no call when neither is on, or under
+    # no_grad (a readout).
+    _sm_coeff, _pw_coeff = aux_term_coeffs(loss_coeffs)
+    _aux_on = (_sm_coeff > 0 or _pw_coeff > 0) and torch.is_grad_enabled()
+    _aux_stats = {}
+    if _aux_on and (_rg_on or _path_live):
+        raise ValueError("fwd_loss_coeffs.score / pathwise with reward_grads, traj_grads or path_grad_last_k: the "
+                         "aux terms own the reward's gradient on this branch")
     # PATH-GRADIENT DIAGNOSTIC. When any rollout step is live, record the
     # per-step ||dL/dx_{i+1}|| (batch mean) as it flows back through the
     # reparameterised chain. Consumed by train.py's ten-step report as
@@ -410,12 +520,41 @@ def get_gfn_forward_loss(loss_coeffs,
                                                                 freeze_policy=freeze_policy,
                                                                 path_grad_last_k=_path_k,
                                                                 state_grad_hook=_state_grad_hook,
+                                                                **({'pathwise': True}
+                                                                   if (_aux_on and _pw_coeff > 0) else {}),
                                                                 )
     finally:
         gfn.path_grad_scale_live = True
     log_Z_learned = log_flow[:, 0]
 
-    if _rg_reshape:
+    if _aux_on:
+        _x_src = (gfn._pathwise['x'] if _pw_coeff > 0
+                  else states[:, -1].detach().clone().requires_grad_(True))
+        with torch.enable_grad():
+            if return_exp:
+                _log_r_live, crystal_batch = log_reward_fn(_x_src, mol_batch, log_T_tensor, return_exp,
+                                                           keep_grads=True)
+                crystal_batch = crystal_batch.detach().to('cpu')
+            else:
+                _log_r_live = log_reward_fn(_x_src, mol_batch, log_T_tensor, return_exp, keep_grads=True)
+                crystal_batch = None
+        log_r = _log_r_live.detach()
+        _aux = {}
+        if _sm_coeff > 0:
+            _g_r = torch.autograd.grad(_log_r_live.sum(), _x_src, retain_graph=_pw_coeff > 0, allow_unused=True)[0]
+            _g_r = torch.zeros_like(_x_src) if _g_r is None else _g_r.detach().clone()
+            _g_r[~torch.isfinite(log_r)] = float('nan')
+            _aux['fwd_score'], _st = branch_score_term(loss_coeffs, gfn, _x_src.detach(), condition, mol_batch, _g_r)
+            _aux_stats.update(_st)
+        if _pw_coeff > 0:
+            _pw = gfn._pathwise
+            _l, _st = pathwise_rows(_log_r_live, _pw['log_q_stl'], _pw['x'],
+                                    float(getattr(loss_coeffs, 'pathwise_grad_clip', 0.0) or 0.0))
+            _aux['fwd_pathwise'] = _pw_coeff * _l
+            _aux_stats.update(_st)
+            gfn._pathwise = None
+        gfn._aux_terms = {**(getattr(gfn, '_aux_terms', None) or {}), **_aux}
+    elif _rg_reshape:
         # the reward is scored on a LEAF copy of the terminal: its graph ends
         # there, so the plain reward path cannot reach the policy. The force is
         # read off that graph once; the loss sees a second leaf (log_r) whose
@@ -711,6 +850,8 @@ def get_gfn_forward_loss(loss_coeffs,
 
     else:
         loss_dict = None
+    if loss_dict is not None and _aux_stats:
+        loss_dict.update(_aux_stats)
 
     if return_exp:
         return loss, crystal_batch.cpu().detach(), loss_dict
@@ -909,6 +1050,29 @@ def get_gfn_backward_loss(loss_coeffs,
     if no_reward:   # a placeholder no weighted term reads (checked above); never fed to the tracker or a stream
         log_r = torch.full_like(log_flow[:, -1].detach(), float('nan'))
     log_flow[:, -1] = log_r
+
+    # SCORE MATCHING on this branch's rows (bwd/replay_loss_coeffs.score; NF policy): trained call only (live_stash
+    # set, grad enabled), into gfn._aux_terms for fused_train_step (outside the frac mix). g_R per score_force:
+    # 'live' = a grad-enabled reward call on the rows now; 'stored' = the replay row's force recorded at admission.
+    _aux_stats = {}
+    if aux_term_coeffs(loss_coeffs)[0] > 0 and live_stash is not None and torch.is_grad_enabled():
+        _src = getattr(loss_coeffs, 'score_force', 'live') or 'live'
+        if _src not in SCORE_FORCE_SOURCES:
+            raise ValueError(f"{live_stash}_loss_coeffs.score_force = {_src!r}: one of {SCORE_FORCE_SOURCES}")
+        _x_t = states[:, -1].detach()
+        if _src == 'stored':
+            _g_r = getattr(mol_batch, 'replay_force', None) if live_stash == 'replay' else None
+            if _g_r is None:
+                raise NotImplementedError(f"{live_stash}_loss_coeffs.score_force 'stored': no stored force on these "
+                                          f"rows (replay: the buffer records it at admission when the replay "
+                                          f"score is on; bwd: the prior's force column is not wired yet)")
+        else:
+            if log_reward_fn is None or log_T_tensor is None:
+                raise ValueError(f"{live_stash}_loss_coeffs.score_force 'live' needs the caller to pass "
+                                 f"log_reward_fn and log_T_tensor")
+            _g_r, _ = live_reward_force(log_reward_fn, _x_t, mol_batch, log_T_tensor)
+        _t, _aux_stats = branch_score_term(loss_coeffs, gfn, _x_t, condition, mol_batch, _g_r)
+        gfn._aux_terms = {**(getattr(gfn, '_aux_terms', None) or {}), f'{live_stash}_score': _t}
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -1238,6 +1402,8 @@ def get_gfn_backward_loss(loss_coeffs,
 
     else:
         loss_dict = None
+    if loss_dict is not None and _aux_stats:
+        loss_dict.update(_aux_stats)
 
     return loss, loss_dict
 

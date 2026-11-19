@@ -6262,6 +6262,8 @@ class Modeller:
         self.gfn_model._live_fwd = None
         self.gfn_model._live_bwd = None
         self.gfn_model._live_replay = None
+        # score matching / pathwise (gflownet_losses.py aux terms): each branch call below writes its own
+        self.gfn_model._aux_terms = None
         # which branch's live rows pair with bwd's in the pooled term below
         pooled_src = getattr(self.args.fwd_loss_coeffs, 'pooled_source', 'fwd') or 'fwd'
         if pooled_src not in POOLED_SOURCES:
@@ -6444,6 +6446,18 @@ class Modeller:
         if sidecar:
             fused_loss = fused_loss + sub_losses['fwd'][0]
             self._sidecar_count = getattr(self, '_sidecar_count', 0) + 1
+        # SCORE MATCHING / PATHWISE REVERSE KL (<branch>_loss_coeffs.score, fwd_loss_coeffs.pathwise): added OUTSIDE
+        # the frac mix at their own coefficients, like the pooled term, and only from a branch that trained this step
+        # (a force-refresh-only branch's terms are dropped with its loss). fwd trains here on its rollouts whether or
+        # not its TB terms are frozen to a Z sidecar.
+        aux = self.gfn_model._aux_terms or {}
+        self.gfn_model._aux_terms = None
+        trained = {'fwd': fwd_ran and (fwd_active or sidecar),
+                   'bwd': 'bwd' in sub_losses and sub_losses['bwd'][2],
+                   'replay': 'replay' in sub_losses and sub_losses['replay'][2]}
+        for name, term in aux.items():
+            if term is not None and trained.get(name.split('_')[0], False):
+                fused_loss = fused_loss + term
         # NOTHING TO DESCEND. The aligned draw's zero-eligible fallback on a stage
         # whose bwd and replay blocks carry no term of their own (the pooled term
         # and the sidecar are the whole gradient -- var_conditioning): off the
@@ -6983,6 +6997,11 @@ class Modeller:
         return out
 
     def step_loss(self, step_type, loss, do_step: bool = True):
+        aux = getattr(self.gfn_model, '_aux_terms', None)
+        if aux:
+            self.gfn_model._aux_terms = None
+            raise RuntimeError(f"score / pathwise terms {sorted(aux)} were computed on a '{step_type}' step and not "
+                               f"consumed: they are added by fused_train_step only (train_mode fused)")
         parts = getattr(self.gfn_model, '_mle_parts', None)
         if parts is not None:
             self.gfn_model._mle_parts = None
@@ -8000,7 +8019,12 @@ class Modeller:
                                                 # embedding's log_pf is not the conditional
                                                 # policy's level, so skip the feed there. Replay
                                                 # deliberately never feeds either stream.
-                                                mode_level_stream=None if scramble_tiles else 'bwd')
+                                                mode_level_stream=None if scramble_tiles else 'bwd',
+                                                # bwd_loss_coeffs.score with score_force 'live' scores the rows'
+                                                # force now, at the route's temperature
+                                                log_reward_fn=getattr(getattr(self, 'energy_function', None),
+                                                                      'log_reward', None),
+                                                log_T_tensor=self._bwd_log_T(latents))
 
         if self.row_store is not None:
             # a scrambled condition's log q is not the row's own: no write
@@ -8384,6 +8408,15 @@ class Modeller:
         return out
 
     @torch.no_grad()
+    def _bwd_log_T(self, latents):
+        """log10 T per stored row for a live reward call on the bwd branch (bwd_loss_coeffs.score, score_force 'live'):
+        the route's temperature. None when the energy function has none (the loss then refuses a live force)."""
+        ef = getattr(self, 'energy_function', None)
+        T = getattr(ef, 'temperature', None)
+        if T is None or bool(getattr(ef, 'temperature_conditioning', False)):
+            return None
+        return torch.full((latents.shape[0],), math.log10(float(T)))
+
     def draw_bwd_sample(self, repeats, target_cids=None, condition_draw=None):
         if self.row_store is not None:   # buffers.store: uniform over the store's data rows
             return self._store_draw('mle', repeats)
@@ -12070,7 +12103,9 @@ class Modeller:
     def _replay_needs_force(self) -> bool:
         """Does the live replay loss consume the buffer's force_legs column?"""
         rc = getattr(self.args, 'replay_loss_coeffs', None)
-        return int(getattr(rc, 'stored_force_k', 0) or 0) > 0
+        return (int(getattr(rc, 'stored_force_k', 0) or 0) > 0
+                or (float(getattr(rc, 'score', 0.0) or 0.0) > 0
+                    and (getattr(rc, 'score_force', 'live') or 'live') == 'stored'))
 
     def _admission_force_legs(self, fwd_stats, sample_batch, flow_states, idx):
         """[k, N_FORCE_LEGS, dim] per-leg d log R / d x_T for the admitted rows

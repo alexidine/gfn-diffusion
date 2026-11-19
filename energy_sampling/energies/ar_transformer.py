@@ -126,6 +126,9 @@ class CausalTransformerConditioner(nn.Module):
                                     for _ in range(layers))
         self.ln = _norm(norm, width)
         self.bf16 = True
+        # activation checkpointing of the layers under autograd; NFPolicy.score turns it off for its double backward,
+        # whose attention runs on the math SDPA kernel (a layer recomputed in backward would run another kernel)
+        self.checkpoint_layers = True
         self.head = nn.Linear(width, self.n_params)
         # identity spline at step 0, as _MADE: zero weights, unit knot slopes, zero shift
         nn.init.zeros_(self.head.weight)
@@ -177,8 +180,8 @@ class CausalTransformerConditioner(nn.Module):
             for layer in self.layers:
                 # under autograd each layer is recomputed in backward: a full-width layer's
                 # internals at 8192 rows x 12 tokens are ~1.7 GB, stored they exceed a shared card
-                h = (checkpoint(layer, h, mem, mem_mask, use_reentrant=False) if torch.is_grad_enabled()
-                     else layer(h, mem, mem_mask))
+                h = (checkpoint(layer, h, mem, mem_mask, use_reentrant=False)
+                     if torch.is_grad_enabled() and self.checkpoint_layers else layer(h, mem, mem_mask))
         out = self.head(self.ln(h.to(feats.dtype)))       # [b, d, n_params], slot order
         return out[:, self.slot_of_dim].reshape(b, self.d * self.n_params)
 

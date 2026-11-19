@@ -1177,6 +1177,31 @@ def test_a_malformed_heldout_gate_is_an_error(canonical):
     assert _fires(cfg, 'heldout_gate_is_well_formed', severity=ERROR)
 
 
+def test_malformed_or_unconsumable_nf_aux_terms_are_an_error(canonical):
+    """Full coverage of the terms themselves: tests/models/test_nf_score_pathwise.py."""
+    cfg = copy.deepcopy(canonical)
+    cfg['policy']['kind'] = 'nf'
+    rule = 'nf_aux_terms_are_well_formed'
+    assert not _fires(cfg, rule)                                          # absent keys
+    stages = cfg['protocols'][cfg['protocol']]['stages']
+    st = stages[0]
+    st.setdefault('loss_coeffs', {}).setdefault('replay', {})['score'] = -1.0
+    assert _fires(cfg, rule)                                              # malformed
+    st['loss_coeffs']['replay']['score'] = 0.1
+    st['train_mode'] = 'bwd'
+    assert _fires(cfg, rule)                                              # not consumed off the fused step
+    st['train_mode'] = 'fused'
+    cfg['policy'].setdefault('nf', {}).update(rotate_frames=False, mirror_frames=False, canonical_frame='none')
+    st['loss_coeffs']['replay']['score_force'] = 'sideways'
+    assert _fires(cfg, rule)                                              # unknown force source
+    st['loss_coeffs']['replay']['score_force'] = 'stored'
+    st['loss_coeffs'].setdefault('bwd', {})['pathwise'] = 0.1
+    assert _fires(cfg, rule)                                              # pathwise off the fwd branch
+    del st['loss_coeffs']['bwd']['pathwise']
+    cfg['policy']['kind'] = 'sde'
+    assert _fires(cfg, rule)                                              # SDE policy
+
+
 def test_malformed_or_inert_nf_orient_split_is_an_error(canonical):
     """Full coverage of the split itself: tests/models/test_nf_orient_split.py."""
     cfg = copy.deepcopy(canonical)

@@ -1121,14 +1121,22 @@ class ConditionalLatentFlow(nn.Module):
         return base + ld, (part if lj_frame is None else part + lj_frame)
 
     @torch.no_grad()
+    def base_sample(self, n):
+        """n base points z0 [n, d] as sample() draws them (uniform on [-1, 1] on unit-base rows, standard normal
+        elsewhere, dead rows pinned); rsample(z0, c) maps them to the draw sample() would make."""
+        f = self.flow
+        dev, dtype = f.mu.device, f.mu.dtype
+        return _pin(torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
+                                torch.randn(n, f.d, device=dev, dtype=dtype)), f.live_rows(n))
+
+    @torch.no_grad()
     def sample(self, n, c, return_base: bool = False):
         f = self.flow
         dev, dtype = f.mu.device, f.mu.dtype
         full, F = f.context_frame(c)
         ctx = full[0]
         live = f.live_rows(n)
-        z0 = _pin(torch.where(f.unit_base, 2.0 * torch.rand(n, f.d, device=dev, dtype=dtype) - 1.0,
-                              torch.randn(n, f.d, device=dev, dtype=dtype)), live)
+        z0 = self.base_sample(n)
         z = z0
         extra_of = None if f.describer is None else (lambda x: f.row_extra(x, c))
         extra_step = None if f.describer is None else (lambda: f.row_extra_step(c))
