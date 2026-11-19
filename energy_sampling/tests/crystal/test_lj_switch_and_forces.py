@@ -132,3 +132,21 @@ def test_a_stored_force_is_the_gradient_of_the_stored_mol_energy_at_the_chart_po
         assert bool((err <= 0.05 * cd.abs()[m] + 1.0).all()), (j, b.force[:, j][m], cd[m])
         checked += int(m.sum())
     assert checked >= n * x0.shape[1] // 2
+
+
+def test_merging_groups_pads_each_force_column_with_nan_to_the_widest_chart():
+    from types import SimpleNamespace
+    from data_processing.merge_noised_priors import pad_forces
+
+    class Rows(SimpleNamespace):
+        def keys(self):
+            return list(vars(self))
+    a = Rows(force=torch.arange(24.).reshape(2, 12))
+    b = Rows(force=torch.arange(27.).reshape(3, 9))
+    assert pad_forces([a, b]) == 12
+    assert a.force.shape == (2, 12) and torch.equal(a.force, torch.arange(24.).reshape(2, 12))
+    assert b.force.shape == (3, 12) and torch.equal(b.force[:, :9], torch.arange(27.).reshape(3, 9))
+    assert bool(torch.isnan(b.force[:, 9:]).all())
+    assert pad_forces([Rows(x=1), Rows(x=2)]) is None
+    with pytest.raises(SystemExit):
+        pad_forces([Rows(force=torch.zeros(1, 9)), Rows(x=1)])

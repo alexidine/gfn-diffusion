@@ -11,7 +11,8 @@ thermal_scaling_factor and on the manifest keys the trainer reads (format_versio
 log_hi, basin_kernel, temperature, window_kT_target, chart, heldout_frac, forces) and on every identity field but space_groups
 / z_primes (their union is written). Refuses a condition (identifier, space group, Z') in two files: a build holds
 each condition's anchors whole (its floor, its never-held-out lowest anchor), so shards must split by molecule. The
-manifest is the first file's, with identity.space_groups / z_primes the union, counts summed (children_within_window:
+manifest is the first file's, with identity.space_groups / z_primes the union, a ``force`` column padded with NaN to
+the widest chart (pad_forces), counts summed (children_within_window:
 the row-weighted mean), seed and basin_set as per-file lists, and every source manifest under 'merged_from' with its
 path. Never overwrites OUT; writes it atomically."""
 import argparse
@@ -31,6 +32,25 @@ import noised_prior as NP  # noqa: E402
 READ = ('format_version', 'k', 'child_kernel', 'kick_units', 'log_lo', 'log_hi', 'basin_kernel', 'temperature',
         'window_kT_target', 'chart', 'heldout_frac', 'forces')
 LAYOUT_ROWS = ('fd_state', 'fd_log_reference')   # layout-specific chart rows: the trainer attaches its own
+
+
+def pad_forces(batches):
+    """Pad every batch's ``force`` column (build_noised_prior --forces: d mol_energy / d the row's FD chart point,
+    one width per space group's chart) with NaN to the widest, in place; returns that width (None without forces).
+    The file stays group-native: a row's chart is its sg_ind's, and a trainer packs the force into its run's slot
+    layout as it packs the chart point; NaN marks a pad slot, never a zero force (owner and Architecture,
+    2026-11-19)."""
+    widths = {int(b.force.shape[1]) for b in batches if 'force' in b.keys()}
+    if not widths:
+        return None
+    if any('force' not in b.keys() for b in batches):
+        raise SystemExit('some files carry a force column and others do not')
+    w = max(widths)
+    for b in batches:
+        f = b.force
+        if f.shape[1] < w:
+            b.force = torch.cat([f, torch.full((f.shape[0], w - f.shape[1]), float('nan'), dtype=f.dtype)], 1)
+    return w
 
 
 def merge(paths, out_path):
@@ -73,6 +93,7 @@ def merge(paths, out_path):
         batches.append(b)
         mans.append(m)
         del f
+    force_width = pad_forces(batches)
     out = merge_batches(batches)
     ident = dict(mans[0]['identity'])
     for k in ('space_groups', 'z_primes'):
@@ -88,6 +109,9 @@ def merge(paths, out_path):
     manifest = dict(mans[0], identity=ident, counts=counts, seed=[m.get('seed') for m in mans],
                     basin_set=[m.get('basin_set') for m in mans], build_seconds=sum(m.get('build_seconds') or 0 for m in mans),
                     merged_from=[dict(m, path=os.path.abspath(p)) for m, p in zip(mans, paths)])
+    if force_width is not None and manifest.get('forces'):
+        manifest['forces'] = dict(manifest['forces'], width=force_width,
+                                  padding="NaN past the width of each row's own chart (its sg_ind)")
     payload = {'prior': out, 'equalized_prior': out, NP.MANIFEST_KEY: manifest}
     if tsf != {None}:
         payload['thermal_scaling_factor'] = tsf.pop()
