@@ -253,3 +253,25 @@ Caption: every probe ingested exactly into its searched group (fit and residual 
 conformer of its own CSD entry held rigid, so torsions are frozen at the experimental values: the probes test methyl
 and torsion-bearing environments in packing, not torsional energies. MACE-OFF24 lattice energies at the five anchors
 (kJ/mol, unrelaxed): −164.9, −105.1, −112.7, −140.5, −145.1.
+
+**MACE-CSP-25.2 with D3 (observation, 2026-11-19).** Weights from the authors in `D:/crystal_datasets/day_models/`
+(small, medium, large; hyperparameters as the paper). Dispersion is added in the MACE route by MXtalTools
+`mlip_interfaces/dispersion.py` (D3, Becke–Johnson damping, PBE parameters, 15 Å cutoff; search key
+`mace_dispersion`). At the panel and probe anchors the route's D3 term equals torch-dftd on ASE's neighbour list to
+0.005 kJ/mol; 15 Å sits 0.2–1.1 kJ/mol above 50 Å, nearly the same shift for both paracetamol forms.
+
+| anchor | MACE-OFF24 (kJ/mol) | MACE-CSP S + D3 (kJ/mol) | MACE-CSP M + D3 (kJ/mol) | MACE-CSP L + D3 (kJ/mol) | X23 reference (kJ/mol, approx.) |
+|---|---|---|---|---|---|
+| naphthalene | −91.6 | −77.7 | −80.8 | −79.6 | −82 |
+| imidazole | −94.2 | −93.9 | −94.2 | −93.4 | −87 |
+| acetic acid | −73.8 | −58.2 | −32.8 | −57.1 | −73 |
+| uracil | −179.7 | −121.3 | −81.9 | −105.2 | −136 |
+| benzoic acid | −161.1 | −160.9 | −161.4 | −158.1 | – |
+| paracetamol II − I | −4.6 | −9.4 | −8.1 | −9.5 | – |
+
+Caption: lattice energy per molecule at the unrelaxed CSD anchor (crystal minus the isolated molecule in the same
+conformer), one single point each; the last row is a difference of two lattice energies. Reading: with D3 the
+dispersion-bound crystal (naphthalene) lands within 1–4 kJ/mol of the reference for all three sizes; for small polar
+H-bonded molecules the three sizes differ by up to 40 kJ/mol, which points at the isolated-molecule leg (the models are
+trained on crystals only) and cancels within a molecule. Benzoic acid at about −160 kJ/mol under every model is far
+from its sublimation enthalpy (about 90 kJ/mol) and is unexplained.
