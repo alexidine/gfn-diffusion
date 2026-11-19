@@ -36,6 +36,7 @@ big, big2 = tbrate.big, tbrate.big2
 TAG = 'pool8_smpw_nov19'
 PRIOR = big.PRIOR[:-len('.pt')] + '_switched.pt'
 SM_WEIGHTS = (1e-2, 1.0)
+SM_NO_ABS_BAR = 0.1              # score weights at or above this run without lr_control's absolute gradient bar
 PW_ARMS = ((1.0, 100.0),)        # (weight, pathwise_grad_clip)
 SCORE_ROWS = 256
 SCORE_BETA = 10.0
@@ -61,6 +62,12 @@ def arms(files, source):
         lc = tbrate._stage(cfg).setdefault('loss_coeffs', {})
         for mode in ('fwd', 'bwd', 'replay'):
             lc.setdefault(mode, {}).update(score=w, score_rows=SCORE_ROWS)
+        if w >= SM_NO_ABS_BAR:
+            # the score term's raw (pre-clip) gradient is a second derivative through the flow: at weight 1 its norm
+            # sits above lr_control's absolute bar (1e6) from step 0 (cluster sm1, wandb 2vk1nplp: 4.48e6 on every
+            # retry, aborted at step 33). The global clip bounds the step; the relative excursion bar still guards.
+            assert cfg['lr_control']['hard_failure']['grad_abs'] == 1.0e6, cfg['lr_control']['hard_failure']
+            cfg['lr_control']['hard_failure']['grad_abs'] = None
         out[f'sm{_tag(w)}'] = cfg
     for w, clip in PW_ARMS:
         cfg = copy.deepcopy(bigbuf)
