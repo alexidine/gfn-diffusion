@@ -137,7 +137,8 @@ STORED_ENERGY_NOTE = (
     'the crystal the builder scored with the centroid clipped to 1 - 1e-4, while the output row describes the '
     'unclipped crystal. The manifest checks report the differences (energy.*_outliers, source_clip_band, '
     'moved_images).')
-ANALYZE_KW = dict(cutoff=10, supercell_size=10, std_orientation=False)  #: MolecularCrystal.analyze_crystal_batch
+ANALYZE_KW = dict(cutoff=10, supercell_size=10, std_orientation=False,  #: MolecularCrystal.analyze_crystal_batch's,
+                  lj_envelope=1.0)   # with the LJ cutoff switch it applies by default (energies/molecular_crystal.py::LJ_ENVELOPE_A)
 LATENT_NAMES = ('a', 'b', 'c', 'alpha', 'beta', 'gamma', 't_x', 't_y', 't_z', 'theta', 'phi', 'r')
 POSE_FIELDS = ('cell_lengths', 'cell_angles', 'aunit_centroid', 'aunit_orientation', 'aunit_handedness',
                'T_fc', 'T_cf', 'cell_volume', 'packing_coeff', 'density')

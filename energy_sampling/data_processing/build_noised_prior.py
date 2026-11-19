@@ -116,6 +116,8 @@ def build_parser():
                    help='--child_kernel basin: redraws of a draw with no chart point before it is dropped')
     p.add_argument('--limit_anchors', type=int, default=None, help='the first N anchors only (tests)')
     p.add_argument('--harvest', default=None, help='a glob of train.py harvest shards (cfg:harvest) to merge in')
+    p.add_argument('--forces', action='store_true',
+                   help="FD chart only: store each row's force, d mol_energy / d its FD chart point (score)")
     return p
 
 
@@ -137,14 +139,19 @@ def collate(batches):
 
 
 
-def score(ef, batch, T, device, chunk):
+def score(ef, batch, T, device, chunk, forces=False):
     """(the analysed batches, on the CPU, [n] bool the rows of `batch` they hold): every row through the energy
     function's own scoring of a stored prior row (train.py::Modeller._score_prior_rows), chunk rows at a time, from
     the state the run's chart gives it. FD chart (energy_config.crystal_coordinates 'fd'): the row's FD chart point
     (noised_prior.fd_chart_points, as the trainer reads a stored row), so any description of a crystal scores as that
     crystal; a row with no chart point is dropped. Latent chart: the row's latent_params, every row kept (a cell or
-    centroid outside the latent's boxes is clipped into another crystal, which check_basin_energies catches)."""
+    centroid outside the latent's boxes is clipped into another crystal, which check_basin_energies catches).
+    forces (FD chart only): each analysed row also carries ``force`` [n, chart width] float32, the gradient of its
+    stored mol_energy (run units) with respect to its FD chart point, the state noised_prior.fd_chart_points gives it
+    and the trainer reads it as (MolecularCrystal.capture_mol_energy, autograd)."""
     fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+    if forces and not fd:
+        raise ValueError('score(forces=True) needs the FD chart (energy_config.crystal_coordinates fd)')
     out, kept = [], torch.ones(batch.num_graphs, dtype=torch.bool)
     for lo in range(0, batch.num_graphs, chunk):
         idx = torch.arange(lo, min(lo + chunk, batch.num_graphs))
@@ -161,11 +168,21 @@ def score(ef, batch, T, device, chunk):
         else:
             c = c.to(device)
             x = c.latent_params(gauge_fix_free_axes=True)
-        with torch.no_grad(), ef.allow_unreferenced():
-            _, c = ef.batched_analyze_crystal_batch(
-                x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
-                return_batch=True, internal_oom_recovery=True)
-        c = c.cpu()
+        if forces:
+            x = x.detach().clone().requires_grad_(True)
+            with torch.enable_grad(), ef.allow_unreferenced(), ef.capture_mol_energy() as got:
+                _, c = ef.batched_analyze_crystal_batch(
+                    x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
+                    return_batch=True, internal_oom_recovery=True, keep_grads=True)
+                g, = torch.autograd.grad(torch.cat([e.reshape(-1) for e in got]).sum(), x)
+            c = c.cpu()
+            c.add_graph_attr(g.detach().float().cpu(), 'force')
+        else:
+            with torch.no_grad(), ef.allow_unreferenced():
+                _, c = ef.batched_analyze_crystal_batch(
+                    x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
+                    return_batch=True, internal_oom_recovery=True)
+            c = c.cpu()
         # its own bookkeeping dicts: the analysis returns a batch whose _slice_dict / _inc_dict objects a later
         # analysis call writes into, so an earlier result's atom pointers went stale (a K 0 build's anchors, after the
         # pilot scored its kicks; 2026-11-11, pool8 held-out anchors)
@@ -483,13 +500,34 @@ def heldout_mask(groups, e_anchor, frac, rng, units=None):
     return torch.tensor([drawn[p] and p not in keep for p in pairs], dtype=torch.bool)
 
 
-def check_basin_energies(anchors, basins, tol):
+def search_cutoff_energy(run_args, args, ef, anchors, T):
+    """[B] float64 mol_energy of `anchors` under the search's reporting energy, or None when the run's energy is it. A
+    search reports every row's energy on the hard LJ cutoff (MXtalTools crystal_search/minima.py: lj_envelope switches
+    the descent only), and the trainer's LJ-family energy is switched by default since 2026-11-19, which moves a row's
+    energy by ~1.25 run units (eLJ x 0.36358); check_basin_energies compares like with like, so it re-scores the
+    anchors once with the switch off."""
+    if ef.analyze_kwargs.get('lj_envelope') is None:
+        return None
+    from train import energy_function_kwargs
+    from energies.molecular_crystal import MolecularCrystal
+    hard = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
+    hard.analyze_kwargs['lj_envelope'] = None
+    hard.lj_coeff = ef.lj_coeff
+    scored, kept = score(hard, anchors, T, args.device, args.chunk)
+    if not bool(kept.all()):
+        raise SystemExit('anchors with a chart point under the run lost it on the hard-cutoff re-score')
+    return torch.cat([torch.as_tensor(s.mol_energy, dtype=torch.float64).reshape(-1) for s in scored])
+
+
+def check_basin_energies(anchors, basins, tol, got=None):
     """[B] bool, the anchors that rescore to their basin's converted search energy within ``tol`` (run units). A row
     that does not has no faithful chart point: on the latent chart score() builds from the trainer latent, which clips
     a cell outside the trainer's length box, or a centroid outside the latent's asymmetric-unit box, into another
     crystal. Such rows are dropped and counted, never kept clipped; more than 20% of rows off refuses the set (frame,
-    chart or energy definition differs)."""
-    got = torch.as_tensor(anchors.mol_energy, dtype=torch.float64).reshape(-1)
+    chart or energy definition differs). ``got``: the rows' energies under the search's own reporting energy
+    (search_cutoff_energy), when the run's differs; default the rows' stored mol_energy."""
+    if got is None:
+        got = torch.as_tensor(anchors.mol_energy, dtype=torch.float64).reshape(-1)
     want = basins['tags']['basin_E'].reshape(-1)
     off = (got - want).abs()
     keep = off <= tol
@@ -541,7 +579,7 @@ def main(argv=None):
               f"{len(harvest_files)} shard(s)", flush=True)
 
     t0 = time.time()
-    scored, kept = score(ef, anchors, T, args.device, args.chunk)
+    scored, kept = score(ef, anchors, T, args.device, args.chunk, forces=args.forces)
     anchors_no_point = int((~kept).sum())
     if anchors_no_point:
         print(f"anchors: {anchors_no_point} of {kept.numel()} rows have no {chart} chart point; dropped", flush=True)
@@ -551,7 +589,8 @@ def main(argv=None):
     anchors = collate(scored)
     e_anchor = seed_energy(ef, anchors, T, args.device)
     if basins is not None:
-        keep = check_basin_energies(anchors, basins, args.energy_tol)
+        keep = check_basin_energies(anchors, basins, args.energy_tol,
+                                    got=search_cutoff_energy(run_args, args, ef, anchors, T))
         basins['dropped_off_chart'] = int((~keep).sum())
         if not bool(keep.all()):
             rows_kept = torch.nonzero(keep).flatten()
@@ -631,7 +670,7 @@ def main(argv=None):
         else:
             b, mag = kick(anchors.subsample_new_batch(rep), args.log_lo, log_hi, args.device, args.child_kernel,
                           chart)
-        scored, kept = score(ef, b, T, args.device, args.chunk)
+        scored, kept = score(ef, b, T, args.device, args.chunk, forces=args.forces)
         if not bool(kept.all()):   # a kicked crystal with no chart point: dropped with its parent and radius
             children_no_point += int((~kept).sum())
             rep, mag = rep[kept], mag[kept.to(mag.device)]
@@ -710,6 +749,9 @@ def main(argv=None):
                                                    to_run_units=basins['factor'],
                                                    dropped_off_chart=basins['dropped_off_chart']),
         chart=chart, child_kernel=args.child_kernel, basin_kernel=kernel,
+        forces=None if not args.forces else dict(
+            column='force', of='mol_energy', wrt='the FD chart point (noised_prior.fd_chart_points)',
+            units='run energy units per chart unit', lj_envelope=ef.analyze_kwargs.get('lj_envelope')),
         k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
         kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,

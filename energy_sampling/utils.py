@@ -907,6 +907,17 @@ _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reductio
 PROBLEM_DEF_SCHEMA_VERSION = 1
 
 
+def _drop_lj_envelope(energy_config):
+    """Leave the LJ cutoff switch (analyze_kwargs.lj_envelope) out of a problem definition, in place. It moves eLJ
+    energies by ~0.002 (2026-11-19, when the switch became the default), so a checkpoint is the same problem with or
+    without it; in the problem definition it would rename every checkpoint (the slug hashes it), so a resume would
+    start fresh and a warm start would refuse. A stored row's energy is judged by noised_prior.identity and
+    prior_scan_cache.scan_identity, which do carry the effective switch."""
+    ak = energy_config.get('analyze_kwargs')
+    if isinstance(ak, dict) and 'lj_envelope' in ak:
+        energy_config['analyze_kwargs'] = {k: v for k, v in ak.items() if k != 'lj_envelope'}
+
+
 def get_problem_definition(args) -> dict:
     """
     The subset of the config that defines *what problem* is being solved -
@@ -920,6 +931,7 @@ def get_problem_definition(args) -> dict:
     energy_config = _to_plain(args.energy_config)
     for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
         energy_config.pop(key, None)
+    _drop_lj_envelope(energy_config)
     # crystal_coordinates enters the identity only when off its default, as emb_cond below: the 'latent' state space
     # is the one every existing run already has, and writing it would change their hash
     if energy_config.get('crystal_coordinates', 'latent') == 'latent':
@@ -971,6 +983,7 @@ def normalize_problem_def(problem_def):
         energy_config = dict(normalized['energy_config'])
         for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
             energy_config.pop(key, None)
+        _drop_lj_envelope(energy_config)
         normalized['energy_config'] = energy_config
     return normalized
 

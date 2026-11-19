@@ -4625,7 +4625,9 @@ class Modeller:
         bad = noised_prior.identity_mismatch(manifest['identity'], noised_prior.identity(self.args, ef))
         if bad:
             raise ValueError(f"pre-noised prior {self.args.prior_path} was scored under another energy definition; "
-                             f"rebuild it for this run. Differences: " + '; '.join(bad))
+                             f"rebuild it for this run. Differences: " + '; '.join(bad)
+                             + noised_prior.restamp_hint(manifest['identity'], noised_prior.identity(self.args, ef),
+                                                         self.args.prior_path))
 
         fd_ok = None
         if getattr(ef, 'crystal_coordinates', 'latent') == 'fd':

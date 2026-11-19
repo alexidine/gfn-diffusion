@@ -51,7 +51,7 @@ srun singularity exec \
         export CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
         python -u data_processing/build_noised_prior.py --config configs/mk_dev.yaml \
             --set energy_config.crystal_coordinates=fd --set 'space_groups=[14]' --thermal_scaling_factor ${TSF} \
-            --device cpu --basins ${SHARDS}/list_${TAG}.txt --k ${K} --child_kernel metric --log_hi ${LOGHI} \
+            --device cpu --basins ${SHARDS}/list_${TAG}.txt --k ${K} --child_kernel metric --log_hi ${LOGHI} --forces \
             --seed $(( 1000 + I )) --out ${SHARD}.tmp.pt
         mv ${SHARD}.tmp.pt ${SHARD}
     "

@@ -16,6 +16,8 @@ Per group g (make.py renders them; edit the templates, not the rendered files):
 | 2 | shard_sg<g>.sbatch | array 0-99, 4 cores, 16 GB, 6 h | shard i = band sets 29i+1 .. 29i+29: K 4 metric children, seed 1000 + i |
 | 3 | merge_sg<g>.sbatch | 8 cores, 96 GB, 8 h | merged prior, held-out anchors (K 0), conditions file, test file (W 5, 8 per molecule, 500 molecules) |
 
+2026-11-19 (owner): the trainer's eLJ is switched by default (lj_envelope 1.0, as the searches; energies/molecular_crystal.py::LJ_ENVELOPE_A), so these builds score under it, and the shards build with `--forces`: every training row stores `force`, d mol_energy / d its FD chart point (docs/wiki/prior-buffer.md). The band sets' hard-cutoff energies are checked against a hard-cutoff re-score of the anchors. The P-1 K=4 prior was scored on the hard cutoff: before it is merged with these groups or loaded by a run on this code, restamp it with forces (`IN=<p1 prior> FORCES=1 sbatch configs/pool8_prior_nov09/restamp_prior.sbatch`).
+
 Outputs in `/scratch/mk8347/data/crystal_datasets/conditional/pool8sg_nov15/priors/sg<g>/`:
 `pool8_sg<g>_train_k4_metric.pt`, `pool8_sg<g>_heldout_anchors.pt`, `pool8_sg<g>_train_conditions.pt`,
 `pool8_sg<g>_test_w5.pt`.

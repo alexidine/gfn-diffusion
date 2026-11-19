@@ -66,6 +66,12 @@ def _plain(obj):
     return repr(obj)
 
 
+def _effective_analyze_kwargs(energy_function, analyze_kwargs):
+    from energies.molecular_crystal import effective_analyze_kwargs
+    return {k: v for k, v in effective_analyze_kwargs(energy_function, analyze_kwargs).items()
+            if k not in ('predictor', 'c', 'width')}
+
+
 def scan_identity(args, n_rows, lj_coeff):
     """The identity dict of a scoring pass of args.prior_path under args (see the module docstring)."""
     mlip = getattr(args, 'mlip_path', None)
@@ -80,6 +86,9 @@ def scan_identity(args, n_rows, lj_coeff):
         'lj_coeff': None if lj_coeff is None else float(lj_coeff),
         'energy_config': {k: CHUNKING_KEYS.get(k, v) for k, v in _plain(args.energy_config).items()
                           if k not in SCREEN_KEYS},
+        # the analysis as it runs, code defaults included (an LJ-family energy's cutoff switch, 2026-11-19)
+        'analyze_kwargs_effective': _plain(_effective_analyze_kwargs(
+            args.energy_function, getattr(args.energy_config, 'analyze_kwargs', None))),
     }
 
 

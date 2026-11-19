@@ -26,6 +26,23 @@ from mxtaltools.mlip_interfaces.uma_utils import (init_uma_crystal_predictor,
 
 #: MolecularCrystal(crystal_coordinates=...): the trainer latent, or crystal_fd's fundamental-domain chart
 CRYSTAL_COORDINATES = ('latent', 'fd')
+# The LJ-family computes are switched off smoothly over the last LJ_ENVELOPE_A Angstrom before the analysis cutoff
+# (MXtalTools vdw_analysis.lj_cutoff_envelope) unless energy_config.analyze_kwargs sets lj_envelope itself (null =
+# the hard cutoff). Owner 2026-11-19: the searches' value, so the energy is continuous and its gradient is the
+# derivative of the energy (a hard cutoff drops every pair crossing it from the gradient).
+LJ_FAMILY = ('lj', 'qlj', 'elj')
+LJ_ENVELOPE_A = 1.0
+
+
+def effective_analyze_kwargs(energy_function, analyze_kwargs):
+    """energy_config.analyze_kwargs as the analysis runs it: a copy, with lj_envelope LJ_ENVELOPE_A added for an
+    LJ-family energy that does not set it. Read by MolecularCrystal and by every identity of a scored file."""
+    if isinstance(analyze_kwargs, Namespace):
+        analyze_kwargs = vars(analyze_kwargs)
+    out = dict(analyze_kwargs or {})
+    if energy_function in LJ_FAMILY:
+        out.setdefault('lj_envelope', LJ_ENVELOPE_A)
+    return out
 #: any radius: the FD chart's width and circle rows do not depend on it (only its length box does)
 FD_LAYOUT_RADIUS = 4.0
 
@@ -345,9 +362,7 @@ class MolecularCrystal(BaseSet):
         self.pressure = pressure
         self.log_temperature_range = log_temperature_range
         self.internal_oom_recovery = internal_oom_recovery
-        if isinstance(analyze_kwargs, Namespace):  # yaml configs nest dicts as Namespaces
-            analyze_kwargs = vars(analyze_kwargs)
-        self.analyze_kwargs = analyze_kwargs or {}
+        self.analyze_kwargs = effective_analyze_kwargs(energy_function, analyze_kwargs)   # yaml nests dicts as Namespaces
         self.host_gas_phase_reference = bool(host_gas_phase_reference)
         # mol_id -> isolated-molecule MLIP energy, filled lazily on first sight of
         # each molecule. Deliberately NOT checkpointed: it is a pure function of the
@@ -446,6 +461,7 @@ class MolecularCrystal(BaseSet):
         self.lambda_mix = float(lambda_mix)
         # the per-call leg capture used by capture_reward_legs (None = not capturing)
         self._reward_leg_capture = None
+        self._mol_energy_capture = None
         if prior_flow_path is not None:
             self.prior_flow = PriorFlow.load(prior_flow_path, device=self.device)
             if len(self.prior_flow.wrap_mask) != self.data_ndim:
@@ -1047,6 +1063,9 @@ class MolecularCrystal(BaseSet):
         # an ordinary-looking sample that a buffer would happily admit, rather
         # than something anything downstream could notice.
 
+        _capture = getattr(self, '_mol_energy_capture', None)
+        if _capture is not None:   # the stored lattice-energy column, graph attached (capture_mol_energy)
+            _capture.append(ens_dict['mol_energy'])
         for key in ens_dict.keys():
             setattr(crystal_batch, key, ens_dict[key].cpu().detach())
 
@@ -1065,6 +1084,20 @@ class MolecularCrystal(BaseSet):
     #: gflownet_losses.terminal_force_legs, which stores each leg's gradient so a
     #: replay row's terminal force can be re-mixed at a later lambda.
     REWARD_LEGS = ('flow', 'phys', 'bound')
+
+    @contextlib.contextmanager
+    def capture_mol_energy(self):
+        """Collect, per analyze_crystal_batch call inside the block (call order; the OOM-recovery path chunks one
+        batch into several), the [B] mol_energy column the call stores on its rows, graph attached, so that under
+        keep_grads its gradient with respect to the analysed state is the gradient of exactly that stored column
+        (build_noised_prior --forces). Not re-entrant; the list is dropped on exit."""
+        if getattr(self, '_mol_energy_capture', None) is not None:
+            raise RuntimeError("capture_mol_energy blocks do not nest")
+        self._mol_energy_capture = []
+        try:
+            yield self._mol_energy_capture
+        finally:
+            self._mol_energy_capture = None
 
     @contextlib.contextmanager
     def capture_reward_legs(self):

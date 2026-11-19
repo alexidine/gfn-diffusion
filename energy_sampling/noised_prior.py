@@ -385,6 +385,8 @@ def identity(args, energy_function):
     analyze = dict(cutoff=10, supercell_size=10, std_orientation=False)
     analyze.update({k: v for k, v in dict(getattr(energy_function, 'analyze_kwargs', {}) or {}).items()
                     if k not in ('predictor', 'c', 'width')})
+    if analyze.get('lj_envelope', 0) is None:   # the hard cutoff, as every file written before the switch (2026-11-19)
+        del analyze['lj_envelope']
     mlip = getattr(args, 'mlip_path', None)
     ec = args.energy_config
     return {
@@ -413,6 +415,23 @@ def identity_mismatch(stored, current):
             return bool(a) and set(a) <= set(b)
         return a == b
     return [f"{k}: file {stored.get(k)!r}, run {current.get(k)!r}" for k in sorted(current) if not same(k)]
+
+
+def restamp_hint(stored, current, path):
+    """'' unless the only identity difference between a file and a run is the LJ cutoff switch
+    (analyze_kwargs.lj_envelope), which data_processing/restamp_prior.py fixes by re-scoring the stored rows: then the
+    command, as a sentence to append to the refusal."""
+    keys = [k for k in current if stored.get(k) != current.get(k)]
+    if keys != ['analyze_kwargs']:
+        return ''
+    a, b = dict(stored.get('analyze_kwargs') or {}), dict(current.get('analyze_kwargs') or {})
+    a.pop('lj_envelope', None)
+    b.pop('lj_envelope', None)
+    if a != b:
+        return ''
+    return (f". Only the LJ cutoff switch differs (the trainer's eLJ is switched by default since 2026-11-19): re-score "
+            f"the file in place of a rebuild with  python data_processing/restamp_prior.py {path} <out.pt> --config "
+            f"<this config>  and point prior_path at the output")
 
 
 def condition_groups(batch):

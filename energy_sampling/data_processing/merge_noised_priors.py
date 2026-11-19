@@ -8,7 +8,7 @@ space groups.
 Rows are concatenated in input order (energies.molecular_crystal.merge_batches); each later file's noised_parent
 indices are offset by the rows before it (an anchor's parent is itself). Refuses unless every file agrees on the
 thermal_scaling_factor and on the manifest keys the trainer reads (format_version, k, child_kernel, kick_units, log_lo,
-log_hi, basin_kernel, temperature, window_kT_target, chart, heldout_frac) and on every identity field but space_groups
+log_hi, basin_kernel, temperature, window_kT_target, chart, heldout_frac, forces) and on every identity field but space_groups
 / z_primes (their union is written). Refuses a condition (identifier, space group, Z') in two files: a build holds
 each condition's anchors whole (its floor, its never-held-out lowest anchor), so shards must split by molecule. The
 manifest is the first file's, with identity.space_groups / z_primes the union, counts summed (children_within_window:
@@ -29,7 +29,7 @@ if HERE not in sys.path:
 import noised_prior as NP  # noqa: E402
 
 READ = ('format_version', 'k', 'child_kernel', 'kick_units', 'log_lo', 'log_hi', 'basin_kernel', 'temperature',
-        'window_kT_target', 'chart', 'heldout_frac')
+        'window_kT_target', 'chart', 'heldout_frac', 'forces')
 LAYOUT_ROWS = ('fd_state', 'fd_log_reference')   # layout-specific chart rows: the trainer attaches its own
 
 
