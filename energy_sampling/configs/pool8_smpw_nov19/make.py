@@ -73,6 +73,11 @@ def arms(files, source):
         cfg = copy.deepcopy(bigbuf)
         tbrate._stage(cfg).setdefault('loss_coeffs', {}).setdefault('fwd', {}).update(pathwise=w,
                                                                                        pathwise_grad_clip=clip)
+        # the same bar on the pathwise draw's raw gradient (the reparameterised Jacobian through the flow): cluster
+        # pw1c100 (wandb u6tprdkw) hit grad_abs 1.664e6 identically on every retry from step 36, aborted at step 45;
+        # the per-row clip in x bounds each row's push, not dx/dtheta
+        assert cfg['lr_control']['hard_failure']['grad_abs'] == 1.0e6, cfg['lr_control']['hard_failure']
+        cfg['lr_control']['hard_failure']['grad_abs'] = None
         out[f'pw{_tag(w)}c{_tag(clip)}'] = cfg
     for name, cfg in out.items():
         # the source checkpoint names the unswitched prior; _switched is the same rows re-scored under the switched eLJ

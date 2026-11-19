@@ -87,7 +87,7 @@ lr_control:
     loss_excursion_k: 10.0
     grad_excursion_x: 100.0
     loss_abs: 1000000.0
-    grad_abs: 1000000.0
+    grad_abs: null
     cruise_rederive: true
     cruise_settle_steps: 200
     root_window: 200
