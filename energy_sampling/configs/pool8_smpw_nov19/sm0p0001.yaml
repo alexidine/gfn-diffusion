@@ -42,7 +42,8 @@ archive_period: 5000
 archive_buffers: false
 override_learning_rates: false
 checkpoint_read_only: false
-warm_start_ignore_problem_keys: null
+warm_start_ignore_problem_keys:
+- prior_path
 rewind_tolerance: 0.25
 nonfinite_abort_streak: 50
 freeze_backward_policy: false

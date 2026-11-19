@@ -61,7 +61,9 @@ def arms(files, source):
         tbrate._stage(cfg).setdefault('loss_coeffs', {}).setdefault('fwd', {})['pathwise'] = w
         out[f'pw{_tag(w)}'] = cfg
     for name, cfg in out.items():
-        cfg.update(run_name=name, tag=TAG)
+        # the source checkpoint names the unswitched prior; _switched is the same rows re-scored under the switched eLJ
+        assert cfg['load_weights_only'] is True
+        cfg.update(run_name=name, tag=TAG, warm_start_ignore_problem_keys=['prior_path'])
     return out
 
 
