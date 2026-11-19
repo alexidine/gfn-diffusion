@@ -1255,7 +1255,7 @@ energy_config:
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   physical_energy_clip: null # absolute crystal-energy cutoff above which the PHYSICAL leg is log-compressed (cutoff + log1p). Valid under lambda mixing (the flow leg is untouched); reward_range is not. Logs physical_clip_active_frac
   energy_reference: null  # 'seed_min': the reward's physical leg is scored against each condition's lowest seed energy (prior rows + conditions-file crystals, rescored at init without the Jacobian); a per-condition constant, so only each condition's log Z moves. Absolute reward floors are judged on the unreferenced log R. null: no reference
-  analyze_kwargs: { }  # elj: none
+  analyze_kwargs: { lj_envelope: 1.0 }  # LJ-family cutoff switch width (A); null = hard cutoff
   # MLIP EXECUTION, uma route only; all three are the behaviour every run has had.
   mlip_compile: false            # torch.compile the MLIP. Needs mlip_edge_chunk_size set, or every distinct edge count is a recompile and dynamo silently falls back to eager. Unconditional/single-molecule arms only: a molecule-conditioned run makes atoms-per-batch dynamic too, which edge padding cannot fix. Changes float summation order, so energies move at ULP level
   mlip_edge_chunk_size: null     # pad the edge dimension into buckets of this size, the one truly dynamic shape in the batch. Set it comfortably above `energy/uma_edges_max`; too small forces recompiles, too large pads. null = no bucketing

@@ -272,7 +272,13 @@ def arm(name: str, problem: Optional[str] = None, tag: Optional[str] = None,
     """
     cfg = copy.deepcopy(base) if base is not None else canonical()
     if problem is not None:
-        cfg = merge(cfg, problem_block(problem))
+        block = problem_block(problem)
+        cfg = merge(cfg, block)
+        # a problem's analyze_kwargs is its whole analysis spec, not edits to canonical's: merged, canonical's
+        # lj_envelope (an LJ-family key) reached every registry problem, the non-LJ toys included (2026-11-19)
+        ak = (block.get('energy_config') or {}).get('analyze_kwargs')
+        if ak is not None:
+            cfg['energy_config']['analyze_kwargs'] = copy.deepcopy(ak)
     cfg['run_name'] = name
     if tag is not None:
         cfg['tag'] = tag
