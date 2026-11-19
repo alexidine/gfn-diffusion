@@ -9,10 +9,10 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool8sg4
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8sg4_nov20/joblogs/%x_%A_%a.out
 
-# pool8sg4_nov20 (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms smoke mle4 tb4 in index
+# pool8sg4_nov20 (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms smoke smoke_cpu mle4 tb4 in index
 # order (make.py's docstring). Submit ONE index at a time: --array=0 (smoke) first and read it; then --array=1 (mle4);
 # tb4 (--array=2) only after `make.py --tb SOURCE` has written tb4.yaml. a100_chemistry only and 256 GB: the merged prior
 # is ~4x P-1's (RAM) and the GPU holds two copies of its rows (VRAM); the smoke measures both (sacct MaxRSS, _smi.csv).
@@ -28,11 +28,11 @@ LOGS=${ARMS}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional
 mkdir -p ${LOGS}
 
-ARM_LIST=(smoke mle4 tb4)
+ARM_LIST=(smoke smoke_cpu mle4 tb4)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 
-FILES=(pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt pool8_nov09/priors/pool8_p1_train_conditions.pt pool8_nov09/priors/pool8_p1_test_w5.pt)
+FILES=(pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt pool8_nov09/priors/pool8_p1_train_conditions.pt pool8sg4_nov20/priors/pool8_4sg_test_w5.pt)
 for f in "${FILES[@]}"; do
     if [ ! -s ${DATA}/${f} ]; then echo "FATAL: ${DATA}/${f} is missing or empty" >&2; exit 1; fi
 done

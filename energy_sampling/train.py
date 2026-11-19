@@ -4905,11 +4905,15 @@ class Modeller:
     def init_prior_buffer_source(self):
         """A pre-noised prior's buffer seed (_load_noised_prior's `buffer` rows: every scored training row, anchors
         and children) as a dataset built like prior_dataset, read by _prior_buffer_seed_source. Any other prior has
-        none, and the buffer seeds from prior_dataset as before."""
+        none, and the buffer seeds from prior_dataset as before.
+
+        Held on the CPU whatever buffer_device is: it is a seed source only, and both readers
+        (_store_seed, the prior-buffer seed generator) move each chunk to self.device themselves. On the GPU it was a
+        second resident copy of every training row beside prior_dataset (pool8sg4_nov20, 2026-11-20: ~4x P-1's rows)."""
         rows = getattr(self, '_prior_buffer_rows', None)
         self._prior_buffer_rows = None
         self.prior_buffer_source = None if rows is None else CrystalBuffer(
-            rows, device=self.buffer_device, **self._buffer_kwargs(), y_fn=self._buffer_y_fn(),
+            rows, device='cpu', **self._buffer_kwargs(), y_fn=self._buffer_y_fn(),
             exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
     def _prior_buffer_seed_source(self):

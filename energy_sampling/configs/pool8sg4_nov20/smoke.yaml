@@ -13,7 +13,7 @@ checkpoint_name: null
 load_weights_only: false
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors/pool8_p1_train_conditions.pt
-test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors/pool8_p1_test_w5.pt
+test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8sg4_nov20/priors/pool8_4sg_test_w5.pt
 prior_scan_cache: false
 noised_prior:
   window_kT: 10.0
