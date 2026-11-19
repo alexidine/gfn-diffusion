@@ -7,11 +7,19 @@ build_noised_prior.py), built from scored prior files:
               kT of their molecule's lowest (T 2.5, density coefficient 10), packing in the window; at most
               --per_molecule per molecule (lowest first) and --max_molecules molecules (a seeded draw), so the
               eval_test readouts stay a fixed, affordable row set at large molecule counts. One file per W.
+  heldout_groups  cfg:test_molecules_path for a run over several space groups, drawn uniformly over the groups
+              (owner 2026-11-20): one scored held-out file per group; the SAME seeded draw of --molecules held-out
+              molecules, from those with a crystal in every file's window, and from each file at most --per_molecule
+              of each molecule's crystals within W kT of that molecule's own floor in that file (lowest first),
+              concatenated in file order. A merged file through `heldout` would take each molecule's floor across the
+              groups and so favour whichever group is lowest.
 
 usage, from energy_sampling/:
     python data_processing/molecule_split_files.py conditions TRAIN_PRIOR.pt OUT.pt
     python data_processing/molecule_split_files.py heldout HELDOUT.pt OUT_STEM W [W ...] [--per_molecule N]
         [--max_molecules M] [--seed S]
+    python data_processing/molecule_split_files.py heldout_groups OUT.pt W HELDOUT_G1.pt HELDOUT_G2.pt [...]
+        --molecules M --per_molecule N [--seed S]
 """
 import argparse
 import os
@@ -95,6 +103,73 @@ def heldout(src, stem, windows, per_molecule=None, max_molecules=None, seed=0):
               f'{counts.min()}/{np.median(counts):g}/{counts.max()}')
 
 
+
+def _eligible(b, w):
+    """(identifiers [n], du [n] in kT above each molecule's floor in this file, eligible [n] bool: in the packing
+    window and within w kT)."""
+    e = _energy(b)
+    inpk = _in_window(b)
+    floor = NP.condition_floor(e, NP.condition_groups(b), torch.isfinite(e) & inpk)
+    du = ((e - floor) / T_KT).numpy()
+    return (np.asarray([str(x) for x in b.identifier]), du,
+            inpk.numpy() & np.isfinite(du) & (du <= w))
+
+
+def heldout_groups(srcs, out, w, molecules, per_molecule, seed=0):
+    from energies.molecular_crystal import merge_batches
+    if os.path.exists(out):
+        raise SystemExit(f'{out} exists')
+    files, tsf = [], set()
+    for src in srcs:
+        d = torch.load(src, weights_only=False, map_location='cpu')
+        NP.refuse_stale_atom_pointers(d['prior'], src)
+        sg = sorted({int(x) for x in torch.as_tensor(d['prior'].sg_ind).reshape(-1).tolist()})
+        tsf.add(d.get('thermal_scaling_factor'))
+        files.append((src, d['prior'], sg) + _eligible(d['prior'], w))
+    if len(tsf) != 1:
+        raise SystemExit(f'the files differ in thermal_scaling_factor: {tsf}')
+    common = sorted(set.intersection(*[set(ids[ok].tolist()) for _, _, _, ids, _, ok in files]))
+    if len(common) < molecules:
+        raise SystemExit(f'only {len(common)} molecules have a crystal within {w:g} kT in every file')
+    mols = np.sort(np.random.default_rng(seed).choice(np.asarray(common), size=molecules, replace=False))
+    parts, report = [], []
+    for src, b, sg, ids, du, ok in files:
+        rows = np.nonzero(ok & np.isin(ids, mols))[0]
+        rows = rows[np.lexsort((du[rows], ids[rows]))]
+        rank = np.zeros(len(rows), dtype=np.int64)
+        for i in range(1, len(rows)):
+            rank[i] = rank[i - 1] + 1 if ids[rows[i]] == ids[rows[i - 1]] else 0
+        rows = np.sort(rows[rank < per_molecule])
+        sub = b.subsample_new_batch(torch.as_tensor(rows))
+        NP.strip_analysis_helpers(sub)
+        parts.append(sub)
+        counts = np.unique(ids[rows], return_counts=True)[1]
+        report.append(f'space group {sg}: {len(rows)} crystals of {len(counts)} molecules, per molecule '
+                      f'min/median/max {counts.min()}/{np.median(counts):g}/{counts.max()} ({src})')
+    # layout-specific chart rows (the trainer attaches its own) and any column a file lacks are left out, named
+    for b in parts:
+        for key in ('fd_state', 'fd_log_reference'):
+            if key in b.keys():
+                delattr(b, key)
+    shared = set.intersection(*[set(b.keys()) for b in parts])
+    dropped = sorted(set.union(*[set(b.keys()) for b in parts]) - shared)
+    for b in parts:
+        for key in dropped:
+            if key in b.keys():
+                delattr(b, key)
+    if dropped:
+        print(f'columns not in every file, left out: {dropped}')
+    merged = merge_batches(parts)
+    torch.save({'prior': merged, 'thermal_scaling_factor': tsf.pop(),
+                'note': f'held-out molecules over {len(srcs)} space groups, uniform: the same {molecules} molecules '
+                        f'(seed {seed}) in every group, at most {per_molecule} crystals each within {w:g} kT (T {T_KT}) '
+                        f'of the molecule floor in that group, packing in {PW}; from {list(srcs)}'}, out)
+    print(f'{out}: {int(merged.num_graphs)} crystals, {molecules} molecules drawn from {len(common)} common to all '
+          f'{len(srcs)} files')
+    for r in report:
+        print('  ' + r)
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -108,8 +183,17 @@ if __name__ == '__main__':
     h.add_argument('--per_molecule', type=int, default=None)
     h.add_argument('--max_molecules', type=int, default=None)
     h.add_argument('--seed', type=int, default=0)
+    g = sub.add_parser('heldout_groups')
+    g.add_argument('out')
+    g.add_argument('window', type=float)
+    g.add_argument('srcs', nargs='+')
+    g.add_argument('--molecules', type=int, required=True)
+    g.add_argument('--per_molecule', type=int, required=True)
+    g.add_argument('--seed', type=int, default=0)
     a = p.parse_args()
     if a.cmd == 'conditions':
         conditions(a.src, a.out)
-    else:
+    elif a.cmd == 'heldout':
         heldout(a.src, a.stem, a.windows, a.per_molecule, a.max_molecules, a.seed)
+    else:
+        heldout_groups(a.srcs, a.out, a.window, a.molecules, a.per_molecule, a.seed)
