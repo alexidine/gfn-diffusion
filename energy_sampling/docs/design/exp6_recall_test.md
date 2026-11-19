@@ -275,3 +275,29 @@ dispersion-bound crystal (naphthalene) lands within 1–4 kJ/mol of the referenc
 H-bonded molecules the three sizes differ by up to 40 kJ/mol, which points at the isolated-molecule leg (the models are
 trained on crystals only) and cancels within a molecule. Benzoic acid at about −160 kJ/mol under every model is far
 from its sublimation enthalpy (about 90 kJ/mol) and is unexplained.
+
+**Hydrogen placement defect (2026-11-19).** Until GFN 00028573, `panel.normalise_h` put every hydrogen at 2r − L
+from its heavy atom (X-ray C–H 0.93 Å → 0.77 Å). Every panel and probe conformer and anchor built before then
+(`panel/`, `panel_probes_nov18/`) carries it; imidazole's deposited hydrogens (about 1.07 Å) make it the least
+affected. The mirror test, the MACE-OFF24 vs UMA-s chiral-molecule comparison, and the anchor tables above were
+computed on those conformers and are to be redone before they are relied on.
+
+**Polymorph energy differences, three MLIPs (observation, 2026-11-19; `eval/exp6_recall/polymorph_pairs.py`,
+outputs `D:/crystal_datasets/exp6_recall_nov10/polymorph_pairs_nov19/subset16_fixedH/`).** 16 molecules with two
+Z' = 1 CSD forms each (R ≤ 5%, no zwitterion-capable molecules, the smallest cells), 8 inside MACE-CSP-25.2's training
+selection and 8 outside it (CH₃, amide and other torsions, acetic acid); hydrogens normalised; one rigid-molecule local
+relaxation per crystal per model from the deposited structure (the search's BFGS polish, tol 2e-3 kT). All 96
+relaxations converged; cell volumes changed by −8% to +15%.
+
+| models | molecules | pairs | median \|ΔE₁ − ΔE₂\| (kJ/mol) | within 2 kJ/mol | within 5 kJ/mol | same sign (both \|ΔE\| > 1) |
+|---|---|---|---|---|---|---|
+| MACE-CSP L + D3 vs UMA-s | inside | 8 | 1.27 | 6/8 | 7/8 | 5/5 |
+| MACE-CSP L + D3 vs UMA-s | outside | 8 | 0.75 | 6/8 | 8/8 | 6/6 |
+| MACE-CSP L + D3 vs MACE-OFF24 | all | 16 | 7.72 | 4/16 | 7/16 | 6/11 |
+| MACE-OFF24 vs UMA-s | all | 16 | 6.15 | 4/16 | 7/16 | 9/13 |
+
+Caption: ΔE = lattice energy of form B minus form A at each model's own relaxed structures (kJ/mol per molecule),
+one relaxation each; UMA-s mirror-averaged in Sohncke groups. Reading: MACE-CSP-25.2 + D3 and UMA-s agree on
+polymorph differences to about 1 kJ/mol, as well outside MACE-CSP's training selection as inside it, on this sample;
+MACE-OFF24 departs from both by 6–8 kJ/mol. Sixteen pairs, one relaxation each: a screen, not a measurement of
+accuracy against experiment.
