@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=a100_chemistry
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --mem=256G
 #SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
@@ -14,7 +13,7 @@
 
 # @TAG@ (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms @ARMS@ in index
 # order (make.py's docstring). Submit ONE index at a time: --array=0 (smoke) first and read it; then --array=1 (mle4);
-# tb4 (--array=2) only after `make.py --tb SOURCE` has written tb4.yaml. a100_chemistry only and 256 GB: the merged prior
+# tb4 (--array=2) only after `make.py --tb SOURCE` has written tb4.yaml. an A100 (any partition that has one) and 256 GB: the merged prior
 # is ~4x P-1's (RAM) and the GPU holds two copies of its rows (VRAM); the smoke measures both (sacct MaxRSS, _smi.csv).
 module purge
 
