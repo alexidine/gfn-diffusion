@@ -57,7 +57,7 @@ DATA = '/scratch/mk8347/data/crystal_datasets/conditional'
 PRIOR = 'pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt'
 CONDITIONS = 'pool8_nov09/priors/pool8_p1_train_conditions.pt'
 TEST = 'pool8_nov09/priors/pool8_p1_test_w5.pt'
-ZSG_PANEL = None   # the Z(sg) readout block, set once the readout code lands (see README)
+ZSG_PANEL = {'enabled': True, 'molecules': 64, 'draws': 32, 'every_n_evals': 4}   # Z(sg) readouts (train.py::Modeller.log_zsg_panels)
 
 
 def mle4(files):

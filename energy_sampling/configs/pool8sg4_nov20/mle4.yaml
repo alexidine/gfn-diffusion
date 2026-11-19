@@ -624,3 +624,8 @@ energy_config:
   mlip_activation_checkpointing: true
   prior_flow_path: null
   lambda_mix: 1.0
+zsg_panel:
+  enabled: true
+  molecules: 64
+  draws: 32
+  every_n_evals: 4
