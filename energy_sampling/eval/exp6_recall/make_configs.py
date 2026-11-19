@@ -8,7 +8,8 @@ energy, then the polish to minima with Hessians, merged into a library. Modes:
     seeds   num_samples 0: only the rows of a seeds file are relaxed (they start in the last stage) and polished;
             the MLIP leg of the exp-6 and eLJ arms, and the anchors
 
-Energies: 'elj' (its search kT, as MIPCAS), 'exp6' (FIT + MMFF charges, kJ/mol per molecule), 'uma' (UMA-s 1.1,
+Energies: 'elj' (its search kT, as MIPCAS), 'exp6' (FIT + MMFF charges, kJ/mol per molecule), 'mace' (MACE-OFF24
+medium), 'mace_csp' (MACE-CSP-25.2 large + D3(BJ, PBE)), 'uma' (UMA-s 1.1,
 uma-s-1p1.pt, through the uma route, lattice energy in kJ/mol per molecule; the owner's reference, 2026-11-10, after
 eSEN-S was found to compress aromatic crystals). kT for the kJ/mol energies is RT at 300 K.
 
@@ -24,15 +25,18 @@ import os
 import yaml
 
 KT_KJ = 2.494339  # RT at 300 K, kJ/mol
-KT = {'elj': 6.859493755713105, 'exp6': KT_KJ, 'uma': KT_KJ, 'mace': KT_KJ}
+KT = {'elj': 6.859493755713105, 'exp6': KT_KJ, 'uma': KT_KJ, 'mace': KT_KJ, 'mace_csp': KT_KJ}
+# the MXtalTools optim_target of each energy; MACE-CSP-25.2 runs through the MACE route with D3 added
+TARGET = {'mace_csp': 'mace'}
 SITES = {
-    'local': dict(uma='D:/crystal_datasets/uma-s-1p1.pt', mace='D:/crystal_datasets/MACE-OFF24_medium.model'),
+    'local': dict(uma='D:/crystal_datasets/uma-s-1p1.pt', mace='D:/crystal_datasets/MACE-OFF24_medium.model',
+                  mace_csp='D:/crystal_datasets/day_models/mace_csp_25.2_large.model'),
     'cluster': dict(uma='/scratch/mk8347/models/uma/uma-s-1p1.pt'),
 }
-SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96, 'mace': 96}  # starts in flight; an MLIP holds far fewer rows per call
+SLOTS = {'elj': 250, 'exp6': 250, 'uma': 96, 'mace': 96, 'mace_csp': 96}  # starts in flight; an MLIP holds far fewer rows per call
 # the polish's tolerance (kT); None: MXtalTools' default (1e-4, MLIP_TOL on an MLIP). exp-6's float32 energy repeats to
 # 5.5e-5 kT (imidazole, 2026-11-10), so at 1e-4 its polish stalled short of the test
-POLISH_TOL = {'elj': None, 'exp6': 1e-3, 'uma': None, 'mace': None}
+POLISH_TOL = {'elj': None, 'exp6': 1e-3, 'uma': None, 'mace': None, 'mace_csp': None}
 # the 65 Sohncke space groups (no improper element): a crystal and its mirror image are different crystals
 SOHNCKE = {1, 3, 4, 5, *range(16, 25), *range(75, 81), *range(89, 99), *range(143, 147), *range(149, 156),
            *range(168, 174), *range(177, 183), *range(195, 200), *range(207, 215)}
@@ -40,10 +44,11 @@ SOHNCKE = {1, 3, 4, 5, *range(16, 25), *range(75, 81), *range(89, 99), *range(14
 
 def stages(energy):
     kT = KT[energy]
-    s1 = dict(optim_target=energy, enforce_reduced=False, compression_factor=0.0, cutoff=10, init_lr=0.05,
+    target = TARGET.get(energy, energy)
+    s1 = dict(optim_target=target, enforce_reduced=False, compression_factor=0.0, cutoff=10, init_lr=0.05,
               convergence_eps=0.01, optimizer_func='rprop', anneal_lr=False, grad_norm_clip=0.1, show_tqdm=False,
               max_num_steps=350, target_packing_coeff=None, centroid_boundary='wrap')
-    s2 = dict(optim_target=energy, enforce_reduced=False, compression_factor=0.0, cutoff=10, convergence_eps=1e-4,
+    s2 = dict(optim_target=target, enforce_reduced=False, compression_factor=0.0, cutoff=10, convergence_eps=1e-4,
               optimizer_func='bfgs', show_tqdm=False, max_num_steps=200, target_packing_coeff=None,
               centroid_boundary='wrap', early_stop=[[25, 20.0], [50, 15.0], [100, 12.0]], early_stop_kT=kT)
     return [s1, s2]
@@ -73,6 +78,9 @@ def config(name, sg, energy, mode, panel_dir, out_dir, site, n=2000, seeds=None,
         c['mlip_mirror_average'] = int(sg) in SOHNCKE
     if energy == 'mace':  # MACE-OFF24 (medium): exactly mirror-invariant, no parity keys
         c['mace_predictor_path'] = SITES[site]['mace']
+    if energy == 'mace_csp':  # MACE-CSP-25.2 (large; PBE without dispersion) + D3(BJ, PBE) in the MACE route
+        c['mace_predictor_path'] = SITES[site]['mace_csp']
+        c['mace_dispersion'] = dict(xc='pbe', damping='bj')
     return run, c
 
 
