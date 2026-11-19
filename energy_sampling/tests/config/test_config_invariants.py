@@ -1177,6 +1177,19 @@ def test_a_malformed_heldout_gate_is_an_error(canonical):
     assert _fires(cfg, 'heldout_gate_is_well_formed', severity=ERROR)
 
 
+def test_a_malformed_zsg_panel_is_an_error_and_an_inert_one_is_reported(canonical):
+    """Full coverage: tests/crystal/test_sg_readouts.py."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'zsg_panel_is_well_formed')                    # absent or off
+    cfg['zsg_panel'] = {'enabled': True, 'draws': 0}
+    assert _fires(cfg, 'zsg_panel_is_well_formed', severity=ERROR)        # malformed
+    cfg['zsg_panel'] = {'enabled': True}
+    cfg['space_groups'] = [2]
+    assert _fires(cfg, 'zsg_panel_is_well_formed', severity=BASELINE)     # one group: inert
+    cfg['space_groups'] = [2, 14]
+    assert not _fires(cfg, 'zsg_panel_is_well_formed', severity=BASELINE)
+
+
 def test_malformed_or_unconsumable_nf_aux_terms_are_an_error(canonical):
     """Full coverage of the terms themselves: tests/models/test_nf_score_pathwise.py."""
     cfg = copy.deepcopy(canonical)

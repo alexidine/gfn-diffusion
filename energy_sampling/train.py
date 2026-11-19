@@ -66,6 +66,8 @@ from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES,
 from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
+from energy_sampling.eval.sg_readouts import (branch_group_stats, buffer_group_share, condition_groups,
+                                               head_panel_stats, is_panel_stats, panel_line)
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
@@ -545,6 +547,9 @@ class Modeller:
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         # cfg heldout_gate merged over progress_metrics._HELDOUT_GATE; raises here on a malformed block
         self.heldout_gate_spec = parse_heldout_gate(getattr(self.args, 'heldout_gate', None))
+        # cfg zsg_panel merged over config_invariants.ZSG_PANEL_DEFAULTS (off); raises here on a malformed block
+        from config_invariants import parse_zsg_panel
+        self.zsg_panel_spec = parse_zsg_panel(getattr(self.args, 'zsg_panel', None))
         self.init_train_constants()
 
     #: Consecutive telemetry failures tolerated before the run is torn down. A
@@ -6743,7 +6748,7 @@ class Modeller:
             **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id',
-                       'log_T_tensor', 'log_z_target']})
+                       'log_T_tensor', 'log_z_target', 'mle_rows']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
         # NB the condition-aware metrics -- 'logw_std_within' (the clean
@@ -6815,6 +6820,17 @@ class Modeller:
             self._forgetting_sensor(stats)
         self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
+        # per space group on a run over several (eval/sg_readouts.py::branch_group_stats): direction sg<g>, so the
+        # keys publish as sg<g>/<sub_type>/<name> on the pooled keys' EMA clock; nothing on a single-group run
+        for direction, vals in branch_group_stats(loss_dict, sub_type, *self._condition_group_axes()).items():
+            self.metric_tracker.update(direction, vals, self.step_ind)
+
+    def _condition_group_axes(self):
+        """(space groups in condition_id's local order, Z' count): the energy function's, else the config's."""
+        ef = getattr(self, 'energy_function', None)
+        groups = list(getattr(ef, 'space_groups', None) or getattr(self.args, 'space_groups', None) or [])
+        n_zp = getattr(ef, 'n_zp', None) or len(getattr(self.args, 'z_primes', None) or [1])
+        return groups, int(n_zp)
 
     _UC_WINDOW_STEPS = 150
 
@@ -9475,6 +9491,142 @@ class Modeller:
         out['xcond/skipped'] = 0.0
         return out
 
+    #: per panel: (dataset attribute, metric prefix, seed offset)
+    ZSG_PANELS = (('mol_dataset', 'zsg/', 13), ('test_mol_dataset', 'zsg_test/', 17))
+
+    def log_zsg_panels(self, eval_discretizer):
+        """
+        Z(sg) panels on a run over two or more space groups with cfg:zsg_panel.enabled: a FIXED panel of
+        zsg_panel.molecules molecules, drawn once (seed + 13) from mol_dataset, one row per distinct mol_id, and a
+        second (prefix zsg_test/, seed + 17) from test_mol_dataset when cfg:test_molecules_path is set. Every panel
+        molecule is scored in ALL run groups, at the run temperature (a temperature-conditioned run: a log T drawn once
+        per molecule) and a Z' drawn once per molecule.
+
+          head (every eval, no energy call): L(m, g) = models/group_draw.py::level_group_logits;
+                <prefix>head_p_sg<g>, <prefix>head_level_sg<g>, <prefix>head_entropy_nats (eval/sg_readouts.py::
+                head_panel_stats). Needs a conditional policy (its level reads the condition); skipped otherwise.
+          IS   (evals on the zsg_panel.every_n_evals cadence, eval_cadence_fires): for each molecule and group, the
+                group forced, zsg_panel.draws forward draws through the eval sampler (eval/utils.py::
+                sample_eval_fwd_trajs, under the policy's standard frames as fwd_eval_sampling), log w = log R +
+                log P_B - log P_F (= log R - log q under the flow); per molecule models/group_draw.py::
+                group_weights_is -> <prefix>is_log_z_sg<g>, is_p_sg<g>, is_ess_sg<g>, is_entropy_nats,
+                head_minus_is_sg<g> (eval/sg_readouts.py::is_panel_stats). Draws in chunks of at most the eval draw
+                (eval_draw_size), no gradient. A CUDA OOM goes through handle_train_epoch_error and drops the IS
+                panel for this eval (<prefix>is_skipped 1); it is not retried.
+
+        Per-group levels live on different FD charts (different cell-coordinate counts and pose normalisation), so
+        compare each group's curve over time, not levels across groups; p(g) here is a sampling allocation, not a
+        thermodynamic group preference. Prints one captioned line per panel.
+        """
+        spec = getattr(self, 'zsg_panel_spec', None)
+        if spec is None:
+            from config_invariants import parse_zsg_panel
+            spec = self.zsg_panel_spec = parse_zsg_panel(getattr(self.args, 'zsg_panel', None))
+        groups, n_zp = self._condition_group_axes()
+        if not spec['enabled'] or len({int(g) for g in groups}) < 2:
+            return {}
+        run_is = eval_cadence_fires(self.step_ind, spec['every_n_evals'], getattr(self.args, 'eval_period', None))
+        out = {}
+        for attr, prefix, seed_off in self.ZSG_PANELS:
+            dataset = getattr(self, attr, None)
+            batch = getattr(dataset, 'batch', None)
+            if batch is None or int(batch.num_graphs) == 0:
+                continue
+            panel = self._zsg_panel(attr, batch, spec['molecules'], seed_off)
+            stats, level = {}, None
+            if getattr(self.gfn_model, 'conditional', False):
+                level = self._zsg_head_levels(batch, panel, groups)
+                stats.update(head_panel_stats(level, groups, prefix))
+            if run_is:
+                stats.update(self._zsg_is_panel(batch, panel, groups, spec['draws'], eval_discretizer, level, prefix))
+            if stats:
+                print(panel_line(stats, groups, prefix, int(panel['rows'].numel()), spec['draws']), flush=True)
+            out.update(stats)
+        return out
+
+    def _zsg_panel(self, attr, batch, n_mol, seed_off):
+        """The fixed panel of `batch` (cached per dataset attribute): rows [M] (one per distinct mol_id where the
+        batch carries mol_id, else distinct rows), and per row the temperature and Z' it is scored at. A function of
+        cfg:seed and the dataset alone, so a resume rebuilds the same panel."""
+        cache = self.__dict__.setdefault('_zsg_panel_cache', {})
+        if attr in cache:
+            return cache[attr]
+        g = torch.Generator().manual_seed(int(self.args.seed) + int(seed_off))
+        n = int(batch.num_graphs)
+        mol_id = getattr(batch, 'mol_id', None)
+        if mol_id is not None:
+            mid = torch.as_tensor(mol_id).reshape(-1).cpu()
+            first = {}
+            for i, v in enumerate(mid.tolist()):
+                first.setdefault(v, i)
+            cand = torch.tensor(sorted(first.values()), dtype=torch.long)
+        else:
+            cand = torch.arange(n)
+        rows = cand[torch.randperm(cand.numel(), generator=g)[:int(n_mol)]].sort().values
+        ef = self.energy_function
+        m = rows.numel()
+        if getattr(ef, 'temperature_conditioning', False):
+            lo, hi = (float(v) for v in ef.log_temperature_range)
+            temps = torch.pow(10.0, lo + torch.rand(m, generator=g) * (hi - lo))
+        else:
+            temps = torch.full((m,), float(ef.temperature))
+        zps = torch.as_tensor([int(z) for z in getattr(ef, 'z_primes', None) or [1]], dtype=torch.long)
+        zp = zps[torch.randint(len(zps), (m,), generator=g)]
+        cache[attr] = {'rows': rows, 'temps': temps.float(), 'zp': zp}
+        return cache[attr]
+
+    def _zsg_rows(self, batch, panel, sel):
+        """The panel rows `sel` (indices into the panel) as a batch on the device in the standard molecule frame,
+        with their temperatures [n] and Z' [n]."""
+        idx = panel['rows'][sel]
+        mb = batch.subsample_new_batch(idx.to(batch.ptr.device)).to(self.device)
+        mb.orient_molecule(mode='standard')
+        return mb, panel['temps'][sel].to(self.device), panel['zp'][sel].to(self.device)
+
+    @torch.no_grad()
+    def _zsg_head_levels(self, batch, panel, groups):
+        """[M, G] float64: the policy's level L(m, g) of each panel molecule under each group."""
+        from models.group_draw import level_group_logits
+        ef = self.energy_function
+        mb, temps, zp = self._zsg_rows(batch, panel, torch.arange(panel['rows'].numel()))
+
+        def condition_of(g):
+            mb_g, _, cond, _ = ef.condition_samples(mb.clone(), temperature=temps, sg_inds=torch.full_like(zp, g),
+                                                    z_primes=zp)
+            return mb_g, cond.to(self.device)
+        return level_group_logits(self.gfn_model, condition_of, mb, groups).double().cpu()
+
+    @torch.no_grad()
+    def _zsg_is_panel(self, batch, panel, groups, draws, eval_discretizer, level, prefix):
+        """The IS half of log_zsg_panels: `draws` forward draws per (panel molecule, group)."""
+        ef, model = self.energy_function, self.gfn_model
+        m, k = panel['rows'].numel(), int(draws)
+        log_w, mol_index, group_index = [], [], []
+        frame = getattr(model, 'standard_frames', None)
+        try:
+            with (frame() if frame is not None else contextlib.nullcontext()):
+                for gi, g in enumerate(groups):
+                    step = max(1, int(self.eval_draw_size()) // k)
+                    for s in range(0, m, step):
+                        sel = torch.arange(s, min(m, s + step)).repeat_interleave(k)
+                        mb, temps, zp = self._zsg_rows(batch, panel, sel)
+                        n = int(mb.num_graphs)
+                        out = sample_eval_fwd_trajs(get_gfn_init_state(n, ef.data_ndim, self.device), model,
+                                                    eval_discretizer, ef, mb, sg_inds=torch.full_like(zp, int(g)),
+                                                    z_primes=zp, temperatures=temps)
+                        log_w.append((out['log_r'].reshape(-1) + out['log_pb'].reshape(-1)
+                                      - out['log_pf'].reshape(-1)).double())
+                        mol_index.append(sel)
+                        group_index.append(torch.full((n,), gi, dtype=torch.long))
+        except (RuntimeError, ValueError) as e:
+            self.handle_train_epoch_error(e, 'zsg_panel')   # re-raises anything but a CUDA OOM
+            print(f"log_zsg_panels: {prefix.rstrip('/')} IS panel dropped this eval after an OOM", flush=True)
+            return {f'{prefix}is_skipped': 1.0}
+        stats = is_panel_stats(torch.cat(log_w), torch.cat(mol_index), torch.cat(group_index), m, groups,
+                               level=level, prefix=prefix)
+        stats[f'{prefix}is_skipped'] = 0.0
+        return stats
+
     def log_test_metrics(self, eval_discretizer, fwd_stats):
         """
         Conditional generalization check: the same on-policy eval protocol run
@@ -9966,6 +10118,10 @@ class Modeller:
                 log_w = (fwd_stats['log_r'].reshape(-1) + fwd_stats['log_pbs'].sum(-1).reshape(-1)
                          - fwd_stats['log_pfs'].sum(-1).reshape(-1))
                 metrics.update(group_split_means('eval_fwd/jensen_z', log_w, sg_rows, None, self.args))
+            # the head's level over each group's rows, beside its Jensen estimate (a scalar head has one level)
+            lz = torch.as_tensor(log_Z_learned).reshape(-1)
+            if lz.numel() == torch.as_tensor(sg_rows).numel() and lz.numel() > 1:
+                metrics.update(group_split_means('log_Z_learned', lz, sg_rows, None, self.args))
 
         # ...and the same indicator read PER CONDITION rather than pooled: a
         # batch fraction of 0.5 is a different (much worse) model when half the
@@ -10729,6 +10885,7 @@ class Modeller:
         self._merge_metrics(metrics,
                             self.log_xcond_metrics(eval_discretizer, sample_batch),
                             'log_xcond_metrics')
+        self._merge_metrics(metrics, self.log_zsg_panels(eval_discretizer), 'log_zsg_panels')
 
         self.times['eval_figs_start'] = time()
         fig_dict = {}
@@ -10955,6 +11112,10 @@ class Modeller:
 
         if hasattr(self, 'replay_buffer'):
             metrics.update(self._buffer_core_stats(self.replay_buffer, 'replay_buffer'))
+            # resident rows per space group on a run over several (sg<g>/replay_buffer_share; a group with none reads 0)
+            if len(self.replay_buffer) > 0:
+                metrics.update(buffer_group_share(getattr(self.replay_buffer.batch, 'sg_ind', None),
+                                                  self._condition_group_axes()[0], 'replay_buffer_share'))
             # resident HELD-OUT rows: read against replay/val_n to see whether
             # the probe is scoring a sample of the pool or the whole of it
             metrics['replay_buffer_val_rows'] = float(self.replay_buffer.is_val.sum())
@@ -11099,6 +11260,10 @@ class Modeller:
 
         if self.row_store is not None:
             metrics.update(self.row_store.stats(self._store_level_table()))
+            if len(self.row_store) > 0:   # the store's rows per space group (sg<g>/store_share)
+                groups, n_zp = self._condition_group_axes()
+                metrics.update(buffer_group_share(condition_groups(self.row_store.cid, groups, n_zp) if
+                                                  len(groups) > 1 else None, groups, 'store_share'))
         return metrics
 
     def log_condition_log_z_stats(self):

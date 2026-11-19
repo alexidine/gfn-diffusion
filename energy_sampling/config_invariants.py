@@ -2791,6 +2791,52 @@ def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
     return []
 
 
+#: The Z(sg) panel's code defaults (train.py::Modeller.log_zsg_panels; eval/sg_readouts.py). Off unless `enabled`.
+ZSG_PANEL_DEFAULTS = {'enabled': False, 'molecules': 64, 'draws': 32, 'every_n_evals': 4}
+
+
+def parse_zsg_panel(node) -> dict:
+    """The `zsg_panel` block merged over ZSG_PANEL_DEFAULTS (absent = the defaults, so off). `node` is a raw dict or
+    the trainer's Namespace. Raises on unknown keys, `enabled` not a bool, `molecules` / `draws` not integers >= 1,
+    `every_n_evals` not an integer >= 0 or null (0 / null: the importance-sampling panel never fires)."""
+    if node is None:
+        node = {}
+    if hasattr(node, '__dict__') and not isinstance(node, dict):
+        node = dict(vars(node))
+    if not isinstance(node, dict):
+        raise TypeError(f'zsg_panel must be a mapping, got {type(node).__name__}')
+    bad = sorted(set(node) - set(ZSG_PANEL_DEFAULTS))
+    if bad:
+        raise ValueError(f'zsg_panel has unknown key(s) {bad}; keys are {sorted(ZSG_PANEL_DEFAULTS)}')
+    spec = {**ZSG_PANEL_DEFAULTS, **node}
+    if not isinstance(spec['enabled'], bool):
+        raise ValueError(f"zsg_panel.enabled must be true or false, got {spec['enabled']!r}")
+    for k in ('molecules', 'draws'):
+        if not _whole(spec[k]) or spec[k] < 1:
+            raise ValueError(f'zsg_panel.{k} must be an integer >= 1, got {spec[k]!r}')
+        spec[k] = int(spec[k])
+    v = spec['every_n_evals']
+    if v is not None and (not _whole(v) or v < 0):
+        raise ValueError(f'zsg_panel.every_n_evals must be an integer >= 0 or null, got {v!r}')
+    spec['every_n_evals'] = int(v or 0)
+    return spec
+
+
+def zsg_panel_is_well_formed(cfg: dict) -> list[Violation]:
+    """`zsg_panel` parses through parse_zsg_panel, the parser Modeller.__init__ runs. An enabled panel on a run over
+    fewer than two space groups is reported (BASELINE): every readout it owns is inert there."""
+    try:
+        spec = parse_zsg_panel(_get(cfg, 'zsg_panel'))
+    except (TypeError, ValueError) as e:
+        return [Violation(ERROR, 'zsg_panel_is_well_formed', str(e))]
+    groups = _get(cfg, 'space_groups') or []
+    if spec['enabled'] and len({int(g) for g in groups}) < 2:
+        return [Violation(BASELINE, 'zsg_panel_is_well_formed',
+                          f'zsg_panel.enabled over space_groups {list(groups)}: the panel needs two or more groups '
+                          f'and writes nothing on this run')]
+    return []
+
+
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
@@ -2799,6 +2845,7 @@ RULES = (
     energy_reference_is_consistent,
     z_feed_is_well_formed,
     heldout_gate_is_well_formed,
+    zsg_panel_is_well_formed,
     auto_lr_requires_lr_control,
     lr_control_is_well_formed,
     # every route but the conformer one; returns [] on energy_function conformer_torsions

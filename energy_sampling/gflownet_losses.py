@@ -1363,6 +1363,9 @@ def get_gfn_backward_loss(loss_coeffs,
             loss_dict['emp_z'] = emp_z_loss.mean().detach()
         if loss_coeffs.mle > 0:
             loss_dict['mle'] = mle_nll.mean().detach()
+            # per terminal row, for the per-space-group split (eval/sg_readouts.py::branch_group_stats); one entry
+            # per distinct terminal, so under repeats > 1 it is the first of each K-tile of condition_id
+            loss_dict['mle_rows'] = mle_nll.detach()
             if mle_row_stats is not None:
                 loss_dict.update(mle_row_stats)
         if tbc_loss is not None:
