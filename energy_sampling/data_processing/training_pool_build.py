@@ -17,6 +17,8 @@ Steps, in order, with each step's count written to pool_v1_counts.json:
                          holding more than SCAF_CAP of the pool; acyclic molecules are not eligible
        heldout_random    5% of the remaining molecules by key hash
        train             the rest
+     Superseded 2026-11-20 by data_processing/training_pool_split.py (size-step scaffold arm drawn on the built
+     molecules); this column is the v1 split the pool8 runs up to 2026-11-20 used.
 usage, from energy_sampling/: python -m data_processing.training_pool_build [workers]
 reads DATA/v3/<source>_v3.csv.gz and DATA/day_keys.csv; writes DATA/pool_v1.csv.gz and DATA/pool_v1_counts.json
 """
