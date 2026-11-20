@@ -15,13 +15,17 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
    evals every 100, with the buffers on the GPU (smoke) and in host RAM (smoke_cpu). Read before mle4: which one
    loads, peak RAM (`_sacct.txt` MaxRSS, `_ram.txt`), peak VRAM (`_smi.csv`), the landed batch, steps per second, and
    that every `sg2/`, `sg14/`, `sg19/`, `sg61/` key and the `zsg/` panels appear.
-3. **mle4** (`--array=2`): fresh policy, unaugmented MLE, capped at 60k steps, buffers in host RAM (`buffer_device:
-   cpu`). Read 2026-11-20: smoke (GPU buffers, wandb poq5fwwy) and the first mle4 (qicjg8lf) ran out of GPU memory
-   seeding the anchor buffer, before step 0; smoke_cpu (q0c73xp4) ran 300 steps, every sg<g>/ and zsg/ key present,
-   batch landed at 2,225 (OOM ceiling 3,560), 2.2 s/step at 7-20% GPU utilisation, 49 min init, 66 s per eval. At that
-   rate 60k steps is ~37 h plus ~2 h of evals: inside the 2-day limit, with little margin.
-4. **tb4**: `python configs/pool8sg4_nov20/make.py --tb <mle4 archive file name>` writes `tb4.yaml`; then
-   `--array=3`. bigbuf's TB stage, 10k steps.
+3. **mle4** (`--array=2`): fresh policy, unaugmented MLE, capped at 60k steps, rows on the GPU, anchor seed
+   `seed_floors_only` (the 30.6M seed rows only set each condition's energy floor, in 1M-row chunks; no anchor buffer,
+   none admitted while `frozen`). History, 2026-11-20:
+   - smoke (GPU, wandb poq5fwwy) and mle4 qicjg8lf ran out of GPU memory in the anchor seed (one clone of all 30.6M
+     rows), before step 0;
+   - smoke_cpu q0c73xp4 and mle4 owr4qv4f (`buffer_device: cpu`) ran, at 2.0-2.4 s/step and 7-50% GPU utilisation;
+     the cluster cancelled owr4qv4f (SIGTERM, 2 h 13 m, step 2,026) with a 2-hour mean GPU utilisation of 23%.
+   Startup is ~33 min at ~1% GPU utilisation (40.8M rows loaded and prepared); each `vram [...]` ledger line now ends
+   with the seconds since start, to place that time. The single-group run (vtba4cf5) averaged 60% over its first 2 h.
+4. **tb4**: not ready. `make.py --tb` raises until the four-group anchor-buffer placement is settled: the TB stage's
+   prior buffer tops up from noised anchor-buffer rows, and mle4 builds none.
 
 ## Known limits
 

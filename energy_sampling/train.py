@@ -304,8 +304,30 @@ def _dataset_row_batches(source, limit: Optional[int] = None):
     return [batch]
 
 
+#: Rows per chunk when buffers.anchor_buffer.seed_floors_only reads the prior dataset (Modeller.init_anchor_buffer_seed)
+ANCHOR_FLOOR_CHUNK_ROWS = 1_000_000
+
+
+def _dataset_row_chunks(source, chunk_rows: int):
+    """Every row of a prior-dataset-like `source`, as consecutive graph batches of at most `chunk_rows` rows, sliced
+    from the resident batch without first cloning it whole (_dataset_row_batches clones it, a second full copy on the
+    source's device). A source offering `row_batches` (a compact conformer store) hands out its own chunks."""
+    chunks = getattr(source, 'row_batches', None)
+    chunks = chunks(None) if chunks is not None else None
+    if chunks is not None:
+        yield from chunks
+        return
+    batch = source.batch
+    n = int(batch.num_graphs)
+    for start in range(0, n, int(chunk_rows)):
+        yield batch.subsample_new_batch(torch.arange(start, min(start + int(chunk_rows), n), device=batch.ptr.device))
+
+
+#: Wall time when train.py was imported: Modeller.vram_ledger stamps each init milestone with the seconds since
+PROCESS_T0 = time()
+
 #: pooled_condition_vargrad readouts that log_metrics also publishes as means over the steps since the last log
-POOLED_RUNNING_KEYS = ('pooled_knee_frac', 'pooled_gap_signed', 'pooled_center_minus_head')
+POOLED_RUNNING_KEYS =('pooled_knee_frac', 'pooled_gap_signed', 'pooled_center_minus_head')
 
 #: The conversion Modeller._refuse_mirrored_rows names for a refused file. It lives in a
 #: build script, which the trainer does not import, so it is named here and not called.
@@ -9714,7 +9736,7 @@ class Modeller:
             res = torch.cuda.memory_reserved() / (1024 ** 2)
             peak = torch.cuda.max_memory_reserved() / (1024 ** 2)
             print(f"vram [{tag:<28}] live {alloc:8.0f} MiB | reserved {res:8.0f} MiB "
-                  f"| cached {res - alloc:8.0f} MiB | peak reserved {peak:8.0f} MiB")
+                  f"| cached {res - alloc:8.0f} MiB | peak reserved {peak:8.0f} MiB | t {time() - PROCESS_T0:7.0f} s")
             if not hasattr(self, '_vram_ledger'):
                 self._vram_ledger = {}
             self._vram_ledger[tag] = (round(alloc), round(res))
@@ -13038,10 +13060,25 @@ class Modeller:
 
         cfg = self.args.buffers.anchor_buffer
         seed_source = getattr(cfg, 'seed_source', 'generated')
+        # seed_floors_only: score the seed rows only to warm condition_log_z's per-condition energy floors (the
+        # Excess Energy readouts and the admission gates measure against them), in chunks of ANCHOR_FLOOR_CHUNK_ROWS,
+        # and build no anchor buffer. Under frozen, screen_and_admit_anchors then admits nothing (the seeded buffer
+        # would have been frozen); otherwise it bootstraps one from generated samples, as under seed_source
+        # 'generated'. For a stage that never reads the anchor buffer (MLE) on a prior too large for a second GPU copy
+        # (pool8sg4_nov20: 30.6M rows).
+        floors_only = bool(getattr(cfg, 'seed_floors_only', False))
         if seed_source == 'generated':
+            if floors_only:
+                raise ValueError("buffers.anchor_buffer.seed_floors_only needs seed_source 'prior_dataset' (or a "
+                                 "path): with 'generated' there are no seed rows to take floors from")
             return
+        if floors_only and not hasattr(self, 'condition_log_z'):
+            raise ValueError("buffers.anchor_buffer.seed_floors_only warms condition_log_z's floors, and this run "
+                             "builds no condition_log_z tracker")
 
-        if seed_source == 'prior_dataset':
+        if seed_source == 'prior_dataset' and floors_only:
+            seed_batches = (b.to(self.device) for b in _dataset_row_chunks(self.prior_dataset, ANCHOR_FLOOR_CHUNK_ROWS))
+        elif seed_source == 'prior_dataset':
             # one batch, or one per chunk of a compact conformer prior dataset
             seed_batches = (b.to(self.device) for b in _dataset_row_batches(self.prior_dataset))
         else:
@@ -13062,6 +13099,13 @@ class Modeller:
                 return_batch=True, internal_oom_recovery=True)
             seed_batches = [seed_batch.to(self.device)]
 
+        n_floor_rows = n_floor_chunks = 0
+        if floors_only:
+            # update_best_energy counts a condition whose minimum falls in a later chunk as a discovered improvement;
+            # the one-batch seed counts every condition as a first visit only. Kept and restored after the loop.
+            _tr = self.condition_log_z
+            _discovery = {k: getattr(_tr, k) for k in ('_window_improved', '_window_depth', 'minima_improved_total',
+                                                         'minima_depth_total')}
         for seed_batch in seed_batches:
             # condition_samples resolves condition_id through mol_id (the dense
             # integer init_identifiers() minted per identifier string), not the
@@ -13119,6 +13163,10 @@ class Modeller:
             # folding in real scored seed samples is always valid.
             if hasattr(self, 'condition_log_z'):
                 self.condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
+            if floors_only:
+                n_floor_rows += int(seed_batch.num_graphs)
+                n_floor_chunks += 1
+                continue
 
             # Generated candidates arrive without the string keys (sample_graphs
             # drops them at draw time), and append_batch demands key parity, so the
@@ -13138,6 +13186,16 @@ class Modeller:
                 **self._buffer_kwargs(),
                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
             )
+        if floors_only:
+            for k, v in _discovery.items():
+                setattr(self.condition_log_z, k, v)
+            seen = int(torch.isfinite(self.condition_log_z.best_energy_phys).sum())
+            later = ("no admission while frozen" if bool(getattr(cfg, 'frozen', False))
+                     else "bootstraps from generated samples")
+            print(f"anchor_buffer seed_floors_only: {n_floor_rows} {seed_source} rows scored in {n_floor_chunks} "
+                  f"chunk(s); condition_log_z floors set for {seen} conditions; no anchor buffer built ({later})",
+                  flush=True)
+            return
         self.apply_anchor_buffer_policy('config seed')
 
 
@@ -13195,6 +13253,11 @@ class Modeller:
             # (seed_source 'generated') still takes the lazy-bootstrap constructor.
             return
         cfg = self.args.buffers.anchor_buffer
+        if (not hasattr(self, 'anchor_buffer') and bool(getattr(cfg, 'seed_floors_only', False))
+                and bool(getattr(cfg, 'frozen', False))):
+            # seed_floors_only built no buffer, but frozen asks for none to be admitted to: the seed's buffer would
+            # have been frozen here, so the run screens nothing and never lazily bootstraps one from generated rows
+            return
         # admission count accumulated since the last log_buffer_stats read
         # (which zeroes it): this runs more than once per eval cycle (the eval
         # batch at evaluation(), then manage_prior_buffer's prior batch), so a

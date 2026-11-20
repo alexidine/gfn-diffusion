@@ -72,10 +72,15 @@ def mle4(files):
     nf.update(sym_ops='pooled', sym_ops_init=None)
     assert cfg['energy_config']['crystal_coordinates'] == 'fd'
     assert cfg['energy_config']['analyze_kwargs'].get('lj_envelope') == 1.0, cfg['energy_config']['analyze_kwargs']
-    # buffer_device cpu: the GPU placement ran out of memory seeding the anchor buffer (smoke poq5fwwy, mle4 qicjg8lf,
-    # 2026-11-20: prior_dataset 33 GB live, 76.5 GB allocated); smoke_cpu q0c73xp4 ran 300 steps at 2.2 s/step, batch 2225
+    # Rows on the GPU; the anchor seed only sets the energy floors (seed_floors_only), in 1M-row chunks, and builds no
+    # anchor buffer, which the MLE stage never reads (bwd_sampling_mode dataset). GPU smoke poq5fwwy and mle4 qicjg8lf
+    # (2026-11-20) ran out of memory in init_anchor_buffer_seed, which cloned and rescored all 30.6M training rows as
+    # one GPU batch; buffer_device cpu (126ac933) fitted but left the GPU 7-20% busy, and the cluster cancelled mle4
+    # owr4qv4f at 2 h 13 m. Without the seed the Excess Energy floors are empty (a local smoke read P50 0).
     cfg.update(test_eval_num_samples=4000, epochs=MLE_STEPS, archive_period=5000, tag=TAG, run_name='mle4',
-               buffer_device='cpu')
+               buffer_device='cuda')
+    assert cfg['buffers']['anchor_buffer']['seed_source'] == 'prior_dataset', cfg['buffers']['anchor_buffer']
+    cfg['buffers']['anchor_buffer']['seed_floors_only'] = True
     if ZSG_PANEL is not None:
         cfg['zsg_panel'] = dict(ZSG_PANEL)
     stage = cfg['protocols'][cfg['protocol']]['stages'][0]
@@ -85,8 +90,7 @@ def mle4(files):
 
 def smoke(files):
     cfg = mle4(files)
-    cfg.update(epochs=SMOKE_STEPS, eval_period=100, archive_period=10 ** 6, smoke=True, run_name='smoke',
-               buffer_device='cuda')
+    cfg.update(epochs=SMOKE_STEPS, eval_period=100, archive_period=10 ** 6, smoke=True, run_name='smoke')
     cfg['protocols'][cfg['protocol']]['stages'][0]['max_steps'] = SMOKE_STEPS
     return cfg
 
@@ -101,6 +105,10 @@ def smoke_cpu(files):
 
 def tb4(files, source):
     """bigbuf (pool8_tbrate_nov17) on the four-group base, from an mle4 checkpoint."""
+    raise NotImplementedError(
+        "tb4 is not ready: mle4's anchor seed builds no anchor buffer (seed_floors_only), and the TB stage's prior "
+        "buffer tops up from noised anchor-buffer rows, while seeding all 30.6M rows on the GPU ran out of memory "
+        "(README.md, Known limits). Settle the four-group anchor-buffer placement before writing tb4.yaml.")
     base = mle4(files)
     cfg = tbrate.control(base, source)
     vc = tbrate._stage(cfg)

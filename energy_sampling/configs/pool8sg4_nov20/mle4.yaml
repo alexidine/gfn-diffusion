@@ -204,7 +204,7 @@ drift_force:
   max_pairs: 40000
   max_pairs_per_call: 4000000
   partial: false
-buffer_device: cpu
+buffer_device: cuda
 batch_size: 1000
 grow_batch_size: true
 max_batch_size: 20000
@@ -585,6 +585,7 @@ buffers:
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
+    seed_floors_only: true
 energy_function: elj
 temperature_conditioning: false
 molecule_conditioning: true

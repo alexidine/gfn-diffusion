@@ -13,7 +13,7 @@ Four config keys name the files a run reads; the table lists, for each, the trai
 | `cfg:molecules_path` | `train.py::Modeller.init_mol_dataset` | the condition set trained over, loaded into `mol_dataset` |
 | `cfg:prior_path` | `train.py::Modeller.init_prior_dataset` | the structures backward training draws from, `prior_dataset` |
 | `cfg:test_molecules_path` | `train.py::Modeller.init_mol_dataset` | held-out conditions, `test_mol_dataset`; `null` leaves it `None` and every `eval_test` metric absent |
-| `cfg:buffers.anchor_buffer.seed_source` | `train.py::Modeller.init_anchor_buffer_seed` | `generated`, `prior_dataset`, or a path loaded the same way |
+| `cfg:buffers.anchor_buffer.seed_source` | `train.py::Modeller.init_anchor_buffer_seed` | `generated`, `prior_dataset`, or a path loaded the same way; under `cfg:buffers.anchor_buffer.seed_floors_only` the seed sets the per-condition energy floors and builds no buffer ([anchor-buffer.md](anchor-buffer.md)) |
 
 The envelopes differ. `train.py::Modeller._load_condition_file` unwraps `{'prior': batch}` and is shared by the two condition keys; `init_prior_dataset` reads the `'equalized_prior'` entry; a seed-source path accepts either. The three dataset keys each become a `buffer.py::CrystalBuffer` over one resident collated batch; a seed-source batch is re-scored and handed to the anchor buffer instead. On mk_dev the first two keys name the same file, one molecule, unconditional.
 
