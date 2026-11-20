@@ -1419,7 +1419,7 @@ def nf_orient_split_is_well_formed(cfg: dict) -> list[Violation]:
 # <branch>_loss_coeffs.score (fwd, bwd, replay), .score_beta, .score_force (bwd, replay); fwd_loss_coeffs.pathwise,
 # .pathwise_grad_clip. Trained outside the frac mix by train.py::Modeller.fused_train_step.
 # ---------------------------------------------------------------------------
-AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip'),
+AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip', 'pathwise_entropy'),
                  'bwd': ('score', 'score_beta', 'score_rows', 'score_force'),
                  'replay': ('score', 'score_beta', 'score_rows', 'score_force')}
 AUX_SCORE_FORCE = ('live', 'stored')
@@ -1457,7 +1457,7 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
                                                       f"number >= 0"))
                 elif v > 0:
                     on.append(f'{mode}.{k}')
-            for k in ('score_beta', 'score_rows', 'pathwise_grad_clip'):
+            for k in ('score_beta', 'score_rows', 'pathwise_grad_clip', 'pathwise_entropy'):
                 v = _coeff_raw(cfg, st, mode, k) if k in keys else None
                 if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
                                       or not math.isfinite(v) or v < 0):

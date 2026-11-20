@@ -390,10 +390,12 @@ def branch_score_term(loss_coeffs, gfn, x, condition, mol_batch, g_r):
     return coeff * loss, stats
 
 
-def pathwise_rows(log_r_live, log_q_stl, x_live, grad_clip: float = 0.0):
-    """Pathwise reverse KL per row, log q_theta-bar(x) - log R(x) at a reparameterised draw x (sticking the
-    landing: log q's parameters detached, so the gradient is d(log q - log R)/dx . dx/dtheta). Rows with a non-finite
-    reward are dropped. grad_clip > 0 caps each row's own gradient norm in x. Returns (loss: the mean, stats)."""
+def pathwise_rows(log_r_live, log_q_stl, x_live, grad_clip: float = 0.0, entropy: float = 1.0):
+    """Pathwise reverse KL per row, entropy * log q_theta-bar(x) - log R(x) at a reparameterised draw x (sticking the
+    landing: log q's parameters detached, so the gradient is d(entropy log q - log R)/dx . dx/dtheta). entropy 1 is the
+    reverse KL; 0 is energy descent along the draw alone (no entropy term: collapses toward the reward's modes).
+    Rows with a non-finite reward are dropped. grad_clip > 0 caps each row's own gradient norm in x. Returns (loss:
+    the mean, stats)."""
     ok = torch.isfinite(log_r_live) & torch.isfinite(log_q_stl)
     n_ok = int(ok.sum())
     if grad_clip > 0 and x_live.requires_grad:
@@ -403,7 +405,7 @@ def pathwise_rows(log_r_live, log_q_stl, x_live, grad_clip: float = 0.0):
             gn = g.norm(dim=-1, keepdim=True) * _n
             return g * torch.clamp(_c / gn.clamp_min(1e-12), max=1.0)
         x_live.register_hook(_clip)
-    rows = torch.where(ok, log_q_stl - log_r_live, torch.zeros_like(log_r_live))
+    rows = torch.where(ok, float(entropy) * log_q_stl - log_r_live, torch.zeros_like(log_r_live))
     loss = rows.sum() / max(n_ok, 1)
     with torch.no_grad():
         stats = {'pathwise': loss.detach(), 'pathwise_bad_frac': 1.0 - ok.float().mean(),
@@ -549,7 +551,8 @@ def get_gfn_forward_loss(loss_coeffs,
         if _pw_coeff > 0:
             _pw = gfn._pathwise
             _l, _st = pathwise_rows(_log_r_live, _pw['log_q_stl'], _pw['x'],
-                                    float(getattr(loss_coeffs, 'pathwise_grad_clip', 0.0) or 0.0))
+                                    float(getattr(loss_coeffs, 'pathwise_grad_clip', 0.0) or 0.0),
+                                    entropy=float(getattr(loss_coeffs, 'pathwise_entropy', 1.0)))
             _aux['fwd_pathwise'] = _pw_coeff * _l
             _aux_stats.update(_st)
             gfn._pathwise = None

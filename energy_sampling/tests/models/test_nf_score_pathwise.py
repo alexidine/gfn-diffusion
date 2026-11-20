@@ -246,3 +246,18 @@ def test_descending_the_pathwise_loss_fits_a_gaussian_target():
         loss.backward()
         opt.step()
     assert float(loss) < 25.0 and 2.0 < float(st['pathwise_log_q']) < 8.0
+
+
+def test_pathwise_entropy_zero_is_energy_descent_along_the_draw():
+    """pathwise_entropy 0: the loss is -mean log R at the draw, its gradient d(-log R)/dx . dx/dtheta alone."""
+    pol, c, _ = _setup()
+    torch.manual_seed(3)
+    x, log_q = pol._pathwise_draw(N, pol._context(c, None, N))
+    params = [p for p in pol.sampler.parameters() if p.requires_grad]
+    lr = _reward(x, None, None, False)
+    loss, st = pathwise_rows(lr, log_q, x, entropy=0.0)
+    g = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    want = torch.autograd.grad(-lr.mean(), params, allow_unused=True)
+    for p, a, b in zip(params, g, want):
+        z = torch.zeros_like(p)
+        assert torch.allclose(z if a is None else a, z if b is None else b, atol=1e-5)
