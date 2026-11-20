@@ -62,6 +62,22 @@ def logmeanexp(x, dim=0):
     return x.logsumexp(dim) - math.log(x.shape[dim])
 
 
+TORCH_QUANTILE_MAX = 2 ** 24   # torch.quantile raises "input tensor is too large" past this many elements
+
+
+def quantile_any_size(x, q):
+    """torch.quantile (linear interpolation) of a 1-D tensor of any length, q a float in [0, 1]: torch.quantile itself
+    up to TORCH_QUANTILE_MAX elements, a sort past it (a pre-noised prior of ~3e7 training rows, pool8sg4_nov20)."""
+    x = x.reshape(-1)
+    if x.numel() <= TORCH_QUANTILE_MAX:
+        return torch.quantile(x, q)
+    s = torch.sort(x).values
+    pos = float(q) * (s.numel() - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, s.numel() - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
 def dcp(tensor):
     return tensor.detach().cpu()
 

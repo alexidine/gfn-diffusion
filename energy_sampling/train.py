@@ -85,7 +85,7 @@ from energy_sampling.models.dead_latent_rows import (
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
-    update_ema, keeps_ema_copy, get_problem_definition, problem_hash, problem_slug
+    update_ema, keeps_ema_copy, get_problem_definition, problem_hash, problem_slug, quantile_any_size
 
 # bulky per-sample analysis artifacts (fingerprints, RDFs -- huge tensors) that
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
@@ -4835,7 +4835,7 @@ class Modeller:
                     # The gap between the min and the 0.1st percentile is the
                     # exposure: a few kT is the ordinary tail, a large gap means
                     # one row is setting the target for the run.
-                    _q = torch.quantile(_rewards.double(), 0.999).item()
+                    _q = quantile_any_size(_rewards.double(), 0.999).item()   # > 2^24 rows on a multi-group prior
                     _mx = float(_rewards.max())
                     _gap = _mx - _q
                     print(f"energy clip armed: reward_range "
