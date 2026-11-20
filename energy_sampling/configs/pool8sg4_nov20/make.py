@@ -72,7 +72,10 @@ def mle4(files):
     nf.update(sym_ops='pooled', sym_ops_init=None)
     assert cfg['energy_config']['crystal_coordinates'] == 'fd'
     assert cfg['energy_config']['analyze_kwargs'].get('lj_envelope') == 1.0, cfg['energy_config']['analyze_kwargs']
-    cfg.update(test_eval_num_samples=4000, epochs=MLE_STEPS, archive_period=5000, tag=TAG, run_name='mle4')
+    # buffer_device cpu: the GPU placement ran out of memory seeding the anchor buffer (smoke poq5fwwy, mle4 qicjg8lf,
+    # 2026-11-20: prior_dataset 33 GB live, 76.5 GB allocated); smoke_cpu q0c73xp4 ran 300 steps at 2.2 s/step, batch 2225
+    cfg.update(test_eval_num_samples=4000, epochs=MLE_STEPS, archive_period=5000, tag=TAG, run_name='mle4',
+               buffer_device='cpu')
     if ZSG_PANEL is not None:
         cfg['zsg_panel'] = dict(ZSG_PANEL)
     stage = cfg['protocols'][cfg['protocol']]['stages'][0]
@@ -82,7 +85,8 @@ def mle4(files):
 
 def smoke(files):
     cfg = mle4(files)
-    cfg.update(epochs=SMOKE_STEPS, eval_period=100, archive_period=10 ** 6, smoke=True, run_name='smoke')
+    cfg.update(epochs=SMOKE_STEPS, eval_period=100, archive_period=10 ** 6, smoke=True, run_name='smoke',
+               buffer_device='cuda')
     cfg['protocols'][cfg['protocol']]['stages'][0]['max_steps'] = SMOKE_STEPS
     return cfg
 

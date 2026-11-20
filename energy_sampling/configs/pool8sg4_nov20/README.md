@@ -15,8 +15,11 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
    evals every 100, with the buffers on the GPU (smoke) and in host RAM (smoke_cpu). Read before mle4: which one
    loads, peak RAM (`_sacct.txt` MaxRSS, `_ram.txt`), peak VRAM (`_smi.csv`), the landed batch, steps per second, and
    that every `sg2/`, `sg14/`, `sg19/`, `sg61/` key and the `zsg/` panels appear.
-3. **mle4** (`--array=2`): fresh policy, unaugmented MLE, capped at 60k steps (about 17 h at ~1 step/s). If only
-   smoke_cpu loaded, set `buffer_device: cpu` in make.py's mle4 and regenerate first.
+3. **mle4** (`--array=2`): fresh policy, unaugmented MLE, capped at 60k steps, buffers in host RAM (`buffer_device:
+   cpu`). Read 2026-11-20: smoke (GPU buffers, wandb poq5fwwy) and the first mle4 (qicjg8lf) ran out of GPU memory
+   seeding the anchor buffer, before step 0; smoke_cpu (q0c73xp4) ran 300 steps, every sg<g>/ and zsg/ key present,
+   batch landed at 2,225 (OOM ceiling 3,560), 2.2 s/step at 7-20% GPU utilisation, 49 min init, 66 s per eval. At that
+   rate 60k steps is ~37 h plus ~2 h of evals: inside the 2-day limit, with little margin.
 4. **tb4**: `python configs/pool8sg4_nov20/make.py --tb <mle4 archive file name>` writes `tb4.yaml`; then
    `--array=3`. bigbuf's TB stage, 10k steps.
 
