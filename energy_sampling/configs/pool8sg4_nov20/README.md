@@ -27,6 +27,10 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
      draws in ~0.2 ms.
    Startup is ~33 min at ~1% GPU utilisation (40.8M rows loaded and prepared); each `vram [...]` ledger line now ends
    with the seconds since start, to place that time. The single-group run (vtba4cf5) averaged 60% over its first 2 h.
+   **mle4_150k** (`--array=4`, owner 2026-11-21): carries mle4 on to 150,000 steps by a full load of its running
+   checkpoint, so the optimizer, LR state, step count and pass counter continue. Submit with a dependency on the mle4
+   job. It reuses run name `mle4`, so it rewrites that run's running, best and final files; the step archives stay. In
+   wandb it is a new run of the same name whose curves start at the resumed step.
 4. **tb4**: not ready. `make.py --tb` raises until the four-group anchor-buffer placement is settled: the TB stage's
    prior buffer tops up from noised anchor-buffer rows, and mle4 builds none.
 
@@ -34,7 +38,9 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
 
 - **Not comparable to the single-group P-1 runs.** In the four-group slot layout only phi stays a circle (a slot wraps
   only when it does in every group), so P-1's centroid rows become intervals, and the row standardisation pools groups.
-  The sg2/ numbers are not the bigbuf/auglong P-1 numbers.
+  The sg2/ numbers are not the bigbuf/auglong P-1 numbers. Their -log q is a density on the same chart box
+  (`FDSlotLayout.pack` copies the chart rows and log q carries the standardisation term), so the levels share a measure,
+  but the two models treat those rows differently.
 - **Z(sg) is a trend, not a preference.** Each group's log Z lives on its own FD chart (different free cell
   coordinates, pose normalisation), so compare a group's curve over time, not levels across groups; the zsg/ p(g)
   readouts are a sampling allocation, not a thermodynamic group preference, until a cross-group convention is declared

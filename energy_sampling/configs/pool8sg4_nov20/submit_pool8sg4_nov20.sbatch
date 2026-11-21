@@ -8,10 +8,10 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool8sg4
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8sg4_nov20/joblogs/%x_%A_%a.out
 
-# pool8sg4_nov20 (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms smoke smoke_cpu mle4 tb4 in index
+# pool8sg4_nov20 (make.py, from submit_template.sbatch): the four-group conditional run (2, 14, 19, 61), arms smoke smoke_cpu mle4 tb4 mle4_150k in index
 # order (make.py's docstring). Smokes first, --array=0,1 (smoke, smoke_cpu), and read them; then --array=2 (mle4);
 # tb4 (--array=3) only after `make.py --tb SOURCE` has written tb4.yaml. An A100 (any partition that has one) and 224 GB (the most one A100 job may ask, sbatch --test-only 2026-11-20): the merged prior
 # is ~4x P-1's (RAM) and the GPU holds two copies of its rows (VRAM); the smoke measures both (sacct MaxRSS, _smi.csv).
@@ -27,7 +27,7 @@ LOGS=${ARMS}/joblogs
 DATA=/scratch/mk8347/data/crystal_datasets/conditional
 mkdir -p ${LOGS}
 
-ARM_LIST=(smoke smoke_cpu mle4 tb4)
+ARM_LIST=(smoke smoke_cpu mle4 tb4 mle4_150k)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 

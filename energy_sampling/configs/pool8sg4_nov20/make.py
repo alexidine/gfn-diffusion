@@ -12,6 +12,11 @@ Arms (one per card, run in turn):
   mle4    pool8_big_nov15's unaugmented conditional MLE (the big model, usage-targeted batch growth), from a fresh policy,
           capped at MLE_STEPS. A single-group checkpoint cannot warm-start it: the group slot layout and the group
           embedding change the policy (checkpointing refuses).
+  mle4_150k  mle4 carried on to EXT_STEPS (owner 2026-11-21): a full load of mle4's own running checkpoint, so weights,
+          optimizers, LR state, step count and the pass counter continue. It keeps run_name mle4, so it rewrites that
+          run's running, best and final files; the step archives stay. It names the file rather than using
+          continue_from_checkpoint, which starts a fresh policy when the file is missing or mismatched: here a missing
+          file stops the job and a mismatch raises. Submit after mle4 ends (--array=4).
   tb4     (make.py --tb SOURCE, after mle4) bigbuf's TB stage (pool8_tbrate_nov17: bootstrap_z:offset, pooled_center
           head, LR hold 0.2, fwd_rollout_every 5, replay max_size 200k) from an mle4 archive, weights only, TB_STEPS.
 
@@ -55,6 +60,8 @@ tbrate = _load('tbrate', 'pool8_tbrate_nov17')
 TAG = 'pool8sg4_nov20'
 GROUPS = [2, 14, 19, 61]
 MLE_STEPS = 60000
+EXT_STEPS = 150000
+MLE4_RUNNING = 'pool8sg4_nov20_mle4_elj-pool8_4sg_train_k4_metric-T2.5-1d2dd7_running.pt'   # utils.problem_slug of mle4.yaml
 SMOKE_STEPS = 300
 TB_STEPS = 10000
 DATA = '/scratch/mk8347/data/crystal_datasets/conditional'
@@ -85,6 +92,14 @@ def mle4(files):
         cfg['zsg_panel'] = dict(ZSG_PANEL)
     stage = cfg['protocols'][cfg['protocol']]['stages'][0]
     stage['max_steps'] = MLE_STEPS
+    return cfg
+
+
+def mle4_150k(files):
+    """mle4 from its own running checkpoint, to EXT_STEPS (the module docstring)."""
+    cfg = mle4(files)
+    cfg.update(epochs=EXT_STEPS, checkpoint_name=MLE4_RUNNING, load_weights_only=False, continue_from_checkpoint=False)
+    cfg['protocols'][cfg['protocol']]['stages'][0]['max_steps'] = EXT_STEPS
     return cfg
 
 
@@ -161,6 +176,7 @@ if __name__ == '__main__':
             write('smoke', smoke(files))
             write('smoke_cpu', smoke_cpu(files))
             write('mle4', mle4(files))
-            (HERE / f'submit_{TAG}.sbatch').write_text(sbatch(['smoke', 'smoke_cpu', 'mle4', 'tb4']), encoding='utf-8',
-                                                       newline='\n')
-            print(f'smoke.yaml, mle4.yaml and submit_{TAG}.sbatch in {HERE}')
+            write('mle4_150k', mle4_150k(files))
+            (HERE / f'submit_{TAG}.sbatch').write_text(sbatch(['smoke', 'smoke_cpu', 'mle4', 'tb4', 'mle4_150k']),
+                                                       encoding='utf-8', newline='\n')
+            print(f'smoke.yaml, mle4.yaml, mle4_150k.yaml and submit_{TAG}.sbatch in {HERE}')
