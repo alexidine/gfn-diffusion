@@ -60,3 +60,15 @@ Launch, on the cluster after pulling:
 - Child excess is read against the parent, and the window counts match `select_rows`.
 
 No build ran locally (local work is stopped). The shard array is the first end-to-end run of `--heldout_units`.
+
+## Training arms (hub, `make.py`)
+
+Two unaugmented MLE continuations of pool8_big_nov15/big from its step-50,000 weights, 15k steps each, identical but
+for the prior: `mle_ctrl` (the current switched prior) and `mle_kick` (this build). `make.py` asserts the two configs
+differ only in `prior_path` and `run_name`. Submit after merge.sbatch has written the prior and `compare.txt` passes:
+
+    sbatch /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool8_kick_nov20/submit_pool8_kick_nov20.sbatch
+
+Read: the overfit gaps within each arm, eval_fwd/jensen_z, Excess Energy Nats Per DoF P50, Nonthermal Fraction
+(equipartition), and -log q on the rows both arms share (eval_bwd/mle_anchors, eval_test/mle). Each arm's own training
+and held-out -log q are on different rows and do not compare across arms.
