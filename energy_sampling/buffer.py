@@ -331,6 +331,35 @@ class FDChartState:
         return state
 
 
+#: uniform_rows: pools at least this large, drawn from at most 1 / UNIFORM_ROWS_SPARSE of their rows, skip the full shuffle
+UNIFORM_ROWS_LARGE_POOL = 1_000_000
+UNIFORM_ROWS_SPARSE = 16
+UNIFORM_ROWS_MAX_ROUNDS = 32
+
+
+def uniform_rows(pool, k: int, replace: bool = False):
+    """`k` rows of `pool` (a row count, or an array of row indices), uniformly and in random order, as
+    np.random.choice(pool, size=k, replace=replace), from the same global numpy stream.
+
+    np.random.choice without replacement permutes the whole pool on every call: 1.3 s for a 1000-row draw from 30.6M
+    rows, most of a pool8sg4_nov20 training step, with the GPU idle. On a large pool and a small k this instead draws
+    iid and keeps each row's first occurrence, which is a uniform ordered k-subset, at a cost set by k. Each round's
+    draws are new with probability at least 1 - 1/UNIFORM_ROWS_SPARSE; after UNIFORM_ROWS_MAX_ROUNDS it falls back to
+    np.random.choice, so the loop is bounded."""
+    n = int(pool) if np.ndim(pool) == 0 else int(np.size(pool))
+    if replace or n < UNIFORM_ROWS_LARGE_POOL or k * UNIFORM_ROWS_SPARSE > n:
+        return np.random.choice(pool, size=k, replace=replace)
+    picked = np.empty(0, dtype=np.int64)
+    for _ in range(UNIFORM_ROWS_MAX_ROUNDS):
+        short = k - picked.size
+        merged = np.concatenate([picked, np.random.randint(0, n, size=short + short // 8 + 16, dtype=np.int64)])
+        _, first = np.unique(merged, return_index=True)
+        picked = merged[np.sort(first)][:k]
+        if picked.size == k:
+            return picked if np.ndim(pool) == 0 else np.asarray(pool)[picked]
+    return np.random.choice(pool, size=k, replace=False)
+
+
 def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)
 
@@ -813,12 +842,12 @@ class CrystalBuffer:
         if k <= 0:
             return np.empty(0, dtype=np.int64)
         if target_rows is None:
-            return np.random.choice(pool, size=k, replace=k > n_pool)
+            return uniform_rows(pool, k, replace=k > n_pool)
         take = min(k, target_rows.size)
         out = np.random.choice(target_rows, size=take, replace=take > target_rows.size)
         if take < k:
             out = np.concatenate(
-                [out, np.random.choice(pool, size=k - take, replace=k - take > n_pool)])
+                [out, uniform_rows(pool, k - take, replace=k - take > n_pool)])
         return out.astype(np.int64)
 
     def _trainable_condition_ids(self):
@@ -1020,7 +1049,7 @@ class CrystalBuffer:
             # replacement whenever the pool is bigger than the batch.
             inds = (np.random.choice(n, size=batch_size, replace=replace, p=p)
                     if p is not None
-                    else np.random.choice(pool, size=batch_size, replace=replace))
+                    else uniform_rows(pool, batch_size, replace=bool(replace)))
 
         if repeats > 1:
             inds = np.repeat(inds, repeats)
@@ -1029,10 +1058,11 @@ class CrystalBuffer:
 
     def _bump_counts(self, inds):
         """
-        Count by occurrence so repeats / replacement duplicates each register.
+        Count by occurrence so repeats / replacement duplicates each register. Touches only the drawn rows: a
+        bincount over the store costs 40 ms a step at 30.6M rows.
         """
-        bc = np.bincount(np.asarray(inds), minlength=len(self))
-        self.select_counts += torch.as_tensor(bc, dtype=torch.long)
+        rows, counts = np.unique(np.asarray(inds), return_counts=True)
+        self.select_counts[torch.as_tensor(rows, dtype=torch.long)] += torch.as_tensor(counts, dtype=torch.long)
 
     @staticmethod
     def _drop_keys(batch, exclude_keys):

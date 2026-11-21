@@ -22,6 +22,9 @@ statistics. `make.py`'s docstring has the arms and every change from the single-
      rows), before step 0;
    - smoke_cpu q0c73xp4 and mle4 owr4qv4f (`buffer_device: cpu`) ran, at 2.0-2.4 s/step and 7-50% GPU utilisation;
      the cluster cancelled owr4qv4f (SIGTERM, 2 h 13 m, step 2,026) with a 2-hour mean GPU utilisation of 23%.
+   - mle4 4yg2mp5i (GPU rows, seed_floors_only) stopped at step 3,380 after ~2 h 10 m with a 2-hour GPU mean of 17%:
+     each step's row draw permuted all 30.6M rows on the host (~1.2 s of a 1.5 s step). `buffer.py::uniform_rows`
+     draws in ~0.2 ms.
    Startup is ~33 min at ~1% GPU utilisation (40.8M rows loaded and prepared); each `vram [...]` ledger line now ends
    with the seconds since start, to place that time. The single-group run (vtba4cf5) averaged 60% over its first 2 h.
 4. **tb4**: not ready. `make.py --tb` raises until the four-group anchor-buffer placement is settled: the TB stage's
