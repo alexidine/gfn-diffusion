@@ -37,14 +37,15 @@ CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
-                live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row')
+                live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row', live_log_range=None)
 #: window_by: the energy a child's energy window reads (window_energy): 'row' its own (a basin-kernel build always
 #: reads its basin's anchor), 'parent' its parent anchor's (noised_parent), so a minimum passes or fails the window
 #: with every kick of it, long kicks included
 WINDOW_BY = ('row', 'parent')
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
-#: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row
-LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric')
+#: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
+#: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation
+LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
 
@@ -152,6 +153,16 @@ def settings(args):
     if s['live_shape'] != DEFAULTS['live_shape'] and s['live_kernel'] != 'basin':
         raise ValueError(f"noised_prior.live_shape {s['live_shape']!r} is read by live_kernel 'basin' only, got "
                          f"live_kernel {s['live_kernel']!r}")
+    rng = s['live_log_range']
+    if rng is not None:
+        if s['live_kernel'] != 'chart':
+            raise ValueError(f"noised_prior.live_log_range is read by live_kernel 'chart' only, got live_kernel "
+                             f"{s['live_kernel']!r}")
+        if (not isinstance(rng, (list, tuple)) or len(rng) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in rng)
+                or not rng[0] <= rng[1]):
+            raise ValueError(f"noised_prior.live_log_range must be [log10 lo, log10 hi] in Angstrom with lo <= hi, got "
+                             f"{rng!r}")
     return s
 
 
@@ -203,6 +214,79 @@ def radius_of_gyration(batch):
     d2 = ((pos - c[g]) ** 2).sum(1)
     cnt = torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, torch.ones_like(d2))
     return torch.sqrt(torch.zeros(n, dtype=pos.dtype, device=pos.device).index_add_(0, g, d2) / cnt)
+
+
+def chart_step_lengths(fc, s, rg, sg, h=1e-3):
+    """[n, d] Angstrom per unit s along each chart coordinate of rows s [n, d] of one space group: the FD identity
+    distance (mxtaltools crystal_fd.metric, at each row's r_g) between the row moved +h and -h along that coordinate,
+    over the distance moved. Circle coordinates wrap; interval coordinates are clamped to [-1, 1]."""
+    from mxtaltools.crystal_fd.metric import FDMetric
+    m = FDMetric(int(sg), 1.0)
+    wrap = torch.as_tensor(fc.wrap_mask, dtype=torch.bool)
+    s = s.to(torch.float64)
+    rg = rg.to(torch.float64)
+    out = torch.zeros_like(s)
+
+    def prepared(x):
+        d, _ = fc.to_description(x)
+        return m.prepare(dict(cell=d.cell, t=d.t[:, 0], R=d.R[:, 0]))
+
+    for k in range(s.shape[1]):
+        up, dn = s.clone(), s.clone()
+        up[:, k] += h
+        dn[:, k] -= h
+        if wrap[k]:
+            up[:, k], dn[:, k] = torch.remainder(up[:, k] + 1, 2) - 1, torch.remainder(dn[:, k] + 1, 2) - 1
+            width = torch.full((len(s),), 2 * h, dtype=s.dtype)
+        else:
+            up[:, k], dn[:, k] = up[:, k].clamp(-1, 1), dn[:, k].clamp(-1, 1)
+            width = (up[:, k] - dn[:, k]).clamp_min(1e-12)
+        A, B = prepared(up), prepared(dn)
+        c2 = m.cell2(A['cell'], B['cell'])
+        P = m.frame(A['T'], B['T'])
+        th = m.theta(A['R'], P[:, None] @ B['QR'])
+        ce = m.cent(A['t'], B['t'], A['T'], P @ B['T'])
+        out[:, k] = (c2[:, None] + ce * ce + (rg[:, None] * th) ** 2).min(1).values.sqrt() / width
+    return out
+
+
+#: chart_kick: after its redraws a row's step is halved this many more times before the row keeps its centre
+CHART_KICK_SHRINKS = 10
+
+
+@torch.no_grad()
+def chart_kick(center, per_angstrom, live, wrap, log_lo, log_hi, redraws):
+    """A fresh kick of chart points by arithmetic, with no canonicalisation (cfg:noised_prior.live_kernel 'chart').
+
+    Each row steps from `center` [n, d] by rho u per_angstrom: rho = 10^U(log_lo, log_hi) Angstrom, u uniform on the unit
+    sphere of the row's live coordinates (`live` [n, d] bool), `per_angstrom` [n, d] the chart units per Angstrom along
+    each coordinate. Circle coordinates (`wrap` [d] bool) wrap. A row that leaves [-1, 1] on an interval coordinate keeps
+    its rho and draws a new direction, at most `redraws` times; then its step is halved per try, at most
+    CHART_KICK_SHRINKS times, and only then does it keep its centre. Every point of [-1, 1]^d is one canonical crystal,
+    so every result is a valid chart point; no mass crosses a chart wall, so the kernel of a row near one is one-sided.
+
+    Returns (points [n, d], share of rows out of the box on the first try, share that kept their centre)."""
+    n, d = center.shape
+    dev, dtype = center.device, center.dtype
+    out = center.clone()
+    todo = torch.arange(n, device=dev)
+    rho = 10 ** (log_lo + (log_hi - log_lo) * torch.rand(n, dtype=dtype, device=dev))
+    first_out = 0.0
+    for attempt in range(int(redraws) + 1 + CHART_KICK_SHRINKS):
+        if attempt > int(redraws):
+            rho[todo] = rho[todo] * 0.5
+        g = torch.randn(len(todo), d, dtype=dtype, device=dev) * live[todo].to(dtype)
+        u = g / g.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        x = center[todo] + rho[todo][:, None] * u * per_angstrom[todo]
+        x = torch.where(wrap, torch.remainder(x + 1, 2) - 1, x)
+        inside = ((x >= -1) & (x <= 1)).all(1)
+        out[todo[inside]] = x[inside]
+        if attempt == 0:
+            first_out = 1.0 - float(inside.to(dtype).mean()) if n else 0.0
+        todo = todo[~inside]
+        if not len(todo):
+            break
+    return out, first_out, len(todo) / max(n, 1)
 
 
 def fd_chart_points(ef, batch, device=None):

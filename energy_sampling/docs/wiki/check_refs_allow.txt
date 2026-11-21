@@ -25,6 +25,7 @@ file.py::symbol                              # the notation, not a symbol
 
 # Live keys with code defaults (config_invariants.py::ZSG_PANEL_DEFAULTS) that mk_dev does not carry yet; mk_dev is
 # owner-edited. Delete these four lines once configs/mk_dev.yaml carries the zsg_panel block.
+cfg:noised_prior.live_log_range              # pending the owner's mk_dev edit (2026-11-21)
 cfg:zsg_panel.enabled                        # pending the owner's mk_dev edit (2026-11-19)
 cfg:zsg_panel.molecules                      # pending the owner's mk_dev edit (2026-11-19)
 cfg:zsg_panel.draws                          # pending the owner's mk_dev edit (2026-11-19)

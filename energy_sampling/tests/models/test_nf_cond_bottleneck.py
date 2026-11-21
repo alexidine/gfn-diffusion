@@ -56,3 +56,37 @@ def test_noise_needs_a_bottleneck_and_both_need_an_encoder():
         _typed_policy(14, scale=0.0, atom_tokens='split', cond_noise=0.5)
     with pytest.raises(ValueError, match='cond_bottleneck'):
         _typed_policy(14, scale=0.0, atom_tokens='scalars', cond_bottleneck=8)
+
+
+@pytest.mark.parametrize('mode', ('split', 'split_pooled', True))
+def test_the_bottleneck_projections_are_in_an_optimizer_group(mode):
+    pol = _typed_policy(14, scale=0.05, atom_tokens=mode, cond_bottleneck=16, cond_noise=0.5)
+    groups = [pol.t_model, pol.s_model, pol.forward_policy, pol.backward_policy, pol.conditions_embedding_model,
+              pol.flow_model]
+    ids = [id(p) for g in groups for p in g.parameters()]
+    assert len(ids) == len(set(ids)) and set(ids) == {id(p) for p in pol.parameters()}
+
+
+def test_a_clean_condition_is_the_eval_condition_in_training_mode():
+    pol = _typed_policy(14, scale=0.05, atom_tokens='split_pooled', cond_bottleneck=16, cond_noise=0.5)
+    pol.eval()
+    v_eval, s_eval = _ctx(pol, 0)
+    pol.train()
+    with pol.clean_condition():
+        v1, s1 = _ctx(pol, 0)
+        v2, s2 = _ctx(pol, 1)
+    assert torch.equal(s1, s2) and torch.allclose(s1, s_eval) and torch.allclose(v1, v_eval)
+    _, s3 = _ctx(pol, 2)
+    assert float((s3[:, :16] - s1[:, :16]).abs().max()) > 0.05       # noise is back outside the context
+
+
+def test_a_forward_draw_in_training_mode_scores_log_q_at_its_own_condition():
+    pol = _typed_policy(14, scale=0.05, atom_tokens='split_pooled', cond_bottleneck=16, cond_noise=1.0)
+    mb = _mols(N, 2)
+    cond = torch.randn(N, 4, generator=torch.Generator().manual_seed(2))
+    pol.train()
+    torch.manual_seed(3)
+    states, log_pfs, _, _ = pol.get_traj_fwd(torch.zeros(N, pol.dim), None, 0, cond, mb)
+    pol.eval()
+    _, again, _, _ = pol.get_traj_bwd(states[:, 1], None, cond, mb)
+    assert torch.allclose(log_pfs, again, atol=1e-3)

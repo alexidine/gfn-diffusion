@@ -472,6 +472,9 @@ class NFPolicy(nn.Module):
             embed = nn.ModuleDict({'context': self.sampler.flow.context})
             if atoms is not None and atoms['encoder'] != 'none':
                 embed['atom_encoder'] = self.sampler.flow.atom_encoder
+            for name in ('bn_s', 'bn_p'):   # cond_bottleneck's projections train with the condition's encoders
+                if hasattr(self.sampler.flow, name):
+                    embed[name] = getattr(self.sampler.flow, name)
             if getattr(self.sampler.flow, 'n_sym', 0):   # e_g's encoder trains with the condition's other encoders
                 embed['sym_encoder'] = self.sampler.flow.sym_encoder
                 if s['sym_ops_init']:
@@ -564,6 +567,18 @@ class NFPolicy(nn.Module):
             yield
         finally:
             self._standard_frames = prev
+
+    @contextlib.contextmanager
+    def clean_condition(self):
+        """Inside, a training-mode call reads the condition without cond_noise. For every draw and readout that is not
+        the MLE training loss: the forward draw encodes the condition twice (to sample x, then to score log q), which
+        fresh noise would make two different conditions, and the evaluations run in training mode."""
+        flow = self.sampler.flow
+        prev, flow.condition_noise_off = getattr(flow, 'condition_noise_off', False), True
+        try:
+            yield
+        finally:
+            flow.condition_noise_off = prev
 
     @property
     def _frame_cols(self):
@@ -991,7 +1006,14 @@ class NFPolicy(nn.Module):
                      path_grad_last_k: int = 0, state_grad_hook=None, drift_context=None, pathwise: bool = False):
         """pathwise (fwd_loss_coeffs.pathwise > 0): the draw is made by _pathwise_draw and its live form kept in
         self._pathwise = {'x', 'log_q_stl'} for the pathwise reverse-KL term (gflownet_losses.py::
-        get_gfn_forward_loss); the returned trajectory holds the detached draw, scored as any other."""
+        get_gfn_forward_loss); the returned trajectory holds the detached draw, scored as any other. The draw and its
+        log q read one noise-free condition (clean_condition)."""
+        with self.clean_condition():
+            return self._traj_fwd(initial_state, condition, mol_batch, return_gauss_params, detach_traj, freeze_policy,
+                                  path_grad_last_k, exploration_std, pathwise)
+
+    def _traj_fwd(self, initial_state, condition, mol_batch, return_gauss_params, detach_traj, freeze_policy,
+                  path_grad_last_k, exploration_std, pathwise):
         if not detach_traj or path_grad_last_k > 0:
             raise NotImplementedError("a gradient through the trajectory's states (traj_grads, path_grad_last_k) on "
                                       "the flow policy: use fwd_loss_coeffs.pathwise")

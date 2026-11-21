@@ -995,9 +995,10 @@ class _ContextFlow(nn.Module):
         return (((vec, tokens[inv], mask[inv]) if self.cross else vec), s), F_rows
 
     def _squeeze(self, lin, v):
-        """atoms['bottleneck']: tanh(lin(v)), plus N(0, bottleneck_noise^2) per row in training mode."""
+        """atoms['bottleneck']: tanh(lin(v)), plus N(0, bottleneck_noise^2) per row in training mode, unless inside
+        models/nf_policy.py::NFPolicy.clean_condition."""
         v = torch.tanh(lin(v))
-        if self.training and self.bottleneck_noise > 0:
+        if self.training and self.bottleneck_noise > 0 and not getattr(self, 'condition_noise_off', False):
             v = v + self.bottleneck_noise * torch.randn_like(v)
         return v
 

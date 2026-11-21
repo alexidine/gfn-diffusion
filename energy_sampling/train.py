@@ -992,6 +992,8 @@ class Modeller:
             return self._basin_kernel_table()
         if s['live_kernel'] == 'metric':
             return self._metric_kernel_table()
+        if s['live_kernel'] == 'chart':
+            return self._chart_kernel_table()
         live = self.gfn_model.live_idx.to(self.device)
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
@@ -1176,6 +1178,85 @@ class Modeller:
         B['misses'] += int((~done).sum())
         return out
 
+    #: noised_prior.live_kernel 'chart': rows per space group whose median sets the chart units per Angstrom
+    CHART_KERNEL_SCALE_ROWS = 4096
+
+    def _chart_kernel_table(self):
+        """noised_prior.live_kernel 'chart': each MLE draw is a fresh kick of the drawn row's PARENT ANCHOR (of the row
+        itself, for a child across a chart wall from its parent), by arithmetic on the stored chart point
+        (noised_prior.chart_kick), unscored. The radius law is noised_prior.live_log_range, or
+        the prior's own build range. Per space group, one scale per chart coordinate (Angstrom per unit s, the median over
+        up to CHART_KERNEL_SCALE_ROWS rows) makes the step isotropic in the FD identity metric to first order."""
+        s, m = self._noised_prior_settings, getattr(self, '_noised_prior_manifest', None) or {}
+        center = getattr(self, '_chart_center', None)
+        if center is None:
+            raise ValueError("noised_prior.live_kernel 'chart' needs a pre-noised prior on the FD chart")
+        b, ef = self.prior_dataset.batch, self.energy_function
+        if len(center) != int(b.num_graphs) or noised_prior.digest(b.fd_state.float()) != self._chart_center_rows:
+            raise ValueError("noised_prior.live_kernel 'chart': the parent table is not aligned with prior_dataset")
+        rng = s['live_log_range']
+        if rng is None:
+            if m.get('child_kernel') != 'metric':
+                raise ValueError("noised_prior.live_kernel 'chart' reads the radius law of a metric-kick build; set "
+                                 f"noised_prior.live_log_range for this prior (child_kernel {m.get('child_kernel')!r})")
+            rng = (float(m['log_lo']), float(m['log_hi']))
+        layout = ef.fd_layout
+        sg = b.sg_ind.reshape(-1).long().cpu()
+        per_angstrom = torch.zeros_like(layout.live, dtype=torch.float32)
+        gen = torch.Generator().manual_seed(int(self.args.seed))
+        scales = {}
+        for g in torch.unique(sg).tolist():
+            rows = torch.nonzero(sg == g).flatten()
+            rows = rows[torch.randperm(len(rows), generator=gen)[:self.CHART_KERNEL_SCALE_ROWS]].sort().values
+            sub = b.subsample_new_batch(rows.to(b.ptr.device)).to('cpu')
+            fc = ef.fd_coordinates_rows(int(g), sub.radius.reshape(-1).double())
+            steps = noised_prior.chart_step_lengths(fc, layout.unpack(int(g), center[rows].cpu()),
+                                                    noised_prior.radius_of_gyration(sub).reshape(-1), int(g))
+            med = steps.median(0).values.clamp_min(1e-3)
+            scales[int(g)] = [round(float(v), 3) for v in med]
+            per_angstrom[layout.group_index(torch.tensor([g]))[0]] = layout.pack(int(g), (1 / med).float()[None])[0]
+        # a stored child whose canonical image lies across a chart wall from its parent is an ordinary small kick that
+        # sits far away in the chart: its own point centres its kick, so the mass across the wall stays in the target
+        far_share = 0.0
+        if m.get('log_hi') is not None:
+            limit = 2.0 * 10 ** float(m['log_hi'])
+            own = b.fd_state.float().cpu()
+            wrap = self.gfn_model.ang_mask.bool().cpu()
+            group = layout.group_index(sg)
+            angstrom = torch.where(per_angstrom > 0, 1 / per_angstrom.clamp_min(1e-12), torch.zeros_like(per_angstrom))
+            far = torch.zeros(len(own), dtype=torch.bool)
+            for lo in range(0, len(own), 1 << 20):
+                d = own[lo:lo + (1 << 20)] - center[lo:lo + (1 << 20)]
+                d = torch.where(wrap, torch.remainder(d + 1, 2) - 1, d)
+                far[lo:lo + (1 << 20)] = (d * angstrom[group[lo:lo + (1 << 20)]]).norm(dim=1) > limit
+            center = torch.where(far[:, None], own, center)
+            far_share = float(far.float().mean())
+        dev = self.buffer_device
+        self._chart = dict(center=center.to(dev), per_angstrom=per_angstrom.to(self.device),
+                           live=layout.live.to(self.device), wrap=self.gfn_model.ang_mask.bool().to(self.device),
+                           lo=float(rng[0]), hi=float(rng[1]), draws=0, out=0.0, kept=0.0)
+        self._chart_center = None
+        print(f"live kernel 'chart': a fresh kick of each row's parent anchor, 10^U({rng[0]:g}, {rng[1]:g}) Angstrom, "
+              f"over {len(center)} rows ({far_share:.1%} across a chart wall from their parent, centred on their own "
+              f"point); Angstrom per unit s by space group {scales}", flush=True)
+        return True
+
+    def _chart_kernel_draw(self, latents, inds, mol_batch):
+        """noised_prior.live_kernel 'chart' on the rows `inds` (_chart_kernel_table). MLE only: the row's stored energy
+        is not the kicked point's, so a draw that reads log R raises."""
+        if not self._bwd_draw_is_reward_free():
+            raise ValueError("noised_prior.live_kernel 'chart' draws unscored points: it needs a reward-free MLE stage")
+        K, dev = self._chart, latents.device
+        rows = torch.as_tensor(inds, device=K['center'].device).long().flatten()
+        group = self.energy_function.fd_layout.group_index(mol_batch.sg_ind.reshape(-1).long().cpu()).to(dev)
+        x, out, kept = noised_prior.chart_kick(K['center'][rows].to(dev), K['per_angstrom'][group], K['live'][group],
+                                               K['wrap'], K['lo'], K['hi'], int(self._noised_prior_settings['live_redraws']))
+        n = len(rows)
+        K['draws'] += n
+        K['out'] += out * n
+        K['kept'] += kept * n
+        return x.to(latents)
+
     def _basin_kernel_draw(self, latents, inds, mol_batch):
         """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
         With noised_prior.live_bank > 0, a uniformly chosen point of the row's bank, a share live_fresh_frac of the
@@ -1204,6 +1285,8 @@ class Modeller:
         across a face); dead rows untouched. 'basin' draws in cell parameters instead (_basin_kernel_draw)."""
         if getattr(self, '_live_L', None) is None:
             self._live_L = self._live_kernel_table()
+        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'chart':
+            return self._chart_kernel_draw(latents, inds, mol_batch)
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') in ('basin', 'metric'):
             return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
@@ -4716,6 +4799,18 @@ class Modeller:
         if not bool(keep.any()):
             raise ValueError("pre-noised prior: no row survives the load-time selection")
         batch = prior.subsample_new_batch(torch.nonzero(keep).flatten().to(dev))
+        if s['live_kernel'] == 'chart':
+            if fd_ok is None:
+                raise ValueError("noised_prior.live_kernel 'chart' needs energy_config.crystal_coordinates 'fd'")
+            # each kept row's parent anchor's chart point, the centre of its fresh kick (_chart_kernel_table)
+            kept = torch.nonzero(keep).flatten()
+            parents = noised_prior.tag(prior, 'noised_parent')[kept]
+            if bool((kinds[parents] != noised_prior.KIND_ANCHOR).any()):
+                raise ValueError("noised_prior.live_kernel 'chart': a kept row's noised_parent is not an anchor")
+            state = torch.as_tensor(prior.fd_state).float().cpu()
+            own = state[kept]
+            self._chart_center = torch.where(fd_ok[parents][:, None], state[parents], own)
+            self._chart_center_rows = noised_prior.digest(own)
         energy = (-log_r[keep] * T).float()
         return energy.to(self.device), batch.to(self.device)
 
@@ -5435,7 +5530,10 @@ class Modeller:
                     # this is the pre-transition buffer state, and a transition
                     # freezes its own tagged copy on top (protocol._snapshot)
                     self.checkpointer.save_buffers()
-                    metrics.update(self.evaluation(override_do_figs=self.stage_ctrl.get('request_eval', False)))
+                    # the evaluation runs in training mode; every readout in it reads the noise-free condition
+                    clean = getattr(self.gfn_model, 'clean_condition', None)
+                    with (clean() if clean is not None else contextlib.nullcontext()):
+                        metrics.update(self.evaluation(override_do_figs=self.stage_ctrl.get('request_eval', False)))
 
                 # A protocol 'stop' on_exit fired inside evaluation()'s
                 # transition: the phase's snapshots are on disk and there is no
@@ -10965,6 +11063,10 @@ class Modeller:
             # passes of the dataset-mode MLE draw over the fixed training rows (each row, on average, seen this many
             # times); with live_kernel set the rows are kernel centres, not the points trained on
             metrics['data/mle_passes'] = int(self._mle_rows_drawn) / max(1, len(self.prior_dataset))
+        chart = getattr(self, '_chart', None)
+        if chart is not None and chart['draws']:
+            metrics['live_kernel/out_of_box_first_try'] = chart['out'] / chart['draws']
+            metrics['live_kernel/kept_centre'] = chart['kept'] / chart['draws']
         metrics.update(self.update_heldout_gate(metrics))
         metrics.update({
             'Batch Size': self.batch_size,
