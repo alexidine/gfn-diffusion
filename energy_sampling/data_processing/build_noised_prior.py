@@ -16,8 +16,11 @@ other anchor is held out with probability --heldout_frac, whole, with every chil
 A band set (--basins of kind 'band': thinned low-energy states of a search's descents, mxtaltools
 stream_search.write_band) is held out by descent group instead: the states whose descents ended at one minimum
 (group_id) go together, so a held-out state never has a training neighbour from its own valley; the group of a
-condition's lowest anchor stays in training. A set without Hessians (band sets, the search's endpoint mode) carries
-no basin_H, and --child_kernel basin refuses it.
+condition's lowest anchor stays in training. --heldout_units FILE takes the held-out descent groups from an earlier
+build instead of drawing them (heldout_units: a file of (identifier, space group, Z', basin_group) keys, written by
+data_processing/prior_kick_compare.py units), so a rebuild of the same band sets with another kernel holds out the same
+crystals; the lowest-anchor rule is not applied (the earlier build applied it). A set without Hessians (band sets,
+the search's endpoint mode) carries no basin_H, and --child_kernel basin refuses it.
 
 CHILDREN. Each anchor is kicked K times by MolCrystalOps.log_noise_latent_parameters(log_lo, log_hi) (a unit
 direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded, hard-cleaned) and scored. With
@@ -96,6 +99,9 @@ def build_parser():
     p.add_argument('--log_hi', default='auto', help="'auto' (pilot calibration) or a number")
     p.add_argument('--window_kT', type=float, default=6.0, help='the calibration target, the load-time window')
     p.add_argument('--heldout_frac', type=float, default=0.05)
+    p.add_argument('--heldout_units', default=None,
+                   help="with --basins of band sets: a file of held-out (identifier, space group, Z', basin_group) keys "
+                        "(prior_kick_compare.py units) to hold out instead of drawing; --heldout_frac is then unused")
     p.add_argument('--molecule_fraction', type=float, default=1.0)
     p.add_argument('--anchors', choices=['all', 'is_anchor_image0'], default='all')
     p.add_argument('--images', choices=['auto', 'off'], default='auto')
@@ -500,6 +506,19 @@ def heldout_mask(groups, e_anchor, frac, rng, units=None):
     return torch.tensor([drawn[p] and p not in keep for p in pairs], dtype=torch.bool)
 
 
+def heldout_from_units(anchors, path):
+    """[B] bool, the anchors whose (identifier, space group, Z', basin_group) is among the held-out keys of ``path``
+    (a dict with 'units', a list of such tuples, as prior_kick_compare.py units writes it). Raises on anchors without
+    basin_group (not a band set)."""
+    if getattr(anchors, 'basin_group', None) is None:
+        raise SystemExit('--heldout_units needs band-set anchors (basin_group)')
+    units = {(str(i), int(g), int(z), int(u)) for i, g, z, u in torch.load(path, weights_only=False)['units']}
+    keys = zip((str(m) for m in anchors.identifier), torch.as_tensor(anchors.sg_ind).reshape(-1).tolist(),
+               torch.as_tensor(anchors.z_prime).reshape(-1).tolist(),
+               torch.as_tensor(anchors.basin_group).reshape(-1).tolist())
+    return torch.tensor([(i, int(g), int(z), int(u)) in units for i, g, z, u in keys], dtype=torch.bool)
+
+
 def search_cutoff_energy(run_args, args, ef, anchors, T):
     """[B] float64 mol_energy of `anchors` under the search's reporting energy, or None when the run's energy is it. A
     search reports every row's energy on the hard LJ cutoff (MXtalTools crystal_search/minima.py: lj_envelope switches
@@ -617,8 +636,15 @@ def main(argv=None):
     # held out whole, per condition, never a condition's lowest anchor (a band set: whole descent groups)
     groups = NP.condition_groups(anchors)
     units = getattr(anchors, 'basin_group', None)
-    held = heldout_mask(groups, e_anchor, args.heldout_frac, rng,
-                        units=None if units is None else torch.as_tensor(units).reshape(-1))
+    if args.heldout_units is not None:
+        held = heldout_from_units(anchors, args.heldout_units)
+        lowest = NP.condition_floor(e_anchor, groups, torch.isfinite(e_anchor)) == e_anchor.double()
+        lowest_held = int((held & lowest).sum())
+        print(f"held out from {args.heldout_units}: {lowest_held} conditions' lowest anchor (this build's energy) is "
+              f"held out", flush=True)
+    else:
+        held = heldout_mask(groups, e_anchor, args.heldout_frac, rng,
+                            units=None if units is None else torch.as_tensor(units).reshape(-1))
     split = torch.where(held, NP.SPLIT_HELDOUT, NP.SPLIT_TRAIN)
     train_idx = torch.nonzero(~held).flatten().numpy()
     print(f"held out: {int(held.sum())} of {anchors.num_graphs} anchors over {len(set(groups.tolist()))} conditions"
@@ -755,7 +781,8 @@ def main(argv=None):
         k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
         kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,
-        temperature=T, heldout_frac=args.heldout_frac, images=bool(images), seed=args.seed,
+        temperature=T, heldout_frac=None if args.heldout_units else args.heldout_frac,
+        heldout_units=os.path.abspath(args.heldout_units) if args.heldout_units else None, images=bool(images), seed=args.seed,
         harvest=dict(files=harvest_files, promoted_to_anchor=n_promoted, kept_as_harvested=n_h),
         counts=dict(anchors=n_a, children=n_c, harvested=n_h, heldout_anchors=int(held.sum()), conditions=len(set(groups.tolist())),
                     children_within_window=inside, children_far_below_parent=int(below_parent.sum()),
