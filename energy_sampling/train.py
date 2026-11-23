@@ -9716,12 +9716,18 @@ class Modeller:
             raise e  # will simply raise error if other or if training on CPU
 
         print("OOMED!")
+        # the traceback's frames hold the failed step's graph; gc cannot free it while they do
+        import traceback
+        traceback.clear_frames(e.__traceback__)
         # counted BEFORE the step_ind == 0 bail below, and for eval OOMs as well as
         # train ones: this is the record that an allocation failed, not the record of
         # what the controller did about it. Which of the two it was is recoverable from
         # whether batch/oom_ceiling moved on the same step.
         self.batch_oom_events = getattr(self, 'batch_oom_events', 0) + 1
         if self.step_ind == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
 
         for opt in self.optimizers.values():
