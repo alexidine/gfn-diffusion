@@ -2901,34 +2901,37 @@ def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
     return []
 
 
-#: The Z(sg) panel's code defaults (train.py::Modeller.log_zsg_panels; eval/sg_readouts.py). Off unless `enabled`.
-ZSG_PANEL_DEFAULTS = {'enabled': False, 'molecules': 64, 'draws': 32, 'every_n_evals': 4}
+#: The Z(sg) head panel's code defaults (train.py::Modeller.log_zsg_panels; eval/sg_readouts.py). Off unless `enabled`.
+ZSG_PANEL_DEFAULTS = {'enabled': False, 'molecules': 64}
+
+#: Keys of the forced space-group importance-sampling panels; parse_zsg_panel refuses them.
+ZSG_PANEL_RETIRED = ('draws', 'every_n_evals')
 
 
 def parse_zsg_panel(node) -> dict:
     """The `zsg_panel` block merged over ZSG_PANEL_DEFAULTS (absent = the defaults, so off). `node` is a raw dict or
-    the trainer's Namespace. Raises on unknown keys, `enabled` not a bool, `molecules` / `draws` not integers >= 1,
-    `every_n_evals` not an integer >= 0 or null (0 / null: the importance-sampling panel never fires)."""
+    the trainer's Namespace. Raises on a ZSG_PANEL_RETIRED key, unknown keys, `enabled` not a bool, `molecules` not an
+    integer >= 1."""
     if node is None:
         node = {}
     if hasattr(node, '__dict__') and not isinstance(node, dict):
         node = dict(vars(node))
     if not isinstance(node, dict):
         raise TypeError(f'zsg_panel must be a mapping, got {type(node).__name__}')
+    retired = sorted(set(node) & set(ZSG_PANEL_RETIRED))
+    if retired:
+        raise ValueError(f'zsg_panel key(s) {retired} are retired: the forced space-group importance-sampling panels '
+                         f'were removed by owner decision (unified crystal workflow, 2026-11-23). Delete them; the '
+                         f'head readout takes {sorted(ZSG_PANEL_DEFAULTS)}')
     bad = sorted(set(node) - set(ZSG_PANEL_DEFAULTS))
     if bad:
         raise ValueError(f'zsg_panel has unknown key(s) {bad}; keys are {sorted(ZSG_PANEL_DEFAULTS)}')
     spec = {**ZSG_PANEL_DEFAULTS, **node}
     if not isinstance(spec['enabled'], bool):
         raise ValueError(f"zsg_panel.enabled must be true or false, got {spec['enabled']!r}")
-    for k in ('molecules', 'draws'):
-        if not _whole(spec[k]) or spec[k] < 1:
-            raise ValueError(f'zsg_panel.{k} must be an integer >= 1, got {spec[k]!r}')
-        spec[k] = int(spec[k])
-    v = spec['every_n_evals']
-    if v is not None and (not _whole(v) or v < 0):
-        raise ValueError(f'zsg_panel.every_n_evals must be an integer >= 0 or null, got {v!r}')
-    spec['every_n_evals'] = int(v or 0)
+    if not _whole(spec['molecules']) or spec['molecules'] < 1:
+        raise ValueError(f"zsg_panel.molecules must be an integer >= 1, got {spec['molecules']!r}")
+    spec['molecules'] = int(spec['molecules'])
     return spec
 
 

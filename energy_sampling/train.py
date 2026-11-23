@@ -68,7 +68,7 @@ from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.eval.sg_readouts import (branch_group_stats, buffer_group_share, condition_groups,
-                                               head_panel_stats, is_panel_stats, panel_line)
+                                               head_panel_stats, panel_line)
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
@@ -10145,14 +10145,6 @@ class Modeller:
           head (every eval, no energy call): L(m, g) = models/group_draw.py::level_group_logits;
                 <prefix>head_p_sg<g>, <prefix>head_level_sg<g>, <prefix>head_entropy_nats (eval/sg_readouts.py::
                 head_panel_stats). Needs a conditional policy (its level reads the condition); skipped otherwise.
-          IS   (evals on the zsg_panel.every_n_evals cadence, eval_cadence_fires): for each molecule and group, the
-                group forced, zsg_panel.draws forward draws through the eval sampler (eval/utils.py::
-                sample_eval_fwd_trajs, under the policy's standard frames as fwd_eval_sampling), log w = log R +
-                log P_B - log P_F (= log R - log q under the flow); per molecule models/group_draw.py::
-                group_weights_is -> <prefix>is_log_z_sg<g>, is_p_sg<g>, is_ess_sg<g>, is_entropy_nats,
-                head_minus_is_sg<g> (eval/sg_readouts.py::is_panel_stats). Draws in chunks of at most the eval draw
-                (eval_draw_size), no gradient. A CUDA OOM goes through handle_train_epoch_error and drops the IS
-                panel for this eval (<prefix>is_skipped 1); it is not retried.
 
         Per-group levels live on different FD charts (different cell-coordinate counts and pose normalisation), so
         compare each group's curve over time, not levels across groups; p(g) here is a sampling allocation, not a
@@ -10165,7 +10157,6 @@ class Modeller:
         groups, n_zp = self._condition_group_axes()
         if not spec['enabled'] or len({int(g) for g in groups}) < 2:
             return {}
-        run_is = eval_cadence_fires(self.step_ind, spec['every_n_evals'], getattr(self.args, 'eval_period', None))
         out = {}
         for attr, prefix, seed_off in self.ZSG_PANELS:
             dataset = getattr(self, attr, None)
@@ -10173,14 +10164,11 @@ class Modeller:
             if batch is None or int(batch.num_graphs) == 0:
                 continue
             panel = self._zsg_panel(attr, batch, spec['molecules'], seed_off)
-            stats, level = {}, None
+            stats = {}
             if getattr(self.gfn_model, 'conditional', False):
-                level = self._zsg_head_levels(batch, panel, groups)
-                stats.update(head_panel_stats(level, groups, prefix))
-            if run_is:
-                stats.update(self._zsg_is_panel(batch, panel, groups, spec['draws'], eval_discretizer, level, prefix))
+                stats.update(head_panel_stats(self._zsg_head_levels(batch, panel, groups), groups, prefix))
             if stats:
-                print(panel_line(stats, groups, prefix, int(panel['rows'].numel()), spec['draws']), flush=True)
+                print(panel_line(stats, groups, prefix, int(panel['rows'].numel())), flush=True)
             out.update(stats)
         return out
 
@@ -10235,37 +10223,6 @@ class Modeller:
                                                     z_primes=zp)
             return mb_g, cond.to(self.device)
         return level_group_logits(self.gfn_model, condition_of, mb, groups).double().cpu()
-
-    @torch.no_grad()
-    def _zsg_is_panel(self, batch, panel, groups, draws, eval_discretizer, level, prefix):
-        """The IS half of log_zsg_panels: `draws` forward draws per (panel molecule, group)."""
-        ef, model = self.energy_function, self.gfn_model
-        m, k = panel['rows'].numel(), int(draws)
-        log_w, mol_index, group_index = [], [], []
-        frame = getattr(model, 'standard_frames', None)
-        try:
-            with (frame() if frame is not None else contextlib.nullcontext()):
-                for gi, g in enumerate(groups):
-                    step = max(1, int(self.eval_draw_size()) // k)
-                    for s in range(0, m, step):
-                        sel = torch.arange(s, min(m, s + step)).repeat_interleave(k)
-                        mb, temps, zp = self._zsg_rows(batch, panel, sel)
-                        n = int(mb.num_graphs)
-                        out = sample_eval_fwd_trajs(get_gfn_init_state(n, ef.data_ndim, self.device), model,
-                                                    eval_discretizer, ef, mb, sg_inds=torch.full_like(zp, int(g)),
-                                                    z_primes=zp, temperatures=temps)
-                        log_w.append((out['log_r'].reshape(-1) + out['log_pb'].reshape(-1)
-                                      - out['log_pf'].reshape(-1)).double())
-                        mol_index.append(sel)
-                        group_index.append(torch.full((n,), gi, dtype=torch.long))
-        except (RuntimeError, ValueError) as e:
-            self.handle_train_epoch_error(e, 'zsg_panel')   # re-raises anything but a CUDA OOM
-            print(f"log_zsg_panels: {prefix.rstrip('/')} IS panel dropped this eval after an OOM", flush=True)
-            return {f'{prefix}is_skipped': 1.0}
-        stats = is_panel_stats(torch.cat(log_w), torch.cat(mol_index), torch.cat(group_index), m, groups,
-                               level=level, prefix=prefix)
-        stats[f'{prefix}is_skipped'] = 0.0
-        return stats
 
     def log_test_metrics(self, eval_discretizer, fwd_stats):
         """

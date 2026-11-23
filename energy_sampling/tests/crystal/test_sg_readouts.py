@@ -1,5 +1,5 @@
-"""Per-space-group readouts (eval/sg_readouts.py) and the Z(sg) panels (train.py::Modeller.log_zsg_panels). What each
-test would catch:
+"""Per-space-group readouts (eval/sg_readouts.py) and the Z(sg) head panel (train.py::Modeller.log_zsg_panels). What
+each test would catch:
 
   * a group's train-cadence tb_err / logw_std_within / mle / log_Z_learned taken over another group's rows, the
     group decoded from the wrong digit of condition_id, the within-condition spread seeing a per-condition offset,
@@ -8,9 +8,8 @@ test would catch:
   * a buffer share missing a group that holds no rows (it must read 0);
   * the head panel's p(g | m) not a softmax of the level per molecule, or its entropy / level means wrong, on a small
     mixed-group flow policy (GROUPS = (2, 14), sym_ops pooled, so the level reads the group);
-  * the IS panel not recovering each (molecule, group) log Z, its normalised weights, ESS, or head - IS;
-  * the panel redrawn between evals, the IS half firing off its every_n_evals cadence, the panel present when the
-    block is off or the run has one group, an OOM retried, a non-OOM error swallowed, the test panel missing.
+  * the panel redrawn between evals, a forward draw or energy call made by the panel, the panel present when the block
+    is off or the run has one group, the test panel missing, a retired importance-sampling key accepted.
 
 CPU, synthetic, no energy computed.
 
@@ -29,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tests' / 'models'))
 
 from eval.sg_readouts import (branch_group_stats, buffer_group_share, condition_groups,  # noqa: E402
-                              head_panel_stats, is_panel_stats, panel_line, ZSG_CAVEAT)
+                              head_panel_stats, panel_line, ZSG_CAVEAT)
 
 pytestmark = pytest.mark.fast
 
@@ -142,40 +141,15 @@ def test_head_panel_on_a_mixed_group_policy():
     assert head_panel_stats(L[:, :1], [2]) == {}
 
 
-def test_is_panel_recovers_each_molecules_group_log_z():
-    g = torch.Generator().manual_seed(2)
-    a = torch.tensor([[0.0, math.log(3.0)], [1.0, 1.0]], dtype=torch.float64)   # true log Z(m, g)
-    n = 100000
-    lw, mi, gi = [], [], []
-    for m in range(2):
-        for k in range(2):
-            x = torch.randn(n, generator=g, dtype=torch.float64)
-            log_q = -0.5 * x ** 2 - 0.5 * math.log(2 * math.pi)
-            log_r = a[m, k] - 0.5 * (x / 1.1) ** 2 - 0.5 * math.log(2 * math.pi * 1.1 ** 2)
-            lw.append(log_r - log_q)
-            mi.append(torch.full((n,), m))
-            gi.append(torch.full((n,), k))
-    lw = torch.cat(lw)
-    lw[5] = math.nan                                           # a crashed row is dropped, not contagious
-    level = a + torch.tensor([[0.5, -0.5], [0.0, 2.0]], dtype=torch.float64)
-    out = is_panel_stats(lw, torch.cat(mi), torch.cat(gi), 2, GROUPS, level=level)
-    assert math.isclose(out['zsg/is_log_z_sg2'], float(a[:, 0].mean()), abs_tol=0.02)
-    assert math.isclose(out['zsg/is_log_z_sg14'], float(a[:, 1].mean()), abs_tol=0.02)
-    w = torch.softmax(a, -1)
-    assert math.isclose(out['zsg/is_p_sg14'], float(w[:, 1].mean()), abs_tol=0.01)
-    ent = float((-(w * w.log()).sum(-1)).mean())
-    assert math.isclose(out['zsg/is_entropy_nats'], ent, abs_tol=0.01)
-    assert math.isclose(out['zsg/head_minus_is_sg2'], 0.25, abs_tol=0.02)
-    assert math.isclose(out['zsg/head_minus_is_sg14'], 0.75, abs_tol=0.02)
-    assert 0.9 * n < out['zsg/is_ess_sg2'] <= n
-    line = panel_line(out, GROUPS, 'zsg/', 2, n)
-    assert ZSG_CAVEAT in line and 'sg14' in line and 'IS logZ' in line
+def test_panel_line_is_captioned_and_head_only():
+    out = head_panel_stats(torch.tensor([[0.0, 1.0], [2.0, 0.5]]), GROUPS)
+    line = panel_line(out, GROUPS, 'zsg/', 2)
+    assert ZSG_CAVEAT in line and 'sg14' in line and 'head p' in line and 'IS' not in line.replace(ZSG_CAVEAT, '')
 
 
 # --- Modeller.log_zsg_panels on a Modeller built without __init__ ------------------------------------------------
 
-A = torch.tensor([[0.0, 1.0], [2.0, 0.5], [-1.0, 3.0], [0.3, 0.3], [1.5, -0.5]], dtype=torch.float64)  # log Z(m, g)
-B = A + torch.tensor([1.0, -2.0], dtype=torch.float64)                                                 # level L(m, g)
+B = torch.tensor([[1.0, -1.0], [3.0, -1.5], [0.0, 1.0], [1.3, -1.7], [2.5, -2.5]], dtype=torch.float64)  # level L(m, g)
 
 
 class _Mols:
@@ -210,19 +184,13 @@ class _Ef:
         cond = torch.stack([mb.mol_id.double(), local.double()], -1)
         return mb, torch.zeros(mb.num_graphs), cond, mb.mol_id * 2 + local
 
-    def log_reward(self, x, mol_batch, log_temperature, return_exp=True):
-        # log R = A[m, g] + log N(x; 0, 1), so log w = log R - log q = A[m, g] exactly under q = N(0, 1)
-        local = (mol_batch.sg_ind == 14).long()
-        log_n = -0.5 * x.pow(2).sum(-1) - 0.5 * x.shape[-1] * math.log(2 * math.pi)
-        return A[mol_batch.mol_id, local] + log_n, SimpleNamespace(cpu=lambda: SimpleNamespace(detach=lambda: 0))
+    def log_reward(self, *a, **k):
+        raise AssertionError('the head panel makes no energy call')
 
 
 class _Policy:
     device = torch.device('cpu')
     conditional = True
-
-    def __init__(self, fail=None):
-        self.fail, self.calls = fail, []
 
     def get_condition_embedding(self, cond, mb):
         return cond
@@ -230,26 +198,18 @@ class _Policy:
     def flow_model(self, emb):
         return B[emb[:, 0].long(), emb[:, 1].long()]
 
-    def get_traj_fwd(self, init_state, disc, _, condition, mol_batch, return_gauss_params=False):
-        if self.fail is not None:
-            raise self.fail
-        n = init_state.shape[0]
-        self.calls.append(n)
-        x = torch.randn(n, 3, dtype=torch.float64)
-        log_q = -0.5 * x.pow(2).sum(-1) - 1.5 * math.log(2 * math.pi)
-        states = torch.stack([torch.zeros_like(x), x], 1)
-        return states, log_q[:, None], torch.zeros(n, 1), torch.zeros(n, 2), {}
+    def get_traj_fwd(self, *a, **k):
+        raise AssertionError('the head panel makes no forward draw')
 
 
-def _modeller(enabled=True, groups=GROUPS, every=2, step=10, fail=None, test=False):
+def _modeller(enabled=True, groups=GROUPS, step=10, test=False):
     from energy_sampling.train import Modeller
     m = Modeller.__new__(Modeller)
     m.args = SimpleNamespace(seed=0, eval_period=5, space_groups=list(groups), z_primes=[1],
-                             zsg_panel=SimpleNamespace(enabled=enabled, molecules=4, draws=8, every_n_evals=every),
-                             oom_batch_shrink_factor=0.5)
+                             zsg_panel=SimpleNamespace(enabled=enabled, molecules=4))
     ef = _Ef()
     ef.space_groups = list(groups)
-    m.energy_function, m.gfn_model = ef, _Policy(fail)
+    m.energy_function, m.gfn_model = ef, _Policy()
     m.device = torch.device('cpu')
     m.batch_size, m.step_ind, m.optimizers = 20, step, {}
     m.mol_dataset = SimpleNamespace(batch=_Mols(torch.arange(10) // 2))  # 5 molecules, 2 rows each
@@ -257,25 +217,21 @@ def _modeller(enabled=True, groups=GROUPS, every=2, step=10, fail=None, test=Fal
     return m
 
 
-def test_panels_read_head_and_is_on_their_cadences():
+def test_panels_read_the_head_on_a_fixed_panel_with_no_draw_or_energy_call():
     m = _modeller(test=True)
-    out = m.log_zsg_panels(None)                       # step 10 = 2 evals x 5: the IS half fires
+    out = m.log_zsg_panels(None)
     rows = m._zsg_panel_cache['mol_dataset']['rows']
     assert rows.numel() == 4 and bool((rows % 2 == 0).all())              # one row per distinct molecule
     mols = (rows // 2).long()
+    p = torch.softmax(B[mols], -1)
     for k, g in enumerate(GROUPS):
         assert math.isclose(out[f'zsg/head_level_sg{g}'], float(B[mols, k].mean()), abs_tol=1e-6)   # level: fp32
-        assert math.isclose(out[f'zsg/is_log_z_sg{g}'], float(A[mols, k].mean()), rel_tol=1e-9)
-        assert math.isclose(out[f'zsg/head_minus_is_sg{g}'], float((B - A)[0, k]), abs_tol=1e-6)
-        assert math.isclose(out[f'zsg/is_ess_sg{g}'], 8.0, rel_tol=1e-9)                 # log w constant per cell
-        assert math.isclose(out[f'zsg/is_p_sg{g}'], float(torch.softmax(A[mols], -1)[:, k].mean()), rel_tol=1e-9)
-    assert out['zsg/is_skipped'] == 0.0
-    assert any(k.startswith('zsg_test/is_log_z') for k in out)
-    assert max(m.gfn_model.calls) <= 20                                  # chunked at the eval draw
-    assert sum(m.gfn_model.calls) == 2 * (4 * 2 * 8)                     # 2 panels x 4 mols x 2 groups x 8 draws
-    m.step_ind = 15                                                      # off the IS cadence: head only
+        assert math.isclose(out[f'zsg/head_p_sg{g}'], float(p[:, k].mean()), abs_tol=1e-6)
+    assert any(k.startswith('zsg_test/head_level') for k in out)
+    assert not any(k.split('/')[1].startswith('is_') or 'minus_is' in k for k in out)
+    m.step_ind = 15
     out2 = m.log_zsg_panels(None)
-    assert not any('/is_' in k for k in out2) and 'zsg/head_p_sg2' in out2
+    assert set(out2) == set(out)
     assert torch.equal(m._zsg_panel_cache['mol_dataset']['rows'], rows)  # the panel is fixed
 
 
@@ -284,23 +240,24 @@ def test_panels_are_inert_when_off_or_on_one_group():
     assert _modeller(groups=[2]).log_zsg_panels(None) == {}
 
 
-def test_an_oom_drops_the_is_panel_and_other_errors_raise():
-    m = _modeller(fail=RuntimeError('CUDA out of memory. Tried to allocate'), step=0)   # step 0: no batch cut
-    out = m.log_zsg_panels(None)
-    assert out['zsg/is_skipped'] == 1.0 and 'zsg/head_p_sg2' in out and len(m.gfn_model.calls) == 0
-    with pytest.raises(ValueError, match='boom'):
-        _modeller(fail=ValueError('boom')).log_zsg_panels(None)
-
-
 def test_zsg_panel_block_is_validated():
     from config_invariants import parse_zsg_panel, zsg_panel_is_well_formed
-    assert parse_zsg_panel(None) == {'enabled': False, 'molecules': 64, 'draws': 32, 'every_n_evals': 4}
+    assert parse_zsg_panel(None) == {'enabled': False, 'molecules': 64}
     with pytest.raises(ValueError, match='unknown'):
         parse_zsg_panel({'molecule': 3})
-    with pytest.raises(ValueError, match='draws'):
-        parse_zsg_panel({'draws': 0})
-    assert parse_zsg_panel({'every_n_evals': None})['every_n_evals'] == 0
+    with pytest.raises(ValueError, match='molecules'):
+        parse_zsg_panel({'molecules': 0})
     assert zsg_panel_is_well_formed({'zsg_panel': {'enabled': True}, 'space_groups': [2, 14]}) == []
     v = zsg_panel_is_well_formed({'zsg_panel': {'enabled': True}, 'space_groups': [2]})
     assert v and v[0].severity == 'BASELINE'
     assert zsg_panel_is_well_formed({'zsg_panel': {'enabled': 'yes'}})[0].severity == 'ERROR'
+
+
+@pytest.mark.parametrize('key', ['draws', 'every_n_evals'])
+def test_a_retired_importance_sampling_key_is_refused_by_name(key):
+    from config_invariants import parse_zsg_panel, zsg_panel_is_well_formed
+    for node in ({'enabled': True, key: 4}, SimpleNamespace(enabled=True, **{key: 4})):
+        with pytest.raises(ValueError, match=f'{key}.*retired.*owner decision'):
+            parse_zsg_panel(node)
+    v = zsg_panel_is_well_formed({'zsg_panel': {key: 4}, 'space_groups': [2, 14]})
+    assert v[0].severity == 'ERROR' and 'retired' in v[0].detail
