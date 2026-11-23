@@ -40,6 +40,15 @@ def _rows(mode: str, st, args, c: dict) -> tuple[str, str]:
     win = (f"within {_n(np_.get('window_kT'))} kT of each molecule's floor (read per {np_.get('window_by', 'row')})"
            + (f", packing {tuple(np_['packing_window'])}" if np_.get('packing_window') else ''))
     prior = _base(getattr(args, 'prior_path', None))
+    store = cs.store_row_sources(args, st.bwd_sampling_mode)
+    if store is not None:
+        chip, phrase, detail = store[mode]
+        if mode == 'bwd':
+            return chip, f'{prior}: {phrase}, seed rows {win}; {detail}'
+        if mode == 'replay':
+            return chip, f'{phrase}; {detail}'
+        return chip, (f"on-policy, {_n(c.get('repeats', 1))} per condition, conditions taken "
+                      f"{_get(args, 'condition_log_z.rollout_condition_draw', 'iid')}; {detail}")
     if mode == 'bwd' and st.bwd_sampling_mode == 'dataset':
         noise = np_.get('live_kernel')
         return ('prior dataset (MLE draw)',
