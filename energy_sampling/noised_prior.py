@@ -44,8 +44,12 @@ DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), chec
 WINDOW_BY = ('row', 'parent')
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
-#: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation
-LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart')
+#: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation;
+#: 'physical' is metric_kick's step from the parent anchor's canonical description, put back in canonical form
+#: (physical_kick.py)
+LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart', 'physical')
+#: the live kernels that read live_log_range
+LOG_RANGE_KERNELS = ('chart', 'physical')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
 
@@ -155,9 +159,9 @@ def settings(args):
                          f"live_kernel {s['live_kernel']!r}")
     rng = s['live_log_range']
     if rng is not None:
-        if s['live_kernel'] != 'chart':
-            raise ValueError(f"noised_prior.live_log_range is read by live_kernel 'chart' only, got live_kernel "
-                             f"{s['live_kernel']!r}")
+        if s['live_kernel'] not in LOG_RANGE_KERNELS:
+            raise ValueError(f"noised_prior.live_log_range is read by live_kernel 'chart' or 'physical' only, got "
+                             f"live_kernel {s['live_kernel']!r}")
         if (not isinstance(rng, (list, tuple)) or len(rng) != 2 or any(
                 isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in rng)
                 or not rng[0] <= rng[1]):

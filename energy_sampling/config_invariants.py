@@ -1555,6 +1555,9 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         err('buffers.store seeds once from the prior: set buffers.anchor_buffer.frozen true')
     if 'harvested' in list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()):
         err("buffers.store seeds data tags anchor and child only: remove 'harvested' from noised_prior.train_kinds")
+    if _get(cfg, 'noised_prior.live_kernel') == 'physical':
+        err("buffers.store draws its rows without any live kernel (Modeller._store_draw): refused with "
+            "noised_prior.live_kernel 'physical'")
     if _get(cfg, 'condition_log_z.rollout_condition_draw', 'iid') == 'under_drawn':
         err("buffers.store: condition_log_z.rollout_condition_draw 'under_drawn' reads replay_buffer occupancy")
 

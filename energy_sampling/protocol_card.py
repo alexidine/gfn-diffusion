@@ -45,6 +45,7 @@ def _rows(mode: str, st, args, c: dict) -> tuple[str, str]:
         return ('prior dataset (MLE draw)',
                 f"{prior}: rows of kind {', '.join(np_.get('train_kinds') or [])} {win}; "
                 + ('no noise added in the run (rows as built)' if noise is None
+                   else "each draw a fresh physical kick of the row's parent anchor, unscored" if noise == 'physical'
                    else f'live {noise} kernel added to each draw'))
     if mode == 'bwd':
         pb = _get(args, 'buffers.prior_buffer')

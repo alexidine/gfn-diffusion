@@ -58,6 +58,7 @@ from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling import prior_scan_cache
 from energy_sampling import noised_prior
+from energy_sampling import physical_kick
 from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY
 from energy_sampling.row_store import FORMAT_VERSION as ROW_STORE_FORMAT
 from energy_sampling.grad_clip_guard import GradClipGuard
@@ -994,6 +995,8 @@ class Modeller:
             return self._metric_kernel_table()
         if s['live_kernel'] == 'chart':
             return self._chart_kernel_table()
+        if s['live_kernel'] == 'physical':
+            return self._physical_kernel_table()
         live = self.gfn_model.live_idx.to(self.device)
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
@@ -1257,6 +1260,89 @@ class Modeller:
         K['kept'] += kept * n
         return x.to(latents)
 
+    @staticmethod
+    def _physical_rows_digest(state):
+        """A digest of every (len / 4096)-th row of chart rows `state`: what ties the parent table to prior_dataset."""
+        return noised_prior.digest(state[::max(1, len(state) // 4096)].float())
+
+    def _physical_kernel_parents(self, prior, manifest, kinds, fd_ok, keep):
+        """noised_prior.live_kernel 'physical', at load: the table of the kept rows' parent anchors (self._physical).
+        Returns `keep` without the rows whose parent anchor has no usable chart point: such a row has no kick to draw
+        and is left out of the MLE draw, counted and printed. The prior buffer's seed is selected apart and keeps it.
+
+        Refuses a run off the FD chart, a space group with no basis table (physical_kick.group_kit), a radius law it
+        cannot read, and a kept row whose noised_parent is not an anchor of the same space group and molecule radius
+        (a harvested row has none)."""
+        s = self._noised_prior_settings
+        if fd_ok is None:
+            raise ValueError("noised_prior.live_kernel 'physical' needs energy_config.crystal_coordinates 'fd'")
+        rng = s['live_log_range']
+        if rng is None:
+            if manifest.get('child_kernel') != 'metric':
+                raise ValueError("noised_prior.live_kernel 'physical' reads the radius law of a metric-kick build; set "
+                                 f"noised_prior.live_log_range for this prior (child_kernel "
+                                 f"{manifest.get('child_kernel')!r})")
+            rng = (float(manifest['log_lo']), float(manifest['log_hi']))
+        kits = physical_kick.group_kits(self.energy_function.fd_layout)
+        kept = torch.nonzero(keep).flatten()
+        parents = noised_prior.tag(prior, 'noised_parent')[kept]
+        if bool((parents < 0).any()) or bool((parents >= len(kinds)).any()) \
+                or bool((kinds[parents] != noised_prior.KIND_ANCHOR).any()):
+            raise ValueError("noised_prior.live_kernel 'physical': a kept row's noised_parent is not an anchor (a "
+                             "harvested row has none: remove 'harvested' from noised_prior.train_kinds)")
+        sg = prior.sg_ind.reshape(-1).long().cpu()
+        radius = prior.radius.reshape(-1).detach().cpu()
+        if bool((sg[parents] != sg[kept]).any()) or bool(((radius[parents] - radius[kept]).abs() > 1e-3).any()):
+            raise ValueError("noised_prior.live_kernel 'physical': a kept row's noised_parent is another space group "
+                             "or molecule radius")
+        state = torch.as_tensor(prior.fd_state).float().cpu()
+        uniq, pos = torch.unique(parents, return_inverse=True)
+        usable = (fd_ok[uniq] & torch.isfinite(state[uniq]).all(1))[pos]
+        n_lost = int((~usable).sum())
+        if n_lost == len(kept):
+            raise ValueError("noised_prior.live_kernel 'physical': no kept row has a parent anchor with a chart point")
+        if n_lost:
+            keep = keep.clone()
+            keep[kept[~usable]] = False
+            kept = kept[usable]
+            uniq, pos = torch.unique(parents[usable], return_inverse=True)
+        self._physical = dict(kits=kits, parent=pos.to(torch.int32), centre=state[uniq], sg=sg[uniq], radius=radius[uniq],
+                              rg=physical_kick.radius_of_gyration_rows(prior, uniq), lo=float(rng[0]), hi=float(rng[1]),
+                              n_rows=len(kept), rows_digest=self._physical_rows_digest(state[kept]), no_parent=n_lost,
+                              rows=0, full_route=0, redrawn=0, kept=0)
+        print(f"live kernel 'physical': a fresh metric kick of each row's parent anchor, 10^U({rng[0]:g}, {rng[1]:g}) "
+              f"Angstrom, at most {1 + int(s['live_redraws'])} draws per row and then the anchor's own point; "
+              f"{len(kept)} rows over {len(uniq)} parent anchors in space groups {sorted(kits)}; {n_lost} kept rows "
+              f"({n_lost / (len(kept) + n_lost):.2%}) left out of the MLE draw, their parent anchor having no chart "
+              f"point", flush=True)
+        return keep
+
+    def _physical_kernel_table(self):
+        """noised_prior.live_kernel 'physical' at the first draw: checks that the parent table built at load
+        (_physical_kernel_parents) is aligned with prior_dataset."""
+        K = getattr(self, '_physical', None)
+        if K is None:
+            raise ValueError("noised_prior.live_kernel 'physical' needs a pre-noised prior on the FD chart")
+        b = self.prior_dataset.batch
+        if K['n_rows'] != int(b.num_graphs) or self._physical_rows_digest(b.fd_state) != K['rows_digest']:
+            raise ValueError("noised_prior.live_kernel 'physical': the parent table is not aligned with prior_dataset")
+        return True
+
+    def _physical_kernel_draw(self, latents, inds, mol_batch=None):
+        """noised_prior.live_kernel 'physical' on the rows `inds`: a fresh kick of each row's parent anchor
+        (physical_kick.kick, on the CPU), returned on the latents' device and dtype. MLE only: the row's stored energy
+        is not the kicked point's, so a draw that reads log R raises."""
+        if not self._bwd_draw_is_reward_free():
+            raise ValueError("noised_prior.live_kernel 'physical' draws unscored points: it needs a reward-free MLE "
+                             "stage")
+        K = self._physical
+        p = K['parent'][torch.as_tensor(inds).long().flatten().cpu()]
+        x, counts = physical_kick.kick(K['kits'], K['centre'][p], K['sg'][p], K['radius'][p], K['rg'][p], K['lo'], K['hi'],
+                                       1 + int(self._noised_prior_settings['live_redraws']))
+        for name, v in counts.items():
+            K[name] += v
+        return x.to(latents)
+
     def _basin_kernel_draw(self, latents, inds, mol_batch):
         """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
         With noised_prior.live_bank > 0, a uniformly chosen point of the row's bank, a share live_fresh_frac of the
@@ -1287,6 +1373,8 @@ class Modeller:
             self._live_L = self._live_kernel_table()
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'chart':
             return self._chart_kernel_draw(latents, inds, mol_batch)
+        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'physical':
+            return self._physical_kernel_draw(latents, inds, mol_batch)
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') in ('basin', 'metric'):
             return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
@@ -4769,6 +4857,8 @@ class Modeller:
         self._noised_prior_manifest = manifest   # read by the kernel readouts' fresh gap (_kernel_readouts)
         masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s, window_e=window_e)
         keep = masks['train'] & torch.isfinite(log_r)
+        if s['live_kernel'] == 'physical':
+            keep = self._physical_kernel_parents(prior, manifest, kinds, fd_ok, keep)
         n_groups = int(groups.max()) + 1
         kept_per = torch.bincount(groups[keep], minlength=n_groups)
         dev = prior.ptr.device
@@ -11067,6 +11157,12 @@ class Modeller:
         if chart is not None and chart['draws']:
             metrics['live_kernel/out_of_box_first_try'] = chart['out'] / chart['draws']
             metrics['live_kernel/kept_centre'] = chart['kept'] / chart['draws']
+        physical = getattr(self, '_physical', None)
+        if physical is not None and physical['rows']:
+            metrics['live_kernel/physical_full_route'] = physical['full_route'] / physical['rows']
+            metrics['live_kernel/physical_redrawn'] = physical['redrawn'] / physical['rows']
+            metrics['live_kernel/physical_kept_anchor'] = physical['kept'] / physical['rows']
+            metrics['live_kernel/physical_rows_without_parent'] = physical['no_parent']
         metrics.update(self.update_heldout_gate(metrics))
         metrics.update({
             'Batch Size': self.batch_size,
