@@ -442,14 +442,53 @@ class Checkpointer:
         return {
             'problem_def': m.problem_def,  # guards against pairing buffers with another problem's checkpoint
             'problem_hash': m.problem_hash,  # legacy guard - hash changes whenever the exclusion list grows, the def compare doesn't
+            'run_name': getattr(m, 'run_name', None),  # the writer: restore_row_store refuses a mismatch on its own run
             'step_ind': m.step_ind,  # buffers lag their checkpoint by up to eval_period; this reports by how much
             'prior_buffer': self._store_state('prior_buffer'),
             'replay_buffer': m.replay_buffer.state_dict() if hasattr(m, 'replay_buffer') else None,
             'anchor_buffer': self._store_state('anchor_buffer'),
-            # buffers.store (row_store.py), stamped with what its rows depend on (Modeller._store_stamp)
-            'row_store': (m.row_store.state_dict(m._store_stamp())
-                          if getattr(m, 'row_store', None) is not None else None),
+            # buffers.store, stamped with what its rows depend on (Modeller._store_stamp)
+            'row_store': self._row_store_entry(),
         }
+
+    def _row_store_entry(self):
+        """The row store's sidecar entry, compact when its state_dict takes `compact`; None without a store."""
+        m = self.modeller
+        st = getattr(m, 'row_store', None)
+        if st is None:
+            return None
+        kw = {'compact': True} if 'compact' in inspect.signature(st.state_dict).parameters else {}
+        return st.state_dict(m._store_stamp(), **kw)
+
+    def restore_row_store(self, store) -> bool:
+        """Apply the sidecar entry restore_buffers parked onto `store`, which this launch has just seeded. Returns True
+        when applied, False when none is parked or another run's entry does not fit (the store stays as seeded). An
+        entry the run wrote itself that does not fit raises. After applying: log q written after the resumed step is
+        undone (store.invalidate_q_after), and the generator is rekeyed on the resumed step unless the sidecar was
+        written at that step."""
+        m = self.modeller
+        state = getattr(m, '_row_store_state', None)
+        m._row_store_state = None
+        if state is None:
+            return False
+        src_run, src_step = getattr(m, '_row_store_source', (None, None))
+        why = store.state_mismatch(state, m._store_stamp())
+        if why is not None:
+            if src_run is not None and src_run == getattr(m, 'run_name', None):
+                raise ValueError(f"buffer sidecar of this run ({src_run!r}, step {src_step}) cannot be restored: {why}. "
+                                 f"Seeding afresh would discard its grown rows. To start clean, move the sidecar away, "
+                                 f"or load the checkpoint under a new run_name with buffers.fresh_on_switch")
+            print(f"row store in the buffer sidecar of run {src_run!r} ignored: {why}; keeping this launch's seed",
+                  flush=True)
+            return False
+        store.apply_state(state)
+        step = int(m.step_ind)
+        if src_step is None or int(src_step) != step:
+            store.reseed(store.base_seed, step)
+        undone = store.invalidate_q_after(step)
+        print(f"row store restored from the buffer sidecar (step {src_step}): {store.n_rows} rows, generation "
+              f"{store.generation}, log q undone on {undone} rows written after step {step}", flush=True)
+        return True
 
     #: the stores whose rows a launch's own seed rebuilds (train.py::Modeller.settle_seeded_store)
     SEEDED_STORES = ('prior_buffer', 'anchor_buffer')
@@ -501,10 +540,11 @@ class Checkpointer:
 
     def _buffer_fingerprint(self):
         """A cheap identity of the resident stores: per store its row count and the sum of each per-row column
-        (FINGERPRINT_COLUMNS); None (always write) while a row store is live, whose state this does not cover. Any
-        admission, eviction, draw count or loss update moves it."""
+        (FINGERPRINT_COLUMNS), plus a live row store's `generation`; None (always write) for a row store without one.
+        Any admission, eviction, draw count or loss update moves it."""
         m = self.modeller
-        if getattr(m, 'row_store', None) is not None:
+        st = getattr(m, 'row_store', None)
+        if st is not None and getattr(st, 'generation', None) is None:
             return None
         out = []
         for name in self.CURRENCY_CHECKED_BUFFERS:
@@ -527,7 +567,7 @@ class Checkpointer:
                 else:
                     sums.append(float(t.double().sum()))
             out.append((name, int(x.shape[0]), tuple(sums)))
-        return tuple(out)
+        return tuple(out) if st is None else (int(st.generation), tuple(out))
 
     def save_buffers(self, tag: Optional[str] = None):
         """Write the buffer sidecar. Called only at eval cadence -- see BUFFER_SUFFIX. The untagged eval-cadence
@@ -544,9 +584,21 @@ class Checkpointer:
                       flush=True)
             return
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        before = self._file_id(path)
         atomic_save(self.buffer_state(), path)
         if tag is None:
-            self._last_buffer_fp = fp
+            # atomic_save prints a failed write and returns: with a row store the next eval then writes again
+            failed = getattr(self.modeller, 'row_store', None) is not None and self._file_id(path) == before
+            self._last_buffer_fp = None if failed else fp
+
+    @staticmethod
+    def _file_id(path):
+        """(inode, mtime in ns, size) of a file, or None when it is absent."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
 
     def restore_buffers(self, state: dict, source: str):
         m = self.modeller
@@ -559,6 +611,11 @@ class Checkpointer:
         else:
             mismatched = state.get('problem_hash') is not None and state['problem_hash'] != m.problem_hash
         if mismatched:
+            writer = state.get('run_name')
+            if state.get('row_store') is not None and writer is not None and writer == getattr(m, 'run_name', None):
+                raise ValueError(f"buffer sidecar {source} of this run was saved under a different problem: seeding "
+                                 f"afresh would discard its grown rows. To start clean, move the sidecar away, or load "
+                                 f"the checkpoint under a new run_name with buffers.fresh_on_switch")
             print(f"Buffer sidecar {source} was saved under a different problem "
                   f"- ignoring it, buffers start fresh")
             return
@@ -584,9 +641,9 @@ class Checkpointer:
             m.prior_buffer = buf_cls.from_state_dict(state['prior_buffer'], device=m.buffer_device)
         if state.get('replay_buffer') is not None:
             m.replay_buffer = buf_cls.from_state_dict(state['replay_buffer'], device=m.buffer_device)
-        # the row store is rebuilt by Modeller.init_row_store, which runs after the identifier registry and the
-        # energy reference exist and compares this state's stamp against the run's
+        # parked for Modeller.init_row_store, which runs after the identifier registry and the energy reference exist
         m._row_store_state = state.get('row_store')
+        m._row_store_source = (state.get('run_name'), state.get('step_ind'))
         if state.get('anchor_buffer') is not None:
             m.anchor_buffer = anchor_cls.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
             # CONFIG OWNS THE ANCHOR POLICY, the sidecar does not. from_state_dict
