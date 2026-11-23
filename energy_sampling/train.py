@@ -8859,7 +8859,7 @@ class Modeller:
     #: rounds an MLE draw takes to replace a row whose kick kept its anchor point
     MLE_KICK_ROUNDS = 3
     #: rows per origin, and the bars, of the smoke currency check (nats; units of T on mol_energy)
-    STORE_CURRENCY_ROWS, STORE_CURRENCY_TOL = 64, 1e-2
+    STORE_CURRENCY_ROWS, STORE_CURRENCY_TOL, STORE_CURRENCY_REL = 64, 1e-2, 1e-5
 
     def store_settings(self):
         """buffers.store merged over config_invariants.ROW_STORE_DEFAULTS when enabled, else None."""
@@ -9392,8 +9392,9 @@ class Modeller:
     @torch.no_grad()
     def _store_check_currency(self):
         """smoke: for each origin present, re-scores STORE_CURRENCY_ROWS stored rows through st.x and st.mol_batch and
-        raises when log R differs by more than STORE_CURRENCY_TOL nats or mol_energy by more than STORE_CURRENCY_TOL
-        x T. Reads no global generator."""
+        raises when log R differs by more than STORE_CURRENCY_TOL nats or a row's mol_energy by more than
+        STORE_CURRENCY_TOL x T + STORE_CURRENCY_REL x |E| (float32 pair sums at |E| ~ 1e4 differ by ~0.05 between two
+        re-score batch sizes). Reads no global generator."""
         st, ef = self.row_store, self.energy_function
         T = float(self.args.energy_config.temperature)
         live = torch.nonzero(st.kind[:st.high_water] != crystal_store.FREE).flatten()
@@ -9412,11 +9413,14 @@ class Modeller:
             log_r, scored = ef.log_reward(st.x[at].to(self.device), mol, log_T, return_exp=True,
                                           internal_oom_recovery=True)
             d_r = float((log_r.detach().float().flatten().cpu() - st.log_r[at]).abs().max())
-            d_e = float((torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu() - st.energy[at]).abs().max())
+            gap = (torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu() - st.energy[at]).abs()
+            bar = self.STORE_CURRENCY_TOL * T + self.STORE_CURRENCY_REL * st.energy[at].abs()
+            d_e = float(gap.max())
             line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e}")
-            if not (d_r <= self.STORE_CURRENCY_TOL and d_e <= self.STORE_CURRENCY_TOL * T):
+            if not (d_r <= self.STORE_CURRENCY_TOL and bool((gap <= bar).all())):
                 raise RuntimeError(f"store currency check at step {int(self.step_ind)}: {line[-1]} (bars "
-                                   f"{self.STORE_CURRENCY_TOL:g} nats, {self.STORE_CURRENCY_TOL * T:g} energy units)")
+                                   f"{self.STORE_CURRENCY_TOL:g} nats, {self.STORE_CURRENCY_TOL * T:g} energy units + "
+                                   f"{self.STORE_CURRENCY_REL:g} |E|)")
         print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
 
     def _store_metrics(self):
