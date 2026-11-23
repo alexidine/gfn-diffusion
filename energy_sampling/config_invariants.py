@@ -1637,10 +1637,15 @@ def row_store_is_well_formed(cfg: dict) -> list[Violation]:
 
 def _z_head_pinned_by_sidecar(cfg: dict, stage: dict, mode: str) -> bool:
     """True for a bwd or replay branch whose resolved coefficients run TB against a detached Z (tb > 0, freeze_z > 0.5)
-    on a stage with fwd_z_sidecar, where the forward emp_z term fits the Z(c) head on fresh rollouts."""
-    return (stage.get('fwd_z_sidecar') is True and mode in ('bwd', 'replay')
+    on a fused stage with fwd_z_sidecar whose forward freeze_z leaves the head attached, so the forward emp_z term fits
+    Z(c) on fresh rollouts. Only fused_train_step runs the sidecar loss. The forward freeze_z is read as the
+    loss reads it: absent is 0 and a boolean compares as 0 or 1."""
+    fwd_freeze = _coeff_raw(cfg, stage, 'fwd', 'freeze_z')
+    return (stage.get('fwd_z_sidecar') is True and stage.get('train_mode', 'fused') == 'fused'
+            and mode in ('bwd', 'replay')
             and (_coeff(cfg, stage, mode, 'tb') or 0) > 0
-            and (_coeff(cfg, stage, mode, 'freeze_z') or 0) > 0.5)
+            and (_coeff(cfg, stage, mode, 'freeze_z') or 0) > 0.5
+            and (fwd_freeze is None or (isinstance(fwd_freeze, (bool, int, float)) and fwd_freeze <= 0.5)))
 
 
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:

@@ -902,6 +902,47 @@ def test_learned_inherited_from_the_base_block_is_pinned_the_same(canonical):
     assert _z_rule(cfg) == []
 
 
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_fires_on_a_single_branch_stage_where_the_sidecar_never_runs(canonical, branch):
+    """Only fused_train_step runs the sidecar loss."""
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['train_mode'] = branch
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+def test_the_pin_reads_an_absent_train_mode_as_fused(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg).pop('train_mode', None)
+    fwd = _vg_stage(cfg)['loss_coeffs']['fwd']
+    fwd['tb_z_source'] = 'persistent'  # an absent train_mode puts fwd in the rule's live list
+    assert _z_rule(cfg) == []
+
+
+@pytest.mark.parametrize('frozen', [1.0, 1, True])
+def test_learned_fires_when_the_forward_branch_cannot_train_z(canonical, frozen):
+    """A boolean counts: the loss reads `freeze_z > 0.5`, and True passes it."""
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd']['freeze_z'] = frozen
+    vs = _z_rule(cfg)
+    assert len(vs) == 2 and {'bwd', 'replay'} == {m for m in ('bwd', 'replay') if any(
+        f'{m}_loss_coeffs' in v.detail for v in vs)}
+
+
+def test_learned_fires_when_forward_freeze_z_is_inherited_from_the_base_block(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('freeze_z', None)
+    cfg['fwd_loss_coeffs']['freeze_z'] = 1.0
+    assert len(_z_rule(cfg)) == 2
+
+
+def test_forward_freeze_z_set_nowhere_reads_as_not_frozen(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('freeze_z', None)
+    cfg['fwd_loss_coeffs'].pop('freeze_z', None)
+    assert _z_rule(cfg) == []
+
+
 def test_a_branch_the_stage_does_not_train_is_not_flagged(canonical):
     """The narrowness is load-bearing, not incidental. The rule judges only the
     branches a stage's fracs train, and `var_conditioning` zeroes the fwd frac
