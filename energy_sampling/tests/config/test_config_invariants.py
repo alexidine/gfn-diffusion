@@ -1193,8 +1193,11 @@ def test_a_malformed_zsg_panel_is_an_error_and_an_inert_one_is_reported(canonica
     """Full coverage: tests/crystal/test_sg_readouts.py."""
     cfg = copy.deepcopy(canonical)
     assert not _fires(cfg, 'zsg_panel_is_well_formed')                    # absent or off
-    cfg['zsg_panel'] = {'enabled': True, 'draws': 0}
+    cfg['zsg_panel'] = {'enabled': True, 'molecules': 0}
     assert _fires(cfg, 'zsg_panel_is_well_formed', severity=ERROR)        # malformed
+    for retired in ('draws', 'every_n_evals'):
+        cfg['zsg_panel'] = {'enabled': True, retired: 4}
+        assert _fires(cfg, 'zsg_panel_is_well_formed', severity=ERROR)    # forced-group IS panel keys
     cfg['zsg_panel'] = {'enabled': True}
     cfg['space_groups'] = [2]
     assert _fires(cfg, 'zsg_panel_is_well_formed', severity=BASELINE)     # one group: inert
