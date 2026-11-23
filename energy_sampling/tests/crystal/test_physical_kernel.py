@@ -385,8 +385,8 @@ def test_settings_refuse_the_wrong_combinations(block, message):
         _settings(**block)
 
 
-@pytest.mark.parametrize('kernel, refused', [('physical', True), ('chart', False), (None, False)])
-def test_the_row_store_refuses_this_kernel_and_only_this_one(kernel, refused):
+@pytest.mark.parametrize('kernel, refused', [('physical', False), ('chart', True), (None, True)])
+def test_the_store_route_requires_this_kernel_and_no_other(kernel, refused):
     from config_invariants import ERROR, row_store_problems
     cfg = {'buffers': {'store': {'enabled': True}}, 'noised_prior': {'live_kernel': kernel}}
     hit = [m for sev, m in row_store_problems(cfg) if sev == ERROR and 'live_kernel' in m]

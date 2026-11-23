@@ -1,8 +1,10 @@
 # MLE phase
 
-*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04; the `'physical'` clauses written 2026-11-22 against commit `347921b6` plus the change that amends them. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04; the `'physical'` clauses written 2026-11-22 against commit `347921b6` plus the change that amends them; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them. Sources at the end.*
 
 The first stage of the canonical protocol is `train_prior`, a maximum-likelihood warm start: terminals come from a fixed dataset, a trajectory is sampled backward from each under $P_B$, and the forward log-density of that trajectory is maximised. No reward enters the loss, no trajectory-balance residual is formed, and the learned normaliser receives no gradient. This page covers the objective, the structure of its descent, the exit gate, the exit actions, and what a resume from the snapshot re-enters. Left out and named: the TB residual and its level decomposition, [trajectory-balance](trajectory-balance.md); the stage engine, [stage-protocol-engine](stage-protocol-engine.md); the buffer the next stage draws from, [prior-buffer](prior-buffer.md); what a checkpoint holds, [checkpoints-and-resume](checkpoints-and-resume.md).
+
+On the store route (`cfg:buffers.store.enabled`, [row-store](row-store.md)) the dataset is the store's anchors: `train.py::Modeller._store_draw` draws $B$ of them, uniformly over anchors or condition-first by `cfg:buffers.store.mle_draw`, and replaces each by a fresh `'physical'` kick from the run's own generator (`train.py::Modeller._kick_fresh`). A kick that returned its anchor's point is replaced by a kick of another anchor, so the batch holds no anchor point. The draw writes nothing to the store. `eval_bwd/mle`, `eval_bwd/mle_heldout_rows`, `eval_bwd/mle_anchors` and the `w1r/` readouts read frozen panels cut at load, of training children, held-out children and training anchors.
 
 ## The objective
 

@@ -647,6 +647,7 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
       floor_ok   rows a condition's floor is taken over: training split, finite, inside the packing window
       train      rows the run trains on: training split, a kind in train_kinds, inside both windows
       heldout    held-out anchor groups' rows of those kinds, inside both windows
+      heldout_children  held-out children inside both windows, whatever train_kinds holds
       anchors    clean training anchors inside both windows (a readout when anchors are not trained on)
       buffer     every scored training row inside both windows, anchors and children whatever train_kinds holds: the
                  prior buffer's seed (train.py::Modeller.prior_buffer_source), so the noised rows the build already
@@ -671,6 +672,7 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
     return dict(floor_ok=floor_ok, train=(splits == SPLIT_TRAIN) & kind_ok & good,
                 buffer=(splits == SPLIT_TRAIN) & scored & good,
                 heldout=(splits == SPLIT_HELDOUT) & kind_ok & good,
+                heldout_children=(splits == SPLIT_HELDOUT) & (kinds == KIND_CHILD) & good,
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
 
 

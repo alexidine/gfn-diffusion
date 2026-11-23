@@ -1253,12 +1253,24 @@ def test_an_nf_policy_refuses_sde_only_settings(canonical):
 def test_a_row_store_off_the_nf_route_is_an_error(canonical):
     """buffers.store enabled under model.kind sde refuses; under nf it passes. Full coverage:
     tests/config/test_row_store_invariants.py."""
+    from config_invariants import ROW_STORE_REFUSED_ACTIONS
     cfg = copy.deepcopy(canonical)
     assert not _fires(cfg, 'row_store_is_well_formed')                 # store off
     cfg['buffers']['store']['enabled'] = True
     assert _fires(cfg, 'row_store_is_well_formed')                     # kind sde
     cfg['policy']['kind'] = 'nf'
     cfg['gradient_norm_clip'] = 10.0
+    cfg['buffers']['store'] = {'enabled': True, 'ram_gb': 16}
+    cfg['buffers']['anchor_buffer'].update(frozen=True, seed_floors_only=True)
+    cfg['noised_prior'].update(live_kernel='physical', train_kinds=['anchor'])
+    cfg['energy_config']['crystal_coordinates'] = 'fd'
+    cfg['grow_batch_size'] = False
+    stages = cfg['protocols'][cfg['protocol']]['stages']
+    for st in stages:
+        st['max_steps'] = 100
+        for hook in ('on_enter', 'on_exit'):
+            st[hook] = [a for a in st.get(hook) or [] if a.split(':')[0] not in ROW_STORE_REFUSED_ACTIONS]
+    cfg['epochs'] = 111 * len(stages)
     assert not _fires(cfg, 'row_store_is_well_formed')
 
 

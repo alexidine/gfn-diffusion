@@ -1,6 +1,6 @@
 # Trajectory balance
 
-*Drift: **T** (theory). Verified against commit `e17167e`, 2026-09-20. Sources at the end.*
+*Drift: **T** (theory). Verified against commit `e17167e`, 2026-09-20; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them. Sources at the end.*
 
 Trajectory balance (TB) is the objective this codebase trains a diffusion-style sampler with. It asks that a single learned scalar $\log Z$ reconcile, on every trajectory, the forward policy's density, the backward policy's density and the reward. This page defines the residual and the loss shape the code builds, states what its zero and its variance imply, reproduces the level decomposition of `docs/tb_level_decomposition.tex`, and describes the gradient the loss delivers. Left out and named: the estimators and servo machinery that place $\log Z$ between fills are [z-calibration](z-calibration.md); the directions the objective does not restore are [flat-directions-and-limit-cycles](flat-directions-and-limit-cycles.md); how the two streams are combined is [on-policy-and-off-policy-training](on-policy-and-off-policy-training.md); the normaliser-free sibling objective is [vargrad](vargrad.md).
 
@@ -97,6 +97,8 @@ $$\mathbb{E}_\mu[r\,\nabla_\theta \log q_\theta] = \mathbb{E}_\mu\big[(\log q_\t
 $q_\theta = \pi$ with $\log Z = \log Z^\star$ zeroes every residual for any $\mu$. The `bwd` and `replay` branches of `mk_dev.yaml` ship `freeze_z: 1.0`, so $\log Z$ in this term is the detached head.
 
 The tests drive `gflownet_losses.py::get_gfn_forward_loss` on a small unconditional `NFPolicy` with no dead rows and a quadratic $\log R$: `tests/models/test_nf_tb_reverse_kl.py::test_fwd_tb_gradient_is_the_score_function_reverse_kl_gradient` checks, on the same draws and inside the knee, that the gradient on the flow's blocks equals $\tfrac1B\sum_i r_i \nabla_\theta \log q_\theta(x_i)$ and the gradient on $\log Z$ equals $\tfrac1B\sum_i r_i$; `::test_outside_the_knee_the_weight_is_the_clipped_residual` checks the same with $\mathrm{clip}(r_i, \pm\beta)$ at a $\beta$ that clips part of the batch; `::test_log_z_enters_the_policy_gradient_as_a_baseline` checks that two levels on the same draws differ by $\Delta\log Z \cdot \tfrac1B\sum_i \nabla_\theta \log q_\theta(x_i)$, and that on 4096 draws that mean score is small beside the per-row score norm.
+
+On the store route ([row-store](row-store.md)) the bwd and replay branches run this residual on stored rows with `cfg:bwd_loss_coeffs.freeze_z` and `cfg:replay_loss_coeffs.freeze_z` at 1 and `tb_z_source` `learned`, so $\log Z(c)$ enters detached. Its head is trained by the forward sidecar. `train.py::Modeller._store_touch` writes each drawn row's $\log P_F$ and signed residual to the store.
 
 ## Where the note and the code differ
 

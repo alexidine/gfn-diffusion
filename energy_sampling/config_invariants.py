@@ -1493,13 +1493,20 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
     return out
 
 
-#: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
+#: buffers.store, the NF-route crystal store (crystal_store.py; docs/wiki/row-store.md): every key and its code default.
 #: On an enabled block an absent key reads its default and an unknown key is refused. A disabled block is not read.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
                           eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, is_exponent=1.0,
                           refresh_chunk=8192, ram_gb=None, ram_frac=0.5, mle_draw='anchor', replay_weight='uniform')
 #: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
 ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
+#: keys of the previous row store: inert on a disabled block, refused on an enabled one
+ROW_STORE_RETIRED_KEYS = ('bar', 'admit_reward_min', 'cap_per_condition', 'max_rows', 'eps', 'records_kept', 'kappa',
+                          'floor_frac', 'uniform_frac', 'is_exponent', 'refresh_chunk')
+#: stage actions that write the prior buffer, which the store route never builds
+ROW_STORE_REFUSED_ACTIONS = ('rebuild_prior_by_churn', 'reseed_prior_from_dataset', 'seed_prior_from_anchors')
+#: steps past a stage's max_steps its exit can take: the 10-step tick reads the cap, then pulls one eval
+ROW_STORE_STAGE_MARGIN = 11
 
 
 def row_store_settings(node) -> Optional[dict]:
@@ -1525,6 +1532,19 @@ def store_row_limit(ram_gb, data_ndim, ram_frac=0.5) -> int:
     state_dict copy of the index order."""
     bytes_per_row = 2 * (4 * data_ndim + 43) + 16 + 4
     return min(int(ram_frac * ram_gb * 2 ** 30 / bytes_per_row), 2 ** 31 - 1)
+
+
+@functools.lru_cache(maxsize=None)
+def replay_weight_rules() -> tuple:
+    """The names in crystal_store.REPLAY_WEIGHTS, by AST parse of the source (that module imports torch). Raises when
+    the file has lost the assignment."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crystal_store.py')
+    with open(path, 'r', encoding='utf-8') as f:
+        tree = ast.parse(f.read(), path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == 'REPLAY_WEIGHTS' for t in node.targets):
+            return tuple(k.value for k in node.value.keys)
+    raise ValueError(f'{path} has no REPLAY_WEIGHTS assignment')
 
 
 def _real(v) -> bool:
@@ -1556,19 +1576,52 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         err('buffers.store stores log R at one temperature: refused with temperature_conditioning')
     if _get(cfg, 'energy_config.prior_flow_path') is not None:
         err('buffers.store stores log R at admission: refused with energy_config.prior_flow_path (a lambda path)')
-    if _get(cfg, 'policy.nf.atom_tokens', False) is True:
-        err('buffers.store keeps no molecule graph per row: refused with model.nf.atom_tokens')
     if _get(cfg, 'buffers.replay_buffer.prioritise.enabled', False) is True:
         err('buffers.store draws replay by its own priority: set buffers.replay_buffer.prioritise.enabled false')
     if (_num(_get(cfg, 'buffers.replay_buffer.val_frac')) or 0) > 0:
         err('buffers.store holds no replay held-out split: set buffers.replay_buffer.val_frac 0')
     if _get(cfg, 'buffers.anchor_buffer.frozen', False) is not True:
         err('buffers.store seeds once from the prior: set buffers.anchor_buffer.frozen true')
-    if 'harvested' in list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()):
-        err("buffers.store seeds data tags anchor and child only: remove 'harvested' from noised_prior.train_kinds")
-    if _get(cfg, 'noised_prior.live_kernel') == 'physical':
-        err("buffers.store draws its rows without any live kernel (Modeller._store_draw): refused with "
-            "noised_prior.live_kernel 'physical'")
+    raw = _member(_member(cfg, 'buffers'), 'store')
+    raw = raw if isinstance(raw, dict) else vars(raw)
+    retired = sorted(k for k in raw if k in ROW_STORE_RETIRED_KEYS)
+    if retired:
+        err(f"buffers.store: {retired} belong to the previous row store and are refused on an enabled block")
+    if _get(cfg, 'noised_prior.live_kernel') != 'physical':
+        err("buffers.store trains phase 1 on fresh kicks of anchors: set noised_prior.live_kernel 'physical'")
+    if list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()) != ['anchor']:
+        err("buffers.store trains phase 1 on anchors: set noised_prior.train_kinds ['anchor']")
+    if _get(cfg, 'energy_config.crystal_coordinates', 'latent') != 'fd':
+        err("buffers.store holds FD chart rows: set energy_config.crystal_coordinates 'fd'")
+    if _get(cfg, 'buffers.anchor_buffer.seed_floors_only', False) is not True:
+        err('buffers.store warms the tracker floors from its own rows: set buffers.anchor_buffer.seed_floors_only true')
+    if not (_real(s['ram_gb']) and s['ram_gb'] > 0):
+        err(f"buffers.store.ram_gb must be the job's requested RAM in GiB, got {s['ram_gb']!r}")
+    if not (_real(s['ram_frac']) and 0 < s['ram_frac'] <= 1):
+        err(f"buffers.store.ram_frac must lie in (0, 1], got {s['ram_frac']!r}")
+    if s['mle_draw'] not in ('anchor', 'condition'):
+        err(f"buffers.store.mle_draw must be 'anchor' or 'condition', got {s['mle_draw']!r}")
+    if s['replay_weight'] not in replay_weight_rules():
+        err(f"buffers.store.replay_weight {s['replay_weight']!r} is not in crystal_store.REPLAY_WEIGHTS "
+            f"{list(replay_weight_rules())}")
+    if _get(cfg, 'condition_log_z.rollout_group_draw', 'uniform') != 'uniform':
+        err("buffers.store draws rollout groups uniformly: set condition_log_z.rollout_group_draw 'uniform'")
+    if _get(cfg, 'buffers.replay_buffer.admit_from_eval', True) is False:
+        err('buffers.store keeps every scored eval row: buffers.replay_buffer.admit_from_eval false is refused')
+    if _get(cfg, 'grow_batch_size', False) is True:
+        err('buffers.store sizes its headroom from the batch: grow_batch_size true is refused')
+    stages_seen = [st for st in active_stages(cfg) if isinstance(st, dict)]
+    if (_num(_get(cfg, 'policy.nf.cond_noise')) or 0) > 0 and any(
+            (_coeff(cfg, st, m, 'tb') or 0) > 0 for st in stages_seen for m in ('bwd', 'replay')):
+        err('buffers.store: model.nf.cond_noise > 0 with a TB branch (the level would read a noised condition)')
+    caps = [_num(st.get('max_steps')) for st in stages_seen]
+    if any(c is None for c in caps):
+        err('buffers.store: every stage needs max_steps')
+    elif caps:
+        need = int(sum(caps)) + ROW_STORE_STAGE_MARGIN * len(caps)
+        if (_num(_get(cfg, 'epochs')) or 0) < need:
+            err(f"buffers.store: epochs {_get(cfg, 'epochs')!r} is below the stage caps' sum + "
+                f"{ROW_STORE_STAGE_MARGIN} per stage = {need}, so the run would end before its last stage")
     if _get(cfg, 'condition_log_z.rollout_condition_draw', 'iid') == 'under_drawn':
         err("buffers.store: condition_log_z.rollout_condition_draw 'under_drawn' reads replay_buffer occupancy")
 
@@ -1576,6 +1629,12 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         if not isinstance(st, dict):
             continue
         name = st.get('name', '?')
+        if (_num(st.get('z_pin_rollout_every')) or 0) > 0:
+            err(f"stage {name!r}: z_pin_rollout_every > 0 (a z-pin rollout is not admitted, and the store keeps every "
+                f"scored row)")
+        for action in list(st.get('on_enter') or ()) + list(st.get('on_exit') or ()):
+            if str(action).split(':')[0] in ROW_STORE_REFUSED_ACTIONS:
+                err(f"stage {name!r}: action {action!r} writes the prior buffer, which the store route never builds")
         if st.get('condition_draw'):
             err(f"stage {name!r}: condition_draw draws from prior_buffer and replay_buffer, not the store")
         if (_num(st.get('replay_warmup_rows')) or 0) > 0:
@@ -1605,32 +1664,11 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
             err(f"stage {name!r}: z_calibration.mode replay draws from replay_buffer, which the store never fills "
                 f"(Modeller._z_replay_step returns without a step)")
 
-    if not (_real(s['kappa']) and s['kappa'] >= 0):
-        err(f"buffers.store.kappa must be a number >= 0, got {s['kappa']!r}")
-    for k in ('floor_frac', 'uniform_frac', 'is_exponent'):
-        if not (_real(s[k]) and 0 <= s[k] <= 1):
-            err(f"buffers.store.{k} must lie in [0, 1], got {s[k]!r}")
-    if not (_real(s['bar']) and s['bar'] >= 0):
-        err(f"buffers.store.bar must be a number >= 0, got {s['bar']!r}")
-    if not (_real(s['eps']) and s['eps'] > 0):
-        err(f"buffers.store.eps must be a number > 0, got {s['eps']!r}")
-    for k in ('cap_per_condition', 'max_rows'):
-        if not (_whole(s[k]) and s[k] >= 0):
-            err(f"buffers.store.{k} must be an integer >= 0, got {s[k]!r}")
-    if s['records_kept'] is not None and not (_whole(s['records_kept']) and s['records_kept'] >= 1):
-        err(f"buffers.store.records_kept must be an integer >= 1 or null, got {s['records_kept']!r}")
-    if not (_whole(s['refresh_chunk']) and s['refresh_chunk'] >= 1):
-        err(f"buffers.store.refresh_chunk must be an integer >= 1, got {s['refresh_chunk']!r}")
-    if s['admit_reward_min'] is not None and not _real(s['admit_reward_min']):
-        err(f"buffers.store.admit_reward_min must be a number or null, got {s['admit_reward_min']!r}")
-    if s['records_kept'] is None:
-        out.append((BASELINE, 'buffers.store.records_kept null: protected records are unbounded (one per condition '
-                              'per admission call at most)'))
     return out
 
 
 def row_store_is_well_formed(cfg: dict) -> list[Violation]:
-    """buffers.store (row_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
+    """buffers.store (crystal_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
     ERRORs, since this module only reports at load."""
     return [Violation(sev, 'row_store_is_well_formed', msg) for sev, msg in row_store_problems(canonical_model_section(cfg))]
 
