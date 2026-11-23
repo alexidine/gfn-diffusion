@@ -2,9 +2,11 @@
 the new crystal's canonical chart point certified from a small table of basis changes.
 
   1. step    metric_kick's arithmetic (chart 'fd') on the anchor's description, decoded in closed form from its chart row.
-  2. cell    only the basis changes of BASIS_TABLES (axis_order.axis_orders on the orthorhombic groups) are tried. A basis
-             is certified when its cell is strictly inside every wall of the reduced domain (ops.tri_niggli_conditions,
-             ops.mono_conditions, the axis-order faces) by CELL_MARGIN and exactly one table entry passes.
+  2. cell    only the basis changes of BASIS_TABLES (axis_order.axis_orders on the orthorhombic groups) are tried. A cell
+             passes a basis when it is strictly inside every wall of the reduced domain there (ops.tri_niggli_conditions,
+             ops.mono_conditions, the axis-order faces) by CELL_MARGIN. Triclinic and monoclinic: the identity is
+             accepted as soon as it passes, and the other entries are then not evaluated; otherwise exactly one of them
+             must pass. Orthorhombic: exactly one axis order must pass.
   3. pose    the centroid is certified when exactly one Gamma+ image lies strictly inside the asymmetric-unit box by
              T_MARGIN.
   4. chart   the closed-form inverse of the FD chart. A cell coordinate strictly inside the length box is accepted, one
@@ -34,9 +36,16 @@ BOX_BAND = 1e-5         # unit coordinate: outside the length box by more is a r
 BOX_MARGIN = 1e-7       # unit coordinate: inside the length box by more is an acceptance
 ORI_MARGIN = 1e-7       # unit theta and r: closer to the orientation chart's seams is not certified
 _PAD = 1e-6             # domains._PAD: the margin of the fold's lattice shift
+FULL_ROUTE_WARN_SHARE = 0.05    # a run with more than this share of its rows on the full route is told once ...
+FULL_ROUTE_WARN_ROWS = 4096     # ... once it has drawn this many rows (train.py::Modeller._physical_kernel_draw)
 
 #: the basis changes tried per space group, each a row-major 3 x 3 integer matrix, identity first. None: the group's
-#: whole allowed set comes from axis_order.axis_orders. A basis missing from a table costs a full-route fallback.
+#: whole allowed set comes from axis_order.axis_orders. A basis missing from a table costs a full-route fallback, never
+#: a wrong row. data_processing/mine_basis_tables.py rebuilds an entry: every distinct basis change canon.canonicalize
+#: chooses on kicks of a prior's anchors, identity first and then most frequent first. The entries below are that list
+#: for 300,000 kicks per group (half at the radius law 10^U(-2, -0.375) Angstrom, half at 1.4 times it) of a random 60%
+#: of the anchors of pool4_test_train_k4_metric.pt. tests/crystal/test_physical_kernel.py accepts a table: unimodular,
+#: no repeated entry, and every row it certifies equal to the full canonicaliser's.
 BASIS_TABLES = {
     2: (
         (1, 0, 0, 0, 1, 0, 0, 0, 1), (-1, 1, 0, 0, 1, 0, 0, 0, -1), (-1, 0, 0, 0, 0, -1, 0, -1, 0),
@@ -117,11 +126,12 @@ class GroupKit:
     mono_cls: Optional[int]         # ops.mono_class of a monoclinic group
 
 
-def group_kit(g, slots) -> GroupKit:
+def group_kit(g, slots, table=None) -> GroupKit:
     """The kit of space group g with chart slots `slots`. Raises, naming the group, when it has no basis table or its
-    chart is not of the form the closed forms below are written for."""
+    chart is not of the form the closed forms below are written for. `table`: basis changes read in place of
+    BASIS_TABLES[g], for a group not yet in it (data_processing/mine_basis_tables.py)."""
     g = int(g)
-    if g not in BASIS_TABLES:
+    if table is None and g not in BASIS_TABLES:
         raise ValueError(f"noised_prior.live_kernel 'physical': space group {g} has no basis table "
                          f"(physical_kick.BASIS_TABLES holds {sorted(BASIS_TABLES)})")
     fam = charts.cell_family(g)
@@ -148,7 +158,7 @@ def group_kit(g, slots) -> GroupKit:
         kind, perm, faces = o.kind, o.perm.cpu(), o.faces.to('cpu', F64)
         N, shift = o.N.to('cpu', F64), o.s.to('cpu', F64)
     else:
-        N = torch.tensor(BASIS_TABLES[g], dtype=F64).reshape(-1, 3, 3)
+        N = torch.tensor(BASIS_TABLES[g] if table is None else table, dtype=F64).reshape(-1, 3, 3)
         shift = torch.zeros(len(N), 3, dtype=F64)
     if fam == 'monoclinic':
         mono_cls = int(ops.mono_class(torch.tensor([g]))[0])
@@ -474,6 +484,7 @@ def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None):
     of gyration [n]. Runs on the CPU on one thread; a row of a group outside `kits` raises."""
     centres, sg = centres.cpu(), torch.as_tensor(sg).reshape(-1).long().cpu()
     radius, rg = torch.as_tensor(radius).cpu().to(F64), torch.as_tensor(rg).cpu().to(F64)
+    radius = torch.round(radius * 1e6) / 1e6        # the production chart's radius (MolecularCrystal.fd_coordinates_rows)
     x = torch.zeros_like(centres, dtype=torch.float32)
     total = dict(rows=0, full_route=0, redrawn=0, kept=0)
     with single_thread():

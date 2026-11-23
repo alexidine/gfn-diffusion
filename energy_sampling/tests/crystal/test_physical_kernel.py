@@ -6,23 +6,35 @@ fallback) and its trainer wiring on a Modeller built without __init__. What each
   * a kick centred on a child, or on another row's anchor;
   * a redraw loop with no bound;
   * the kernel running under a stage that reads log R, or beside buffers.store, which never calls it;
-  * the global torch thread count left changed.
+  * the global torch thread count left changed;
+  * a step or a decode that differs from metric_kick's or the production chart's arithmetic;
+  * tiles of one terminal holding different kicks, which terminal_mle would read as one terminal;
+  * the key set on a route that would silently not draw it (a prior that is not a build, the INN trainer);
+  * the fallback taking every row with nothing said.
 
 CPU only, no model or energy.
 
     python -m pytest -q tests/crystal/test_physical_kernel.py
 """
-from types import SimpleNamespace
+import copy
+import os
+import pathlib
+from types import MethodType, SimpleNamespace
 
+import mxtaltools
+import numpy as np
 import pytest
 import torch
+import yaml
 
 from energies.fd_coordinates import FDCoordinates, FDSlotLayout
-from energy_sampling import noised_prior, physical_kick as PK
+from energy_sampling import config_invariants as ci, noised_prior, physical_kick as PK
 from energy_sampling.train import Modeller
-from mxtaltools.crystal_fd import domains
+from mxtaltools.crystal_fd import charts, domains
 
 pytestmark = pytest.mark.fast
+
+MK_DEV = pathlib.Path(__file__).resolve().parents[2] / 'configs' / 'mk_dev.yaml'
 
 GROUPS = (2, 14, 19, 61)
 F64 = torch.float64
@@ -192,6 +204,14 @@ def test_a_group_without_a_table_is_refused_by_name():
         PK.group_kit(33, torch.arange(9))
 
 
+def test_a_row_of_a_group_outside_the_run_is_refused_by_name(layout, kits):
+    centres, sg, radius, rg = _mixed(layout, kits, 2)
+    sg = sg.clone()
+    sg[0] = 33
+    with pytest.raises(ValueError, match='space group 33 has no table in this run'):
+        PK.kick(kits, centres, sg, radius, rg, -2.0, -0.375, 5)
+
+
 def test_the_carried_tables_are_unimodular_and_the_fold_margin_is_the_librarys():
     for g, rows in PK.BASIS_TABLES.items():
         if rows is None:
@@ -240,7 +260,8 @@ def _prior(layout, kits):
 def _trainer(layout, prior, redraws=4, log_range=(-3.0, -3.0), free=True):
     m = Modeller.__new__(Modeller)
     m.energy_function = SimpleNamespace(fd_layout=layout)
-    m._noised_prior_settings = dict(live_kernel='physical', live_log_range=log_range, live_redraws=redraws)
+    m._noised_prior_settings = {**noised_prior.DEFAULTS, 'live_kernel': 'physical', 'live_log_range': log_range,
+                                'live_redraws': redraws}
     m._bwd_draw_is_reward_free = lambda: free
     m.prior_dataset = SimpleNamespace(batch=prior)
     return m
@@ -380,3 +401,301 @@ def test_the_protocol_card_names_the_kernel():
                            prior_path='prior.pt')
     _, text = protocol_card._rows('bwd', SimpleNamespace(bwd_sampling_mode='dataset'), args, {})
     assert "physical kick of the row's parent anchor" in text
+
+
+# -- the law: the kernel's own arithmetic against the production code it restates -----------------------------------
+
+def _csd_rows(g, per=8):
+    """Real Z' = 1 rows of space group g (mxtaltools mini_new_csd.pt) as one batch."""
+    from mxtaltools.dataset_utils.utils import collate_data_list
+    data = torch.load(os.path.join(os.path.dirname(os.path.dirname(mxtaltools.__file__)), 'mini_datasets', 'mini_new_csd.pt'),
+                      weights_only=False)
+    rows = [e for e in data if int(e.sg_ind) == g and int(e.z_prime) == 1 and bool(e.is_well_defined)][:per]
+    assert rows, g
+    return collate_data_list(rows)
+
+
+@pytest.mark.parametrize('g', GROUPS)
+def test_decode_is_the_production_chart(kits, g):
+    k = kits[g]
+    u, _, _ = _anchors(k, 600, seed=g + 30)
+    radius = 3.0 + 2.0 * torch.rand(600, generator=torch.Generator().manual_seed(g), dtype=F64)
+    fc = FDCoordinates(g, radius)
+    desc, _ = fc.to_description(2 * u - 1)
+    cell, t, R = PK.decode(k, u, radius)
+    assert float((cell - desc.cell).abs().max()) < 1e-9
+    gap = t - desc.t[:, 0]
+    assert float((gap - gap.round()).abs().max()) < 1e-9                 # the description wraps its centres into [0, 1)
+    assert float((R - desc.R[:, 0]).abs().max()) < 1e-9
+    v = charts.to_unit(fc.chart, fc.chart.inverse(desc)[0])
+    assert float((PK.cell_unit(k, cell, radius) - v[:, :k.nc]).abs().max()) < 1e-9
+
+
+@pytest.mark.parametrize('g', GROUPS)
+def test_the_step_is_metric_kick_with_the_same_draws(kits, g):
+    """draw_step and apply_step against noised_prior.metric_kick(chart='fd') on a real batch, one seed for both."""
+    b, k = _csd_rows(g), kits[g]
+    n = int(b.num_graphs)
+    p0 = b.full_cell_parameters().detach().to(F64)
+    rg = noised_prior.radius_of_gyration(b)
+    st = PK.draw_step(k, n, -1.0, -0.375, torch.Generator().manual_seed(g))
+    c2, t2, R2 = PK.apply_step(st, p0[:, :6], p0[:, 6:9], noised_prior._rodrigues(p0[:, 9:12]), rg, PK.t_fc(p0[:, :6]))
+    noised_prior.metric_kick(b, -1.0, -0.375, generator=torch.Generator().manual_seed(g), chart='fd')
+    p1 = b.full_cell_parameters().detach().to(F64)
+    assert float((c2 - p1[:, :6]).abs().max()) < 2e-5                    # the batch stores float32
+    assert float((t2 - p1[:, 6:9]).abs().max()) < 2e-5
+    assert float((R2 - noised_prior._rodrigues(p1[:, 9:12])).abs().max()) < 1e-4
+    assert float(st.norm(dim=1).min()) > 0.09                            # the comparison is over a real step
+
+
+def test_the_radius_is_rounded_as_the_production_chart_rounds_it(layout, kits, monkeypatch):
+    centres, sg, _, rg = _mixed(layout, kits, 16)
+    radius = (3.0 + 2.0 * torch.rand(len(sg), generator=torch.Generator().manual_seed(6))).float()
+    seen = []
+    real = PK.kick_group
+    monkeypatch.setattr(PK, 'kick_group', lambda kit, s, r, *a, **kw: (seen.append(r.clone()), real(kit, s, r, *a, **kw))[1])
+    PK.kick(kits, centres, sg, radius, rg, -2.0, -0.375, 5)
+    want = torch.round(radius.to(F64) * 1e6) / 1e6
+    assert not torch.equal(want, radius.to(F64))                         # the rounding is not a no-op on these radii
+    assert torch.equal(torch.cat(seen).sort()[0], want.sort()[0])
+
+
+# -- the trainer: tiles, draw counts, load wiring, refusals ---------------------------------------------------------
+
+def test_every_tile_of_a_terminal_holds_the_same_kick(layout, kits, monkeypatch):
+    prior, kinds = _prior(layout, kits)
+    m = _trainer(layout, prior)
+    _, rows = _load(m, prior, kinds)
+    B, K = len(rows), 3
+    sizes = []
+    real = PK.kick
+    monkeypatch.setattr(PK, 'kick', lambda kit, c, *a, **kw: (sizes.append(len(c)), real(kit, c, *a, **kw))[1])
+    x = Modeller._live_kernel_draw(m, prior.fd_state[rows].repeat_interleave(K, 0),
+                                   torch.arange(B).repeat_interleave(K).numpy(), repeats=K)
+    assert sizes == [B] and x.shape[0] == B * K and m._physical['rows'] == B
+    tiles = x.reshape(B, K, -1)
+    assert torch.equal(tiles[:, 0], tiles[:, 1]) and torch.equal(tiles[:, 0], tiles[:, 2])
+    assert len(torch.unique(tiles[:, 0], dim=0)) == B                    # the terminals themselves are different points
+    with pytest.raises(ValueError, match='tiles per terminal'):
+        Modeller._live_kernel_draw(m, prior.fd_state[rows], torch.arange(B).numpy(), repeats=K)
+
+
+def test_draw_bwd_sample_hands_its_repeats_to_the_kernel():
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def stop(latents, inds, mol_batch, repeats=1):
+        seen['repeats'] = repeats
+        raise Stop
+    rows = SimpleNamespace(loader=lambda **kw: iter([(SimpleNamespace(), [0, 0])]))
+    m = SimpleNamespace(row_store=None, bwd_sampling_mode='dataset', prior_dataset=rows, batch_size=1, device='cpu',
+                        _batch_latents=lambda b: torch.zeros(2, 3), _noised_prior_settings=dict(live_kernel='physical'),
+                        _live_kernel_draw=stop)
+    with pytest.raises(Stop):
+        Modeller.draw_bwd_sample(m, 2)
+    assert seen['repeats'] == 2
+
+
+@pytest.mark.parametrize('redraws', [0, 4])
+def test_the_draw_count_reaching_the_kick_is_one_plus_the_redraws(layout, kits, monkeypatch, redraws):
+    prior, kinds = _prior(layout, kits)
+    m = _trainer(layout, prior, redraws=redraws)
+    _, rows = _load(m, prior, kinds)
+    tries = []
+    real = PK.kick
+
+    def spy(kit, c, s, r, g, lo, hi, n, *a, **kw):
+        tries.append(n)
+        return real(kit, c, s, r, g, lo, hi, n, *a, **kw)
+    monkeypatch.setattr(PK, 'kick', spy)
+    x = Modeller._physical_kernel_draw(m, prior.fd_state[rows], torch.arange(len(rows)).numpy())
+    assert tries == [1 + redraws]
+    assert bool((x != prior.fd_state[prior.noised_parent[rows]]).any(1).all())      # every row was kicked
+
+
+def test_the_parent_table_holds_each_anchor_s_radius_of_gyration(layout, kits):
+    prior, kinds = _prior(layout, kits)
+    m = _trainer(layout, prior)
+    _, rows = _load(m, prior, kinds)
+    parents = torch.unique(prior.noised_parent[rows])
+    want = noised_prior.radius_of_gyration(prior).float()[parents]
+    assert torch.allclose(m._physical['rg'], want)
+    assert not torch.allclose(m._physical['rg'], m._physical['radius'])  # r_g is not the molecule radius
+
+
+def test_a_parent_that_is_a_child_is_refused(layout, kits):
+    prior, kinds = _prior(layout, kits)
+    prior.noised_parent = prior.noised_parent.clone()
+    prior.noised_parent[3] = 2                                           # row 2 is a child of the same group
+    with pytest.raises(ValueError, match='not an anchor'):
+        _load(_trainer(layout, prior), prior, kinds)
+
+
+def test_a_parent_of_another_molecule_radius_is_refused(layout, kits):
+    prior, kinds = _prior(layout, kits)
+    prior.radius = prior.radius.clone()
+    prior.radius[0] = 4.1                                                # the anchor of children 2 and 3
+    with pytest.raises(ValueError, match='molecule radius'):
+        _load(_trainer(layout, prior), prior, kinds)
+
+
+class _Rows(SimpleNamespace):
+    def to(self, device):
+        return self
+
+
+def _load_setup(layout, kits, monkeypatch, train=None):
+    """A Modeller on the fixture prior with the steps of _load_noised_prior around the selection stubbed."""
+    prior, kinds = _prior(layout, kits)
+    n = len(kinds)
+    prior.packing_coeff, prior.noised_split = torch.full((n,), 0.7), torch.zeros(n, dtype=torch.long)
+    prior.subsample_new_batch = lambda idx: _Rows(fd_state=prior.fd_state[idx.cpu()], num_graphs=len(idx))
+    train = kinds == noised_prior.KIND_CHILD if train is None else train
+    masks = dict(train=train, heldout=torch.zeros(n, dtype=torch.bool), anchors=kinds == noised_prior.KIND_ANCHOR,
+                 buffer=kinds == noised_prior.KIND_CHILD)
+    for name, fn in dict(identity_mismatch=lambda *a: [], identity=lambda *a: {},
+                         check_rows=lambda *a, **k: np.arange(4), compare_terms=lambda *a: (0.0, 0.0, {}),
+                         condition_groups=lambda p: torch.zeros(n, dtype=torch.long),
+                         window_energy=lambda *a, **k: torch.zeros(n, dtype=F64),
+                         select_rows=lambda *a, **k: (masks, None)).items():
+        monkeypatch.setattr(noised_prior, name, fn)
+    m = Modeller.__new__(Modeller)
+    m.device = 'cpu'
+    m.energy_function = SimpleNamespace(fd_layout=layout, crystal_coordinates='fd')
+    m.args = SimpleNamespace(energy_config=SimpleNamespace(temperature=2.5), prior_path='p.pt', seed=0,
+                             energy_function='elj', noised_prior=dict(live_kernel='physical', live_log_range=[-3.0, -3.0]))
+    m._fd_chart_points_cached = lambda p, path: (torch.ones(n, dtype=torch.bool), None, None)
+    m._attach_fd_reference = lambda p, points: points[0]
+    m._score_prior_rows = lambda b, announce=False: (None, None)
+    m._stored_reward_terms = lambda p: (torch.zeros(n, dtype=F64), torch.zeros(n, dtype=F64))
+    return m, prior, kinds, dict(format_version=noised_prior.FORMAT_VERSION, identity={})
+
+
+def test_the_load_builds_the_parent_table_and_drops_rows_without_a_centre(layout, kits, monkeypatch):
+    m, prior, kinds, manifest = _load_setup(layout, kits, monkeypatch)
+    fd_ok = torch.ones(len(kinds), dtype=torch.bool)
+    fd_ok[0] = False                                                     # an anchor with two children in the rows
+    m._fd_chart_points_cached = lambda p, path: (fd_ok, None, None)
+    energy, batch = Modeller._load_noised_prior(m, prior, manifest)
+    children = int((kinds == noised_prior.KIND_CHILD).sum())
+    assert m._physical['no_parent'] == 2 and m._physical['n_rows'] == children - 2
+    assert len(energy) == batch.num_graphs == children - 2
+
+
+def test_an_empty_selection_is_reported_as_the_selection(layout, kits, monkeypatch):
+    m, prior, kinds, manifest = _load_setup(layout, kits, monkeypatch, train=torch.zeros(24, dtype=torch.bool))
+    with pytest.raises(ValueError, match='no row survives the load-time selection'):
+        Modeller._load_noised_prior(m, prior, manifest)
+
+
+def test_a_prior_that_is_not_a_build_is_refused():
+    args = SimpleNamespace(energy_config=SimpleNamespace(temperature=2.5), prior_path='p.pt',
+                           noised_prior=dict(live_kernel='physical'))
+    m = SimpleNamespace(args=args, NOISED_PRIOR_RECORD=Modeller.NOISED_PRIOR_RECORD)
+    with pytest.raises(ValueError, match='needs a pre-noised prior'):
+        Modeller._noised_prior_record(m, None)
+    args.noised_prior = dict(live_kernel='chart')                        # the other kernels keep their behaviour
+    assert Modeller._noised_prior_record(m, None) == {'data/prior_prenoised': 0}
+
+
+def test_the_inn_route_refuses_the_kernel():
+    from inn_modeller import InnModeller
+    args = SimpleNamespace(noised_prior=dict(live_kernel='physical'))
+    with pytest.raises(ValueError, match='never calls'):
+        InnModeller.check_buffer_options(SimpleNamespace(inn=SimpleNamespace(), args=args))
+
+
+def test_a_run_gone_to_the_full_route_is_told_once(layout, kits, monkeypatch, capsys):
+    prior, kinds = _prior(layout, kits)
+    m = _trainer(layout, prior)
+    _, rows = _load(m, prior, kinds)
+    capsys.readouterr()
+    monkeypatch.setattr(PK, 'FULL_ROUTE_WARN_ROWS', 2 * len(rows))
+    draw = lambda: Modeller._physical_kernel_draw(m, prior.fd_state[rows], torch.arange(len(rows)).numpy())
+    draw()
+    assert 'WARNING' not in capsys.readouterr().out                      # healthy, and below the row count
+    m._physical.update(rows=0, full_route=0)
+    monkeypatch.setattr(PK, 'certified_chart', lambda kit, c, t, R, r: (
+        torch.full((len(c), kit.d), float('nan'), dtype=F64), torch.full((len(c),), -1, dtype=torch.int8)))
+    draw()
+    assert 'WARNING' not in capsys.readouterr().out                      # below the row count
+    draw()
+    assert capsys.readouterr().out.count('took the full canonicaliser') == 1
+    draw()
+    assert 'WARNING' not in capsys.readouterr().out
+
+
+def test_settings_the_kernel_does_not_read_are_printed_at_load(layout, kits, capsys):
+    prior, kinds = _prior(layout, kits)
+    m = _trainer(layout, prior)
+    m._noised_prior_settings = {**noised_prior.DEFAULTS, 'live_kernel': 'physical', 'live_log_range': (-3.0, -3.0),
+                                'live_tau': 7.0, 'live_bank': 1024, 'live_caps': [1.0, 0.2, 0.1, 0.5]}
+    _load(m, prior, kinds)
+    assert "not read by this kernel: {'live_tau': 7.0, 'live_bank': 1024}" in capsys.readouterr().out
+
+
+def _physical_mk_dev():
+    cfg = yaml.safe_load(open(MK_DEV, encoding='utf-8'))
+    cfg['noised_prior']['live_kernel'] = 'physical'
+    return cfg
+
+
+def _rule_hits(cfg):
+    return [v.detail for v in ci.check(cfg) if v.rule == 'physical_kernel_is_reward_free']
+
+
+@pytest.mark.parametrize('term, branch', [('tb', 'bwd'), ('subtb', 'bwd'), (ci.CROSS_BRANCH_VARGRAD_COEFF, 'fwd')])
+def test_a_later_dataset_stage_that_reads_log_r_is_refused_at_load(term, branch):
+    """The rule on the raw config, and the trainer's raise at step 0 on a stage it has not reached."""
+    from energy_sampling.protocol import StageProtocol
+    from energy_sampling.utils import dict2namespace
+    cfg = _physical_mk_dev()
+    assert not _rule_hits(cfg)
+    stages = cfg[ci.PROTOCOL_LIBRARY][cfg[ci.PROTOCOL_SELECTOR]]['stages']
+    later = copy.deepcopy(stages[0])
+    assert later['bwd_sampling_mode'] == 'dataset'
+    later['name'] = 'later_dataset'
+    later.setdefault('loss_coeffs', {}).setdefault(branch, {})[term] = 1.0
+    stages.insert(1, later)
+    hit = _rule_hits(cfg)
+    assert len(hit) == 1 and 'later_dataset' in hit[0] and term in hit[0]
+    m = SimpleNamespace(args=dict2namespace(copy.deepcopy(cfg)), gfn_model=SimpleNamespace(), stage=None,
+                        _warn_if_z_untrained=lambda: None)
+    m.protocol = StageProtocol(m)
+    with pytest.raises(ValueError, match='later_dataset'):
+        MethodType(Modeller.set_loss_coeffs, m)()
+
+
+def test_the_rule_ignores_a_reward_reading_stage_of_another_source_or_kernel():
+    cfg = _physical_mk_dev()
+    stages = cfg[ci.PROTOCOL_LIBRARY][cfg[ci.PROTOCOL_SELECTOR]]['stages']
+    later = copy.deepcopy(stages[0])
+    later.update(name='later_prior', bwd_sampling_mode='prior')
+    later.setdefault('loss_coeffs', {}).setdefault('bwd', {})['tb'] = 1.0
+    stages.insert(1, later)
+    assert not _rule_hits(cfg)
+    later['bwd_sampling_mode'] = 'dataset'
+    cfg['noised_prior']['live_kernel'] = 'chart'
+    assert not _rule_hits(cfg)
+
+
+def test_the_miner_lists_the_canonicaliser_s_choices_and_they_make_an_accepted_table(layout):
+    from data_processing.mine_basis_tables import IDENTITY, literal, mine
+    bare = PK.group_kit(14, layout.slots[14], table=(IDENTITY,))
+    u, radius, rg = _anchors(bare, 300, seed=41)
+    entries = mine(bare, 2 * u - 1, radius, rg, 4000, -2.0, -0.375, seed=3)
+    table = [n for n, _ in entries]
+    assert table[0] == IDENTITY and len(set(table)) == len(table) > 1
+    assert sum(c for _, c in entries) > 3900
+    assert [c for _, c in entries[1:]] == sorted((c for _, c in entries[1:]), reverse=True)
+    N = torch.tensor(table, dtype=F64).reshape(-1, 3, 3)
+    assert bool((torch.linalg.det(N).abs().round() == 1).all())
+    assert eval(literal(14, entries).strip().split(': ', 1)[1].rstrip(',')) == tuple(table)
+    k = PK.group_kit(14, layout.slots[14], table=table)
+    cell, t, R = PK.decode(k, u, radius)
+    st = PK.draw_step(k, len(u), -2.0, -0.375, torch.Generator().manual_seed(4))
+    c2, t2, R2 = PK.apply_step(st, cell, t, R, rg, PK.t_fc(cell))
+    yes, no, rest = _check_against_full_route(k, c2, t2, R2, radius)
+    assert yes > 0.9 * len(u), (yes, no, rest)

@@ -1276,6 +1276,8 @@ class Modeller:
         s = self._noised_prior_settings
         if fd_ok is None:
             raise ValueError("noised_prior.live_kernel 'physical' needs energy_config.crystal_coordinates 'fd'")
+        if not bool(keep.any()):   # no parent to judge: _load_noised_prior raises, naming the selection
+            return keep
         rng = s['live_log_range']
         if rng is None:
             if manifest.get('child_kernel') != 'metric':
@@ -1315,6 +1317,10 @@ class Modeller:
               f"{len(kept)} rows over {len(uniq)} parent anchors in space groups {sorted(kits)}; {n_lost} kept rows "
               f"({n_lost / (len(kept) + n_lost):.2%}) left out of the MLE draw, their parent anchor having no chart "
               f"point", flush=True)
+        unread = noised_prior.physical_unread_settings(s)
+        if unread:
+            print(f"live kernel 'physical': these noised_prior settings are not read by this kernel: {unread}",
+                  flush=True)
         return keep
 
     def _physical_kernel_table(self):
@@ -1328,20 +1334,34 @@ class Modeller:
             raise ValueError("noised_prior.live_kernel 'physical': the parent table is not aligned with prior_dataset")
         return True
 
-    def _physical_kernel_draw(self, latents, inds, mol_batch=None):
+    def _physical_kernel_draw(self, latents, inds, mol_batch=None, repeats=1):
         """noised_prior.live_kernel 'physical' on the rows `inds`: a fresh kick of each row's parent anchor
         (physical_kick.kick, on the CPU), returned on the latents' device and dtype. MLE only: the row's stored energy
-        is not the kicked point's, so a draw that reads log R raises."""
+        is not the kicked point's, so a draw that reads log R raises. `inds` holds each terminal `repeats` times in a
+        row (buffer.py::_sample_indices): it takes one kick, copied to its tiles, because terminal_mle's 'exact'
+        estimator reads the tiles as backward paths to one terminal."""
         if not self._bwd_draw_is_reward_free():
             raise ValueError("noised_prior.live_kernel 'physical' draws unscored points: it needs a reward-free MLE "
                              "stage")
         K = self._physical
-        p = K['parent'][torch.as_tensor(inds).long().flatten().cpu()]
+        rows = torch.as_tensor(inds).long().flatten().cpu()
+        tiles = max(1, int(repeats))
+        terminals = rows[::tiles]
+        if not torch.equal(terminals.repeat_interleave(tiles), rows):
+            raise ValueError(f"noised_prior.live_kernel 'physical': the drawn rows are not {tiles} tiles per terminal")
+        p = K['parent'][terminals]
         x, counts = physical_kick.kick(K['kits'], K['centre'][p], K['sg'][p], K['radius'][p], K['rg'][p], K['lo'], K['hi'],
                                        1 + int(self._noised_prior_settings['live_redraws']))
         for name, v in counts.items():
             K[name] += v
-        return x.to(latents)
+        if (not K.get('warned') and K['rows'] >= physical_kick.FULL_ROUTE_WARN_ROWS
+                and K['full_route'] > physical_kick.FULL_ROUTE_WARN_SHARE * K['rows']):
+            K['warned'] = True
+            print(f"WARNING: live kernel 'physical': {K['full_route'] / K['rows']:.1%} of the {K['rows']} rows drawn so "
+                  f"far took the full canonicaliser (bound {physical_kick.FULL_ROUTE_WARN_SHARE:.0%}). The draws stay "
+                  f"correct but each costs far more: check physical_kick.BASIS_TABLES against the reduction walls",
+                  flush=True)
+        return x.repeat_interleave(tiles, 0).to(latents)
 
     def _basin_kernel_draw(self, latents, inds, mol_batch):
         """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
@@ -1365,7 +1385,7 @@ class Modeller:
             B['bank'][rows[pick], slot[pick]] = fresh
         return out.to(latents)
 
-    def _live_kernel_draw(self, latents, inds, mol_batch=None):
+    def _live_kernel_draw(self, latents, inds, mol_batch=None, repeats=1):
         """noised_prior.live_kernel: each drawn row moved by L z in its live chart rows, z standard normal; wrapped
         rows folded onto their period, every other live row reflected into [-1, 1] (a stand-in for re-canonicalising
         across a face); dead rows untouched. 'basin' draws in cell parameters instead (_basin_kernel_draw)."""
@@ -1374,7 +1394,7 @@ class Modeller:
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'chart':
             return self._chart_kernel_draw(latents, inds, mol_batch)
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'physical':
-            return self._physical_kernel_draw(latents, inds, mol_batch)
+            return self._physical_kernel_draw(latents, inds, mol_batch, repeats)
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') in ('basin', 'metric'):
             return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
@@ -2769,7 +2789,7 @@ class Modeller:
         # The aligned per-condition draw (stage.condition_draw) and the rollout
         # condition draw (condition_log_z.rollout_condition_draw) are refused the
         # same way, on the same resolved config.
-        from config_invariants import (replay_seat_problems, condition_draw_problems,
+        from config_invariants import (replay_seat_problems, condition_draw_problems, physical_kernel_problems,
                                        rollout_condition_draw_problems, _member)
 
         def _glob(dotted):
@@ -2787,7 +2807,8 @@ class Modeller:
             _coeff = (lambda mode, key, _st=_st: _st.loss_coeffs.get(mode, {}).get(
                 key, self.protocol.base_coeffs(mode).get(key)))
             problems = (replay_seat_problems(_st, _coeff, _glob)
-                        + condition_draw_problems(_st, _coeff, _glob))
+                        + condition_draw_problems(_st, _coeff, _glob)
+                        + physical_kernel_problems(_st, _coeff, _glob))
             if problems:
                 raise ValueError(f"stage '{_st.name}': " + ' '.join(problems))
 
@@ -4915,9 +4936,13 @@ class Modeller:
         noised_prior.MANIFEST_KEY (manifest not None), else 0; for a build, the manifest entries of NOISED_PRIOR_RECORD
         it holds. cfg:noised_prior is read through noised_prior.settings for every prior, so an unknown key raises on
         either kind; on a prior that is not a build a present block prints that it is inert. A build whose manifest
-        temperature differs from energy_config.temperature prints a warning."""
-        noised_prior.settings(self.args)
+        temperature differs from energy_config.temperature prints a warning. live_kernel 'physical' on a prior that is
+        not a build raises: _load_noised_prior would never run, and MLE would train on the stored rows with no kick."""
+        s = noised_prior.settings(self.args)
         if manifest is None:
+            if s['live_kernel'] == 'physical':
+                raise ValueError(f"noised_prior.live_kernel 'physical' needs a pre-noised prior: {self.args.prior_path} "
+                                 f"has no noised manifest, so no draw would be kicked")
             if getattr(self.args, 'noised_prior', None) is not None:
                 print("noised_prior block inert: prior_path is not a pre-noised build", flush=True)
             return {'data/prior_prenoised': 0}
@@ -8681,7 +8706,7 @@ class Modeller:
             self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(len(inds))
             if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
                 # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
-                latents = self._live_kernel_draw(latents, inds, mol_batch)
+                latents = self._live_kernel_draw(latents, inds, mol_batch, repeats=repeats)
 
         elif self.bwd_sampling_mode == 'prior':
             # condition-blocked draws (C conditions x up to M distinct terminals

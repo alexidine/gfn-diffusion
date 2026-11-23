@@ -2105,6 +2105,48 @@ def _coeff_raw(cfg: dict, stage: dict, mode: str, key: str):
     return _get(cfg, f'{mode}_loss_coeffs.{key}')
 
 
+#: the backward-branch terms that read log R; every other term (mle) reads only log P_F / log P_B
+BWD_REWARD_TERMS = ('tb', 'tbc', 'vg_lb', 'vg_lme', 'emp_z', 'emp_z_persistent', 'pf_boost', 'level_gap', 'db',
+                    'subtb')
+
+
+def physical_kernel_problems(stage, coeff, glob) -> list[str]:
+    """noised_prior.live_kernel 'physical' draws unscored points, so a stage that takes its backward rows from the
+    dataset must read no log R: no term of BWD_REWARD_TERMS above 0 and no pooled stash (the two readings of
+    Modeller._bwd_draw_is_reward_free, which raises at that stage's first draw). Over getters, as replay_seat_problems,
+    so this rule and the refusal in Modeller.set_loss_coeffs share one implementation."""
+    if glob('noised_prior.live_kernel') != 'physical' or stage.bwd_sampling_mode != 'dataset':
+        return []
+    out = []
+    terms = [k for k in BWD_REWARD_TERMS if (_num(coeff('bwd', k)) or 0.0) > 0]
+    if terms:
+        out.append(f"noised_prior.live_kernel 'physical' on a bwd_sampling_mode 'dataset' stage with bwd {terms} > 0: "
+                   f"these terms read log R and the kernel's draws are unscored.")
+    if (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0:
+        out.append(f"noised_prior.live_kernel 'physical' on a bwd_sampling_mode 'dataset' stage with fwd "
+                   f"{CROSS_BRANCH_VARGRAD_COEFF} > 0: the pooled term reads the backward rows' log R and the "
+                   f"kernel's draws are unscored.")
+    return out
+
+
+def physical_kernel_is_reward_free(cfg: dict) -> list[Violation]:
+    """The audit-path twin of the refusal in Modeller.set_loss_coeffs: physical_kernel_problems on every active stage. A
+    stage that does not parse is skipped here; every_protocol_parses reports it."""
+    from protocol import Stage           # local: protocol imports this module back
+    out = []
+    for i, st in enumerate(active_stages(cfg)):
+        if not isinstance(st, dict):
+            continue
+        try:
+            parsed = Stage(st, i)
+        except Exception:
+            continue
+        for msg in physical_kernel_problems(parsed, lambda mode, key, st=st: _coeff_raw(cfg, st, mode, key),
+                                            lambda dotted: _get(cfg, dotted)):
+            out.append(Violation(ERROR, 'physical_kernel_is_reward_free', f"stage '{parsed.name}': {msg}"))
+    return out
+
+
 def replay_seat_is_well_formed(cfg: dict) -> list[Violation]:
     """The audit-path twin of Modeller.set_loss_coeffs' refusal: every active
     stage's replay-seat keys against the resolved config (replay_seat_problems).
@@ -2880,6 +2922,7 @@ RULES = (
     z_fill_mode_is_well_formed,
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
+    physical_kernel_is_reward_free,
     tb_z_source_is_known,
     static_prior_buffer_is_seeded,
     condition_draw_is_well_formed,

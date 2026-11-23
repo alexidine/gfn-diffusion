@@ -1122,6 +1122,18 @@ def test_condition_draws_are_judged_on_the_resolved_config(canonical):
     assert not _fires(canonical, 'condition_draw_is_well_formed')
 
 
+def test_the_physical_kernel_reads_no_log_r_on_a_dataset_stage(canonical):
+    """The full case table is tests/crystal/test_physical_kernel.py; this is the rule's mutation test in the registry's
+    own file."""
+    cfg = broken(canonical, noised_prior__live_kernel='physical')
+    assert not _fires(cfg, 'physical_kernel_is_reward_free')
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages'] if s.get('bwd_sampling_mode') == 'dataset')
+    stage.setdefault('loss_coeffs', {}).setdefault('bwd', {})['tb'] = 1.0
+    assert _fires(cfg, 'physical_kernel_is_reward_free')
+    cfg['noised_prior']['live_kernel'] = 'chart'
+    assert not _fires(cfg, 'physical_kernel_is_reward_free')
+
+
 def test_a_global_untrusted_z_without_an_energy_reference_is_an_error(canonical):
     # one all-condition level only stands in for conditions whose depth was removed
     cfg = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference=None)

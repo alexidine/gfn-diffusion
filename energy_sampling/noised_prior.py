@@ -50,6 +50,8 @@ WINDOW_BY = ('row', 'parent')
 LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart', 'physical')
 #: the live kernels that read live_log_range
 LOG_RANGE_KERNELS = ('chart', 'physical')
+#: the live_kernel keys the 'physical' kernel does not read: its step is metric_kick's, with no bank
+PHYSICAL_UNREAD_KEYS = ('live_tau', 'live_width_cap', 'live_caps', 'live_bank', 'live_fresh_frac')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
 
@@ -168,6 +170,13 @@ def settings(args):
             raise ValueError(f"noised_prior.live_log_range must be [log10 lo, log10 hi] in Angstrom with lo <= hi, got "
                              f"{rng!r}")
     return s
+
+
+def physical_unread_settings(s) -> dict:
+    """{key: value} of the keys of PHYSICAL_UNREAD_KEYS set away from DEFAULTS in the settings `s`. Reported at load, not
+    refused: configs/mk_dev.yaml's block sets live_bank and live_fresh_frac for the 'basin' kernel."""
+    plain = lambda v: list(v) if isinstance(v, (list, tuple)) else v
+    return {k: s[k] for k in PHYSICAL_UNREAD_KEYS if plain(s[k]) != plain(DEFAULTS[k])}
 
 
 def _metric_projector(lattice_codes, dtype, device):

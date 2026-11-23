@@ -62,6 +62,7 @@ from data_processing.molecule_subset import keep_molecules
 from energies.prior_flow import _Block, _Flow, _MADE, _rq_spline, _wrap, invert_block, rq_spline_inverse
 from energy_sampling.eval.evaluations import (FUNNEL_MAX_POINTS, boltzmann_fig, flow_parity_plot, vargrad_error,
                                               xy_scatter_plot)
+from energy_sampling import noised_prior
 from energy_sampling.eval.xcond import xcond_metrics
 from gflownet_losses import update_and_lookup_condition_log_z, update_condition_best_energy, winsorized_z_root
 from models.gfn import GFN
@@ -805,6 +806,9 @@ class InnModeller(Modeller):
         """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on.
         On this route both stages read the buffer: stage 1 fits its rows, stage 2 trains on them as stored rows."""
         inn, args = self.inn, self.args
+        if noised_prior.settings(args)['live_kernel'] == 'physical':
+            raise ValueError("noised_prior.live_kernel 'physical' is drawn by Modeller.draw_bwd_sample, which this "
+                             "route never calls: the key would have no effect")
         acfg = args.buffers.anchor_buffer
         tile = getattr(acfg, 'tile', 'iso')
         self.pbuf_on = inn.stored_source == 'buffer'

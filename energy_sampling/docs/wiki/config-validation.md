@@ -1,6 +1,6 @@
 # Config validation
 
-*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the ten `conformer_*` rule rows and the paragraph after the rule table re-verified on 2026-09-26 against commit `5f4828d` plus uncommitted working-tree changes that are in no commit yet. Sources at the end.*
+*Drift: **C** (code-bound). Verified against commit `a637e70`, 2026-09-20; the ten `conformer_*` rule rows and the paragraph after the rule table re-verified on 2026-09-26 against commit `5f4828d` plus uncommitted working-tree changes that are in no commit yet; the `physical_kernel_is_reward_free` row written 2026-11-22 against commit `347921b6` plus the change that adds it. Sources at the end.*
 
 A run is a YAML file. `utils.py::get_train_args` takes one named argument, `--config PATH`, and returns `resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))`; nothing else in `train.py` reads the file. Between the text on disk and the object the trainer holds, the nested dicts become an `argparse.Namespace` tree, the config is refused if it carries a retired key or a stale state stamp, and values written `auto` become numbers. This page covers those gates, the rules that report without gating, and the versioning that repairs an old file.
 
@@ -73,6 +73,7 @@ The rules in `config_invariants.py::RULES`, each against the config relation it 
 | `z_fill_mode_is_well_formed` | a malformed fill mode, variance, reset or `fill_from_eval` |
 | `batch_root_forward_is_well_formed` | `tb_z_source: batch_root` on bwd or replay, with no cadence, or with the forward policy frozen |
 | `replay_seat_is_well_formed` | the replay-seat keys, an audit twin of `Modeller.set_loss_coeffs` |
+| `physical_kernel_is_reward_free` | `cfg:noised_prior.live_kernel` `'physical'` on a `bwd_sampling_mode` `'dataset'` stage that reads log R, an audit twin of `Modeller.set_loss_coeffs` |
 | `condition_draw_is_well_formed` | the two condition draws, likewise |
 | `row_store_is_well_formed` | an enabled `cfg:buffers.store` off `model.kind` nf or beside a setting it does not serve, an unknown or malformed store key; `records_kept` null (BASELINE). `train.py::Modeller.init_row_store` raises on its ERRORs ([row-store](row-store.md)) |
 | `crystal_prior_model_is_retired` | off the conformer route: a non-null `cfg:prior_model_name`; `cfg:buffers.prior_buffer.source` other than `anchors`, absence included (code default `prior_model`); `skip_if: prior_loaded` or a `snapshot_prior` action in an active stage |

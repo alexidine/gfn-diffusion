@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.utils import collate_data_list
 from buffer import N_FORCE_LEGS
+from config_invariants import BWD_REWARD_TERMS
 from protocol import POOLED_CENTERS, HEAD_CENTERS
 from utils import compute_sample_overlap
 
@@ -860,11 +861,6 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, crystal_batch.cpu().detach(), loss_dict
     else:
         return loss, loss_dict
-
-
-#: the backward-branch terms that read log R; every other term (mle) reads only log P_F / log P_B
-BWD_REWARD_TERMS = ('tb', 'tbc', 'vg_lb', 'vg_lme', 'emp_z', 'emp_z_persistent', 'pf_boost', 'level_gap', 'db',
-                    'subtb')
 
 
 def bwd_loss_reads_reward(loss_coeffs) -> bool:
