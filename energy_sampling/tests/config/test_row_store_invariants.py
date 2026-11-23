@@ -35,7 +35,7 @@ def _on(mk_dev):
     for st in stages:
         st['max_steps'] = 100
         for hook in ('on_enter', 'on_exit'):
-            st[hook] = [a for a in st.get(hook) or [] if a.split(':')[0] not in ci.ROW_STORE_REFUSED_ACTIONS]
+            st[hook] = [a for a in st.get(hook) or [] if not ci.row_store_refuses_action(a)]
     cfg['epochs'] = 100 * len(stages) + ci.ROW_STORE_STAGE_MARGIN * len(stages)
     return cfg
 
@@ -209,6 +209,9 @@ STAGE_REFUSALS = [
     ('lr_sensor ray', lambda s: s.update(lr_sensor={'kind': 'ray'}), 'ray'),
     ('z_pin', lambda s: s.update(z_pin_rollout_every=5), 'z_pin_rollout_every'),
     ('prior action', lambda s: s.update(on_enter=['reseed_prior_from_dataset']), 'reseed_prior_from_dataset'),
+    ('bare bootstrap_z', lambda s: s.update(on_enter=['bootstrap_z']), 'bootstrap_z:offset'),
+    ('bootstrap_z rollout', lambda s: s.update(on_enter=['bootstrap_z:rollout:4000']), 'bootstrap_z:offset'),
+    ('bootstrap_z conditioner', lambda s: s.update(on_exit=['bootstrap_z:train_conditioner']), 'bootstrap_z:offset'),
     ('no max_steps', lambda s: s.pop('max_steps'), 'max_steps'),
 ]
 
@@ -268,3 +271,10 @@ def test_settings_read_the_trainer_namespace(mk_dev):
     ns = SimpleNamespace(buffers=SimpleNamespace(store=SimpleNamespace(enabled=True, bar=2.0)))
     s = ci.row_store_settings(ns)
     assert s['bar'] == 2.0 and s['kappa'] == ci.ROW_STORE_DEFAULTS['kappa']
+
+
+@pytest.mark.parametrize('action', ['bootstrap_z:offset', 'bootstrap_z:offset:500'])
+def test_the_offset_bootstrap_is_allowed(mk_dev, action):
+    cfg = _on(mk_dev)
+    _stage(cfg).update(on_enter=[action])
+    assert not any('bootstrap_z' in m for m in _msgs(cfg)), _msgs(cfg)

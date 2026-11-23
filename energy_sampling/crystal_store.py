@@ -74,6 +74,7 @@ _SEED_MUTABLE = ('log_q', 'q_step', 'resid', 'draws')   # the only columns of a 
 _SEED_EXACT = ('cid', 'kind', 'flags', 'origin', 'parent', 'birth_step')     # seed-row columns hashed byte for byte
 _SEED_CLOSE_TABLES = ('cond_radius', 'cond_rg', 'window_floor')             # compared within the tolerances below
 SEED_CLOSE_RTOL, SEED_CLOSE_ATOL = 1e-4, 1e-3   # per-condition means of x, log_r, energy and the tables above
+_STAMP_CLOSE = ('energy_clip', 'energy_reference_table')    # stamp entries recomputed at launch, read within the same
 _DIGEST_CHUNK = 2 ** 20
 
 
@@ -96,13 +97,27 @@ def _blank_stat(t, k):
     return torch.full(shape, math.nan, dtype=t.dtype) if t.is_floating_point() else torch.zeros(shape, dtype=t.dtype)
 
 
+def _stamp_close(a, b):
+    """Two values of a _STAMP_CLOSE key agree entrywise within SEED_CLOSE_RTOL and SEED_CLOSE_ATOL; None matches only
+    None."""
+    if a is None or b is None:
+        return a is None and b is None
+    a, b = torch.as_tensor(a, dtype=torch.float64).flatten(), torch.as_tensor(b, dtype=torch.float64).flatten()
+    return a.shape == b.shape and bool(torch.isclose(a, b, rtol=SEED_CLOSE_RTOL, atol=SEED_CLOSE_ATOL,
+                                                     equal_nan=True).all())
+
+
 def stamp_diff(a, b):
-    """The top-level keys on which two stamps differ. Tuples read as lists and NaN equals NaN."""
+    """The top-level keys on which two stamps differ. Tuples read as lists and NaN equals NaN. The _STAMP_CLOSE keys are
+    recomputed from the rows at each launch, so they are compared within the seed digest's tolerances."""
     def canon(v):
         return json.dumps(v, sort_keys=True, default=str)
     if not (isinstance(a, dict) and isinstance(b, dict)):
         return [] if canon(a) == canon(b) else ['<whole stamp>']
-    return sorted(k for k in set(a) | set(b) if canon(a.get(k)) != canon(b.get(k)))
+
+    def same(k):
+        return _stamp_close(a.get(k), b.get(k)) if k in _STAMP_CLOSE else canon(a.get(k)) == canon(b.get(k))
+    return sorted(k for k in set(a) | set(b) if not same(k))
 
 
 def _ragged(starts, lens):

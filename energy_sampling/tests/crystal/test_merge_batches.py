@@ -15,7 +15,7 @@ import pytest
 import torch
 
 import utils
-from energies.molecular_crystal import MolecularCrystal, merge_batches
+from energies.molecular_crystal import OOM_RECOVERY_KEEP_CACHE, MolecularCrystal, merge_batches
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 
@@ -128,3 +128,48 @@ def test_the_chunked_pass_returns_what_one_call_returns(capsys):
     torch.testing.assert_close(e_chunk, e_one.detach().cpu(), equal_nan=True)
     assert list(b_chunk.identifier) == list(b_one.identifier) == [f'mol-{i}' for i in range(n)]
     torch.testing.assert_close(b_chunk.gfn_energy, b_one.gfn_energy.detach().cpu(), equal_nan=True)
+
+
+@pytest.mark.parametrize('recovery,flushes', [(True, 1), (OOM_RECOVERY_KEEP_CACHE, 0)], ids=['True', 'keep_cache'])
+def test_the_end_of_call_flush_is_the_callers_choice(monkeypatch, capsys, recovery, flushes):
+    ef = _energy_function()
+    capsys.readouterr()
+    n = 5
+    mols = collate_data_list([_molecule(i) for i in range(n)])
+    calls, count = [], {'empty': 0, 'sync': 0}
+
+    def fake_analyze(x, mol_batch, temperature, return_batch=False, keep_grads=False):
+        calls.append(mol_batch.num_graphs)
+        return torch.zeros(mol_batch.num_graphs), _with_tables(mol_batch.subsample_new_batch(
+            list(range(mol_batch.num_graphs))))
+    monkeypatch.setattr(ef, 'analyze_crystal_batch', fake_analyze)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda *a, **k: count.__setitem__('empty', count['empty'] + 1))
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda *a, **k: count.__setitem__('sync', count['sync'] + 1))
+    ef.batch_size = 2
+    ef.batched_analyze_crystal_batch(torch.zeros(n, 12), mols, torch.full((n,), 2.5), return_batch=True,
+                                     internal_oom_recovery=recovery)
+    assert sum(calls) == n and len(calls) > 1
+    assert count == {'empty': flushes, 'sync': flushes}
+
+
+def test_keep_cache_still_recovers_from_an_oom(monkeypatch, capsys):
+    ef = _energy_function()
+    capsys.readouterr()
+    n = 5
+    mols = collate_data_list([_molecule(i) for i in range(n)])
+    calls, empties = [], []
+
+    def fake_analyze(x, mol_batch, temperature, return_batch=False, keep_grads=False):
+        calls.append(mol_batch.num_graphs)
+        if len(calls) == 1:
+            raise RuntimeError('CUDA out of memory (simulated)')
+        return torch.zeros(mol_batch.num_graphs), _with_tables(mol_batch.subsample_new_batch(
+            list(range(mol_batch.num_graphs))))
+    monkeypatch.setattr(ef, 'analyze_crystal_batch', fake_analyze)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda *a, **k: empties.append(1))
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda *a, **k: None)
+    ef.batch_size = 4
+    _, out = ef.batched_analyze_crystal_batch(torch.zeros(n, 12), mols, torch.full((n,), 2.5), return_batch=True,
+                                              internal_oom_recovery=OOM_RECOVERY_KEEP_CACHE)
+    assert out.num_graphs == n and calls[0] == 4 and ef.batch_size < 4 and len(empties) == 1

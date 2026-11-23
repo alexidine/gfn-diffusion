@@ -1294,7 +1294,7 @@ def test_an_nf_policy_refuses_sde_only_settings(canonical):
 def test_a_row_store_off_the_nf_route_is_an_error(canonical):
     """buffers.store enabled under model.kind sde refuses; under nf it passes. Full coverage:
     tests/config/test_row_store_invariants.py."""
-    from config_invariants import ROW_STORE_REFUSED_ACTIONS
+    from config_invariants import row_store_refuses_action
     cfg = copy.deepcopy(canonical)
     assert not _fires(cfg, 'row_store_is_well_formed')                 # store off
     cfg['buffers']['store']['enabled'] = True
@@ -1310,7 +1310,7 @@ def test_a_row_store_off_the_nf_route_is_an_error(canonical):
     for st in stages:
         st['max_steps'] = 100
         for hook in ('on_enter', 'on_exit'):
-            st[hook] = [a for a in st.get(hook) or [] if a.split(':')[0] not in ROW_STORE_REFUSED_ACTIONS]
+            st[hook] = [a for a in st.get(hook) or [] if not row_store_refuses_action(a)]
     cfg['epochs'] = 111 * len(stages)
     assert not _fires(cfg, 'row_store_is_well_formed')
 

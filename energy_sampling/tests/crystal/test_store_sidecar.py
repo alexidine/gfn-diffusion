@@ -20,9 +20,12 @@ for p in (_here, os.path.dirname(_here)):
         sys.path.insert(0, p)
 
 from energy_sampling import crystal_store as CS  # noqa: E402
+from energy_sampling import noised_prior  # noqa: E402
+from energy_sampling.buffer import ConditionLogZTracker  # noqa: E402
 from energy_sampling.checkpointing import Checkpointer  # noqa: E402
 from energy_sampling.crystal_store import (  # noqa: E402
     ANCHOR, CHILD, ONPOLICY, ORIGIN_KICK, ORIGIN_ROLLOUT, CrystalStore, CrystalStoreError, stamp_diff)
+from energy_sampling.train import Modeller  # noqa: E402
 from mxtaltools.dataset_utils.data_classes import MolData  # noqa: E402
 from mxtaltools.dataset_utils.utils import collate_data_list  # noqa: E402
 
@@ -424,3 +427,183 @@ def test_bytes_written_follow_the_occupied_rows_not_the_capacity(thinned):
             st.remove(torch.nonzero(st.kind[:st.high_water] == ONPOLICY).flatten()[:2])
         return saved_bytes(Checkpointer(_modeller(st)).buffer_state())
     assert written(1_000_000) < written(400) + 4096
+
+
+# ---- values a launch recomputes: compared within the seed digest's tolerances --------------------------------
+
+
+def _ulp(v):
+    return float(np.nextafter(np.float32(v), np.float32(np.inf)))
+
+
+CLOSE = {'energy_clip': 20.5, 'energy_reference_table': [1.25, -3.5, 0.0], 'prior': 'a'}
+
+
+@pytest.mark.parametrize('moved', [dict(energy_clip=_ulp(20.5)),
+                                   dict(energy_reference_table=[1.250001, -3.500001, 1e-6])],
+                         ids=['clip one float32 ulp', 'table at its 6-decimal rounding'])
+def test_a_rounding_move_in_a_recomputed_stamp_value_is_not_a_mismatch(moved):
+    assert stamp_diff(CLOSE, dict(CLOSE, **moved)) == []
+
+
+@pytest.mark.parametrize('key,value', [('energy_clip', 20.6), ('energy_clip', None),
+                                       ('energy_reference_table', [1.26, -3.5, 0.0]),
+                                       ('energy_reference_table', [1.25, -3.5]),
+                                       ('energy_reference_table', None)],
+                         ids=['clip moved', 'clip removed', 'table moved', 'table shortened', 'table removed'])
+def test_a_real_change_in_a_recomputed_stamp_value_still_differs(key, value):
+    assert stamp_diff(CLOSE, dict(CLOSE, **{key: value})) == [key]
+
+
+def test_a_requeue_survives_a_rounded_clip_and_refuses_a_changed_one():
+    st = seeded()
+    grow(st)
+    state = _sidecar(_modeller(st, stamp=CLOSE))
+    near = _modeller(stamp=dict(CLOSE, energy_clip=_ulp(20.5)))
+    ck = Checkpointer(near)
+    ck.restore_buffers(dict(state), 'x_buffers.pt')
+    assert ck.restore_row_store(seeded()) is True
+    far = _modeller(stamp=dict(CLOSE, energy_clip=21.0))
+    ck = Checkpointer(far)
+    ck.restore_buffers(dict(state), 'x_buffers.pt')
+    with pytest.raises(ValueError, match='energy_clip'):
+        ck.restore_row_store(seeded())
+
+
+# ---- Modeller.init_row_store around a sidecar ------------------------------------------------------------------
+
+
+def _launch(state=None, run='run_a', step=20, store_on=True):
+    """A Modeller built without __init__ through the real init_row_store and Checkpointer, seeding the rows of
+    seeded(). The energy recompute is the rows' own values."""
+    ref = seeded()
+    n = ref.n_seed_kept
+    m = Modeller.__new__(Modeller)
+    m.run_name, m.step_ind, m.problem_def, m.problem_hash = run, step, {'p': 1}, 'abc'
+    m.args = SimpleNamespace(seed=3, checkpoint_read_only=False, energy_config=SimpleNamespace(temperature=2.5))
+    m.energy_function = SimpleNamespace(data_ndim=DIM, condition_library_size=3)
+    m.condition_log_z = ConditionLogZTracker(3)
+    m.store_settings = lambda: dict(ram_gb=0.01, ram_frac=0.5) if store_on else None
+    m._store_headroom = lambda: 20
+    m._store_stamp = lambda: STAMP
+    m._stored_reward_terms = lambda batch, **kw: (None, ref.log_r[:n].clone(), ref.energy[:n].clone())
+    m._physical = {}
+    m._store_load = dict(batch=SimpleNamespace(fd_state=ref.x[:n].clone()), rows=torch.arange(n), cid=ref.cid[:n].long(),
+                         kinds=torch.where(ref.kind[:n] == ANCHOR, torch.tensor(noised_prior.KIND_ANCHOR),
+                                           torch.tensor(noised_prior.KIND_CHILD)),
+                         parent=ref.parent[:n].long(), undrawn=torch.zeros(n, dtype=torch.bool),
+                         templates=_templates(3), template_cids=torch.arange(3), floor_cids=torch.arange(3),
+                         floor=torch.zeros(3, dtype=torch.float64))
+    m.checkpointer = Checkpointer(m)
+    if state is not None:
+        m.checkpointer.restore_buffers(state, 'x_buffers.pt')
+    return m
+
+
+@pytest.fixture
+def no_config_check(monkeypatch):
+    monkeypatch.setattr('config_invariants.row_store_problems', lambda cfg: [])
+
+
+def _grown_sidecar(deep=-40.0):
+    """The sidecar of a run whose rollout wrote a row at -T log R = `deep` on condition 0, after the checkpoint."""
+    m = _launch()
+    m.init_row_store()
+    m.row_store.add(torch.full((2, DIM), 0.2), [0, 0], ONPOLICY, ORIGIN_ROLLOUT, torch.full((2,), -deep / 2.5),
+                    torch.full((2,), deep), 15, log_q=torch.full((2,), -1.0), resid=torch.full((2,), 0.5))
+    return _sidecar(m)
+
+
+def test_a_restored_row_below_the_seed_lowers_the_tracker_floor(no_config_check):
+    m = _launch(_grown_sidecar())
+    tracker = m.condition_log_z
+    tracker.minima_improved_total, tracker.minima_depth_total = 7, 1.5
+    m.init_row_store()
+    assert m.row_store.high_water == seeded().n_seed_kept + 2
+    assert float(tracker.best_energy[0]) == pytest.approx(-40.0)
+    assert float(m.row_store.best_energy[0]) == pytest.approx(-40.0)
+    assert (tracker.minima_improved_total, tracker.minima_depth_total) == (7, 1.5)
+
+
+def test_a_launch_without_a_sidecar_keeps_the_seed_floor(no_config_check):
+    m = _launch()
+    m.init_row_store()
+    assert float(m.condition_log_z.best_energy[0]) == pytest.approx(float(seeded().energy[0]))
+
+
+def test_store_off_on_this_runs_sidecar_raises(no_config_check):
+    m = _launch(_grown_sidecar(), store_on=False)
+    with pytest.raises(ValueError, match='would discard its grown rows'):
+        m.init_row_store()
+
+
+def test_store_off_on_another_runs_sidecar_clears_it_and_says_so(no_config_check, capsys):
+    m = _launch(_grown_sidecar(), run='run_b', store_on=False)
+    m.init_row_store()
+    assert m._row_store_state is None and getattr(m, 'row_store', None) is None
+    assert "'run_a'" in capsys.readouterr().out
+
+
+def test_store_off_with_nothing_parked_is_a_no_op(no_config_check):
+    m = _launch(store_on=False)
+    m.init_row_store()
+    assert getattr(m, 'row_store', None) is None
+
+
+# ---- a store-on launch and a store-off run's buffers -----------------------------------------------------------
+
+
+class _Buf:
+    def __init__(self, n=4):
+        self.x, self.n = torch.zeros(n, DIM), n
+
+    def __len__(self):
+        return self.n
+
+    @classmethod
+    def from_state_dict(cls, s, device=None):
+        return cls(s['n'])
+
+
+def _store_on_modeller(enabled=True):
+    m = _modeller()
+    m.args.buffers = SimpleNamespace(store=SimpleNamespace(enabled=enabled, ram_gb=1))
+    m.buffer_cls = m.anchor_buffer_cls = _Buf
+    m.apply_anchor_buffer_policy = lambda why: None
+    return m
+
+
+@pytest.mark.parametrize('held', ['prior_buffer', 'replay_buffer', 'anchor_buffer'])
+def test_a_store_on_launch_refuses_a_sidecar_of_old_buffers(held):
+    state = {'problem_def': {'p': 1}, 'run_name': 'old', 'step_ind': 9, 'row_store': None, held: {'n': 4}}
+    with pytest.raises(ValueError, match=r'buffers\.fresh_on_switch.*load_weights_only'):
+        Checkpointer(_store_on_modeller()).restore_buffers(state, 'old_buffers.pt')
+
+
+def test_a_store_on_launch_refuses_a_compact_old_entry():
+    state = {'problem_def': {'p': 1}, 'run_name': 'old', 'step_ind': 9, 'row_store': None,
+             'prior_buffer': {'n': 3, 'compact_seed': 'abc'}}
+    with pytest.raises(ValueError, match=r'buffers\.fresh_on_switch'):
+        Checkpointer(_store_on_modeller()).restore_buffers(state, 'old_buffers.pt')
+
+
+def test_a_store_off_launch_still_restores_old_buffers():
+    m = _store_on_modeller(enabled=False)
+    Checkpointer(m).restore_buffers({'problem_def': {'p': 1}, 'run_name': 'old', 'step_ind': 9, 'row_store': None,
+                                     'prior_buffer': {'n': 4}, 'replay_buffer': {'n': 5}}, 'old_buffers.pt')
+    assert len(m.prior_buffer) == 4 and len(m.replay_buffer) == 5
+
+
+def test_a_store_on_sidecar_with_a_store_entry_restores():
+    st = seeded()
+    state = dict(_sidecar(_modeller(st)), replay_buffer={'n': 4})
+    m = _store_on_modeller()
+    Checkpointer(m).restore_buffers(state, 'x_buffers.pt')
+    assert m._row_store_state is not None
+
+
+def test_a_store_on_sidecar_of_another_problem_is_ignored():
+    m = _store_on_modeller()
+    Checkpointer(m).restore_buffers({'problem_def': {'p': 2}, 'run_name': 'old', 'step_ind': 9, 'row_store': None,
+                                     'prior_buffer': {'n': 4}}, 'old_buffers.pt')
+    assert getattr(m, 'prior_buffer', None) is None

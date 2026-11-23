@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from energy_sampling import crystal_store as CS
+from energies.molecular_crystal import OOM_RECOVERY_KEEP_CACHE
 from energy_sampling.buffer import ORIGIN_ROLLOUT
 from energy_sampling.tests.crystal import store_stub as S
 
@@ -136,3 +137,26 @@ def test_a_non_finite_kick_is_counted_and_never_reaches_a_minimum(monkeypatch):
     assert m.row_store.nonfinite_rows == 1 and m._store_growth['scored'] == 5
     assert m.condition_log_z.calls[-1][0].numel() == 5
     assert bool(torch.isfinite(m.condition_log_z.calls[-1][1]).all())
+
+
+def test_growth_keeps_chunked_recovery_without_the_end_of_call_flush(monkeypatch):
+    m = grown(monkeypatch)
+    seen = []
+    score = m.energy_function.log_reward
+
+    def spy(*a, internal_oom_recovery=None, **k):
+        seen.append(internal_oom_recovery)
+        return score(*a, internal_oom_recovery=internal_oom_recovery, **k)
+    m.energy_function.log_reward = spy
+    m._store_grow()
+    assert seen == [OOM_RECOVERY_KEEP_CACHE]
+
+
+def test_store_best_energy_median_reads_the_physical_minimum_over_visited_conditions():
+    m = S.build()
+    m._condition_group_axes = lambda: ([2], 1)
+    st = m.row_store
+    st.best_energy[:] = torch.tensor([1.0, 3.0, 10.0, float('inf')])
+    assert m._store_metrics()['store/best_energy_median'] == pytest.approx(3.0)
+    st.best_energy[:] = float('inf')
+    assert 'store/best_energy_median' not in m._store_metrics()

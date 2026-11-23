@@ -1509,6 +1509,14 @@ ROW_STORE_REFUSED_ACTIONS = ('rebuild_prior_by_churn', 'reseed_prior_from_datase
 ROW_STORE_STAGE_MARGIN = 11
 
 
+def row_store_refuses_action(action) -> bool:
+    """A stage action the store route cannot run: one of ROW_STORE_REFUSED_ACTIONS, or any bootstrap_z form but offset
+    (their head fit, train.py::Modeller.bootstrap_log_z, draws std-oriented mol_dataset rows, not the store's
+    templates)."""
+    parts = str(action).split(':')
+    return parts[0] in ROW_STORE_REFUSED_ACTIONS or (parts[0] == 'bootstrap_z' and parts[1:2] != ['offset'])
+
+
 def row_store_settings(node) -> Optional[dict]:
     """buffers.store merged over ROW_STORE_DEFAULTS when its `enabled` is true, else None. `node` is a raw config dict
     or the trainer's Namespace. Raises on unknown keys of an enabled block; a block not enabled is not inspected."""
@@ -1635,6 +1643,9 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         for action in list(st.get('on_enter') or ()) + list(st.get('on_exit') or ()):
             if str(action).split(':')[0] in ROW_STORE_REFUSED_ACTIONS:
                 err(f"stage {name!r}: action {action!r} writes the prior buffer, which the store route never builds")
+            elif row_store_refuses_action(action):
+                err(f"stage {name!r}: action {action!r} fits Z(c) on std-oriented mol_dataset rows, not the store's "
+                    f"templates: use bootstrap_z:offset")
         if st.get('condition_draw'):
             err(f"stage {name!r}: condition_draw draws from prior_buffer and replay_buffer, not the store")
         if (_num(st.get('replay_warmup_rows')) or 0) > 0:

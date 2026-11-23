@@ -10,6 +10,7 @@ import torch
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     BufferCurrencyError
 from energy_sampling import noised_prior
+from energy_sampling.config_invariants import row_store_settings
 from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, keeps_ema_copy, normalize_problem_def, trajectory_T
 from models import GFN
@@ -145,6 +146,13 @@ BUFFER_SUFFIX = '_buffers.pt'
 # written; it stays so an existing *_prior.pt still resolves its sidecar.
 CHECKPOINT_TAGS = ('best', 'running', 'prior', 'thermalized', 'final',
                    'phase1_exit', 'phase2_exit', 'ff_calibrated')
+
+
+def own_store_refusal(run, step, why) -> str:
+    """The refusal of a launch that cannot take the crystal store entry of its own run's sidecar."""
+    return (f"buffer sidecar of this run ({run!r}, step {step}) cannot be restored: {why}. Going on without it would "
+            f"discard its grown rows. To start clean, move the sidecar away, or load the checkpoint under a new "
+            f"run_name with buffers.fresh_on_switch")
 
 
 def fresh_buffers_on_switch(modeller, checkpoint: dict, path: str) -> bool:
@@ -476,9 +484,7 @@ class Checkpointer:
         why = store.state_mismatch(state, m._store_stamp())
         if why is not None:
             if src_run is not None and src_run == getattr(m, 'run_name', None):
-                raise ValueError(f"buffer sidecar of this run ({src_run!r}, step {src_step}) cannot be restored: {why}. "
-                                 f"Seeding afresh would discard its grown rows. To start clean, move the sidecar away, "
-                                 f"or load the checkpoint under a new run_name with buffers.fresh_on_switch")
+                raise ValueError(own_store_refusal(src_run, src_step, why))
             print(f"row store in the buffer sidecar of run {src_run!r} ignored: {why}; keeping this launch's seed",
                   flush=True)
             return False
@@ -620,6 +626,13 @@ class Checkpointer:
             print(f"Buffer sidecar {source} was saved under a different problem "
                   f"- ignoring it, buffers start fresh")
             return
+        if row_store_settings(getattr(m, 'args', None)) is not None and state.get('row_store') is None:
+            held = [k for k in self.CURRENCY_CHECKED_BUFFERS if state.get(k) is not None]
+            if held:
+                raise ValueError(f"buffer sidecar {source} holds {held} and no crystal store, and this launch has "
+                                 f"buffers.store on: those buffers would stay resident beside the store, outside its "
+                                 f"RAM limit. Load it under a new run_name with buffers.fresh_on_switch, or with "
+                                 f"load_weights_only")
         # all resident stores restore onto the configured buffer_device, and through the
         # modeller's OWN buffer classes. Hardcoding CrystalBuffer/AnchorBuffer here restored
         # a crystal store on a non-crystal route: the rows are fine, but the class carries

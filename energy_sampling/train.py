@@ -48,13 +48,13 @@ import profiling
 import wandb
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
+from energies.molecular_crystal import MolecularCrystal, OOM_RECOVERY_KEEP_CACHE, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, FDChartState, \
     DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, Z_FEED_MODES, DEFAULT_EVAL_HALF_LIFE_VISITS, \
     ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
-from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
+from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS, own_store_refusal
 from energy_sampling.controller import LRController
 from energy_sampling import prior_scan_cache
 from energy_sampling import noised_prior
@@ -9056,7 +9056,7 @@ class Modeller:
 
     def _store_headroom(self):
         """H of crystal_store I11: the largest single add. Twice a rollout (B x fwd repeats, the rollout and its kicks),
-        an eval rollout, or a stage-entry bootstrap draw."""
+        an eval rollout, or a stage-entry bootstrap_z:offset draw."""
         from config_invariants import active_stages, _coeff
         from utils import _namespace_to_dict
         cfg = _namespace_to_dict(self.args)
@@ -9067,7 +9067,7 @@ class Modeller:
         for st in stages:
             for action in st.get('on_enter') or ():
                 parts = str(action).split(':')
-                if parts[0] == 'bootstrap_z' and len(parts) >= 2 and parts[1] in ('offset', 'rollout'):
+                if parts[0] == 'bootstrap_z' and len(parts) >= 2 and parts[1] == 'offset':
                     sizes.append(int(parts[2]) if len(parts) > 2 else evals)
         return max(sizes)
 
@@ -9075,9 +9075,19 @@ class Modeller:
         """Build the store when buffers.store is enabled, from the rows _load_noised_prior held, after the clip and
         energy reference are armed so stored log R is in the run's currency. Refuses the configurations
         config_invariants.row_store_is_well_formed reports as ERROR, and a row limit below anchors + 2 headroom.
-        Warms condition_log_z's floors from every row given, then releases the file batch."""
+        Warms condition_log_z's floors from every row given and every row a restored sidecar holds, then releases the
+        file batch. With the store off, a parked sidecar entry of this run raises, because the run's next sidecar would
+        drop its grown rows; another run's entry is cleared with a printed line."""
         s = self.store_settings()
         if s is None:
+            state = getattr(self, '_row_store_state', None)
+            if state is not None:
+                src_run, src_step = getattr(self, '_row_store_source', (None, None))
+                if src_run is not None and src_run == getattr(self, 'run_name', None):
+                    raise ValueError(own_store_refusal(src_run, src_step, 'buffers.store is off in this launch'))
+                print(f"row store in the buffer sidecar of run {src_run!r} ignored: buffers.store is off in this launch",
+                      flush=True)
+                self._row_store_state = None
             return
         from config_invariants import row_store_problems, store_row_limit, ERROR
         from utils import _namespace_to_dict
@@ -9115,7 +9125,9 @@ class Modeller:
         self._store_growth = dict(kicks=0, unchanged=0, scored=0, in_window=0, out_of_box=0)
         self._physical['gen'] = torch.Generator().manual_seed(int(self.args.seed) + int(getattr(self, 'step_ind', 0)))
         self._store_warm_tracker(cid, log_r)
-        self.checkpointer.restore_row_store(self.row_store)
+        if self.checkpointer.restore_row_store(self.row_store):     # a sidecar can hold rows its checkpoint never saw
+            live = store.kind[:store.high_water] != crystal_store.FREE
+            self._store_warm_tracker(store.cid[:store.high_water][live].long(), store.log_r[:store.high_water][live])
         print(f"crystal store seeded: {store.n_rows} rows ({store.n_anchors} anchors, {store.stats()['store/children']} "
               f"children, {store.stats()['store/undrawn']} undrawn) of {rows.numel()} given; {store.seed_nonfinite} "
               f"non-finite and {store.seed_orphans} orphaned rows dropped; row limit {max_rows} (ram_gb {s['ram_gb']}, "
@@ -9354,7 +9366,8 @@ class Modeller:
         mol = st.mol_batch(cid).to(dev)
         mol, log_T, _, _ = ef.condition_samples(mol, sg_inds=mol.sg_ind.reshape(-1).long(),
                                                 z_primes=mol.z_prime.reshape(-1).long())
-        log_r, scored = ef.log_reward(x.to(dev), mol, log_T, return_exp=True, internal_oom_recovery=True)
+        log_r, scored = ef.log_reward(x.to(dev), mol, log_T, return_exp=True,
+                                      internal_oom_recovery=OOM_RECOVERY_KEEP_CACHE)
         log_r = log_r.detach().float().flatten().cpu()
         mol_energy = torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu()
         e_win = ef.seed_energy_from(dict(mol_energy=torch.as_tensor(scored.mol_energy),
@@ -9407,7 +9420,9 @@ class Modeller:
         print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
 
     def _store_metrics(self):
-        """store/* readouts: the store's counters, the growth tally, and its rows per space group."""
+        """store/* readouts: the store's counters, the growth tally, its rows per space group, and
+        store/best_energy_median, the median over conditions with a finite store minimum of the lowest physical
+        mol_energy stored from any source."""
         st, g = self.row_store, self._store_growth
         out = st.stats()
         out.update({'store/kicks_owed': self._growth_kicks_due(), 'store/kicks_drawn': g['kicks'],
@@ -9415,6 +9430,9 @@ class Modeller:
                     'store/rows_out_of_box': g['out_of_box']})
         if g['scored']:
             out['store/kick_in_window_frac'] = g['in_window'] / g['scored']
+        best = st.best_energy[torch.isfinite(st.best_energy)]
+        if best.numel():
+            out['store/best_energy_median'] = float(np.median(best.numpy()))
         groups, n_zp = self._condition_group_axes()
         if len(groups) > 1 and st.n_rows:
             live = st.kind[:st.high_water] != crystal_store.FREE
@@ -11201,6 +11219,11 @@ class Modeller:
           eval_bwd/mle_anchors       a pre-noised prior's clean training anchors (its stage 1 trains on children)
           eval_bwd/mle_mol_crystals  the molecules_path crystals (one per training molecule)
           eval_test/mle              the test_molecules_path crystals (molecules never trained on)
+        On the store route (Modeller._store_take_rows) the first three are frozen panels cut at load, each capped at
+        4 * eval_num_samples rows: eval_bwd/mle reads prior_dataset, the in-window training CHILDREN, and is not the MLE
+        draw, which is fresh unfiltered kicks of anchors (Modeller._store_draw); eval_bwd/mle_heldout_rows reads
+        prior_heldout_batch, the held-out children; eval_bwd/mle_anchors reads prior_anchor_batch, the in-window
+        training anchors, which MLE kicks and never trains on directly.
         Each set is read on the same up to n_rows rows at every eval (drawn once, seed + 3), through the backward
         draw's own path (the stored latent, the condition built from the row's own space group and Z'). A policy
         without an exact density reports nothing.
