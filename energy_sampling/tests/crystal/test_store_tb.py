@@ -119,24 +119,31 @@ def test_the_currency_check_reads_no_global_generator():
     assert torch.equal(torch.get_rng_state(), state)
 
 
-def test_restore_applies_a_matching_state_and_refuses_another():
-    m = S.build()
-    st = m.row_store
-    m._store_stamp = lambda: {'a': 1}
-    fwd, batch = S.rollout([0, 1])
-    m._store_admit(fwd, batch, ORIGIN_ROLLOUT)
-    state = st.state_dict({'a': 1})
-    fresh = S.build()
-    fresh._store_stamp = lambda: {'a': 1}
-    fresh._row_store_state = state
-    fresh._store_restore_state()
-    assert fresh.row_store.n_rows == st.n_rows and fresh._row_store_state is None
-    fresh.row_store.check()
+def test_an_own_run_resume_seeds_from_the_saved_row_mask():
+    first = S.build()
+    first.run_name = 'run_a'
+    first._row_store_state, first._row_store_source = None, (None, None)
+    was = torch.tensor([True, False, True, True, False, False, True, False, True, True, False])
+    assert torch.equal(first._store_seed_keep(was), was)
+
+    moved = was.clone()
+    moved[[1, 2]] = ~moved[[1, 2]]   # a window edge that moved by rounding on another node
+    own = S.build()
+    own.run_name = 'run_a'
+    own._row_store_state, own._row_store_source = {'seed_keep': first._store_seed_mask}, ('run_a', 7)
+    assert torch.equal(own._store_seed_keep(moved), was)
+    assert torch.equal(own._store_seed_mask['bits'], first._store_seed_mask['bits'])
+
     other = S.build()
-    other._store_stamp = lambda: {'a': 2}
-    other._row_store_state = state
-    with pytest.raises(ValueError, match='another prior'):
-        other._store_restore_state()
+    other.run_name = 'run_b'
+    other._row_store_state, other._row_store_source = {'seed_keep': first._store_seed_mask}, ('run_a', 7)
+    assert torch.equal(other._store_seed_keep(moved), moved)
+
+    short = S.build()
+    short.run_name = 'run_a'
+    short._row_store_state, short._row_store_source = {'seed_keep': first._store_seed_mask}, ('run_a', 7)
+    with pytest.raises(ValueError, match='file rows'):
+        short._store_seed_keep(moved[:-1])
 
 
 def test_a_rewind_invalidates_only_later_log_q():

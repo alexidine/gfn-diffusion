@@ -8945,7 +8945,7 @@ class Modeller:
         parents = noised_prior.tag(prior, 'noised_parent')
         is_anchor = kinds == noised_prior.KIND_ANCHOR
         finite = torch.isfinite(log_r)
-        keep = masks['buffer'] & finite
+        keep = self._store_seed_keep(masks['buffer'] & finite)
         kids = torch.nonzero(keep & ~is_anchor).flatten()
         par = parents[kids]
         if bool((par < 0).any()) or bool((par >= n).any()) or not bool(is_anchor[par].all()):
@@ -9115,7 +9115,7 @@ class Modeller:
         self._store_growth = dict(kicks=0, unchanged=0, scored=0, in_window=0, out_of_box=0)
         self._physical['gen'] = torch.Generator().manual_seed(int(self.args.seed) + int(getattr(self, 'step_ind', 0)))
         self._store_warm_tracker(cid, log_r)
-        self._store_restore_state()
+        self.checkpointer.restore_row_store(self.row_store)
         print(f"crystal store seeded: {store.n_rows} rows ({store.n_anchors} anchors, {store.stats()['store/children']} "
               f"children, {store.stats()['store/undrawn']} undrawn) of {rows.numel()} given; {store.seed_nonfinite} "
               f"non-finite and {store.seed_orphans} orphaned rows dropped; row limit {max_rows} (ram_gb {s['ram_gb']}, "
@@ -9140,17 +9140,23 @@ class Modeller:
         for k, v in saved.items():
             setattr(tracker, k, v)
 
-    def _store_restore_state(self):
-        """Apply a sidecar's store state to the seeded store. A stamp from another run configuration raises."""
+    def _store_seed_keep(self, keep):
+        """[n] bool, the file rows this launch seeds. On a resume of this run's own sidecar: the mask that sidecar was
+        seeded from, so a row at a window edge whose recomputed energy moved by rounding on another node stays on the
+        side it was. Sets self._store_seed_mask, the packed mask Checkpointer._row_store_entry saves."""
         state = getattr(self, '_row_store_state', None)
-        self._row_store_state = None
-        if state is None:
-            return
-        if state.get('stamp') != self._store_stamp():
-            raise ValueError("the store in the buffer sidecar was written under another prior, chart, condition set "
-                             "or reward setting; start the buffers fresh (buffers.fresh_on_switch)")
-        self.row_store.apply_state(state)
-        print(f"crystal store restored from the buffer sidecar: {self.row_store.n_rows} rows", flush=True)
+        src_run = getattr(self, '_row_store_source', (None, None))[0]
+        saved = None if state is None or src_run != getattr(self, 'run_name', None) else state.get('seed_keep')
+        if saved is not None:
+            if int(saved['rows']) != keep.numel():
+                raise ValueError(f"buffer sidecar of this run was seeded from {int(saved['rows'])} file rows; this "
+                                 f"prior file has {keep.numel()}")
+            was = torch.from_numpy(np.unpackbits(saved['bits'].numpy(), count=keep.numel()).astype(bool))
+            print(f"crystal store load: the seed row mask comes from this run's sidecar; {int((was != keep).sum())} of "
+                  f"{keep.numel()} rows differ from this launch's recomputed window", flush=True)
+            keep = was
+        self._store_seed_mask = dict(rows=keep.numel(), bits=torch.from_numpy(np.packbits(keep.numpy())))
+        return keep
 
     def _store_rewind(self, checkpoint_step):
         """A rewind to `checkpoint_step`: log q written after it no longer describes the restored weights."""
@@ -10204,11 +10210,12 @@ class Modeller:
         return cache[attr]
 
     def _zsg_rows(self, batch, panel, sel):
-        """The panel rows `sel` (indices into the panel) as a batch on the device in the standard molecule frame,
-        with their temperatures [n] and Z' [n]."""
+        """The panel rows `sel` (indices into the panel) as a batch on the device, in the standard molecule frame off
+        the store route and as stored on it, with their temperatures [n] and Z' [n]."""
         idx = panel['rows'][sel]
         mb = batch.subsample_new_batch(idx.to(batch.ptr.device)).to(self.device)
-        mb.orient_molecule(mode='standard')
+        if self.row_store is None:
+            mb.orient_molecule(mode='standard')
         return mb, panel['temps'][sel].to(self.device), panel['zp'][sel].to(self.device)
 
     @torch.no_grad()

@@ -457,8 +457,9 @@ class Checkpointer:
         st = getattr(m, 'row_store', None)
         if st is None:
             return None
-        kw = {'compact': True} if 'compact' in inspect.signature(st.state_dict).parameters else {}
-        return st.state_dict(m._store_stamp(), **kw)
+        entry = st.state_dict(m._store_stamp(), compact=True)
+        entry['seed_keep'] = getattr(m, '_store_seed_mask', None)
+        return entry
 
     def restore_row_store(self, store) -> bool:
         """Apply the sidecar entry restore_buffers parked onto `store`, which this launch has just seeded. Returns True

@@ -1161,10 +1161,10 @@ buffers:
     uniform_frac: 0.5         # uniform share of the replay draw measure; IS weight 1/(n q) <= 1/uniform_frac. Code default 0.1
     is_exponent: 1.0          # replay IS weight w = (1/(n q))^is_exponent, then self-normalised in the loss; 1 = exact, 0 = unweighted
     refresh_chunk: 8192       # rows per log q call in the eval refresh; a CUDA OOM halves it for the rest of the run
-    ram_gb: null              # GiB of RAM requested for the job, the ram_gb of config_invariants.store_row_limit. No trainer code reads this key yet
-    ram_frac: 0.5             # share of ram_gb the store may hold, the ram_frac of store_row_limit. No trainer code reads this key yet
-    mle_draw: anchor          # MLE row draw: anchor = uniform over anchors, condition = uniform condition then anchor. No trainer code reads this key yet
-    replay_weight: uniform    # name in crystal_store.REPLAY_WEIGHTS, the replay row weight within a condition. No trainer code reads this key yet
+    ram_gb: null              # GiB of RAM requested for the job, the ram_gb of config_invariants.store_row_limit. Required when enabled
+    ram_frac: 0.5             # share of ram_gb the store may hold, the ram_frac of store_row_limit
+    mle_draw: anchor          # MLE row draw: anchor = uniform over anchors, condition = uniform condition then anchor
+    replay_weight: uniform    # name in crystal_store.REPLAY_WEIGHTS, the replay row weight within a condition
   # todo my general thought on these buffers is we need a simple, few-point, global theory of dataset management. It should simplify all this organization I imagine
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission, and tops up prior_buffer via noising + rescoring whenever a
