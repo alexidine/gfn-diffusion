@@ -39,9 +39,11 @@ Invariants, verified by check():
 
 The store owns one numpy Generator. It never reads or advances the global torch or numpy generators.
 
-This module imports math, numpy, torch and noised_prior at load. Joining template batches imports
+This module imports hashlib, json, math, numpy, torch and noised_prior at load. Joining template batches imports
 mxtaltools.dataset_utils.utils when called.
 """
+import hashlib
+import json
 import math
 
 import numpy as np
@@ -67,7 +69,12 @@ _COLUMNS = (('x', torch.float32), ('cid', torch.int32), ('kind', torch.int8), ('
             ('resid', torch.float32), ('draws', torch.int32), ('birth_step', torch.int32))
 _TABLES = ('tmpl_of', 'cond_sg', 'cond_radius', 'cond_rg', 'best_energy', 'window_floor')
 _COUNTERS = ('n_free', 'high_water', 'epoch', 'generation', 'n_seed_given', 'n_seed_kept', 'seed_nonfinite',
-             'seed_orphans', 'thinned_total', 'nonfinite_rows', 'seeded')
+             'seed_orphans', 'thinned_total', 'nonfinite_rows', 'seeded', 'seed_intact')
+_SEED_MUTABLE = ('log_q', 'q_step', 'resid', 'draws')   # the only columns of a seed row written after seed()
+_SEED_EXACT = ('cid', 'kind', 'flags', 'origin', 'parent', 'birth_step')     # seed-row columns hashed byte for byte
+_SEED_CLOSE_TABLES = ('cond_radius', 'cond_rg', 'window_floor')             # compared within the tolerances below
+SEED_CLOSE_RTOL, SEED_CLOSE_ATOL = 1e-4, 1e-3   # per-condition means of x, log_r, energy and the tables above
+_DIGEST_CHUNK = 2 ** 20
 
 
 class CrystalStoreError(ValueError):
@@ -87,6 +94,15 @@ def _blank_stat(t, k):
     """k new entries of the cond_stats tensor t: NaN on a float tensor, zero on any other."""
     shape = (k,) + tuple(t.shape[1:])
     return torch.full(shape, math.nan, dtype=t.dtype) if t.is_floating_point() else torch.zeros(shape, dtype=t.dtype)
+
+
+def stamp_diff(a, b):
+    """The top-level keys on which two stamps differ. Tuples read as lists and NaN equals NaN."""
+    def canon(v):
+        return json.dumps(v, sort_keys=True, default=str)
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return [] if canon(a) == canon(b) else ['<whole stamp>']
+    return sorted(k for k in set(a) | set(b) if canon(a.get(k)) != canon(b.get(k)))
 
 
 def _ragged(starts, lens):
@@ -298,7 +314,8 @@ class CrystalStore:
         self.epoch = self.generation = 0
         self.n_seed_given = self.n_seed_kept = self.seed_nonfinite = self.seed_orphans = 0
         self.thinned_total = self.nonfinite_rows = 0
-        self.seeded = False
+        self.seeded = self.seed_intact = False
+        self._seed_digest = None
         self._n_kind = [0] * N_KINDS
         self._n_drawable = [0] * N_KINDS
         self._n_undrawn = 0
@@ -485,7 +502,8 @@ class CrystalStore:
             self.active[k].add(np.flatnonzero(self.index.count[pool_ids]).astype(np.int32))
             self._n_drawable[k] = int(self.index.count[pool_ids].sum())
         self._anchor_rows = None
-        self.seeded = True
+        self.seeded = self.seed_intact = True
+        self._seed_digest = None
         self.generation += 1
 
     # ---- growth ---------------------------------------------------------------------
@@ -624,6 +642,7 @@ class CrystalStore:
         self.n_free += len(rows)
         self.epoch += 1
         self.generation += 1
+        self.seed_intact = False
 
     def thin(self, need):
         """Free at least `need` rows, 50:50 between children and on-policy rows, uniformly within each; returns the rows
@@ -699,6 +718,7 @@ class CrystalStore:
         self.cond_stats, self.templates = stats, joined
         self.n_cond += k
         self.generation += 1
+        self.seed_intact = False
         return torch.arange(first, first + k, dtype=torch.long)
 
     @staticmethod
@@ -972,45 +992,128 @@ class CrystalStore:
 
     # ---- persistence ----------------------------------------------------------------
 
-    def state_dict(self, stamp=None):
-        """Clones of the occupied column prefix, the tables, the free stack, the index order and the generator."""
-        hw = self.high_water
-        pools = np.arange(len(self.index.count), dtype=np.int64)
-        return {'format_version': FORMAT_VERSION, 'stamp': stamp, 'dim': self.dim, 'max_rows': self.max_rows,
-                'headroom': self.headroom, 'n_cond': self.n_cond, 'base_seed': self.base_seed,
-                'columns': {name: getattr(self, name)[:hw].clone() for name, _ in _COLUMNS},
-                'tables': {name: getattr(self, name).clone() for name in _TABLES},
-                'cond_stats': {k: v.clone() for k, v in self.cond_stats.items()},
-                'free': torch.from_numpy(self._free[:self.n_free].copy()),
-                'index_count': torch.from_numpy(self.index.count.copy()),
-                'index_start': torch.from_numpy(self.index.start.copy()),
-                'index_cap': torch.from_numpy(self.index.cap.copy()),
-                'index_tail': self.index.tail, 'index_compactions': self.index.compactions,
-                'index_rows': torch.from_numpy(self.index.rows_of(pools)),
-                'active': [torch.from_numpy(s.members().copy()) for s in self.active],
-                'counters': {name: getattr(self, name) for name in _COUNTERS},
-                'n_kind': list(self._n_kind), 'n_drawable': list(self._n_drawable), 'n_undrawn': self._n_undrawn,
-                'rng_state': self.rng.bit_generator.state, 'templates': self.templates}
+    def seed_digest(self):
+        """What identifies the seed rows: 'exact', a sha1 of the discrete seed columns (_SEED_EXACT), the template map
+        and the template atom types; 'close', [n_cond, dim + 2 + 3] float64, each condition's mean x, log_r and energy
+        over its seed rows (NaN without one) and its _SEED_CLOSE_TABLES entries. x, log_r and energy are recomputed at
+        every launch on that launch's device, so they are compared within SEED_CLOSE_RTOL and SEED_CLOSE_ATOL. Cached:
+        none of this is written while seed_intact holds."""
+        if self._seed_digest is None:
+            n = self.n_seed_kept
+            h = hashlib.sha1(repr((self.dim, self.n_cond, n)).encode())
+            for name in _SEED_EXACT:
+                h.update(getattr(self, name)[:n].contiguous().numpy())
+            for name in ('tmpl_of', 'cond_sg'):
+                h.update(getattr(self, name).contiguous().numpy())
+            z = getattr(self.templates, 'z', None)
+            if z is not None:
+                h.update(z.detach().cpu().contiguous().numpy())
+            sums = torch.zeros((self.n_cond, self.dim + 2), dtype=torch.float64)
+            counts = torch.zeros(self.n_cond, dtype=torch.float64)
+            for lo in range(0, n, _DIGEST_CHUNK):
+                hi = min(lo + _DIGEST_CHUNK, n)
+                c = self.cid[lo:hi].long()
+                sums.index_add_(0, c, torch.cat([self.x[lo:hi], self.log_r[lo:hi, None], self.energy[lo:hi, None]],
+                                                1).double())
+                counts.index_add_(0, c, torch.ones(hi - lo, dtype=torch.float64))
+            tables = torch.stack([getattr(self, name).double() for name in _SEED_CLOSE_TABLES], 1)
+            self._seed_digest = {'exact': h.hexdigest()[:16], 'close': torch.cat([sums / counts[:, None], tables], 1)}
+        return self._seed_digest
 
-    def apply_state(self, state):
-        """Restore state_dict() into this store. dim, max_rows and headroom must match."""
+    def _digest_differs(self, digest):
+        """How `digest` differs from this store's seed_digest(), or None."""
+        mine = self.seed_digest()
+        if digest['exact'] != mine['exact']:
+            return f"seed rows: state digest {digest['exact']}, this store {mine['exact']}"
+        a, b = digest['close'], mine['close']
+        if a.shape != b.shape:
+            return f'seed digest shape {tuple(a.shape)}, this store {tuple(b.shape)}'
+        far = ~torch.isclose(a, b, rtol=SEED_CLOSE_RTOL, atol=SEED_CLOSE_ATOL, equal_nan=True)
+        if bool(far.any()):
+            return (f'seed digest: the seed values of {int(far.any(1).sum())} conditions moved, largest change '
+                    f'{float((a - b)[far].abs().nan_to_num(math.inf).max()):.4g}')
+        return None
+
+    def state_dict(self, stamp=None, compact=False):
+        """Clones of the occupied column prefix, the tables, the free stack, the index order and the generator.
+
+        compact=True on a store with seed_intact leaves out what a relaunch's seed() rebuilds: `columns` then holds only
+        the rows appended after the seed, `seed_columns` the seed rows' _SEED_MUTABLE columns, `seed_digest` identifies
+        the rest, and `templates` is None. On any other store it has no effect."""
+        hw = self.high_water
+        compact = bool(compact) and self.seed_intact
+        first = self.n_seed_kept if compact else 0
+        pools = np.arange(len(self.index.count), dtype=np.int64)
+        state = {'format_version': FORMAT_VERSION, 'stamp': stamp, 'dim': self.dim, 'max_rows': self.max_rows,
+                 'headroom': self.headroom, 'n_cond': self.n_cond, 'base_seed': self.base_seed,
+                 'columns': {name: getattr(self, name)[first:hw].clone() for name, _ in _COLUMNS},
+                 'tables': {name: getattr(self, name).clone() for name in _TABLES},
+                 'cond_stats': {k: v.clone() for k, v in self.cond_stats.items()},
+                 'free': torch.from_numpy(self._free[:self.n_free].copy()),
+                 'index_count': torch.from_numpy(self.index.count.copy()),
+                 'index_start': torch.from_numpy(self.index.start.copy()),
+                 'index_cap': torch.from_numpy(self.index.cap.copy()),
+                 'index_tail': self.index.tail, 'index_compactions': self.index.compactions,
+                 'index_rows': torch.from_numpy(self.index.rows_of(pools)),
+                 'active': [torch.from_numpy(s.members().copy()) for s in self.active],
+                 'counters': {name: getattr(self, name) for name in _COUNTERS},
+                 'n_kind': list(self._n_kind), 'n_drawable': list(self._n_drawable), 'n_undrawn': self._n_undrawn,
+                 'rng_state': self.rng.bit_generator.state, 'templates': None if compact else self.templates,
+                 'seed_digest': self.seed_digest() if compact else None}
+        if compact:
+            state['seed_columns'] = {name: getattr(self, name)[:first].clone() for name in _SEED_MUTABLE}
+        return state
+
+    def _refusal(self, state):
+        """Why state_dict() output `state` cannot be applied to this store, or None."""
         fv = state.get('format_version')
         if fv != FORMAT_VERSION:
-            raise CrystalStoreError(f'crystal store format_version {fv}, this code reads {FORMAT_VERSION}')
+            return f'crystal store format_version {fv}, this code reads {FORMAT_VERSION}'
         for name in ('dim', 'max_rows', 'headroom'):
-            if state[name] != getattr(self, name):
-                raise CrystalStoreError(f'crystal store {name}: state {state[name]}, this store {getattr(self, name)}')
+            if state.get(name) != getattr(self, name):
+                return f'crystal store {name}: state {state.get(name)}, this store {getattr(self, name)}'
         if state['n_cond'] < self.n_cond:
-            raise CrystalStoreError(f"crystal store n_cond: state {state['n_cond']}, this store {self.n_cond}")
+            return f"crystal store n_cond: state {state['n_cond']}, this store {self.n_cond}"
+        hw = int(state['counters']['high_water'])
+        if hw > self.max_rows:
+            return f'crystal store high_water {hw} above max_rows {self.max_rows}'
+        digest = state.get('seed_digest')
+        if digest is not None:
+            if not (self.seeded and self.seed_intact and self.high_water == self.n_seed_kept):
+                return 'a compact crystal store state applies only to a freshly seeded store'
+            differs = self._digest_differs(digest)
+            if differs is not None:
+                return f'crystal store {differs} (the prior file, its load window, the seed or the row limit changed)'
+        return None
+
+    def state_mismatch(self, state, stamp):
+        """Why `state` cannot be restored into this store under `stamp`, or None."""
+        diff = stamp_diff(state.get('stamp'), stamp)
+        if diff:
+            return f'crystal store stamp differs on {diff}'
+        return self._refusal(state)
+
+    def apply_state(self, state):
+        """Restore state_dict() into this store. dim, max_rows and headroom must match. A compact state needs a store
+        freshly seeded to the same seed digest."""
+        why = self._refusal(state)
+        if why is not None:
+            raise CrystalStoreError(why)
         if state['n_cond'] > self.n_cond:
             self.add_conditions(state['n_cond'] - self.n_cond)
         hw = int(state['counters']['high_water'])
-        if hw > self.max_rows:
-            raise CrystalStoreError(f'crystal store high_water {hw} above max_rows {self.max_rows}')
+        compact = state.get('seed_digest') is not None
+        first = int(state['counters']['n_seed_kept']) if compact else 0
         for name, _ in _COLUMNS:
-            getattr(self, name)[:hw] = state['columns'][name]
+            getattr(self, name)[first:hw] = state['columns'][name]
+        if compact:
+            for name in _SEED_MUTABLE:
+                getattr(self, name)[:first] = state['seed_columns'][name]
+        seed_best = self.best_energy
         for name in _TABLES:
             setattr(self, name, state['tables'][name].clone())
+        if compact:     # I6 over the seed energies this launch recomputed
+            self.best_energy = torch.minimum(self.best_energy, seed_best)
         self._floor_written = self.window_floor.clone()
         self.cond_stats = {k: v.clone() for k, v in state['cond_stats'].items()}
         self.base_seed = int(state['base_seed'])
@@ -1025,6 +1128,8 @@ class CrystalStore:
         self._n_kind, self._n_drawable = list(state['n_kind']), list(state['n_drawable'])
         self._n_undrawn = state['n_undrawn']
         self._anchor_rows = None
-        self.templates = state['templates']
+        if not compact:
+            self.templates = state['templates']
+            self._seed_digest = None
         self.rng = np.random.Generator(np.random.PCG64())
         self.rng.bit_generator.state = state['rng_state']
