@@ -83,7 +83,8 @@ def main():
     ap.add_argument('--kicks', type=int, default=300000, help='kicks per group')
     ap.add_argument('--log_range', type=float, nargs=2, default=(-2.0, -0.375), help='log10 Angstrom')
     ap.add_argument('--fit_frac', type=float, default=0.6, help='share of each group\'s anchors the kicks start from')
-    ap.add_argument('--max_anchors', type=int, default=20000)
+    ap.add_argument('--max_anchors', type=int, default=30000,
+                    help='most anchors kept per group after fit_frac; bounds the memory on a full-scale prior')
     a = ap.parse_args()
     prior = torch.load(a.prior, weights_only=False, map_location='cpu')['equalized_prior']
     layout = FDSlotLayout(tuple(a.groups))
