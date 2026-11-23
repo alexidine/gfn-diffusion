@@ -514,9 +514,46 @@ def test_invalidate_q_after_clears_only_later_writes():
     st.touch([b], st.epoch, [-4.0], [0.2], 8)
     st.touch([c], st.epoch, [-4.0], [0.2], 12)
     assert st.invalidate_q_after(8) == 1
-    assert int(st.q_step[c]) == -1 and torch.isnan(st.log_q[c]) and torch.isnan(st.resid[c])
+    assert float(st.log_q[c]) == -1.0 and int(st.q_step[c]) == 2 and torch.isnan(st.resid[c])
     assert float(st.log_q[b]) == -4.0 and int(st.q_step[b]) == 8 and int(st.q_step[a]) == 2
     assert float(st.log_q_birth[c]) == -1.0
+
+
+def test_invalidate_q_after_clears_a_touched_child():
+    st = make()
+    kid = int(st.draw(CHILD, 1)[0])
+    st.touch([kid], st.epoch, [-4.0], [0.2], 12)
+    assert st.invalidate_q_after(8) == 1
+    assert torch.isnan(st.log_q[kid]) and torch.isnan(st.resid[kid]) and int(st.q_step[kid]) == -1
+    st.check()
+
+
+def test_a_row_born_after_the_rewind_keeps_its_admission_log_q_and_a_repeat_changes_nothing():
+    st = make()
+    s = add_onpolicy(st, [0, 1], step=10, log_q=-2.0)
+    assert st.invalidate_q_after(5) == 2
+    assert st.log_q[s].tolist() == [-2.0, -2.0] and st.q_step[s].tolist() == [10, 10]
+    assert torch.isnan(st.resid[s]).all()
+    g = st.generation
+    assert st.invalidate_q_after(5) == 0 and st.generation == g
+
+
+def test_a_log_q_replay_rule_still_draws_after_a_rewind():
+    st = make()
+    s = add_onpolicy(st, [0, 0, 1, 1], step=10, log_q=-2.0)
+    st.touch(s, st.epoch, torch.full((4,), -3.0), torch.full((4,), 0.1), 12)
+    st.invalidate_q_after(5)
+    st.check()
+    rows, cor = st.draw_weighted(ONPOLICY, 64, lambda store, r, step: torch.exp(-store.log_q[r].double()), 13)
+    assert set(rows.tolist()) <= set(s.tolist()) and torch.isfinite(cor).all()
+
+
+def test_check_detects_a_drawable_onpolicy_row_without_log_q():
+    st = make()
+    s = add_onpolicy(st, [0])
+    st.log_q[s] = math.nan
+    with pytest.raises(CrystalStoreError, match='finite log_q'):
+        st.check()
 
 
 # ---- thinning ------------------------------------------------------------------------------------------------
@@ -852,8 +889,107 @@ def test_check_detects_a_corrupted_store():
                           (lambda s: s.flags.__setitem__(3, UNDRAWN), 'undrawn'),
                           (lambda s: s.window_floor.__setitem__(0, 5.0), 'I7'),
                           (lambda s: s.energy.__setitem__(3, -1e6), 'I6'),
-                          (lambda s: s.log_q_birth.__setitem__(3, 0.0), 'I12')):
+                          (lambda s: s.log_q_birth.__setitem__(3, 0.0), 'I12'),
+                          (lambda s: setattr(s, 'best_energy', torch.zeros(5)), 'table best_energy'),
+                          (lambda s: s.cond_stats.__setitem__('n', torch.zeros(5)), 'table n')):
         st = make()
         corrupt(st)
         with pytest.raises(CrystalStoreError, match=what):
             st.check()
+
+
+# ---- refused writes leave the store unchanged ------------------------------------------------------------------
+
+
+def _fingerprint(st):
+    return (st.n_cond, st.n_rows, st.high_water, st.n_free, st.epoch, st.generation, st.nonfinite_rows, st.thinned_total,
+            list(st._n_kind), list(st._n_drawable), st.best_energy.tolist(), st.tmpl_of.tolist(), len(st.cond_sg),
+            len(st.window_floor), len(st._floor_written), len(st.index.count), st.index.arena.size,
+            [s.pos.size for s in st.active], {k: tuple(v.shape) for k, v in st.cond_stats.items()},
+            None if st.templates is None else int(st.templates.num_graphs), repr(st.rng.bit_generator.state))
+
+
+def test_add_refuses_a_condition_with_no_template_and_changes_nothing():
+    st = make(max_rows=19, H=8)                     # 12 rows + 8 would thin, and -5 would lower the minimum
+    new = int(st.add_conditions(1)[0])
+    before = _fingerprint(st)
+    with pytest.raises(CrystalStoreError, match=f'conditions \\[{new}\\] have no template'):
+        st.add(torch.zeros(8, DIM), [0] * 7 + [new], ONPOLICY, ORIGIN_ROLLOUT, torch.zeros(8), torch.full((8,), -5.0), 1,
+               log_q=torch.zeros(8), resid=torch.zeros(8))
+    assert _fingerprint(st) == before
+    st.check()
+
+
+def test_a_nonfinite_row_of_a_condition_with_no_template_is_dropped_and_counted():
+    st = make()
+    new = int(st.add_conditions(1)[0])
+    got = st.add(torch.zeros(1, DIM), [new], ONPOLICY, ORIGIN_ROLLOUT, [math.nan], [1.0], 1, log_q=[0.0], resid=[0.0])
+    assert got.numel() == 0 and st.nonfinite_rows == 1 and float(st.best_energy[new]) == math.inf
+    st.check()
+
+
+def test_a_weight_sum_that_overflows_raises_naming_the_rule():
+    st = make()
+
+    def huge(store, rows, step):
+        return torch.full((rows.numel(),), 1.5e308, dtype=torch.float64)
+    with pytest.raises(CrystalStoreError, match="'huge'.*not finite"):
+        st.draw_weighted(CHILD, 32, huge, 0)
+
+
+def test_correction_is_exact_for_one_huge_weight():
+    st = make(spec=((1, 5),))
+    kids = torch.nonzero(st.kind[:st.high_water] == CHILD).flatten()
+
+    def one(store, rows, step):
+        return (rows == kids[0]).double() * 1.5e308
+    rows, cor = st.draw_weighted(CHILD, 16, one, 0)
+    assert (rows == kids[0]).all() and cor.tolist() == pytest.approx([0.2] * 16)
+
+
+@pytest.mark.parametrize('breaks', ['template', 'stat'])
+def test_a_failed_add_conditions_changes_nothing(breaks):
+    st = make()
+    st.cond_stats['seen'] = torch.zeros(2, dtype=torch.int32)
+    templates = _templates(2, first=2)
+    if breaks == 'template':
+        templates.radius = templates.radius[:1]
+    else:
+        st.cond_stats['bad'] = torch.tensor(1.0)
+    before = _fingerprint(st)
+    with pytest.raises((CrystalStoreError, RuntimeError, IndexError)):
+        st.add_conditions(2, templates)
+    assert _fingerprint(st) == before
+    if breaks == 'stat':
+        del st.cond_stats['bad']
+    st.check()
+
+
+def test_add_conditions_extends_every_cond_stats_dtype():
+    st = make()
+    st.cond_stats.update(seen=torch.ones(2, dtype=torch.int32), hit=torch.ones(2, dtype=torch.bool),
+                         spread=torch.ones((2, 3), dtype=torch.float32))
+    st.add_conditions(2, _templates(2, first=2))
+    assert st.cond_stats['seen'].tolist() == [1, 1, 0, 0] and st.cond_stats['seen'].dtype == torch.int32
+    assert st.cond_stats['hit'].tolist() == [True, True, False, False]
+    assert st.cond_stats['spread'].shape == (4, 3) and torch.isnan(st.cond_stats['spread'][2:]).all()
+    st.check()
+
+
+def test_round_trip_keeps_the_index_layout_and_compaction_count():
+    rng = np.random.default_rng(0)
+    st = make(spec=((2, 30), (1, 300), (1, 5)), max_rows=500, H=40, seed=5)
+    for i in range(30):
+        add_onpolicy(st, rng.integers(0, 3, 40).tolist(), step=i + 1)
+    assert st.index.compactions > 0
+    other = CrystalStore(DIM, 3, 500, 40, seed=77)
+    other.apply_state(st.state_dict())
+    other.check()
+    assert other.stats() == st.stats()
+    assert (other.index.start == st.index.start).all() and (other.index.cap == st.index.cap).all()
+    assert other.index.tail == st.index.tail
+    for i in range(300):
+        c = rng.integers(0, 3, 40).tolist()
+        assert torch.equal(add_onpolicy(st, c, step=100 + i), add_onpolicy(other, c, step=100 + i))
+        assert torch.equal(st.draw(CHILD, 16), other.draw(CHILD, 16))
+    assert other.stats() == st.stats()

@@ -35,11 +35,12 @@ Invariants, verified by check():
         raises on an empty pool.
     I10 touch refuses anchors, so no reward or log q column of an anchor is written after its seed.
     I11 max_rows >= n_anchors + 2 * headroom. add raises on a single add above headroom.
-    I12 log_q_birth is written once, at on-policy admission.
+    I12 log_q_birth is written once, at on-policy admission. A drawable on-policy row has a finite log_q and log_q_birth.
 
 The store owns one numpy Generator. It never reads or advances the global torch or numpy generators.
 
-This module imports math, numpy, torch and noised_prior only.
+This module imports math, numpy, torch and noised_prior at load. Joining template batches imports
+mxtaltools.dataset_utils.utils when called.
 """
 import math
 
@@ -80,6 +81,12 @@ def uniform(store, rows, step):
 
 #: rule(store, rows, step) -> [len(rows)] weights >= 0, or None for uniform within the condition
 REPLAY_WEIGHTS = {'uniform': uniform}
+
+
+def _blank_stat(t, k):
+    """k new entries of the cond_stats tensor t: NaN on a float tensor, zero on any other."""
+    shape = (k,) + tuple(t.shape[1:])
+    return torch.full(shape, math.nan, dtype=t.dtype) if t.is_floating_point() else torch.zeros(shape, dtype=t.dtype)
 
 
 def _ragged(starts, lens):
@@ -248,12 +255,10 @@ class PoolIndex:
         new[:self.tail] = self.arena[:self.tail]
         self.arena = new
 
-    def load(self, count, rows):
-        """Refill from each pool's count and its rows in pool order, keeping the order within each pool."""
-        self.count = count.copy()
-        self.cap = (self.count * 3) // 2 + MIN_POOL_CAP
-        self.start = np.cumsum(self.cap) - self.cap
-        self.tail = int(self.cap.sum())
+    def load(self, count, start, cap, tail, compactions, rows):
+        """Restore the saved layout and each pool's rows, given in pool order and in arena order within each pool."""
+        self.count, self.start, self.cap = count.copy(), start.copy(), cap.copy()
+        self.tail, self.compactions = int(tail), int(compactions)
         live = np.flatnonzero(self.count)
         k = self.count[live]
         self.arena[_ragged(self.start[live], k)] = rows
@@ -369,17 +374,22 @@ class CrystalStore:
         for k in range(N_KINDS):
             self._n_drawable[k] += int((kinds == k).sum())
 
-    def _set_templates(self, templates, template_cids, first_row=0):
-        """Point conditions template_cids at graphs first_row, first_row + 1, ... of self.templates, and fill their
-        tables from `templates`, whose graph i is the template of condition template_cids[i]."""
+    def _template_fields(self, templates):
+        """(space group, radius, radius of gyration) of each graph, one entry per graph."""
+        n = int(templates.num_graphs)
+        return (self._vec(templates.sg_ind, n, torch.int16, 'sg_ind'),
+                self._vec(templates.radius, n, torch.float32, 'radius'),
+                self._vec(NP.radius_of_gyration(templates), n, torch.float32, 'radius of gyration'))
+
+    def _set_templates(self, templates, template_cids):
+        """Point condition template_cids[i] at graph i of `templates` and fill its tables."""
         n = int(templates.num_graphs)
         tc = self._cids(template_cids)
         if tc.numel() != n or torch.unique(tc).numel() != n:
             raise CrystalStoreError(f'{n} templates need {n} distinct condition ids, got {tc.numel()}')
-        self.tmpl_of[tc] = torch.arange(first_row, first_row + n, dtype=torch.int32)
-        self.cond_sg[tc] = torch.as_tensor(templates.sg_ind).detach().cpu().reshape(-1).to(torch.int16)
-        self.cond_radius[tc] = torch.as_tensor(templates.radius).detach().cpu().reshape(-1).to(torch.float32)
-        self.cond_rg[tc] = NP.radius_of_gyration(templates).detach().cpu().to(torch.float32)
+        sg, radius, rg = self._template_fields(templates)
+        self.tmpl_of[tc] = torch.arange(n, dtype=torch.int32)
+        self.cond_sg[tc], self.cond_radius[tc], self.cond_rg[tc] = sg, radius, rg
 
     # ---- seeding --------------------------------------------------------------------
 
@@ -492,8 +502,9 @@ class CrystalStore:
             log_q=None, resid=None, eval_row=False, durable=True):
         """Write rows; returns the slots written, in input order. Rows with a non-finite x, log_r or energy are dropped
         and counted (nonfinite_rows). kind and origin: one value or one per row. log_q: required on on-policy rows,
-        refused elsewhere; an on-policy row with a non-finite log_q is stored UNDRAWN. best_energy is updated before any
-        thin. Thins first when the rows do not fit."""
+        refused elsewhere; an on-policy row with a non-finite log_q is stored UNDRAWN. A finite row of a condition with
+        no template raises before any write. best_energy is updated before any thin. Thins first when the rows do not
+        fit."""
         if not self.seeded:
             raise CrystalStoreError('add() before seed()')
         x = self._states(x)
@@ -526,6 +537,9 @@ class CrystalStore:
         finite = torch.isfinite(x).all(1) & torch.isfinite(log_r) & torch.isfinite(energy)
         at = torch.nonzero(finite).flatten()
         k = at.numel()
+        no_template = self.tmpl_of[cid[at]] < 0
+        if bool(no_template.any()):
+            raise CrystalStoreError(f'add: conditions {cid[at][no_template].unique()[:8].tolist()} have no template')
         new_anchors = int((kind[at] == ANCHOR).sum())
         if self.n_anchors + new_anchors + 2 * self.headroom > self.max_rows:
             raise CrystalStoreError(f'{self.n_anchors} + {new_anchors} anchors + 2 * headroom {self.headroom} exceed '
@@ -659,31 +673,33 @@ class CrystalStore:
 
     def add_conditions(self, k, templates=None):
         """Append k conditions with empty pools; returns their ids. templates: k graphs, in id order. Nothing is
-        renumbered."""
+        renumbered. A failure leaves the store unchanged."""
         k = int(k)
         if k < 1:
             raise CrystalStoreError(f'add_conditions takes k >= 1, got {k}')
         if templates is not None and int(templates.num_graphs) != k:
             raise CrystalStoreError(f'{int(templates.num_graphs)} templates for {k} new conditions')
         first = self.n_cond
-        for name, fill in (('tmpl_of', -1), ('cond_sg', -1), ('cond_radius', math.nan), ('cond_rg', math.nan),
-                           ('best_energy', math.inf), ('window_floor', math.inf)):
-            t = getattr(self, name)
-            setattr(self, name, torch.cat([t, torch.full((k,), fill, dtype=t.dtype)]))
-        self._floor_written = torch.cat([self._floor_written, torch.full((k,), math.inf, dtype=torch.float64)])
-        for name, t in self.cond_stats.items():
-            self.cond_stats[name] = torch.cat([t, torch.full((k,) + tuple(t.shape[1:]), math.nan, dtype=t.dtype)])
+        grown = {name: torch.cat([getattr(self, name), torch.full((k,), fill, dtype=getattr(self, name).dtype)])
+                 for name, fill in (('tmpl_of', -1), ('cond_sg', -1), ('cond_radius', math.nan), ('cond_rg', math.nan),
+                                    ('best_energy', math.inf), ('window_floor', math.inf), ('_floor_written', math.inf))}
+        stats = {name: torch.cat([t, _blank_stat(t, k)]) for name, t in self.cond_stats.items()}
+        joined = self.templates
+        if templates is not None:
+            old = 0 if self.templates is None else int(self.templates.num_graphs)
+            sg, radius, rg = self._template_fields(templates)
+            joined = templates if self.templates is None else self._join_templates(self.templates, templates)
+            grown['tmpl_of'][first:] = torch.arange(old, old + k, dtype=torch.int32)
+            grown['cond_sg'][first:], grown['cond_radius'][first:], grown['cond_rg'][first:] = sg, radius, rg
         self.index.grow(N_KINDS * k)
         for s in self.active:
             s.grow(k)
+        for name, t in grown.items():
+            setattr(self, name, t)
+        self.cond_stats, self.templates = stats, joined
         self.n_cond += k
-        ids = torch.arange(first, first + k, dtype=torch.long)
-        if templates is not None:
-            old = 0 if self.templates is None else int(self.templates.num_graphs)
-            self.templates = templates if self.templates is None else self._join_templates(self.templates, templates)
-            self._set_templates(templates, ids, first_row=old)
         self.generation += 1
-        return ids
+        return torch.arange(first, first + k, dtype=torch.long)
 
     @staticmethod
     def _join_templates(old, new):
@@ -734,8 +750,8 @@ class CrystalStore:
         (a subtype draw) and reads every pool of `kind`. is_correction = 1 / (n_c p), the uniform-within-condition law
         over the draw law, with n_c the condition's eligible rows: exactly 1 under the uniform rule.
 
-        A non-finite or negative weight on an eligible row raises. A condition whose eligible weights are all zero
-        draws uniformly among its eligible rows."""
+        A non-finite or negative weight on an eligible row raises, and so does a condition whose weight sum is not
+        finite. A condition whose eligible weights are all zero draws uniformly among its eligible rows."""
         kind, B = self._check_kind(kind), int(B)
         if B < 1:
             raise CrystalStoreError(f'draw size must be >= 1, got {B}')
@@ -777,6 +793,9 @@ class CrystalStore:
                 raise CrystalStoreError(f'weight rule {rule!r} gave weight {w[at]} to slot {int(flat[at])}')
         n_c = np.bincount(group, weights=ok.astype(np.float64), minlength=len(uc))
         tot = np.bincount(group, weights=w, minlength=len(uc))
+        if not np.isfinite(tot).all():
+            at = int(np.flatnonzero(~np.isfinite(tot))[0])
+            raise CrystalStoreError(f'weight rule {rule!r} gave condition {int(uc[at])} a weight sum that is not finite')
         zero = tot <= 0
         if zero.any():
             fill = zero[group] & ok
@@ -792,7 +811,7 @@ class CrystalStore:
         target = base[inv] + self.rng.random(B) * (top[inv] - base[inv])
         pick = np.minimum(np.searchsorted(cum, target, side='right'), last[inv])
         g = group[pick]
-        correction = tot[g] / (n_c[g] * w[pick])
+        correction = tot[g] / w[pick] / n_c[g]
         return torch.from_numpy(flat[pick]), torch.from_numpy(correction).to(torch.float32)
 
     def mol_batch(self, cids, repeats=1):
@@ -810,8 +829,8 @@ class CrystalStore:
 
     def touch(self, rows, epoch, log_q, resid, step):
         """After a training draw: draws += occurrences; log_q, resid and q_step take the last occurrence with a finite
-        log_q and resid. Writes nothing under another epoch and returns the rows whose log_q was written. Refuses
-        anchors. Never writes log_q_birth."""
+        log_q and resid. Returns the number of rows whose log_q was written: 0 under another epoch, which writes nothing.
+        Refuses anchors. Never writes log_q_birth."""
         if epoch != self.epoch:
             return 0
         rows = self._rows(rows)
@@ -844,13 +863,17 @@ class CrystalStore:
         return written
 
     def invalidate_q_after(self, step):
-        """log_q and resid become NaN and q_step -1 on live rows written after `step`; returns how many."""
+        """Undo log q writes after `step` on live rows. resid becomes NaN. A row with a finite log_q_birth returns to it
+        with q_step = birth_step; any other row gets NaN and -1. Returns how many rows changed."""
         hw = self.high_water
-        hit = torch.nonzero((self.q_step[:hw] > int(step)) & (self.kind[:hw] != FREE)).flatten()
+        at_admission = (self.q_step[:hw] == self.birth_step[:hw]) & torch.isnan(self.resid[:hw])
+        hit = torch.nonzero((self.q_step[:hw] > int(step)) & (self.kind[:hw] != FREE) & ~at_admission).flatten()
         if hit.numel():
-            self.log_q[hit] = math.nan
+            birth = self.log_q_birth[hit]
+            self.log_q[hit] = birth
             self.resid[hit] = math.nan
-            self.q_step[hit] = -1
+            self.q_step[hit] = torch.where(torch.isfinite(birth), self.birth_step[hit],
+                                           torch.full((hit.numel(),), -1, dtype=torch.int32))
             self.generation += 1
         return hit.numel()
 
@@ -881,6 +904,11 @@ class CrystalStore:
                 raise CrystalStoreError(f'store check failed: {what}')
 
         hw = self.high_water
+        for name in _TABLES + ('_floor_written',):
+            need(len(getattr(self, name)) == self.n_cond, f'table {name} does not have n_cond entries')
+        for name, t in self.cond_stats.items():
+            need(t.dim() >= 1 and len(t) == self.n_cond, f'table {name} does not have n_cond entries')
+        need(all(s.pos.size == self.n_cond for s in self.active), 'an active set does not have n_cond entries')
         need(0 <= self.n_free <= hw <= self.max_rows, 'I5: free stack or high water out of range')
         kinds = self.kind[:hw].numpy()
         flags = self.flags[:hw].numpy()
@@ -939,7 +967,8 @@ class CrystalStore:
         need(bool(torch.isnan(self.log_q_birth[:hw][not_on]).all()), 'I12: log_q_birth on a non on-policy row')
         drawn_on = torch.from_numpy(live & (kinds == ONPOLICY) & ~undrawn)
         need(bool(torch.isfinite(self.log_q_birth[:hw][drawn_on]).all()),
-             'a drawable on-policy row has no finite log_q_birth')
+             'I12: a drawable on-policy row has no finite log_q_birth')
+        need(bool(torch.isfinite(self.log_q[:hw][drawn_on]).all()), 'I12: a drawable on-policy row has no finite log_q')
 
     # ---- persistence ----------------------------------------------------------------
 
@@ -954,6 +983,9 @@ class CrystalStore:
                 'cond_stats': {k: v.clone() for k, v in self.cond_stats.items()},
                 'free': torch.from_numpy(self._free[:self.n_free].copy()),
                 'index_count': torch.from_numpy(self.index.count.copy()),
+                'index_start': torch.from_numpy(self.index.start.copy()),
+                'index_cap': torch.from_numpy(self.index.cap.copy()),
+                'index_tail': self.index.tail, 'index_compactions': self.index.compactions,
                 'index_rows': torch.from_numpy(self.index.rows_of(pools)),
                 'active': [torch.from_numpy(s.members().copy()) for s in self.active],
                 'counters': {name: getattr(self, name) for name in _COUNTERS},
@@ -986,7 +1018,8 @@ class CrystalStore:
             setattr(self, name, state['counters'][name])
         free = state['free'].numpy()
         self._free[:len(free)] = free
-        self.index.load(state['index_count'].numpy(), state['index_rows'].numpy())
+        self.index.load(state['index_count'].numpy(), state['index_start'].numpy(), state['index_cap'].numpy(),
+                        state['index_tail'], state['index_compactions'], state['index_rows'].numpy())
         for s, members in zip(self.active, state['active']):
             s.load(members.numpy())
         self._n_kind, self._n_drawable = list(state['n_kind']), list(state['n_drawable'])
