@@ -1,5 +1,5 @@
 """Phase 2 on the crystal store (train.py Modeller._store_admit, _admit_eval_rollout, _store_heldout_panel,
-_store_check_currency, _store_restore_state, _store_rewind), on a Modeller built without __init__ around a real
+_store_check_currency, _store_seed_keep, _store_rewind), on a Modeller built without __init__ around a real
 CrystalStore. CPU, no energy computed but a stub's.
 
     python -m pytest -q tests/crystal/test_store_tb.py
