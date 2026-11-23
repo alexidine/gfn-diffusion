@@ -61,6 +61,66 @@ def test_store_absent_or_off_judges_nothing(mk_dev):
     assert _msgs(cfg) == []
 
 
+@pytest.mark.parametrize('block', [{'enabled': False, 'not_a_key': 1}, {'not_a_key': 1},
+                                   {'enabled': 'true', 'not_a_key': 1}, {'enabled': 1, 'not_a_key': 1},
+                                   {'enabled': None, 'not_a_key': 1}])
+def test_a_block_not_enabled_is_not_inspected(mk_dev, block):
+    cfg = copy.deepcopy(mk_dev)
+    cfg['buffers']['store'] = block
+    assert ci.row_store_settings(cfg) is None
+    assert ci.row_store_problems(cfg) == []
+    assert _msgs(cfg) == []
+
+
+def test_a_namespace_block_not_enabled_is_not_inspected():
+    from types import SimpleNamespace
+    ns = SimpleNamespace(buffers=SimpleNamespace(store=SimpleNamespace(enabled=False, not_a_key=1)))
+    assert ci.row_store_settings(ns) is None
+
+
+def test_an_enabled_block_still_refuses_an_unknown_key():
+    with pytest.raises(ValueError, match='unknown keys'):
+        ci.row_store_settings({'buffers': {'store': {'enabled': True, 'not_a_key': 1}}})
+
+
+def test_new_store_keys_and_their_defaults(mk_dev):
+    new = {'ram_gb': None, 'ram_frac': 0.5, 'mle_draw': 'anchor', 'replay_weight': 'uniform'}
+    assert {k: ci.ROW_STORE_DEFAULTS[k] for k in new} == new
+    assert {k: mk_dev['buffers']['store'][k] for k in new} == new
+    assert mk_dev['buffers']['store']['enabled'] is False
+
+
+@pytest.mark.parametrize('ram_gb,ndim,frac,rows', [(224, 12, 0.5, 595342001), (16, 12, 0.5, 42524428),
+                                                   (224, 12, 1.0, 1190684002), (10 ** 6, 12, 0.5, 2 ** 31 - 1)])
+def test_store_row_limit(ram_gb, ndim, frac, rows):
+    assert ci.store_row_limit(ram_gb, ndim, frac) == rows
+
+
+def test_store_row_limit_default_share_and_dimension():
+    assert ci.store_row_limit(224, 12) == ci.store_row_limit(224, 12, ci.ROW_STORE_DEFAULTS['ram_frac'])
+    assert ci.store_row_limit(224, 24) < ci.store_row_limit(224, 12)
+
+
+def test_store_row_limit_counts_the_store_allocation():
+    """The per-slot bytes store_row_limit charges for the columns and index are what CrystalStore allocates."""
+    from energy_sampling import crystal_store as cs
+    ndim, slots, n_cond = 12, 1000, 3
+    st = cs.CrystalStore(ndim, n_cond, slots, 5)
+    columns = sum(getattr(st, name).numel() * getattr(st, name).element_size() for name, _ in cs._COLUMNS)
+    assert columns == slots * (4 * ndim + 43)
+    pool_slack = cs.MIN_POOL_CAP * cs.N_KINDS * n_cond * st.index.arena.itemsize
+    assert st.index.where.nbytes + st.index.arena.nbytes - pool_slack + st._free.nbytes == 16 * slots
+    assert cs.MAX_ROWS_LIMIT == 2 ** 31 - 1
+
+
+def test_store_row_limit_needs_no_torch():
+    import ast
+    tree = ast.parse(pathlib.Path(ci.__file__).read_text(encoding='utf-8'))
+    imported = {a.name.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    imported |= {(n.module or '').split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    assert 'torch' not in imported
+
+
 def test_store_on_nf_is_clean(mk_dev):
     assert _msgs(_on(mk_dev)) == []
 

@@ -1494,26 +1494,37 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
 
 
 #: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
-#: An absent key reads its default; an unknown key is refused.
+#: On an enabled block an absent key reads its default and an unknown key is refused. A disabled block is not read.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
                           eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, is_exponent=1.0,
-                          refresh_chunk=8192)
+                          refresh_chunk=8192, ram_gb=None, ram_frac=0.5, mle_draw='anchor', replay_weight='uniform')
 #: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
 ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
 
 
 def row_store_settings(node) -> Optional[dict]:
     """buffers.store merged over ROW_STORE_DEFAULTS when its `enabled` is true, else None. `node` is a raw config dict
-    or the trainer's Namespace. Raises on unknown keys."""
+    or the trainer's Namespace. Raises on unknown keys of an enabled block; a block not enabled is not inspected."""
     st = _member(_member(node, 'buffers'), 'store')
     if st is None:
         return None
     st = dict(st) if isinstance(st, dict) else dict(vars(st))
+    if st.get('enabled', ROW_STORE_DEFAULTS['enabled']) is not True:
+        return None
     unknown = sorted(set(st) - set(ROW_STORE_DEFAULTS))
     if unknown:
         raise ValueError(f"buffers.store: unknown keys {unknown} (known: {sorted(ROW_STORE_DEFAULTS)})")
-    s = {**ROW_STORE_DEFAULTS, **st}
-    return s if s['enabled'] is True else None
+    return {**ROW_STORE_DEFAULTS, **st}
+
+
+def store_row_limit(ram_gb, data_ndim, ram_frac=0.5) -> int:
+    """The most rows a crystal_store.CrystalStore may hold in `ram_frac` of `ram_gb` GiB, capped at its int32 slot limit.
+
+    Bytes per slot at the peak, a sidecar write: the columns (4 data_ndim + 43) and their clone in
+    CrystalStore.state_dict, 16 of index (PoolIndex.where 4, PoolIndex.arena 8, the free stack 4), and 4 for the
+    state_dict copy of the index order."""
+    bytes_per_row = 2 * (4 * data_ndim + 43) + 16 + 4
+    return min(int(ram_frac * ram_gb * 2 ** 30 / bytes_per_row), 2 ** 31 - 1)
 
 
 def _real(v) -> bool:
@@ -1624,6 +1635,14 @@ def row_store_is_well_formed(cfg: dict) -> list[Violation]:
     return [Violation(sev, 'row_store_is_well_formed', msg) for sev, msg in row_store_problems(canonical_model_section(cfg))]
 
 
+def _z_head_pinned_by_sidecar(cfg: dict, stage: dict, mode: str) -> bool:
+    """True for a bwd or replay branch whose resolved coefficients run TB against a detached Z (tb > 0, freeze_z > 0.5)
+    on a stage with fwd_z_sidecar, where the forward emp_z term fits the Z(c) head on fresh rollouts."""
+    return (stage.get('fwd_z_sidecar') is True and mode in ('bwd', 'replay')
+            and (_coeff(cfg, stage, mode, 'tb') or 0) > 0
+            and (_coeff(cfg, stage, mode, 'freeze_z') or 0) > 0.5)
+
+
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     """Three Z-side keys are documented as UNCONDITIONAL-route settings and must
     be switched when the route is conditional.
@@ -1663,7 +1682,10 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     conditional ones resolved to the F-042 detonation regime, because their
     generator wrote `persistent` into the pre-migration home where nothing reads
     it. A rule that passes the exact config it was written to catch is not a
-    conservative rule, it is a broken one."""
+    conservative rule, it is a broken one.
+
+    A stated or inherited `learned` is not reported on a branch for which
+    _z_head_pinned_by_sidecar holds. An unset tb_z_source is reported there too."""
     conditional = any(_get(cfg, k) is True for k in
                       ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning'))
     if not conditional:
@@ -1725,7 +1747,7 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
                     f'NOWHERE on a CONDITIONAL route, so it resolves to the code '
                     f'fallback `learned` (train.py:1105){where}. Every battery that ran '
                     f'used `persistent` ({src}). Set it in that stage\'s loss_coeffs.'))
-            elif eff == 'learned':
+            elif eff == 'learned' and not _z_head_pinned_by_sidecar(cfg, st, mode):
                 out.append(Violation(
                     BASELINE, 'conditional_z_settings_are_conditional',
                     f"stage '{st.get('name')}' resolves {mode}_loss_coeffs.tb_z_source "

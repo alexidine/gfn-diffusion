@@ -819,6 +819,89 @@ def test_inherited_tb_z_source_fires_at_its_state6_home(canonical, branch):
     assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
 
 
+def _sidecar_pinned(canonical):
+    """The conditional route with bwd and replay on ordinary TB against the learned head, detached, on the stage whose
+    forward sidecar fits that head."""
+    cfg = _conditional(canonical)
+    stage = _vg_stage(cfg)
+    assert stage['fwd_z_sidecar'] is True, 'precondition: the stage carries the sidecar'
+    for branch in ('bwd', 'replay'):
+        stage['loss_coeffs'][branch].update(tb=1.0, freeze_z=1.0, tb_z_source='learned')
+    return cfg
+
+
+def _z_rule(cfg):
+    return _fired(cfg, 'conditional_z_settings_are_conditional')
+
+
+def test_learned_is_accepted_on_a_detached_tb_branch_of_a_sidecar_stage(canonical):
+    assert _z_rule(_sidecar_pinned(canonical)) == []
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_without_a_tb_term_still_fires(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch]['tb'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and vs[0].severity == BASELINE and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_with_z_not_detached_still_fires(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch]['freeze_z'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and vs[0].severity == BASELINE and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_absent_tb_z_source_still_fires_on_a_pinned_branch(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch].pop('tb_z_source')
+    cfg[f'{branch}_loss_coeffs'].pop('tb_z_source')
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'NOWHERE' in vs[0].detail
+
+
+def test_learned_without_the_sidecar_still_fires(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['fwd_z_sidecar'] = False
+    assert len(_z_rule(cfg)) == 2
+
+
+def test_learned_on_a_live_fwd_branch_of_a_sidecar_stage_still_fires(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['fracs']['fwd'] = 0.1
+    _vg_stage(cfg)['loss_coeffs']['fwd']['tb_z_source'] = 'learned'
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'fwd_loss_coeffs' in vs[0].detail
+
+
+def test_the_pin_reads_coefficients_inherited_from_the_base_block(canonical):
+    """A stage without its own tb or freeze_z runs the base block's (StageProtocol.coeffs)."""
+    cfg = _sidecar_pinned(canonical)
+    lc = _vg_stage(cfg)['loss_coeffs']
+    lc['replay'].pop('tb'), lc['replay'].pop('freeze_z')
+    assert cfg['replay_loss_coeffs']['tb'] > 0 and cfg['replay_loss_coeffs']['freeze_z'] > 0.5
+    assert _z_rule(cfg) == []
+
+    cfg['replay_loss_coeffs']['freeze_z'] = 0.0
+    assert len(_z_rule(cfg)) == 1
+
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd'].pop('tb')
+    assert cfg['bwd_loss_coeffs']['tb'] == 0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'bwd_loss_coeffs' in vs[0].detail
+
+
+def test_learned_inherited_from_the_base_block_is_pinned_the_same(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd'].pop('tb_z_source')
+    assert cfg['bwd_loss_coeffs']['tb_z_source'] == 'learned'
+    assert _z_rule(cfg) == []
+
+
 def test_a_branch_the_stage_does_not_train_is_not_flagged(canonical):
     """The narrowness is load-bearing, not incidental. The rule judges only the
     branches a stage's fracs train, and `var_conditioning` zeroes the fwd frac
