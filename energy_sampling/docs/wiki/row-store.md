@@ -67,11 +67,15 @@ Headroom $H$ (`Modeller._store_headroom`) is the largest single add: the largest
 | rows | stored | drawable |
 |---|---|---|
 | training rollout | yes | yes |
-| eval scored in a stage with `buffers_active` | yes, `EVAL` | yes |
+| eval rows drawn to fill the rollout pool's shortfall, in a stage with `buffers_active` | yes, `EVAL` | yes |
 | eval scored in any other stage, the one that ends MLE included | yes, `EVAL` | no |
 | `bootstrap_z:offset` at stage entry | yes, `EVAL`, `ORIGIN_BOOTSTRAP` | no |
 
 *How each kind of on-policy rollout enters the store. `evaluation` reads `buffers_active` before `protocol.maybe_advance`, so rows are judged by the stage that scored them.*
+
+In a `buffers_active` stage the eval's on-policy statistics read `Modeller._eval_pool`, a `crystal_store.py::RolloutPool` of the trailing $N$ = `cfg:eval_num_samples` rows of training rollouts. `Modeller._store_admit` feeds it through `Modeller._eval_pool_add`, from `ORIGIN_ROLLOUT` rows only. It is held on the CPU and trimmed at row level when read, so the set is always $N$ rows and its age varies with the batch size and `cfg:stage.fwd_rollout_every`. `Modeller._eval_forward_rows` reads it, `Modeller._pool_eval_stats` shapes the rows as an eval's (each row's `log_flow` is the level it was scored with, the Gaussian diagnostics the NF policy's constant zeros) and `Modeller._fwd_eval_summary` computes the pooled summary, the same function a fresh draw goes through. Pool rows are not written to the store again and make no floor or tracker update: the rollout that scored them did both.
+
+A shortfall (the start of a stage, or after a rewind or resume, since the pool is not checkpointed) is drawn fresh by `Modeller.fwd_eval_sampling`, so an eval never waits on the pool. Those rows take a fresh eval's treatment, floor updates included, and are stored as drawable `EVAL` rows. The pool is cleared on a rewind (`Modeller._store_rewind`) and at every stage transition. `Modeller._eval_pool_refusal` makes the eval draw every row fresh, printing the reason once, under `exploration_std` above 0, `rotate_frames` or `mirror_frames`, a `drift_force` provider, or `z_calibration.fill_from_eval` on a head it can fill. The held-out panel, backward and density readouts, cross-condition readouts and figures run as they do without the pool, and a stage without `buffers_active` draws its eval fresh.
 
 The held-out molecules are read through a fixed panel (`Modeller._store_heldout_panel`): $\min(\lfloor n / (2 n_{sg}) \rfloor, \text{test molecules})$ molecules, at least one, for $n$ = `cfg:test_eval_num_samples`, chosen once from `cfg:seed`, each scored twice in every space group of the run. Those rows are not stored.
 
@@ -83,7 +87,7 @@ A kick outside the packing window, or whose seed energy (`MolecularCrystal.seed_
 
 ## Rewind and resume
 
-The divergence rewind calls `Modeller._store_rewind`, which runs `CrystalStore.invalidate_q_after` at the checkpoint's step: a row's `log_q` written after it returns to its birth value, or to NaN. No per-eval refresh of stored $\log q$ exists on this route.
+The divergence rewind calls `Modeller._store_rewind`, which runs `CrystalStore.invalidate_q_after` at the checkpoint's step: a row's `log_q` written after it returns to its birth value, or to NaN. It also clears the eval's rollout pool. No per-eval refresh of stored $\log q$ exists on this route.
 
 ## Monitoring
 
@@ -100,6 +104,8 @@ The divergence rewind calls `Modeller._store_rewind`, which runs `CrystalStore.i
 | `store/rows_out_of_box` | on-policy rows written with a coordinate outside $[-1, 1]$ | rows |
 | `store/best_energy_median` | median, over conditions with a finite store minimum, of the lowest physical `mol_energy` stored from any source | `mol_energy` units |
 | `sg<g>/store_share` | share of live rows in space group g, on a run over several groups | fraction |
+| `eval/pool_rows`, `eval/pool_fresh_rows` | this eval's rows read from the rollout pool; rows it drew fresh | rows |
+| `eval/pool_oldest_age_steps` | steps since the oldest rollout read by this eval; NaN when it read none | steps |
 
 *The store's readouts; each is a counter over the run so far unless named a share or a median.*
 
@@ -117,7 +123,7 @@ Under `cfg:smoke`, `Modeller._store_check_currency` re-scores up to `Modeller.ST
 
 `cfg:buffers.store.{enabled, ram_gb, ram_frac, mle_draw, replay_weight}`, `cfg:noised_prior.{live_kernel, train_kinds, window_kT, window_by, packing_window, live_log_range, live_redraws}`, `cfg:buffers.anchor_buffer.seed_floors_only`, `cfg:stage.fwd_rollout_every`, `cfg:eval_num_samples`, `cfg:test_eval_num_samples`, `cfg:batch_size`.
 
-Code: `crystal_store.py::CrystalStore.seed`, `.add`, `.thin`, `.draw`, `.draw_anchors`, `.draw_weighted`, `.mol_batch`, `.touch`, `.invalidate_q_after`, `.stats`, `.check`, `.state_dict`, `.apply_state`; `train.py::Modeller.store_settings`, `._store_take_rows`, `._store_frame_check`, `._store_after_identifiers`, `._store_headroom`, `.init_row_store`, `._store_warm_tracker`, `._store_rewind`, `._kick_anchors`, `._kick_fresh`, `._store_replay_rows`, `._store_draw`, `._store_touch`, `._store_admit`, `._replay_rows`, `._store_condition_batch`, `._store_heldout_panel`, `._growth_kicks_due`, `._store_grow`, `._store_check_currency`, `._store_metrics`; `config_invariants.py::row_store_settings`, `::store_row_limit`, `::row_store_problems`, `::row_store_is_well_formed`.
+Code: `crystal_store.py::CrystalStore.seed`, `.add`, `.thin`, `.draw`, `.draw_anchors`, `.draw_weighted`, `.mol_batch`, `.touch`, `.invalidate_q_after`, `.stats`, `.check`, `.state_dict`, `.apply_state`; `crystal_store.py::RolloutPool`; `train.py::Modeller.store_settings`, `._store_take_rows`, `._store_frame_check`, `._store_after_identifiers`, `._store_headroom`, `.init_row_store`, `._store_warm_tracker`, `._store_rewind`, `._kick_anchors`, `._kick_fresh`, `._store_replay_rows`, `._store_draw`, `._store_touch`, `._store_admit`, `._replay_rows`, `._store_condition_batch`, `._store_heldout_panel`, `._growth_kicks_due`, `._store_grow`, `._store_check_currency`, `._store_metrics`, `._eval_pool_add`, `._eval_pool_refusal`, `._pool_eval_stats`, `._eval_forward_rows`, `._fwd_eval_summary`; `config_invariants.py::row_store_settings`, `::store_row_limit`, `::row_store_problems`, `::row_store_is_well_formed`.
 
 ## Could be tooling
 
@@ -125,4 +131,4 @@ The store's columns are enough to tabulate rows per condition, kind and origin, 
 
 ## Sources
 
-Repo: `energy_sampling/crystal_store.py`, `energy_sampling/train.py`, `energy_sampling/noised_prior.py`, `energy_sampling/physical_kick.py`, `energy_sampling/config_invariants.py`, `energy_sampling/gflownet_losses.py` and the `buffers.store` block of the canonical config, read at the stamped commit with the change that wires the store in. Tests: `tests/crystal/test_crystal_store.py`, `tests/crystal/test_row_store_trainer.py`, `tests/crystal/test_store_tb.py`, `tests/crystal/test_store_growth.py`, `tests/config/test_row_store_invariants.py`.
+Repo: `energy_sampling/crystal_store.py`, `energy_sampling/train.py`, `energy_sampling/noised_prior.py`, `energy_sampling/physical_kick.py`, `energy_sampling/config_invariants.py`, `energy_sampling/gflownet_losses.py` and the `buffers.store` block of the canonical config, read at the stamped commit with the change that wires the store in. Tests: `tests/crystal/test_crystal_store.py`, `tests/crystal/test_row_store_trainer.py`, `tests/crystal/test_store_tb.py`, `tests/crystal/test_store_growth.py`, `tests/crystal/test_eval_pool.py`, `tests/config/test_row_store_invariants.py`.

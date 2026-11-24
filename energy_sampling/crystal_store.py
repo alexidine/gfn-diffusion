@@ -296,6 +296,55 @@ class PoolIndex:
         self.where[rows] = (np.arange(len(rows), dtype=np.int64) - np.repeat(np.cumsum(k) - k, k)).astype(np.int32)
 
 
+class RolloutPool:
+    """The trailing n rows of on-policy training rollouts, oldest first, as a list of chunks on the CPU. A chunk is
+    (step, per-row tensors, crystal batch) and is dropped once the chunks after it hold n rows, so the pool holds fewer
+    than n + one chunk's rows. Nothing here reads the store."""
+
+    def __init__(self, n):
+        self.n = int(n)
+        if self.n < 1:
+            raise CrystalStoreError(f'a rollout pool needs n >= 1, got {n}')
+        self._chunks = []
+        self.rows = 0
+
+    def clear(self):
+        self._chunks, self.rows = [], 0
+
+    def _first_rows(self):
+        return next(iter(self._chunks[0][1].values())).shape[0]
+
+    def add(self, rows, batch, step):
+        """rows: name -> [k, ...] tensor, detached to the CPU here; batch: the k crystals, row for row."""
+        rows = {name: t.detach().cpu() for name, t in rows.items()}
+        k = int(batch.num_graphs)
+        if any(t.shape[0] != k for t in rows.values()):
+            raise CrystalStoreError(f'pool chunk: {k} crystals but columns of {sorted({t.shape[0] for t in rows.values()})} '
+                                    f'rows')
+        if k == 0:
+            return
+        self._chunks.append((int(step), rows, batch))
+        self.rows += k
+        while self.rows - self._first_rows() >= self.n:
+            self.rows -= self._first_rows()
+            self._chunks.pop(0)
+
+    def read(self, join):
+        """(rows, batch, step of the oldest chunk read) for the newest min(n, held) rows, oldest first, or
+        (None, None, None) when empty. join(list of batches) -> one batch. The batch returned is a copy."""
+        if not self._chunks:
+            return None, None, None
+        drop = self.rows - self.n
+        if drop > 0:
+            step, rows, batch = self._chunks[0]
+            keep = torch.arange(drop, self._first_rows())
+            self._chunks[0] = (step, {name: t[keep] for name, t in rows.items()}, batch.subsample_new_batch(keep))
+            self.rows = self.n
+        names = list(self._chunks[0][1])
+        out = {name: torch.cat([c[1][name] for c in self._chunks]) for name in names}
+        return out, join([c[2] for c in self._chunks]).clone(), self._chunks[0][0]
+
+
 class CrystalStore:
     """See the module docstring. `headroom` is H of I11, the largest single add."""
 

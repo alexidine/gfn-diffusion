@@ -9123,6 +9123,7 @@ class Modeller:
         self._store_cfg = s
         self._growth_owed = 0
         self._store_growth = dict(kicks=0, unchanged=0, scored=0, in_window=0, out_of_box=0)
+        self._eval_pool = crystal_store.RolloutPool(int(self.args.eval_num_samples))
         self._physical['gen'] = torch.Generator().manual_seed(int(self.args.seed) + int(getattr(self, 'step_ind', 0)))
         self._store_warm_tracker(cid, log_r)
         if self.checkpointer.restore_row_store(self.row_store):     # a sidecar can hold rows its checkpoint never saw
@@ -9171,7 +9172,11 @@ class Modeller:
         return keep
 
     def _store_rewind(self, checkpoint_step):
-        """A rewind to `checkpoint_step`: log q written after it no longer describes the restored weights."""
+        """A rewind to `checkpoint_step`: log q written after it no longer describes the restored weights, and the
+        eval's rollout pool holds rows of the discarded policy."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is not None:
+            pool.clear()
         return self.row_store.invalidate_q_after(int(checkpoint_step))
 
     def _kick_anchors(self, rows):
@@ -9291,7 +9296,79 @@ class Modeller:
                          eval_row=eval_row, durable=durable)
         if origin == ORIGIN_ROLLOUT:
             self._growth_owed += int(written.numel())
+            self._eval_pool_add(fwd_stats, sample_batch)
         return written
+
+    def _eval_pool_add(self, fwd_stats, sample_batch):
+        """A training rollout of a buffers_active stage into the eval's trailing pool: every row it scored, each with the
+        level log_Z it was scored against."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is None or not self.protocol.flag('buffers_active'):
+            return
+        rows = {k: fwd_stats[k].detach().flatten() for k in ('log_r', 'log_pf', 'log_pb', 'log_Z', 'condition_id',
+                                                             'log_T_tensor')}
+        rows['flow_states'] = fwd_stats['flow_states'].detach()
+        pool.add(rows, sample_batch, int(self.step_ind))
+
+    def _eval_pool_refusal(self):
+        """Why this eval draws fresh instead of reading the rollout pool, or None. The rollouts are not samples of the
+        eval target under exploration noise or random frames; a force readout scores the eval's own draw; a z_calibration
+        eval fill on a fillable head takes the eval rows as a sample of the current policy."""
+        if float(getattr(self.args.fwd_loss_coeffs, 'exploration_std', 0.0) or 0.0) > 0:
+            return 'fwd_loss_coeffs.exploration_std > 0 (rollouts are off-policy)'
+        if getattr(self.gfn_model, '_framed', False):
+            return 'rotate_frames or mirror_frames (rollouts draw random frames, the eval reads the standard frame)'
+        if getattr(self, 'drift_force', None) is not None:
+            return 'drift_force (its readout scores the eval draw)'
+        cfg = getattr(self.args, 'z_calibration', None)
+        if str(getattr(cfg, 'fill_from_eval', 'off') or 'off') != 'off' and self._z_fill_head_is_fillable():
+            return 'z_calibration.fill_from_eval on a fillable head (it reads the eval rows as the current policy)'
+        return None
+
+    def _pool_eval_stats(self, rows):
+        """The eval's per-row keys from pool rows. log_flow is [level, 0], each row keeping the level it was scored with;
+        the Gaussian diagnostics are the NF policy's constant zeros."""
+        n = rows['log_r'].shape[0]
+        log_flow = torch.zeros(n, 2, dtype=rows['log_Z'].dtype)
+        log_flow[:, 0] = rows['log_Z']
+        stats = {k: rows[k] for k in ('flow_states', 'log_r', 'log_pf', 'log_pb', 'log_T_tensor', 'condition_id')}
+        stats.update(log_pfs=rows['log_pf'][:, None], log_pbs=rows['log_pb'][:, None], log_flow=log_flow,
+                     temperature=(self.energy_function.temperature * torch.ones(n, dtype=torch.float32)).cpu())
+        stats.update({k: torch.zeros(n, 1) for k in self.gfn_model.GAUSS_PARAM_KEYS})
+        return stats
+
+    def _eval_forward_rows(self, eval_discretizer):
+        """(stats, crystal batch, fresh, readouts) of the eval's on-policy rows. fresh: the (stats, batch) drawn and
+        scored by this eval, which evaluation() admits; None when every row came from the pool. A buffers_active stage on
+        the store route reads the trailing eval_num_samples rollout rows and draws only the shortfall, so the set is
+        always eval_num_samples rows and an empty pool never blocks an eval; every other stage draws them all."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is None:
+            stats, batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+            return stats, batch, (stats, batch), {}
+        n = int(self.args.eval_num_samples)
+        active = bool(self.protocol.flag('buffers_active'))
+        why = self._eval_pool_refusal() if active else None
+        if why is not None and why != getattr(self, '_eval_pool_refused', None):
+            self._eval_pool_refused = why
+            print(f"eval: on-policy rows drawn fresh, not from the rollout pool: {why}", flush=True)
+        if why is not None or not active or pool.rows == 0:
+            stats, batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+            return stats, batch, (stats, batch), {'eval/pool_rows': 0, 'eval/pool_fresh_rows': n,
+                                                  'eval/pool_oldest_age_steps': float('nan')}
+        t0 = time()
+        rows, batch, oldest = pool.read(merge_batches)
+        stats = self._pool_eval_stats(rows)
+        k = rows['log_r'].shape[0]
+        fresh = None
+        if k < n:
+            fresh = self.fwd_eval_sampling(self.gfn_model, eval_discretizer, override_num_samples=n - k)
+            stats = {name: torch.cat([t, fresh[0][name].to(t.dtype)]) for name, t in stats.items()}
+            batch = batch.append_batch(fresh[1])
+        self._fwd_eval_summary(stats)
+        self.times['eval_sampling_start'], self.times['eval_sampling_end'] = t0, time()
+        return stats, batch, fresh, {'eval/pool_rows': k, 'eval/pool_fresh_rows': n - k,
+                                     'eval/pool_oldest_age_steps': int(self.step_ind) - oldest}
 
     def _replay_rows(self):
         """Rows the replay branch can draw: the store's drawable on-policy rows when the store is on, else the replay
@@ -11517,7 +11594,8 @@ class Modeller:
         do_figs = self.figs_due() or override_do_figs
 
         '''sampling and metrics analysis'''
-        fwd_stats, sample_batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+        fwd_stats, sample_batch, fresh_rows, pool_readouts = self._eval_forward_rows(eval_discretizer)
+        metrics.update(pool_readouts)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         self._merge_metrics(metrics, self.log_metrics(fwd_stats, bwd_stats, sample_batch),
                             'log_metrics')
@@ -11634,9 +11712,13 @@ class Modeller:
         # actions -- executes inside this call. Also clears any pending
         # pulled-forward eval request, whoever set it.
         scored_in_tb = self.protocol.flag('buffers_active')   # the stage that scored these rows
+        stage_before = self.protocol.stage
         self.protocol.maybe_advance(metrics)
         if getattr(self, 'row_store', None) is not None:
-            self._admit_eval_rollout(fwd_stats, sample_batch, drawable=scored_in_tb)
+            if self.protocol.stage is not stage_before and getattr(self, '_eval_pool', None) is not None:
+                self._eval_pool.clear()
+            if fresh_rows is not None:      # pool rows were admitted when their rollout was scored
+                self._admit_eval_rollout(*fresh_rows, drawable=scored_in_tb)
             if getattr(self.args, 'smoke', False):
                 self._store_check_currency()
         elif self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
@@ -14082,6 +14164,40 @@ class Modeller:
             # so it can't be mistaken for the prior model earning its churn budget
             self.prior_churn['from_seed'] += int(num_samples)
 
+    def _fwd_eval_summary(self, pooled):
+        """Writes the eval's pooled summary into `pooled` (nonfinite_rows, nonfinite_frac, log_Z, log_Z_lb,
+        log_Z_learned) from its per-row log_r, log_pfs, log_pbs and log_flow; returns the per-row log weight. Fresh and
+        pool-fed evals both come through here."""
+        # Z estimates computed ONCE over the pooled trajectories
+        log_weight = pooled['log_r'] + pooled['log_pbs'].sum(-1) - pooled['log_pfs'].sum(-1)
+
+        # POOLED AGGREGATES ARE COMPUTED OVER THE FINITE ROWS ONLY, and the reason is
+        # that NaN is CONTAGIOUS through a reduction in a way a wrong number is not.
+        # logmeanexp and mean both return NaN if a SINGLE row is NaN, so one crashed
+        # sample out of eval_num_samples would take out this eval's entire log_Z --
+        # and a NaN metric then fails every threshold comparison in BOTH directions,
+        # so a stage gate reading it never fires. That is the silent-stall mode, and
+        # it has happened here before (1,579 consecutive non-finite steps, ~13 h, on
+        # the QM9 conditional route). A failed MLIP forward substitutes NaN
+        # deliberately (uma_utils._crashed_energy); localising it to the rows it
+        # actually ruined is what keeps the rest of the eval readable.
+        finite_w = torch.isfinite(log_weight)
+        n_bad = int((~finite_w).sum())
+        if n_bad:
+            print(f"eval: {n_bad}/{log_weight.numel()} non-finite log-weights excluded "
+                  f"from pooled Z estimates (check energy/uma_crash_rows)")
+        # reported ALWAYS, including 0 -- an absent key reads as "not instrumented"
+        pooled['nonfinite_rows'] = torch.tensor(float(n_bad))
+        pooled['nonfinite_frac'] = torch.tensor(n_bad / max(log_weight.numel(), 1))
+        # all-bad is left to produce NaN rather than a fabricated finite number: at
+        # that point there is no measurement to report and pretending otherwise is
+        # the original defect in a new place
+        good_w = log_weight[finite_w] if n_bad and finite_w.any() else log_weight
+        pooled['log_Z'] = logmeanexp(good_w)
+        pooled['log_Z_lb'] = good_w.mean()
+        pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
+        return log_weight
+
     @torch.no_grad()
     def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None,
                           dataset=None, side_effects: bool = True, panel=None):
@@ -14192,35 +14308,7 @@ class Modeller:
             acc['temperature'].append(temperatures.cpu().detach())
 
         pooled = {k: torch.cat(v) for k, v in acc.items()}
-
-        # Z estimates computed ONCE over the pooled trajectories
-        log_weight = pooled['log_r'] + pooled['log_pbs'].sum(-1) - pooled['log_pfs'].sum(-1)
-
-        # POOLED AGGREGATES ARE COMPUTED OVER THE FINITE ROWS ONLY, and the reason is
-        # that NaN is CONTAGIOUS through a reduction in a way a wrong number is not.
-        # logmeanexp and mean both return NaN if a SINGLE row is NaN, so one crashed
-        # sample out of eval_num_samples would take out this eval's entire log_Z --
-        # and a NaN metric then fails every threshold comparison in BOTH directions,
-        # so a stage gate reading it never fires. That is the silent-stall mode, and
-        # it has happened here before (1,579 consecutive non-finite steps, ~13 h, on
-        # the QM9 conditional route). A failed MLIP forward substitutes NaN
-        # deliberately (uma_utils._crashed_energy); localising it to the rows it
-        # actually ruined is what keeps the rest of the eval readable.
-        finite_w = torch.isfinite(log_weight)
-        n_bad = int((~finite_w).sum())
-        if n_bad:
-            print(f"eval: {n_bad}/{log_weight.numel()} non-finite log-weights excluded "
-                  f"from pooled Z estimates (check energy/uma_crash_rows)")
-        # reported ALWAYS, including 0 -- an absent key reads as "not instrumented"
-        pooled['nonfinite_rows'] = torch.tensor(float(n_bad))
-        pooled['nonfinite_frac'] = torch.tensor(n_bad / max(log_weight.numel(), 1))
-        # all-bad is left to produce NaN rather than a fabricated finite number: at
-        # that point there is no measurement to report and pretending otherwise is
-        # the original defect in a new place
-        good_w = log_weight[finite_w] if n_bad and finite_w.any() else log_weight
-        pooled['log_Z'] = logmeanexp(good_w)
-        pooled['log_Z_lb'] = good_w.mean()
-        pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
+        log_weight = self._fwd_eval_summary(pooled)
 
         # energy computed unconditionally (not just under condition_log_z) since
         # screen_and_admit_anchors below needs it regardless of whether the persistent

@@ -480,7 +480,8 @@ def _launch(state=None, run='run_a', step=20, store_on=True):
     n = ref.n_seed_kept
     m = Modeller.__new__(Modeller)
     m.run_name, m.step_ind, m.problem_def, m.problem_hash = run, step, {'p': 1}, 'abc'
-    m.args = SimpleNamespace(seed=3, checkpoint_read_only=False, energy_config=SimpleNamespace(temperature=2.5))
+    m.args = SimpleNamespace(seed=3, checkpoint_read_only=False, energy_config=SimpleNamespace(temperature=2.5),
+                             eval_num_samples=16)
     m.energy_function = SimpleNamespace(data_ndim=DIM, condition_library_size=3)
     m.condition_log_z = ConditionLogZTracker(3)
     m.store_settings = lambda: dict(ram_gb=0.01, ram_frac=0.5) if store_on else None
