@@ -11,8 +11,6 @@ fresh MLE arm on the live physical kernel and two smokes.
             The smokes take the first array indices: submit them first (sbatch --array=0-<last smoke>), the rest after.
   resume    `--resume ARM` writes ARM_resume.yaml: continue_from_checkpoint true, checkpoint_name null,
             load_weights_only false (a TB arm resubmitted with its checkpoint_name would restart from mle4 at step 0).
-            Keep batch_size, max_batch_size and grow_batch_size unchanged between legs: they set the store headroom,
-            and a resume refuses its own sidecar when the headroom differs.
 
 usage: python configs/pool4_nov24/make.py              (one yaml per arm and submit_pool4_nov24.sbatch)
        python configs/pool4_nov24/make.py --resume ARM (ARM_resume.yaml)"""
@@ -36,7 +34,7 @@ SMOKE_TB_STEPS, SMOKE_MLE_STEPS = 600, 300
 AUX_KEYS = {'bwd': ('score', 'score_beta', 'score_rows', 'score_force'),
             'replay': ('score', 'score_beta', 'score_rows', 'score_force'),
             'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip', 'pathwise_entropy')}
-AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 256, 'score_force': 'live', 'pathwise': 0.0,
+AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 0, 'score_force': 'live', 'pathwise': 0.0,
            'pathwise_grad_clip': 100.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
 # config paths an arm may change: every one is read on the store route (a legacy buffers.* key would sweep nothing)
 LIVE_PREFIXES = ('protocols.', 'model.nf.rotate_frames', 'model.nf.mirror_frames', 'model.nf.atom_tokens',
@@ -116,7 +114,7 @@ ARMS = {
                   ('model.nf.mirror_frames', True)],
     'tb_m4_every4': [('tb.fwd_rollout_every', 4)],
     'tb_m4_knee20': [('tb.loss_coeffs.bwd.beta', 20.0)],
-    'tb_m4_sm': [('tb.loss_coeffs.bwd.score', 0.1), ('tb.loss_coeffs.bwd.score_rows', 256),
+    'tb_m4_sm': [('tb.loss_coeffs.bwd.score', 0.1), ('tb.loss_coeffs.bwd.score_rows', 0),        # 0: every bwd row
                  ('tb.loss_coeffs.bwd.score_beta', 10.0), ('tb.loss_coeffs.bwd.score_force', 'live')],
     'tb_m4_pw': [('tb.loss_coeffs.fwd.pathwise', 0.1), ('tb.loss_coeffs.fwd.pathwise_grad_clip', 100.0),
                  ('lr_control.hard_failure.grad_abs', None)],

@@ -1201,9 +1201,12 @@ class CrystalStore:
         fv = state.get('format_version')
         if fv != FORMAT_VERSION:
             return f'crystal store format_version {fv}, this code reads {FORMAT_VERSION}'
-        for name in ('dim', 'max_rows', 'headroom'):
+        for name in ('dim', 'max_rows'):
             if state.get(name) != getattr(self, name):
                 return f'crystal store {name}: state {state.get(name)}, this store {getattr(self, name)}'
+        if int(state['n_kind'][ANCHOR]) + 2 * self.headroom > self.max_rows:     # I11 under this store's headroom
+            return (f"crystal store: {int(state['n_kind'][ANCHOR])} anchors + 2 * headroom {self.headroom} exceed "
+                    f"max_rows {self.max_rows}")
         if state['n_cond'] < self.n_cond:
             return f"crystal store n_cond: state {state['n_cond']}, this store {self.n_cond}"
         hw = int(state['counters']['high_water'])
@@ -1226,8 +1229,9 @@ class CrystalStore:
         return self._refusal(state)
 
     def apply_state(self, state):
-        """Restore state_dict() into this store. dim, max_rows and headroom must match. A compact state needs a store
-        freshly seeded to the same seed digest."""
+        """Restore state_dict() into this store. dim and max_rows must match; the headroom is this store's (a resume may
+        change the batch that sets it), so I11 is checked against it. A compact state needs a store freshly seeded to
+        the same seed digest."""
         why = self._refusal(state)
         if why is not None:
             raise CrystalStoreError(why)

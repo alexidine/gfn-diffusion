@@ -273,7 +273,7 @@ fwd_loss_coeffs:
   pooled_center: mean
   score: 0.0
   score_beta: 10.0
-  score_rows: 256
+  score_rows: 0
   pathwise: 0.0
   pathwise_grad_clip: 100.0
   pathwise_entropy: 1.0
@@ -302,7 +302,7 @@ bwd_loss_coeffs:
   beta: 10.0
   score: 0.0
   score_beta: 10.0
-  score_rows: 256
+  score_rows: 0
   score_force: live
 replay_loss_coeffs:
   tb: 1.0
@@ -332,7 +332,7 @@ replay_loss_coeffs:
   beta: 10.0
   score: 0.0
   score_beta: 10.0
-  score_rows: 256
+  score_rows: 0
   score_force: live
 condition_log_z:
   min_visits: 20

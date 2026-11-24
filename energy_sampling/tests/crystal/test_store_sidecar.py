@@ -608,3 +608,23 @@ def test_a_store_on_sidecar_of_another_problem_is_ignored():
     Checkpointer(m).restore_buffers({'problem_def': {'p': 2}, 'run_name': 'old', 'step_ind': 9, 'row_store': None,
                                      'prior_buffer': {'n': 4}}, 'old_buffers.pt')
     assert getattr(m, 'prior_buffer', None) is None
+
+
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_resume_takes_this_launchs_headroom(compact):
+    st = seeded()
+    grow(st)
+    state = roundtrip(st.state_dict(compact=compact))
+    for H in (10, 40):                                  # a resume may change the batch that sets the headroom
+        other = seeded(H=H)
+        other.apply_state(state)
+        assert other.headroom == H and other.n_rows == st.n_rows
+        other.check()
+
+
+def test_a_headroom_that_breaks_capacity_is_refused():
+    st = seeded()
+    state = roundtrip(st.state_dict())
+    other = CrystalStore(DIM, 3, 400, 198, seed=3)      # 6 anchors + 2 x 198 > 400
+    with pytest.raises(CrystalStoreError, match='headroom'):
+        other.apply_state(state)
