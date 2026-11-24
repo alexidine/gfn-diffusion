@@ -9125,6 +9125,8 @@ class Modeller:
                    load['template_cids'], floor)
         store.check()
         self.row_store = store
+        self._store_seed_best = store.best_energy.clone()     # per-condition seed minimum, read before any restore
+        self._store_draw_tally = None
         self._store_cfg = s
         self._growth_owed = 0
         self._store_growth = dict(kicks=0, unchanged=0, scored=0, in_window=0, out_of_box=0)
@@ -9258,6 +9260,7 @@ class Modeller:
                 rows, w = self._store_replay_rows(B)
                 self._replay_is_w = None if w is None else w.repeat_interleave(R).float()
                 self._replay_is_stats, self._replay_draw_origin = {}, {}
+            self._tally_store_draw(kind, rows)
             idx = rows.repeat_interleave(R)
             latents, log_reward, inds = st.x[idx].to(dev), st.log_r[idx].to(dev), (idx, st.epoch)
         mol = st.mol_batch(st.cid[idx]).to(dev)
@@ -9513,10 +9516,76 @@ class Modeller:
                                    f"{self.STORE_CURRENCY_REL:g} |E|)")
         print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
 
+    STORE_IMPROVED_RTOL = 1e-5
+
+    def _tally_store_draw(self, kind, rows):
+        """Add one bwd or replay training draw's rows (before tiling by repeats) to the tally _store_draw_readouts
+        drains: bwd counts the kicked children it drew; replay sums the rows' age (steps since birth, 0 for a row
+        born after the current step, which a rewind or an older checkpoint's resume keeps) and their draws column
+        before this draw. Rows of a step that then OOMs are counted: the tally is of draws made, not draws trained."""
+        st = self.row_store
+        t = getattr(self, '_store_draw_tally', None)
+        if t is None:
+            t = self._store_draw_tally = dict(bwd_n=0, bwd_kicked=0, replay_n=0, replay_age=0.0, replay_reuse=0.0)
+        if kind == 'bwd':
+            t['bwd_n'] += int(rows.numel())
+            t['bwd_kicked'] += int((st.origin[rows] == crystal_store.ORIGIN_KICK).sum())
+        else:
+            step = int(getattr(self, 'step_ind', 0))
+            t['replay_n'] += int(rows.numel())
+            t['replay_age'] += float((step - st.birth_step[rows].double()).clamp_min(0.0).sum())
+            t['replay_reuse'] += float(st.draws[rows].double().sum())
+
+    def _store_draw_readouts(self):
+        """The training draws since the last read, then cleared: store/bwd_draw_kicked_frac (share of bwd rows that are
+        kicked children), store/replay_draw_age_mean (mean age of replay rows, steps) and store/replay_draw_reuse_mean
+        (mean draws column of replay rows before the draw, occurrences). nan when the window drew no row of that
+        branch."""
+        t = getattr(self, '_store_draw_tally', None) or {}
+        self._store_draw_tally = None
+        bn, rn, nan = t.get('bwd_n', 0), t.get('replay_n', 0), float('nan')
+        return {'store/bwd_draw_kicked_frac': t['bwd_kicked'] / bn if bn else nan,
+                'store/replay_draw_age_mean': t['replay_age'] / rn if rn else nan,
+                'store/replay_draw_reuse_mean': t['replay_reuse'] / rn if rn else nan}
+
+    def _store_population_readouts(self):
+        """O(rows) readouts over the store as it stands: on-policy reuse and coverage, the replay rule's weights over
+        the drawable on-policy rows, and the count of conditions whose physical minimum is below their seed minimum by
+        more than STORE_IMPROVED_RTOL of it (far above float32 rounding of a recomputed seed, far below a kick's
+        typical improvement)."""
+        st, out = self.row_store, {}
+        hw = st.high_water
+        on = torch.nonzero((st.kind[:hw] == crystal_store.ONPOLICY)
+                           & ((st.flags[:hw] & crystal_store.UNDRAWN) == 0)).flatten()
+        if on.numel():
+            d = st.draws[on].double()
+            out['store/onpolicy_draws_mean'] = float(d.mean())
+            out['store/onpolicy_drawn_frac'] = float((d > 0).double().mean())
+            name = self._store_cfg['replay_weight']
+            rule = crystal_store.REPLAY_WEIGHTS[name]
+            if rule is not crystal_store.uniform:
+                w = rule(st, on, int(getattr(self, 'step_ind', 0))).double()
+                out['store/replay_w_mean'] = float(w.mean())
+                if rule is crystal_store.duty:
+                    out['store/replay_w_one_frac'] = float((w >= 1.0).double().mean())
+                    out['store/replay_w_floor_frac'] = float((w <= crystal_store.DUTY_FLOOR * (1 + 1e-6)).double().mean())
+        count = st.index.count.reshape(-1, crystal_store.N_KINDS)
+        alive = count.sum(1) > 0
+        if alive.any():
+            per = count[:, crystal_store.ONPOLICY]
+            out['store/onpolicy_cond_frac'] = float((per[alive] > 0).mean())
+            if (per > 0).any():
+                out['store/onpolicy_per_cond_median'] = float(np.median(per[per > 0]))
+        seed = getattr(self, '_store_seed_best', None)
+        if seed is not None:
+            n = min(seed.numel(), st.best_energy.numel())
+            s, b = seed[:n], st.best_energy[:n]
+            out['store/conditions_improved'] = int((torch.isfinite(s) & (b < s - self.STORE_IMPROVED_RTOL * s.abs())).sum())
+        return out
+
     def _store_metrics(self):
-        """store/* readouts: the store's counters, the growth tally, its rows per space group, and
-        store/best_energy_median, the median over conditions with a finite store minimum of the lowest physical
-        mol_energy stored from any source."""
+        """store/* readouts: the store's counters, the growth tally, the training-draw tally since the last read, the
+        population readouts and its rows per space group."""
         st, g = self.row_store, self._store_growth
         out = st.stats()
         out.update({'store/kicks_owed': self._growth_kicks_due(), 'store/kicks_drawn': g['kicks'],
@@ -9524,9 +9593,8 @@ class Modeller:
                     'store/rows_out_of_box': g['out_of_box']})
         if g['scored']:
             out['store/kick_in_window_frac'] = g['in_window'] / g['scored']
-        best = st.best_energy[torch.isfinite(st.best_energy)]
-        if best.numel():
-            out['store/best_energy_median'] = float(np.median(best.numpy()))
+        out.update(self._store_draw_readouts())
+        out.update(self._store_population_readouts())
         groups, n_zp = self._condition_group_axes()
         if len(groups) > 1 and st.n_rows:
             live = st.kind[:st.high_water] != crystal_store.FREE

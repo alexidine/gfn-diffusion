@@ -152,11 +152,14 @@ def test_growth_keeps_chunked_recovery_without_the_end_of_call_flush(monkeypatch
     assert seen == [OOM_RECOVERY_KEEP_CACHE]
 
 
-def test_store_best_energy_median_reads_the_physical_minimum_over_visited_conditions():
+def test_store_counts_conditions_whose_physical_minimum_fell_below_the_seed_minimum():
     m = S.build()
     m._condition_group_axes = lambda: ([2], 1)
     st = m.row_store
-    st.best_energy[:] = torch.tensor([1.0, 3.0, 10.0, float('inf')])
-    assert m._store_metrics()['store/best_energy_median'] == pytest.approx(3.0)
-    st.best_energy[:] = float('inf')
-    assert 'store/best_energy_median' not in m._store_metrics()
+    seed = m._store_seed_best.clone()
+    st.best_energy[:] = seed
+    st.best_energy[1] = seed[1] - 0.5
+    st.best_energy[3] = seed[3] + 0.5          # a minimum never rises; an equal or higher value is not an improvement
+    out = m._store_metrics()
+    assert out['store/conditions_improved'] == 1
+    assert 'store/best_energy_median' not in out

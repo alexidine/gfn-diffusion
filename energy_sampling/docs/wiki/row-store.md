@@ -110,12 +110,18 @@ The divergence rewind calls `Modeller._store_rewind`, which runs `CrystalStore.i
 | `store/kicks_owed`, `store/kicks_drawn`, `store/kicks_scored`, `store/kicks_unchanged` | growth tally | rows |
 | `store/kick_in_window_frac` | share of scored kicks inside the fixed windows | fraction |
 | `store/rows_out_of_box` | on-policy rows written with a coordinate outside $[-1, 1]$ | rows |
-| `store/best_energy_median` | median, over conditions with a finite store minimum, of the lowest physical `mol_energy` stored from any source | `mol_energy` units |
+| `store/conditions_improved` | conditions whose lowest physical `mol_energy` stored from any source is below their seed minimum (`Modeller._store_seed_best`, taken when the store is seeded, before a restore) by more than `Modeller.STORE_IMPROVED_RTOL` of it | conditions |
+| `store/bwd_draw_kicked_frac` | share of the bwd rows drawn since the last eval that are kicked children (`ORIGIN_KICK`); NaN when none were drawn | fraction |
+| `store/replay_draw_age_mean`, `store/replay_draw_reuse_mean` | mean, over the replay rows drawn since the last eval, of steps since birth (0 for a row born after the current step, which a rewind keeps) and of the `draws` column before the draw | steps; occurrences |
+| `store/onpolicy_draws_mean`, `store/onpolicy_drawn_frac` | mean `draws` of the drawable on-policy rows; share drawn at least once | occurrences; fraction |
+| `store/onpolicy_cond_frac` | share of conditions with any drawable row that hold a drawable on-policy row (the conditions replay draws from) | fraction |
+| `store/onpolicy_per_cond_median` | drawable on-policy rows per condition, over the conditions that hold one | rows |
+| `store/replay_w_mean`; under `duty` also `store/replay_w_one_frac`, `store/replay_w_floor_frac` | the replay rule's weight over the drawable on-policy rows (absent under `uniform`); share at 1 and at `crystal_store.DUTY_FLOOR` | weight; fraction |
 | `sg<g>/store_share` | share of live rows in space group g, on a run over several groups | fraction |
 | `eval/pool_rows`, `eval/pool_fresh_rows` | this eval's rows read from the rollout pool; rows it drew fresh | rows |
 | `eval/pool_oldest_age_steps` | steps since the oldest rollout read by this eval; NaN when it read none | steps |
 
-*The store's readouts; each is a counter over the run so far unless named a share or a median.*
+*The store's readouts. The counters from `store/rows` to `store/kick_in_window_frac` run over the whole run; the `*_draw_*` keys cover the training draws since the last eval (`Modeller._tally_store_draw`, in `Modeller._store_draw` before rows are tiled by `repeats`, counting the rows of a step that then fails; `Modeller._store_draw_readouts` clears them at each read); the on-policy, weight and `conditions_improved` keys read the store as it stands (`Modeller._store_population_readouts`, O(rows)).*
 
 Under `cfg:smoke`, `Modeller._store_check_currency` re-scores up to `Modeller.STORE_CURRENCY_ROWS` rows of each origin present through `x` and the template at every eval, and raises when $\log R$ differs by more than `Modeller.STORE_CURRENCY_TOL` nats or `mol_energy` by more than that times $T$.
 

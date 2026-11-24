@@ -93,6 +93,8 @@ def build(spec=((2, 4), (1, 3), (1, 2), (1, 2)), max_rows=2000, H=64, batch=8, s
             torch.full((t.num_graphs,), 100.0, dtype=torch.float64))
     m = Modeller.__new__(Modeller)
     m.row_store = st
+    m._store_seed_best = st.best_energy.clone()
+    m._store_draw_tally = None
     m.energy_function = Energy()
     m.device = torch.device('cpu')
     m.batch_size = batch
