@@ -1612,6 +1612,11 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
     if s['replay_weight'] not in replay_weight_rules():
         err(f"buffers.store.replay_weight {s['replay_weight']!r} is not in crystal_store.REPLAY_WEIGHTS "
             f"{list(replay_weight_rules())}")
+    if s['replay_weight'] == 'duty':
+        framed = [k for k in ('rotate_frames', 'mirror_frames') if _get(cfg, f'policy.nf.{k}', False)]
+        if framed:
+            err(f"buffers.store.replay_weight 'duty' compares log q across writes, and model.nf.{framed[0]} gives each "
+                f"write its own random frame")
     if _get(cfg, 'condition_log_z.rollout_group_draw', 'uniform') != 'uniform':
         err("buffers.store draws rollout groups uniformly: set condition_log_z.rollout_group_draw 'uniform'")
     if _get(cfg, 'buffers.replay_buffer.admit_from_eval', True) is False:

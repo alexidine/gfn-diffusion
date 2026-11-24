@@ -495,7 +495,7 @@ buffers:
     ram_gb: 224
     ram_frac: 0.5
     mle_draw: anchor
-    replay_weight: uniform
+    replay_weight: duty
   anchor_buffer:
     frozen: true
     online_loss_flow: false

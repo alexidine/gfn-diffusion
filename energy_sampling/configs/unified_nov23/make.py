@@ -2,7 +2,7 @@
 
   unified  pool8sg4_next_nov22 v4_kick's model, prior and MLE stage, with
            store     buffers.store enabled, ram_gb from RAM_GB (also #SBATCH --mem), ram_frac RAM_FRAC, mle_draw anchor,
-                     replay_weight uniform
+                     replay_weight duty
            MLE       live physical kernel on anchors, MLE_STEPS
            TB        fused, TB_STEPS: bwd and replay 50:50, TB against the detached Z(c) head at Huber knees BWD_KNEE and
                      REPLAY_KNEE; Z(c) on the forward sidecar at knee Z_KNEE, FWD_REPEATS rows per condition
@@ -112,7 +112,7 @@ def unified(files, batch=BATCH, mle_steps=MLE_STEPS, tb_steps=TB_STEPS, every=No
     assert buffers['replay_buffer']['admit_from_eval'] is True and buffers['replay_buffer']['val_frac'] == 0.0
     assert buffers['replay_buffer']['prioritise']['enabled'] is False, buffers['replay_buffer']['prioritise']
     buffers['store'] = {'enabled': True, 'ram_gb': ram_gb, 'ram_frac': RAM_FRAC, 'mle_draw': 'anchor',
-                        'replay_weight': 'uniform'}
+                        'replay_weight': 'duty'}
 
     assert cfg['protocol'] == 'unconditional_tb', cfg['protocol']
     stages = ref._stages(cfg)

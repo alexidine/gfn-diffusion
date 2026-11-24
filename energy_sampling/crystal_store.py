@@ -87,8 +87,23 @@ def uniform(store, rows, step):
     return None
 
 
+DUTY_TAU, DUTY_FLOOR = 1.0, 0.05
+
+
+def duty(store, rows, step):
+    """w = 1 if r > 0, else max(exp(-max(log_q_birth - log_q, 0) / DUTY_TAU), DUTY_FLOOR), with r = log R - log q - L =
+    -resid (log P_B = 0 on the NF route), from the row's stored columns. A row with a NaN resid has unknown r: w = 1."""
+    rows = torch.as_tensor(rows).long()
+    resid = store.resid[rows]
+    drop = (store.log_q_birth[rows] - store.log_q[rows]).clamp_min(0.0)
+    w = torch.exp(-drop / DUTY_TAU).clamp_min(DUTY_FLOOR)
+    return torch.where(torch.isnan(resid) | (resid < 0), torch.ones_like(w), w)
+
+
 #: rule(store, rows, step) -> [len(rows)] weights >= 0, or None for uniform within the condition
-REPLAY_WEIGHTS = {'uniform': uniform}
+REPLAY_WEIGHTS = {'uniform': uniform, 'duty': duty}
+#: rules that choose which rows are drawn and leave the loss unweighted: draw_weighted's correction is not applied
+UNCORRECTED_RULES = ('duty',)
 
 
 def _blank_stat(t, k):
