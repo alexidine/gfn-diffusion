@@ -9,7 +9,7 @@ Stages of the arm. B = batch rows per step, R = forward rows per condition.
 |---|---|---|---|---|---|
 | `train_prior` (MLE) | 150,000 | bwd | fresh physical kick of a uniform anchor, unscored | `mle` | none |
 | `tb` (fused) | 100,000 | bwd, share 0.5 | uniform condition, uniform stored child | TB, Z(c) detached | 80 |
-| | | replay, share 0.5 | uniform condition, stored on-policy row, `replay_weight: uniform` | TB, Z(c) detached | 10 |
+| | | replay, share 0.5 | uniform condition, stored on-policy row, `replay_weight: duty` | TB, Z(c) detached | 10 |
 | | | fwd sidecar | rollout every 20 steps, R = 2 | `emp_z` on Z(c) only | 10 |
 
 Store: `ram_gb: 224` (one constant, `RAM_GB`, also written to `#SBATCH --mem`), `ram_frac: 0.5`, `mle_draw: anchor`. The row
@@ -26,7 +26,7 @@ row owes one physical kick of an anchor, scored and stored as a child.
   Set it to true in `unified.yaml` before resubmitting a job that stopped at the limit.
 - **LR hold.** MLE: `lr_control.schedule`, 0.05 x `seed_lr` (1.25e-4) for 3,000 steps, geometric to 0.2 x by step 4,000. TB:
   held at 0.2 x `seed_lr` = 2.5e-5, flow LR set to 1.0e-4 on entry. Both values are carried from earlier arms.
-- **Replay weight.** `uniform` is the default of `crystal_store.REPLAY_WEIGHTS` while the draw rule is open.
+- **Replay weight.** This arm uses `duty` (`make.py`); the code default is `uniform`, and `visits` is the third rule of `crystal_store.REPLAY_WEIGHTS`. `duty` is refused with `rotate_frames` or `mirror_frames`.
 
 ## Regenerate
 

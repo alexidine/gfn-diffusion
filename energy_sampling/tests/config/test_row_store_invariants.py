@@ -170,7 +170,6 @@ GLOBAL_REFUSALS = [
     ('retired key', lambda c: c['buffers']['store'].update(kappa=1.0), 'previous row store'),
     ('rollout_group_draw', lambda c: c['condition_log_z'].update(rollout_group_draw='level'), 'rollout_group_draw'),
     ('admit_from_eval', lambda c: c['buffers']['replay_buffer'].update(admit_from_eval=False), 'admit_from_eval'),
-    ('grow_batch_size', lambda c: c.update(grow_batch_size=True), 'grow_batch_size'),
     ('replay_weight', lambda c: c['buffers']['store'].update(replay_weight='not_a_rule'), 'REPLAY_WEIGHTS'),
     ('short epochs', lambda c: c.update(epochs=c['epochs'] - 1), 'epochs'),
     ('under_drawn', lambda c: c['condition_log_z'].update(rollout_condition_draw='under_drawn'), 'under_drawn'),
@@ -278,3 +277,9 @@ def test_the_offset_bootstrap_is_allowed(mk_dev, action):
     cfg = _on(mk_dev)
     _stage(cfg).update(on_enter=[action])
     assert not any('bootstrap_z' in m for m in _msgs(cfg)), _msgs(cfg)
+
+
+def test_batch_growth_is_allowed_on_the_store(mk_dev):
+    cfg = _on(mk_dev)
+    cfg['grow_batch_size'] = True
+    assert not [m for sev, m in ci.row_store_problems(cfg) if sev == ci.ERROR and 'grow_batch_size' in m]

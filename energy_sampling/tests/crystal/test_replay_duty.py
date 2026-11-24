@@ -146,8 +146,28 @@ def test_the_accepted_draw_refuses_a_weight_outside_zero_to_one(bad):
         m.row_store.draw_accepted(CS.ONPOLICY, 8, lambda s, r, step: torch.full((len(r),), bad), 0)
 
 
-def test_only_duty_skips_the_correction():
-    assert CS.UNCORRECTED_RULES == ('duty',) and set(CS.UNCORRECTED_RULES) <= set(CS.REPLAY_WEIGHTS)
+def test_only_duty_and_visits_skip_the_correction():
+    assert CS.UNCORRECTED_RULES == ('duty', 'visits') and set(CS.UNCORRECTED_RULES) <= set(CS.REPLAY_WEIGHTS)
+
+
+def test_visits_weighs_a_row_by_one_over_one_plus_its_draws_down_to_the_floor():
+    m, rows = admitted([0, 0, 0], [-8.0] * 3, [-2.0] * 3)
+    st = m.row_store
+    st.touch(rows[1:2].repeat(3), st.epoch, torch.full((3,), -2.0), torch.zeros(3), 9)
+    st.touch(rows[2:3].repeat(100), st.epoch, torch.full((100,), -2.0), torch.zeros(100), 9)
+    w = CS.visits(st, rows, 9)
+    assert torch.allclose(w, torch.tensor([1.0, 0.25, CS.VISITS_FLOOR]))
+
+
+def test_the_visits_draw_follows_the_rule_within_a_condition():
+    m, rows = admitted([0, 0], [-8.0, -8.0], [-2.0, -2.0])
+    st = m.row_store
+    st.touch(rows[1:2].repeat(3), st.epoch, torch.full((3,), -2.0), torch.zeros(3), 9)     # w = 1 and 1/4
+    m._store_cfg['replay_weight'] = 'visits'
+    drawn, w = m._store_replay_rows(4000)
+    assert w is None
+    share = float((drawn == rows[1]).double().mean())
+    assert share == pytest.approx(0.25 / 1.25, abs=0.025)
 
 
 def _store_on(cfg):
@@ -163,6 +183,14 @@ def test_duty_with_random_frames_is_a_config_error(key):
     cfg['model']['nf'][key] = True
     msgs = [m for sev, m in ci.row_store_problems(ci.canonical_model_section(cfg)) if sev == ci.ERROR]
     assert len(msgs) == 1 and key in msgs[0] and 'duty' in msgs[0]
+
+
+@pytest.mark.parametrize('key', ['rotate_frames', 'mirror_frames'])
+def test_visits_with_random_frames_is_not_refused(key):
+    cfg = yaml.safe_load((CONFIGS / 'unified_nov23' / 'unified.yaml').read_text(encoding='utf-8'))
+    cfg['buffers']['store']['replay_weight'] = 'visits'
+    cfg['model']['nf'][key] = True
+    assert not [m for sev, m in ci.row_store_problems(ci.canonical_model_section(cfg)) if sev == ci.ERROR]
 
 
 def test_uniform_with_random_frames_is_not_refused_by_this_rule():

@@ -145,3 +145,18 @@ def test_an_improvement_survives_a_resume_into_a_freshly_seeded_store():
     fresh = S.build()                                   # init_row_store: seed, take the seed minimum, then restore
     fresh.row_store.apply_state(state)
     assert fresh._store_population_readouts()['store/conditions_improved'] == 1
+
+
+@pytest.mark.parametrize('grow, want_b', [(False, 125), (True, 4000)])
+def test_headroom_takes_the_batch_ceiling_when_the_sizer_can_grow_the_batch(grow, want_b):
+    from pathlib import Path
+    import yaml
+    from utils import dict2namespace
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / 'configs' / 'unified_nov23' / 'unified.yaml')
+                         .read_text(encoding='utf-8'))
+    cfg.update(grow_batch_size=grow, max_batch_size=4000, batch_size=125, eval_num_samples=64)
+    m = S.build()
+    m.args = dict2namespace(cfg)
+    m.batch_size = 125
+    reps = 2                                            # the unified tb stage's fwd repeats
+    assert m._store_headroom() == 2 * want_b * reps

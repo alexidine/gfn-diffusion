@@ -9061,14 +9061,16 @@ class Modeller:
 
     def _store_headroom(self):
         """H of crystal_store I11: the largest single add. Twice a rollout (B x fwd repeats, the rollout and its kicks),
-        an eval rollout, or a stage-entry bootstrap_z:offset draw."""
+        an eval rollout, or a stage-entry bootstrap_z:offset draw. B is max_batch_size under grow_batch_size, since the
+        sizer may raise the batch up to it after the store is built."""
         from config_invariants import active_stages, _coeff
         from utils import _namespace_to_dict
         cfg = _namespace_to_dict(self.args)
         stages = [st for st in active_stages(cfg) if isinstance(st, dict)]
         reps = max([max(1, int(round(_coeff(cfg, st, 'fwd', 'repeats') or 1))) for st in stages] or [1])
         evals = int(self.args.eval_num_samples)
-        sizes = [2 * int(self.batch_size) * reps, evals]
+        B = int(self.args.max_batch_size) if getattr(self.args, 'grow_batch_size', False) else int(self.batch_size)
+        sizes = [2 * B * reps, evals]
         for st in stages:
             for action in st.get('on_enter') or ():
                 parts = str(action).split(':')
@@ -9566,9 +9568,10 @@ class Modeller:
             if rule is not crystal_store.uniform:
                 w = rule(st, on, int(getattr(self, 'step_ind', 0))).double()
                 out['store/replay_w_mean'] = float(w.mean())
-                if rule is crystal_store.duty:
+                floor = crystal_store.RULE_FLOORS.get(name)
+                if floor is not None:
                     out['store/replay_w_one_frac'] = float((w >= 1.0).double().mean())
-                    out['store/replay_w_floor_frac'] = float((w <= crystal_store.DUTY_FLOOR * (1 + 1e-6)).double().mean())
+                    out['store/replay_w_floor_frac'] = float((w <= floor * (1 + 1e-6)).double().mean())
         count = st.index.count.reshape(-1, crystal_store.N_KINDS)
         alive = count.sum(1) > 0
         if alive.any():

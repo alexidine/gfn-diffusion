@@ -100,10 +100,22 @@ def duty(store, rows, step):
     return torch.where(torch.isnan(resid) | (resid < 0), torch.ones_like(w), w)
 
 
+VISITS_FLOOR = 0.05
+
+
+def visits(store, rows, step):
+    """w = max(1 / (1 + draws), VISITS_FLOOR): a row is drawn less the more often it has been trained on. Reads only the
+    draws column, so no log q and no frame."""
+    rows = torch.as_tensor(rows).long()
+    return (1.0 / (1.0 + store.draws[rows].float())).clamp_min(VISITS_FLOOR)
+
+
 #: rule(store, rows, step) -> [len(rows)] weights >= 0, or None for uniform within the condition
-REPLAY_WEIGHTS = {'uniform': uniform, 'duty': duty}
+REPLAY_WEIGHTS = {'uniform': uniform, 'duty': duty, 'visits': visits}
 #: rules that choose which rows are drawn and leave the loss unweighted, with weights in [0, 1]: CrystalStore.draw_accepted
-UNCORRECTED_RULES = ('duty',)
+UNCORRECTED_RULES = ('duty', 'visits')
+#: the weight floor of each rule that has one, for the store/replay_w_floor_frac readout
+RULE_FLOORS = {'duty': DUTY_FLOOR, 'visits': VISITS_FLOOR}
 ACCEPT_ROUNDS = 128                     # proposal rounds of CrystalStore.draw_accepted before its open slots take the scan
 
 

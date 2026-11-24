@@ -1621,8 +1621,6 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         err("buffers.store draws rollout groups uniformly: set condition_log_z.rollout_group_draw 'uniform'")
     if _get(cfg, 'buffers.replay_buffer.admit_from_eval', True) is False:
         err('buffers.store keeps every scored eval row: buffers.replay_buffer.admit_from_eval false is refused')
-    if _get(cfg, 'grow_batch_size', False) is True:
-        err('buffers.store sizes its headroom from the batch: grow_batch_size true is refused')
     stages_seen = [st for st in active_stages(cfg) if isinstance(st, dict)]
     if (_num(_get(cfg, 'policy.nf.cond_noise')) or 0) > 0 and any(
             (_coeff(cfg, st, m, 'tb') or 0) > 0 for st in stages_seen for m in ('bwd', 'replay')):
