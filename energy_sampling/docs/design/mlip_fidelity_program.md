@@ -1,15 +1,16 @@
 # Energy-fidelity program: is MACE-CSP + D3 safe on top, and does cheap seeding recover its basins? (draft 2, 2026-11-19)
 
-Status: **proposal for owner review; nothing built or submitted.** Draft 1 was reviewed the same day by four critics
+Status: **not adopted.** The owner rejected this program as too expensive on 2026-11-23; the two smaller checks run
+instead are recorded in `docs/results/mace-csp-transfer-2026-11-23.md`. Kept as history. Draft 1 was reviewed the same day by four critics
 (a student who would run it, a PI, a physical chemist, a JCIM referee); this draft is the revision. Successor to the
 local work in `exp6_recall_test.md`, whose panel conformers carry a hydrogen-placement defect (fixed in GFN 00028573).
 Results go to `docs/results/` as a frozen record and a note under `docs/research/`.
 
 ## What changed from draft 1, and why
 
-- **D1 is now one-sided.** MACE-CSP-25.2 + D3(BJ, PBE) and UMA-s both target PBE-D3, so their agreement (1.1 kJ/mol
-  median on 16 polymorph pairs) shows they copy the same functional, not that either is right, and disagreement could
-  not say which is wrong. Since they agree, the choice rests on cost (about 4× per relaxation, 8× in Sohncke groups
+- **D1 is now one-sided.** MACE-CSP-25.2 + D3(BJ, PBE) and UMA-s both derive from PBE + D3, though with different
+  damping (OMC25 uses zero damping, `IVDW = 11`), so their agreement (1.1 kJ/mol median on 16 polymorph pairs) does not
+  show that either is right, and disagreement could not say which is wrong. Since they agree, the choice rests on cost (about 4× per relaxation, 8× in Sohncke groups
   where UMA-s is mirror-averaged), exact mirror symmetry, and whether MACE-CSP fails where it was not trained. The
   question becomes: **is MACE-CSP + D3 safe wherever GFN would use it?** It is the default; failures against an
   independent reference overturn it.
@@ -36,8 +37,8 @@ Results go to `docs/results/` as a frozen record and a note under `docs/research
 1. **Rebuild conformers and anchors with corrected hydrogens** (panel, probes, polymorph pairs) into new folders.
 2. **D3 cutoff:** 15 Å shifts the D3 lattice term by 0.2–1.1 kJ/mol depending on density, the size of the agreement
    being measured. Use 30 Å, or 15 Å with a tail correction, after measuring both on the anchors.
-3. **Damping check:** confirm OMC25's dispersion is D3 with Becke–Johnson damping, so UMA-s and MACE-CSP + D3 target
-   the same functional.
+3. **Damping check (done 2026-11-23):** OMC25's dispersion is D3 with zero damping, not Becke–Johnson, so MACE-CSP
+   needs zero-damped D3 to target the same functional as UMA.
 4. **Training overlap:** list which program molecules are among MACE-CSP's 1,617 training molecules (ask the authors
    for the list); report inside/outside and seen/unseen separately.
 5. **Long-range electrostatics flag:** per crystal, the MMFF-charge Ewald energy minus the same sum truncated at 9 Å
