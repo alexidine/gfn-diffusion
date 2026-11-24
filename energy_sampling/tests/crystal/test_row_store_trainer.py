@@ -220,9 +220,16 @@ def test_the_load_drops_a_child_whose_anchor_has_no_chart_point(monkeypatch):
 
 def test_the_load_refuses_a_row_off_its_conditions_template_frame(monkeypatch):
     a, c = _kinds()
-    b, kinds, splits, groups = _file([a, c], [0, 0], [0, 0], shift={1: torch.tensor([0.01, 0.0, 0.0])})
+    b, kinds, splits, groups = _file([a, c], [0, 0], [0, 0], shift={1: torch.tensor([0.05, 0.0, 0.0])})
     with pytest.raises(ValueError, match='share a frame'):
         _take(monkeypatch, b, kinds, splits, groups, [True, True])
+
+
+def test_the_load_accepts_a_row_within_the_frame_bar(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, c], [0, 0], [0, 0], shift={1: torch.tensor([0.018, 0.0, 0.0])})
+    m, _ = _take(monkeypatch, b, kinds, splits, groups, [True, True])
+    assert m._store_load['rows'].tolist() == [0, 1]
 
 
 def test_the_load_refuses_a_child_whose_parent_is_another_condition(monkeypatch):

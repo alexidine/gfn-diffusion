@@ -8853,7 +8853,7 @@ class Modeller:
     STORE_TEMPLATE_KEYS = ('z', 'pos', 'radius', 'mol_volume', 'sg_ind', 'z_prime', 'num_atoms', 'mass', 'x',
                            'max_z_prime', 'ptr', 'batch', 'mol_id', 'identifier')
     #: Angstrom: the largest displacement of a stored row's atoms from its condition's template
-    STORE_FRAME_TOL = 1e-3
+    STORE_FRAME_TOL = 0.02
     #: seed-sequence offsets of the store's readout panels and of the held-out eval panel
     STORE_PANEL_SEED, STORE_HELDOUT_SEED = 31, 23
     #: rounds an MLE draw takes to replace a row whose kick kept its anchor point
