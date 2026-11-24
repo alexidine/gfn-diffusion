@@ -102,8 +102,9 @@ def duty(store, rows, step):
 
 #: rule(store, rows, step) -> [len(rows)] weights >= 0, or None for uniform within the condition
 REPLAY_WEIGHTS = {'uniform': uniform, 'duty': duty}
-#: rules that choose which rows are drawn and leave the loss unweighted: draw_weighted's correction is not applied
+#: rules that choose which rows are drawn and leave the loss unweighted, with weights in [0, 1]: CrystalStore.draw_accepted
 UNCORRECTED_RULES = ('duty',)
+ACCEPT_ROUNDS = 128                     # proposal rounds of CrystalStore.draw_accepted before its open slots take the scan
 
 
 def _blank_stat(t, k):
@@ -856,7 +857,6 @@ class CrystalStore:
             raise CrystalStoreError(f'draw size must be >= 1, got {B}')
         if weight_fn is uniform and mask is None:
             return self.draw(kind, B), torch.ones(B, dtype=torch.float32)
-        rule = getattr(weight_fn, '__name__', repr(weight_fn))
         if mask is None:
             conds = self._conditions(kind, B)
         else:
@@ -871,6 +871,47 @@ class CrystalStore:
                 raise CrystalStoreError(f'no {KIND_NAMES[kind]} rows pass the mask')
             elig = act[hit]
             conds = elig[self.rng.integers(0, len(elig), B)]
+        return self._scan_weighted(kind, conds, weight_fn, step, mask)
+
+    def draw_accepted(self, kind, B, weight_fn, step):
+        """B rows at draw_weighted's law for a rule with weights in [0, 1], reading O(B / mean weight) rows: condition
+        uniform over those with a drawable row, then each slot proposes a uniform row of its condition and keeps it with
+        probability w, for at most ACCEPT_ROUNDS rounds. A slot still open takes draw_weighted's scan of its condition,
+        which also draws uniformly from a condition whose weights are all zero. A non-finite weight or one outside
+        [0, 1] on a proposed row raises."""
+        kind, B = self._check_kind(kind), int(B)
+        if B < 1:
+            raise CrystalStoreError(f'draw size must be >= 1, got {B}')
+        if weight_fn is uniform:
+            return self.draw(kind, B)
+        rule = getattr(weight_fn, '__name__', repr(weight_fn))
+        conds = self._conditions(kind, B)
+        pools = conds * N_KINDS + kind
+        rows = np.empty(B, dtype=np.int64)
+        pending = np.arange(B)
+        for _ in range(ACCEPT_ROUNDS):
+            if not len(pending):
+                break
+            proposed = self.index.uniform(pools[pending], self.rng).astype(np.int64)
+            w = torch.as_tensor(weight_fn(self, torch.from_numpy(proposed), step)).detach().cpu().double().reshape(-1).numpy()
+            if len(w) != len(proposed):
+                raise CrystalStoreError(f'weight rule {rule!r} returned {len(w)} weights for {len(proposed)} rows')
+            bad = ~np.isfinite(w) | (w < 0) | (w > 1)
+            if bad.any():
+                at = int(np.flatnonzero(bad)[0])
+                raise CrystalStoreError(f'weight rule {rule!r} gave weight {w[at]} to slot {int(proposed[at])}')
+            keep = self.rng.random(len(proposed)) < w
+            rows[pending[keep]] = proposed[keep]
+            pending = pending[~keep]
+        if len(pending):
+            rows[pending] = self._scan_weighted(kind, conds[pending], weight_fn, step)[0].numpy()
+        return torch.from_numpy(rows)
+
+    def _scan_weighted(self, kind, conds, weight_fn, step, mask=None):
+        """(rows, is_correction), one per entry of `conds`, from a read of every row of those conditions: draw_weighted's
+        row draw and its checks."""
+        B = len(conds)
+        rule = getattr(weight_fn, '__name__', repr(weight_fn))
         uc, inv = np.unique(conds, return_inverse=True)
         pools = uc * N_KINDS + kind
         lens = self.index.count[pools]

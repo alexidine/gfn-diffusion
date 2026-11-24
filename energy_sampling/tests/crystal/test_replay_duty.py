@@ -99,6 +99,53 @@ def test_the_replay_loss_takes_no_importance_weight_under_duty():
     assert m._replay_is_w is None
 
 
+def test_the_replay_draw_reads_one_row_per_slot_however_many_rows_the_condition_holds(monkeypatch):
+    k = 60
+    m, rows = admitted([0] * k, [-8.0] * k, [-2.0] * k)         # at birth every weight is 1
+    read = []
+
+    def counted(store, r, step):
+        read.append(len(r))
+        return CS.duty(store, r, step)
+
+    monkeypatch.setitem(CS.REPLAY_WEIGHTS, 'duty', counted)
+    m._store_cfg['replay_weight'] = 'duty'
+    drawn, w = m._store_replay_rows(32)
+    assert w is None and drawn.numel() == 32 and sum(read) == 32
+
+
+def test_the_accepted_draw_has_the_scan_draws_law():
+    m, rows = admitted([0] * 6 + [1] * 2, [-8.0] * 8, [-2.0] * 8)
+    st = m.row_store
+    drop = torch.tensor([0.0, 0.5, 1.0, 2.0, 30.0, 3.0, 0.0, 30.0])
+    st.touch(rows, st.epoch, st.log_q_birth[rows] - drop, torch.ones(8), 9)
+    B = 200000
+    scan, _ = st.draw_weighted(CS.ONPOLICY, B, CS.duty, 9)
+    got = st.draw_accepted(CS.ONPOLICY, B, CS.duty, 9)
+    for row in rows.tolist():
+        assert float((got == row).float().mean()) == pytest.approx(float((scan == row).float().mean()), abs=0.005)
+
+
+def test_the_accepted_draw_is_bounded_and_scans_what_stays_open():
+    m, rows = admitted([0, 0, 0], [-8.0] * 3, [-2.0] * 3)
+    calls = []
+
+    def never(store, r, step):
+        calls.append(len(r))
+        return torch.zeros(len(r))
+
+    got = m.row_store.draw_accepted(CS.ONPOLICY, 300, never, 0)
+    assert len(calls) == CS.ACCEPT_ROUNDS + 1 and calls[-1] == 3        # the last call is the scan of the one condition
+    assert set(got.tolist()) == set(rows.tolist())                      # all-zero weights: uniform, as draw_weighted
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -0.1, 1.5])
+def test_the_accepted_draw_refuses_a_weight_outside_zero_to_one(bad):
+    m, _ = admitted([0, 0], [-8.0] * 2, [-2.0] * 2)
+    with pytest.raises(CS.CrystalStoreError, match='weight'):
+        m.row_store.draw_accepted(CS.ONPOLICY, 8, lambda s, r, step: torch.full((len(r),), bad), 0)
+
+
 def test_only_duty_skips_the_correction():
     assert CS.UNCORRECTED_RULES == ('duty',) and set(CS.UNCORRECTED_RULES) <= set(CS.REPLAY_WEIGHTS)
 

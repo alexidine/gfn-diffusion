@@ -9225,14 +9225,16 @@ class Modeller:
     def _store_replay_rows(self, B):
         """(rows [B], importance weights [B] or None) of the replay draw over on-policy rows: conditions uniform, rows
         by the rule buffers.store.replay_weight names in crystal_store.REPLAY_WEIGHTS. None for the uniform rule and for
-        a rule of crystal_store.UNCORRECTED_RULES, whose loss is unweighted."""
+        a rule of crystal_store.UNCORRECTED_RULES, whose loss is unweighted and whose draw is CrystalStore.draw_accepted."""
         st = self.row_store
         name = self._store_cfg['replay_weight']
         rule = crystal_store.REPLAY_WEIGHTS[name]
         if rule is crystal_store.uniform:
             return st.draw(crystal_store.ONPOLICY, B), None
-        rows, correction = st.draw_weighted(crystal_store.ONPOLICY, B, rule, int(getattr(self, 'step_ind', 0)))
-        return rows, None if name in crystal_store.UNCORRECTED_RULES else correction
+        step = int(getattr(self, 'step_ind', 0))
+        if name in crystal_store.UNCORRECTED_RULES:
+            return st.draw_accepted(crystal_store.ONPOLICY, B, rule, step), None
+        return st.draw_weighted(crystal_store.ONPOLICY, B, rule, step)
 
     def _store_draw(self, kind, repeats):
         """draw_bwd_sample's 7-tuple from the store. 'mle': fresh kicks of uniformly drawn anchors, reward-free, with no
