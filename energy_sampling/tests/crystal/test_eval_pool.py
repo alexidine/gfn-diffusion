@@ -201,6 +201,9 @@ def test_an_mle_stage_draws_fresh():
     (lambda m: setattr(m, 'drift_force', object()), 'drift_force'),
     (lambda m: (setattr(m.args, 'z_calibration', SimpleNamespace(fill_from_eval='fill')),
                 setattr(m, '_z_fill_head_is_fillable', lambda: True)), 'fill_from_eval'),
+    (lambda m: (setattr(m.args, 'condition_log_z', SimpleNamespace(weighted_condition_sampling=True)),
+                setattr(m.protocol, 'flag', lambda name: name in ('buffers_active', 'weighted_condition_sampling'))),
+     'weighted_condition_sampling'),
 ])
 def test_a_rollout_that_is_not_a_sample_of_the_eval_target_falls_back_and_says_so_once(arm, word, capsys):
     m = modeller(n=8)
@@ -212,6 +215,16 @@ def test_a_rollout_that_is_not_a_sample_of_the_eval_target_falls_back_and_says_s
     assert m.fresh_calls == [8, 8]
     out = capsys.readouterr().out
     assert out.count('drawn fresh') == 1 and word in out
+
+
+@pytest.mark.parametrize('stage_flag, config_key', [(True, False), (False, True)])
+def test_a_weighted_condition_draw_refuses_the_pool_only_with_both_switches_on(stage_flag, config_key):
+    m = modeller(n=8)
+    m.args.condition_log_z = SimpleNamespace(weighted_condition_sampling=config_key)
+    on = {'buffers_active'} | ({'weighted_condition_sampling'} if stage_flag else set())
+    m.protocol.flag = lambda name: name in on
+    m._eval_pool_add(rollout_rows(8), crystals(8))
+    assert m._eval_pool_refusal() is None and m._eval_forward_rows(None)[3]['eval/pool_rows'] == 8
 
 
 def test_an_eval_fill_on_a_head_it_cannot_fill_keeps_the_pool():

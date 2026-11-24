@@ -3530,6 +3530,12 @@ class Modeller:
                              f"one of {ROLLOUT_CONDITION_DRAWS}")
         return mode
 
+    def _rollout_draw_is_weighted(self) -> bool:
+        """This stage's forward rollouts draw conditions by weighted_condition_sampling's fit-error measure: the stage
+        flag and condition_log_z.weighted_condition_sampling are both on."""
+        return bool(self.protocol.flag('weighted_condition_sampling')
+                    and getattr(getattr(self.args, 'condition_log_z', None), 'weighted_condition_sampling', False))
+
     def _rollout_mol_batch(self, repeats):
         """The forward rollout's mol_dataset rows: self.batch_size rows (one
         condition each on a single-SG/Z' route), each tiled `repeats` times.
@@ -3554,8 +3560,7 @@ class Modeller:
         # forward can't lower that variance anyway -- weighting there aims the
         # weak lever at its worst conditions while starving the clean-gradient
         # bulk. Declare the flag per-stage to A/B it.
-        weighted = bool(self.protocol.flag('weighted_condition_sampling')
-                        and getattr(cfg, 'weighted_condition_sampling', False))
+        weighted = self._rollout_draw_is_weighted()
         mode = self._rollout_condition_mode()
         if mode != 'iid':
             if weighted:
@@ -9315,12 +9320,15 @@ class Modeller:
 
     def _eval_pool_refusal(self):
         """Why this eval draws fresh instead of reading the rollout pool, or None. The rollouts are not samples of the
-        eval target under exploration noise or random frames; a force readout scores the eval's own draw; a z_calibration
-        eval fill on a fillable head takes the eval rows as a sample of the current policy."""
+        eval target under exploration noise, random frames or a fit-error condition draw; a force readout scores the
+        eval's own draw; a z_calibration eval fill on a fillable head takes the eval rows as a sample of the current
+        policy."""
         if float(getattr(self.args.fwd_loss_coeffs, 'exploration_std', 0.0) or 0.0) > 0:
             return 'fwd_loss_coeffs.exploration_std > 0 (rollouts are off-policy)'
         if getattr(self.gfn_model, '_framed', False):
             return 'rotate_frames or mirror_frames (rollouts draw random frames, the eval reads the standard frame)'
+        if self._rollout_draw_is_weighted():
+            return 'weighted_condition_sampling (rollouts draw conditions by fit error, the eval draws them uniformly)'
         if getattr(self, 'drift_force', None) is not None:
             return 'drift_force (its readout scores the eval draw)'
         cfg = getattr(self.args, 'z_calibration', None)
