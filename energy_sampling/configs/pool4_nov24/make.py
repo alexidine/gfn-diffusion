@@ -12,7 +12,11 @@ fresh MLE arm on the live physical kernel and two smokes.
   resume    `--resume ARM` writes ARM_resume.yaml: continue_from_checkpoint true, checkpoint_name null,
             load_weights_only false (a TB arm resubmitted with its checkpoint_name would restart from mle4 at step 0).
 
-usage: python configs/pool4_nov24/make.py              (one yaml per arm and submit_pool4_nov24.sbatch)
+  legs      every job asks for LEG_TIME (12 h), so full arms run as chained legs. Each full arm also gets
+            ARM_resume.yaml, run by submit_pool4_nov24_resume.sbatch (indices 0-8 = main indices 9-17):
+            sbatch --dependency=afterany:<previous leg> --array=0-8 configs/pool4_nov24/submit_pool4_nov24_resume.sbatch
+
+usage: python configs/pool4_nov24/make.py              (arm yamls, resume yamls and both sbatch files)
        python configs/pool4_nov24/make.py --resume ARM (ARM_resume.yaml)"""
 import copy
 import importlib.util
@@ -153,8 +157,13 @@ GUARDS = '''    if [ "$(awk '/^continue_from_checkpoint:/{print $2}' ${ARMS}/${A
 '''
 
 
+LEG_TIME = '12:00:00'       # the cluster has been kind to 12 h jobs: full arms run as chained legs
+
+
 def sbatch(arms):
     text = (HERE.parent / 'unified_nov23' / 'submit_template.sbatch').read_text(encoding='utf-8')
+    assert text.count('#SBATCH --time=2-00:00:00') == 1
+    text = text.replace('#SBATCH --time=2-00:00:00', f'#SBATCH --time={LEG_TIME}')
     anchor = "    SRC=$(awk '/^checkpoint_name:/{print $2}' ${ARMS}/${ARM}.yaml)\n"
     assert text.count(anchor) == 1
     text = text.replace(anchor, anchor + GUARDS)
@@ -174,4 +183,10 @@ if __name__ == '__main__':
         assert cfg['run_name'] == name and cfg['tag'] == TAG
         (HERE / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
     (HERE / f'submit_{TAG}.sbatch').write_text(sbatch(list(cfgs)), encoding='utf-8', newline='\n')
-    print(f'{len(cfgs)} arms in {HERE}: ' + ' '.join(cfgs))
+    full = [n for n in cfgs if not n.startswith('smoke_')]     # resume legs: same order as the main array's 9-17
+    for name in full:
+        (HERE / f'{name}_resume.yaml').write_text(yaml.safe_dump(resume(name), sort_keys=False), encoding='utf-8',
+                                                  newline='\n')
+    (HERE / f'submit_{TAG}_resume.sbatch').write_text(sbatch([f'{n}_resume' for n in full]), encoding='utf-8',
+                                                      newline='\n')
+    print(f'{len(cfgs)} arms in {HERE}: ' + ' '.join(cfgs) + f'; resume legs for {len(full)}')
