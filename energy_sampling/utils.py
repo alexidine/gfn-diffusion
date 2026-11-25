@@ -952,6 +952,14 @@ def get_problem_definition(args) -> dict:
     # is the one every existing run already has, and writing it would change their hash
     if energy_config.get('crystal_coordinates', 'latent') == 'latent':
         energy_config.pop('crystal_coordinates', None)
+    # mlip_dispersion (the MACE route's D3) moves every energy, so it is identity; it enters only when set, for the
+    # same reason: a run without dispersion keeps the hash it had before the key existed
+    if energy_config.get('mlip_dispersion') is None:
+        energy_config.pop('mlip_dispersion', None)
+    else:   # a plain dict in key order (yaml nests it as a Namespace, which would hash as its repr)
+        d = energy_config['mlip_dispersion']
+        d = dict(vars(d)) if hasattr(d, '__dict__') else dict(d)
+        energy_config['mlip_dispersion'] = {k: d[k] for k in sorted(d)}
 
     definition = {
         # explicit schema version -- bump when adding/removing a field below

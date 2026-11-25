@@ -472,9 +472,18 @@ def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws
     return out, ~pending
 
 
+def _plain_settings(value):
+    """A settings block (a dict, or the Namespace yaml nests it as) as a dict with sorted keys; None stays None."""
+    if value is None:
+        return None
+    d = dict(vars(value)) if hasattr(value, '__dict__') else dict(value)
+    return {k: d[k] for k in sorted(d)}
+
+
 def identity(args, energy_function):
     """What is baked into a stored row's energy terms, so a file is read only by runs that would score it the same:
-    the energy function and its weights, the analysis settings as resolved (MolecularCrystal.analyze_crystal_batch's
+    the energy function and its weights, the MACE route's D3 settings (energy_config.mlip_dispersion; a file without
+    the key reads as None, no dispersion), the analysis settings as resolved (MolecularCrystal.analyze_crystal_batch's
     defaults, then energy_config.analyze_kwargs), the MLIP density guard, the legacy triclinic wall switch, the space
     groups and Z' the run builds, and the eLJ coefficient the energies are scaled by. Not the state chart
     (energy_config.crystal_coordinates): the stored terms are the crystal's, and the chart's Jacobian is recomputed from
@@ -492,6 +501,7 @@ def identity(args, energy_function):
         'analyze_kwargs': {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
                            for k, v in sorted(analyze.items())},
         'mlip_max_packing_coeff': getattr(ec, 'mlip_max_packing_coeff', None),
+        'mlip_dispersion': _plain_settings(getattr(ec, 'mlip_dispersion', None)),
         'legacy_triclinic_walls': os.environ.get('MXT_LEGACY_TRICLINIC_WALLS'),
         'space_groups': [int(s) for s in args.space_groups],
         'z_primes': [int(z) for z in args.z_primes],

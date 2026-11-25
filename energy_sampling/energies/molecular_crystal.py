@@ -34,6 +34,14 @@ LJ_FAMILY = ('lj', 'qlj', 'elj')
 LJ_ENVELOPE_A = 1.0
 
 
+def mlip_dispersion_settings(value):
+    """energy_config.mlip_dispersion as a plain dict with sorted keys (yaml nests dicts as Namespaces), or None."""
+    if value is None:
+        return None
+    d = dict(vars(value)) if hasattr(value, '__dict__') else dict(value)
+    return {k: d[k] for k in sorted(d)}
+
+
 def effective_analyze_kwargs(energy_function, analyze_kwargs):
     """energy_config.analyze_kwargs as the analysis runs it: a copy, with lj_envelope LJ_ENVELOPE_A added for an
     LJ-family energy that does not set it. Read by MolecularCrystal and by every identity of a scored file."""
@@ -261,6 +269,7 @@ class MolecularCrystal(BaseSet):
                  mlip_edge_chunk_size: Optional[int] = None,
                  mlip_activation_checkpointing: bool = True,
                  implausible_energy_below: Optional[float] = None,  # a physical energy under this (run energy units, negative) is replaced by its magnitude: see screen_implausible_energy. None = no screen
+                 mlip_dispersion: Optional[dict] = None,  # mace only: D3 settings added to every MACE energy (MXtalTools load_mace_model(dispersion=...), torch-dftd), e.g. {'xc': 'pbe', 'damping': 'bj'} for MACE-CSP-25.2 (trained on PBE without dispersion). None = the model's energy alone
                  mlip_max_packing_coeff: Optional[float] = None,  # mace only: a cell denser than this is not handed to the MLIP and is scored as a clash: see analyze_density_guarded. None = every cell goes to the MLIP
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
@@ -392,9 +401,14 @@ class MolecularCrystal(BaseSet):
                       f"energy/uma_edges_max before believing a null result")
         elif self.energy_function == 'mace':
             self.mlip_path = mlip_path
-            self.predictor = load_mace_model(self.mlip_path, self.device, torch.float32)
+            self.mlip_dispersion = mlip_dispersion_settings(mlip_dispersion)
+            self.predictor = load_mace_model(self.mlip_path, self.device, torch.float32,
+                                             dispersion=self.mlip_dispersion)
         else:
             self.predictor = None
+        if mlip_dispersion is not None and self.energy_function != 'mace':
+            raise ValueError(f'energy_config.mlip_dispersion is read by the mace route only, not '
+                             f'{self.energy_function!r}')
 
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
