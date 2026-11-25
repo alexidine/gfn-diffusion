@@ -16,7 +16,13 @@ fresh MLE arm on the live physical kernel and two smokes.
             ARM_resume.yaml, run by submit_pool4_nov24_resume.sbatch (indices 0-8 = main indices 9-17):
             sbatch --dependency=afterany:<previous leg> --array=0-8 configs/pool4_nov24/submit_pool4_nov24_resume.sbatch
 
-usage: python configs/pool4_nov24/make.py              (arm yamls, resume yamls and both sbatch files)
+  aug       augmented MLE before augmented TB, in their own sbatch files (submit_pool4_nov24_aug.sbatch, index order
+            smoke_mle4_aug, smoke_tb_m4aug_aug, mle4_aug, tb_m4aug_aug; each TB arm needs its MLE arm's phase1_exit,
+            so submit in that order with afterok): mle4_aug trains the MLE stage MLE_AUG_STEPS steps from mle4's final
+            weights with random frames (rotate, mirror; replay rule visits, since duty is refused with frames) and
+            stops; tb_m4aug_aug is tb_m4_aug started from mle4_aug's phase1_exit instead of mle4.
+
+usage: python configs/pool4_nov24/make.py              (arm yamls, resume yamls and the sbatch files)
        python configs/pool4_nov24/make.py --resume ARM (ARM_resume.yaml)"""
 import copy
 import importlib.util
@@ -110,6 +116,40 @@ def mle_live(name='mle_live', mle_steps=MLE_STEPS):
     return cfg
 
 
+MLE_AUG_STEPS, SMOKE_MLE_AUG_STEPS = 20000, 300     # 20k: one 12 h leg with room; TB needs its phase1_exit
+FRAMES = [('buffers.store.replay_weight', 'visits'), ('model.nf.rotate_frames', True), ('model.nf.mirror_frames', True)]
+STEM = 'elj-pool8_4sg_train_k4_metric-T2.5-1d2dd7'      # the problem stem of this prior's checkpoint names
+
+
+def mle4_aug(name='mle4_aug', mle_steps=MLE_AUG_STEPS):
+    """MLE only, weights-only from mle4's final weights, with random frames; stops at phase1_exit."""
+    cfg = from_mle4(name, base(mle_steps=mle_steps))
+    for path, value in FRAMES:
+        _set(cfg, path, value)
+    mle = _mle(cfg)
+    del mle['skip_if']                                  # the weights are loaded and this arm trains the MLE stage
+    mle.update(max_steps=mle_steps, on_exit=['snapshot:phase1_exit', 'stop'])
+    cfg['protocols'][uni.PROTOCOL]['stages'] = [mle]
+    cfg.update(epochs=mle_steps + uni.LOOP_MARGIN)
+    return cfg
+
+
+def tb_from_mle_aug(name, source_run, tb_steps=TB_STEPS):
+    """tb_m4_aug's settings, weights-only from source_run's phase1_exit snapshot."""
+    cfg = tb_arm(name, FRAMES, tb_steps=tb_steps)
+    _set(cfg, 'checkpoint_name', f'{TAG}_{source_run}_{STEM}_phase1_exit.pt')
+    return cfg
+
+
+def aug_configs():
+    sm_mle = mle4_aug('smoke_mle4_aug', SMOKE_MLE_AUG_STEPS)
+    sm_tb = tb_from_mle_aug('smoke_tb_m4aug_aug', 'smoke_mle4_aug', tb_steps=SMOKE_TB_STEPS)
+    for c in (sm_mle, sm_tb):
+        c.update(smoke=True, eval_period=100, archive_period=10 ** 6)
+    return {'smoke_mle4_aug': sm_mle, 'smoke_tb_m4aug_aug': sm_tb, 'mle4_aug': mle4_aug(),
+            'tb_m4aug_aug': tb_from_mle_aug('tb_m4aug_aug', 'mle4_aug')}
+
+
 ARMS = {
     'tb_m4': [],
     'tb_m4_lr4': [('tb.lr_schedule', [{'to': 0.8, 'steps': 0, 'kind': 'hold'}])],
@@ -190,3 +230,15 @@ if __name__ == '__main__':
     (HERE / f'submit_{TAG}_resume.sbatch').write_text(sbatch([f'{n}_resume' for n in full]), encoding='utf-8',
                                                       newline='\n')
     print(f'{len(cfgs)} arms in {HERE}: ' + ' '.join(cfgs) + f'; resume legs for {len(full)}')
+    aug = aug_configs()
+    for name, cfg in aug.items():
+        assert cfg['run_name'] == name and cfg['tag'] == TAG and name not in cfgs
+        (HERE / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
+    (HERE / f'submit_{TAG}_aug.sbatch').write_text(sbatch(list(aug)), encoding='utf-8', newline='\n')
+    aug_full = [n for n in aug if not n.startswith('smoke_')]
+    for name in aug_full:
+        (HERE / f'{name}_resume.yaml').write_text(yaml.safe_dump(resume(name), sort_keys=False), encoding='utf-8',
+                                                  newline='\n')
+    (HERE / f'submit_{TAG}_aug_resume.sbatch').write_text(sbatch([f'{n}_resume' for n in aug_full]),
+                                                          encoding='utf-8', newline='\n')
+    print(f'aug: ' + ' '.join(aug) + f'; resume legs for {len(aug_full)}')
