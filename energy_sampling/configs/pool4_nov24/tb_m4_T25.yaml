@@ -567,7 +567,7 @@ energy_config:
   log_temperature_range:
   - 0
   - 0.693147
-  density_coeff: 10.0
+  density_coeff: 100.0
   implausible_energy_below: null
   mlip_max_packing_coeff: null
   bounding_coeff: 10.0

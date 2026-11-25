@@ -48,7 +48,7 @@ AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 0, 'score_force': 'li
            'pathwise_grad_clip': 100.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
 # config paths an arm may change: every one is read on the store route (a legacy buffers.* key would sweep nothing)
 LIVE_PREFIXES = ('protocols.', 'model.nf.rotate_frames', 'model.nf.mirror_frames', 'model.nf.atom_tokens',
-                 'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'energy_config.temperature', 'warm_start_ignore_problem_keys', 'lr_control.hard_failure.grad_abs', 'smoke',
+                 'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'energy_config.temperature', 'energy_config.density_coeff', 'warm_start_ignore_problem_keys', 'lr_control.hard_failure.grad_abs', 'smoke',
                  'checkpoint_name',
                  'load_weights_only', 'epochs')
 
@@ -181,18 +181,29 @@ def onpol_configs():
 #: mle4's weights may start another temperature, but T is part of the checkpoint's problem identity: each arm exempts
 #: it (warm_start_ignore_problem_keys, honoured on the weights-only load only). The energy window (window_kT x T)
 #: widens with T and the reward cache keys on T. Each LR change ramps (RAMP_STEPS).
+#: energy_config.density_coeff scales with T (BASE_T, BASE_DENSITY): the density term enters the energy beside the eLJ
+#: energy and is divided by T with it, while the bounding and reduction terms are pre-multiplied by T, so without the
+#: scaling the packing wall would soften by T / BASE_T in nats and a hot target would open loose, gas-like cells.
 HOT = {'tb_m4_T10': 10.0, 'tb_m4_T25': 25.0}
+BASE_T, BASE_DENSITY = 2.5, 10.0
 HOT_COMMON = [('warm_start_ignore_problem_keys', ['energy_config.temperature']), ('tb.lr_schedule', ramp(0.2))]
 
 
+def hot_changes(T):
+    return [('energy_config.temperature', T), ('energy_config.density_coeff', BASE_DENSITY * T / BASE_T)] + HOT_COMMON
+
+
 def hot_configs():
+    base_cfg = base()
+    assert base_cfg['energy_config']['temperature'] == BASE_T, base_cfg['energy_config']['temperature']
+    assert base_cfg['energy_config']['density_coeff'] == BASE_DENSITY, base_cfg['energy_config']['density_coeff']
     out = {}
     for name, T in HOT.items():                         # smokes first: they take the first array indices
-        sm = tb_arm(f'smoke_{name}', [('energy_config.temperature', T)] + HOT_COMMON, tb_steps=SMOKE_TB_STEPS)
+        sm = tb_arm(f'smoke_{name}', hot_changes(T), tb_steps=SMOKE_TB_STEPS)
         sm.update(smoke=True, eval_period=100, archive_period=10 ** 6)
         out[sm['run_name']] = sm
     for name, T in HOT.items():
-        out[name] = tb_arm(name, [('energy_config.temperature', T)] + HOT_COMMON)
+        out[name] = tb_arm(name, hot_changes(T))
     return out
 
 
