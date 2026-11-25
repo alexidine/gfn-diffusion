@@ -9362,7 +9362,12 @@ class Modeller:
 
     def _store_admit(self, fwd_stats, sample_batch, origin, eval_row=False, drawable=True, durable=True):
         """Write every row of a scored rollout as an on-policy row; CrystalStore.add drops and counts non-finite rows.
-        A training rollout (ORIGIN_ROLLOUT) owes one kick per row it wrote (_growth_kicks_due)."""
+        A training rollout (ORIGIN_ROLLOUT) owes one kick per row it wrote (_growth_kicks_due), on every
+        buffers.store.growth_every-th training rollout (_owe_growth).
+
+        Under buffers.store.keep_rollouts false a training rollout writes no row: it feeds the eval's trailing pool,
+        lowers best_energy (invariant I6 counts every row given), owes kicks for its finite rows on the same cadence, and
+        returns an empty index. Eval and bootstrap rows are written as before."""
         st = self.row_store
         cid = fwd_stats.get('condition_id')
         if cid is None:
@@ -9378,6 +9383,13 @@ class Modeller:
             raise RuntimeError(f"store admission: mol_energy has {energy.numel()} rows, the rollout {cid.numel()}")
         x = fwd_stats['flow_states'][:, -1].detach().float().cpu()
         log_r = fwd_stats['log_r'].detach().float().flatten().cpu()
+        if origin == ORIGIN_ROLLOUT and not self._store_cfg.get('keep_rollouts', True):
+            ok = torch.isfinite(energy) & torch.isfinite(log_r) & torch.isfinite(x).all(1)   # add()'s finite rows
+            if bool(ok.any()):
+                st.best_energy.scatter_reduce_(0, cid[ok], energy[ok], reduce='amin', include_self=True)
+            self._owe_growth(int(ok.sum()))
+            self._eval_pool_add(fwd_stats, sample_batch)
+            return torch.empty(0, dtype=torch.long)
         log_pf = fwd_stats['log_pf'].detach().float().flatten().cpu()
         log_pb = fwd_stats['log_pb'].detach().float().flatten().cpu()
         log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
@@ -9388,9 +9400,18 @@ class Modeller:
                          undrawn=torch.full((cid.numel(),), not drawable), log_q=log_pf, resid=resid,
                          eval_row=eval_row, durable=durable)
         if origin == ORIGIN_ROLLOUT:
-            self._growth_owed += int(written.numel())
+            self._owe_growth(int(written.numel()))
             self._eval_pool_add(fwd_stats, sample_batch)
         return written
+
+    def _owe_growth(self, n):
+        """Owe `n` growth kicks for this training rollout when it is the first of every buffers.store.growth_every
+        training rollouts (1 = every one). The count is not checkpointed: a resume owes on its first rollout, so the
+        kick rate holds and only the phase of the cadence moves."""
+        every = int(self._store_cfg.get('growth_every', 1) or 1)
+        k = self._growth_rollouts = int(getattr(self, '_growth_rollouts', 0)) + 1
+        if (k - 1) % every == 0:
+            self._growth_owed += int(n)
 
     def _eval_pool_add(self, fwd_stats, sample_batch):
         """A training rollout of a buffers_active stage into the eval's trailing pool: every row it scored, each with the

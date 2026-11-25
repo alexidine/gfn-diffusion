@@ -410,6 +410,37 @@ def test_the_forward_tb_is_its_hand_value_on_one_step():
     assert torch.allclose(loss, tb_hand.mean(), atol=1e-4)
 
 
+@pytest.mark.parametrize('emp_z', [0.0, 1.0])
+def test_forward_tb_detach_z_reads_a_detached_head_in_tb_only(emp_z):
+    """fwd tb_detach_z: the TB term takes the level head detached, so with TB alone the head gets no gradient and the
+    loss is unchanged, while the policy still does; an emp_z term on the same branch still trains the head."""
+    from types import SimpleNamespace
+    from gflownet_losses import get_gfn_forward_loss
+    n = 6
+    c = torch.randn(n, 4)
+    cid = torch.arange(n) % 2
+
+    def log_reward_fn(x, mol_batch, log_T, return_exp, keep_grads=False):
+        return -(x ** 2).sum(-1) * 3
+
+    def run(detach):
+        pol = flow_policy(True, dead=(9,))
+        coeffs = _bwd_coeffs(tb=1, emp_z=emp_z, vg_by_condition=1.0 if emp_z else 0.0, vg_lme=0, beta=10.0,
+                             traj_grads=0, reward_grads=0, pooled_source=None, coeff_matrix=None, tb_detach_z=detach)
+        torch.manual_seed(1)
+        loss, _ = get_gfn_forward_loss(coeffs, torch.zeros(n, 12), pol, log_reward_fn, None, None, torch.zeros(n),
+                                       condition=c, report_losses=True, condition_id=cid)
+        loss.backward()
+        head = sum(float(p.grad.abs().sum()) for p in pol.flow_model.parameters() if p.grad is not None)
+        flow = sum(float(p.grad.abs().sum()) for p in pol.sampler.parameters() if p.grad is not None)
+        return float(loss), head, flow
+
+    live, detached = run(0.0), run(1.0)
+    assert detached[0] == pytest.approx(live[0], rel=1e-5)
+    assert live[1] > 0 and detached[2] > 0
+    assert (detached[1] > 0) == bool(emp_z)
+
+
 def test_a_state_dict_round_trip_restores_the_flow_and_its_scalers(tmp_path):
     """A resume rebuilds the policy from its gfn_config and loads the state dict (checkpointing.py): the fitted
     standardisers ride in it (scalers_fitted stays True, so train.py's fit_policy_data_scalers does not refit them on

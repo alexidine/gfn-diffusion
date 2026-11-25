@@ -1497,7 +1497,8 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
 #: On an enabled block an absent key reads its default and an unknown key is refused. A disabled block is not read.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
                           eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, is_exponent=1.0,
-                          refresh_chunk=8192, ram_gb=None, ram_frac=0.5, mle_draw='anchor', replay_weight='uniform')
+                          refresh_chunk=8192, ram_gb=None, ram_frac=0.5, mle_draw='anchor', replay_weight='uniform',
+                          keep_rollouts=True, growth_every=1)
 #: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
 ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
 #: keys of the previous row store: inert on a disabled block, refused on an enabled one
@@ -1617,6 +1618,15 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         if framed:
             err(f"buffers.store.replay_weight 'duty' compares log q across writes, and model.nf.{framed[0]} gives each "
                 f"write its own random frame")
+    if isinstance(s['growth_every'], bool) or not _whole(s['growth_every']) or s['growth_every'] < 1:
+        err(f"buffers.store.growth_every must be an integer >= 1, got {s['growth_every']!r}")
+    if not isinstance(s['keep_rollouts'], bool):
+        err(f"buffers.store.keep_rollouts must be true or false, got {s['keep_rollouts']!r}")
+    elif not s['keep_rollouts']:
+        for st in active_stages(cfg):
+            if isinstance(st, dict) and (_num((st.get('fracs') or {}).get('replay')) or 0) > 0:
+                err(f"stage {st.get('name', '?')!r}: replay frac > 0 with buffers.store.keep_rollouts false (no "
+                    f"training rollout row is written, so replay would draw only the eval's stored rows)")
     if _get(cfg, 'condition_log_z.rollout_group_draw', 'uniform') != 'uniform':
         err("buffers.store draws rollout groups uniformly: set condition_log_z.rollout_group_draw 'uniform'")
     if _get(cfg, 'buffers.replay_buffer.admit_from_eval', True) is False:
@@ -1700,6 +1710,36 @@ def _z_head_pinned_by_sidecar(cfg: dict, stage: dict, mode: str) -> bool:
             and (fwd_freeze is None or (isinstance(fwd_freeze, (bool, int, float)) and fwd_freeze <= 0.5)))
 
 
+def _z_head_pinned_on_policy(cfg: dict, stage: dict, mode: str) -> bool:
+    """True where the forward branch fits Z(c) on fresh rollouts on every step of a fused stage without the sidecar:
+    the sidecar's pin moved into the frac mix. The forward branch carries no TB term that trains the head (tb 0, or
+    tb against a detached head under tb_detach_z > 0.5), its emp_z fits the head (emp_z > 0, freeze_z <= 0.5) on condition groups
+    (vg_by_condition > 0.5, repeats >= 2), and it actually trains: its entry share is at least the deactivate threshold
+    (stage, else controller) and, on a stage with a balance, so is its floor (min_fracs.fwd, else
+    controller.min_mode_frac), since a balance could otherwise move it dark. Whether the forward branch also trains the
+    policy does not matter to the pin. Then the forward branch itself, and a bwd or replay branch running TB against a
+    detached head (tb > 0, freeze_z > 0.5), read a head the forward emp_z pins."""
+    def num(m, k):
+        return _coeff(cfg, stage, m, k) or 0
+    fwd_freeze = _coeff_raw(cfg, stage, 'fwd', 'freeze_z')
+    deact = _num(stage.get('deactivate_threshold'))
+    if deact is None:
+        deact = _num(_get(cfg, 'controller.deactivate_threshold'))
+    floor = _num((stage.get('min_fracs') or {}).get('fwd'))
+    if floor is None:
+        floor = _num(_get(cfg, 'controller.min_mode_frac'))
+    share = _num((stage.get('fracs') or {}).get('fwd')) or 0
+    trains = share > 0 and (deact is None or share >= deact) and (
+        not stage.get('balance') or (deact is not None and floor is not None and floor >= deact))
+    if not (stage.get('fwd_z_sidecar') is not True and stage.get('train_mode', 'fused') == 'fused' and trains
+            and (num('fwd', 'tb') == 0 or num('fwd', 'tb_detach_z') > 0.5)
+            and num('fwd', 'emp_z') > 0 and num('fwd', 'vg_by_condition') > 0.5
+            and num('fwd', 'repeats') >= 2
+            and (fwd_freeze is None or (isinstance(fwd_freeze, (bool, int, float)) and fwd_freeze <= 0.5))):
+        return False
+    return mode == 'fwd' or (mode in ('bwd', 'replay') and num(mode, 'tb') > 0 and num(mode, 'freeze_z') > 0.5)
+
+
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     """Three Z-side keys are documented as UNCONDITIONAL-route settings and must
     be switched when the route is conditional.
@@ -1742,7 +1782,7 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     conservative rule, it is a broken one.
 
     A stated or inherited `learned` is not reported on a branch for which
-    _z_head_pinned_by_sidecar holds. An unset tb_z_source is reported there too."""
+    _z_head_pinned_by_sidecar or _z_head_pinned_on_policy holds. An unset tb_z_source is reported there too."""
     conditional = any(_get(cfg, k) is True for k in
                       ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning'))
     if not conditional:
@@ -1804,7 +1844,8 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
                     f'NOWHERE on a CONDITIONAL route, so it resolves to the code '
                     f'fallback `learned` (train.py:1105){where}. Every battery that ran '
                     f'used `persistent` ({src}). Set it in that stage\'s loss_coeffs.'))
-            elif eff == 'learned' and not _z_head_pinned_by_sidecar(cfg, st, mode):
+            elif eff == 'learned' and not (_z_head_pinned_by_sidecar(cfg, st, mode)
+                                           or _z_head_pinned_on_policy(cfg, st, mode)):
                 out.append(Violation(
                     BASELINE, 'conditional_z_settings_are_conditional',
                     f"stage '{st.get('name')}' resolves {mode}_loss_coeffs.tb_z_source "

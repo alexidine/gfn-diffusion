@@ -838,6 +838,77 @@ def test_learned_is_accepted_on_a_detached_tb_branch_of_a_sidecar_stage(canonica
     assert _z_rule(_sidecar_pinned(canonical)) == []
 
 
+def _on_policy_pinned(canonical):
+    """The sidecar stage turned on-policy: no sidecar, fwd in the mix training the policy by per-condition VarGrad
+    (Z-free) while its emp_z fits the learned head on the same rollouts; bwd and replay run TB against that head,
+    detached."""
+    cfg = _sidecar_pinned(canonical)
+    stage = _vg_stage(cfg)
+    stage['fwd_z_sidecar'] = False
+    stage['fracs']['fwd'] = 0.5
+    stage['min_fracs'] = dict(stage.get('min_fracs') or {}, fwd=0.05)   # the stage's balance cannot move fwd dark
+    stage['loss_coeffs']['fwd'].update(tb=1.0, tb_detach_z=1.0, vg_by_condition=1.0, vg_lb=0.0, emp_z=1.0,
+                                       freeze_policy=0.0, freeze_z=0.0, tb_z_source='learned', repeats=2)
+    return cfg
+
+
+def test_learned_is_accepted_where_an_on_policy_forward_branch_pins_the_head(canonical):
+    assert _z_rule(_on_policy_pinned(canonical)) == []
+
+
+@pytest.mark.parametrize('change', [dict(tb=0.0), dict(tb=0.0, vg_lb=1.0), dict(freeze_policy=1.0)])
+def test_the_on_policy_pin_does_not_depend_on_the_policy_term(canonical, change):
+    """emp_z fits Z(c) every step whatever trains the policy: TB against the detached head, VarGrad, or nothing
+    (gflownet_losses: the standalone emp_z path; freeze_policy detaches log_pf and log_pb only)."""
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].update(change)
+    assert _z_rule(cfg) == []
+
+
+@pytest.mark.parametrize('key, value', [('tb_detach_z', 0.0), ('emp_z', 0.0), ('vg_by_condition', 0.0),
+                                        ('freeze_z', 1.0), ('repeats', 1)])
+def test_the_on_policy_pin_needs_every_part(canonical, key, value):
+    """A forward TB term that trains the head, no head fit, no condition groups, a frozen head or singleton groups:
+    the learned head is no longer pinned on fresh rollouts, and every live branch reading it fires."""
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'][key] = value
+    vs = _z_rule(cfg)
+    assert {m for m in ('fwd', 'bwd', 'replay') if any(f'{m}_loss_coeffs' in v.detail for v in vs)} == {
+        'fwd', 'bwd', 'replay'}, [v.detail for v in vs]
+
+
+def test_the_on_policy_pin_needs_a_share_at_or_above_the_deactivate_threshold(canonical):
+    cfg = _on_policy_pinned(canonical)
+    st = _vg_stage(cfg)
+    st['deactivate_threshold'] = 0.01
+    st['fracs']['fwd'] = 0.005                          # trains at weight 0: fwd_active needs frac >= the threshold
+    vs = _z_rule(cfg)
+    assert {m for m in ('fwd', 'bwd', 'replay') if any(f'{m}_loss_coeffs' in v.detail for v in vs)} == {
+        'fwd', 'bwd', 'replay'}
+
+
+def test_the_on_policy_pin_under_a_balance_needs_a_floor_at_or_above_the_threshold(canonical):
+    cfg = _on_policy_pinned(canonical)
+    st = _vg_stage(cfg)
+    st.update(deactivate_threshold=0.01, balance={'rules': []}, min_fracs={'fwd': 0.001})
+    assert len(_z_rule(cfg)) == 3
+    st['min_fracs']['fwd'] = 0.05
+    assert _z_rule(cfg) == []
+
+
+def test_the_on_policy_pin_needs_the_forward_branch_in_the_mix(canonical):
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['fracs']['fwd'] = 0.0
+    assert len(_z_rule(cfg)) == 2                      # bwd and replay; fwd is no longer judged
+
+
+def test_the_on_policy_pin_does_not_cover_an_undetached_tb_branch(canonical):
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd']['freeze_z'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'bwd_loss_coeffs' in vs[0].detail
+
+
 @pytest.mark.parametrize('branch', ['bwd', 'replay'])
 def test_learned_without_a_tb_term_still_fires(canonical, branch):
     cfg = _sidecar_pinned(canonical)

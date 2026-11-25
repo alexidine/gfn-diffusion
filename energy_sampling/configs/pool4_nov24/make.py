@@ -48,7 +48,8 @@ AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 0, 'score_force': 'li
            'pathwise_grad_clip': 100.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
 # config paths an arm may change: every one is read on the store route (a legacy buffers.* key would sweep nothing)
 LIVE_PREFIXES = ('protocols.', 'model.nf.rotate_frames', 'model.nf.mirror_frames', 'model.nf.atom_tokens',
-                 'buffers.store.replay_weight', 'lr_control.hard_failure.grad_abs', 'smoke', 'checkpoint_name',
+                 'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'lr_control.hard_failure.grad_abs', 'smoke',
+                 'checkpoint_name',
                  'load_weights_only', 'epochs')
 
 
@@ -150,6 +151,32 @@ def aug_configs():
             'tb_m4aug_aug': tb_from_mle_aug('tb_m4aug_aug', 'mle4_aug')}
 
 
+
+#: LR changes ramp, never jump (owner rule, nov25): a stage's schedule starts at 1% of its level and rises
+#: geometrically to it over RAMP_STEPS
+RAMP_STEPS = 2000
+
+
+def ramp(to, steps=RAMP_STEPS):
+    return [{'to': to / 100, 'steps': 0, 'kind': 'hold'}, {'to': to, 'steps': steps, 'kind': 'geometric'}]
+
+
+#: on-policy in place of replay: the forward branch trains the policy by TB on a fresh rollout every step at replay's
+#: weight, as replay runs it (against the detached learned head, Huber knee 10: tb_detach_z), while emp_z fits the
+#: Z(c) head on the same rollouts; no rollout cadence or sidecar; the store writes no rollout row (so no replay pool),
+#: and growth kicks are owed on every 20th rollout, tb_m4's kick rate. Its LR ramps to tb_m4's level over RAMP_STEPS.
+ONPOL = [('fwd_loss_coeffs.tb_detach_z', 0.0),         # the base block carries the key the stage overrides
+         ('tb.fracs', {'fwd': 0.5, 'bwd': 0.5, 'replay': 0.0}), ('tb.fwd_rollout_every', 0),
+         ('tb.fwd_z_sidecar', False), ('tb.loss_coeffs.fwd.freeze_policy', 0.0), ('tb.loss_coeffs.fwd.tb', 1.0),
+         ('tb.loss_coeffs.fwd.tb_detach_z', 1.0), ('tb.lr_schedule', ramp(0.2)),
+         ('buffers.store.keep_rollouts', False), ('buffers.store.growth_every', 20)]
+
+
+def onpol_configs():
+    sm = tb_arm('smoke_tb_m4_onpol', ONPOL, tb_steps=SMOKE_TB_STEPS)
+    sm.update(smoke=True, eval_period=100, archive_period=10 ** 6)
+    return {'smoke_tb_m4_onpol': sm, 'tb_m4_onpol': tb_arm('tb_m4_onpol', ONPOL)}
+
 ARMS = {
     'tb_m4': [],
     'tb_m4_lr4': [('tb.lr_schedule', [{'to': 0.8, 'steps': 0, 'kind': 'hold'}])],
@@ -242,3 +269,13 @@ if __name__ == '__main__':
     (HERE / f'submit_{TAG}_aug_resume.sbatch').write_text(sbatch([f'{n}_resume' for n in aug_full]),
                                                           encoding='utf-8', newline='\n')
     print(f'aug: ' + ' '.join(aug) + f'; resume legs for {len(aug_full)}')
+    onpol = onpol_configs()
+    for name, cfg in onpol.items():
+        assert cfg['run_name'] == name and cfg['tag'] == TAG and name not in cfgs and name not in aug
+        (HERE / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
+    (HERE / f'submit_{TAG}_onpol.sbatch').write_text(sbatch(list(onpol)), encoding='utf-8', newline='\n')
+    (HERE / 'tb_m4_onpol_resume.yaml').write_text(yaml.safe_dump(resume('tb_m4_onpol'), sort_keys=False),
+                                                  encoding='utf-8', newline='\n')
+    (HERE / f'submit_{TAG}_onpol_resume.sbatch').write_text(sbatch(['tb_m4_onpol_resume']), encoding='utf-8',
+                                                            newline='\n')
+    print('onpol: ' + ' '.join(onpol) + '; resume leg for tb_m4_onpol')

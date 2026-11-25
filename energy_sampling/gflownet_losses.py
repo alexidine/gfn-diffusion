@@ -715,6 +715,10 @@ def get_gfn_forward_loss(loss_coeffs,
     if loss_coeffs.tb > 0:
         use_persistent_z = tb_z_source == 'persistent'
         z_for_tb = log_Z_learned
+        if getattr(loss_coeffs, 'tb_detach_z', 0) > 0.5:
+            # TB against a detached head, as bwd and replay read it under freeze_z, while the branch's other terms
+            # (emp_z) keep the live head: freeze_z detaches it for every term of the branch
+            z_for_tb = log_Z_learned.detach()
         if tb_z_source == 'batch_root':
             z_for_tb = batch_root_z(log_Z_learned, log_pb, log_pf, log_r, beta)
         untrusted_log_Z = untrusted_z_for(condition_log_z, use_persistent_z)
