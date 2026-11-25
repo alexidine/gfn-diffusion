@@ -474,6 +474,7 @@ fwd_loss_coeffs:
   emp_z: 0                # NB > 0 also disables fwd tb activation at phase1to3
   emp_z_persistent: 0
   tb_z_source: learned    # 'learned' | 'persistent'. CONDITIONAL routes want persistent -- set it in the stage, not here
+  tb_detach_z: 0.0        # > 0.5 = the forward TB term reads the Z head detached; the branch's other terms (emp_z) keep it live
   traj_grads: 0.0
   reward_grads: 0.0
   path_grad_last_k: 0     # > 0: the reparameterised state gradient stays live for the LAST k rollout steps only (0 = every step detached unless traj_grads). With reward_grads this is the truncated terminal-force path. NOT INERT ALONE: the reward half is (get_loss_reward detaches x_T and log_r at reward_grads 0), but log_pf and log_pb still differentiate through the live next_state on the last step (gfn.py:916, :919), so k>0 at reward_grads 0 is NOT the same gradient as k=0
@@ -1164,6 +1165,8 @@ buffers:
     ram_gb: null              # GiB of RAM requested for the job, the ram_gb of config_invariants.store_row_limit. Required when enabled
     ram_frac: 0.5             # share of ram_gb the store may hold, the ram_frac of store_row_limit
     mle_draw: anchor          # MLE row draw: anchor = uniform over anchors, condition = uniform condition then anchor
+    keep_rollouts: true       # false = a training rollout writes no store row (it still feeds the eval pool, lowers best_energy and owes its growth kicks)
+    growth_every: 1           # growth kicks are owed on every Nth training rollout; 1 = every rollout
     replay_weight: uniform    # name in crystal_store.REPLAY_WEIGHTS, the replay row weight within a condition
   # todo my general thought on these buffers is we need a simple, few-point, global theory of dataset management. It should simplify all this organization I imagine
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
