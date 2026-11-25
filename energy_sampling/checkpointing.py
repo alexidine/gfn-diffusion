@@ -362,15 +362,30 @@ class Checkpointer:
 
         return path
 
+    @staticmethod
+    def _drop_problem_keys(defn, keys):
+        """A copy of the normalized problem_def `defn` without `keys`: a plain key drops that field, a dotted key
+        'block.field' drops one field of a dict-valued block (energy_config.temperature). A non-dict passes through."""
+        if not isinstance(defn, dict):
+            return defn
+        out = dict(defn)
+        for key in keys:
+            head, _, tail = key.partition('.')
+            if not tail:
+                out.pop(key, None)
+            elif isinstance(out.get(head), dict):
+                out[head] = {k: v for k, v in out[head].items() if k != tail}
+        return out
+
     def problem_mismatch_report(self, stored_def: Optional[dict], ignore_keys: tuple = ()) -> str:
         """Readable stored-vs-current problem_def comparison, one line per differing field."""
-        current_def = normalize_problem_def(self.modeller.problem_def)
+        current_def = self._drop_problem_keys(normalize_problem_def(self.modeller.problem_def), ignore_keys)
         if stored_def is None:
             return ("  stored:  <none - checkpoint predates problem_def>\n"
                     f"  current: {current_def}")
-        stored_def = normalize_problem_def(stored_def)
+        stored_def = self._drop_problem_keys(normalize_problem_def(stored_def), ignore_keys)
         lines = []
-        for key in sorted((set(stored_def) | set(current_def)) - set(ignore_keys)):
+        for key in sorted(set(stored_def) | set(current_def)):
             stored_val = stored_def.get(key, '<missing>')
             current_val = current_def.get(key, '<missing>')
             if stored_val != current_val:
@@ -396,13 +411,8 @@ class Checkpointer:
         and the prior model is a sampling-only object rebuilt from its own
         stored gfn_config, so it need not share the live model's interface.
         """
-        stored_def = normalize_problem_def(checkpoint.get('problem_def'))
-        current_def = normalize_problem_def(self.modeller.problem_def)
-        if isinstance(stored_def, dict):
-            stored_def_cmp = {k: v for k, v in stored_def.items() if k not in ignore_keys}
-        else:
-            stored_def_cmp = stored_def
-        current_def_cmp = {k: v for k, v in current_def.items() if k not in ignore_keys}
+        stored_def_cmp = self._drop_problem_keys(normalize_problem_def(checkpoint.get('problem_def')), ignore_keys)
+        current_def_cmp = self._drop_problem_keys(normalize_problem_def(self.modeller.problem_def), ignore_keys)
         if stored_def_cmp != current_def_cmp:
             raise ValueError(
                 f"{config_key} checkpoint {path} was trained on a different problem "
@@ -1174,12 +1184,16 @@ class Checkpointer:
                             group['lr'] = target_lrs[key]
 
     #: The ONLY problem_def keys `warm_start_ignore_problem_keys` may exempt, and
-    #: only on the weights-only path. Deliberately one key: a warm start across a
+    #: only on the weights-only path. Deliberately few: a warm start across a
     #: different ENERGY FUNCTION or space group would load weights that mean
     #: nothing for the new target, and no config should be able to ask for that.
     #: prior_path is exemptible because it names the MLE sample, which
     #: `load_weights_only` does not restore any part of -- see below.
-    WARM_START_EXEMPTIBLE = ('prior_path',)
+    #: energy_config.temperature (one field of the energy_config block, nothing else
+    #: in it) is exemptible because the MLE stage is reward-free, so its weights do
+    #: not depend on T, and the weights-only path restores no stored reward, buffer or
+    #: Z level: a TB stage entered on them re-levels log Z (bootstrap_z) at its own T.
+    WARM_START_EXEMPTIBLE = ('prior_path', 'energy_config.temperature')
 
     def _warm_start_ignore_keys(self):
         """Problem-def keys this run is permitted to warm-start ACROSS.

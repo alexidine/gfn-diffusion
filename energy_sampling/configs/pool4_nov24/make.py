@@ -48,7 +48,7 @@ AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 0, 'score_force': 'li
            'pathwise_grad_clip': 100.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
 # config paths an arm may change: every one is read on the store route (a legacy buffers.* key would sweep nothing)
 LIVE_PREFIXES = ('protocols.', 'model.nf.rotate_frames', 'model.nf.mirror_frames', 'model.nf.atom_tokens',
-                 'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'lr_control.hard_failure.grad_abs', 'smoke',
+                 'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'energy_config.temperature', 'warm_start_ignore_problem_keys', 'lr_control.hard_failure.grad_abs', 'smoke',
                  'checkpoint_name',
                  'load_weights_only', 'epochs')
 
@@ -177,6 +177,25 @@ def onpol_configs():
     sm.update(smoke=True, eval_period=100, archive_period=10 ** 6)
     return {'smoke_tb_m4_onpol': sm, 'tb_m4_onpol': tb_arm('tb_m4_onpol', ONPOL)}
 
+#: hot TB: tb_m4 at a higher temperature (energy_config.temperature; tb_m4 runs 2.5). The MLE stage is reward-free, so
+#: mle4's weights may start another temperature, but T is part of the checkpoint's problem identity: each arm exempts
+#: it (warm_start_ignore_problem_keys, honoured on the weights-only load only). The energy window (window_kT x T)
+#: widens with T and the reward cache keys on T. Each LR change ramps (RAMP_STEPS).
+HOT = {'tb_m4_T10': 10.0, 'tb_m4_T25': 25.0}
+HOT_COMMON = [('warm_start_ignore_problem_keys', ['energy_config.temperature']), ('tb.lr_schedule', ramp(0.2))]
+
+
+def hot_configs():
+    out = {}
+    for name, T in HOT.items():                         # smokes first: they take the first array indices
+        sm = tb_arm(f'smoke_{name}', [('energy_config.temperature', T)] + HOT_COMMON, tb_steps=SMOKE_TB_STEPS)
+        sm.update(smoke=True, eval_period=100, archive_period=10 ** 6)
+        out[sm['run_name']] = sm
+    for name, T in HOT.items():
+        out[name] = tb_arm(name, [('energy_config.temperature', T)] + HOT_COMMON)
+    return out
+
+
 ARMS = {
     'tb_m4': [],
     'tb_m4_lr4': [('tb.lr_schedule', [{'to': 0.8, 'steps': 0, 'kind': 'hold'}])],
@@ -279,3 +298,15 @@ if __name__ == '__main__':
     (HERE / f'submit_{TAG}_onpol_resume.sbatch').write_text(sbatch(['tb_m4_onpol_resume']), encoding='utf-8',
                                                             newline='\n')
     print('onpol: ' + ' '.join(onpol) + '; resume leg for tb_m4_onpol')
+    hot = hot_configs()
+    for name, cfg in hot.items():
+        assert cfg['run_name'] == name and cfg['tag'] == TAG and name not in cfgs and name not in aug
+        (HERE / f'{name}.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8', newline='\n')
+    (HERE / f'submit_{TAG}_hot.sbatch').write_text(sbatch(list(hot)), encoding='utf-8', newline='\n')
+    hot_full = [n for n in hot if not n.startswith('smoke_')]
+    for name in hot_full:
+        (HERE / f'{name}_resume.yaml').write_text(yaml.safe_dump(resume(name), sort_keys=False), encoding='utf-8',
+                                                  newline='\n')
+    (HERE / f'submit_{TAG}_hot_resume.sbatch').write_text(sbatch([f'{n}_resume' for n in hot_full]),
+                                                          encoding='utf-8', newline='\n')
+    print('hot: ' + ' '.join(hot) + f'; resume legs for {len(hot_full)}')
