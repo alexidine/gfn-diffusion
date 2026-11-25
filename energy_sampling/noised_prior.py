@@ -109,7 +109,7 @@ def save_cache(path, key: dict, **payload) -> bool:
         torch.save(dict(version=FD_CACHE_VERSION, key=key, **payload), tmp)
         os.replace(tmp, path)
         return True
-    except OSError as e:
+    except Exception as e:      # torch.save reports an unwritable or full file as RuntimeError, not OSError
         print(f"fd cache {path}: not written ({e})", flush=True)
         try:
             os.remove(tmp)

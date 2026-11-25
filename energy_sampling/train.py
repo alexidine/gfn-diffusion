@@ -4769,18 +4769,95 @@ class Modeller:
         strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
         return energy.to(self.device), batch.to(self.device)
 
+    ROW_LIST_KEYS = ('identifier', 'symmetry_operators')   # per-row Python lists a chunk drops before its device move
+    REWARD_CACHE_CHECK_ROWS = 256
+
     @torch.no_grad()
-    def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False, rows=None, cids=None):
+    def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False, rows=None, cids=None,
+                             prior_path=None):
         """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
         (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU. with_mol_energy adds a
         third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced). rows: the rows to read, in
-        this order (default every row); cids: their condition ids, attached for an energy reference to read."""
+        this order (default every row); cids: their condition ids, attached for an energy reference to read.
+        prior_path: `batch` is that pre-noised prior file's batch, and the result goes through the sidecar cache beside
+        it (noised_prior.cache_path 'rewards'), keyed on the file, the rows, the condition ids, the temperature and the
+        energy function's settings, clip and reference. A cached result is used only after a fresh scoring of
+        REWARD_CACHE_CHECK_ROWS rows (random, plus the highest-energy rows, which the clip acts on) agrees with it."""
+        if prior_path is None:
+            return self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+        import json
+        from utils import _namespace_to_dict
+        ef, T =self.energy_function, float(self.args.energy_config.temperature)
+        n = int(batch.num_graphs) if rows is None else int(rows.numel())
+        ref = getattr(ef, 'energy_reference', None)
+        key = dict(file=noised_prior.file_identity(prior_path), n=n, mol=bool(with_mol_energy), T=T,
+                   rows=None if rows is None else noised_prior.digest(torch.as_tensor(rows).long().cpu()),
+                   cids=None if cids is None else noised_prior.digest(torch.as_tensor(cids).long().cpu()),
+                   energy_function=str(self.args.energy_function),
+                   energy_config=json.dumps(_namespace_to_dict(self.args.energy_config), sort_keys=True, default=str),
+                   clip=getattr(ef, 'energy_clip', None), physical_clip=getattr(ef, 'physical_energy_clip', None),
+                   reference=None if ref is None else noised_prior.digest(torch.as_tensor(ref).double()),
+                   fd_chart=getattr(self, '_fd_chart_digest', None), code=self._reward_code_digest())
+        side = noised_prior.cache_path(prior_path, 'rewards', key)
+        hit = noised_prior.load_cache(side, key)
+        if hit is not None:
+            terms = hit['terms']
+            # random rows (a new draw each launch), one share per (kind, split, space group, Z') stratum, and the
+            # highest-energy rows, which the clip acts on
+            idx = torch.randperm(n)[:min(n, self.REWARD_CACHE_CHECK_ROWS)]
+            try:
+                strat = torch.as_tensor(noised_prior.check_rows(batch, n=self.REWARD_CACHE_CHECK_ROWS)).long()
+            except (AttributeError, KeyError, ValueError):     # no stratum tags on this batch: random and top rows only
+                strat = torch.zeros(0, dtype=torch.long)
+            if rows is not None:
+                mark = torch.zeros(int(batch.num_graphs), dtype=torch.bool)
+                mark[strat] = True
+                strat = torch.nonzero(mark[torch.as_tensor(rows).long().cpu()]).flatten()
+            top = torch.topk(terms[0].nan_to_num(-math.inf), min(n, 32)).indices
+            idx = torch.unique(torch.cat([idx, strat, top]))
+            sub_rows = idx if rows is None else torch.as_tensor(rows)[idx]
+            fresh = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, sub_rows,
+                                                    None if cids is None else torch.as_tensor(cids)[idx])
+            if all(torch.allclose(f, c[idx], atol=1e-4, rtol=1e-5, equal_nan=True) for f, c in zip(fresh, terms)):
+                print(f"reward cache: {n} rows read from {side} ({idx.numel()} rows re-scored and agree)", flush=True)
+                return tuple(terms)
+            print(f"reward cache {side}: {idx.numel()} re-scored rows disagree with the cache; recomputing every row",
+                  flush=True)
+        t0 = time()
+        terms = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+        wrote = noised_prior.save_cache(side, key, terms=list(terms))
+        print(f"reward cache: {n} rows scored in {time() - t0:.0f} s" + (f", written to {side}" if wrote else ''),
+              flush=True)
+        return terms
+
+    def _reward_code_digest(self):
+        """A digest of the source of the energy function's reward path (generator_energy, prebuilt_sample_to_reward,
+        seed_energy_from), so an edit to it misses the reward cache."""
+        import hashlib
+        import inspect
+        ef, h = self.energy_function, hashlib.sha1()
+        for name in ('generator_energy', 'prebuilt_sample_to_reward', 'seed_energy_from'):
+            fn = getattr(ef, name, None)
+            try:
+                h.update(inspect.getsource(fn).encode())
+            except (TypeError, OSError):
+                h.update(repr(fn).encode())
+        return h.hexdigest()[:16]
+
+    @torch.no_grad()
+    def _stored_reward_terms_fresh(self, batch, chunk, with_mol_energy, rows, cids):
+        """_stored_reward_terms computed row by row, chunk by chunk. Each chunk drops ROW_LIST_KEYS before its device
+        move: torch_geometric's move walks a Python list element by element, and the reward reads neither list."""
         ef, T = self.energy_function, float(self.args.energy_config.temperature)
         seed, log_r, mol = [], [], []
         n = int(batch.num_graphs) if rows is None else int(rows.numel())
         for lo in range(0, n, chunk):
             at = (torch.arange(lo, min(lo + chunk, n)) if rows is None else rows[lo:lo + chunk]).to(batch.ptr.device)
-            sub = batch.subsample_new_batch(at).to(self.device)
+            sub = batch.subsample_new_batch(at)
+            for k in self.ROW_LIST_KEYS:
+                if k in sub.keys() and isinstance(sub[k], (list, tuple)):
+                    del sub[k]
+            sub = sub.to(self.device)
             if cids is not None:
                 sub.add_graph_attr(cids[lo:lo + chunk].to(sub.ptr.device), 'condition_id')
             lr, ens = ef.prebuilt_sample_to_reward(sub, T, return_ens_dict=True)
@@ -4887,7 +4964,7 @@ class Modeller:
             raise ValueError(f"pre-noised prior {self.args.prior_path}: a stored row does not re-score to its stored "
                              f"terms (worst miss {worst:.3g}): the file is stale or was built by other code")
 
-        seed_e, log_r = self._stored_reward_terms(prior)
+        seed_e, log_r = self._stored_reward_terms(prior, prior_path=getattr(self.args, 'prior_path', None))
         if fd_ok is not None:
             log_r = torch.where(fd_ok, log_r, torch.full_like(log_r, float('nan')))
         kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
@@ -9115,7 +9192,8 @@ class Modeller:
             raise ValueError(f"buffers.store: {n_anchors} anchors + 2 x headroom {H} exceed the row limit {max_rows} "
                              f"(ram_gb {s['ram_gb']}, ram_frac {s['ram_frac']}): raise ram_gb")
         rows, cid = load['rows'], load['cid']
-        _, log_r, energy = self._stored_reward_terms(load['batch'], with_mol_energy=True, rows=rows, cids=cid)
+        _, log_r, energy = self._stored_reward_terms(load['batch'], with_mol_energy=True, rows=rows, cids=cid,
+                                                     prior_path=getattr(self.args, 'prior_path', None))
         x = torch.as_tensor(load['batch'].fd_state).float().cpu()[rows]
         n_cond = int(ef.condition_library_size)
         floor = torch.full((n_cond,), float('inf'), dtype=torch.float64)
