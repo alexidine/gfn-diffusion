@@ -15,8 +15,9 @@ Loss, per minibatch of molecules (fit-split molecules only), each term within a 
     order     over pairs of the molecule's MLIP-minimum frames more than 0.5 kJ/mol apart: softplus of the exp-6
               difference against the MLIP order, in units of TAU_RANK
     prior     ((theta - theta_FIT) / scale)^2, so a type the data barely constrain stays near FIT
-Each move from FIT is bounded smoothly (BOUND), and a step that leaves any pair without a repulsive wall is undone
-with the step size halved (at most MAX_REJECTED times).
+Each move from FIT is bounded smoothly (BOUND). After every step, the types in any pair that lost its repulsive wall
+or its well (pair_ok, the checks a parameter set must pass) are put back to their values before the step (wall_safe);
+the other types keep their step and the learning rate never changes.
 Frames are dropped when not labelled, when their shortest intermolecular contact is below common.MIN_CONTACT_A (MLIP
 holes), or when more than E_MAX above their molecule's lowest MLIP frame.
 
@@ -28,7 +29,6 @@ usage: python -m eval.exp6_calibration.fit FRAMES_PT OUT_JSON [--steps 1500] [--
            [--frames 16] [--w_grad 0.1] [--w_rank 1.0] [--w_prior 0.01] [--val_frac 0.15] [--device cuda]
 """
 import argparse
-import copy
 import json
 import math
 import os
@@ -49,7 +49,6 @@ PRIOR_SCALE = dict(logA=0.5, B=0.3, logC=0.5, logs=0.3)
 BOUND = dict(logA=1.0, B=0.5, logC=1.0, logs=0.5)
 # the readout that picks the kept step; the all-frames weighted RMS rose while this fell in the prototype (2026-11-25)
 SELECT = 'low_rms_kJ'
-MAX_REJECTED = 20  # steps undone for a missing wall (each halves the step size) before the fit stops
 
 
 class Params(torch.nn.Module):
@@ -107,6 +106,47 @@ class Params(torch.nn.Module):
         return dict(format='exp6_params/1', typing='fit', h_shift=0.0, charge_scale=float(torch.exp(logs)),
                     types={k: [self.el[i], float(torch.exp(logA[i])), float(B[i]), float(torch.exp(logC[i]))]
                            for i, k in enumerate(self.names)})
+
+
+def pair_ok(A, B, C):
+    """The checks exp6_ff applies to every pair of a parameter set: a repulsive wall (an inner inflection) and a well
+    (an exp-6 minimum beyond it)."""
+    from mxtaltools.analysis import exp6_ff as ff
+    try:
+        ff._exp6_minimum(A, B, C, ff._inner_inflection(A, B, C))
+        return True
+    except ValueError:
+        return False
+
+
+@torch.no_grad()
+def failing_types(params):
+    """Indices of the types in any pair that fails pair_ok at the current values."""
+    logA, B, logC, _ = (v.double() for v in params.values())
+    n, bad = len(params.names), set()
+    for i in range(n):
+        for j in range(i, n):
+            if not pair_ok(float(torch.exp(0.5 * (logA[i] + logA[j]))), float(0.5 * (B[i] + B[j])),
+                           float(torch.exp(0.5 * (logC[i] + logC[j])))):
+                bad |= {i, j}
+    return bad
+
+
+@torch.no_grad()
+def wall_safe(params, before):
+    """After an optimiser step: while any pair fails pair_ok, put the (A, B, C) of the types in failing pairs back to
+    ``before`` (the values before the step, where every pair passed). Ends within one pass per type, since with every
+    type put back the step is undone. Returns the names of the types held back."""
+    held = set()
+    for _ in range(len(params.names) + 1):
+        bad = failing_types(params)
+        if not bad:
+            break
+        for i in bad:
+            for v, b in zip((params.dlogA, params.dB, params.dlogC), before[:3]):
+                v[i] = b[i]
+        held |= bad
+    return sorted(params.names[i] for i in held)
 
 
 def install(params, device):
@@ -284,7 +324,7 @@ def main():
     print(f'validation at FIT: {fit0}', flush=True)
     # FIT itself is a candidate: if no step beats it on validation, the file is FIT (best step 0)
     best = (fit0[SELECT] if fit0[SELECT] is not None else math.inf, params.spec(), 0)
-    history, t0, rejected = [], time.time(), 0
+    history, t0, cut = [], time.time(), [0, {}]
     for step in range(1, a.steps + 1):
         opt.zero_grad()
         le = lg = lr = 0.0
@@ -305,21 +345,16 @@ def main():
                     if v.grad is None or not bool(v.grad.abs().sum() > 0)]
             if dead:
                 raise SystemExit(f'no gradient reaches {dead}')
-        snap = ({k: v.detach().clone() for k, v in params.state_dict().items()}, copy.deepcopy(opt.state_dict()))
+        before = [v.detach().clone() for v in (params.dlogA, params.dB, params.dlogC)]
         opt.step()
-        try:  # every pair must keep a repulsive wall; a step that removes one is undone and the step size halved
-            params.tables('cpu', torch.float64)
-        except ValueError as err:
-            params.load_state_dict(snap[0])
-            opt.load_state_dict(snap[1])
-            for gp in opt.param_groups:
-                gp['lr'] *= 0.5
-            rejected += 1
-            print(f'step {step} rejected ({err}); lr now {opt.param_groups[0]["lr"]:.2e}', flush=True)
-            if rejected >= MAX_REJECTED:  # pressed against the edge of the walled region: keep the best so far
-                print(f'{rejected} steps rejected for a missing repulsive wall; ending the fit at step {step}',
-                      flush=True)
-                break
+        held = wall_safe(params, before)
+        if held:
+            cut[0] += 1
+            for k in held:
+                cut[1][k] = cut[1].get(k, 0) + 1
+            if cut[0] <= 5 or cut[0] % 100 == 0:
+                print(f'step {step}: held {held} at their previous values (a pair would lose its wall or well); '
+                      f'{cut[0]} steps so far', flush=True)
         if step % a.eval_every == 0 or step == a.steps:
             v = readout(frames, frames.val_mols, params, refresh)
             score = v[SELECT] if v[SELECT] is not None else math.inf
@@ -330,7 +365,7 @@ def main():
     spec = best[1] or params.spec()
     spec['provenance'] = dict(frames=os.path.abspath(a.frames), best_step=best[2], args=vars(a),
                               validation_at_fit=fit0, history=history, fit_molecules=frames.fit_mols,
-                              validation_molecules=frames.val_mols, loss=dict(T_W=T_W, W_FLOOR=W_FLOOR, E_MAX=E_MAX,
+                              validation_molecules=frames.val_mols, steps_with_held_types=cut[0], held_type_counts=cut[1], loss=dict(T_W=T_W, W_FLOOR=W_FLOOR, E_MAX=E_MAX,
                               TAU_RANK=TAU_RANK, RANK_MIN_GAP=RANK_MIN_GAP, PRIOR_SCALE=PRIOR_SCALE))
     from mxtaltools.analysis import exp6_ff as ff
     ff.register_parameter_set('exp6_calibration_check', spec)  # validates; tables build (each pair keeps a wall)

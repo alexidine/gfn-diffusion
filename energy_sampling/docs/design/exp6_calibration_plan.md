@@ -47,8 +47,11 @@ structure enters the fit.
    max(exp(−(E − E_lowest)/10 kJ/mol), 0.02); a logistic penalty on every pair of MLIP minima more than 0.5 kJ/mol
    apart that exp-6 puts in the wrong order; a weak prior toward FIT. Starting weights: gradient 0.1, order 1, prior
    0.01, chosen on the validation molecules. The fit refuses to start unless its path reproduces the labelled FIT
-   energies, and stops if no gradient reaches any parameter group. Output: a parameter file (`exp6_params/1`) the
-   search reads directly (MXtalTools 3b8b7ef2).
+   energies, and stops if no gradient reaches any parameter group. Each move from FIT is bounded (A and C within a
+   factor e, B within 0.5 Å⁻¹), and a type whose step would cost any pair its repulsive wall or its well is held at
+   its previous values for that step (in the prototype, H on O, from step ~210). The kept step is the one with the
+   lowest validation error below 10 kJ/mol, FIT included. Output: a parameter file (`exp6_params/1`) the search reads
+   directly (MXtalTools 3b8b7ef2).
 5. **Comparison** (`compare.py`). Per panel molecule, the same 200 starts (same seed) in three arms. Every arm runs
    at the same slot count, because the stream draws a condition's starts in seeded blocks of min(slots, N); the
    report checks the shared starts from the searches' first recorded states.
