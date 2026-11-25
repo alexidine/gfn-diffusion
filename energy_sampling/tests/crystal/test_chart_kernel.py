@@ -111,7 +111,7 @@ def _settings(**block):
 def test_settings_accept_the_chart_kernel_and_refuse_a_stray_or_bad_range():
     assert _settings(live_kernel='chart')['live_log_range'] is None
     assert list(_settings(live_kernel='chart', live_log_range=[-1.0, -0.2])['live_log_range']) == [-1.0, -0.2]
-    with pytest.raises(ValueError, match="read by live_kernel 'chart' only"):
+    with pytest.raises(ValueError, match="read by live_kernel 'chart' or 'physical' only"):
         _settings(live_kernel='metric', live_log_range=[-1.0, -0.2])
     with pytest.raises(ValueError, match='lo <= hi'):
         _settings(live_kernel='chart', live_log_range=[-0.2, -1.0])

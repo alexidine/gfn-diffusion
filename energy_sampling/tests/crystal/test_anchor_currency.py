@@ -365,7 +365,7 @@ def _modeller_calls(attr):
 
 def test_every_update_best_energy_call_supplies_the_physical_leg():
     calls = _modeller_calls('update_best_energy')
-    assert len(calls) == 4, f'expected the four trainer sites, found {len(calls)}'
+    assert len(calls) == 6, f'expected the six trainer sites, found {len(calls)}'
     bare = [c.lineno for c in calls if 'energy_phys' not in {k.arg for k in c.keywords}]
     assert not bare, f'update_best_energy without energy_phys at Modeller lines {bare}'
 

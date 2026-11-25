@@ -1,12 +1,12 @@
 # Replay buffer
 
-*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `a637e70`, 2026-09-20; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them. Sources at the end.*
 
 The replay buffer is a store of forward trajectories. A row is a terminal state, stored as a graph carrying the energy terms scored at admission, and the full trajectory that produced it; the replay branch draws rows, recomposes $\log R$ from the stored terms in `train.py::Modeller._finish_replay_draw` (on the crystal route the bounding term is computed there from the stored trajectory's last state), and re-scores the stored path under the current $P_F$ and $P_B$. At `cfg:replay_loss_coeffs.resample_last_k` 0 the replay step calls no energy function; above 0 it re-scores the reward on a re-sampled terminal ([gradient-routes-and-terminal-force](gradient-routes-and-terminal-force.md)). Rollout cadence and its cost are on [rollout-cadence-and-dose](rollout-cadence-and-dose.md), what the replay loss does with the rows is on [loss-composition](loss-composition.md), and the branch weights are on [balance-controllers](balance-controllers.md). The buffer is built lazily: `train.py::Modeller.replay_in_play` derives from the stage, not from a config switch, whether the stage has a use for it, and `train.py::Modeller.manage_replay_buffer` returns immediately when it is false.
 
 ## Under the row store
 
-On `model.kind nf` with `cfg:buffers.store.enabled` true, no replay buffer is built. `manage_replay_buffer` passes each rollout to `train.py::Modeller._store_admit` after its harvest and `replay_in_play` checks, and `draw_replay_sample` returns `train.py::Modeller._store_draw` after its held-out branch, so the admission, residence, draw and held-out machinery on this page is not reached; the store's own admission, eviction and prioritised draw are on [row-store](row-store.md). The prioritised draw, the held-out split and the replay-buffer rollout triggers are refused beside it (`config_invariants.py::row_store_is_well_formed`).
+On `model.kind nf` with `cfg:buffers.store.enabled` true, no replay buffer is built. `manage_replay_buffer` passes each rollout to `train.py::Modeller._store_admit` after its harvest and before its `replay_in_play` check, so every scored rollout row is written in every stage, and `draw_replay_sample` returns `train.py::Modeller._store_draw` after its held-out branch. The admission, residence, draw and held-out machinery on this page is not reached. Replay draws the store's drawable on-policy rows, conditions uniform and rows by `cfg:buffers.store.replay_weight` ([row-store](row-store.md)). The prioritised draw, the held-out split and the replay-buffer rollout triggers are refused beside it (`config_invariants.py::row_store_is_well_formed`).
 
 ## Admission
 

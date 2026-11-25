@@ -1493,27 +1493,67 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
     return out
 
 
-#: buffers.store, the NF-route row store (row_store.py; docs/wiki/row-store.md): every key and its code default.
-#: An absent key reads its default; an unknown key is refused.
+#: buffers.store, the NF-route crystal store (crystal_store.py; docs/wiki/row-store.md): every key and its code default.
+#: On an enabled block an absent key reads its default and an unknown key is refused. A disabled block is not read.
 ROW_STORE_DEFAULTS = dict(enabled=False, bar=1.0, admit_reward_min=-200, cap_per_condition=50000, max_rows=200000,
                           eps=0.1, records_kept=8, kappa=1.0, floor_frac=0.25, uniform_frac=0.1, is_exponent=1.0,
-                          refresh_chunk=8192)
+                          refresh_chunk=8192, ram_gb=None, ram_frac=0.5, mle_draw='anchor', replay_weight='uniform',
+                          keep_rollouts=True, growth_every=1)
 #: the off-cadence rollout bars whose reading is a replay_buffer statistic the store never writes
 ROW_STORE_REFUSED_TRIGGERS = ('drift_std_max', 'ess_min', 'val_gap_max')
+#: keys of the previous row store: inert on a disabled block, refused on an enabled one
+ROW_STORE_RETIRED_KEYS = ('bar', 'admit_reward_min', 'cap_per_condition', 'max_rows', 'eps', 'records_kept', 'kappa',
+                          'floor_frac', 'uniform_frac', 'is_exponent', 'refresh_chunk')
+#: stage actions that write the prior buffer, which the store route never builds
+ROW_STORE_REFUSED_ACTIONS = ('rebuild_prior_by_churn', 'reseed_prior_from_dataset', 'seed_prior_from_anchors')
+#: steps past a stage's max_steps its exit can take: the 10-step tick reads the cap, then pulls one eval
+ROW_STORE_STAGE_MARGIN = 11
+
+
+def row_store_refuses_action(action) -> bool:
+    """A stage action the store route cannot run: one of ROW_STORE_REFUSED_ACTIONS, or any bootstrap_z form but offset
+    (their head fit, train.py::Modeller.bootstrap_log_z, draws std-oriented mol_dataset rows, not the store's
+    templates)."""
+    parts = str(action).split(':')
+    return parts[0] in ROW_STORE_REFUSED_ACTIONS or (parts[0] == 'bootstrap_z' and parts[1:2] != ['offset'])
 
 
 def row_store_settings(node) -> Optional[dict]:
     """buffers.store merged over ROW_STORE_DEFAULTS when its `enabled` is true, else None. `node` is a raw config dict
-    or the trainer's Namespace. Raises on unknown keys."""
+    or the trainer's Namespace. Raises on unknown keys of an enabled block; a block not enabled is not inspected."""
     st = _member(_member(node, 'buffers'), 'store')
     if st is None:
         return None
     st = dict(st) if isinstance(st, dict) else dict(vars(st))
+    if st.get('enabled', ROW_STORE_DEFAULTS['enabled']) is not True:
+        return None
     unknown = sorted(set(st) - set(ROW_STORE_DEFAULTS))
     if unknown:
         raise ValueError(f"buffers.store: unknown keys {unknown} (known: {sorted(ROW_STORE_DEFAULTS)})")
-    s = {**ROW_STORE_DEFAULTS, **st}
-    return s if s['enabled'] is True else None
+    return {**ROW_STORE_DEFAULTS, **st}
+
+
+def store_row_limit(ram_gb, data_ndim, ram_frac=0.5) -> int:
+    """The most rows a crystal_store.CrystalStore may hold in `ram_frac` of `ram_gb` GiB, capped at its int32 slot limit.
+
+    Bytes per slot at the peak, a sidecar write: the columns (4 data_ndim + 43) and their clone in
+    CrystalStore.state_dict, 16 of index (PoolIndex.where 4, PoolIndex.arena 8, the free stack 4), and 4 for the
+    state_dict copy of the index order."""
+    bytes_per_row = 2 * (4 * data_ndim + 43) + 16 + 4
+    return min(int(ram_frac * ram_gb * 2 ** 30 / bytes_per_row), 2 ** 31 - 1)
+
+
+@functools.lru_cache(maxsize=None)
+def replay_weight_rules() -> tuple:
+    """The names in crystal_store.REPLAY_WEIGHTS, by AST parse of the source (that module imports torch). Raises when
+    the file has lost the assignment."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crystal_store.py')
+    with open(path, 'r', encoding='utf-8') as f:
+        tree = ast.parse(f.read(), path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == 'REPLAY_WEIGHTS' for t in node.targets):
+            return tuple(k.value for k in node.value.keys)
+    raise ValueError(f'{path} has no REPLAY_WEIGHTS assignment')
 
 
 def _real(v) -> bool:
@@ -1545,16 +1585,64 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         err('buffers.store stores log R at one temperature: refused with temperature_conditioning')
     if _get(cfg, 'energy_config.prior_flow_path') is not None:
         err('buffers.store stores log R at admission: refused with energy_config.prior_flow_path (a lambda path)')
-    if _get(cfg, 'policy.nf.atom_tokens', False) is True:
-        err('buffers.store keeps no molecule graph per row: refused with model.nf.atom_tokens')
     if _get(cfg, 'buffers.replay_buffer.prioritise.enabled', False) is True:
         err('buffers.store draws replay by its own priority: set buffers.replay_buffer.prioritise.enabled false')
     if (_num(_get(cfg, 'buffers.replay_buffer.val_frac')) or 0) > 0:
         err('buffers.store holds no replay held-out split: set buffers.replay_buffer.val_frac 0')
     if _get(cfg, 'buffers.anchor_buffer.frozen', False) is not True:
         err('buffers.store seeds once from the prior: set buffers.anchor_buffer.frozen true')
-    if 'harvested' in list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()):
-        err("buffers.store seeds data tags anchor and child only: remove 'harvested' from noised_prior.train_kinds")
+    raw = _member(_member(cfg, 'buffers'), 'store')
+    raw = raw if isinstance(raw, dict) else vars(raw)
+    retired = sorted(k for k in raw if k in ROW_STORE_RETIRED_KEYS)
+    if retired:
+        err(f"buffers.store: {retired} belong to the previous row store and are refused on an enabled block")
+    if _get(cfg, 'noised_prior.live_kernel') != 'physical':
+        err("buffers.store trains phase 1 on fresh kicks of anchors: set noised_prior.live_kernel 'physical'")
+    if list(_get(cfg, 'noised_prior.train_kinds', ('child',)) or ()) != ['anchor']:
+        err("buffers.store trains phase 1 on anchors: set noised_prior.train_kinds ['anchor']")
+    if _get(cfg, 'energy_config.crystal_coordinates', 'latent') != 'fd':
+        err("buffers.store holds FD chart rows: set energy_config.crystal_coordinates 'fd'")
+    if _get(cfg, 'buffers.anchor_buffer.seed_floors_only', False) is not True:
+        err('buffers.store warms the tracker floors from its own rows: set buffers.anchor_buffer.seed_floors_only true')
+    if not (_real(s['ram_gb']) and s['ram_gb'] > 0):
+        err(f"buffers.store.ram_gb must be the job's requested RAM in GiB, got {s['ram_gb']!r}")
+    if not (_real(s['ram_frac']) and 0 < s['ram_frac'] <= 1):
+        err(f"buffers.store.ram_frac must lie in (0, 1], got {s['ram_frac']!r}")
+    if s['mle_draw'] not in ('anchor', 'condition'):
+        err(f"buffers.store.mle_draw must be 'anchor' or 'condition', got {s['mle_draw']!r}")
+    if s['replay_weight'] not in replay_weight_rules():
+        err(f"buffers.store.replay_weight {s['replay_weight']!r} is not in crystal_store.REPLAY_WEIGHTS "
+            f"{list(replay_weight_rules())}")
+    if s['replay_weight'] == 'duty':
+        framed = [k for k in ('rotate_frames', 'mirror_frames') if _get(cfg, f'policy.nf.{k}', False)]
+        if framed:
+            err(f"buffers.store.replay_weight 'duty' compares log q across writes, and model.nf.{framed[0]} gives each "
+                f"write its own random frame")
+    if isinstance(s['growth_every'], bool) or not _whole(s['growth_every']) or s['growth_every'] < 1:
+        err(f"buffers.store.growth_every must be an integer >= 1, got {s['growth_every']!r}")
+    if not isinstance(s['keep_rollouts'], bool):
+        err(f"buffers.store.keep_rollouts must be true or false, got {s['keep_rollouts']!r}")
+    elif not s['keep_rollouts']:
+        for st in active_stages(cfg):
+            if isinstance(st, dict) and (_num((st.get('fracs') or {}).get('replay')) or 0) > 0:
+                err(f"stage {st.get('name', '?')!r}: replay frac > 0 with buffers.store.keep_rollouts false (no "
+                    f"training rollout row is written, so replay would draw only the eval's stored rows)")
+    if _get(cfg, 'condition_log_z.rollout_group_draw', 'uniform') != 'uniform':
+        err("buffers.store draws rollout groups uniformly: set condition_log_z.rollout_group_draw 'uniform'")
+    if _get(cfg, 'buffers.replay_buffer.admit_from_eval', True) is False:
+        err('buffers.store keeps every scored eval row: buffers.replay_buffer.admit_from_eval false is refused')
+    stages_seen = [st for st in active_stages(cfg) if isinstance(st, dict)]
+    if (_num(_get(cfg, 'policy.nf.cond_noise')) or 0) > 0 and any(
+            (_coeff(cfg, st, m, 'tb') or 0) > 0 for st in stages_seen for m in ('bwd', 'replay')):
+        err('buffers.store: model.nf.cond_noise > 0 with a TB branch (the level would read a noised condition)')
+    caps = [_num(st.get('max_steps')) for st in stages_seen]
+    if any(c is None for c in caps):
+        err('buffers.store: every stage needs max_steps')
+    elif caps:
+        need = int(sum(caps)) + ROW_STORE_STAGE_MARGIN * len(caps)
+        if (_num(_get(cfg, 'epochs')) or 0) < need:
+            err(f"buffers.store: epochs {_get(cfg, 'epochs')!r} is below the stage caps' sum + "
+                f"{ROW_STORE_STAGE_MARGIN} per stage = {need}, so the run would end before its last stage")
     if _get(cfg, 'condition_log_z.rollout_condition_draw', 'iid') == 'under_drawn':
         err("buffers.store: condition_log_z.rollout_condition_draw 'under_drawn' reads replay_buffer occupancy")
 
@@ -1562,6 +1650,15 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         if not isinstance(st, dict):
             continue
         name = st.get('name', '?')
+        if (_num(st.get('z_pin_rollout_every')) or 0) > 0:
+            err(f"stage {name!r}: z_pin_rollout_every > 0 (a z-pin rollout is not admitted, and the store keeps every "
+                f"scored row)")
+        for action in list(st.get('on_enter') or ()) + list(st.get('on_exit') or ()):
+            if str(action).split(':')[0] in ROW_STORE_REFUSED_ACTIONS:
+                err(f"stage {name!r}: action {action!r} writes the prior buffer, which the store route never builds")
+            elif row_store_refuses_action(action):
+                err(f"stage {name!r}: action {action!r} fits Z(c) on std-oriented mol_dataset rows, not the store's "
+                    f"templates: use bootstrap_z:offset")
         if st.get('condition_draw'):
             err(f"stage {name!r}: condition_draw draws from prior_buffer and replay_buffer, not the store")
         if (_num(st.get('replay_warmup_rows')) or 0) > 0:
@@ -1591,34 +1688,56 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
             err(f"stage {name!r}: z_calibration.mode replay draws from replay_buffer, which the store never fills "
                 f"(Modeller._z_replay_step returns without a step)")
 
-    if not (_real(s['kappa']) and s['kappa'] >= 0):
-        err(f"buffers.store.kappa must be a number >= 0, got {s['kappa']!r}")
-    for k in ('floor_frac', 'uniform_frac', 'is_exponent'):
-        if not (_real(s[k]) and 0 <= s[k] <= 1):
-            err(f"buffers.store.{k} must lie in [0, 1], got {s[k]!r}")
-    if not (_real(s['bar']) and s['bar'] >= 0):
-        err(f"buffers.store.bar must be a number >= 0, got {s['bar']!r}")
-    if not (_real(s['eps']) and s['eps'] > 0):
-        err(f"buffers.store.eps must be a number > 0, got {s['eps']!r}")
-    for k in ('cap_per_condition', 'max_rows'):
-        if not (_whole(s[k]) and s[k] >= 0):
-            err(f"buffers.store.{k} must be an integer >= 0, got {s[k]!r}")
-    if s['records_kept'] is not None and not (_whole(s['records_kept']) and s['records_kept'] >= 1):
-        err(f"buffers.store.records_kept must be an integer >= 1 or null, got {s['records_kept']!r}")
-    if not (_whole(s['refresh_chunk']) and s['refresh_chunk'] >= 1):
-        err(f"buffers.store.refresh_chunk must be an integer >= 1, got {s['refresh_chunk']!r}")
-    if s['admit_reward_min'] is not None and not _real(s['admit_reward_min']):
-        err(f"buffers.store.admit_reward_min must be a number or null, got {s['admit_reward_min']!r}")
-    if s['records_kept'] is None:
-        out.append((BASELINE, 'buffers.store.records_kept null: protected records are unbounded (one per condition '
-                              'per admission call at most)'))
     return out
 
 
 def row_store_is_well_formed(cfg: dict) -> list[Violation]:
-    """buffers.store (row_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
+    """buffers.store (crystal_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
     ERRORs, since this module only reports at load."""
     return [Violation(sev, 'row_store_is_well_formed', msg) for sev, msg in row_store_problems(canonical_model_section(cfg))]
+
+
+def _z_head_pinned_by_sidecar(cfg: dict, stage: dict, mode: str) -> bool:
+    """True for a bwd or replay branch whose resolved coefficients run TB against a detached Z (tb > 0, freeze_z > 0.5)
+    on a fused stage with fwd_z_sidecar whose forward freeze_z leaves the head attached, so the forward emp_z term fits
+    Z(c) on fresh rollouts. Only fused_train_step runs the sidecar loss. The forward freeze_z is read as the
+    loss reads it: absent is 0 and a boolean compares as 0 or 1."""
+    fwd_freeze = _coeff_raw(cfg, stage, 'fwd', 'freeze_z')
+    return (stage.get('fwd_z_sidecar') is True and stage.get('train_mode', 'fused') == 'fused'
+            and mode in ('bwd', 'replay')
+            and (_coeff(cfg, stage, mode, 'tb') or 0) > 0
+            and (_coeff(cfg, stage, mode, 'freeze_z') or 0) > 0.5
+            and (fwd_freeze is None or (isinstance(fwd_freeze, (bool, int, float)) and fwd_freeze <= 0.5)))
+
+
+def _z_head_pinned_on_policy(cfg: dict, stage: dict, mode: str) -> bool:
+    """True where the forward branch fits Z(c) on fresh rollouts on every step of a fused stage without the sidecar:
+    the sidecar's pin moved into the frac mix. The forward branch carries no TB term that trains the head (tb 0, or
+    tb against a detached head under tb_detach_z > 0.5), its emp_z fits the head (emp_z > 0, freeze_z <= 0.5) on condition groups
+    (vg_by_condition > 0.5, repeats >= 2), and it actually trains: its entry share is at least the deactivate threshold
+    (stage, else controller) and, on a stage with a balance, so is its floor (min_fracs.fwd, else
+    controller.min_mode_frac), since a balance could otherwise move it dark. Whether the forward branch also trains the
+    policy does not matter to the pin. Then the forward branch itself, and a bwd or replay branch running TB against a
+    detached head (tb > 0, freeze_z > 0.5), read a head the forward emp_z pins."""
+    def num(m, k):
+        return _coeff(cfg, stage, m, k) or 0
+    fwd_freeze = _coeff_raw(cfg, stage, 'fwd', 'freeze_z')
+    deact = _num(stage.get('deactivate_threshold'))
+    if deact is None:
+        deact = _num(_get(cfg, 'controller.deactivate_threshold'))
+    floor = _num((stage.get('min_fracs') or {}).get('fwd'))
+    if floor is None:
+        floor = _num(_get(cfg, 'controller.min_mode_frac'))
+    share = _num((stage.get('fracs') or {}).get('fwd')) or 0
+    trains = share > 0 and (deact is None or share >= deact) and (
+        not stage.get('balance') or (deact is not None and floor is not None and floor >= deact))
+    if not (stage.get('fwd_z_sidecar') is not True and stage.get('train_mode', 'fused') == 'fused' and trains
+            and (num('fwd', 'tb') == 0 or num('fwd', 'tb_detach_z') > 0.5)
+            and num('fwd', 'emp_z') > 0 and num('fwd', 'vg_by_condition') > 0.5
+            and num('fwd', 'repeats') >= 2
+            and (fwd_freeze is None or (isinstance(fwd_freeze, (bool, int, float)) and fwd_freeze <= 0.5))):
+        return False
+    return mode == 'fwd' or (mode in ('bwd', 'replay') and num(mode, 'tb') > 0 and num(mode, 'freeze_z') > 0.5)
 
 
 def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
@@ -1660,7 +1779,10 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
     conditional ones resolved to the F-042 detonation regime, because their
     generator wrote `persistent` into the pre-migration home where nothing reads
     it. A rule that passes the exact config it was written to catch is not a
-    conservative rule, it is a broken one."""
+    conservative rule, it is a broken one.
+
+    A stated or inherited `learned` is not reported on a branch for which
+    _z_head_pinned_by_sidecar or _z_head_pinned_on_policy holds. An unset tb_z_source is reported there too."""
     conditional = any(_get(cfg, k) is True for k in
                       ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning'))
     if not conditional:
@@ -1722,7 +1844,8 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
                     f'NOWHERE on a CONDITIONAL route, so it resolves to the code '
                     f'fallback `learned` (train.py:1105){where}. Every battery that ran '
                     f'used `persistent` ({src}). Set it in that stage\'s loss_coeffs.'))
-            elif eff == 'learned':
+            elif eff == 'learned' and not (_z_head_pinned_by_sidecar(cfg, st, mode)
+                                           or _z_head_pinned_on_policy(cfg, st, mode)):
                 out.append(Violation(
                     BASELINE, 'conditional_z_settings_are_conditional',
                     f"stage '{st.get('name')}' resolves {mode}_loss_coeffs.tb_z_source "
@@ -2100,6 +2223,48 @@ def _coeff_raw(cfg: dict, stage: dict, mode: str, key: str):
     if key in override:
         return override[key]
     return _get(cfg, f'{mode}_loss_coeffs.{key}')
+
+
+#: the backward-branch terms that read log R; every other term (mle) reads only log P_F / log P_B
+BWD_REWARD_TERMS = ('tb', 'tbc', 'vg_lb', 'vg_lme', 'emp_z', 'emp_z_persistent', 'pf_boost', 'level_gap', 'db',
+                    'subtb')
+
+
+def physical_kernel_problems(stage, coeff, glob) -> list[str]:
+    """noised_prior.live_kernel 'physical' draws unscored points, so a stage that takes its backward rows from the
+    dataset must read no log R: no term of BWD_REWARD_TERMS above 0 and no pooled stash (the two readings of
+    Modeller._bwd_draw_is_reward_free, which raises at that stage's first draw). Over getters, as replay_seat_problems,
+    so this rule and the refusal in Modeller.set_loss_coeffs share one implementation."""
+    if glob('noised_prior.live_kernel') != 'physical' or stage.bwd_sampling_mode != 'dataset':
+        return []
+    out = []
+    terms = [k for k in BWD_REWARD_TERMS if (_num(coeff('bwd', k)) or 0.0) > 0]
+    if terms:
+        out.append(f"noised_prior.live_kernel 'physical' on a bwd_sampling_mode 'dataset' stage with bwd {terms} > 0: "
+                   f"these terms read log R and the kernel's draws are unscored.")
+    if (_num(coeff('fwd', CROSS_BRANCH_VARGRAD_COEFF)) or 0.0) > 0:
+        out.append(f"noised_prior.live_kernel 'physical' on a bwd_sampling_mode 'dataset' stage with fwd "
+                   f"{CROSS_BRANCH_VARGRAD_COEFF} > 0: the pooled term reads the backward rows' log R and the "
+                   f"kernel's draws are unscored.")
+    return out
+
+
+def physical_kernel_is_reward_free(cfg: dict) -> list[Violation]:
+    """The audit-path twin of the refusal in Modeller.set_loss_coeffs: physical_kernel_problems on every active stage. A
+    stage that does not parse is skipped here; every_protocol_parses reports it."""
+    from protocol import Stage           # local: protocol imports this module back
+    out = []
+    for i, st in enumerate(active_stages(cfg)):
+        if not isinstance(st, dict):
+            continue
+        try:
+            parsed = Stage(st, i)
+        except Exception:
+            continue
+        for msg in physical_kernel_problems(parsed, lambda mode, key, st=st: _coeff_raw(cfg, st, mode, key),
+                                            lambda dotted: _get(cfg, dotted)):
+            out.append(Violation(ERROR, 'physical_kernel_is_reward_free', f"stage '{parsed.name}': {msg}"))
+    return out
 
 
 def replay_seat_is_well_formed(cfg: dict) -> list[Violation]:
@@ -2791,34 +2956,37 @@ def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
     return []
 
 
-#: The Z(sg) panel's code defaults (train.py::Modeller.log_zsg_panels; eval/sg_readouts.py). Off unless `enabled`.
-ZSG_PANEL_DEFAULTS = {'enabled': False, 'molecules': 64, 'draws': 32, 'every_n_evals': 4}
+#: The Z(sg) head panel's code defaults (train.py::Modeller.log_zsg_panels; eval/sg_readouts.py). Off unless `enabled`.
+ZSG_PANEL_DEFAULTS = {'enabled': False, 'molecules': 64}
+
+#: Keys of the forced space-group importance-sampling panels; parse_zsg_panel refuses them.
+ZSG_PANEL_RETIRED = ('draws', 'every_n_evals')
 
 
 def parse_zsg_panel(node) -> dict:
     """The `zsg_panel` block merged over ZSG_PANEL_DEFAULTS (absent = the defaults, so off). `node` is a raw dict or
-    the trainer's Namespace. Raises on unknown keys, `enabled` not a bool, `molecules` / `draws` not integers >= 1,
-    `every_n_evals` not an integer >= 0 or null (0 / null: the importance-sampling panel never fires)."""
+    the trainer's Namespace. Raises on a ZSG_PANEL_RETIRED key, unknown keys, `enabled` not a bool, `molecules` not an
+    integer >= 1."""
     if node is None:
         node = {}
     if hasattr(node, '__dict__') and not isinstance(node, dict):
         node = dict(vars(node))
     if not isinstance(node, dict):
         raise TypeError(f'zsg_panel must be a mapping, got {type(node).__name__}')
+    retired = sorted(set(node) & set(ZSG_PANEL_RETIRED))
+    if retired:
+        raise ValueError(f'zsg_panel key(s) {retired} are retired: the forced space-group importance-sampling panels '
+                         f'were removed by owner decision (unified crystal workflow, 2026-11-23). Delete them; the '
+                         f'head readout takes {sorted(ZSG_PANEL_DEFAULTS)}')
     bad = sorted(set(node) - set(ZSG_PANEL_DEFAULTS))
     if bad:
         raise ValueError(f'zsg_panel has unknown key(s) {bad}; keys are {sorted(ZSG_PANEL_DEFAULTS)}')
     spec = {**ZSG_PANEL_DEFAULTS, **node}
     if not isinstance(spec['enabled'], bool):
         raise ValueError(f"zsg_panel.enabled must be true or false, got {spec['enabled']!r}")
-    for k in ('molecules', 'draws'):
-        if not _whole(spec[k]) or spec[k] < 1:
-            raise ValueError(f'zsg_panel.{k} must be an integer >= 1, got {spec[k]!r}')
-        spec[k] = int(spec[k])
-    v = spec['every_n_evals']
-    if v is not None and (not _whole(v) or v < 0):
-        raise ValueError(f'zsg_panel.every_n_evals must be an integer >= 0 or null, got {v!r}')
-    spec['every_n_evals'] = int(v or 0)
+    if not _whole(spec['molecules']) or spec['molecules'] < 1:
+        raise ValueError(f"zsg_panel.molecules must be an integer >= 1, got {spec['molecules']!r}")
+    spec['molecules'] = int(spec['molecules'])
     return spec
 
 
@@ -2877,6 +3045,7 @@ RULES = (
     z_fill_mode_is_well_formed,
     batch_root_forward_is_well_formed,
     replay_seat_is_well_formed,
+    physical_kernel_is_reward_free,
     tb_z_source_is_known,
     static_prior_buffer_is_seeded,
     condition_draw_is_well_formed,

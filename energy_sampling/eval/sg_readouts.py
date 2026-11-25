@@ -15,8 +15,7 @@ run over fewer than two groups, as train.py::group_split_means does.
     log_Z_learned     the mean of the head's level over the group's rows
 - ``buffer_group_share(sg_rows, space_groups, key)``: {'sg<g>/<key>': the share of the rows in group g}, every run
   group present (a group with no row reads 0).
-- ``head_panel_stats(logits, groups, prefix)`` / ``is_panel_stats(...)``: the Z(sg) panel aggregates
-  (train.py::Modeller.log_zsg_panels).
+- ``head_panel_stats(logits, groups, prefix)``: the Z(sg) head panel aggregates (train.py::Modeller.log_zsg_panels).
 
 Per-group levels live on different FD charts (different cell-coordinate counts and pose normalisation), so compare each
 group's curve over time, not levels across groups; p(g) here is a sampling allocation, not a thermodynamic group
@@ -25,8 +24,6 @@ preference.
 import math
 
 import torch
-
-from models.group_draw import group_weights_is
 
 ZSG_CAVEAT = ("per-group levels live on different FD charts (different cell-coordinate counts and pose "
               "normalisation), so compare each group's curve over time, not levels across groups; p(g) here is a "
@@ -148,62 +145,12 @@ def head_panel_stats(logits, groups, prefix='zsg/') -> dict:
     return out
 
 
-def is_panel_stats(log_w, mol_index, group_index, n_mol, groups, level=None, prefix='zsg/') -> dict:
-    """The importance-sampling panel from per-draw log w [N] = log R - log q, each draw's panel molecule mol_index [N]
-    in [0, n_mol) and group column group_index [N] in [0, G). Per molecule, models/group_draw.py::group_weights_is over
-    its finite draws gives log Z_g, the normalised weights Z_g / sum Z and ESS_g. Returns, as panel means over the
-    molecules where each is finite: <prefix>is_log_z_sg<g>, <prefix>is_p_sg<g>, <prefix>is_ess_sg<g>,
-    <prefix>is_entropy_nats (entropy of the normalised weights) and, given the head's level [n_mol, G],
-    <prefix>head_minus_is_sg<g> = L(m, g) - log Z_g(m). {} on fewer than two groups."""
-    if not _multi_group(groups):
-        return {}
-    G = len(groups)
-    lw = _flat(log_w)
-    mi = torch.as_tensor(mol_index).reshape(-1).long().cpu()
-    gi = torch.as_tensor(group_index).reshape(-1).long().cpu()
-    fin = torch.isfinite(lw)
-    log_z = torch.full((int(n_mol), G), -math.inf, dtype=torch.float64)
-    w = torch.zeros(int(n_mol), G, dtype=torch.float64)
-    ess = torch.zeros(int(n_mol), G, dtype=torch.float64)
-    for m in range(int(n_mol)):
-        sel = (mi == m) & fin
-        if bool(sel.any()):
-            log_z[m], w[m], ess[m] = group_weights_is(lw[sel], gi[sel], G)
-    has = torch.isfinite(log_z).any(-1)
-    out = {}
-    if bool(has.any()):
-        out[f'{prefix}is_entropy_nats'] = float(_entropy(w[has]).mean())
-    L = None if level is None else torch.as_tensor(level).detach().double().cpu()
-    for k, g in enumerate(groups):
-        g = int(g)
-        ok = torch.isfinite(log_z[:, k])
-        if bool(ok.any()):
-            out[f'{prefix}is_log_z_sg{g}'] = float(log_z[ok, k].mean())
-            if L is not None:
-                out[f'{prefix}head_minus_is_sg{g}'] = float((L[ok, k] - log_z[ok, k]).mean())
-        if bool(has.any()):
-            out[f'{prefix}is_p_sg{g}'] = float(w[has, k].mean())
-            out[f'{prefix}is_ess_sg{g}'] = float(ess[has, k].mean())
-    return out
-
-
-def panel_line(stats, groups, prefix, n_mol, draws) -> str:
+def panel_line(stats, groups, prefix, n_mol) -> str:
     """One captioned line of a panel's numbers for the eval log."""
     def f(key, fmt='.3g'):
         v = stats.get(f'{prefix}{key}')
         return '-' if v is None else format(v, fmt)
-    ran = any(k.startswith(f'{prefix}is_') for k in stats)
-    cells = []
-    for g in groups:
-        g = int(g)
-        cell = f"sg{g} head p {f(f'head_p_sg{g}')} L {f(f'head_level_sg{g}')}"
-        if ran:
-            cell += (f" | IS logZ {f(f'is_log_z_sg{g}')} p {f(f'is_p_sg{g}')} ess {f(f'is_ess_sg{g}')}"
-                     f" L-IS {f(f'head_minus_is_sg{g}')}")
-        cells.append(cell)
-    ent = f"H head {f('head_entropy_nats')}" + (f" IS {f('is_entropy_nats')}" if ran else '')
-    what = (f"{n_mol} panel molecules, each in all {len(groups)} groups; head p = panel mean of softmax_g L(m, g)"
-            + (f", IS from {draws} forward draws per (molecule, group), logZ / p / ess panel means" if ran
-               else ", IS panel not on this eval"))
+    cells = [f"sg{int(g)} head p {f(f'head_p_sg{int(g)}')} L {f(f'head_level_sg{int(g)}')}" for g in groups]
+    what = f"{n_mol} panel molecules, each in all {len(groups)} groups; head p = panel mean of softmax_g L(m, g)"
     return (f"{prefix.rstrip('/')} ({what}; entropies in nats, uniform {math.log(len(groups)):.3g}; {ZSG_CAVEAT}): "
-            + '; '.join(cells) + f'; {ent}')
+            + '; '.join(cells) + f"; H head {f('head_entropy_nats')}")

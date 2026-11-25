@@ -392,6 +392,7 @@ class CrystalBuffer:
             is_val: Optional[torch.Tensor] = None,
             origin: Optional[torch.Tensor] = None,
             force_legs: Optional[torch.Tensor] = None,
+            orient: bool = True,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -405,7 +406,8 @@ class CrystalBuffer:
 
         self.batch = self._as_batch(data).to(device)
         self._drop_keys(self.batch, self.exclude_keys)
-        self._orient_stored_batch(self.batch)
+        if orient:
+            self._orient_stored_batch(self.batch)
         self.x, self.y = self._compute_xy(self.batch)
 
         n = len(self)

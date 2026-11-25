@@ -160,6 +160,9 @@ def is_crystal_energy(name: str) -> bool:
 #: as per-row or per-atom data and the next join fails; batched_analyze_crystal_batch drops them from each chunk.
 SG_LOOKUP_TABLES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut', 'free_axis_lut')
 
+#: a value of the per-call internal_oom_recovery: the chunked OOM-recovering pass, without the end-of-call allocator flush
+OOM_RECOVERY_KEEP_CACHE = 'keep_cache'
+
 
 def latent_rows_from_params(params, hand, sg: int, radius, generator=None):
     """The trainer latent of crystals given in any description: ([B, 12] float32 latents, [B] bool ok) of cell
@@ -1764,16 +1767,16 @@ class MolecularCrystal(BaseSet):
         # blocks are shaped like supercell neighbour lists that a T-step MLP rollout
         # never asks for.
         #
-        # THIS IS NOT THE PER-STEP HOT PATH, which is why it can afford to sync. The
-        # `not use_recovery` branch at the top of this function returns EARLY, and
-        # every physical config sets energy_config.internal_oom_recovery: false -- so
-        # training-time energy calls never reach this line. What does reach it is the
-        # init pass (internal_oom_recovery=True, explicitly) and the other one-off
-        # whole-dataset scans, i.e. exactly the calls whose footprint outlives them.
-        gc.collect()
-        if torch.cuda.is_available():        # synchronize() RAISES with no device
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        # This flush syncs the device, so a caller on the training cadence opts out: the
+        # store's dataset growth (train.py::Modeller._store_grow) passes
+        # OOM_RECOVERY_KEEP_CACHE, keeping the chunking and the flush an OOM itself runs
+        # above. What reaches it is the init pass and the other calls that pass
+        # internal_oom_recovery=True, whose footprint outlives them.
+        if internal_oom_recovery != OOM_RECOVERY_KEEP_CACHE:
+            gc.collect()
+            if torch.cuda.is_available():        # synchronize() RAISES with no device
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
         if return_batch:
             return energies.to(x.device), samples_batch

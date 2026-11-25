@@ -44,8 +44,14 @@ DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), chec
 WINDOW_BY = ('row', 'parent')
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
-#: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation
-LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart')
+#: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation;
+#: 'physical' is metric_kick's step from the parent anchor's canonical description, put back in canonical form
+#: (physical_kick.py)
+LIVE_KERNELS = (None, 'iso', 'hessian', 'basin', 'metric', 'chart', 'physical')
+#: the live kernels that read live_log_range
+LOG_RANGE_KERNELS = ('chart', 'physical')
+#: the live_kernel keys the 'physical' kernel does not read: its step is metric_kick's, with no bank
+PHYSICAL_UNREAD_KEYS = ('live_tau', 'live_width_cap', 'live_caps', 'live_bank', 'live_fresh_frac')
 #: live_shape: the basin draw's covariance (basin_factors); read by live_kernel 'basin' only
 LIVE_SHAPES = ('hessian', 'iso')
 
@@ -103,7 +109,7 @@ def save_cache(path, key: dict, **payload) -> bool:
         torch.save(dict(version=FD_CACHE_VERSION, key=key, **payload), tmp)
         os.replace(tmp, path)
         return True
-    except OSError as e:
+    except Exception as e:      # torch.save reports an unwritable or full file as RuntimeError, not OSError
         print(f"fd cache {path}: not written ({e})", flush=True)
         try:
             os.remove(tmp)
@@ -155,15 +161,22 @@ def settings(args):
                          f"live_kernel {s['live_kernel']!r}")
     rng = s['live_log_range']
     if rng is not None:
-        if s['live_kernel'] != 'chart':
-            raise ValueError(f"noised_prior.live_log_range is read by live_kernel 'chart' only, got live_kernel "
-                             f"{s['live_kernel']!r}")
+        if s['live_kernel'] not in LOG_RANGE_KERNELS:
+            raise ValueError(f"noised_prior.live_log_range is read by live_kernel 'chart' or 'physical' only, got "
+                             f"live_kernel {s['live_kernel']!r}")
         if (not isinstance(rng, (list, tuple)) or len(rng) != 2 or any(
                 isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in rng)
                 or not rng[0] <= rng[1]):
             raise ValueError(f"noised_prior.live_log_range must be [log10 lo, log10 hi] in Angstrom with lo <= hi, got "
                              f"{rng!r}")
     return s
+
+
+def physical_unread_settings(s) -> dict:
+    """{key: value} of the keys of PHYSICAL_UNREAD_KEYS set away from DEFAULTS in the settings `s`. Reported at load, not
+    refused: configs/mk_dev.yaml's block sets live_bank and live_fresh_frac for the 'basin' kernel."""
+    plain = lambda v: list(v) if isinstance(v, (list, tuple)) else v
+    return {k: s[k] for k in PHYSICAL_UNREAD_KEYS if plain(s[k]) != plain(DEFAULTS[k])}
 
 
 def _metric_projector(lattice_codes, dtype, device):
@@ -634,6 +647,7 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
       floor_ok   rows a condition's floor is taken over: training split, finite, inside the packing window
       train      rows the run trains on: training split, a kind in train_kinds, inside both windows
       heldout    held-out anchor groups' rows of those kinds, inside both windows
+      heldout_children  held-out children inside both windows, whatever train_kinds holds
       anchors    clean training anchors inside both windows (a readout when anchors are not trained on)
       buffer     every scored training row inside both windows, anchors and children whatever train_kinds holds: the
                  prior buffer's seed (train.py::Modeller.prior_buffer_source), so the noised rows the build already
@@ -658,6 +672,7 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
     return dict(floor_ok=floor_ok, train=(splits == SPLIT_TRAIN) & kind_ok & good,
                 buffer=(splits == SPLIT_TRAIN) & scored & good,
                 heldout=(splits == SPLIT_HELDOUT) & kind_ok & good,
+                heldout_children=(splits == SPLIT_HELDOUT) & (kinds == KIND_CHILD) & good,
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
 
 

@@ -1,6 +1,6 @@
 # Loss composition
 
-*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them. Sources at the end.*
 
 A fused training step assembles one scalar loss out of three branches: forward, backward and replay. This page is about that assembly, from the branch draws up through the per-branch coefficient blocks to the weighted sum, and what each branch's residual can and cannot see. The controllers that move the weights during a stage are on [balance-controllers](balance-controllers.md); the VarGrad objective is on [vargrad](vargrad.md); the trajectory-balance residual and its fixed point are on [trajectory-balance](trajectory-balance.md); the coupling between the rollout that fills the replay buffer and the branch that drains it is on [on-policy-and-off-policy-training](on-policy-and-off-policy-training.md).
 
@@ -13,6 +13,8 @@ The **forward** branch rolls out its own trajectories. `train.py::Modeller.fwd_t
 The **backward** branch draws terminal states, not trajectories: from the prior buffer under `cfg:stage.bwd_sampling_mode` `prior`, or from the fixed prior dataset under `dataset` (`train.py::Modeller.draw_bwd_sample`). A trajectory is then sampled backward from each terminal under $P_B$, and the reward is recomposed from the energy terms stored on the drawn rows by the energy function's `prebuilt_sample_to_reward` (`energies/molecular_crystal.py::MolecularCrystal.prebuilt_sample_to_reward` on the crystal route), without re-analysing the crystal.
 
 The **replay** branch draws stored forward trajectories from the replay buffer (`train.py::Modeller.draw_replay_sample`) and re-scores them under the current $P_F$ and $P_B$: the path is fixed, the densities move. Backward and replay share one builder, `gflownet_losses.py::get_gfn_backward_loss`, whose `trajectories` argument is what distinguishes a replayed path from a freshly sampled backward one.
+
+On the store route ([row-store](row-store.md)) all three branches read their molecules from the per-condition templates of `crystal_store.py::CrystalStore`: the forward branch rolls out on them, the backward branch draws stored children (`train.py::Modeller._store_draw`) and the replay branch draws stored on-policy rows. An empty on-policy pool folds replay's share into the backward branch for that step.
 
 Every branch that runs, runs a full batch. `cfg:stage.fracs` are coefficients on losses, not sample fractions, so a branch at a small nonzero weight still draws, scores and backpropagates $B$ rows. Under `cfg:stage.condition_draw` the backward and replay draws are sized by the step's condition set instead: `train.py::Modeller._choose_draw_conditions` picks the conditions, and the two branches draw `prior_rows` and `replay_rows` rows of each. On a step where it returns no eligible condition the backward branch draws its usual $B$ rows and the replay branch is skipped.
 

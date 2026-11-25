@@ -48,18 +48,19 @@ import profiling
 import wandb
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal, resolve_energy_reference, merge_batches
+from energies.molecular_crystal import MolecularCrystal, OOM_RECOVERY_KEEP_CACHE, resolve_energy_reference, merge_batches
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS, toy_latent_params, FDChartState, \
     DEFAULT_GLOBAL_HALF_LIFE_UPDATES, UNTRUSTED_Z_MODES, Z_FEED_MODES, DEFAULT_EVAL_HALF_LIFE_VISITS, \
     ANCHOR_ENERGY_CURRENCY, BufferCurrencyError, \
     ORIGIN_ROLLOUT, ORIGIN_EVAL, ORIGIN_BOOTSTRAP, ORIGIN_NAMES
-from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
+from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS, own_store_refusal
 from energy_sampling.controller import LRController
 from energy_sampling import prior_scan_cache
 from energy_sampling import noised_prior
-from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY
-from energy_sampling.row_store import FORMAT_VERSION as ROW_STORE_FORMAT
+from energy_sampling import physical_kick
+from energy_sampling import crystal_store
+from energy_sampling.crystal_store import CrystalStore
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES, POOLED_SOURCES, \
     ROLLOUT_CONDITION_DRAWS, TB_Z_SOURCES
@@ -67,7 +68,7 @@ from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.eval.sg_readouts import (branch_group_stats, buffer_group_share, condition_groups,
-                                               head_panel_stats, is_panel_stats, panel_line)
+                                               head_panel_stats, panel_line)
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, logmeanexp, \
@@ -791,7 +792,7 @@ class Modeller:
     #: unchanged: same class, same kwargs.
     buffer_cls = CrystalBuffer
 
-    #: the NF-route row store (row_store.py), built by init_row_store when buffers.store is enabled; None otherwise
+    #: the crystal store (crystal_store.py), built by init_row_store when buffers.store is enabled; None otherwise
     row_store = None
 
     #: the anchor store. A SEPARATE hook because AnchorBuffer is not buffer_cls: it carries
@@ -994,6 +995,8 @@ class Modeller:
             return self._metric_kernel_table()
         if s['live_kernel'] == 'chart':
             return self._chart_kernel_table()
+        if s['live_kernel'] == 'physical':
+            return self._physical_kernel_table()
         live = self.gfn_model.live_idx.to(self.device)
         d, n = int(live.numel()), len(ds)
         T = float(self.energy_function.temperature)
@@ -1257,6 +1260,121 @@ class Modeller:
         K['kept'] += kept * n
         return x.to(latents)
 
+    @staticmethod
+    def _physical_rows_digest(state):
+        """A digest of every (len / 4096)-th row of chart rows `state`: what ties the parent table to prior_dataset."""
+        return noised_prior.digest(state[::max(1, len(state) // 4096)].float())
+
+    def _physical_kernel_parents(self, prior, manifest, kinds, fd_ok, keep):
+        """noised_prior.live_kernel 'physical', at load: the table of the kept rows' parent anchors (self._physical).
+        Returns `keep` without the rows whose parent anchor has no usable chart point: such a row has no kick to draw
+        and is left out of the MLE draw, counted and printed. The prior buffer's seed is selected apart and keeps it.
+
+        Refuses a run off the FD chart, a space group with no basis table (physical_kick.group_kit), a radius law it
+        cannot read, and a kept row whose noised_parent is not an anchor of the same space group and molecule radius
+        (a harvested row has none)."""
+        s = self._noised_prior_settings
+        if fd_ok is None:
+            raise ValueError("noised_prior.live_kernel 'physical' needs energy_config.crystal_coordinates 'fd'")
+        if not bool(keep.any()):   # no parent to judge: _load_noised_prior raises, naming the selection
+            return keep
+        rng = self._physical_log_range(s, manifest)
+        kits = physical_kick.group_kits(self.energy_function.fd_layout)
+        kept = torch.nonzero(keep).flatten()
+        parents = noised_prior.tag(prior, 'noised_parent')[kept]
+        if bool((parents < 0).any()) or bool((parents >= len(kinds)).any()) \
+                or bool((kinds[parents] != noised_prior.KIND_ANCHOR).any()):
+            raise ValueError("noised_prior.live_kernel 'physical': a kept row's noised_parent is not an anchor (a "
+                             "harvested row has none: remove 'harvested' from noised_prior.train_kinds)")
+        sg = prior.sg_ind.reshape(-1).long().cpu()
+        radius = prior.radius.reshape(-1).detach().cpu()
+        if bool((sg[parents] != sg[kept]).any()) or bool(((radius[parents] - radius[kept]).abs() > 1e-3).any()):
+            raise ValueError("noised_prior.live_kernel 'physical': a kept row's noised_parent is another space group "
+                             "or molecule radius")
+        state = torch.as_tensor(prior.fd_state).float().cpu()
+        uniq, pos = torch.unique(parents, return_inverse=True)
+        usable = (fd_ok[uniq] & torch.isfinite(state[uniq]).all(1))[pos]
+        n_lost = int((~usable).sum())
+        if n_lost == len(kept):
+            raise ValueError("noised_prior.live_kernel 'physical': no kept row has a parent anchor with a chart point")
+        if n_lost:
+            keep = keep.clone()
+            keep[kept[~usable]] = False
+            kept = kept[usable]
+            uniq, pos = torch.unique(parents[usable], return_inverse=True)
+        self._physical = dict(kits=kits, parent=pos.to(torch.int32), centre=state[uniq], sg=sg[uniq], radius=radius[uniq],
+                              rg=physical_kick.radius_of_gyration_rows(prior, uniq), lo=float(rng[0]), hi=float(rng[1]),
+                              n_rows=len(kept), rows_digest=self._physical_rows_digest(state[kept]), no_parent=n_lost,
+                              rows=0, full_route=0, redrawn=0, kept=0)
+        print(f"live kernel 'physical': a fresh metric kick of each row's parent anchor, 10^U({rng[0]:g}, {rng[1]:g}) "
+              f"Angstrom, at most {1 + int(s['live_redraws'])} draws per row and then the anchor's own point; "
+              f"{len(kept)} rows over {len(uniq)} parent anchors in space groups {sorted(kits)}; {n_lost} kept rows "
+              f"({n_lost / (len(kept) + n_lost):.2%}) left out of the MLE draw, their parent anchor having no chart "
+              f"point", flush=True)
+        unread = noised_prior.physical_unread_settings(s)
+        if unread:
+            print(f"live kernel 'physical': these noised_prior settings are not read by this kernel: {unread}",
+                  flush=True)
+        return keep
+
+    @staticmethod
+    def _physical_log_range(s, manifest):
+        """(lo, hi) of the kick radius 10^U(lo, hi) Angstrom: noised_prior.live_log_range, else a metric-kick build's
+        manifest range; any other build without the key raises."""
+        rng = s['live_log_range']
+        if rng is None:
+            if manifest.get('child_kernel') != 'metric':
+                raise ValueError("noised_prior.live_kernel 'physical' reads the radius law of a metric-kick build; set "
+                                 f"noised_prior.live_log_range for this prior (child_kernel "
+                                 f"{manifest.get('child_kernel')!r})")
+            rng = (float(manifest['log_lo']), float(manifest['log_hi']))
+        return rng
+
+    @staticmethod
+    def _physical_warn_full_route(K):
+        """Prints once when the share of kicked rows that took the full canonicaliser passes its bound."""
+        if (not K.get('warned') and K['rows'] >= physical_kick.FULL_ROUTE_WARN_ROWS
+                and K['full_route'] > physical_kick.FULL_ROUTE_WARN_SHARE * K['rows']):
+            K['warned'] = True
+            print(f"WARNING: live kernel 'physical': {K['full_route'] / K['rows']:.1%} of the {K['rows']} rows drawn so "
+                  f"far took the full canonicaliser (bound {physical_kick.FULL_ROUTE_WARN_SHARE:.0%}). The draws stay "
+                  f"correct but each costs far more: check physical_kick.BASIS_TABLES against the reduction walls",
+                  flush=True)
+
+    def _physical_kernel_table(self):
+        """noised_prior.live_kernel 'physical' at the first draw: checks that the parent table built at load
+        (_physical_kernel_parents) is aligned with prior_dataset."""
+        K = getattr(self, '_physical', None)
+        if K is None:
+            raise ValueError("noised_prior.live_kernel 'physical' needs a pre-noised prior on the FD chart")
+        b = self.prior_dataset.batch
+        if K['n_rows'] != int(b.num_graphs) or self._physical_rows_digest(b.fd_state) != K['rows_digest']:
+            raise ValueError("noised_prior.live_kernel 'physical': the parent table is not aligned with prior_dataset")
+        return True
+
+    def _physical_kernel_draw(self, latents, inds, mol_batch=None, repeats=1):
+        """noised_prior.live_kernel 'physical' on the rows `inds`: a fresh kick of each row's parent anchor
+        (physical_kick.kick, on the CPU), returned on the latents' device and dtype. MLE only: the row's stored energy
+        is not the kicked point's, so a draw that reads log R raises. `inds` holds each terminal `repeats` times in a
+        row (buffer.py::_sample_indices): it takes one kick, copied to its tiles, because terminal_mle's 'exact'
+        estimator reads the tiles as backward paths to one terminal."""
+        if not self._bwd_draw_is_reward_free():
+            raise ValueError("noised_prior.live_kernel 'physical' draws unscored points: it needs a reward-free MLE "
+                             "stage")
+        K = self._physical
+        rows = torch.as_tensor(inds).long().flatten().cpu()
+        tiles = max(1, int(repeats))
+        terminals = rows[::tiles]
+        if not torch.equal(terminals.repeat_interleave(tiles), rows):
+            raise ValueError(f"noised_prior.live_kernel 'physical': the drawn rows are not {tiles} tiles per terminal")
+        p = K['parent'][terminals]
+        x, counts = physical_kick.kick(K['kits'], K['centre'][p], K['sg'][p], K['radius'][p], K['rg'][p], K['lo'], K['hi'],
+                                       1 + int(self._noised_prior_settings['live_redraws']))
+        for name, v in counts.items():
+            K[name] += v
+        self._physical_warn_full_route(K)
+        return x.repeat_interleave(tiles, 0).to(latents)
+
     def _basin_kernel_draw(self, latents, inds, mol_batch):
         """noised_prior.live_kernel 'basin': each drawn row's chart point replaced by a draw around its basin centre.
         With noised_prior.live_bank > 0, a uniformly chosen point of the row's bank, a share live_fresh_frac of the
@@ -1279,7 +1397,7 @@ class Modeller:
             B['bank'][rows[pick], slot[pick]] = fresh
         return out.to(latents)
 
-    def _live_kernel_draw(self, latents, inds, mol_batch=None):
+    def _live_kernel_draw(self, latents, inds, mol_batch=None, repeats=1):
         """noised_prior.live_kernel: each drawn row moved by L z in its live chart rows, z standard normal; wrapped
         rows folded onto their period, every other live row reflected into [-1, 1] (a stand-in for re-canonicalising
         across a face); dead rows untouched. 'basin' draws in cell parameters instead (_basin_kernel_draw)."""
@@ -1287,6 +1405,8 @@ class Modeller:
             self._live_L = self._live_kernel_table()
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'chart':
             return self._chart_kernel_draw(latents, inds, mol_batch)
+        if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') == 'physical':
+            return self._physical_kernel_draw(latents, inds, mol_batch, repeats)
         if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel') in ('basin', 'metric'):
             return self._basin_kernel_draw(latents, inds, mol_batch)
         live = self.gfn_model.live_idx.to(latents.device)
@@ -2681,7 +2801,7 @@ class Modeller:
         # The aligned per-condition draw (stage.condition_draw) and the rollout
         # condition draw (condition_log_z.rollout_condition_draw) are refused the
         # same way, on the same resolved config.
-        from config_invariants import (replay_seat_problems, condition_draw_problems,
+        from config_invariants import (replay_seat_problems, condition_draw_problems, physical_kernel_problems,
                                        rollout_condition_draw_problems, _member)
 
         def _glob(dotted):
@@ -2699,7 +2819,8 @@ class Modeller:
             _coeff = (lambda mode, key, _st=_st: _st.loss_coeffs.get(mode, {}).get(
                 key, self.protocol.base_coeffs(mode).get(key)))
             problems = (replay_seat_problems(_st, _coeff, _glob)
-                        + condition_draw_problems(_st, _coeff, _glob))
+                        + condition_draw_problems(_st, _coeff, _glob)
+                        + physical_kernel_problems(_st, _coeff, _glob))
             if problems:
                 raise ValueError(f"stage '{_st.name}': " + ' '.join(problems))
 
@@ -2950,8 +3071,8 @@ class Modeller:
                   f"function {lib}; trainable mask left unset (whole-library quorum)", flush=True)
             return
         mol_ids = [torch.as_tensor(m).detach().cpu().long().flatten()
-                   for m in (getattr(getattr(getattr(self, name, None), 'batch', None), 'mol_id', None)
-                             for name in ('mol_dataset', 'prior_dataset'))
+                   for m in (getattr(getattr(getattr(self, 'mol_dataset', None), 'batch', None), 'mol_id', None),
+                             getattr(Modeller._prior_molecule_batch(self), 'mol_id', None))
                    if m is not None]
         if not mol_ids:
             return
@@ -3409,6 +3530,12 @@ class Modeller:
                              f"one of {ROLLOUT_CONDITION_DRAWS}")
         return mode
 
+    def _rollout_draw_is_weighted(self) -> bool:
+        """This stage's forward rollouts draw conditions by weighted_condition_sampling's fit-error measure: the stage
+        flag and condition_log_z.weighted_condition_sampling are both on."""
+        return bool(self.protocol.flag('weighted_condition_sampling')
+                    and getattr(getattr(self.args, 'condition_log_z', None), 'weighted_condition_sampling', False))
+
     def _rollout_mol_batch(self, repeats):
         """The forward rollout's mol_dataset rows: self.batch_size rows (one
         condition each on a single-SG/Z' route), each tiled `repeats` times.
@@ -3433,8 +3560,7 @@ class Modeller:
         # forward can't lower that variance anyway -- weighting there aims the
         # weak lever at its worst conditions while starving the clean-gradient
         # bulk. Declare the flag per-stage to A/B it.
-        weighted = bool(self.protocol.flag('weighted_condition_sampling')
-                        and getattr(cfg, 'weighted_condition_sampling', False))
+        weighted = self._rollout_draw_is_weighted()
         mode = self._rollout_condition_mode()
         if mode != 'iid':
             if weighted:
@@ -4643,16 +4769,97 @@ class Modeller:
         strip_lazy_sg_caches(batch)  # as init_prior_dataset does to the file's own batch: rebuilt by this code, not the writer's
         return energy.to(self.device), batch.to(self.device)
 
+    ROW_LIST_KEYS = ('identifier', 'symmetry_operators')   # per-row Python lists a chunk drops before its device move
+    REWARD_CACHE_CHECK_ROWS = 256
+
     @torch.no_grad()
-    def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False):
+    def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False, rows=None, cids=None,
+                             prior_path=None):
         """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
         (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU. with_mol_energy adds a
-        third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced)."""
+        third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced). rows: the rows to read, in
+        this order (default every row); cids: their condition ids, attached for an energy reference to read.
+        prior_path: `batch` is that pre-noised prior file's batch, and the result goes through the sidecar cache beside
+        it (noised_prior.cache_path 'rewards'), keyed on the file, the rows, the condition ids, the temperature and the
+        energy function's settings, clip and reference. A cached result is used only after a fresh scoring of
+        REWARD_CACHE_CHECK_ROWS rows (random, plus the highest-energy rows, which the clip acts on) agrees with it."""
+        if prior_path is None:
+            return self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+        import json
+        from utils import _namespace_to_dict
+        ef, T =self.energy_function, float(self.args.energy_config.temperature)
+        n = int(batch.num_graphs) if rows is None else int(rows.numel())
+        ref = getattr(ef, 'energy_reference', None)
+        key = dict(file=noised_prior.file_identity(prior_path), n=n, mol=bool(with_mol_energy), T=T,
+                   rows=None if rows is None else noised_prior.digest(torch.as_tensor(rows).long().cpu()),
+                   cids=None if cids is None else noised_prior.digest(torch.as_tensor(cids).long().cpu()),
+                   energy_function=str(self.args.energy_function),
+                   energy_config=json.dumps(_namespace_to_dict(self.args.energy_config), sort_keys=True, default=str),
+                   clip=getattr(ef, 'energy_clip', None), physical_clip=getattr(ef, 'physical_energy_clip', None),
+                   reference=None if ref is None else noised_prior.digest(torch.as_tensor(ref).double()),
+                   fd_chart=getattr(self, '_fd_chart_digest', None), code=self._reward_code_digest())
+        side = noised_prior.cache_path(prior_path, 'rewards', key)
+        hit = noised_prior.load_cache(side, key)
+        if hit is not None:
+            terms = hit['terms']
+            # random rows (a new draw each launch), one share per (kind, split, space group, Z') stratum, and the
+            # highest-energy rows, which the clip acts on
+            idx = torch.randperm(n)[:min(n, self.REWARD_CACHE_CHECK_ROWS)]
+            try:
+                strat = torch.as_tensor(noised_prior.check_rows(batch, n=self.REWARD_CACHE_CHECK_ROWS)).long()
+            except (AttributeError, KeyError, ValueError):     # no stratum tags on this batch: random and top rows only
+                strat = torch.zeros(0, dtype=torch.long)
+            if rows is not None:
+                mark = torch.zeros(int(batch.num_graphs), dtype=torch.bool)
+                mark[strat] = True
+                strat = torch.nonzero(mark[torch.as_tensor(rows).long().cpu()]).flatten()
+            top = torch.topk(terms[0].nan_to_num(-math.inf), min(n, 32)).indices
+            idx = torch.unique(torch.cat([idx, strat, top]))
+            sub_rows = idx if rows is None else torch.as_tensor(rows)[idx]
+            fresh = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, sub_rows,
+                                                    None if cids is None else torch.as_tensor(cids)[idx])
+            if all(torch.allclose(f, c[idx], atol=1e-4, rtol=1e-5, equal_nan=True) for f, c in zip(fresh, terms)):
+                print(f"reward cache: {n} rows read from {side} ({idx.numel()} rows re-scored and agree)", flush=True)
+                return tuple(terms)
+            print(f"reward cache {side}: {idx.numel()} re-scored rows disagree with the cache; recomputing every row",
+                  flush=True)
+        t0 = time()
+        terms = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+        wrote = noised_prior.save_cache(side, key, terms=list(terms))
+        print(f"reward cache: {n} rows scored in {time() - t0:.0f} s" + (f", written to {side}" if wrote else ''),
+              flush=True)
+        return terms
+
+    def _reward_code_digest(self):
+        """A digest of the source of the energy function's reward path (generator_energy, prebuilt_sample_to_reward,
+        seed_energy_from), so an edit to it misses the reward cache."""
+        import hashlib
+        import inspect
+        ef, h = self.energy_function, hashlib.sha1()
+        for name in ('generator_energy', 'prebuilt_sample_to_reward', 'seed_energy_from'):
+            fn = getattr(ef, name, None)
+            try:
+                h.update(inspect.getsource(fn).encode())
+            except (TypeError, OSError):
+                h.update(repr(fn).encode())
+        return h.hexdigest()[:16]
+
+    @torch.no_grad()
+    def _stored_reward_terms_fresh(self, batch, chunk, with_mol_energy, rows, cids):
+        """_stored_reward_terms computed row by row, chunk by chunk. Each chunk drops ROW_LIST_KEYS before its device
+        move: torch_geometric's move walks a Python list element by element, and the reward reads neither list."""
         ef, T = self.energy_function, float(self.args.energy_config.temperature)
         seed, log_r, mol = [], [], []
-        for lo in range(0, int(batch.num_graphs), chunk):
-            sub = batch.subsample_new_batch(
-                torch.arange(lo, min(lo + chunk, int(batch.num_graphs)), device=batch.ptr.device)).to(self.device)
+        n = int(batch.num_graphs) if rows is None else int(rows.numel())
+        for lo in range(0, n, chunk):
+            at = (torch.arange(lo, min(lo + chunk, n)) if rows is None else rows[lo:lo + chunk]).to(batch.ptr.device)
+            sub = batch.subsample_new_batch(at)
+            for k in self.ROW_LIST_KEYS:
+                if k in sub.keys() and isinstance(sub[k], (list, tuple)):
+                    del sub[k]
+            sub = sub.to(self.device)
+            if cids is not None:
+                sub.add_graph_attr(cids[lo:lo + chunk].to(sub.ptr.device), 'condition_id')
             lr, ens = ef.prebuilt_sample_to_reward(sub, T, return_ens_dict=True)
             seed.append(ef.seed_energy_from(ens).double().flatten().cpu())
             log_r.append(lr.double().flatten().cpu())
@@ -4757,7 +4964,7 @@ class Modeller:
             raise ValueError(f"pre-noised prior {self.args.prior_path}: a stored row does not re-score to its stored "
                              f"terms (worst miss {worst:.3g}): the file is stale or was built by other code")
 
-        seed_e, log_r = self._stored_reward_terms(prior)
+        seed_e, log_r = self._stored_reward_terms(prior, prior_path=getattr(self.args, 'prior_path', None))
         if fd_ok is not None:
             log_r = torch.where(fd_ok, log_r, torch.full_like(log_r, float('nan')))
         kinds, splits = noised_prior.tag(prior, 'noised_kind'), noised_prior.tag(prior, 'noised_split')
@@ -4768,7 +4975,11 @@ class Modeller:
             parents=noised_prior.tag(prior, 'noised_parent') if s['window_by'] == 'parent' else None)
         self._noised_prior_manifest = manifest   # read by the kernel readouts' fresh gap (_kernel_readouts)
         masks, floor = noised_prior.select_rows(seed_e, packing, kinds, splits, groups, T, s, window_e=window_e)
+        if self.store_settings() is not None:
+            return self._store_take_rows(prior, manifest, seed_e, log_r, kinds, splits, groups, fd_ok, masks, floor)
         keep = masks['train'] & torch.isfinite(log_r)
+        if s['live_kernel'] == 'physical':
+            keep = self._physical_kernel_parents(prior, manifest, kinds, fd_ok, keep)
         n_groups = int(groups.max()) + 1
         kept_per = torch.bincount(groups[keep], minlength=n_groups)
         dev = prior.ptr.device
@@ -4825,9 +5036,13 @@ class Modeller:
         noised_prior.MANIFEST_KEY (manifest not None), else 0; for a build, the manifest entries of NOISED_PRIOR_RECORD
         it holds. cfg:noised_prior is read through noised_prior.settings for every prior, so an unknown key raises on
         either kind; on a prior that is not a build a present block prints that it is inert. A build whose manifest
-        temperature differs from energy_config.temperature prints a warning."""
-        noised_prior.settings(self.args)
+        temperature differs from energy_config.temperature prints a warning. live_kernel 'physical' on a prior that is
+        not a build raises: _load_noised_prior would never run, and MLE would train on the stored rows with no kick."""
+        s = noised_prior.settings(self.args)
         if manifest is None:
+            if s['live_kernel'] == 'physical':
+                raise ValueError(f"noised_prior.live_kernel 'physical' needs a pre-noised prior: {self.args.prior_path} "
+                                 f"has no noised manifest, so no draw would be kicked")
             if getattr(self.args, 'noised_prior', None) is not None:
                 print("noised_prior block inert: prior_path is not a pre-noised build", flush=True)
             return {'data/prior_prenoised': 0}
@@ -5014,6 +5229,7 @@ class Modeller:
         self.prior_dataset = CrystalBuffer(prior,
                                            device=self.buffer_device,
                                            **self._buffer_kwargs(),
+                                           **Modeller._store_buffer_kwargs(self),
                                            y_fn=self._buffer_y_fn(),
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
@@ -5063,6 +5279,7 @@ class Modeller:
         self.mol_dataset = CrystalBuffer(self.subset_training_molecules(mols, 'molecules_path'),
                                          device=self.buffer_device,
                                          **self._buffer_kwargs(),
+                                         **Modeller._store_buffer_kwargs(self),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
         if self.args.test_molecules_path is not None:
@@ -5071,6 +5288,7 @@ class Modeller:
             self.test_mol_dataset = CrystalBuffer(test_mols,
                                                   device=self.buffer_device,
                                                   **self._buffer_kwargs(),
+                                                  **Modeller._store_buffer_kwargs(self),
                                                   exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
         else:
             self.test_mol_dataset = None
@@ -5107,6 +5325,9 @@ class Modeller:
         # a pre-noised prior's held-out anchor groups and clean anchors (_load_noised_prior), read by density_readouts
         batches += [b for b in (getattr(self, 'prior_heldout_batch', None), getattr(self, 'prior_anchor_batch', None))
                     if b is not None]
+        load = getattr(self, '_store_load', None)
+        if load is not None:   # one template per file condition: the rows the store's molecules are read from
+            batches.append(load['templates'])
 
         identifiers = set()
         for batch in batches:
@@ -5124,6 +5345,18 @@ class Modeller:
                 batch.add_graph_attr(mol_id, 'mol_id')
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
+        if load is not None:
+            self._store_after_identifiers()
+
+    def _prior_molecule_batch(self):
+        """The prior batch that names the run's molecules: the store route's templates (its panels hold a sample of
+        them), else prior_dataset's batch; None when neither is loaded."""
+        load = getattr(self, '_store_load', None)
+        if load is not None:
+            return load['templates']
+        if getattr(self, 'row_store', None) is not None:
+            return self.row_store.templates
+        return getattr(getattr(self, 'prior_dataset', None), 'batch', None)
 
     @staticmethod
     def _molecule_keys(batch, smiles=True):
@@ -5152,7 +5385,7 @@ class Modeller:
         args = getattr(self, 'args', None)
         mol_path, prior_path = getattr(args, 'molecules_path', None), getattr(args, 'prior_path', None)
         mol_ids, _ = self._molecule_keys(getattr(getattr(self, 'mol_dataset', None), 'batch', None), smiles=False)
-        prior_ids, _ = self._molecule_keys(getattr(getattr(self, 'prior_dataset', None), 'batch', None), smiles=False)
+        prior_ids, _ = self._molecule_keys(Modeller._prior_molecule_batch(self), smiles=False)
         if mol_ids and prior_ids and mol_ids != prior_ids:
             only_prior, only_mol = sorted(prior_ids - mol_ids), sorted(mol_ids - prior_ids)
             print(f"prior and condition molecule sets differ: {len(only_prior)} of {len(prior_ids)} prior_path "
@@ -5165,7 +5398,7 @@ class Modeller:
             return
         test_ids, test_smiles = self._molecule_keys(test.batch)
         sources = [('molecules_path', mol_path, getattr(self.mol_dataset, 'batch', None)),
-                   ('prior_path', prior_path, getattr(self.prior_dataset, 'batch', None)),
+                   ('prior_path', prior_path, Modeller._prior_molecule_batch(self)),
                    ('prior_path held-out anchor groups', prior_path, getattr(self, 'prior_heldout_batch', None)),
                    ('prior_path clean anchors', prior_path, getattr(self, 'prior_anchor_batch', None))]
         leaks = []
@@ -5190,10 +5423,12 @@ class Modeller:
             b = getattr(ds, 'batch', None)
             return len(set(b.identifier)) if b is not None and hasattr(b, 'identifier') else 0
 
+        load = getattr(self, '_store_load', None)
         sizes = {'data/train_molecules': molecules(self.mol_dataset),
                  'data/test_molecules': molecules(getattr(self, 'test_mol_dataset', None)),
-                 'data/prior_rows': int(self.prior_dataset.batch.num_graphs),
-                 'data/prior_molecules': molecules(self.prior_dataset),
+                 'data/prior_rows': int(self.prior_dataset.batch.num_graphs if load is None else load['rows'].numel()),
+                 'data/prior_molecules': (molecules(self.prior_dataset) if load is None
+                                          else int(torch.unique(load['templates'].mol_id).numel())),
                  'data/molecules': len(self.identifier_registry),
                  'data/condition_library_size': int(self.energy_function.condition_library_size),
                  **getattr(self, 'prior_data_record', {}),
@@ -5262,7 +5497,12 @@ class Modeller:
                 ids.append(ef.condition_ids_of(sub).cpu())
 
         with ef.allow_unreferenced():
-            score(self.prior_dataset.batch, analyse=False)
+            load = getattr(self, '_store_load', None)
+            if load is None:
+                score(self.prior_dataset.batch, analyse=False)
+            else:   # the first-pass seed energies of every stored row
+                ids.append(load['cid'])
+                energies.append(load['seed_e'].float())
             score(self.mol_dataset.batch, analyse=True)
             if getattr(self, 'test_mol_dataset', None) is not None:
                 score(self.test_mol_dataset.batch, analyse=True)
@@ -5442,6 +5682,7 @@ class Modeller:
                     # forward loss was live.
                     self.z_level_fill()
                     self.z_calibration_tick(step_type)
+                    self._store_grow()
                 self.times['train_step_end'] = time()
                 step_dt = self.times['train_step_end'] - self.times['train_step_start']
                 if not hasattr(self, '_recent_step_times'):
@@ -5927,6 +6168,7 @@ class Modeller:
             step = deepcopy(self.step_ind)
             self.checkpointer.set_state_dict(checkpoint['modeller_state'])
             self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
+            checkpoint_step = int(self.step_ind)
             self.step_ind = step
             # only pre-sidecar checkpoints carry buffers inline. Otherwise the
             # LIVE buffers are kept rather than pulled from the sidecar: no
@@ -5963,9 +6205,8 @@ class Modeller:
                 self._arm_phys_energy_guard()
                 # same for the trainable mask, which from_state_dict leaves unset
                 self._set_tracker_trainable()
-            # the live rows' log q under the reloaded weights, after the tracker so the level reads the restored one
             if self.row_store is not None:
-                self._store_refresh()
+                self._store_rewind(checkpoint_step)
 
         # set_state_dict above restored lr_ctrl (the scale and any ramp in
         # flight) from the healthy checkpoint, so the cut below compounds off
@@ -7623,12 +7864,19 @@ class Modeller:
                        repeats: int = 1,
                        report_losses: bool = False,
                        ):
-        mol_batch = self._rollout_mol_batch(repeats)
-        mol_batch = mol_batch.to(self.device)
-        mol_batch.orient_molecule(mode='std')
-        init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
-        mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            mol_batch, repeats=repeats)
+        if getattr(self, 'row_store', None) is not None:
+            mol_batch = self._store_condition_batch(self._rollout_mol_batch(1), repeats).to(self.device)
+            init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
+            mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
+                mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
+                z_primes=mol_batch.z_prime.reshape(-1).long())
+        else:
+            mol_batch = self._rollout_mol_batch(repeats)
+            mol_batch = mol_batch.to(self.device)
+            mol_batch.orient_molecule(mode='std')
+            init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
+            mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
+                mol_batch, repeats=repeats)
         if self._rollout_group_mode() == 'level':   # each molecule's space group from the level, not uniform
             mol_batch, log_T_tensor, condition, condition_id = self._level_group_draw(mol_batch, log_T_tensor,
                                                                                       repeats)
@@ -7974,17 +8222,20 @@ class Modeller:
         nearly all singletons, so the root here is taken over rows, which matches it exactly only when groups are
         singletons and is otherwise wider than the pair means by the within-condition spread.
 
-        A Z measurement, not an eval: no tracker, anchor or replay-buffer writes. Applied to every policy copy
-        (_policies). Left as loaded, with a line saying so, when the draw has under two finite rows or the root is not
-        identified (winsorized_z_root's ValueError, or a non-finite root).
+        A Z measurement, not an eval: no tracker, anchor or replay-buffer writes. On the store route the scored rows
+        are written to the store, tagged and undrawn. Applied to every policy copy (_policies). Left as loaded, with a
+        line saying so, when the draw has under two finite rows or the root is not identified (winsorized_z_root's
+        ValueError, or a non-finite root).
         """
         n = int(n_samples or getattr(self.args, 'eval_num_samples', 0) or self.batch_size)
         if not all(hasattr(p, 'shift_level') for p in self._policies()):
             raise NotImplementedError("bootstrap_z:offset needs a policy with shift_level (models/nf_policy.py::"
                                       "NFPolicy); use bootstrap_z:rollout on this route")
         eval_discretizer = get_discretizer(trajectory_T(self.args))
-        fwd_stats, _ = self.fwd_eval_sampling(
+        fwd_stats, boot_batch = self.fwd_eval_sampling(
             self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False)
+        if getattr(self, 'row_store', None) is not None:
+            self._store_admit(fwd_stats, boot_batch, ORIGIN_BOOTSTRAP, eval_row=True, drawable=False)
         logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
                 - fwd_stats['log_pfs'].sum(-1)).detach().flatten().double()
         head = fwd_stats['log_flow'][:, 0].detach().flatten().double()
@@ -8558,8 +8809,8 @@ class Modeller:
         return torch.full((latents.shape[0],), math.log10(float(T)))
 
     def draw_bwd_sample(self, repeats, target_cids=None, condition_draw=None):
-        if self.row_store is not None:   # buffers.store: uniform over the store's data rows
-            return self._store_draw('mle', repeats)
+        if self.row_store is not None:   # MLE: fresh kicks of anchors; TB: stored children
+            return self._store_draw('mle' if self.bwd_sampling_mode == 'dataset' else 'bwd', repeats)
         traj = None
         if condition_draw is not None:
             # THE ALIGNED PER-CONDITION DRAW: exactly prior_rows distinct rows for
@@ -8591,7 +8842,7 @@ class Modeller:
             self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(len(inds))
             if (getattr(self, '_noised_prior_settings', None) or {}).get('live_kernel'):
                 # the stored row is the anchor; MLE trains on a fresh draw around it (log R stays the anchor's)
-                latents = self._live_kernel_draw(latents, inds, mol_batch)
+                latents = self._live_kernel_draw(latents, inds, mol_batch, repeats=repeats)
 
         elif self.bwd_sampling_mode == 'prior':
             # condition-blocked draws (C conditions x up to M distinct terminals
@@ -8651,7 +8902,7 @@ class Modeller:
     def _bwd_draw_is_reward_free(self) -> bool:
         """Whether this step's backward draw goes unscored: the 'dataset' draw (the MLE stage's) under coefficients
         whose every log R term is 0 (gflownet_losses.bwd_loss_reads_reward) and with no pooled stash armed."""
-        return (self.bwd_sampling_mode == 'dataset' and self.row_store is None
+        return (self.bwd_sampling_mode == 'dataset'
                 and not bwd_loss_reads_reward(self.args.bwd_loss_coeffs)
                 and not getattr(self.gfn_model, '_stash_live_branches', False))
 
@@ -8678,16 +8929,31 @@ class Modeller:
             return None
         return float(v[0])
 
-    # ---- the NF-route row store (row_store.py; docs/wiki/row-store.md) --------------------------------------------
+    # ---- the crystal store route (crystal_store.py; docs/wiki/row-store.md) ----------------------------------------
+
+    #: what a condition's template keeps of a prior row: the molecule and the fields the kick and the scorer read
+    STORE_TEMPLATE_KEYS = ('z', 'pos', 'radius', 'mol_volume', 'sg_ind', 'z_prime', 'num_atoms', 'mass', 'x',
+                           'max_z_prime', 'ptr', 'batch', 'mol_id', 'identifier')
+    #: Angstrom: the largest displacement of a stored row's atoms from its condition's template
+    STORE_FRAME_TOL = 0.02
+    #: seed-sequence offsets of the store's readout panels and of the held-out eval panel
+    STORE_PANEL_SEED, STORE_HELDOUT_SEED = 31, 23
+    #: rounds an MLE draw takes to replace a row whose kick kept its anchor point
+    MLE_KICK_ROUNDS = 3
+    #: rows per origin, and the bars, of the smoke currency check (nats; units of T on mol_energy)
+    STORE_CURRENCY_ROWS, STORE_CURRENCY_TOL, STORE_CURRENCY_REL = 64, 1e-2, 1e-5
 
     def store_settings(self):
         """buffers.store merged over config_invariants.ROW_STORE_DEFAULTS when enabled, else None."""
         from config_invariants import row_store_settings
         return row_store_settings(self.args)
 
+    def _store_buffer_kwargs(self):
+        """CrystalBuffer keywords of a dataset on the store route: rows keep their stored molecule frame."""
+        return {'orient': False} if Modeller.store_settings(self) is not None else {}
+
     def _store_stamp(self):
-        """What the stored rows' x, log R, energy and condition ids depend on, and the store's format version. A
-        sidecar store whose stamp differs is not loaded (init_row_store seeds afresh)."""
+        """What the stored rows' x, log R, energy and condition ids depend on, and the store's format version."""
         from utils import _to_plain
         ef = self.energy_function
         ec = dict(_to_plain(self.args.energy_config))
@@ -8697,7 +8963,7 @@ class Modeller:
         reg = getattr(self, 'identifier_registry', {}) or {}
         path = str(self.args.prior_path)
         return {
-            'store_format': ROW_STORE_FORMAT,
+            'store_format': crystal_store.FORMAT_VERSION,
             'noised_prior_identity': noised_prior.identity(self.args, ef),
             'noised_prior_settings': {k: (list(v) if isinstance(v, tuple) else v)
                                       for k, v in noised_prior.settings(self.args).items()},
@@ -8716,190 +8982,727 @@ class Modeller:
                                        else [round(float(v), 6) for v in torch.as_tensor(ref).flatten().tolist()]),
         }
 
+    def _store_template_batch(self, batch):
+        """`batch` cut down to STORE_TEMPLATE_KEYS, never oriented."""
+        for key in [k for k in batch.keys() if k not in self.STORE_TEMPLATE_KEYS]:
+            del batch[key]
+        return batch
+
+    def _store_frame_check(self, prior, rows, tmpl, chunk: int = 1 << 20):
+        """Raises unless each of `rows` has its template row's atoms (tmpl[i], same z) within STORE_FRAME_TOL Angstrom.
+        Returns the largest displacement."""
+        ptr, dev = prior.ptr.cpu(), prior.pos.device
+        worst = 0.0
+        for lo in range(0, rows.numel(), chunk):
+            r, t = rows[lo:lo + chunk], tmpl[lo:lo + chunk]
+            count = ptr[r + 1] - ptr[r]
+            if bool((count != ptr[t + 1] - ptr[t]).any()):
+                raise ValueError("buffers.store: a stored row has another atom count than its condition's template")
+            group = torch.arange(r.numel()).repeat_interleave(count)
+            off = torch.arange(int(count.sum())) - (count.cumsum(0) - count)[group]
+            a, b = (ptr[r][group] + off).to(dev), (ptr[t][group] + off).to(dev)
+            if not torch.equal(prior.z.reshape(-1)[a], prior.z.reshape(-1)[b]):
+                raise ValueError("buffers.store: a stored row has other atoms than its condition's template")
+            gap = float((prior.pos[a] - prior.pos[b]).norm(dim=1).max())
+            worst = max(worst, gap)
+            if gap > self.STORE_FRAME_TOL:
+                raise ValueError(f"buffers.store: a stored row's atoms lie {gap:.2e} A from its condition's template "
+                                 f"(bar {self.STORE_FRAME_TOL:g} A): the rows of a condition must share a frame")
+        return worst
+
+    def _store_take_rows(self, prior, manifest, seed_e, log_r, kinds, splits, groups, fd_ok, masks, floor):
+        """The store route of _load_noised_prior, returning (-T log R of the kept rows, panel). Keeps every scored
+        training row inside the load windows, with the parent anchor of each kept child (an anchor outside the window
+        is stored undrawn, so it holds the link and is never kicked). A child whose parent has no chart point is
+        dropped and counted. Holds the file batch and the row tables in self._store_load until init_row_store; the
+        frozen readout panels (prior_dataset, prior_heldout_batch, prior_anchor_batch) are cut here, each capped at
+        4 * eval_num_samples rows, deterministic in the file and seed."""
+        ef, T, s = self.energy_function, float(self.args.energy_config.temperature), self._noised_prior_settings
+        if fd_ok is None:
+            raise ValueError("buffers.store needs energy_config.crystal_coordinates 'fd'")
+        rng = self._physical_log_range(s, manifest)
+        kits = physical_kick.group_kits(ef.fd_layout)
+        n = int(prior.num_graphs)
+        state = torch.as_tensor(prior.fd_state).float().cpu()
+        parents = noised_prior.tag(prior, 'noised_parent')
+        is_anchor = kinds == noised_prior.KIND_ANCHOR
+        finite = torch.isfinite(log_r)
+        keep = self._store_seed_keep(masks['buffer'] & finite)
+        kids = torch.nonzero(keep & ~is_anchor).flatten()
+        par = parents[kids]
+        if bool((par < 0).any()) or bool((par >= n).any()) or not bool(is_anchor[par].all()):
+            raise ValueError("buffers.store: a kept child's noised_parent is not an anchor of this file")
+        if bool((groups[par] != groups[kids]).any()) or bool((splits[par] != noised_prior.SPLIT_TRAIN).any()):
+            raise ValueError("buffers.store: a kept child's parent anchor is in another condition or split")
+        usable = fd_ok[par] & torch.isfinite(state[par]).all(1) & finite[par]
+        n_lost = int((~usable).sum())
+        if n_lost:
+            keep[kids[~usable]] = False
+            kids, par = kids[usable], par[usable]
+        if not kids.numel():
+            raise ValueError("buffers.store: no child survives the load-time selection")
+        stored = keep.clone()
+        stored[par] = True
+        outside = stored & ~keep
+        rows = torch.nonzero(stored).flatten()
+        kind_rows = kinds[rows]
+        slot_of = torch.cumsum(stored.long(), 0) - 1
+        child = kind_rows == noised_prior.KIND_CHILD
+        parent = torch.where(child, slot_of[torch.where(child, parents[rows], torch.zeros_like(rows))],
+                             torch.full_like(rows, -1))
+
+        n_groups = int(groups.max()) + 1
+        anchors = rows[~child]
+        first = torch.full((n_groups,), n, dtype=torch.long)
+        first.scatter_reduce_(0, groups[anchors], anchors, reduce='amin', include_self=True)
+        t_groups = torch.nonzero(first < n).flatten()
+        gap = self._store_frame_check(prior, rows, first[groups[rows]])
+        templates = self._store_template_batch(prior.subsample_new_batch(first[t_groups].to(prior.ptr.device)))
+        floor_of = torch.full((n_groups,), float('inf'), dtype=torch.float64).scatter(0, groups, floor.double())
+
+        cap = 4 * int(self.args.eval_num_samples)
+        g = torch.Generator().manual_seed(int(self.args.seed) + self.STORE_PANEL_SEED)
+
+        def panel(mask):
+            at = torch.nonzero(mask).flatten()
+            if at.numel() > cap:
+                at = at[torch.randperm(at.numel(), generator=g)[:cap]].sort().values
+            return prior.subsample_new_batch(at.to(prior.ptr.device)) if at.numel() else None
+        train_panel = panel(keep & ~is_anchor)
+        self.prior_heldout_batch = panel(masks['heldout_children'] & finite)
+        self.prior_anchor_batch = panel(masks['anchors'] & finite)
+        self.prior_is_prenoised = True
+        self._prior_buffer_rows = None
+        self._store_load = dict(batch=prior, rows=rows, groups=groups[rows], kinds=kind_rows, parent=parent,
+                                undrawn=outside[rows], seed_e=seed_e[rows], t_groups=t_groups, templates=templates,
+                                floor=floor_of[t_groups])
+        self._physical = dict(kits=kits, lo=float(rng[0]), hi=float(rng[1]), no_parent=n_lost, rows=0, full_route=0,
+                              redrawn=0, kept=0, mle_kept_dropped=0)
+        window = 'no energy window' if s['window_kT'] is None else f"{s['window_kT']} kT (T {T:g}) of the condition floor"
+        print(f"crystal store load: {n} file rows; {rows.numel()} scored training rows stored over {t_groups.numel()} "
+              f"conditions: {int((~child).sum())} anchors ({int(outside.sum())} outside the windows, stored undrawn "
+              f"and never kicked) and {int(child.sum())} children; every other stored row lies inside {window} and "
+              f"packing {s['packing_window']}; {n_lost} children dropped, their parent anchor having no chart point; rows lie "
+              f"within {gap:.2e} A of their condition's template. MLE trains on fresh kicks of the in-window anchors, "
+              f"10^U({rng[0]:g}, {rng[1]:g}) A, and those kicks are not window-filtered. Panels: "
+              f"{int(train_panel.num_graphs)} train children, "
+              f"{0 if self.prior_heldout_batch is None else int(self.prior_heldout_batch.num_graphs)} held-out "
+              f"children, {0 if self.prior_anchor_batch is None else int(self.prior_anchor_batch.num_graphs)} anchors",
+              flush=True)
+        return (-log_r[keep] * T).float().to(self.device), train_panel.to(self.device)
+
+    def _store_after_identifiers(self):
+        """The store load once mol_id exists: each stored row's condition id, and one template per training condition.
+        A training condition (a mol_dataset molecule in any of the run's space groups and Z') with no stored row takes
+        the molecule's mol_dataset row as its template."""
+        load, ef = self._store_load, self.energy_function
+        t = load['templates']
+        file_cids = ef.condition_ids_of(t).cpu()
+        cid_of_group = torch.full((int(load['t_groups'].max()) + 1,), -1, dtype=torch.long)
+        cid_of_group[load['t_groups']] = file_cids
+        load['cid'] = cid_of_group[load['groups']]
+        load['floor_cids'] = file_cids
+        for key in ('identifier', 'smiles'):
+            if key in t._store:
+                del t[key]
+        n_combo = int(ef.n_sg) * int(ef.n_zp)
+        mb = self.mol_dataset.batch
+        mol_ids = torch.as_tensor(mb.mol_id).long().flatten().cpu()
+        wanted = (torch.unique(mol_ids)[:, None] * n_combo + torch.arange(n_combo)[None, :]).flatten()
+        missing = wanted[~torch.isin(wanted, file_cids)]
+        if missing.numel():
+            first = torch.zeros(int(mol_ids.max()) + 1, dtype=torch.long)
+            first[mol_ids.flip(0)] = torch.arange(mol_ids.numel() - 1, -1, -1)
+            sg_lut, zp_lut = ef.sg_to_local.cpu(), ef.zp_to_local.cpu()
+            sg_of = torch.zeros(int(ef.n_sg), dtype=torch.long)
+            sg_of[sg_lut[sg_lut >= 0]] = torch.nonzero(sg_lut >= 0).flatten()
+            zp_of = torch.zeros(int(ef.n_zp), dtype=torch.long)
+            zp_of[zp_lut[zp_lut >= 0]] = torch.nonzero(zp_lut >= 0).flatten()
+            local = missing % n_combo
+            extra = self._store_template_batch(
+                mb.subsample_new_batch(first[missing // n_combo].to(mb.ptr.device)).clone())
+            for key in ('identifier', 'smiles'):
+                if key in extra._store:
+                    del extra[key]
+            dev = extra.ptr.device
+            extra.add_graph_attr(sg_of[local // int(ef.n_zp)].to(dev), 'sg_ind')
+            extra.add_graph_attr(zp_of[local % int(ef.n_zp)].to(dev), 'z_prime')
+            differ = set(t.keys()) ^ set(extra.keys())
+            if differ:
+                raise ValueError(f"buffers.store: a fallback template and a prior template differ in keys {sorted(differ)}")
+            t = merge_batches([t, extra.to(t.ptr.device)])
+            load['templates'] = t
+        load['template_cids'] = torch.cat([file_cids, missing])
+        print(f"crystal store templates: {load['template_cids'].numel()} conditions, {missing.numel()} of them with no "
+              f"stored row (template from molecules_path)", flush=True)
+
+    def _store_headroom(self):
+        """H of crystal_store I11: the largest single add. Twice a rollout (B x fwd repeats, the rollout and its kicks),
+        an eval rollout, or a stage-entry bootstrap_z:offset draw. B is max_batch_size under grow_batch_size, since the
+        sizer may raise the batch up to it after the store is built."""
+        from config_invariants import active_stages, _coeff
+        from utils import _namespace_to_dict
+        cfg = _namespace_to_dict(self.args)
+        stages = [st for st in active_stages(cfg) if isinstance(st, dict)]
+        reps = max([max(1, int(round(_coeff(cfg, st, 'fwd', 'repeats') or 1))) for st in stages] or [1])
+        evals = int(self.args.eval_num_samples)
+        B = int(self.args.max_batch_size) if getattr(self.args, 'grow_batch_size', False) else int(self.batch_size)
+        sizes = [2 * B * reps, evals]
+        for st in stages:
+            for action in st.get('on_enter') or ():
+                parts = str(action).split(':')
+                if parts[0] == 'bootstrap_z' and len(parts) >= 2 and parts[1] == 'offset':
+                    sizes.append(int(parts[2]) if len(parts) > 2 else evals)
+        return max(sizes)
+
     def init_row_store(self):
-        """Build the row store when buffers.store is enabled: from the checkpoint sidecar when its stamp matches this
-        run's (_store_stamp), else seeded from the pre-noised prior -- prior_dataset's rows (data tags, drawable) and
-        prior_heldout_batch's (held out) -- then refreshed once. Refuses the configurations
-        config_invariants.row_store_is_well_formed reports as ERROR."""
+        """Build the store when buffers.store is enabled, from the rows _load_noised_prior held, after the clip and
+        energy reference are armed so stored log R is in the run's currency. Refuses the configurations
+        config_invariants.row_store_is_well_formed reports as ERROR, and a row limit below anchors + 2 headroom.
+        Warms condition_log_z's floors from every row given and every row a restored sidecar holds, then releases the
+        file batch. With the store off, a parked sidecar entry of this run raises, because the run's next sidecar would
+        drop its grown rows; another run's entry is cleared with a printed line."""
         s = self.store_settings()
         if s is None:
+            state = getattr(self, '_row_store_state', None)
+            if state is not None:
+                src_run, src_step = getattr(self, '_row_store_source', (None, None))
+                if src_run is not None and src_run == getattr(self, 'run_name', None):
+                    raise ValueError(own_store_refusal(src_run, src_step, 'buffers.store is off in this launch'))
+                print(f"row store in the buffer sidecar of run {src_run!r} ignored: buffers.store is off in this launch",
+                      flush=True)
+                self._row_store_state = None
             return
-        from config_invariants import row_store_problems, ERROR
+        from config_invariants import row_store_problems, store_row_limit, ERROR
         from utils import _namespace_to_dict
         bad = [m for sev, m in row_store_problems(_namespace_to_dict(self.args)) if sev == ERROR]
         if bad:
             raise ValueError('buffers.store: ' + '; '.join(bad))
-        if not getattr(self, 'prior_is_prenoised', False):
+        load = getattr(self, '_store_load', None)
+        if load is None:
             raise ValueError("buffers.store seeds from a pre-noised prior (noised_prior.py): prior_path is not one")
-        settings = {k: s[k] for k in ('bar', 'eps', 'cap_per_condition', 'max_rows', 'records_kept', 'kappa',
-                                      'floor_frac', 'uniform_frac', 'admit_reward_min', 'is_exponent')}
-        state = getattr(self, '_row_store_state', None)
-        self._row_store_state = None
-        if state is not None:
-            if state.get('stamp') == self._store_stamp():
-                self.row_store = RowStore.from_state_dict(state, self.buffer_device, **settings)
-                print(f"row store restored from the buffer sidecar: {len(self.row_store)} rows", flush=True)
-                self._store_refresh()
-                return
-            print("row store in the buffer sidecar ignored: its stamp differs from this run's (prior, chart, "
-                  "conditions or reward settings); seeding afresh", flush=True)
-        self._store_seed(settings)
-        self._store_refresh()
-
-    @torch.no_grad()
-    def _store_seed(self, settings, chunk: int = 8192):
-        """Seed a new store from the prior buffer's seed source (_prior_buffer_seed_source: every scored training row
-        of a pre-noised prior; tags from noised_kind) and prior_heldout_batch (held out)."""
+        slurm_mb = os.environ.get('SLURM_MEM_PER_NODE')
+        if slurm_mb and float(slurm_mb) / 1024 < float(s['ram_gb']):
+            raise ValueError(f"buffers.store.ram_gb {s['ram_gb']} exceeds the job's SLURM_MEM_PER_NODE {slurm_mb} MB")
         ef = self.energy_function
-        parts = []
-        for batch, held in ((self._prior_buffer_seed_source().batch, False),
-                            (getattr(self, 'prior_heldout_batch', None), True)):
-            if batch is None or int(batch.num_graphs) == 0:
-                continue
-            tag = noised_prior.tag(batch, 'noised_kind')
-            _, log_r, energy = self._stored_reward_terms(batch, with_mol_energy=True)
-            xs, cids, conds = [], [], []
-            for lo in range(0, int(batch.num_graphs), chunk):
-                sub = batch.subsample_new_batch(
-                    torch.arange(lo, min(lo + chunk, int(batch.num_graphs)), device=batch.ptr.device)).to(self.device)
-                xs.append(self._batch_latents(sub).float().cpu())
-                sub, _, cond, cid = ef.condition_samples(
-                    sub, sg_inds=sub.sg_ind.reshape(-1).long(), z_primes=sub.z_prime.reshape(-1).long())
-                cids.append(cid.long().cpu())
-                conds.append(cond.float().cpu())
-            parts.append((torch.cat(cids), torch.cat(xs), log_r.float(), energy.float(), tag,
-                          torch.full((int(batch.num_graphs),), held), torch.cat(conds)))
-        cid, x, log_r, energy, tag, held, cond = (torch.cat(t) for t in zip(*parts))
-        if bool(((tag != TAG_ANCHOR) & (tag != TAG_CHILD)).any()):
-            raise ValueError("buffers.store: a seed row is neither an anchor nor a child (noised_kind); "
-                             "noised_prior.train_kinds must not include 'harvested'")
-        store = RowStore(int(x.shape[1]), int(ef.condition_library_size), int(cond.shape[1]), self.buffer_device,
-                         **settings)
-        store.set_conditions(cid, cond)
-        store.seed(cid, x, log_r, tag, held, energy=energy)
+        H = self._store_headroom()
+        max_rows = store_row_limit(float(s['ram_gb']), int(ef.data_ndim), float(s['ram_frac']))
+        n_anchors = int((load['kinds'] == noised_prior.KIND_ANCHOR).sum())
+        if n_anchors + 2 * H > max_rows:
+            raise ValueError(f"buffers.store: {n_anchors} anchors + 2 x headroom {H} exceed the row limit {max_rows} "
+                             f"(ram_gb {s['ram_gb']}, ram_frac {s['ram_frac']}): raise ram_gb")
+        rows, cid = load['rows'], load['cid']
+        _, log_r, energy = self._stored_reward_terms(load['batch'], with_mol_energy=True, rows=rows, cids=cid,
+                                                     prior_path=getattr(self.args, 'prior_path', None))
+        x = torch.as_tensor(load['batch'].fd_state).float().cpu()[rows]
+        n_cond = int(ef.condition_library_size)
+        floor = torch.full((n_cond,), float('inf'), dtype=torch.float64)
+        floor[load['floor_cids']] = load['floor']
+        kind = torch.where(load['kinds'] == noised_prior.KIND_ANCHOR, torch.tensor(crystal_store.ANCHOR),
+                           torch.tensor(crystal_store.CHILD))
+        store = CrystalStore(int(x.shape[1]), n_cond, max_rows, H, seed=int(self.args.seed))
+        store.seed(x, cid, kind, log_r, energy, load['parent'], load['undrawn'], load['templates'],
+                   load['template_cids'], floor)
+        store.check()
         self.row_store = store
-        be = store.best_energy[torch.isfinite(store.best_energy)]
-        print(f"row store seeded: {store.n_mle} drawable data rows ({int((tag[~held] == TAG_ANCHOR).sum())} "
-              f"anchors, {int((tag[~held] == TAG_CHILD).sum())} children) and {store.n_seed - store.n_mle} held-out "
-              f"rows over {int(torch.unique(cid).numel())} conditions; best physical energy (mol_energy) per "
-              f"condition min {float(be.min()) if be.numel() else float('nan'):.4g} over {be.numel()} conditions",
-              flush=True)
+        self._store_seed_best = store.best_energy.clone()     # per-condition seed minimum, read before any restore
+        self._store_draw_tally = None
+        self._store_cfg = s
+        self._growth_owed = 0
+        self._store_growth = dict(kicks=0, unchanged=0, scored=0, in_window=0, out_of_box=0)
+        self._eval_pool = crystal_store.RolloutPool(int(self.args.eval_num_samples))
+        self._physical['gen'] = torch.Generator().manual_seed(int(self.args.seed) + int(getattr(self, 'step_ind', 0)))
+        self._store_warm_tracker(cid, log_r)
+        if self.checkpointer.restore_row_store(self.row_store):     # a sidecar can hold rows its checkpoint never saw
+            live = store.kind[:store.high_water] != crystal_store.FREE
+            self._store_warm_tracker(store.cid[:store.high_water][live].long(), store.log_r[:store.high_water][live])
+        print(f"crystal store seeded: {store.n_rows} rows ({store.n_anchors} anchors, {store.stats()['store/children']} "
+              f"children, {store.stats()['store/undrawn']} undrawn) of {rows.numel()} given; {store.seed_nonfinite} "
+              f"non-finite and {store.seed_orphans} orphaned rows dropped; row limit {max_rows} (ram_gb {s['ram_gb']}, "
+              f"ram_frac {s['ram_frac']}), headroom {H}; {store.bytes_per_row():.1f} bytes per row", flush=True)
+        self._store_load = None
+        gc.collect()
 
-    @torch.no_grad()
-    def _store_level_table(self):
-        """[n_cond] float32 on the store's device: the replay branch's TB level L(c) (tb_z_source('replay')) at every
-        condition with a stored condition vector, NaN elsewhere. Built live on every call."""
-        st = self.row_store
-        lv = torch.full((st.n_cond,), float('nan'), dtype=torch.float32)
-        u = torch.nonzero(~torch.isnan(st.cond_table).any(1)).flatten().cpu()
-        if u.numel() == 0:
-            return lv.to(st.device)
-        m = self.gfn_model
-        if getattr(m, 'conditional', False):
-            c = st.cond_table[u.to(st.device)].to(self.device)
-            head = m.flow_model(m.get_condition_embedding(c, None)).reshape(-1)
-        else:
-            head = torch.as_tensor(m.flow_model()).reshape(-1).expand(u.numel())
-        head = head.detach().float().cpu()
-        if self.tb_z_source('replay') == 'persistent':
-            tracker = getattr(self, 'condition_log_z', None)
-            if tracker is not None:
-                target, mask = tracker.lookup(u)
-                head = tb_z_per_traj(head, target.float(), mask, untrusted_z_for(tracker, True)).float()
-        lv[u] = head
-        return lv.to(st.device)
+    def _store_warm_tracker(self, cid, log_r):
+        """condition_log_z's per-condition floors from -T log R of every row given to the store, in chunks; its
+        discovery counters are left as they were."""
+        tracker = getattr(self, 'condition_log_z', None)
+        if tracker is None:
+            raise ValueError("buffers.store warms condition_log_z's floors, and this run builds no condition_log_z")
+        saved = {k: getattr(tracker, k) for k in ('_window_improved', '_window_depth', 'minima_improved_total',
+                                                  'minima_depth_total')}
+        T = float(self.args.energy_config.temperature)
+        ok = torch.isfinite(log_r)
+        c, e = cid[ok], (-log_r[ok] * T).float()
+        for lo in range(0, c.numel(), ANCHOR_FLOOR_CHUNK_ROWS):
+            tracker.update_best_energy(c[lo:lo + ANCHOR_FLOOR_CHUNK_ROWS], e[lo:lo + ANCHOR_FLOOR_CHUNK_ROWS],
+                                       energy_phys=None)   # buffers.store refuses a prior_flow
+        for k, v in saved.items():
+            setattr(tracker, k, v)
 
-    def _store_refresh(self):
-        """Recompute log q of every stored row under the policy in eval mode (row_store.RowStore.refresh)."""
+    def _store_seed_keep(self, keep):
+        """[n] bool, the file rows this launch seeds. On a resume of this run's own sidecar: the mask that sidecar was
+        seeded from, so a row at a window edge whose recomputed energy moved by rounding on another node stays on the
+        side it was. Sets self._store_seed_mask, the packed mask Checkpointer._row_store_entry saves."""
+        state = getattr(self, '_row_store_state', None)
+        src_run = getattr(self, '_row_store_source', (None, None))[0]
+        saved = None if state is None or src_run != getattr(self, 'run_name', None) else state.get('seed_keep')
+        if saved is not None:
+            if int(saved['rows']) != keep.numel():
+                raise ValueError(f"buffer sidecar of this run was seeded from {int(saved['rows'])} file rows; this "
+                                 f"prior file has {keep.numel()}")
+            was = torch.from_numpy(np.unpackbits(saved['bits'].numpy(), count=keep.numel()).astype(bool))
+            print(f"crystal store load: the seed row mask comes from this run's sidecar; {int((was != keep).sum())} of "
+                  f"{keep.numel()} rows differ from this launch's recomputed window", flush=True)
+            keep = was
+        self._store_seed_mask = dict(rows=keep.numel(), bits=torch.from_numpy(np.packbits(keep.numpy())))
+        return keep
+
+    def _store_rewind(self, checkpoint_step):
+        """A rewind to `checkpoint_step`: log q written after it no longer describes the restored weights, and the
+        eval's rollout pool holds rows of the discarded policy."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is not None:
+            pool.clear()
+        return self.row_store.invalidate_q_after(int(checkpoint_step))
+
+    def _kick_anchors(self, rows):
+        """(x [n, d] float32, kept [n] bool) for the anchor slots `rows`: a fresh physical kick of each, from this run's
+        own generator (seeded with seed + the launch step), so the global generators are neither read nor advanced.
+        kept: the kick ran out of tries and returned the anchor's own point."""
+        K, st = self._physical, self.row_store
+        rows = torch.as_tensor(rows).long().flatten().cpu()
+        cid = st.cid[rows].long()
+        x, counts = physical_kick.kick(K['kits'], st.x[rows], st.cond_sg[cid].long(), st.cond_radius[cid],
+                                       st.cond_rg[cid], K['lo'], K['hi'],
+                                       1 + int(self._noised_prior_settings['live_redraws']), generator=K['gen'])
+        for name, v in counts.items():
+            K[name] += v
+        self._physical_warn_full_route(K)
+        return x, (x == st.x[rows]).all(1)
+
+    def _kick_fresh(self, rows):
+        """(rows, x) of an MLE draw, which never holds an anchor point: a row whose kick kept its anchor is replaced by
+        a kick of another uniformly drawn anchor, at most MLE_KICK_ROUNDS times, then dropped and counted. An empty
+        draw raises."""
         st = self.row_store
-        s = self.store_settings()
-        policy = self.gfn_model
-        was_training = policy.training
-        policy.eval()
-        try:
-            out = st.refresh(lambda x, c: policy.log_density(x.to(self.device), st.cond_table[c].to(self.device), None),
-                             self._store_level_table(), step=int(getattr(self, 'step_ind', 0)),
-                             chunk=int(s['refresh_chunk']))
-        finally:
-            policy.train(was_training)
-        w = st._win
-        print(f"row store refresh at step {int(getattr(self, 'step_ind', 0))}: {out['rows']} rows in "
-              f"{out['seconds']:.2f} s, {out['nonfinite']} non-finite log q, median |r| "
-              f"{out.get('resid_med', float('nan')):.3f} nats; window admitted {w['admitted']} (records "
-              f"{w['admitted_records']}), evicted {w['evicted_cap'] + w['evicted_global']}", flush=True)
-        return out
+        rows = rows.clone()
+        x, kept = self._kick_anchors(rows)
+        for _ in range(self.MLE_KICK_ROUNDS):
+            at = torch.nonzero(kept).flatten()
+            if not at.numel():
+                break
+            rows[at] = st.draw_anchors(at.numel(), by=self._store_cfg['mle_draw'])
+            x[at], again = self._kick_anchors(rows[at])
+            kept = torch.zeros_like(kept)
+            kept[at] = again
+        if bool(kept.any()):
+            self._physical['mle_kept_dropped'] += int(kept.sum())
+            rows, x = rows[~kept], x[~kept]
+            if not rows.numel():
+                raise RuntimeError("buffers.store: no MLE draw left the anchor point after "
+                                   f"{self.MLE_KICK_ROUNDS} rounds of redraws")
+        return rows, x
+
+    def _store_replay_rows(self, B):
+        """(rows [B], importance weights [B] or None) of the replay draw over on-policy rows: conditions uniform, rows
+        by the rule buffers.store.replay_weight names in crystal_store.REPLAY_WEIGHTS. None for the uniform rule and for
+        a rule of crystal_store.UNCORRECTED_RULES, whose loss is unweighted and whose draw is CrystalStore.draw_accepted."""
+        st = self.row_store
+        name = self._store_cfg['replay_weight']
+        rule = crystal_store.REPLAY_WEIGHTS[name]
+        if rule is crystal_store.uniform:
+            return st.draw(crystal_store.ONPOLICY, B), None
+        step = int(getattr(self, 'step_ind', 0))
+        if name in crystal_store.UNCORRECTED_RULES:
+            return st.draw_accepted(crystal_store.ONPOLICY, B, rule, step), None
+        return st.draw_weighted(crystal_store.ONPOLICY, B, rule, step)
 
     def _store_draw(self, kind, repeats):
-        """A bwd ('mle': uniform over the data rows) or replay ('tb': by priority, with IS weights) draw from the
-        store, in draw_bwd_sample's 7-tuple; inds is (row indices, store version)."""
-        st = self.row_store
-        B = int(self.batch_size)
+        """draw_bwd_sample's 7-tuple from the store. 'mle': fresh kicks of uniformly drawn anchors, reward-free, with no
+        store write (inds None). 'bwd': a uniform condition, then a uniform drawable child. 'replay': a uniform
+        condition, then an on-policy row by _store_replay_rows. Molecules come from each condition's template.
+        inds is (rows tiled `repeats` times, store epoch)."""
+        st, ef, dev = self.row_store, self.energy_function, self.device
+        B, R = int(self.batch_size), max(1, int(repeats))
         if kind == 'mle':
-            idx = st.draw_mle(B)
+            if not self._bwd_draw_is_reward_free():
+                raise ValueError("buffers.store: the MLE draw is unscored fresh kicks, but this stage's bwd loss reads "
+                                 "log R")
+            rows, x = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']))
+            idx = rows.repeat_interleave(R)
+            latents, log_reward, inds = x.repeat_interleave(R, 0).to(dev), None, None
+            self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(idx.numel())
         else:
-            got = st.draw_tb(B, self._store_level_table())
-            if got is None:
-                raise RuntimeError("row store: the replay draw found no drawable row (every residual is non-finite "
-                                   "or every row is held out)")
-            idx, w, stats = got
-            self._replay_is_w = w.float().cpu()
-            self._replay_is_stats = stats
-            self._replay_draw_origin = {}
-        idx = idx.repeat_interleave(int(repeats))
-        latents = st.x[idx].to(self.device)
-        log_reward = st.log_r[idx].to(self.device)
-        condition_id = st.cid[idx].to(self.device)
-        condition = st.cond_table[st.cid[idx]].to(self.device)
-        traj = torch.stack([torch.zeros_like(latents), latents], 1) if kind == 'tb' else None
-        return condition, condition_id, (idx, st.version), latents, log_reward, None, traj
+            if kind == 'bwd':
+                rows = st.draw(crystal_store.CHILD, B)
+            else:
+                rows, w = self._store_replay_rows(B)
+                self._replay_is_w = None if w is None else w.repeat_interleave(R).float()
+                self._replay_is_stats, self._replay_draw_origin = {}, {}
+            self._tally_store_draw(kind, rows)
+            idx = rows.repeat_interleave(R)
+            latents, log_reward, inds = st.x[idx].to(dev), st.log_r[idx].to(dev), (idx, st.epoch)
+        mol = st.mol_batch(st.cid[idx]).to(dev)
+        mol, log_T, condition, cid = ef.condition_samples(mol, repeats=R, sg_inds=mol.sg_ind.reshape(-1).long(),
+                                                          z_primes=mol.z_prime.reshape(-1).long())
+        traj = None
+        if kind == 'replay':
+            traj = torch.stack([torch.zeros_like(latents), latents], 1)
+            mol.replay_log_T = log_T.detach()
+        return condition, cid, inds, latents, log_reward, mol, traj
 
     def _store_touch(self, inds, loss_dict):
-        """Write the drawn rows' log q from this step's loss (row_store.RowStore.touch)."""
-        idx, version = inds
-        self.row_store.touch(idx, version, loss_dict['log_pf'], int(getattr(self, 'step_ind', 0)))
+        """Write the drawn rows' log q and signed TB residual from this step's loss. An MLE draw (inds None) writes
+        nothing."""
+        if inds is None:
+            return
+        idx, epoch = inds
+        self.row_store.touch(idx, epoch, loss_dict['log_pf'], loss_dict['resid'], int(getattr(self, 'step_ind', 0)))
 
-    def _store_admit(self, fwd_stats, sample_batch, origin):
-        """Offer a scored rollout's rows to the store (row_store.RowStore.admit), against the live level."""
+    def _store_admit(self, fwd_stats, sample_batch, origin, eval_row=False, drawable=True, durable=True):
+        """Write every row of a scored rollout as an on-policy row; CrystalStore.add drops and counts non-finite rows.
+        A training rollout (ORIGIN_ROLLOUT) owes one kick per row it wrote (_growth_kicks_due), on every
+        buffers.store.growth_every-th training rollout (_owe_growth).
+
+        Under buffers.store.keep_rollouts false a training rollout writes no row: it feeds the eval's trailing pool,
+        lowers best_energy (invariant I6 counts every row given), owes kicks for its finite rows on the same cadence, and
+        returns an empty index. Eval and bootstrap rows are written as before."""
         st = self.row_store
         cid = fwd_stats.get('condition_id')
         if cid is None:
             cid = getattr(sample_batch, 'condition_id', None)
         if cid is None:
-            raise RuntimeError("row store admission: the rollout carries no condition_id")
+            raise RuntimeError("store admission: the rollout carries no condition_id")
         cid = torch.as_tensor(cid).detach().long().flatten().cpu()
-        cond = getattr(sample_batch, 'conditions', None)
-        cond = None if cond is None else torch.as_tensor(cond).detach().float().reshape(cid.numel(), -1).cpu()
-        if cond is None and bool(torch.isnan(st.cond_table[cid.to(st.device)]).any()) \
-                and not getattr(self, '_store_no_cond_announced', False):
-            self._store_no_cond_announced = True
-            print("row store admission: the rollout batch carries no `conditions`; its rows of conditions with no "
-                  "stored condition vector have no level and are not admitted (printed once)", flush=True)
-        st.set_conditions(cid, cond)
-        log_r = fwd_stats['log_r'].detach().float().flatten().cpu()
-        # physical energy per molecule, unreferenced: generator_energy's ens_dict mol_energy on the analysed batch
         mol_energy = getattr(sample_batch, 'mol_energy', None)
         if mol_energy is None:
-            raise RuntimeError("row store admission: the rollout batch carries no mol_energy (the record currency)")
+            raise RuntimeError("store admission: the rollout batch carries no mol_energy (the record currency)")
         energy = torch.as_tensor(mol_energy).detach().float().flatten().cpu()
         if energy.numel() != cid.numel():
-            raise RuntimeError(f"row store admission: mol_energy has {energy.numel()} rows, the rollout "
-                               f"{cid.numel()}")
-        floor = self.store_settings()['admit_reward_min']
-        ok = None
-        if floor is not None:
-            ok = self.energy_function.unreferenced_log_r(log_r, cid) >= float(floor)
-        res = st.admit(cid, fwd_stats['flow_states'][:, -1].detach().float().cpu(), log_r,
-                       fwd_stats['log_pf'].detach().float().flatten().cpu(), ok, TAG_ONPOLICY,
-                       int(getattr(self, 'step_ind', 0)), self._store_level_table(), cond, energy=energy)
-        return res
+            raise RuntimeError(f"store admission: mol_energy has {energy.numel()} rows, the rollout {cid.numel()}")
+        x = fwd_stats['flow_states'][:, -1].detach().float().cpu()
+        log_r = fwd_stats['log_r'].detach().float().flatten().cpu()
+        if origin == ORIGIN_ROLLOUT and not self._store_cfg.get('keep_rollouts', True):
+            ok = torch.isfinite(energy) & torch.isfinite(log_r) & torch.isfinite(x).all(1)   # add()'s finite rows
+            if bool(ok.any()):
+                st.best_energy.scatter_reduce_(0, cid[ok], energy[ok], reduce='amin', include_self=True)
+            self._owe_growth(int(ok.sum()))
+            self._eval_pool_add(fwd_stats, sample_batch)
+            return torch.empty(0, dtype=torch.long)
+        log_pf = fwd_stats['log_pf'].detach().float().flatten().cpu()
+        log_pb = fwd_stats['log_pb'].detach().float().flatten().cpu()
+        log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
+        log_z = torch.as_tensor(log_z).detach().float().cpu()
+        resid = (log_pf - log_pb) - (log_r - log_z.flatten())
+        self._store_growth['out_of_box'] += int((x.abs() > 1.0 + 1e-6).any(1).sum())
+        written = st.add(x, cid, crystal_store.ONPOLICY, int(origin), log_r, energy, int(self.step_ind),
+                         undrawn=torch.full((cid.numel(),), not drawable), log_q=log_pf, resid=resid,
+                         eval_row=eval_row, durable=durable)
+        if origin == ORIGIN_ROLLOUT:
+            self._owe_growth(int(written.numel()))
+            self._eval_pool_add(fwd_stats, sample_batch)
+        return written
+
+    def _owe_growth(self, n):
+        """Owe `n` growth kicks for this training rollout when it is the first of every buffers.store.growth_every
+        training rollouts (1 = every one). The count is not checkpointed: a resume owes on its first rollout, so the
+        kick rate holds and only the phase of the cadence moves."""
+        every = int(self._store_cfg.get('growth_every', 1) or 1)
+        k = self._growth_rollouts = int(getattr(self, '_growth_rollouts', 0)) + 1
+        if (k - 1) % every == 0:
+            self._growth_owed += int(n)
+
+    def _eval_pool_add(self, fwd_stats, sample_batch):
+        """A training rollout of a buffers_active stage into the eval's trailing pool: every row it scored, each with the
+        level log_Z it was scored against."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is None or not self.protocol.flag('buffers_active'):
+            return
+        rows = {k: fwd_stats[k].detach().flatten() for k in ('log_r', 'log_pf', 'log_pb', 'log_Z', 'condition_id',
+                                                             'log_T_tensor')}
+        rows['flow_states'] = fwd_stats['flow_states'].detach()
+        pool.add(rows, sample_batch, int(self.step_ind))
+
+    def _eval_pool_refusal(self):
+        """Why this eval draws fresh instead of reading the rollout pool, or None. The rollouts are not samples of the
+        eval target under exploration noise, random frames or a fit-error condition draw; a force readout scores the
+        eval's own draw; a z_calibration eval fill on a fillable head takes the eval rows as a sample of the current
+        policy."""
+        if float(getattr(self.args.fwd_loss_coeffs, 'exploration_std', 0.0) or 0.0) > 0:
+            return 'fwd_loss_coeffs.exploration_std > 0 (rollouts are off-policy)'
+        if getattr(self.gfn_model, '_framed', False):
+            return 'rotate_frames or mirror_frames (rollouts draw random frames, the eval reads the standard frame)'
+        if self._rollout_draw_is_weighted():
+            return 'weighted_condition_sampling (rollouts draw conditions by fit error, the eval draws them uniformly)'
+        if getattr(self, 'drift_force', None) is not None:
+            return 'drift_force (its readout scores the eval draw)'
+        cfg = getattr(self.args, 'z_calibration', None)
+        if str(getattr(cfg, 'fill_from_eval', 'off') or 'off') != 'off' and self._z_fill_head_is_fillable():
+            return 'z_calibration.fill_from_eval on a fillable head (it reads the eval rows as the current policy)'
+        return None
+
+    def _pool_eval_stats(self, rows):
+        """The eval's per-row keys from pool rows. log_flow is [level, 0], each row keeping the level it was scored with;
+        the Gaussian diagnostics are the NF policy's constant zeros."""
+        n = rows['log_r'].shape[0]
+        log_flow = torch.zeros(n, 2, dtype=rows['log_Z'].dtype)
+        log_flow[:, 0] = rows['log_Z']
+        stats = {k: rows[k] for k in ('flow_states', 'log_r', 'log_pf', 'log_pb', 'log_T_tensor', 'condition_id')}
+        stats.update(log_pfs=rows['log_pf'][:, None], log_pbs=rows['log_pb'][:, None], log_flow=log_flow,
+                     temperature=(self.energy_function.temperature * torch.ones(n, dtype=torch.float32)).cpu())
+        stats.update({k: torch.zeros(n, 1) for k in self.gfn_model.GAUSS_PARAM_KEYS})
+        return stats
+
+    def _eval_forward_rows(self, eval_discretizer):
+        """(stats, crystal batch, fresh, readouts) of the eval's on-policy rows. fresh: the (stats, batch) drawn and
+        scored by this eval, which evaluation() admits; None when every row came from the pool. A buffers_active stage on
+        the store route reads the trailing eval_num_samples rollout rows and draws only the shortfall, so the set is
+        always eval_num_samples rows and an empty pool never blocks an eval; every other stage draws them all."""
+        pool = getattr(self, '_eval_pool', None)
+        if pool is None:
+            stats, batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+            return stats, batch, (stats, batch), {}
+        n = int(self.args.eval_num_samples)
+        active = bool(self.protocol.flag('buffers_active'))
+        why = self._eval_pool_refusal() if active else None
+        if why is not None and why != getattr(self, '_eval_pool_refused', None):
+            self._eval_pool_refused = why
+            print(f"eval: on-policy rows drawn fresh, not from the rollout pool: {why}", flush=True)
+        if why is not None or not active or pool.rows == 0:
+            stats, batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+            return stats, batch, (stats, batch), {'eval/pool_rows': 0, 'eval/pool_fresh_rows': n,
+                                                  'eval/pool_oldest_age_steps': float('nan')}
+        t0 = time()
+        rows, batch, oldest = pool.read(merge_batches)
+        stats = self._pool_eval_stats(rows)
+        k = rows['log_r'].shape[0]
+        fresh = None
+        if k < n:
+            fresh = self.fwd_eval_sampling(self.gfn_model, eval_discretizer, override_num_samples=n - k)
+            stats = {name: torch.cat([t, fresh[0][name].to(t.dtype)]) for name, t in stats.items()}
+            batch = batch.append_batch(fresh[1])
+        self._fwd_eval_summary(stats)
+        self.times['eval_sampling_start'], self.times['eval_sampling_end'] = t0, time()
+        return stats, batch, fresh, {'eval/pool_rows': k, 'eval/pool_fresh_rows': n - k,
+                                     'eval/pool_oldest_age_steps': int(self.step_ind) - oldest}
 
     def _replay_rows(self):
-        """Rows the replay branch can draw: the store's drawable count when the store is on, else the replay
+        """Rows the replay branch can draw: the store's drawable on-policy rows when the store is on, else the replay
         buffer's length, else None (no buffer)."""
         if self.row_store is not None:
-            return self.row_store.n_drawable(self._store_level_table())
+            return self.row_store.n_drawable(crystal_store.ONPOLICY)
         rb = getattr(self, 'replay_buffer', None)
         return len(rb) if rb is not None else None
+
+    def _store_condition_batch(self, mols, repeats=1):
+        """The stored templates for the molecule rows `mols`, each in a uniformly drawn space group and Z' (as
+        condition_samples draws them), tiled `repeats` times. Never oriented."""
+        ef = self.energy_function
+        n = int(mols.num_graphs)
+        sg = torch.as_tensor(np.random.choice(ef.space_groups, n, replace=True)).long()
+        zp = torch.as_tensor(np.random.choice(ef.z_primes, n, replace=True)).long()
+        cid = (torch.as_tensor(mols.mol_id).reshape(-1).long().cpu() * (int(ef.n_sg) * int(ef.n_zp))
+               + ef.sg_to_local.cpu()[sg] * int(ef.n_zp) + ef.zp_to_local.cpu()[zp])
+        return self.row_store.mol_batch(cid, repeats=repeats)
+
+    def _store_heldout_panel(self, n):
+        """The fixed held-out eval panel, or None without test molecules: (rows of test_mol_dataset, space group of each).
+        min(n // (2 n_sg), test molecules) molecules (at least one), chosen once with seed + STORE_HELDOUT_SEED, each
+        scored twice in every space group of the run."""
+        panel = getattr(self, '_heldout_panel', None)
+        if panel is not None:
+            return panel
+        test = getattr(self, 'test_mol_dataset', None)
+        if test is None or int(test.batch.num_graphs) == 0:
+            return None
+        groups = [int(g) for g in self.energy_function.space_groups]
+        mol_id = torch.as_tensor(test.batch.mol_id).long().flatten().cpu()
+        uniq = torch.unique(mol_id)
+        m = max(1, min(int(n) // (2 * len(groups)), uniq.numel()))
+        g = torch.Generator().manual_seed(int(self.args.seed) + self.STORE_HELDOUT_SEED)
+        chosen = uniq[torch.randperm(uniq.numel(), generator=g)[:m]]
+        first = torch.zeros(int(mol_id.max()) + 1, dtype=torch.long)
+        first[mol_id.flip(0)] = torch.arange(mol_id.numel() - 1, -1, -1)
+        rows = first[chosen].repeat_interleave(2 * len(groups))
+        sg = torch.tensor(groups, dtype=torch.long).repeat_interleave(2).repeat(m)
+        self._heldout_panel = (rows, sg)
+        print(f"held-out eval panel: {m} molecules x {len(groups)} space groups x 2 draws = {rows.numel()} rows, fixed "
+              f"for the run", flush=True)
+        return self._heldout_panel
+
+    def _growth_kicks_due(self):
+        """Kicks owed now: one per on-policy row each training rollout wrote, all paid after that rollout."""
+        return int(getattr(self, '_growth_owed', 0))
+
+    @torch.no_grad()
+    def _store_grow(self):
+        """Dataset growth: for each kick owed, a uniform condition, a uniform anchor of it, one physical kick and one
+        energy call, stored as a child with its parent link. A kick outside the load's packing or fixed energy window
+        (the frozen window_floor, not the falling best_energy) is stored undrawn. A row whose kick kept the anchor
+        spends no energy call and stores nothing. Both condition_log_z minima take the scored rows."""
+        st = self.row_store
+        n = min(self._growth_kicks_due(), st.headroom) if st is not None else 0
+        if n <= 0:
+            return
+        ef, T, dev = self.energy_function, float(self.args.energy_config.temperature), self.device
+        np_cfg = self._noised_prior_settings
+        rows = st.draw(crystal_store.ANCHOR, n)
+        x, kept = self._kick_anchors(rows)
+        self._growth_owed -= n
+        tally = self._store_growth
+        tally['kicks'] += n
+        tally['unchanged'] += int(kept.sum())
+        rows, x = rows[~kept], x[~kept]
+        if not rows.numel():
+            return
+        cid = st.cid[rows].long()
+        mol = st.mol_batch(cid).to(dev)
+        mol, log_T, _, _ = ef.condition_samples(mol, sg_inds=mol.sg_ind.reshape(-1).long(),
+                                                z_primes=mol.z_prime.reshape(-1).long())
+        log_r, scored = ef.log_reward(x.to(dev), mol, log_T, return_exp=True,
+                                      internal_oom_recovery=OOM_RECOVERY_KEEP_CACHE)
+        log_r = log_r.detach().float().flatten().cpu()
+        mol_energy = torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu()
+        e_win = ef.seed_energy_from(dict(mol_energy=torch.as_tensor(scored.mol_energy),
+                                         density_energy=torch.as_tensor(scored.density_energy),
+                                         pressure_energy=torch.as_tensor(scored.pressure_energy))
+                                    ).detach().double().flatten().cpu()
+        packing = torch.as_tensor(scored.packing_coeff).detach().double().flatten().cpu()
+        lo, hi = np_cfg['packing_window']
+        in_window = (packing >= lo) & (packing <= hi) & torch.isfinite(e_win)
+        if np_cfg['window_kT'] is not None:
+            in_window &= e_win <= st.window_floor[cid] + float(np_cfg['window_kT']) * T
+        written = st.add(x, cid, crystal_store.CHILD, crystal_store.ORIGIN_KICK, log_r, mol_energy, int(self.step_ind),
+                         parent=rows, undrawn=~in_window)
+        finite = torch.isfinite(log_r) & torch.isfinite(mol_energy) & torch.isfinite(x).all(1)
+        tally['scored'] += int(written.numel())
+        tally['in_window'] += int((in_window & finite).sum())
+        energy = -log_r * T
+        _, energy_phys = self._anchor_energy(scored, energy)
+        self.condition_log_z.update_best_energy(cid[finite], energy[finite],
+                                                energy_phys=None if energy_phys is None else energy_phys[finite])
+
+    @torch.no_grad()
+    def _store_check_currency(self):
+        """smoke: for each origin present, re-scores STORE_CURRENCY_ROWS stored rows through st.x and st.mol_batch and
+        raises when log R differs by more than STORE_CURRENCY_TOL nats or a row's mol_energy by more than
+        STORE_CURRENCY_TOL x T + STORE_CURRENCY_REL x |E| (float32 pair sums at |E| ~ 1e4 differ by ~0.05 between two
+        re-score batch sizes). Reads no global generator."""
+        st, ef = self.row_store, self.energy_function
+        T = float(self.args.energy_config.temperature)
+        live = torch.nonzero(st.kind[:st.high_water] != crystal_store.FREE).flatten()
+        rng = np.random.default_rng([int(self.args.seed), int(self.step_ind)])
+        names = {crystal_store.ORIGIN_ROLLOUT: 'rollout', crystal_store.ORIGIN_EVAL: 'eval',
+                 crystal_store.ORIGIN_BOOTSTRAP: 'bootstrap', crystal_store.ORIGIN_SEED: 'seed',
+                 crystal_store.ORIGIN_KICK: 'kick'}
+        line = []
+        for o in torch.unique(st.origin[live]).tolist():
+            pool = live[st.origin[live] == o]
+            at = pool[torch.from_numpy(rng.choice(pool.numel(), min(self.STORE_CURRENCY_ROWS, pool.numel()),
+                                                  replace=False))]
+            mol = st.mol_batch(st.cid[at].long()).to(self.device)
+            mol, log_T, _, _ = ef.condition_samples(mol, sg_inds=mol.sg_ind.reshape(-1).long(),
+                                                    z_primes=mol.z_prime.reshape(-1).long())
+            log_r, scored = ef.log_reward(st.x[at].to(self.device), mol, log_T, return_exp=True,
+                                          internal_oom_recovery=True)
+            d_r = float((log_r.detach().float().flatten().cpu() - st.log_r[at]).abs().max())
+            gap = (torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu() - st.energy[at]).abs()
+            bar = self.STORE_CURRENCY_TOL * T + self.STORE_CURRENCY_REL * st.energy[at].abs()
+            d_e = float(gap.max())
+            line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e}")
+            if not (d_r <= self.STORE_CURRENCY_TOL and bool((gap <= bar).all())):
+                raise RuntimeError(f"store currency check at step {int(self.step_ind)}: {line[-1]} (bars "
+                                   f"{self.STORE_CURRENCY_TOL:g} nats, {self.STORE_CURRENCY_TOL * T:g} energy units + "
+                                   f"{self.STORE_CURRENCY_REL:g} |E|)")
+        print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
+
+    STORE_IMPROVED_RTOL = 1e-5
+
+    def _tally_store_draw(self, kind, rows):
+        """Add one bwd or replay training draw's rows (before tiling by repeats) to the tally _store_draw_readouts
+        drains: bwd counts the kicked children it drew; replay sums the rows' age (steps since birth, 0 for a row
+        born after the current step, which a rewind or an older checkpoint's resume keeps) and their draws column
+        before this draw. Rows of a step that then OOMs are counted: the tally is of draws made, not draws trained."""
+        st = self.row_store
+        t = getattr(self, '_store_draw_tally', None)
+        if t is None:
+            t = self._store_draw_tally = dict(bwd_n=0, bwd_kicked=0, replay_n=0, replay_age=0.0, replay_reuse=0.0)
+        if kind == 'bwd':
+            t['bwd_n'] += int(rows.numel())
+            t['bwd_kicked'] += int((st.origin[rows] == crystal_store.ORIGIN_KICK).sum())
+        else:
+            step = int(getattr(self, 'step_ind', 0))
+            t['replay_n'] += int(rows.numel())
+            t['replay_age'] += float((step - st.birth_step[rows].double()).clamp_min(0.0).sum())
+            t['replay_reuse'] += float(st.draws[rows].double().sum())
+
+    def _store_draw_readouts(self):
+        """The training draws since the last read, then cleared: store/bwd_draw_kicked_frac (share of bwd rows that are
+        kicked children), store/replay_draw_age_mean (mean age of replay rows, steps) and store/replay_draw_reuse_mean
+        (mean draws column of replay rows before the draw, occurrences). nan when the window drew no row of that
+        branch."""
+        t = getattr(self, '_store_draw_tally', None) or {}
+        self._store_draw_tally = None
+        bn, rn, nan = t.get('bwd_n', 0), t.get('replay_n', 0), float('nan')
+        return {'store/bwd_draw_kicked_frac': t['bwd_kicked'] / bn if bn else nan,
+                'store/replay_draw_age_mean': t['replay_age'] / rn if rn else nan,
+                'store/replay_draw_reuse_mean': t['replay_reuse'] / rn if rn else nan}
+
+    def _store_population_readouts(self):
+        """O(rows) readouts over the store as it stands: on-policy reuse and coverage, the replay rule's weights over
+        the drawable on-policy rows, and the count of conditions whose physical minimum is below their seed minimum by
+        more than STORE_IMPROVED_RTOL of it (far above float32 rounding of a recomputed seed, far below a kick's
+        typical improvement)."""
+        st, out = self.row_store, {}
+        hw = st.high_water
+        on = torch.nonzero((st.kind[:hw] == crystal_store.ONPOLICY)
+                           & ((st.flags[:hw] & crystal_store.UNDRAWN) == 0)).flatten()
+        if on.numel():
+            d = st.draws[on].double()
+            out['store/onpolicy_draws_mean'] = float(d.mean())
+            out['store/onpolicy_drawn_frac'] = float((d > 0).double().mean())
+            name = self._store_cfg['replay_weight']
+            rule = crystal_store.REPLAY_WEIGHTS[name]
+            if rule is not crystal_store.uniform:
+                w = rule(st, on, int(getattr(self, 'step_ind', 0))).double()
+                out['store/replay_w_mean'] = float(w.mean())
+                floor = crystal_store.RULE_FLOORS.get(name)
+                if floor is not None:
+                    out['store/replay_w_one_frac'] = float((w >= 1.0).double().mean())
+                    out['store/replay_w_floor_frac'] = float((w <= floor * (1 + 1e-6)).double().mean())
+        count = st.index.count.reshape(-1, crystal_store.N_KINDS)
+        alive = count.sum(1) > 0
+        if alive.any():
+            per = count[:, crystal_store.ONPOLICY]
+            out['store/onpolicy_cond_frac'] = float((per[alive] > 0).mean())
+            if (per > 0).any():
+                out['store/onpolicy_per_cond_median'] = float(np.median(per[per > 0]))
+        seed = getattr(self, '_store_seed_best', None)
+        if seed is not None:
+            n = min(seed.numel(), st.best_energy.numel())
+            s, b = seed[:n], st.best_energy[:n]
+            out['store/conditions_improved'] = int((torch.isfinite(s) & (b < s - self.STORE_IMPROVED_RTOL * s.abs())).sum())
+        return out
+
+    def _store_metrics(self):
+        """store/* readouts: the store's counters, the growth tally, the training-draw tally since the last read, the
+        population readouts and its rows per space group."""
+        st, g = self.row_store, self._store_growth
+        out = st.stats()
+        out.update({'store/kicks_owed': self._growth_kicks_due(), 'store/kicks_drawn': g['kicks'],
+                    'store/kicks_scored': g['scored'], 'store/kicks_unchanged': g['unchanged'],
+                    'store/rows_out_of_box': g['out_of_box']})
+        if g['scored']:
+            out['store/kick_in_window_frac'] = g['in_window'] / g['scored']
+        out.update(self._store_draw_readouts())
+        out.update(self._store_population_readouts())
+        groups, n_zp = self._condition_group_axes()
+        if len(groups) > 1 and st.n_rows:
+            live = st.kind[:st.high_water] != crystal_store.FREE
+            out.update(buffer_group_share(condition_groups(st.cid[:st.high_water][live].long(), groups, n_zp),
+                                          groups, 'store_share'))
+        return out
 
     def replay_priority_config(self):
         """kappa for the prioritised replay draw; None/<=0 disables it and the
@@ -8963,8 +9766,8 @@ class Modeller:
         if val_rows > 0:
             mol_batch, traj, inds = self.replay_buffer.sample_val_graphs(val_rows)
             return self._finish_replay_draw(mol_batch, traj, inds, repeats)
-        if self.row_store is not None:   # buffers.store: by priority over its drawable rows, with IS weights
-            return self._store_draw('tb', repeats)
+        if self.row_store is not None:   # buffers.store: on-policy rows, by the configured replay weight
+            return self._store_draw('replay', repeats)
 
         # THE ALIGNED PER-CONDITION DRAW (fused step, stage.condition_draw):
         # exactly replay_rows distinct TRAINABLE rows for each chosen condition.
@@ -9173,12 +9976,18 @@ class Modeller:
             raise e  # will simply raise error if other or if training on CPU
 
         print("OOMED!")
+        # the traceback's frames hold the failed step's graph; gc cannot free it while they do
+        import traceback
+        traceback.clear_frames(e.__traceback__)
         # counted BEFORE the step_ind == 0 bail below, and for eval OOMs as well as
         # train ones: this is the record that an allocation failed, not the record of
         # what the controller did about it. Which of the two it was is recoverable from
         # whether batch/oom_ceiling moved on the same step.
         self.batch_oom_events = getattr(self, 'batch_oom_events', 0) + 1
         if self.step_ind == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return
 
         for opt in self.optimizers.values():
@@ -9433,7 +10242,8 @@ class Modeller:
         samples = 0
         while samples < self.args.eval_num_samples:
             try:
-                if self.bwd_sampling_mode == 'dataset':  # todo consider mixing, or adding anchor states
+                # the store route's frozen panel of children, in both stages
+                if self.bwd_sampling_mode == 'dataset' or getattr(self, 'row_store', None) is not None:
                     mol_batch = next(self.prior_dataset.loader(batch_size=self.eval_draw_size(), mode='graphs'))
                 elif self.bwd_sampling_mode == 'prior':
                     mol_batch = next(self.prior_buffer.loader(batch_size=self.eval_draw_size(), mode='graphs'))
@@ -9629,14 +10439,6 @@ class Modeller:
           head (every eval, no energy call): L(m, g) = models/group_draw.py::level_group_logits;
                 <prefix>head_p_sg<g>, <prefix>head_level_sg<g>, <prefix>head_entropy_nats (eval/sg_readouts.py::
                 head_panel_stats). Needs a conditional policy (its level reads the condition); skipped otherwise.
-          IS   (evals on the zsg_panel.every_n_evals cadence, eval_cadence_fires): for each molecule and group, the
-                group forced, zsg_panel.draws forward draws through the eval sampler (eval/utils.py::
-                sample_eval_fwd_trajs, under the policy's standard frames as fwd_eval_sampling), log w = log R +
-                log P_B - log P_F (= log R - log q under the flow); per molecule models/group_draw.py::
-                group_weights_is -> <prefix>is_log_z_sg<g>, is_p_sg<g>, is_ess_sg<g>, is_entropy_nats,
-                head_minus_is_sg<g> (eval/sg_readouts.py::is_panel_stats). Draws in chunks of at most the eval draw
-                (eval_draw_size), no gradient. A CUDA OOM goes through handle_train_epoch_error and drops the IS
-                panel for this eval (<prefix>is_skipped 1); it is not retried.
 
         Per-group levels live on different FD charts (different cell-coordinate counts and pose normalisation), so
         compare each group's curve over time, not levels across groups; p(g) here is a sampling allocation, not a
@@ -9649,7 +10451,6 @@ class Modeller:
         groups, n_zp = self._condition_group_axes()
         if not spec['enabled'] or len({int(g) for g in groups}) < 2:
             return {}
-        run_is = eval_cadence_fires(self.step_ind, spec['every_n_evals'], getattr(self.args, 'eval_period', None))
         out = {}
         for attr, prefix, seed_off in self.ZSG_PANELS:
             dataset = getattr(self, attr, None)
@@ -9657,14 +10458,11 @@ class Modeller:
             if batch is None or int(batch.num_graphs) == 0:
                 continue
             panel = self._zsg_panel(attr, batch, spec['molecules'], seed_off)
-            stats, level = {}, None
+            stats = {}
             if getattr(self.gfn_model, 'conditional', False):
-                level = self._zsg_head_levels(batch, panel, groups)
-                stats.update(head_panel_stats(level, groups, prefix))
-            if run_is:
-                stats.update(self._zsg_is_panel(batch, panel, groups, spec['draws'], eval_discretizer, level, prefix))
+                stats.update(head_panel_stats(self._zsg_head_levels(batch, panel, groups), groups, prefix))
             if stats:
-                print(panel_line(stats, groups, prefix, int(panel['rows'].numel()), spec['draws']), flush=True)
+                print(panel_line(stats, groups, prefix, int(panel['rows'].numel())), flush=True)
             out.update(stats)
         return out
 
@@ -9700,11 +10498,12 @@ class Modeller:
         return cache[attr]
 
     def _zsg_rows(self, batch, panel, sel):
-        """The panel rows `sel` (indices into the panel) as a batch on the device in the standard molecule frame,
-        with their temperatures [n] and Z' [n]."""
+        """The panel rows `sel` (indices into the panel) as a batch on the device, in the standard molecule frame off
+        the store route and as stored on it, with their temperatures [n] and Z' [n]."""
         idx = panel['rows'][sel]
         mb = batch.subsample_new_batch(idx.to(batch.ptr.device)).to(self.device)
-        mb.orient_molecule(mode='standard')
+        if self.row_store is None:
+            mb.orient_molecule(mode='standard')
         return mb, panel['temps'][sel].to(self.device), panel['zp'][sel].to(self.device)
 
     @torch.no_grad()
@@ -9720,37 +10519,6 @@ class Modeller:
             return mb_g, cond.to(self.device)
         return level_group_logits(self.gfn_model, condition_of, mb, groups).double().cpu()
 
-    @torch.no_grad()
-    def _zsg_is_panel(self, batch, panel, groups, draws, eval_discretizer, level, prefix):
-        """The IS half of log_zsg_panels: `draws` forward draws per (panel molecule, group)."""
-        ef, model = self.energy_function, self.gfn_model
-        m, k = panel['rows'].numel(), int(draws)
-        log_w, mol_index, group_index = [], [], []
-        frame = getattr(model, 'standard_frames', None)
-        try:
-            with (frame() if frame is not None else contextlib.nullcontext()):
-                for gi, g in enumerate(groups):
-                    step = max(1, int(self.eval_draw_size()) // k)
-                    for s in range(0, m, step):
-                        sel = torch.arange(s, min(m, s + step)).repeat_interleave(k)
-                        mb, temps, zp = self._zsg_rows(batch, panel, sel)
-                        n = int(mb.num_graphs)
-                        out = sample_eval_fwd_trajs(get_gfn_init_state(n, ef.data_ndim, self.device), model,
-                                                    eval_discretizer, ef, mb, sg_inds=torch.full_like(zp, int(g)),
-                                                    z_primes=zp, temperatures=temps)
-                        log_w.append((out['log_r'].reshape(-1) + out['log_pb'].reshape(-1)
-                                      - out['log_pf'].reshape(-1)).double())
-                        mol_index.append(sel)
-                        group_index.append(torch.full((n,), gi, dtype=torch.long))
-        except (RuntimeError, ValueError) as e:
-            self.handle_train_epoch_error(e, 'zsg_panel')   # re-raises anything but a CUDA OOM
-            print(f"log_zsg_panels: {prefix.rstrip('/')} IS panel dropped this eval after an OOM", flush=True)
-            return {f'{prefix}is_skipped': 1.0}
-        stats = is_panel_stats(torch.cat(log_w), torch.cat(mol_index), torch.cat(group_index), m, groups,
-                               level=level, prefix=prefix)
-        stats[f'{prefix}is_skipped'] = 0.0
-        return stats
-
     def log_test_metrics(self, eval_discretizer, fwd_stats):
         """
         Conditional generalization check: the same on-policy eval protocol run
@@ -9764,10 +10532,14 @@ class Modeller:
         prior-buffer churn, and nothing here feeds a gate, controller or loss.
         """
         n = getattr(self.args, 'test_eval_num_samples', None) or self.args.eval_num_samples
+        panel = self._store_heldout_panel(int(n)) if getattr(self, 'row_store', None) is not None else None
+        if panel is not None:
+            n = panel[0].numel()
         test_stats, test_batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer,
                                                         override_num_samples=int(n),
                                                         dataset=self.test_mol_dataset,
-                                                        side_effects=False)
+                                                        side_effects=False,
+                                                        **({} if panel is None else {'panel': panel}))
         test_m = self._eval_conditional_stats(test_stats, self.args.fwd_loss_coeffs)
 
         metrics = {f'eval_test/{k}': v for k, v in test_m.items()}
@@ -10064,6 +10836,8 @@ class Modeller:
                    else _np.asarray(per).astype(bool))
             if not hasattr(self, '_w1_floor_cache'):
                 self._w1_floor_cache = {}
+            if getattr(self, 'row_store', None) is not None and ref.shape[0] < 4 * smp.shape[0]:
+                abstain(f'readout panel of {ref.shape[0]} rows is under 4 x the {smp.shape[0]}-row eval draw')
             metrics.update(_column_w1_ratio(smp, ref, per, cache=self._w1_floor_cache))
 
             # energy marginal -- a JOINT function of every coordinate, so it sees the
@@ -10715,6 +11489,11 @@ class Modeller:
           eval_bwd/mle_anchors       a pre-noised prior's clean training anchors (its stage 1 trains on children)
           eval_bwd/mle_mol_crystals  the molecules_path crystals (one per training molecule)
           eval_test/mle              the test_molecules_path crystals (molecules never trained on)
+        On the store route (Modeller._store_take_rows) the first three are frozen panels cut at load, each capped at
+        4 * eval_num_samples rows: eval_bwd/mle reads prior_dataset, the in-window training CHILDREN, and is not the MLE
+        draw, which is fresh unfiltered kicks of anchors (Modeller._store_draw); eval_bwd/mle_heldout_rows reads
+        prior_heldout_batch, the held-out children; eval_bwd/mle_anchors reads prior_anchor_batch, the in-window
+        training anchors, which MLE kicks and never trains on directly.
         Each set is read on the same up to n_rows rows at every eval (drawn once, seed + 3), through the backward
         draw's own path (the stored latent, the condition built from the row's own space group and Z'). A policy
         without an exact density reports nothing.
@@ -10998,7 +11777,8 @@ class Modeller:
         do_figs = self.figs_due() or override_do_figs
 
         '''sampling and metrics analysis'''
-        fwd_stats, sample_batch = self.fwd_eval_sampling(self.gfn_model, eval_discretizer)
+        fwd_stats, sample_batch, fresh_rows, pool_readouts = self._eval_forward_rows(eval_discretizer)
+        metrics.update(pool_readouts)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         self._merge_metrics(metrics, self.log_metrics(fwd_stats, bwd_stats, sample_batch),
                             'log_metrics')
@@ -11062,11 +11842,21 @@ class Modeller:
         if int(getattr(self, '_mle_rows_drawn', 0)) > 0:
             # passes of the dataset-mode MLE draw over the fixed training rows (each row, on average, seen this many
             # times); with live_kernel set the rows are kernel centres, not the points trained on
-            metrics['data/mle_passes'] = int(self._mle_rows_drawn) / max(1, len(self.prior_dataset))
+            metrics['data/mle_passes'] = int(self._mle_rows_drawn) / max(
+                1, (self.row_store.n_drawable(crystal_store.ANCHOR) if getattr(self, 'row_store', None) is not None
+                    else len(self.prior_dataset)))
         chart = getattr(self, '_chart', None)
         if chart is not None and chart['draws']:
             metrics['live_kernel/out_of_box_first_try'] = chart['out'] / chart['draws']
             metrics['live_kernel/kept_centre'] = chart['kept'] / chart['draws']
+        physical = getattr(self, '_physical', None)
+        if physical is not None and physical['rows']:
+            metrics['live_kernel/physical_full_route'] = physical['full_route'] / physical['rows']
+            metrics['live_kernel/physical_redrawn'] = physical['redrawn'] / physical['rows']
+            metrics['live_kernel/physical_kept_anchor'] = physical['kept'] / physical['rows']
+            metrics['live_kernel/physical_rows_without_parent'] = physical['no_parent']
+            if 'mle_kept_dropped' in physical:
+                metrics['live_kernel/mle_kept_dropped'] = physical['mle_kept_dropped']
         metrics.update(self.update_heldout_gate(metrics))
         metrics.update({
             'Batch Size': self.batch_size,
@@ -11104,11 +11894,17 @@ class Modeller:
         # snapshots, coeff switch, optimizer rebuild, LR re-warm, on_enter
         # actions -- executes inside this call. Also clears any pending
         # pulled-forward eval request, whoever set it.
+        scored_in_tb = self.protocol.flag('buffers_active')   # the stage that scored these rows
+        stage_before = self.protocol.stage
         self.protocol.maybe_advance(metrics)
-        if self.row_store is not None:   # log q of every stored row under this eval's weights
-            self._store_refresh()
-
-        if self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
+        if getattr(self, 'row_store', None) is not None:
+            if self.protocol.stage is not stage_before and getattr(self, '_eval_pool', None) is not None:
+                self._eval_pool.clear()
+            if fresh_rows is not None:      # pool rows were admitted when their rollout was scored
+                self._admit_eval_rollout(*fresh_rows, drawable=scored_in_tb)
+            if getattr(self.args, 'smoke', False):
+                self._store_check_currency()
+        elif self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
             self._admit_eval_rollout(fwd_stats, sample_batch)
 
         if hasattr(self, 'anchor_buffer'):
@@ -11168,7 +11964,9 @@ class Modeller:
         # not buffers_active: the flag gates buffer MANAGEMENT, and the
         # localized anchor_seed/z_match variant deliberately draws from a
         # frozen prior_buffer with management paused
-        if self.bwd_sampling_mode == 'prior':
+        if getattr(self, 'row_store', None) is not None:   # the store reports its own counters below
+            buff = None
+        elif self.bwd_sampling_mode == 'prior':
             buff = getattr(self, 'prior_buffer', None)
         else:
             buff = getattr(self, 'prior_dataset', None)
@@ -11386,12 +12184,8 @@ class Modeller:
             if len(valid_priority) > 0:
                 metrics['anchor_replay_priority_hist'] = safe_histogram(valid_priority, num_bins=128)
 
-        if self.row_store is not None:
-            metrics.update(self.row_store.stats(self._store_level_table()))
-            if len(self.row_store) > 0:   # the store's rows per space group (sg<g>/store_share)
-                groups, n_zp = self._condition_group_axes()
-                metrics.update(buffer_group_share(condition_groups(self.row_store.cid, groups, n_zp) if
-                                                  len(groups) > 1 else None, groups, 'store_share'))
+        if getattr(self, 'row_store', None) is not None:
+            metrics.update(self._store_metrics())
         return metrics
 
     def log_condition_log_z_stats(self):
@@ -12602,6 +13396,10 @@ class Modeller:
         """
         # cfg:harvest -- every scored rollout reaches this call, in every stage; the shard writer keeps its share
         self.harvest_scored_rows(fwd_stats, sample_batch, origin)
+        if getattr(self, 'row_store', None) is not None:   # in every stage: the store keeps every scored row
+            self._store_admit(fwd_stats, sample_batch, origin, eval_row=origin != ORIGIN_ROLLOUT,
+                              drawable=origin == ORIGIN_ROLLOUT)
+            return
         in_play = self.replay_in_play()
         if in_play is not self._replay_managed:
             # announced on every flip (both directions) so the transition print
@@ -12614,9 +13412,6 @@ class Modeller:
                   + ('' if in_play else " -- nothing in it trains replay, draws from it, "
                                         "or probes it (replay_in_play)"))
         if not in_play:
-            return
-        if self.row_store is not None:
-            self._store_admit(fwd_stats, sample_batch, origin)
             return
 
         log_r = fwd_stats['log_r']
@@ -12840,9 +13635,10 @@ class Modeller:
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
 
-    def _admit_eval_rollout(self, fwd_stats, sample_batch):
+    def _admit_eval_rollout(self, fwd_stats, sample_batch, drawable: bool = True):
         """The eval rollout's two buffer admissions, together because only one
-        of them is optional.
+        of them is optional. On the store route, one write instead: every scored row, tagged EVAL, drawable only when
+        a TB stage scored it (`drawable`); no prior buffer is built.
 
         The PRIOR buffer always takes it: that store is off-policy by design and
         an eval batch is exactly what it wants.
@@ -12863,6 +13659,11 @@ class Modeller:
         weight is small; on the conditional route replay carries half the loss
         and the same rows are half a different model's distribution.
         """
+        if getattr(self, 'row_store', None) is not None:
+            self.harvest_scored_rows(fwd_stats, sample_batch, ORIGIN_EVAL)
+            self._store_admit(fwd_stats, sample_batch, ORIGIN_EVAL, eval_row=True, drawable=drawable,
+                              durable=drawable)
+            return
         self.manage_prior_buffer(sample_batch)
         if not bool(getattr(self.args.buffers.replay_buffer, 'admit_from_eval', True)):
             return
@@ -12907,6 +13708,8 @@ class Modeller:
         """
         if hasattr(self, 'prior_buffer'):
             return  # already populated from a reloaded checkpoint -- don't clobber it
+        if getattr(self, '_store_load', None) is not None:
+            return  # the store holds the prior's rows (init_row_store)
         seed_source = getattr(self.args.buffers.prior_buffer, 'seed_source', 'generated')
         if self._prior_static_flag() and not getattr(self, 'prior_is_prenoised', False):
             # nothing enters a static buffer after this seed, so it must be the whole dataset
@@ -13159,6 +13962,8 @@ class Modeller:
         """
         if hasattr(self, 'anchor_buffer'):
             return  # already populated from a reloaded checkpoint -- don't clobber it
+        if getattr(self, '_store_load', None) is not None:
+            return  # init_row_store warms the tracker's floors from every stored row
 
         cfg = self.args.buffers.anchor_buffer
         seed_source = getattr(cfg, 'seed_source', 'generated')
@@ -13542,9 +14347,43 @@ class Modeller:
             # so it can't be mistaken for the prior model earning its churn budget
             self.prior_churn['from_seed'] += int(num_samples)
 
+    def _fwd_eval_summary(self, pooled):
+        """Writes the eval's pooled summary into `pooled` (nonfinite_rows, nonfinite_frac, log_Z, log_Z_lb,
+        log_Z_learned) from its per-row log_r, log_pfs, log_pbs and log_flow; returns the per-row log weight. Fresh and
+        pool-fed evals both come through here."""
+        # Z estimates computed ONCE over the pooled trajectories
+        log_weight = pooled['log_r'] + pooled['log_pbs'].sum(-1) - pooled['log_pfs'].sum(-1)
+
+        # POOLED AGGREGATES ARE COMPUTED OVER THE FINITE ROWS ONLY, and the reason is
+        # that NaN is CONTAGIOUS through a reduction in a way a wrong number is not.
+        # logmeanexp and mean both return NaN if a SINGLE row is NaN, so one crashed
+        # sample out of eval_num_samples would take out this eval's entire log_Z --
+        # and a NaN metric then fails every threshold comparison in BOTH directions,
+        # so a stage gate reading it never fires. That is the silent-stall mode, and
+        # it has happened here before (1,579 consecutive non-finite steps, ~13 h, on
+        # the QM9 conditional route). A failed MLIP forward substitutes NaN
+        # deliberately (uma_utils._crashed_energy); localising it to the rows it
+        # actually ruined is what keeps the rest of the eval readable.
+        finite_w = torch.isfinite(log_weight)
+        n_bad = int((~finite_w).sum())
+        if n_bad:
+            print(f"eval: {n_bad}/{log_weight.numel()} non-finite log-weights excluded "
+                  f"from pooled Z estimates (check energy/uma_crash_rows)")
+        # reported ALWAYS, including 0 -- an absent key reads as "not instrumented"
+        pooled['nonfinite_rows'] = torch.tensor(float(n_bad))
+        pooled['nonfinite_frac'] = torch.tensor(n_bad / max(log_weight.numel(), 1))
+        # all-bad is left to produce NaN rather than a fabricated finite number: at
+        # that point there is no measurement to report and pretending otherwise is
+        # the original defect in a new place
+        good_w = log_weight[finite_w] if n_bad and finite_w.any() else log_weight
+        pooled['log_Z'] = logmeanexp(good_w)
+        pooled['log_Z_lb'] = good_w.mean()
+        pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
+        return log_weight
+
     @torch.no_grad()
     def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None,
-                          dataset=None, side_effects: bool = True):
+                          dataset=None, side_effects: bool = True, panel=None):
         """
         On-policy evaluation sampling.
 
@@ -13557,6 +14396,10 @@ class Modeller:
         into training state (tracker Emin(c), anchor buffer, and transitively
         prior-buffer churn, since manage_prior_buffer consumes the same pooled
         batch), which is exactly what a held-out set must never touch.
+
+        panel: (rows, space groups), a fixed draw of `dataset`'s rows, each row scored in its given group
+        (_store_heldout_panel). On the store route the training draw reads the condition's template and is never
+        oriented.
         """
         dataset = self.mol_dataset if dataset is None else dataset
         if side_effects:
@@ -13578,9 +14421,19 @@ class Modeller:
             # asked for 45 GiB at eval draws of 8, 5, 3 and 1 alike.
             bsz = min(num_samples - n_collected, self.eval_draw_size())
             try:
-                mol_batch = next(dataset.loader(bsz, mode='graphs'))
-                mol_batch = mol_batch.to(self.device)
-                mol_batch.orient_molecule(mode='standard')
+                sg_inds = z_primes = None
+                if panel is not None:
+                    at = torch.arange(n_collected, n_collected + bsz)
+                    mol_batch = dataset.sample_graphs_at(panel[0][at].numpy()).to(self.device)
+                    sg_inds = panel[1][at].to(self.device)
+                elif getattr(self, 'row_store', None) is not None:
+                    mol_batch = self._store_condition_batch(next(dataset.loader(bsz, mode='graphs'))).to(self.device)
+                    sg_inds = mol_batch.sg_ind.reshape(-1).long()
+                    z_primes = mol_batch.z_prime.reshape(-1).long()
+                else:
+                    mol_batch = next(dataset.loader(bsz, mode='graphs'))
+                    mol_batch = mol_batch.to(self.device)
+                    mol_batch.orient_molecule(mode='standard')
                 init_state = get_gfn_init_state(bsz,
                                                 self.energy_function.data_ndim, self.device)
 
@@ -13608,6 +14461,7 @@ class Modeller:
                     out = sample_eval_fwd_trajs(init_state, model, eval_discretizer,
                                                 self.energy_function, mol_batch,
                                                 no_conditioning=False,
+                                                sg_inds=sg_inds, z_primes=z_primes,
                                                 temperatures=temperatures)
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'eval_fwd')
@@ -13637,35 +14491,7 @@ class Modeller:
             acc['temperature'].append(temperatures.cpu().detach())
 
         pooled = {k: torch.cat(v) for k, v in acc.items()}
-
-        # Z estimates computed ONCE over the pooled trajectories
-        log_weight = pooled['log_r'] + pooled['log_pbs'].sum(-1) - pooled['log_pfs'].sum(-1)
-
-        # POOLED AGGREGATES ARE COMPUTED OVER THE FINITE ROWS ONLY, and the reason is
-        # that NaN is CONTAGIOUS through a reduction in a way a wrong number is not.
-        # logmeanexp and mean both return NaN if a SINGLE row is NaN, so one crashed
-        # sample out of eval_num_samples would take out this eval's entire log_Z --
-        # and a NaN metric then fails every threshold comparison in BOTH directions,
-        # so a stage gate reading it never fires. That is the silent-stall mode, and
-        # it has happened here before (1,579 consecutive non-finite steps, ~13 h, on
-        # the QM9 conditional route). A failed MLIP forward substitutes NaN
-        # deliberately (uma_utils._crashed_energy); localising it to the rows it
-        # actually ruined is what keeps the rest of the eval readable.
-        finite_w = torch.isfinite(log_weight)
-        n_bad = int((~finite_w).sum())
-        if n_bad:
-            print(f"eval: {n_bad}/{log_weight.numel()} non-finite log-weights excluded "
-                  f"from pooled Z estimates (check energy/uma_crash_rows)")
-        # reported ALWAYS, including 0 -- an absent key reads as "not instrumented"
-        pooled['nonfinite_rows'] = torch.tensor(float(n_bad))
-        pooled['nonfinite_frac'] = torch.tensor(n_bad / max(log_weight.numel(), 1))
-        # all-bad is left to produce NaN rather than a fabricated finite number: at
-        # that point there is no measurement to report and pretending otherwise is
-        # the original defect in a new place
-        good_w = log_weight[finite_w] if n_bad and finite_w.any() else log_weight
-        pooled['log_Z'] = logmeanexp(good_w)
-        pooled['log_Z_lb'] = good_w.mean()
-        pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
+        log_weight = self._fwd_eval_summary(pooled)
 
         # energy computed unconditionally (not just under condition_log_z) since
         # screen_and_admit_anchors below needs it regardless of whether the persistent

@@ -347,6 +347,29 @@ _BWD_DATA = {'dataset': 'terminals drawn from the prior dataset',
              'prior': 'terminals drawn from the prior_buffer'}
 
 
+def store_row_sources(args, bwd_sampling_mode: str) -> Optional[dict]:
+    """{branch: (card label, phrase, card detail)} of the draws train.py::Modeller._store_draw and _store_admit make
+    when buffers.store is enabled, else None."""
+    from config_invariants import row_store_settings
+    s = row_store_settings(args)
+    if s is None:
+        return None
+    anchors = ('uniformly drawn store anchors' if s['mle_draw'] == 'anchor'
+               else 'store anchors (uniform condition, then uniform anchor)')
+    bwd = ((('store: anchors (MLE draw)', f'fresh unscored physical kicks of {anchors}',
+             'the policy never sees the anchor point'))
+           if bwd_sampling_mode == 'dataset' else
+           ('store: children', 'stored children (uniform condition, then uniform drawable child)',
+            'a scored kick outside the load energy or packing window is stored undrawn'))
+    return {'fwd': ('own rollouts', _BRANCH_DATA['fwd'],
+                    'every scored row is stored and owes one physical kick of an anchor, stored as a child'),
+            'bwd': bwd,
+            'replay': ('store: on-policy rows',
+                       f"stored on-policy rows (uniform condition, then replay weight '{s['replay_weight']}')",
+                       f"past the row limit (ram_gb {_num_text(s['ram_gb'])} x ram_frac {_num_text(s['ram_frac'])}) "
+                       f"thinning removes children and on-policy rows 50:50, never anchors")}
+
+
 def _num_text(v) -> str:
     return f'{v:g}' if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
 
@@ -453,7 +476,9 @@ def describe_stage(spec: dict, index: int, args=None, *, coeffs: Optional[dict] 
                 tail.append(f'loss_coeffs.{mode}.{k}={_verbatim(v)}')
 
     # -- sentence 1: who trains what on which data
-    data = dict(_BRANCH_DATA, bwd=_BWD_DATA[st.bwd_sampling_mode])
+    store = store_row_sources(args, st.bwd_sampling_mode)
+    data = ({m: phrase for m, (_, phrase, _) in store.items()} if store is not None
+            else dict(_BRANCH_DATA, bwd=_BWD_DATA[st.bwd_sampling_mode]))
     of_n = f'{index + 1}/{n_stages}' if n_stages else f'{index + 1}'
     head = f"Stage {of_n} '{st.name}' ({st.train_mode})"
     parts = []

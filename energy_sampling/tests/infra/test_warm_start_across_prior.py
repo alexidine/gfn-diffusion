@@ -77,3 +77,23 @@ def test_a_genuinely_different_problem_still_fails_WITH_the_exemption():
     with pytest.raises(ValueError, match='different problem'):
         mgr.assert_problem_match({'problem_def': old}, 'x.pt', 'checkpoint_name',
                                  ignore_keys=mgr._warm_start_ignore_keys())
+
+
+def test_temperature_alone_is_exemptible_inside_energy_config():
+    """energy_config.temperature may be exempted (a reward-free MLE checkpoint warm-starting TB at another T); the rest
+    of energy_config still compares, so a different energy setting is still refused."""
+    old = {'energy_function': 'elj', 'energy_config': {'temperature': 2.5, 'density_coeff': 10.0}}
+    mgr = _mgr(warm_start_ignore_problem_keys=['energy_config.temperature'])
+    assert mgr._warm_start_ignore_keys() == ('energy_config.temperature',)
+    ignore = mgr._warm_start_ignore_keys()
+    hot = dict(old, energy_config={'temperature': 25.0, 'density_coeff': 10.0})
+    assert Checkpointer._drop_problem_keys(old, ignore) == Checkpointer._drop_problem_keys(hot, ignore)
+    other = dict(old, energy_config={'temperature': 25.0, 'density_coeff': 40.0})
+    assert Checkpointer._drop_problem_keys(old, ignore) != Checkpointer._drop_problem_keys(other, ignore)
+    assert Checkpointer._drop_problem_keys(old, ()) != Checkpointer._drop_problem_keys(hot, ())
+
+
+@pytest.mark.parametrize('key', ['energy_config.density_coeff', 'energy_config.lj_coeff', 'energy_config'])
+def test_no_other_energy_config_field_is_exemptible(key):
+    with pytest.raises(ValueError, match='may not be exempted'):
+        _mgr(warm_start_ignore_problem_keys=[key])._warm_start_ignore_keys()

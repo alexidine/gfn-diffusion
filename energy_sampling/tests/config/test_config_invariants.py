@@ -819,6 +819,201 @@ def test_inherited_tb_z_source_fires_at_its_state6_home(canonical, branch):
     assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
 
 
+def _sidecar_pinned(canonical):
+    """The conditional route with bwd and replay on ordinary TB against the learned head, detached, on the stage whose
+    forward sidecar fits that head."""
+    cfg = _conditional(canonical)
+    stage = _vg_stage(cfg)
+    assert stage['fwd_z_sidecar'] is True, 'precondition: the stage carries the sidecar'
+    for branch in ('bwd', 'replay'):
+        stage['loss_coeffs'][branch].update(tb=1.0, freeze_z=1.0, tb_z_source='learned')
+    return cfg
+
+
+def _z_rule(cfg):
+    return _fired(cfg, 'conditional_z_settings_are_conditional')
+
+
+def test_learned_is_accepted_on_a_detached_tb_branch_of_a_sidecar_stage(canonical):
+    assert _z_rule(_sidecar_pinned(canonical)) == []
+
+
+def _on_policy_pinned(canonical):
+    """The sidecar stage turned on-policy: no sidecar, fwd in the mix training the policy by per-condition VarGrad
+    (Z-free) while its emp_z fits the learned head on the same rollouts; bwd and replay run TB against that head,
+    detached."""
+    cfg = _sidecar_pinned(canonical)
+    stage = _vg_stage(cfg)
+    stage['fwd_z_sidecar'] = False
+    stage['fracs']['fwd'] = 0.5
+    stage['min_fracs'] = dict(stage.get('min_fracs') or {}, fwd=0.05)   # the stage's balance cannot move fwd dark
+    stage['loss_coeffs']['fwd'].update(tb=1.0, tb_detach_z=1.0, vg_by_condition=1.0, vg_lb=0.0, emp_z=1.0,
+                                       freeze_policy=0.0, freeze_z=0.0, tb_z_source='learned', repeats=2)
+    return cfg
+
+
+def test_learned_is_accepted_where_an_on_policy_forward_branch_pins_the_head(canonical):
+    assert _z_rule(_on_policy_pinned(canonical)) == []
+
+
+@pytest.mark.parametrize('change', [dict(tb=0.0), dict(tb=0.0, vg_lb=1.0), dict(freeze_policy=1.0)])
+def test_the_on_policy_pin_does_not_depend_on_the_policy_term(canonical, change):
+    """emp_z fits Z(c) every step whatever trains the policy: TB against the detached head, VarGrad, or nothing
+    (gflownet_losses: the standalone emp_z path; freeze_policy detaches log_pf and log_pb only)."""
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].update(change)
+    assert _z_rule(cfg) == []
+
+
+@pytest.mark.parametrize('key, value', [('tb_detach_z', 0.0), ('emp_z', 0.0), ('vg_by_condition', 0.0),
+                                        ('freeze_z', 1.0), ('repeats', 1)])
+def test_the_on_policy_pin_needs_every_part(canonical, key, value):
+    """A forward TB term that trains the head, no head fit, no condition groups, a frozen head or singleton groups:
+    the learned head is no longer pinned on fresh rollouts, and every live branch reading it fires."""
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'][key] = value
+    vs = _z_rule(cfg)
+    assert {m for m in ('fwd', 'bwd', 'replay') if any(f'{m}_loss_coeffs' in v.detail for v in vs)} == {
+        'fwd', 'bwd', 'replay'}, [v.detail for v in vs]
+
+
+def test_the_on_policy_pin_needs_a_share_at_or_above_the_deactivate_threshold(canonical):
+    cfg = _on_policy_pinned(canonical)
+    st = _vg_stage(cfg)
+    st['deactivate_threshold'] = 0.01
+    st['fracs']['fwd'] = 0.005                          # trains at weight 0: fwd_active needs frac >= the threshold
+    vs = _z_rule(cfg)
+    assert {m for m in ('fwd', 'bwd', 'replay') if any(f'{m}_loss_coeffs' in v.detail for v in vs)} == {
+        'fwd', 'bwd', 'replay'}
+
+
+def test_the_on_policy_pin_under_a_balance_needs_a_floor_at_or_above_the_threshold(canonical):
+    cfg = _on_policy_pinned(canonical)
+    st = _vg_stage(cfg)
+    st.update(deactivate_threshold=0.01, balance={'rules': []}, min_fracs={'fwd': 0.001})
+    assert len(_z_rule(cfg)) == 3
+    st['min_fracs']['fwd'] = 0.05
+    assert _z_rule(cfg) == []
+
+
+def test_the_on_policy_pin_needs_the_forward_branch_in_the_mix(canonical):
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['fracs']['fwd'] = 0.0
+    assert len(_z_rule(cfg)) == 2                      # bwd and replay; fwd is no longer judged
+
+
+def test_the_on_policy_pin_does_not_cover_an_undetached_tb_branch(canonical):
+    cfg = _on_policy_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd']['freeze_z'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'bwd_loss_coeffs' in vs[0].detail
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_without_a_tb_term_still_fires(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch]['tb'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and vs[0].severity == BASELINE and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_with_z_not_detached_still_fires(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch]['freeze_z'] = 0.0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and vs[0].severity == BASELINE and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_absent_tb_z_source_still_fires_on_a_pinned_branch(canonical, branch):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch].pop('tb_z_source')
+    cfg[f'{branch}_loss_coeffs'].pop('tb_z_source')
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'NOWHERE' in vs[0].detail
+
+
+def test_learned_without_the_sidecar_still_fires(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['fwd_z_sidecar'] = False
+    assert len(_z_rule(cfg)) == 2
+
+
+def test_learned_on_a_live_fwd_branch_of_a_sidecar_stage_still_fires(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['fracs']['fwd'] = 0.1
+    _vg_stage(cfg)['loss_coeffs']['fwd']['tb_z_source'] = 'learned'
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'fwd_loss_coeffs' in vs[0].detail
+
+
+def test_the_pin_reads_coefficients_inherited_from_the_base_block(canonical):
+    """A stage without its own tb or freeze_z runs the base block's (StageProtocol.coeffs)."""
+    cfg = _sidecar_pinned(canonical)
+    lc = _vg_stage(cfg)['loss_coeffs']
+    lc['replay'].pop('tb'), lc['replay'].pop('freeze_z')
+    assert cfg['replay_loss_coeffs']['tb'] > 0 and cfg['replay_loss_coeffs']['freeze_z'] > 0.5
+    assert _z_rule(cfg) == []
+
+    cfg['replay_loss_coeffs']['freeze_z'] = 0.0
+    assert len(_z_rule(cfg)) == 1
+
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd'].pop('tb')
+    assert cfg['bwd_loss_coeffs']['tb'] == 0
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and 'bwd_loss_coeffs' in vs[0].detail
+
+
+def test_learned_inherited_from_the_base_block_is_pinned_the_same(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['bwd'].pop('tb_z_source')
+    assert cfg['bwd_loss_coeffs']['tb_z_source'] == 'learned'
+    assert _z_rule(cfg) == []
+
+
+@pytest.mark.parametrize('branch', ['bwd', 'replay'])
+def test_learned_fires_on_a_single_branch_stage_where_the_sidecar_never_runs(canonical, branch):
+    """Only fused_train_step runs the sidecar loss."""
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['train_mode'] = branch
+    vs = _z_rule(cfg)
+    assert len(vs) == 1 and f'{branch}_loss_coeffs' in vs[0].detail
+
+
+def test_the_pin_reads_an_absent_train_mode_as_fused(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg).pop('train_mode', None)
+    fwd = _vg_stage(cfg)['loss_coeffs']['fwd']
+    fwd['tb_z_source'] = 'persistent'  # an absent train_mode puts fwd in the rule's live list
+    assert _z_rule(cfg) == []
+
+
+@pytest.mark.parametrize('frozen', [1.0, 1, True])
+def test_learned_fires_when_the_forward_branch_cannot_train_z(canonical, frozen):
+    """A boolean counts: the loss reads `freeze_z > 0.5`, and True passes it."""
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd']['freeze_z'] = frozen
+    vs = _z_rule(cfg)
+    assert len(vs) == 2 and {'bwd', 'replay'} == {m for m in ('bwd', 'replay') if any(
+        f'{m}_loss_coeffs' in v.detail for v in vs)}
+
+
+def test_learned_fires_when_forward_freeze_z_is_inherited_from_the_base_block(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('freeze_z', None)
+    cfg['fwd_loss_coeffs']['freeze_z'] = 1.0
+    assert len(_z_rule(cfg)) == 2
+
+
+def test_forward_freeze_z_set_nowhere_reads_as_not_frozen(canonical):
+    cfg = _sidecar_pinned(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('freeze_z', None)
+    cfg['fwd_loss_coeffs'].pop('freeze_z', None)
+    assert _z_rule(cfg) == []
+
+
 def test_a_branch_the_stage_does_not_train_is_not_flagged(canonical):
     """The narrowness is load-bearing, not incidental. The rule judges only the
     branches a stage's fracs train, and `var_conditioning` zeroes the fwd frac
@@ -1122,6 +1317,18 @@ def test_condition_draws_are_judged_on_the_resolved_config(canonical):
     assert not _fires(canonical, 'condition_draw_is_well_formed')
 
 
+def test_the_physical_kernel_reads_no_log_r_on_a_dataset_stage(canonical):
+    """The full case table is tests/crystal/test_physical_kernel.py; this is the rule's mutation test in the registry's
+    own file."""
+    cfg = broken(canonical, noised_prior__live_kernel='physical')
+    assert not _fires(cfg, 'physical_kernel_is_reward_free')
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages'] if s.get('bwd_sampling_mode') == 'dataset')
+    stage.setdefault('loss_coeffs', {}).setdefault('bwd', {})['tb'] = 1.0
+    assert _fires(cfg, 'physical_kernel_is_reward_free')
+    cfg['noised_prior']['live_kernel'] = 'chart'
+    assert not _fires(cfg, 'physical_kernel_is_reward_free')
+
+
 def test_a_global_untrusted_z_without_an_energy_reference_is_an_error(canonical):
     # one all-condition level only stands in for conditions whose depth was removed
     cfg = broken(canonical, condition_log_z__untrusted_z='global', energy_config__energy_reference=None)
@@ -1158,12 +1365,24 @@ def test_an_nf_policy_refuses_sde_only_settings(canonical):
 def test_a_row_store_off_the_nf_route_is_an_error(canonical):
     """buffers.store enabled under model.kind sde refuses; under nf it passes. Full coverage:
     tests/config/test_row_store_invariants.py."""
+    from config_invariants import row_store_refuses_action
     cfg = copy.deepcopy(canonical)
     assert not _fires(cfg, 'row_store_is_well_formed')                 # store off
     cfg['buffers']['store']['enabled'] = True
     assert _fires(cfg, 'row_store_is_well_formed')                     # kind sde
     cfg['policy']['kind'] = 'nf'
     cfg['gradient_norm_clip'] = 10.0
+    cfg['buffers']['store'] = {'enabled': True, 'ram_gb': 16}
+    cfg['buffers']['anchor_buffer'].update(frozen=True, seed_floors_only=True)
+    cfg['noised_prior'].update(live_kernel='physical', train_kinds=['anchor'])
+    cfg['energy_config']['crystal_coordinates'] = 'fd'
+    cfg['grow_batch_size'] = False
+    stages = cfg['protocols'][cfg['protocol']]['stages']
+    for st in stages:
+        st['max_steps'] = 100
+        for hook in ('on_enter', 'on_exit'):
+            st[hook] = [a for a in st.get(hook) or [] if not row_store_refuses_action(a)]
+    cfg['epochs'] = 111 * len(stages)
     assert not _fires(cfg, 'row_store_is_well_formed')
 
 
@@ -1181,8 +1400,11 @@ def test_a_malformed_zsg_panel_is_an_error_and_an_inert_one_is_reported(canonica
     """Full coverage: tests/crystal/test_sg_readouts.py."""
     cfg = copy.deepcopy(canonical)
     assert not _fires(cfg, 'zsg_panel_is_well_formed')                    # absent or off
-    cfg['zsg_panel'] = {'enabled': True, 'draws': 0}
+    cfg['zsg_panel'] = {'enabled': True, 'molecules': 0}
     assert _fires(cfg, 'zsg_panel_is_well_formed', severity=ERROR)        # malformed
+    for retired in ('draws', 'every_n_evals'):
+        cfg['zsg_panel'] = {'enabled': True, retired: 4}
+        assert _fires(cfg, 'zsg_panel_is_well_formed', severity=ERROR)    # forced-group IS panel keys
     cfg['zsg_panel'] = {'enabled': True}
     cfg['space_groups'] = [2]
     assert _fires(cfg, 'zsg_panel_is_well_formed', severity=BASELINE)     # one group: inert

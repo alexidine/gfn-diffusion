@@ -1,323 +1,257 @@
-"""The trainer's side of the row store (train.py Modeller._store_* and the sites that dispatch to them), on a
-Modeller built without __init__ around a hand-built RowStore and a stub policy. What each test would catch:
-
-  * the bwd draw reading anything but the data rows, or handing back a molecule batch or a trajectory;
-  * the replay draw not carrying its IS weights and stats to replay_train_step, or a wrong trajectory shape;
-  * the level table not being the replay branch's TB level (the head, or the persistent target where trusted);
-  * a rollout on a condition the store has never held being refused for want of a level;
-  * the admission floor judged on the referenced log R;
-  * records judged on anything but the rollout batch's mol_energy, or a batch without it admitted silently;
-  * seed rows given any energy but the stored rows' mol_energy, or best_energy read off held-out rows;
-  * replay availability and the occupancy trigger not reading the store.
-
-CPU, synthetic rows, no energy computed.
+"""The trainer's draws from the crystal store (train.py Modeller._store_draw, _kick_anchors, _kick_fresh, _store_touch), on
+a Modeller built without __init__ around a real CrystalStore with real template batches. CPU, no energy computed.
 
     python -m pytest -q tests/crystal/test_row_store_trainer.py
 """
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-from energy_sampling.row_store import RowStore, TAG_ANCHOR, TAG_CHILD, TAG_ONPOLICY
+from energy_sampling import crystal_store as CS
+from energy_sampling.tests.crystal import store_stub as S
 from energy_sampling.train import Modeller
 
 pytestmark = pytest.mark.fast
 
-STORE = dict(bar=1.0, eps=0.1, cap_per_condition=100, max_rows=1000, records_kept=2, kappa=1.0,
-             floor_frac=0.25, uniform_frac=0.1, refresh_chunk=7, admit_reward_min=None)
-DIM, N_COND = 3, 4
 
-
-class _Head(torch.nn.Module):
-    """log Z(c) = 10 * c[:, 0] (a conditional level head reading the condition vector)."""
-
-    def forward(self, emb):
-        return 10.0 * emb[:, 0]
-
-
-class _Policy(torch.nn.Module):
-    """A conditional stub with the NF policy's interface: log q(x | c) = -|x|^2 - c[:, 0]."""
-    conditional = True
-
-    def __init__(self):
-        super().__init__()
-        self.flow_model = _Head()
-
-    def get_condition_embedding(self, condition, mol_batch):
-        return condition
-
-    def log_density(self, x, condition, mol_batch):
-        return -(x ** 2).sum(-1) - condition[:, 0]
-
-
-class _Ef:
-    temperature = 1.0
-
-    def unreferenced_log_r(self, log_r, cid):
-        return log_r - 100.0      # a reference of -100 / T on every condition
-
-
-def _modeller(tb_z_source='learned', tracker=None, **store_over):
-    m = Modeller.__new__(Modeller)
-    s = {**STORE, **store_over}
-    m.args = SimpleNamespace(buffers=SimpleNamespace(store=SimpleNamespace(enabled=True, **s)),
-                             replay_loss_coeffs=SimpleNamespace(tb_z_source=tb_z_source))
-    m.gfn_model = _Policy()
-    m.device = torch.device('cpu')
-    m.batch_size = 32
-    m.step_ind = 5
-    m.energy_function = _Ef()
-    if tracker is not None:
-        m.condition_log_z = tracker
-    st = RowStore(DIM, N_COND, 1, 'cpu', **{k: v for k, v in s.items() if k != 'refresh_chunk'})
-    g = torch.Generator().manual_seed(0)
-    n = 40
-    cid = torch.arange(n) % 2                          # conditions 0 and 1 only
-    held = torch.arange(n) >= 30
-    st.set_conditions(cid, (cid.float() * 0.1)[:, None])
-    x = torch.randn(n, DIM, generator=g)
-    log_r = torch.randn(n, generator=g)
-    st.seed(cid, x, log_r, TAG_CHILD, held, energy=torch.full((n,), -1.0))   # best physical energy -1 on c0, c1
-    m.row_store = st
-    m._store_refresh()
-    return m
-
-
-def test_bwd_draw_is_uniform_over_data_rows_and_carries_no_graph():
-    m = _modeller()
-    cond, cid, inds, lat, log_r, mol_batch, traj = m.draw_bwd_sample(2)
-    idx, version = inds
-    assert mol_batch is None and traj is None and version == m.row_store.version
-    assert idx.numel() == 64 and bool((idx < m.row_store.n_mle).all())
-    assert bool((idx[0::2] == idx[1::2]).all())        # repeats tile each drawn row in place
+def test_mle_draw_is_reward_free_tiled_and_writes_nothing(monkeypatch):
+    m = S.build()
+    S.shift_kick(monkeypatch)
     st = m.row_store
-    assert torch.equal(lat, st.x[idx]) and torch.equal(log_r, st.log_r[idx]) and torch.equal(cid, st.cid[idx])
-    assert torch.equal(cond, st.cond_table[st.cid[idx]])
+    before = st.generation
+    cond, cid, inds, x, log_r, mol, traj = m.draw_bwd_sample(2)
+    assert inds is None and log_r is None and traj is None
+    assert x.shape == (16, S.DIM) and torch.equal(x[0::2], x[1::2])
+    assert m._mle_rows_drawn == 16 and cid.numel() == 16 and torch.equal(cid[0::2], cid[1::2])
+    assert st.generation == before and bool(torch.isnan(st.log_q[:st.high_water]).all())
+    assert torch.equal(mol.sg_ind.reshape(-1), st.cond_sg[cid].long())
 
 
-def test_replay_draw_sets_is_weights_and_a_one_step_trajectory():
-    m = _modeller()
-    m._replay_is_w = None
-    cond, cid, inds, lat, log_r, mol_batch, traj = m.draw_replay_sample(1)
+def test_mle_draw_centres_are_anchors_and_the_model_never_sees_one(monkeypatch):
+    m = S.build()
+    seen = []
+    real = S.shift_kick(monkeypatch)
+    kick = S.physical_kick.kick
+
+    def spy(kits, centres, *a, **kw):
+        seen.append(centres.clone())
+        return kick(kits, centres, *a, **kw)
+    monkeypatch.setattr(S.physical_kick, 'kick', spy)
+    st = m.row_store
+    _, _, _, x, *_ = m.draw_bwd_sample(1)
+    anchors = st.x[:st.high_water][st.kind[:st.high_water] == CS.ANCHOR]
+    assert bool((torch.cdist(seen[0], anchors).min(1).values == 0).all()) and len(real) == 1
+    assert bool((torch.cdist(x.float(), anchors).min(1).values > 0).all())
+
+
+def test_a_kick_that_kept_its_anchor_is_redrawn_then_dropped_and_counted(monkeypatch):
+    m = S.build()
+    st = m.row_store
+    a0 = st.x[0].clone()
+    S.shift_kick(monkeypatch, keep=lambda c: (c == a0).all(1))         # anchor 0 never leaves its point
+    rows = torch.zeros(4, dtype=torch.long)
+    monkeypatch.setattr(st, 'draw_anchors', lambda n, by='anchor': torch.zeros(n, dtype=torch.long))
+    with pytest.raises(RuntimeError, match='no MLE draw'):
+        m._kick_fresh(rows)
+    assert m._physical['mle_kept_dropped'] == 4
+
+
+def test_a_kept_row_is_replaced_by_a_kick_of_another_anchor(monkeypatch):
+    m = S.build()
+    st = m.row_store
+    a0 = st.x[0].clone()
+    S.shift_kick(monkeypatch, keep=lambda c: (c == a0).all(1))
+    other = int(torch.nonzero(st.kind[:st.high_water] == CS.ANCHOR).flatten()[1])
+    monkeypatch.setattr(st, 'draw_anchors', lambda n, by='anchor': torch.full((n,), other))
+    rows, x = m._kick_fresh(torch.tensor([0, other]))
+    assert rows.tolist() == [other, other] and m._physical['mle_kept_dropped'] == 0
+    assert not bool((x == a0).all(1).any())
+
+
+def test_the_kick_uses_its_own_generator_and_leaves_the_global_ones_alone(monkeypatch):
+    m = S.build()
+    calls = S.shift_kick(monkeypatch)
+    state = torch.get_rng_state()
+    m._kick_anchors(torch.tensor([0, 1]))
+    assert calls[0]['generator'] is m._physical['gen']
+    assert torch.equal(torch.get_rng_state(), state)
+
+
+def test_a_stage_that_reads_log_r_cannot_take_the_mle_draw(monkeypatch):
+    m = S.build()
+    S.shift_kick(monkeypatch)
+    m._bwd_draw_is_reward_free = lambda: False
+    with pytest.raises(ValueError, match='reads log R'):
+        m.draw_bwd_sample(1)
+
+
+def test_reward_free_is_judged_on_the_store_route_too():
+    m = S.build()
+    del m._bwd_draw_is_reward_free
+    m.gfn_model._stash_live_branches = False
+    m.args.fwd_loss_coeffs = m.args.bwd_loss_coeffs
+    assert Modeller._bwd_draw_is_reward_free(m)
+    m.protocol.stage.bwd_sampling_mode = 'prior'
+    assert not Modeller._bwd_draw_is_reward_free(m)
+
+
+def test_bwd_draw_reads_stored_children():
+    m = S.build()
+    m.protocol.stage.bwd_sampling_mode = 'prior'
+    st = m.row_store
+    cond, cid, inds, x, log_r, mol, traj = m.draw_bwd_sample(1)
+    idx, epoch = inds
+    assert epoch == st.epoch and traj is None and bool((st.kind[idx] == CS.CHILD).all())
+    assert torch.equal(x, st.x[idx]) and torch.equal(log_r, st.log_r[idx]) and torch.equal(cid, st.cid[idx].long())
+    assert torch.equal(mol.pos[:3], st.templates.subsample_new_batch(st.tmpl_of[st.cid[idx[:1]]].long()).pos)
+
+
+def test_replay_draw_reads_on_policy_rows_with_a_one_step_path():
+    m = S.build()
+    st = m.row_store
+    fwd, batch = S.rollout([0, 1, 2, 3])
+    m._store_admit(fwd, batch, CS.ORIGIN_ROLLOUT)
+    cond, cid, inds, x, log_r, mol, traj = m.draw_replay_sample(1)
     idx, _ = inds
-    assert mol_batch is None and traj.shape == (32, 2, DIM)
-    assert torch.equal(traj[:, 1], lat) and bool((traj[:, 0] == 0).all())
-    assert bool((~m.row_store.held_out[idx]).all())
-    assert m._replay_is_w.shape == (32,) and set(m._replay_is_stats) == {
-        'replay/is_ess_frac', 'replay/is_w_max_ratio', 'replay/is_elig_frac'}
-    assert m._replay_draw_origin == {}
+    assert bool((st.kind[idx] == CS.ONPOLICY).all()) and traj.shape == (8, 2, S.DIM)
+    assert torch.equal(traj[:, 1], x) and bool((traj[:, 0] == 0).all()) and m._replay_is_w is None
+    assert mol.replay_log_T.shape == (8,)
 
 
-def test_level_table_is_the_head_and_nan_where_no_condition_is_stored():
-    m = _modeller()
-    lv = m._store_level_table()
-    assert torch.allclose(lv[:2], torch.tensor([0.0, 1.0])) and bool(torch.isnan(lv[2:]).all())
-
-
-def test_level_table_under_persistent_reads_the_trusted_target():
-    tracker = SimpleNamespace(
-        lookup=lambda u: (torch.full((len(u),), 7.0), torch.as_tensor(u) == 1),
-        untrusted_fallback=lambda: None)
-    m = _modeller(tb_z_source='persistent', tracker=tracker)
-    lv = m._store_level_table()
-    assert torch.allclose(lv[:2], torch.tensor([0.0, 7.0]))   # condition 0 untrusted: the head
-
-
-def test_refresh_writes_log_q_under_eval_mode_and_restores_training():
-    m = _modeller()
-    m.gfn_model.train()
+def test_a_replay_weight_rule_reaches_the_loss_weights(monkeypatch):
+    m = S.build()
     st = m.row_store
-    st.log_q.fill_(float('nan'))
-    m._store_refresh()
-    want = -(st.x ** 2).sum(-1) - st.cond_table[st.cid, 0]
-    assert torch.allclose(st.log_q, want) and m.gfn_model.training
+    fwd, batch = S.rollout([0, 0, 1])
+    m._store_admit(fwd, batch, CS.ORIGIN_ROLLOUT)
+
+    def rule(store, rows, step):
+        return torch.ones(len(rows)) * 2
+
+    monkeypatch.setitem(CS.REPLAY_WEIGHTS, 'twos', rule)
+    m._store_cfg['replay_weight'] = 'twos'
+    m._store_draw('replay', 1)
+    assert m._replay_is_w.shape == (8,) and torch.allclose(m._replay_is_w, torch.ones(8))
+    assert st.n_drawable(CS.ONPOLICY) == 3
 
 
-def _rollout(cid, log_r, x=None, mol_energy=None):
-    n = len(cid)
-    x = torch.zeros(n, DIM) if x is None else x
-    fwd = {'condition_id': torch.as_tensor(cid), 'log_r': torch.as_tensor(log_r, dtype=torch.float32),
-           'flow_states': torch.stack([torch.zeros_like(x), x], 1), 'log_pf': torch.zeros(n)}
-    mol_energy = -torch.as_tensor(log_r, dtype=torch.float32) if mol_energy is None else mol_energy
-    batch = SimpleNamespace(conditions=(torch.as_tensor(cid).float() * 0.1)[:, None],
-                            mol_energy=torch.as_tensor(mol_energy, dtype=torch.float32)[:, None])
-    return fwd, batch
-
-
-def test_admission_on_a_condition_the_store_never_held():
-    m = _modeller()
-    fwd, batch = _rollout([3, 3], [50.0, 0.0])        # condition 3: no seed row, cond_table unset
-    res = m._store_admit(fwd, batch, origin=0)
+def test_touch_writes_log_q_and_residual_and_mle_inds_write_nothing():
+    m = S.build()
+    m.protocol.stage.bwd_sampling_mode = 'prior'
     st = m.row_store
-    assert res['admitted'] == 2 and res['records'] == 1
-    assert torch.allclose(st.cond_table[3], torch.tensor([0.3]))
-    assert int((st.tag == TAG_ONPOLICY).sum()) == 2 and float(st.best_energy[3]) == -50.0
-
-
-def test_records_are_judged_on_the_batch_mol_energy_not_log_r():
-    m = _modeller(bar=1e6)                              # only records are admitted
-    # c0 (seed best -1): row 0 has the higher log R but energy 5; row 1 the lower log R and energy -3 -> the record
-    fwd, batch = _rollout([0, 0], [30.0, -20.0], mol_energy=[5.0, -3.0])
-    res = m._store_admit(fwd, batch, origin=0)
-    st = m.row_store
-    assert res['records'] == 1 and res['admitted'] == 1
-    assert float(st.log_r[-1]) == -20.0 and float(st.energy[-1]) == -3.0 and bool(st.protected[-1])
-    assert float(st.best_energy[0]) == -3.0 and float(st.best_energy[1]) == -1.0
-
-
-def test_admission_refuses_a_batch_without_matching_mol_energy():
-    m = _modeller()
-    fwd, batch = _rollout([0, 0], [1.0, 2.0])
-    del batch.mol_energy
-    with pytest.raises(RuntimeError, match='mol_energy'):
-        m._store_admit(fwd, batch, origin=0)
-    fwd, batch = _rollout([0, 0], [1.0, 2.0], mol_energy=[1.0, 2.0, 3.0])
-    with pytest.raises(RuntimeError, match='mol_energy'):
-        m._store_admit(fwd, batch, origin=0)
-    assert len(m.row_store) == 40
-
-
-class _PriorRows:
-    """A stored prior batch: per-row noised_kind, space group (read as the condition id), log R and mol_energy."""
-
-    def __init__(self, kind, sg, log_r, mol_energy, x):
-        self.noised_kind, self.sg_ind = torch.as_tensor(kind), torch.as_tensor(sg)
-        self.log_r, self.mol_energy, self.x = torch.as_tensor(log_r), torch.as_tensor(mol_energy), torch.as_tensor(x)
-        self.num_graphs = len(self.sg_ind)
-        self.z_prime = torch.ones(self.num_graphs, dtype=torch.long)
-        self.ptr = torch.arange(self.num_graphs + 1)
-
-    def subsample_new_batch(self, idx):
-        return _PriorRows(self.noised_kind[idx], self.sg_ind[idx], self.log_r[idx], self.mol_energy[idx], self.x[idx])
-
-    def to(self, device):
-        return self
-
-
-class _SeedEf:
-    """seed_energy_from differs from mol_energy by 1000, so a seed taking it is caught."""
-    condition_library_size = N_COND
-
-    def prebuilt_sample_to_reward(self, sub, T, return_ens_dict=False):
-        return sub.log_r, {'mol_energy': sub.mol_energy}
-
-    def seed_energy_from(self, ens):
-        return ens['mol_energy'] + 1000.0
-
-    def condition_samples(self, sub, sg_inds, z_primes):
-        return sub, None, sg_inds.float()[:, None] * 0.1, sg_inds
-
-
-def test_seeding_stores_mol_energy_and_best_energy_from_the_drawable_rows():
-    m = Modeller.__new__(Modeller)
-    m.args = SimpleNamespace(energy_config=SimpleNamespace(temperature=1.0), buffer_device='cpu')
-    m.device = torch.device('cpu')
-    m.energy_function = _SeedEf()
-    m._batch_latents = lambda sub: sub.x
-    n = 7
-    m.prior_dataset = SimpleNamespace(batch=_PriorRows(
-        [TAG_ANCHOR, TAG_CHILD, TAG_CHILD, TAG_CHILD, TAG_ANCHOR, TAG_CHILD, TAG_CHILD],
-        [0, 0, 0, 1, 1, 1, 1], [1.0, 9.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        [-2.0, 7.0, -5.0, -1.0, -3.0, 4.0, 0.5], torch.arange(n * DIM, dtype=torch.float32).reshape(n, DIM)))
-    m.prior_heldout_batch = _PriorRows([TAG_ANCHOR, TAG_ANCHOR], [0, 1], [50.0, 60.0], [-90.0, -80.0],
-                                       -torch.ones(2, DIM))
-    settings = {k: v for k, v in STORE.items() if k != 'refresh_chunk'}
-    m._store_seed(settings, chunk=3)
-    st = m.row_store
-    assert st.n_mle == 7 and st.n_seed == 9 and bool(st.held_out[7:].all())
-    assert st.energy.tolist() == [-2.0, 7.0, -5.0, -1.0, -3.0, 4.0, 0.5, -90.0, -80.0]   # mol_energy rides its row
-    assert st.log_r.tolist() == [1.0, 9.0, 2.0, 3.0, 4.0, 5.0, 6.0, 50.0, 60.0]
-    assert st.best_energy.tolist()[:2] == [-5.0, -3.0]                       # the held-out -90 and -80 do not count
-    assert Modeller._stored_reward_terms(m, m.prior_dataset.batch).__len__() == 2   # the default call is unchanged
-
-
-def test_admission_floor_is_judged_on_the_unreferenced_log_r():
-    m = _modeller(admit_reward_min=-60.0)
-    fwd, batch = _rollout([0, 0], [50.0, 30.0])        # unreferenced: -50 (kept), -70 (refused)
-    res = m._store_admit(fwd, batch, origin=0)
-    assert res['rejected_floor'] == 1 and res['admitted'] == 1
-
-
-def test_manage_replay_buffer_admits_to_the_store_and_builds_no_replay_buffer():
-    m = _modeller()
-    m.args.harvest = None
-    m._replay_managed = True
-    m.replay_in_play = lambda: True
-    fwd, batch = _rollout([0, 1], [40.0, 41.0])
-    n0 = len(m.row_store)
-    m.manage_replay_buffer(fwd, batch)
-    assert len(m.row_store) == n0 + 2 and not hasattr(m, 'replay_buffer')
+    _, _, inds, *_ = m.draw_bwd_sample(1)
+    m._store_touch(inds, {'log_pf': torch.full((8,), -3.0), 'resid': torch.full((8,), 0.5)})
+    assert bool((st.log_q[inds[0]] == -3.0).all()) and bool((st.resid[inds[0]] == 0.5).all())
+    assert bool((st.q_step[inds[0]] == 5).all())
+    gen = st.generation
+    m._store_touch(None, {})
+    assert st.generation == gen
 
 
 def test_replay_rows_and_occupancy_read_the_store():
-    m = _modeller()
-    assert m._replay_rows() == 30                       # drawable: the non-held-out rows
-    assert m._rollout_trigger_reading('occupancy_min_batches', 0) == 30 / 32
+    m = S.build()
+    assert m._replay_rows() == 0
+    fwd, batch = S.rollout([0, 1])
+    m._store_admit(fwd, batch, CS.ORIGIN_ROLLOUT)
+    assert m._replay_rows() == 2
+    assert m._rollout_trigger_reading('occupancy_min_batches', 0) == 2 / 8
     m.row_store = None
-    assert m._replay_rows() is None and m._rollout_trigger_reading('occupancy_min_batches', 0) is None
-    m.replay_buffer = [0] * 7
-    assert m._replay_rows() == 7
+    assert m._replay_rows() is None
 
 
-def test_touch_writes_log_pf_of_the_drawn_rows():
-    m = _modeller()
-    _, _, inds, *_ = m.draw_bwd_sample(1)
-    m._store_touch(inds, {'log_pf': torch.full((32,), -3.0)})
-    assert bool((m.row_store.log_q[inds[0]] == -3.0).all()) and bool((m.row_store.q_step[inds[0]] == 5).all())
+# -- the load: which file rows the store takes ------------------------------------------------------------------------
+
+def _file(kinds, parents, groups, splits=None, shift=None):
+    """A prior file of real graphs, one molecule per condition group."""
+    from mxtaltools.dataset_utils.utils import collate_data_list
+    b = collate_data_list([S.molecule(int(g)) for g in groups])
+    n = len(kinds)
+    if shift is not None:
+        for row, d in shift.items():
+            b.pos[b.ptr[row]:b.ptr[row + 1]] += d
+    b.add_graph_attr(torch.tensor(parents, dtype=torch.long), 'noised_parent')
+    b.add_graph_attr(torch.linspace(-0.5, 0.5, n * 12).reshape(n, 12), 'fd_state')
+    b.add_graph_attr(torch.tensor([S.GROUPS[0]] * n, dtype=torch.long), 'sg_ind')
+    return (b, torch.tensor(kinds), torch.zeros(n, dtype=torch.long) if splits is None else torch.tensor(splits),
+            torch.tensor(groups))
 
 
-def test_stats_are_published_through_log_buffer_stats_keys():
-    m = _modeller()
-    keys = m.row_store.stats(m._store_level_table())
-    assert keys['store/rows'] == 40 and keys['store/rows_heldout'] == 10
+def _take(monkeypatch, b, kinds, splits, groups, keep, fd_ok=None, cap=8):
+    from energy_sampling import noised_prior as NP
+    monkeypatch.setattr(S.physical_kick, 'group_kits', lambda layout: {})
+    m = Modeller.__new__(Modeller)
+    m.energy_function = S.Energy()
+    m.energy_function.fd_layout = None
+    m.device = torch.device('cpu')
+    m.args = S.SimpleNamespace(energy_config=S.SimpleNamespace(temperature=S.T), eval_num_samples=cap // 4, seed=0)
+    m._noised_prior_settings = dict(live_log_range=(-2.0, -1.0), window_kT=10.0, packing_window=(0.5, 0.9))
+    n = len(kinds)
+    keep = torch.tensor(keep)
+    masks = dict(buffer=keep, heldout_children=torch.zeros(n, dtype=torch.bool),
+                 anchors=keep & (kinds == NP.KIND_ANCHOR))
+    log_r = torch.full((n,), -1.0, dtype=torch.float64)
+    fd = torch.ones(n, dtype=torch.bool) if fd_ok is None else torch.tensor(fd_ok)
+    out = m._store_take_rows(b, {}, torch.zeros(n, dtype=torch.float64), log_r, kinds, splits, groups, fd, masks,
+                             torch.zeros(n, dtype=torch.float64))
+    return m, out
 
 
-@pytest.mark.parametrize('conditional', [True, False])
-def test_store_residual_and_is_weights_match_the_replay_tb_loss_on_a_real_flow_policy(conditional):
-    """On models/nf_policy.NFPolicy: the store's level table is the replay TB loss's log Z, its r is minus the loss's
-    residual, the replay loss reduces as sum(w l) / sum(w) with the draw's IS weights, and touch writes the loss's
-    log P_F."""
-    import torch.nn.functional as F
-    from types import SimpleNamespace as NS
-    from models.nf_policy import NFPolicy
-    from gflownet_losses import get_gfn_backward_loss
-    torch.manual_seed(0)
-    gcfg = dict(dim=12, s_emb_dim=32, conditions_dim=4 if conditional else 0, harmonics_dim=16, t_dim=8,
-                t_hidden_dim=32, s_hidden_dim=32, s_layers=2, policy_hidden_dim=32, policy_layers=2,
-                flow_hidden_dim=32, flow_layers=2, cond_hidden_dim=32, cond_layers=2, log_var_range=6.0, t_scale=0.05,
-                learned_variance=True, condition_embedding_dim=16 if conditional else 0, conditions_type='vector',
-                clipping=True, gfn_clip=200.0, pb_drift_range=0.4, pb_var_range=6.0, conditional=conditional,
-                learn_pb=True, dropout=0, norm='layer', zero_init=False, device='cpu', max_z_prime=1,
-                full_flow=False, do_periodic_angles=True, periodic_centroids=True, periodic_centroid_axes=(1, 2),
-                dead_latent_rows=None, dead_latent_values=None, dplr_rank=0, pb_exact_reversal=True)
-    pol = NFPolicy(gcfg, dict(conditioner='made', hidden=32, hidden_layers=1, n_bins=8, context_dim=16,
-                              context_hidden=32, tied_derivatives=False, tf_fp32=False), seed=0)
-    with torch.no_grad():                               # a level head away from its zero init
-        for p in pol.flow_model.parameters():
-            p.add_(torch.randn_like(p) * 0.3)
-    m = _modeller()
-    m.gfn_model = pol
-    st = RowStore(12, 3, 4, 'cpu', **{k: v for k, v in STORE.items() if k != 'refresh_chunk'})
-    n = 40
-    cid = torch.arange(n) % 3
-    st.set_conditions(cid, torch.randn(3, 4)[cid])
-    st.seed(cid, torch.rand(n, 12) * 2 - 1, torch.randn(n) * 5, TAG_CHILD, torch.arange(n) >= 35,
-            energy=torch.zeros(n))
-    m.row_store = st
-    m._store_refresh()
-    lv = m._store_level_table()
-    cond, c_id, inds, lat, log_r, _, traj = m.draw_replay_sample(1)
-    beta = 10.0
-    coeffs = NS(freeze_policy=0, freeze_z=0, traj_grads=1, beta=beta, vg_lb=0, vg_lme=0, pf_boost=0, db=0,
-                subtb=0, emp_z=0, tb=1, mle=0, loss_clip=-1)
-    loss, d = get_gfn_backward_loss(coeffs, lat, pol, log_r, None, None, condition=cond if conditional else None,
-                                    repeats=1, report_losses=True, trajectories=traj, condition_id=c_id,
-                                    sample_weights=m._replay_is_w)
-    assert torch.allclose(lv[c_id], d['log_Z'], atol=1e-4)
-    assert torch.allclose(st.resid(lv, inds[0]), -d['resid'], atol=1e-4)
-    per = beta * F.smooth_l1_loss(d['resid'], torch.zeros_like(d['resid']), reduction='none', beta=beta)
-    w = m._replay_is_w
-    assert torch.allclose(loss.detach(), (w * per).sum() / w.sum(), rtol=1e-5)
-    m._store_touch(inds, d)
-    assert torch.allclose(st.log_q[inds[0]], d['log_pf'])
+def _kinds():
+    from energy_sampling import noised_prior as NP
+    return NP.KIND_ANCHOR, NP.KIND_CHILD
+
+
+def test_the_load_stores_a_kept_childs_anchor_undrawn_when_the_anchor_left_the_window(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, c, c, a, c], [0, 0, 0, 3, 3], [0, 0, 0, 1, 1])
+    m, (energy, panel) = _take(monkeypatch, b, kinds, splits, groups, [False, True, True, True, True])
+    load = m._store_load
+    assert load['rows'].tolist() == [0, 1, 2, 3, 4] and load['undrawn'].tolist() == [True, False, False, False, False]
+    assert load['parent'].tolist() == [-1, 0, 0, -1, 3]
+    assert energy.numel() == 4 and panel.num_graphs == 3         # scored rows in the windows; the children
+    assert m._physical['no_parent'] == 0
+
+
+def test_the_load_drops_a_child_whose_anchor_has_no_chart_point(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, c, a, c], [0, 0, 2, 2], [0, 0, 1, 1])
+    m, _ = _take(monkeypatch, b, kinds, splits, groups, [True, True, True, True], fd_ok=[False, True, True, True])
+    assert m._store_load['rows'].tolist() == [0, 2, 3] and m._physical['no_parent'] == 1
+    assert m._store_load['parent'].tolist() == [-1, -1, 1]       # the parent column is remapped to stored positions
+
+
+def test_the_load_refuses_a_row_off_its_conditions_template_frame(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, c], [0, 0], [0, 0], shift={1: torch.tensor([0.05, 0.0, 0.0])})
+    with pytest.raises(ValueError, match='share a frame'):
+        _take(monkeypatch, b, kinds, splits, groups, [True, True])
+
+
+def test_the_load_accepts_a_row_within_the_frame_bar(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, c], [0, 0], [0, 0], shift={1: torch.tensor([0.018, 0.0, 0.0])})
+    m, _ = _take(monkeypatch, b, kinds, splits, groups, [True, True])
+    assert m._store_load['rows'].tolist() == [0, 1]
+
+
+def test_the_load_refuses_a_child_whose_parent_is_another_condition(monkeypatch):
+    a, c = _kinds()
+    b, kinds, splits, groups = _file([a, a, c], [0, 1, 0], [0, 1, 1])
+    with pytest.raises(ValueError, match='another condition'):
+        _take(monkeypatch, b, kinds, splits, groups, [True, True, True])
+
+
+def test_a_training_condition_with_no_stored_row_takes_its_molecules_template():
+    from mxtaltools.dataset_utils.utils import collate_data_list
+    m = Modeller.__new__(Modeller)
+    m.energy_function = S.Energy()
+    t = S.templates(1).subsample_new_batch(torch.tensor([0]))        # molecule 0 in group 2 only
+    mols = collate_data_list([S.molecule(0)])
+    mols.add_graph_attr(torch.tensor([0]), 'mol_id')
+    mols.add_graph_attr(torch.tensor([S.GROUPS[0]]), 'sg_ind')
+    del mols['identifier']
+    m.mol_dataset = S.SimpleNamespace(batch=mols)
+    m._store_load = dict(templates=t, t_groups=torch.tensor([0]), groups=torch.tensor([0, 0]))
+    m._store_after_identifiers()
+    load = m._store_load
+    assert load['template_cids'].tolist() == [0, 1] and load['cid'].tolist() == [0, 0]
+    assert load['templates'].sg_ind.reshape(-1).tolist() == list(S.GROUPS)
+    assert torch.equal(load['templates'].pos[:3], load['templates'].pos[3:6])
