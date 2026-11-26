@@ -3,7 +3,7 @@ clash.
 
 MACE's neighbour list grows with the density; an untrained exact-density flow on acridine (inn_acr_oct23, 2026-10-23)
 drew cells up to ~600x denser than a crystal and its first evaluation ran the card out of memory at one crystal per
-call. The constructor accepts the key on the mace route only, so the split itself is exercised here on the canonical
+call. The constructor accepts the key on the MLIP routes (mace, uma) only, so the split itself is exercised here on the canonical
 eLJ route on CPU (the route tests/crystal/test_mxtaltools_crystal_boundary.py pins), by setting the guard on a built
 energy function: the backend does not enter the split, and the energy key is the route's own.
 """
@@ -66,7 +66,7 @@ def test_the_guard_keeps_dense_rows_from_the_backend_and_leaves_the_others_and_t
     assert 'energy/mlip_guarded_rows' not in plain.drain_energy_timing(), 'no guard, no counter'
 
     guarded = MolecularCrystal(**_cfg(capsys, implausible_energy_below=-1000.0))
-    guarded.mlip_max_packing_coeff = cap                          # the constructor admits it on the mace route only
+    guarded.mlip_max_packing_coeff = cap                          # the constructor admits it on the MLIP routes only
     e1, b1 = _score(guarded)
     raw0, raw1 = getattr(b0, key).flatten(), getattr(b1, key).flatten()
     assert float(raw1[dense_row]) == pytest.approx(1000.0), 'the dense row carries the clash value'
@@ -100,7 +100,7 @@ def test_a_guarded_chunk_appends_to_an_unguarded_one(capsys):
 
 
 def test_the_constructor_refuses_the_guard_off_the_mace_route_or_without_its_clash_value(capsys):
-    with pytest.raises(ValueError, match='mace route'):
+    with pytest.raises(ValueError, match='MLIP routes'):
         MolecularCrystal(**_cfg(capsys, implausible_energy_below=-1000.0, mlip_max_packing_coeff=2.0))
     with pytest.raises(ValueError, match='set that too'):
         MolecularCrystal(**_cfg(capsys, energy_function='mace', mlip_max_packing_coeff=2.0))

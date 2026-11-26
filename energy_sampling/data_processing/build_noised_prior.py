@@ -24,7 +24,7 @@ the search's endpoint mode) carries no basin_H, and --child_kernel basin refuses
 
 CHILDREN. Each anchor is kicked K times by MolCrystalOps.log_noise_latent_parameters(log_lo, log_hi) (a unit
 direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded, hard-cleaned) and scored. With
---log_hi auto, log_hi is calibrated first: a pilot of PILOT_ROWS training anchors is kicked at each fixed radius
+--log_hi auto, log_hi is calibrated first (not at --k 0: no children, no pilot): a pilot of PILOT_ROWS training anchors is kicked at each fixed radius
 10^h for h in PILOT_GRID, and log_hi is the h whose median seed-energy excess over the parent
 (MolecularCrystal.seed_energy_from, in kT at the run's temperature) lies nearest --window_kT; the table goes in the
 manifest. Every finite child is kept whatever its energy: the energy and packing windows are load-time settings.
@@ -36,6 +36,18 @@ With --basins and --child_kernel basin, the K children of a basin are instead dr
 drawn trainer-box image; basin_kick): no calibration, no image step, a draw with no chart point after --redraws
 redraws dropped and counted (manifest basin_kernel.misses). The manifest's child_kernel 'basin' makes the loader's energy
 window read each child at its basin's energy (noised_prior.window_energy); the packing window still cuts draws one by one.
+
+STORED ENERGIES (--stored_energies, --basins on mace/uma, no --forces). A band set's states carry their MLIP energy as
+the search recorded it (MXtalTools write_band energy_from_traj), so each anchor's MLIP term is taken from the set's E
+and only the cheap terms (reduction, packing, density) are computed: no MLIP call (MolecularCrystal.use_stored_mlip_
+energy). --energy_check_rows anchors (a seeded draw) are re-scored through the MLIP instead, and the build refuses if
+any misses its stored energy by more than --energy_tol (manifest stored_energies). The trainer's entry check re-scores
+its own stratified sample at load.
+
+SELF CHILDREN (--self_children, --k 0 only). The store route's MLE kicks anchors live and its TB stage draws its
+backward rows from children only (train.py::Modeller._store_draw); a band set's anchors are scored states already (a
+search's recorded descent states), so each is also written as a child of itself, noised_radius 0, every scored term
+copied, no energy call (manifest self_children). The TB stage's dataset growth adds kicked children beside them.
 
 IMAGES (owner rule 2026-09-28: noise first, then the normaliser images). On space group 2, Z' 1, handedness +1
 (data_processing/symmetrize_prior.py's scope), each child is written as one of its valid descriptions drawn
@@ -53,6 +65,7 @@ asymmetric-unit box (P2_1/c: y <= 1/4) is clipped into another, which --basins c
 manifest records the chart; the stored terms are the crystal's either way (noised_prior.identity).
 """
 import argparse
+import contextlib
 import datetime
 import math
 import os
@@ -72,6 +85,7 @@ from data_processing.molecule_subset import keep_molecules  # noqa: E402
 from data_processing.symmetrize_prior import ROWS_PER_SOURCE, image_centroids  # noqa: E402
 
 PILOT_ROWS = 2048
+CHECK_CHUNK = 32   # --stored_energies: rows per MLIP call of the check (the stored rows take --chunk, with no MLIP)
 BASIN_ROUND_TRIP_TOL = 1e-3   # latent units: a decoded basin draw's latent_params against the latent it was decoded from
 PHI_LATENT = 10               # Z' = 1 latent row of the orientation's azimuth, periodic on [-1, 1]
 PILOT_GRID = tuple(-2.5 + 0.125 * i for i in range(17))   # 10^-2.5 .. 10^-0.5
@@ -124,6 +138,14 @@ def build_parser():
     p.add_argument('--harvest', default=None, help='a glob of train.py harvest shards (cfg:harvest) to merge in')
     p.add_argument('--forces', action='store_true',
                    help="FD chart only: store each row's force, d mol_energy / d its FD chart point (score)")
+    p.add_argument('--stored_energies', action='store_true',
+                   help='with --basins on an MLIP route: take the MLIP energy of each anchor from the set (its E) and '
+                        'compute only the other terms, no MLIP call except --energy_check_rows; see STORED ENERGIES')
+    p.add_argument('--energy_check_rows', type=int, default=256,
+                   help='with --stored_energies: anchors re-scored through the MLIP as the check (seeded draw)')
+    p.add_argument('--self_children', action='store_true',
+                   help='with --k 0: write each anchor again as a child of itself at radius 0, its scored terms copied '
+                        '(no energy call), so a store-route run has scored rows for its TB stage; see SELF CHILDREN')
     return p
 
 
@@ -145,7 +167,7 @@ def collate(batches):
 
 
 
-def score(ef, batch, T, device, chunk, forces=False):
+def score(ef, batch, T, device, chunk, forces=False, stored=None):
     """(the analysed batches, on the CPU, [n] bool the rows of `batch` they hold): every row through the energy
     function's own scoring of a stored prior row (train.py::Modeller._score_prior_rows), chunk rows at a time, from
     the state the run's chart gives it. FD chart (energy_config.crystal_coordinates 'fd'): the row's FD chart point
@@ -154,8 +176,14 @@ def score(ef, batch, T, device, chunk, forces=False):
     centroid outside the latent's boxes is clipped into another crystal, which check_basin_energies catches).
     forces (FD chart only): each analysed row also carries ``force`` [n, chart width] float32, the gradient of its
     stored mol_energy (run units) with respect to its FD chart point, the state noised_prior.fd_chart_points gives it
-    and the trainer reads it as (MolecularCrystal.capture_mol_energy, autograd)."""
+    and the trainer reads it as (MolecularCrystal.capture_mol_energy, autograd). stored ([n] run units, an MLIP route
+    only, no forces): each row's MLIP energy is taken from it and only the other terms are computed, no MLIP call
+    (MolecularCrystal.use_stored_mlip_energy; --stored_energies)."""
     fd = getattr(ef, 'crystal_coordinates', 'latent') == 'fd'
+    if stored is not None:
+        if forces:
+            raise ValueError('score(stored=...) takes no forces: a stored energy has no graph')
+        batch.add_graph_attr(torch.as_tensor(stored, dtype=torch.float32).reshape(-1), 'stored_mlip_energy')
     if forces and not fd:
         raise ValueError('score(forces=True) needs the FD chart (energy_config.crystal_coordinates fd)')
     out, kept = [], torch.ones(batch.num_graphs, dtype=torch.bool)
@@ -184,11 +212,13 @@ def score(ef, batch, T, device, chunk, forces=False):
             c = c.cpu()
             c.add_graph_attr(g.detach().float().cpu(), 'force')
         else:
-            with torch.no_grad(), ef.allow_unreferenced():
+            with torch.no_grad(), ef.allow_unreferenced(),                     (ef.use_stored_mlip_energy() if stored is not None else contextlib.nullcontext()):
                 _, c = ef.batched_analyze_crystal_batch(
                     x, c, T * torch.ones(c.num_graphs, dtype=torch.float32, device=device),
                     return_batch=True, internal_oom_recovery=True)
             c = c.cpu()
+            if 'stored_mlip_energy' in c.keys():
+                del c.stored_mlip_energy
         # its own bookkeeping dicts: the analysis returns a batch whose _slice_dict / _inc_dict objects a later
         # analysis call writes into, so an earlier result's atom pointers went stale (a K 0 build's anchors, after the
         # pilot scored its kicks; 2026-11-11, pool8 held-out anchors)
@@ -525,8 +555,9 @@ def search_cutoff_energy(run_args, args, ef, anchors, T):
     the descent only), and the trainer's LJ-family energy is switched by default since 2026-11-19, which moves a row's
     energy by ~1.25 run units (eLJ x 0.36358); check_basin_energies compares like with like, so it re-scores the
     anchors once with the switch off."""
-    if ef.analyze_kwargs.get('lj_envelope') is None:
-        return None
+    from energies.molecular_crystal import LJ_FAMILY
+    if run_args.energy_function not in LJ_FAMILY or ef.analyze_kwargs.get('lj_envelope') is None:
+        return None   # an MLIP's energy has no switch (a config's lj_envelope is read by the LJ family only)
     from train import energy_function_kwargs
     from energies.molecular_crystal import MolecularCrystal
     hard = MolecularCrystal(**energy_function_kwargs(run_args, args.device))
@@ -576,6 +607,8 @@ def main(argv=None):
         raise SystemExit('give exactly one of --source and --basins')
     basin_children = args.child_kernel == 'basin'
     check_child_kernel_args(args)
+    if args.self_children and args.k != 0:
+        raise SystemExit('--self_children writes each anchor as its own child: it takes --k 0')
     basins = None
     if args.basins is not None:
         anchors, tsf, what, basins = load_basin_anchors(args, run_args)
@@ -598,7 +631,24 @@ def main(argv=None):
               f"{len(harvest_files)} shard(s)", flush=True)
 
     t0 = time.time()
-    scored, kept = score(ef, anchors, T, args.device, args.chunk, forces=args.forces)
+    stored_check = None
+    if args.stored_energies:
+        if basins is None or args.forces or run_args.energy_function not in ('mace', 'uma'):
+            raise SystemExit('--stored_energies takes --basins on an MLIP route (mace, uma) and no --forces')
+        want = basins['tags']['basin_E'].reshape(-1).double()
+        n_chk = min(int(args.energy_check_rows), anchors.num_graphs)
+        idx = torch.randperm(anchors.num_graphs, generator=torch.Generator().manual_seed(args.seed))[:n_chk].sort().values
+        chk, chk_kept = score(ef, anchors.subsample_new_batch(idx), T, args.device, min(args.chunk, CHECK_CHUNK))
+        got = torch.cat([torch.as_tensor(c_.mol_energy, dtype=torch.float64).reshape(-1) for c_ in chk])
+        off = (got - want[idx[chk_kept]]).abs()
+        stored_check = dict(rows=int(off.numel()), median=float(off.median()), max=float(off.max()), tol=args.energy_tol)
+        print(f"stored energies: {off.numel()} anchors re-scored through the MLIP, |re-score - stored| median "
+              f"{float(off.median()):.3g}, max {float(off.max()):.3g} (bar {args.energy_tol:g})", flush=True)
+        if not float(off.max()) <= args.energy_tol:
+            raise SystemExit('--stored_energies: a re-scored anchor misses its stored energy past --energy_tol')
+        scored, kept = score(ef, anchors, T, args.device, args.chunk, stored=want)
+    else:
+        scored, kept = score(ef, anchors, T, args.device, args.chunk, forces=args.forces)
     anchors_no_point = int((~kept).sum())
     if anchors_no_point:
         print(f"anchors: {anchors_no_point} of {kept.numel()} rows have no {chart} chart point; dropped", flush=True)
@@ -659,15 +709,19 @@ def main(argv=None):
         print(f"children: K {args.k} per basin from its kernel ({args.shape}, tau {args.tau:g}, caps "
               f"{list(args.caps)}): width medians per block (A, rad, frac, rad) "
               f"{[round(float(widths[:, 3 * j:3 * j + 3].median()), 4) for j in range(4)]}", flush=True)
+    elif args.k == 0:   # no children: no kick, so nothing to calibrate (the pilot would score PILOT_ROWS x the grid)
+        log_hi, table = None, None
     elif str(args.log_hi) == 'auto':
         print(f"calibrating log_hi on {min(PILOT_ROWS, len(train_idx))} training anchors (target median excess "
               f"{args.window_kT:g} kT at T {T:g})", flush=True)
         log_hi, table = calibrate(ef, anchors, e_anchor, train_idx, T, args, rng)
     else:
         log_hi, table = float(args.log_hi), None
-    if not basin_children:
+    if not basin_children and args.k > 0:
         print(f"children: K {args.k} per anchor, {args.child_kernel} kick at 10^U({args.log_lo:g}, {log_hi:g}) "
               f"({KICK_UNITS[args.child_kernel]})", flush=True)
+    elif args.k == 0:
+        print("children: no kicked children (K 0), no kick calibration", flush=True)
 
     sg = set(torch.as_tensor(anchors.sg_ind).reshape(-1).tolist())
     zp = set(torch.as_tensor(anchors.z_prime).reshape(-1).tolist())
@@ -709,6 +763,11 @@ def main(argv=None):
         if (lo // per_call) % 20 == 0:
             done = min(lo + per_call, anchors.num_graphs)
             print(f"  children of {done} / {anchors.num_graphs} anchors, {time.time() - t0:.0f} s", flush=True)
+    if args.self_children:   # each anchor once more as its own radius-0 child: the scored terms, copied
+        children = [anchors.subsample_new_batch(torch.arange(anchors.num_graphs))]
+        parents.append(torch.arange(anchors.num_graphs))
+        mags.append(torch.zeros(anchors.num_graphs))
+        print(f"children: {anchors.num_graphs} self children (each anchor at radius 0, no energy call)", flush=True)
     children = collate(children) if children else None
     parents = torch.cat(parents) if parents else torch.zeros(0, dtype=torch.long)
     mags = torch.cat(mags) if mags else torch.zeros(0)
@@ -778,7 +837,8 @@ def main(argv=None):
         forces=None if not args.forces else dict(
             column='force', of='mol_energy', wrt='the FD chart point (noised_prior.fd_chart_points)',
             units='run energy units per chart unit', lj_envelope=ef.analyze_kwargs.get('lj_envelope')),
-        k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
+        k=args.k, self_children=bool(args.self_children), stored_energies=stored_check,
+        log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
         kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,
         temperature=T, heldout_frac=None if args.heldout_units else args.heldout_frac,

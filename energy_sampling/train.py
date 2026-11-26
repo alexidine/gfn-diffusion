@@ -8952,6 +8952,10 @@ class Modeller:
     MLE_KICK_ROUNDS = 3
     #: rows per origin, and the bars, of the smoke currency check (nats; units of T on mol_energy)
     STORE_CURRENCY_ROWS, STORE_CURRENCY_TOL, STORE_CURRENCY_REL = 64, 1e-2, 1e-5
+    #: the uma route's bars are this many times wider: it runs TF32 (MXtalTools crystal_inference_settings), and the same
+    #: crystal re-scored in another batch moved by 0.05 kJ/mol at 482 kJ/mol, log R by 0.02 nats (UMA-s 1.1, acridine,
+    #: 2026-11-25)
+    STORE_CURRENCY_UMA = 10.0
 
     def store_settings(self):
         """buffers.store merged over config_invariants.ROW_STORE_DEFAULTS when enabled, else None."""
@@ -9641,9 +9645,15 @@ class Modeller:
         """smoke: for each origin present, re-scores STORE_CURRENCY_ROWS stored rows through st.x and st.mol_batch and
         raises when log R differs by more than STORE_CURRENCY_TOL nats or a row's mol_energy by more than
         STORE_CURRENCY_TOL x T + STORE_CURRENCY_REL x |E| (float32 pair sums at |E| ~ 1e4 differ by ~0.05 between two
-        re-score batch sizes). Reads no global generator."""
+        re-score batch sizes). The energy bar judges only rows at or below the energy clip (energy_function.energy_clip,
+        when armed): above it the reward reads the energy log-compressed, and an MLIP's float32 energy of an overlapping
+        cell (MACE-CSP on acridine, 2026-11-25: a row at 9e5 kJ/mol moved by ~2e2 between batches, its log R by 1e-4
+        nats) is judged by log R alone. On the uma route both bars are STORE_CURRENCY_UMA times wider (TF32). Reads no
+        global generator."""
         st, ef = self.row_store, self.energy_function
         T = float(self.args.energy_config.temperature)
+        wide = self.STORE_CURRENCY_UMA if getattr(self.args, 'energy_function', None) == 'uma' else 1.0
+        tol = self.STORE_CURRENCY_TOL * wide
         live = torch.nonzero(st.kind[:st.high_water] != crystal_store.FREE).flatten()
         rng = np.random.default_rng([int(self.args.seed), int(self.step_ind)])
         names = {crystal_store.ORIGIN_ROLLOUT: 'rollout', crystal_store.ORIGIN_EVAL: 'eval',
@@ -9661,13 +9671,19 @@ class Modeller:
                                           internal_oom_recovery=True)
             d_r = float((log_r.detach().float().flatten().cpu() - st.log_r[at]).abs().max())
             gap = (torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu() - st.energy[at]).abs()
-            bar = self.STORE_CURRENCY_TOL * T + self.STORE_CURRENCY_REL * st.energy[at].abs()
+            bar = tol * T + self.STORE_CURRENCY_REL * wide * st.energy[at].abs()
+            clip = getattr(ef, 'energy_clip', None)
+            judged = torch.ones_like(gap, dtype=torch.bool) if clip is None else st.energy[at] <= float(clip)
+            gap = torch.where(judged, gap, torch.zeros_like(gap))
             d_e = float(gap.max())
-            line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e}")
-            if not (d_r <= self.STORE_CURRENCY_TOL and bool((gap <= bar).all())):
+            w = int((gap / bar).argmax())
+            line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e} over the "
+                        f"{int(judged.sum())} at or below the energy clip (row furthest past its bar: stored "
+                        f"{float(st.energy[at][w]):.4g}, re-scored {float(torch.as_tensor(scored.mol_energy).flatten()[w]):.4g}, "
+                        f"packing {float(torch.as_tensor(scored.packing_coeff).flatten()[w]):.3g})")
+            if not (d_r <= tol and bool((gap <= bar).all())):
                 raise RuntimeError(f"store currency check at step {int(self.step_ind)}: {line[-1]} (bars "
-                                   f"{self.STORE_CURRENCY_TOL:g} nats, {self.STORE_CURRENCY_TOL * T:g} energy units + "
-                                   f"{self.STORE_CURRENCY_REL:g} |E|)")
+                                   f"{tol:g} nats, {tol * T:g} energy units + {self.STORE_CURRENCY_REL * wide:g} |E|)")
         print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
 
     STORE_IMPROVED_RTOL = 1e-5

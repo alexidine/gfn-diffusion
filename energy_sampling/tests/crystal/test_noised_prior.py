@@ -132,6 +132,19 @@ def test_compare_terms_passes_float_noise_and_fails_a_real_miss():
     assert ratio > 1.0 and abs(worst - 2.0) < 1e-6 and abs(per['elj'] - 2.0) < 1e-6
 
 
+def test_compare_terms_widens_the_uma_energy_bar_only():
+    """UMA runs TF32: a 0.3 kJ/mol re-score drift passes on the uma term and fails on any other energy term."""
+    rest = dict(reduction_en=torch.zeros(2), packing_coeff=torch.tensor([0.7, 0.7]), cell_volume=torch.tensor([9e2, 8e2]))
+    e = torch.tensor([-100.0, -50.0])
+    for name, passes in (('uma', True), ('mace', False)):
+        stored = types.SimpleNamespace(**{name: e}, **rest)
+        fresh = types.SimpleNamespace(**{name: e + 0.3}, **rest)
+        ratio, _, _ = NP.compare_terms(stored, fresh, name)
+        assert (ratio <= 1.0) == passes
+    stored = types.SimpleNamespace(uma=e, **rest)
+    assert NP.compare_terms(stored, types.SimpleNamespace(uma=e + 5.0, **rest), 'uma')[0] > 1.0
+
+
 def test_identity_compares_the_current_definition_only():
     current = dict(energy_function='elj', lj_coeff=1.0)
     assert NP.identity_mismatch({**current, 'crystal_coordinates': 'latent'}, current) == []

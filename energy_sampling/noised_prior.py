@@ -33,6 +33,11 @@ TAGS = ('noised_kind', 'noised_split', 'noised_parent')
 # off by more than FAIL_TOL on any of them fails the run outright
 CHECK_TERMS = ('reduction_en', 'packing_coeff', 'cell_volume')
 ABS_TOL, REL_TOL = 0.1, 1e-4   # energy units: two scorings of one crystal differ by up to ~0.06 raw eLJ in float noise
+#: the entry check's tolerances are this many times wider on the uma route's energy term (2 kJ/mol, the UMA-family
+#: --energy_tol of the acridine builds): it runs TF32, and one acridine row re-scored by the same code in another batch
+#: moved 0.28 kJ/mol (UMA-s 1.1, 2026-11-25); a search's recorded UMA energy (a --stored_energies prior) against the
+#: trainer's differs by a median 0.02 and up to ~1.1 kJ/mol (cause not pinned down; 512-row entry check, 2026-11-26)
+UMA_TOL_SCALE = 20.0
 CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
@@ -479,9 +484,18 @@ def basin_draw(p, hand, L, sg, radius, rows, chart, fd_coordinates=None, redraws
     return out, ~pending
 
 
+def _plain_settings(value):
+    """A settings block (a dict, or the Namespace yaml nests it as) as a dict with sorted keys; None stays None."""
+    if value is None:
+        return None
+    d = dict(vars(value)) if hasattr(value, '__dict__') else dict(value)
+    return {k: d[k] for k in sorted(d)}
+
+
 def identity(args, energy_function):
     """What is baked into a stored row's energy terms, so a file is read only by runs that would score it the same:
-    the energy function and its weights, the analysis settings as resolved (MolecularCrystal.analyze_crystal_batch's
+    the energy function and its weights, the MACE route's D3 settings (energy_config.mlip_dispersion; a file without
+    the key reads as None, no dispersion), the analysis settings as resolved (MolecularCrystal.analyze_crystal_batch's
     defaults, then energy_config.analyze_kwargs), the MLIP density guard, the legacy triclinic wall switch, the space
     groups and Z' the run builds, and the eLJ coefficient the energies are scaled by. Not the state chart
     (energy_config.crystal_coordinates): the stored terms are the crystal's, and the chart's Jacobian is recomputed from
@@ -499,6 +513,7 @@ def identity(args, energy_function):
         'analyze_kwargs': {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
                            for k, v in sorted(analyze.items())},
         'mlip_max_packing_coeff': getattr(ec, 'mlip_max_packing_coeff', None),
+        'mlip_dispersion': _plain_settings(getattr(ec, 'mlip_dispersion', None)),
         'legacy_triclinic_walls': os.environ.get('MXT_LEGACY_TRICLINIC_WALLS'),
         'space_groups': [int(s) for s in args.space_groups],
         'z_primes': [int(z) for z in args.z_primes],
@@ -587,7 +602,8 @@ def check_rows(batch, n=CHECK_ROWS, seed=0):
 
 def compare_terms(stored, fresh, energy_attr):
     """(worst relative-tolerance ratio, worst absolute miss, per-term worst misses) of a re-scored sample against
-    its stored rows, over the energy attribute and CHECK_TERMS. A ratio <= 1 passes."""
+    its stored rows, over the energy attribute and CHECK_TERMS. A ratio <= 1 passes. The uma energy term takes
+    UMA_TOL_SCALE times the tolerances."""
     worst_ratio, worst_abs, per_term = 0.0, 0.0, {}
     for name in (energy_attr,) + CHECK_TERMS:
         a = torch.as_tensor(getattr(stored, name)).reshape(-1).double().cpu()
@@ -598,7 +614,8 @@ def compare_terms(stored, fresh, energy_attr):
         if not bool((torch.isfinite(a) == torch.isfinite(b)).all()):
             return float('inf'), float('inf'), {name: float('inf')}
         d = (a[both] - b[both]).abs()
-        tol = ABS_TOL + REL_TOL * a[both].abs()
+        scale = UMA_TOL_SCALE if name == 'uma' else 1.0
+        tol = scale * (ABS_TOL + REL_TOL * a[both].abs())
         per_term[name] = float(d.max()) if d.numel() else 0.0
         if d.numel():
             worst_ratio = max(worst_ratio, float((d / tol).max()))
