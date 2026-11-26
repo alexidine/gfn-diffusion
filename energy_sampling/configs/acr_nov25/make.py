@@ -13,6 +13,9 @@
             conditions file is the lowest training anchor (molecule_split_files.py).
   smoke     `smoke: true`, SMOKE_MLE_STEPS MLE then SMOKE_TB_STEPS TB steps.
   sbatch    submit_acr_nov25.sbatch: one arm per array index, the smokes first (0-4), then the full arms (5-9).
+  mle_*     the MLE stage alone (owner 2026-11-26): MLE_ONLY_STEPS steps on the live kernel, then snapshot phase1_exit
+            and stop; evaluations every MLE_EVAL_PERIOD steps on MLE_EVAL_SAMPLES draws (the only MLIP calls of an
+            MLE stage), so the compute goes to MLE steps. submit_acr_nov25_mle.sbatch: indices 0-4 in MODELS order.
 
 usage: python configs/acr_nov25/make.py                       (cluster arms and the sbatch file)
        python configs/acr_nov25/make.py --local DIR --prior P --conditions C [--model M]
@@ -52,6 +55,7 @@ PYEXTRA = {'macecspl': '/scratch/mk8347/pylibs_dftd', 'umas1p2': '/scratch/mk834
 MACE_MAX_PACKING, CLASH_BELOW = 1.0, -1000.0
 MLE_STEPS, TB_STEPS = 50000, 100000      # not calibrated for one molecule: the smoke and the first run's curves decide
 SMOKE_MLE_STEPS, SMOKE_TB_STEPS = 300, 600
+MLE_ONLY_STEPS, MLE_EVAL_PERIOD, MLE_EVAL_SAMPLES = 50000, 5000, 2000
 RAMP_STEPS = p4.RAMP_STEPS
 
 
@@ -88,11 +92,24 @@ def smoke(cfg):
     return cfg
 
 
-def sbatch(arms):
+def mle_arm(model, files, steps=MLE_ONLY_STEPS, local=False):
+    """arm() with the MLE stage alone: it ends at phase1_exit and stops; evaluations every MLE_EVAL_PERIOD steps on
+    MLE_EVAL_SAMPLES draws."""
+    cfg = arm(model, files, mle_steps=steps, local=local)
+    mle = p4._mle(cfg)
+    mle.update(max_steps=steps, on_exit=['snapshot:phase1_exit', 'stop'])
+    cfg['protocols'][uni.PROTOCOL]['stages'] = [mle]
+    cfg.update(run_name=f'mle_{model}', epochs=steps + uni.LOOP_MARGIN, eval_period=MLE_EVAL_PERIOD,
+               eval_num_samples=MLE_EVAL_SAMPLES, test_eval_num_samples=min(MLE_EVAL_SAMPLES,
+                                                                            cfg['test_eval_num_samples']))
+    return cfg
+
+
+def sbatch(arms, tag=TAG):
     """submit_acr_nov25.sbatch from unified_nov23's template: one arm per array index (smokes first), no held-out
     molecule file, an arm's model's extra PYTHONPATH (PYEXTRA: torch-dftd for MACE-CSP, fairchem 2.16 for UMA-s 1.2)."""
     text = (HERE.parent / 'unified_nov23' / 'submit_template.sbatch').read_text(encoding='utf-8')
-    text = (text.replace('@TAG@', TAG).replace('@ARMS@', ' '.join(arms)).replace('@NARMS@', str(len(arms) - 1))
+    text = (text.replace('@TAG@', tag).replace('@ARMS@', ' '.join(arms)).replace('@NARMS@', str(len(arms) - 1))
             .replace('@RAM_GB@', str(MEM_GB)))
     old = '    for KEY in prior_path molecules_path test_molecules_path; do'
     assert text.count(old) == 1
@@ -120,11 +137,14 @@ if __name__ == '__main__':
     ap.add_argument('--conditions', default=None)
     ap.add_argument('--model', default='macecspl', choices=list(MODELS))
     ap.add_argument('--ckdir', default=None)
+    ap.add_argument('--mle', action='store_true', help='local: the MLE-only arm, SMOKE_MLE_STEPS steps')
     a = ap.parse_args()
     if a.local:
         out = Path(a.local)
         out.mkdir(parents=True, exist_ok=True)
-        c = smoke(arm(a.model, {'prior': a.prior, 'conditions': a.conditions}, local=True))
+        files = {'prior': a.prior, 'conditions': a.conditions}
+        c = (mle_arm(a.model, files, steps=SMOKE_MLE_STEPS, local=True) if a.mle
+             else smoke(arm(a.model, files, local=True)))
         uni.localize(c, a.ckdir or str(out / 'checkpoints'), eval_samples=500, eval_period=100)
         c['zsg_panel'] = {'enabled': False, 'molecules': 8}
         write(f'local_{a.model}', c, out)
@@ -135,3 +155,8 @@ if __name__ == '__main__':
         arms = [f'smoke_{m}' for m in MODELS] + list(MODELS)
         (HERE / f'submit_{TAG}.sbatch').write_text(sbatch(arms), encoding='utf-8', newline='\n')
         print(HERE / f'submit_{TAG}.sbatch', ': indices', ', '.join(f'{i} {a}' for i, a in enumerate(arms)))
+        for m in MODELS:
+            write(f'mle_{m}', mle_arm(m, prior_files(m)))
+        mle_arms = [f'mle_{m}' for m in MODELS]
+        (HERE / f'submit_{TAG}_mle.sbatch').write_text(sbatch(mle_arms), encoding='utf-8', newline='\n')
+        print(HERE / f'submit_{TAG}_mle.sbatch', ': indices', ', '.join(f'{i} {a}' for i, a in enumerate(mle_arms)))
