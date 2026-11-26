@@ -11,8 +11,10 @@
 #SBATCH --array=0-4
 #SBATCH --output=/scratch/mk8347/logs/%x-%A_%a.out
 
-# acr_nov25 priors (make.py): one array task per model, in MODELS order. Each turns the model's band set (MXtalTools
-# configs/crystal_searches/acr_mlip_nov19/band.py, uploaded to BAND) into
+# acr_nov25 priors (make.py): one array task per model, in MODELS order. Each makes
+#   0. BAND        the model's band set from its search trajectories (MXtalTools
+#                  configs/crystal_searches/acr_mlip_nov19/band.py: 10 kT, 0.1 A net, C2 images, recorded energies, no
+#                  MLIP call), unless BAND exists; then turns it into
 #   1. PRIOR       acr_<model>_k0.pt: every anchor scored once through the trainer's own analysis under the model, with
 #                  forces; no kicked children (--k 0: MLE draws the live physical kernel), each anchor written again as
 #                  its own radius-0 child (--self_children: the TB stage's backward rows), held-out crystals by descent group
@@ -38,7 +40,8 @@ case ${MODEL} in   # the container's fairchem 2.13 cannot build UMA 1.2; it has 
     *)        PYEXTRA= ;;
 esac
 mkdir -p ${OUT}
-if [ ! -s ${BAND}/meta.json ]; then echo "FATAL: no band set ${BAND} (upload it from the dev box)" >&2; exit 1; fi
+SEARCH=$(dirname ${BAND})/${MODEL}_search_traj.pt
+if [ ! -d ${BAND} ] && [ ! -s ${SEARCH} ]; then echo "FATAL: no band set ${BAND} and no trajectories ${SEARCH}" >&2; exit 1; fi
 if [ ! -s ${WORKDIR}/configs/acr_nov25/${MODEL}.yaml ]; then echo "FATAL: no config ${MODEL}.yaml (git pull)" >&2; exit 1; fi
 echo "acr_nov25 prior ${MODEL}: band ${BAND}; gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse --short=12 HEAD)  MXtalTools $(git -C ${PROJECT_ROOT}/MXtalTools rev-parse --short=12 HEAD)"
 
@@ -53,6 +56,7 @@ srun singularity exec --nv \
         source /ext3/env.sh
         export PYTHONPATH=${PYEXTRA:+${PYEXTRA}:}${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
+        [ -d ${BAND} ] || python -u ${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/acr_mlip_nov19/band.py ${MODEL}             --device cuda
         [ -s ${OUT}/${PRIOR} ] || python -u data_processing/build_noised_prior.py --config configs/acr_nov25/${MODEL}.yaml \
             --basins ${BAND} --k 0 --self_children --child_kernel metric --forces --device cuda --chunk 64 --out ${OUT}/${PRIOR}
         [ -s ${OUT}/acr_${MODEL}_k0_conditions.pt ] || python -u data_processing/molecule_split_files.py conditions \
