@@ -41,7 +41,7 @@ case ${MODEL} in   # the container's fairchem 2.13 cannot build UMA 1.2; it has 
 esac
 mkdir -p ${OUT}
 SEARCH=$(dirname ${BAND})/${MODEL}_search_traj.pt
-if [ ! -d ${BAND} ] && [ ! -s ${SEARCH} ]; then echo "FATAL: no band set ${BAND} and no trajectories ${SEARCH}" >&2; exit 1; fi
+if [ ! -s ${BAND}/meta.json ] && [ ! -s ${SEARCH} ]; then echo "FATAL: no band set ${BAND} and no trajectories ${SEARCH}" >&2; exit 1; fi
 if [ ! -s ${WORKDIR}/configs/acr_nov25/${MODEL}.yaml ]; then echo "FATAL: no config ${MODEL}.yaml (git pull)" >&2; exit 1; fi
 echo "acr_nov25 prior ${MODEL}: band ${BAND}; gfn-diffusion $(git -C ${PROJECT_ROOT}/gfn-diffusion rev-parse --short=12 HEAD)  MXtalTools $(git -C ${PROJECT_ROOT}/MXtalTools rev-parse --short=12 HEAD)"
 
@@ -56,7 +56,7 @@ srun singularity exec --nv \
         source /ext3/env.sh
         export PYTHONPATH=${PYEXTRA:+${PYEXTRA}:}${PROJECT_ROOT}/MXtalTools:${PROJECT_ROOT}/gfn-diffusion:\$PYTHONPATH
         export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
-        [ -d ${BAND} ] || python -u ${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/acr_mlip_nov19/band.py ${MODEL}             --device cuda
+        [ -s ${BAND}/meta.json ] || python -u ${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/acr_mlip_nov19/band.py ${MODEL}             --device cuda
         [ -s ${OUT}/${PRIOR} ] || python -u data_processing/build_noised_prior.py --config configs/acr_nov25/${MODEL}.yaml \
             --basins ${BAND} --k 0 --self_children --child_kernel metric --forces --device cuda --chunk 64 --out ${OUT}/${PRIOR}
         [ -s ${OUT}/acr_${MODEL}_k0_conditions.pt ] || python -u data_processing/molecule_split_files.py conditions \
