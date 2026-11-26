@@ -48,6 +48,14 @@ DEVICE = torch.device('cpu')
 B = 5
 TRAJ = 6
 
+
+def _mini_csd_path():
+    """mini_new_csd.pt beside the IMPORTED mxtaltools package, so a worktree outside
+    mxt_gfn/ (no sibling mxtaltools directory) still finds it."""
+    import mxtaltools
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(mxtaltools.__file__))),
+                        'mini_datasets', 'mini_new_csd.pt')
+
 # Recorded from the tree immediately BEFORE the dead-row change, via this same
 # harness. Any drift here means a shared code path moved, not just the new one.
 PRECHANGE = {
@@ -570,11 +578,7 @@ def test_end_to_end_physically_inert():
 
     Needs real structures, so it is skipped when the mini dataset is unavailable.
     """
-    import os
-    # _here is .../gfn_diffusion/energy_sampling, so two levels up is the repo root that
-    # holds mxtaltools -- same expression as the sys.path setup at the top of this file
-    path = os.path.join(os.path.dirname(os.path.dirname(_here)),
-                        'mxtaltools', 'mini_datasets', 'mini_new_csd.pt')
+    path = _mini_csd_path()
     if not os.path.exists(path):
         print(f"SKIP end-to-end inertness (dataset not found at {path})")
         return
@@ -751,9 +755,7 @@ def test_rotation_magnitude_clamp_covers_every_aunit():
     Not a D33 defect, but D33's Z'=2 work is what reached it, and the dead-row machinery
     shares this layout -- so the assertion belongs next to the layout tests.
     """
-    import os
-    path = os.path.abspath(os.path.join(_here, '..', '..', 'mxtaltools',
-                                        'mini_datasets', 'mini_new_csd.pt'))
+    path = _mini_csd_path()
     if not os.path.exists(path):
         # LOUD, not a quiet skip. The first version of this test had a garbled path, so it
         # skipped and the suite still printed ALL TESTS PASSED -- a test written to catch

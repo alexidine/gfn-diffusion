@@ -225,6 +225,11 @@ def test_a_full_resume_re_arms_the_guard():
     restored = ConditionLogZTracker.from_state_dict(t.state_dict())
     assert restored.requires_phys_energy is False
     m = _arm_stub(restored, flow=True)
+    # init_condition_log_z reads the condition_log_z config before its resume branch
+    # (no section = the tracker defaults) and ends that branch in _set_tracker_trainable
+    # (a no-op off MolecularCrystal)
+    m.args = SimpleNamespace()
+    bind(m, '_set_tracker_trainable')
     Modeller.init_condition_log_z(m)
     assert m.condition_log_z.requires_phys_energy is True
 
@@ -521,13 +526,15 @@ def test_top_up_record_breakers_are_judged_in_the_anchor_currency():
             anchor_buffer=cfg, prior_buffer=SimpleNamespace(reward_min=math.inf))),
         energy_function=SimpleNamespace(
             prior_flow=FLOW, bounding_coeff=1.0,
-            log_reward=lambda x, b, logT, **kw: (torch.tensor([50.0, 150.0]), b)),
+            log_reward=lambda x, b, logT, **kw: (torch.tensor([50.0, 150.0]), b),
+            unreferenced_log_r=lambda log_r, cid: log_r),     # no energy reference installed
         # anchor_inds: the seam takes the drawn rows' anchor-buffer indices (the
         # shaped-tile key); unread on this stub, which is the iso path
         _noise_and_condition=lambda b, r, anchor_inds=None: (b, torch.zeros(2), None, b.condition_id),
         _batch_latents=lambda b: torch.zeros(2, 4),
         _condition_energy_floor=lambda cid: None)
-    bind(m, '_anchor_energy_phys', '_anchor_energy')
+    # the real static-prior gate: no prior_is_prenoised and no prior_buffer.static, so not static
+    bind(m, '_anchor_energy_phys', '_anchor_energy', '_prior_is_static', '_prior_static_flag')
     Modeller.top_up_prior_from_anchors(m, 2)
     assert len(anchors.admitted) == 1 and anchors.admitted[0].tolist() == [40.0]
     assert float(t.best_energy_phys[0]) == 40.0 and float(t.best_energy[0]) == -150.0

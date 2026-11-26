@@ -31,13 +31,16 @@ for p in (_here, os.path.dirname(_here),
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import mxtaltools  # noqa: E402
 from mxtaltools.dataset_utils.utils import collate_data_list  # noqa: E402
 from energy_sampling.energies.molecular_crystal import MolecularCrystal  # noqa: E402
 from energy_sampling.energies.prior_flow import PriorFlow  # noqa: E402
 from energy_sampling.models.dead_latent_rows import resolve_dead_rows  # noqa: E402
 
-DATASET = os.path.abspath(os.path.join(_here, '..', '..', 'mxtaltools',
-                                       'mini_datasets', 'mini_new_csd.pt'))
+# beside the IMPORTED mxtaltools package, not beside this checkout: a worktree outside
+# mxt_gfn/ has no sibling mxtaltools directory
+DATASET = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(mxtaltools.__file__))),
+                       'mini_datasets', 'mini_new_csd.pt')
 SG, DIM = 2, 12
 MASK = [i in (10, 11) for i in range(DIM)]     # periodic_centroids OFF -> phi, r only
 _MOL = None
