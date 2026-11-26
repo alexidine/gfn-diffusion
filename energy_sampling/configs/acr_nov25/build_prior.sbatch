@@ -39,6 +39,18 @@ case ${MODEL} in   # the container's fairchem 2.13 cannot build UMA 1.2; it has 
     umas1p2)  PYEXTRA=/scratch/mk8347/pylibs_fc216 ;;
     *)        PYEXTRA= ;;
 esac
+# rows per scoring call: with --forces every row's graph is held to the call's backward, so the call, not the energy
+# function's internal chunking, sets the peak (UMA-s ~0.74 GB per row with gradients: 70.7 GB at 96 rows in the searches;
+# MACE-CSP L 3.1 GB at 8 rows on the dev box)
+# --energy_tol (kJ/mol): the build drops an anchor whose re-score misses the search's recorded energy by more. MACE-CSP
+# re-scores to 0.0014 at most (2,502-row test, dev box). UMA-s 1.1 differs by a median 0.02 and up to ~1.1 (2,986-row
+# test: 15% past 0.05, states and C2 images alike): the trainer hosts one gas-phase reference per molecule where the
+# search scored the gas leg at each row's orientation, and UMA is not exactly rotation-invariant. The stored terms are
+# the trainer's re-score either way; the bar is there to catch a wrong crystal, which misses by far more.
+case ${MODEL} in
+    umas1p1|umas1p2|esens) CHUNK=32; ETOL=2.0 ;;
+    *)                     CHUNK=64; ETOL=0.05 ;;
+esac
 mkdir -p ${OUT}
 SEARCH=$(dirname ${BAND})/${MODEL}_search_traj.pt
 if [ ! -s ${BAND}/meta.json ] && [ ! -s ${SEARCH} ]; then echo "FATAL: no band set ${BAND} and no trajectories ${SEARCH}" >&2; exit 1; fi
@@ -58,7 +70,7 @@ srun singularity exec --nv \
         export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
         [ -s ${BAND}/meta.json ] || python -u ${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/acr_mlip_nov19/band.py ${MODEL}             --device cuda
         [ -s ${OUT}/${PRIOR} ] || python -u data_processing/build_noised_prior.py --config configs/acr_nov25/${MODEL}.yaml \
-            --basins ${BAND} --k 0 --self_children --child_kernel metric --forces --device cuda --chunk 64 --out ${OUT}/${PRIOR}
+            --basins ${BAND} --k 0 --self_children --child_kernel metric --forces --device cuda --chunk ${CHUNK} --energy_tol ${ETOL} --out ${OUT}/${PRIOR}
         [ -s ${OUT}/acr_${MODEL}_k0_conditions.pt ] || python -u data_processing/molecule_split_files.py conditions \
             ${OUT}/${PRIOR} ${OUT}/acr_${MODEL}_k0_conditions.pt
         ls -la ${OUT}

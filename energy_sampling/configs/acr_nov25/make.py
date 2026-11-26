@@ -43,10 +43,11 @@ MODELS = {   # energy_function, cluster mlip_path, dev-box mlip_path, energy_con
 }
 RAM_GB, MEM_GB = 64, 128      # buffers.store.ram_gb (one molecule: a 0.45M-row prior and its replay) and #SBATCH --mem
 PYEXTRA = {'macecspl': '/scratch/mk8347/pylibs_dftd', 'umas1p2': '/scratch/mk8347/pylibs_fc216'}   # PYTHONPATH first
-#: the MACE route's density guard (energy_config.mlip_max_packing_coeff, read with implausible_energy_below): a cell
-#: denser than MACE_MAX_PACKING is not handed to MACE and is scored |CLASH_BELOW| kJ/mol per molecule. An early
-#: policy draws cells at packing ~2.4 whose MACE energy (~6e9) moves by ~4e4 with the batch it is scored in (local
-#: smoke, 2026-11-25); the prior's rows lie in packing 0.55-0.95
+#: the MLIP density guard (energy_config.mlip_max_packing_coeff, read with implausible_energy_below), every arm: a cell
+#: denser than MACE_MAX_PACKING is not handed to the MLIP and is scored |CLASH_BELOW| kJ/mol per molecule. An early
+#: policy draws cells at packing ~2.4 whose MACE energy (~6e9) moves by ~4e4 with the batch it is scored in, and under
+#: UMA-s 1.1 one such rollout asked 11 GB for one crystal (local smokes, 2026-11-25); the prior's rows lie in packing
+#: 0.55-0.95
 MACE_MAX_PACKING, CLASH_BELOW = 1.0, -1000.0
 MLE_STEPS, TB_STEPS = 50000, 100000      # not calibrated for one molecule: the smoke and the first run's curves decide
 SMOKE_MLE_STEPS, SMOKE_TB_STEPS = 300, 600
@@ -67,8 +68,9 @@ def arm(model, files, mle_steps=MLE_STEPS, tb_steps=TB_STEPS, local=False):
                space_groups=[14])
     cfg['energy_config']['mlip_dispersion'] = copy.deepcopy(disp)
     cfg['buffers']['store']['ram_gb'] = RAM_GB
-    if ef == 'mace':
-        cfg['energy_config'].update(mlip_max_packing_coeff=MACE_MAX_PACKING, implausible_energy_below=CLASH_BELOW)
+    cfg['energy_config'].update(mlip_max_packing_coeff=MACE_MAX_PACKING, implausible_energy_below=CLASH_BELOW)
+    if ef == 'uma':   # on, the backward through UMA raises CheckpointError: the prior build's forces (2026-11-25), as
+        cfg['energy_config']['mlip_activation_checkpointing'] = False   # the searches' relaxations (oct27)
     cfg['zsg_panel'] = {'enabled': False, 'molecules': 64}
     tb = p4._tb(cfg)
     assert tb['lr_schedule'] == [{'to': 0.2, 'steps': 0, 'kind': 'hold'}], tb['lr_schedule']

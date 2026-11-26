@@ -311,9 +311,11 @@ class MolecularCrystal(BaseSet):
                                          else float(implausible_energy_below))
         self.implausible_rows = 0          # rows the screen has replaced since the last drain_energy_timing
         if mlip_max_packing_coeff is not None:
-            if energy_function != 'mace':
-                raise ValueError(f'energy_config.mlip_max_packing_coeff is for the mace route (uma guards its own dense '
-                                 f'cells inside MXtalTools), not {energy_function!r}')
+            if energy_function not in ('mace', 'uma'):
+                # uma since 2026-11-25: MXtalTools' own uma guard inflates a cell only above packing 2.0, and an early
+                # policy's rollout at such a density asked 11 GB for one crystal (acridine, UMA-s 1.1)
+                raise ValueError(f'energy_config.mlip_max_packing_coeff is for the MLIP routes (mace, uma), not '
+                                 f'{energy_function!r}')
             if not float(mlip_max_packing_coeff) > 0:
                 raise ValueError(f'energy_config.mlip_max_packing_coeff must be positive, got {mlip_max_packing_coeff!r}')
             if self.implausible_energy_below is None:
