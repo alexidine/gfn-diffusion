@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=24:00:00
+#SBATCH --time=6:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=192G
 #SBATCH --cpus-per-task=8
@@ -15,11 +15,12 @@
 #   0. BAND        the model's band set from its search trajectories (MXtalTools
 #                  configs/crystal_searches/acr_mlip_nov19/band.py: 10 kT, 0.1 A net, C2 images, recorded energies, no
 #                  MLIP call), unless BAND exists; then turns it into
-#   1. PRIOR       acr_<model>_k0.pt: every anchor scored once through the trainer's own analysis under the model, with
-#                  forces; no kicked children (--k 0: MLE draws the live physical kernel), each anchor written again as
-#                  its own radius-0 child (--self_children: the TB stage's backward rows), held-out crystals by descent group
-#                  (the builder's default 0.05; a state and its C2 image share their group). The build compares each
-#                  anchor's energy with the search's (0.05 kJ/mol) and refuses the set when more than 20% are off.
+#   1. PRIOR       acr_<model>_k0.pt: every anchor at the energy its search recorded (--stored_energies: the trainer's
+#                  analysis computes the other terms, no MLIP call; 256 anchors re-scored through the MLIP as the check),
+#                  no forces (owner 2026-11-25: not needed); no kicked children (--k 0: MLE draws the live physical
+#                  kernel), each anchor written again as its own radius-0 child (--self_children: the TB stage's backward rows), held-out crystals by descent group
+#                  (the builder's default 0.05; a state and its C2 image share their group). The build refuses when a
+#                  re-scored check anchor misses its recorded energy by more than ETOL.
 #   2. CONDITIONS  acr_<model>_k0_conditions.pt (data_processing/molecule_split_files.py conditions).
 # The run config is the model's arm (configs/acr_nov25/<model>.yaml): its energy function, MLIP and D3 settings.
 # A step whose output exists is skipped, so resubmitting finishes what is left.
@@ -39,17 +40,13 @@ case ${MODEL} in   # the container's fairchem 2.13 cannot build UMA 1.2; it has 
     umas1p2)  PYEXTRA=/scratch/mk8347/pylibs_fc216 ;;
     *)        PYEXTRA= ;;
 esac
-# rows per scoring call: with --forces every row's graph is held to the call's backward, so the call, not the energy
-# function's internal chunking, sets the peak (UMA-s ~0.74 GB per row with gradients: 70.7 GB at 96 rows in the searches;
-# MACE-CSP L 3.1 GB at 8 rows on the dev box)
-# --energy_tol (kJ/mol): the build drops an anchor whose re-score misses the search's recorded energy by more. MACE-CSP
-# re-scores to 0.0014 at most (2,502-row test, dev box). UMA-s 1.1 differs by a median 0.02 and up to ~1.1 (2,986-row
-# test: 15% past 0.05, states and C2 images alike): the trainer hosts one gas-phase reference per molecule where the
-# search scored the gas leg at each row's orientation, and UMA is not exactly rotation-invariant. The stored terms are
-# the trainer's re-score either way; the bar is there to catch a wrong crystal, which misses by far more.
+# --energy_tol (kJ/mol): the build refuses when a re-scored check anchor misses the search's recorded energy by more.
+# MACE-CSP re-scores to 0.0014 at most (2,502-row test, dev box). The UMA-s 1.1 trainer energy differs from the search's
+# by a median 0.02 and up to ~1.1 (2,986-row test, states and C2 images alike; cause not pinned down), so the UMA family
+# takes 2.0; the bar is there to catch a wrong crystal, which misses by far more.
 case ${MODEL} in
-    umas1p1|umas1p2|esens) CHUNK=32; ETOL=2.0 ;;
-    *)                     CHUNK=64; ETOL=0.05 ;;
+    umas1p1|umas1p2|esens) ETOL=2.0 ;;
+    *)                     ETOL=0.05 ;;
 esac
 mkdir -p ${OUT}
 SEARCH=$(dirname ${BAND})/${MODEL}_search_traj.pt
@@ -70,7 +67,7 @@ srun singularity exec --nv \
         export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
         [ -s ${BAND}/meta.json ] || python -u ${PROJECT_ROOT}/MXtalTools/configs/crystal_searches/acr_mlip_nov19/band.py ${MODEL}             --device cuda
         [ -s ${OUT}/${PRIOR} ] || python -u data_processing/build_noised_prior.py --config configs/acr_nov25/${MODEL}.yaml \
-            --basins ${BAND} --k 0 --self_children --child_kernel metric --forces --device cuda --chunk ${CHUNK} --energy_tol ${ETOL} --out ${OUT}/${PRIOR}
+            --basins ${BAND} --k 0 --self_children --stored_energies --child_kernel metric --device cuda --chunk 4096 --energy_tol ${ETOL} --out ${OUT}/${PRIOR}
         [ -s ${OUT}/acr_${MODEL}_k0_conditions.pt ] || python -u data_processing/molecule_split_files.py conditions \
             ${OUT}/${PRIOR} ${OUT}/acr_${MODEL}_k0_conditions.pt
         ls -la ${OUT}

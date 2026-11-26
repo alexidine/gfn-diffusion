@@ -1005,6 +1005,12 @@ class MolecularCrystal(BaseSet):
         ~600, and the untrained flow's first evaluation failed at one crystal per call. The density wall already puts
         any such cell hundreds of kJ/mol above every crystal, so the guard moves no reward a sampler of the problem
         should see."""
+        stored = getattr(crystal_batch, 'stored_mlip_energy', None) if getattr(self, '_use_stored_mlip', False) else None
+        if stored is not None:   # use_stored_mlip_energy: every row's MLIP energy is given, the rest computed
+            rest = [k for k in self.computes if k != self.energy_function]
+            out = crystal_batch.analyze(rest, **analyze_kwargs) if rest else {}
+            out[self.energy_function] = torch.as_tensor(stored).reshape(-1).to(crystal_batch.device, torch.float32)
+            return out
         cap = self.mlip_max_packing_coeff
         if cap is not None:
             dense = crystal_batch.packing_coeff.flatten() > cap
@@ -1040,7 +1046,8 @@ class MolecularCrystal(BaseSet):
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
         self.stamp_lj_coeff(crystal_batch)
-        self.attach_gas_phase_reference(crystal_batch)
+        if not getattr(self, '_use_stored_mlip', False):   # a stored MLIP energy needs no gas leg
+            self.attach_gas_phase_reference(crystal_batch)
 
         analyze_kwargs = dict(cutoff=10,
                               supercell_size=10,
@@ -1106,6 +1113,23 @@ class MolecularCrystal(BaseSet):
     #: gflownet_losses.terminal_force_legs, which stores each leg's gradient so a
     #: replay row's terminal force can be re-mixed at a later lambda.
     REWARD_LEGS = ('flow', 'phys', 'bound')
+
+    @contextlib.contextmanager
+    def use_stored_mlip_energy(self):
+        """Inside the block, an analysed batch carrying ``stored_mlip_energy`` [B] (the MLIP route's energy key, kJ/mol
+        per molecule) takes it as each row's MLIP energy and computes only the other computes, with no MLIP call
+        (analyze_density_guarded). For rows whose MLIP energy is already known, e.g. a search's recorded descent states
+        (data_processing/build_noised_prior.py --stored_energies). A batch without the attribute is analysed as usual.
+        Not re-entrant."""
+        if self.energy_function not in ('mace', 'uma'):
+            raise ValueError(f'use_stored_mlip_energy is for the MLIP routes, not {self.energy_function!r}')
+        if getattr(self, '_use_stored_mlip', False):
+            raise RuntimeError('use_stored_mlip_energy blocks do not nest')
+        self._use_stored_mlip = True
+        try:
+            yield
+        finally:
+            self._use_stored_mlip = False
 
     @contextlib.contextmanager
     def capture_mol_energy(self):

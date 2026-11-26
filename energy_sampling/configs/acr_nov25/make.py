@@ -8,8 +8,9 @@
   prior     PRIORS[model]: the model's band set (MXtalTools configs/crystal_searches/acr_mlip_nov19/band.py: states
             within 10 kT of the lowest minimum, 0.1 A ball net, with each state's image under the molecule's C2),
             built by data_processing/build_noised_prior.py --basins with no kicked children (--k 0), each anchor again
-            as its own radius-0 child (--self_children: the TB stage draws its backward rows from children), and forces
-            (build_prior.sbatch); its conditions file is the lowest training anchor (molecule_split_files.py).
+            as its own radius-0 child (--self_children: the TB stage draws its backward rows from children), at the
+            energies the search recorded (--stored_energies: no MLIP pass; no forces) (build_prior.sbatch); its
+            conditions file is the lowest training anchor (molecule_split_files.py).
   smoke     `smoke: true`, SMOKE_MLE_STEPS MLE then SMOKE_TB_STEPS TB steps.
   sbatch    submit_acr_nov25.sbatch: one arm per array index, the smokes first (0-4), then the full arms (5-9).
 
