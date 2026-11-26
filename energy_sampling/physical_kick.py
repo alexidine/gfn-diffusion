@@ -433,10 +433,11 @@ def full_route(k: GroupKit, cell, t, R, radius):
 # the draw
 # ---------------------------------------------------------------------------
 
-def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None):
+def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None):
     """([n, d] float64 chart rows, counts) of fresh kicks of one group's anchors s [n, d] in [-1, 1]. Each row takes at
     most `tries` draws, then keeps its anchor. counts: rows, full_route (rows that used the full route in some draw),
-    redrawn (rows whose first draw had no chart point), kept (rows that kept their anchor)."""
+    redrawn (rows whose first draw had no chart point), kept (rows that kept their anchor). rho_out [n] (optional):
+    filled with each row's accepted step length (Angstrom), 0 for a row that kept its anchor."""
     n = len(s)
     cell, t, R = decode(k, ((s + 1) / 2).clamp(0, 1), radius)
     T = t_fc(cell)
@@ -456,6 +457,8 @@ def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None
             full[todo[rest]] = True
         good = state == 1
         out[todo[good]] = 2 * u[good].clamp(0, 1) - 1
+        if rho_out is not None:
+            rho_out[todo[good]] = st[good].norm(dim=1).to(rho_out.dtype)
         todo = todo[~good]
         if attempt == 0:
             redrawn = len(todo)
@@ -478,10 +481,11 @@ def single_thread():
 
 
 @torch.no_grad()
-def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None):
+def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None):
     """([n, dim] float32 CPU states in the run's slot layout, counts summed over the groups) of fresh kicks of the anchors
     `centres` [n, dim] (any device; only their chart slots are read) with space groups sg [n], molecule radii and radii
-    of gyration [n]. Runs on the CPU on one thread; a row of a group outside `kits` raises."""
+    of gyration [n]. Runs on the CPU on one thread; a row of a group outside `kits` raises. rho_out [n] float64 CPU
+    (optional): filled with each row's step length (Angstrom; 0 where the row kept its anchor), kick_group's."""
     centres, sg = centres.cpu(), torch.as_tensor(sg).reshape(-1).long().cpu()
     radius, rg = torch.as_tensor(radius).cpu().to(F64), torch.as_tensor(rg).cpu().to(F64)
     radius = torch.round(radius * 1e6) / 1e6        # the production chart's radius (MolecularCrystal.fd_coordinates_rows)
@@ -493,8 +497,11 @@ def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None):
                 raise ValueError(f"noised_prior.live_kernel 'physical': space group {g} has no table in this run "
                                  f"(built for {sorted(kits)})")
             k, at = kits[g], torch.nonzero(sg == g).flatten()
+            rho_g = None if rho_out is None else torch.zeros(len(at), dtype=F64)
             out, counts = kick_group(k, centres[at][:, k.slots].to(F64), radius[at], rg[at], log_lo, log_hi, tries,
-                                     generator)
+                                     generator, rho_out=rho_g)
+            if rho_out is not None:
+                rho_out[at] = rho_g
             row = torch.zeros(len(at), x.shape[1], dtype=torch.float32)
             row[:, k.slots] = out.to(torch.float32)
             x[at] = row

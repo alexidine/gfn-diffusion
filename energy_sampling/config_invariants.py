@@ -1564,6 +1564,17 @@ def _whole(v) -> bool:
     return _real(v) and int(v) == v
 
 
+def _stage_reads_reward(cfg: dict, st: dict) -> bool:
+    """Whether a stage reads rewards: a forward or replay share, a forward sidecar or rollout cadence, or a backward term
+    of BWD_REWARD_TERMS. An MLE stage (backward mle on the dataset draw, nothing else) does not."""
+    fracs = st.get('fracs') or {}
+    if any((_num(fracs.get(m)) or 0) > 0 for m in ('fwd', 'replay')):
+        return True
+    if st.get('fwd_z_sidecar') is True or (_num(st.get('fwd_rollout_every')) or 0) > 0:
+        return True
+    return any((_coeff(cfg, st, 'bwd', k) or 0) > 0 for k in BWD_REWARD_TERMS)
+
+
 def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
     """(severity, message) for every way an enabled buffers.store conflicts with the rest of the config. [] when the
     store is absent or off."""
@@ -1581,8 +1592,23 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         err(f"buffers.store needs model.kind nf, got {_get(cfg, 'policy.kind', 'sde')!r}")
     if _get(cfg, 'energy_function') in _CONFORMER_ENERGY_FUNCTIONS:
         err('buffers.store is refused on the conformer route')
-    if _get(cfg, 'temperature_conditioning', False) is True:
-        err('buffers.store stores log R at one temperature: refused with temperature_conditioning')
+    tcond = _get(cfg, 'temperature_conditioning', False) is True
+    kappa = _get(cfg, 'noised_prior.kick_kappa_per_atom')
+    if tcond:
+        reward_stages = [st.get('name', '?') for st in active_stages(cfg) if isinstance(st, dict)
+                         and _stage_reads_reward(cfg, st)]
+        if reward_stages:
+            err(f"buffers.store stores log R at one temperature: temperature_conditioning is refused with a stage that "
+                f"reads rewards ({reward_stages}); an MLE-only protocol may take it")
+        if kappa is None:
+            err('buffers.store with temperature_conditioning needs noised_prior.kick_kappa_per_atom: it labels each MLE '
+                'kick with its effective temperature (train.py::Modeller._kick_temperature)')
+        rng = _get(cfg, 'energy_config.log_temperature_range')
+        if not (isinstance(rng, (list, tuple)) and len(rng) == 2 and all(_real(v) for v in rng) and rng[0] < rng[1]):
+            err(f"temperature_conditioning needs energy_config.log_temperature_range [lo, hi] (log10 of kT, lo < hi): "
+                f"the condition scaler is fitted over it; got {rng!r}")
+    elif kappa is not None:
+        err('noised_prior.kick_kappa_per_atom without temperature_conditioning labels nothing (a dead key)')
     if _get(cfg, 'energy_config.prior_flow_path') is not None:
         err('buffers.store stores log R at admission: refused with energy_config.prior_flow_path (a lambda path)')
     if _get(cfg, 'buffers.replay_buffer.prioritise.enabled', False) is True:

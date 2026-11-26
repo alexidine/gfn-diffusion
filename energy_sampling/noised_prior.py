@@ -37,11 +37,15 @@ CHECK_ROWS = 512
 # the load-time defaults (cfg:noised_prior.*): an absent key reads these
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
-                live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row', live_log_range=None)
+                live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row', live_log_range=None,
+                kick_kappa_per_atom=None)
 #: window_by: the energy a child's energy window reads (window_energy): 'row' its own (a basin-kernel build always
 #: reads its basin's anchor), 'parent' its parent anchor's (noised_parent), so a minimum passes or fails the window
 #: with every kick of it, long kicks included
 WINDOW_BY = ('row', 'parent')
+#: kick_kappa_per_atom: kick stiffness per atom (energy units per molecule per A^2) that labels each live physical
+#: kick with an effective temperature T_eff = kappa_per_atom x atoms x rho^2 / d (train.py::Modeller._kick_temperature),
+#: the condition the MLE draw passes under temperature_conditioning. null = no labels
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
 #: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation;
@@ -149,6 +153,9 @@ def settings(args):
     k = s['live_bank']
     if isinstance(k, bool) or not isinstance(k, int) or k < 0:
         raise ValueError(f"noised_prior.live_bank must be an integer >= 0, got {k!r}")
+    v = s['kick_kappa_per_atom']
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0):
+        raise ValueError(f"noised_prior.kick_kappa_per_atom must be a finite number > 0 or null, got {v!r}")
     f = s['live_fresh_frac']
     if isinstance(f, bool) or not isinstance(f, (int, float)) or not 0 <= f <= 1:
         raise ValueError(f"noised_prior.live_fresh_frac must be a number in [0, 1], got {f!r}")

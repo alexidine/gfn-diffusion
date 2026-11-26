@@ -364,6 +364,9 @@ class MolecularCrystal(BaseSet):
         self.lj_rescale = lj_rescale
         self.pressure = pressure
         self.log_temperature_range = log_temperature_range
+        # temperature_conditioning: the temperature a condition draw takes when none is passed; None = a log-uniform draw
+        # over log_temperature_range (log10 of kT). Set by the trainer (train.py), not the config
+        self.untagged_temperature = None
         self.internal_oom_recovery = internal_oom_recovery
         self.analyze_kwargs = effective_analyze_kwargs(energy_function, analyze_kwargs)   # yaml nests dicts as Namespaces
         self.host_gas_phase_reference = bool(host_gas_phase_reference)
@@ -1922,8 +1925,10 @@ class MolecularCrystal(BaseSet):
             """
             sample temp range, or a fixed temp, or an override temp
             """
+            if temperature is None and self.untagged_temperature is not None:
+                temperature = torch.full((mol_batch.num_graphs,), float(self.untagged_temperature))
             if temperature is not None:
-                log_T_tensor = torch.log10(temperature)
+                log_T_tensor = torch.log10(torch.as_tensor(temperature, dtype=torch.float32))
             else:
                 # Uniform samples in [0, 1]
                 u = torch.rand(num_groups, dtype=torch.float32)
@@ -1932,7 +1937,9 @@ class MolecularCrystal(BaseSet):
                             self.log_temperature_range[1] - self.log_temperature_range[0])
                 log_T_tensor = log_T_tensor.repeat_interleave(repeats)
 
-            log_T_tensor = log_T_tensor.to(mol_batch.device)
+            # [n, 1], as the untagged branch below: the reward divides [n, 1] energies by 10 ** log_T, and a flat [n]
+            # tensor would broadcast against them
+            log_T_tensor = log_T_tensor.to(mol_batch.device).reshape(-1, 1)
             conds.append(log_T_tensor)
         else:
             log_T_tensor = torch.log10(

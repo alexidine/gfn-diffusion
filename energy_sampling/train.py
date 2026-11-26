@@ -4062,9 +4062,14 @@ class Modeller:
         if self.gfn_model.conditional:   # molecule mode standardises the columns that pass through beside the molecule
             mb = self.mol_dataset.batch
             cs = []
+            ef = self.energy_function
             for i in range(0, mb.num_graphs, chunk):
                 sub = mb.subsample_new_batch(torch.arange(i, min(i + chunk, mb.num_graphs), device=mb.ptr.device))
-                cs.append(self.energy_function.condition_samples(sub)[2].float().cpu())
+                temperature = None
+                if getattr(ef, 'temperature_conditioning', False):   # the temperature column over its declared range
+                    lo, hi = (float(v) for v in ef.log_temperature_range)
+                    temperature = 10 ** (lo + (hi - lo) * torch.rand(sub.num_graphs))
+                cs.append(ef.condition_samples(sub, temperature=temperature)[2].float().cpu())
             conds = torch.cat(cs)
         self.gfn_model.fit_data_scalers(lat, conds)
         print(f"policy data scalers fitted on {lat.shape[0]} prior rows"
@@ -5565,6 +5570,11 @@ class Modeller:
             # before ANY buffer is seeded: every reward from here on is in the run's currency
             self.init_energy_reference()
             self.fit_policy_data_scalers()   # a flow policy's standardisers; a no-op for the SDE policy
+            # the store route conditions every untagged draw (evals, rollouts, readouts) at the run's temperature; only
+            # the MLE draw tags rows with their own (_kick_temperature)
+            if (getattr(self.energy_function, 'temperature_conditioning', False)
+                    and self.store_settings() is not None):
+                self.energy_function.untagged_temperature = float(self.args.energy_config.temperature)
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
             # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
@@ -9266,43 +9276,71 @@ class Modeller:
             pool.clear()
         return self.row_store.invalidate_q_after(int(checkpoint_step))
 
-    def _kick_anchors(self, rows):
+    def _kick_anchors(self, rows, rho_out=None):
         """(x [n, d] float32, kept [n] bool) for the anchor slots `rows`: a fresh physical kick of each, from this run's
         own generator (seeded with seed + the launch step), so the global generators are neither read nor advanced.
-        kept: the kick ran out of tries and returned the anchor's own point."""
+        kept: the kick ran out of tries and returned the anchor's own point. rho_out [n] float64 (optional): each row's
+        step length in Angstrom (physical_kick.kick)."""
         K, st = self._physical, self.row_store
         rows = torch.as_tensor(rows).long().flatten().cpu()
         cid = st.cid[rows].long()
         x, counts = physical_kick.kick(K['kits'], st.x[rows], st.cond_sg[cid].long(), st.cond_radius[cid],
                                        st.cond_rg[cid], K['lo'], K['hi'],
-                                       1 + int(self._noised_prior_settings['live_redraws']), generator=K['gen'])
+                                       1 + int(self._noised_prior_settings['live_redraws']), generator=K['gen'],
+                                       **({} if rho_out is None else {'rho_out': rho_out}))
         for name, v in counts.items():
             K[name] += v
         self._physical_warn_full_route(K)
         return x, (x == st.x[rows]).all(1)
 
-    def _kick_fresh(self, rows):
+    def _kick_fresh(self, rows, with_rho=False):
         """(rows, x) of an MLE draw, which never holds an anchor point: a row whose kick kept its anchor is replaced by
         a kick of another uniformly drawn anchor, at most MLE_KICK_ROUNDS times, then dropped and counted. An empty
-        draw raises."""
+        draw raises. with_rho: (rows, x, rho), rho [n] float64 each kept row's step length (Angstrom)."""
         st = self.row_store
         rows = rows.clone()
-        x, kept = self._kick_anchors(rows)
+        rho = torch.zeros(rows.numel(), dtype=torch.float64) if with_rho else None
+        x, kept = self._kick_anchors(rows, rho_out=rho)
         for _ in range(self.MLE_KICK_ROUNDS):
             at = torch.nonzero(kept).flatten()
             if not at.numel():
                 break
             rows[at] = st.draw_anchors(at.numel(), by=self._store_cfg['mle_draw'])
-            x[at], again = self._kick_anchors(rows[at])
+            rho_at = torch.zeros(at.numel(), dtype=torch.float64) if with_rho else None
+            x[at], again = self._kick_anchors(rows[at], rho_out=rho_at)
+            if with_rho:
+                rho[at] = rho_at
             kept = torch.zeros_like(kept)
             kept[at] = again
         if bool(kept.any()):
             self._physical['mle_kept_dropped'] += int(kept.sum())
             rows, x = rows[~kept], x[~kept]
+            rho = None if rho is None else rho[~kept]
             if not rows.numel():
                 raise RuntimeError("buffers.store: no MLE draw left the anchor point after "
                                    f"{self.MLE_KICK_ROUNDS} rounds of redraws")
-        return rows, x
+        return (rows, x, rho) if with_rho else (rows, x)
+
+    def _kick_labels_temperature(self):
+        """Whether the MLE draw conditions each live kick on its effective temperature: temperature_conditioning on,
+        with noised_prior.kick_kappa_per_atom set (config_invariants refuses either without the other on the store
+        route)."""
+        s = getattr(self, '_noised_prior_settings', None) or {}
+        return (bool(getattr(self.energy_function, 'temperature_conditioning', False))
+                and s.get('kick_kappa_per_atom') is not None)
+
+    def _kick_temperature(self, rows, rho, mol):
+        """Each MLE row's effective temperature (energy units per molecule, as energy_config.temperature): a harmonic
+        kick of length rho costs about 0.5 kappa rho^2 and a Boltzmann sample has excess d kT / 2, so
+        T_eff = kappa rho^2 / d, with kappa = noised_prior.kick_kappa_per_atom x the molecule's atom count (the
+        stiffness grows about linearly with atoms) and d the live coordinates of the row's space group. mol: the rows'
+        molecule batch (one graph per row)."""
+        kits, st = self._physical['kits'], self.row_store
+        sg = st.cond_sg[st.cid[rows].long()].long()
+        d = torch.tensor([float(kits[int(g)].live.sum()) for g in sg.tolist()], dtype=torch.float64)
+        atoms = torch.diff(mol.ptr.cpu()).to(torch.float64)
+        kappa = float(self._noised_prior_settings['kick_kappa_per_atom']) * atoms
+        return (kappa * rho * rho / d).to(torch.float32)
 
     def _store_replay_rows(self, B):
         """(rows [B], importance weights [B] or None) of the replay draw over on-policy rows: conditions uniform, rows
@@ -9329,7 +9367,11 @@ class Modeller:
             if not self._bwd_draw_is_reward_free():
                 raise ValueError("buffers.store: the MLE draw is unscored fresh kicks, but this stage's bwd loss reads "
                                  "log R")
-            rows, x = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']))
+            labelled = self._kick_labels_temperature()
+            if labelled:
+                rows, x, rho = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']), with_rho=True)
+            else:
+                rows, x = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']))
             idx = rows.repeat_interleave(R)
             latents, log_reward, inds = x.repeat_interleave(R, 0).to(dev), None, None
             self._mle_rows_drawn = int(getattr(self, '_mle_rows_drawn', 0)) + int(idx.numel())
@@ -9344,7 +9386,18 @@ class Modeller:
             idx = rows.repeat_interleave(R)
             latents, log_reward, inds = st.x[idx].to(dev), st.log_r[idx].to(dev), (idx, st.epoch)
         mol = st.mol_batch(st.cid[idx]).to(dev)
-        mol, log_T, condition, cid = ef.condition_samples(mol, repeats=R, sg_inds=mol.sg_ind.reshape(-1).long(),
+        temperature = None
+        if kind == 'mle' and labelled:   # each kicked row conditions on its own effective temperature
+            t_eff = self._kick_temperature(rows, rho, st.mol_batch(st.cid[rows]))
+            if not getattr(self, '_kick_temperature_shown', False):
+                q = torch.quantile(t_eff.double(), torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)).tolist()
+                print(f"MLE kick temperatures (first draw, {t_eff.numel()} rows): P10 {q[0]:.3g}, median {q[1]:.3g}, "
+                      f"P90 {q[2]:.3g} (energy_config.temperature {float(self.args.energy_config.temperature):g})",
+                      flush=True)
+                self._kick_temperature_shown = True
+            temperature = t_eff.repeat_interleave(R).to(dev)
+        mol, log_T, condition, cid = ef.condition_samples(mol, temperature=temperature, repeats=R,
+                                                          sg_inds=mol.sg_ind.reshape(-1).long(),
                                                           z_primes=mol.z_prime.reshape(-1).long())
         traj = None
         if kind == 'replay':
@@ -10487,11 +10540,11 @@ class Modeller:
         rows = cand[torch.randperm(cand.numel(), generator=g)[:int(n_mol)]].sort().values
         ef = self.energy_function
         m = rows.numel()
-        if getattr(ef, 'temperature_conditioning', False):
+        if getattr(ef, 'temperature_conditioning', False) and getattr(ef, 'untagged_temperature', None) is None:
             lo, hi = (float(v) for v in ef.log_temperature_range)
             temps = torch.pow(10.0, lo + torch.rand(m, generator=g) * (hi - lo))
-        else:
-            temps = torch.full((m,), float(ef.temperature))
+        else:   # the store route's temperature-conditioned panel reads at the run's temperature, as every untagged draw
+            temps = torch.full((m,), float(getattr(ef, 'untagged_temperature', None) or ef.temperature))
         zps = torch.as_tensor([int(z) for z in getattr(ef, 'z_primes', None) or [1]], dtype=torch.long)
         zp = zps[torch.randint(len(zps), (m,), generator=g)]
         cache[attr] = {'rows': rows, 'temps': temps.float(), 'zp': zp}
@@ -14437,7 +14490,8 @@ class Modeller:
                 init_state = get_gfn_init_state(bsz,
                                                 self.energy_function.data_ndim, self.device)
 
-                if self.args.temperature_conditioning:
+                if (self.args.temperature_conditioning
+                        and getattr(self.energy_function, 'untagged_temperature', None) is None):
                     u = torch.rand(mol_batch.num_graphs, dtype=torch.float32, device=self.device)
                     # Transform to [log_low, log_high]
                     random_log_T_tensor = (self.energy_function.log_temperature_range[0] + u *
@@ -14449,7 +14503,7 @@ class Modeller:
                     random_temperatures = 10 ** random_log_T_tensor
                     temperatures = random_temperatures
 
-                else:
+                else:   # the store route's untagged draws take the run's temperature (MolecularCrystal.untagged_temperature)
                     temperatures = self.energy_function.temperature * torch.ones(mol_batch.num_graphs,
                                                                                  dtype=torch.float32,
                                                                                  device=self.device)

@@ -569,7 +569,7 @@ def _load_setup(layout, kits, monkeypatch, train=None):
     m._fd_chart_points_cached = lambda p, path: (torch.ones(n, dtype=torch.bool), None, None)
     m._attach_fd_reference = lambda p, points: points[0]
     m._score_prior_rows = lambda b, announce=False: (None, None)
-    m._stored_reward_terms = lambda p: (torch.zeros(n, dtype=F64), torch.zeros(n, dtype=F64))
+    m._stored_reward_terms = lambda p, **kw: (torch.zeros(n, dtype=F64), torch.zeros(n, dtype=F64))
     return m, prior, kinds, dict(format_version=noised_prior.FORMAT_VERSION, identity={})
 
 

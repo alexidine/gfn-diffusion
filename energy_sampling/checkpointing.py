@@ -984,6 +984,11 @@ class Checkpointer:
             if asked != held:
                 raise ValueError(f"model.{key} is {asked:g} in this run's config and {held:g} in the "
                                  f"checkpoint: the saved state encoder was trained on the checkpoint's window")
+        if frames_follow_run and self._adds_temperature_column(config):
+            want = int(self.modeller.get_conditioning_dim())
+            print(f"gfn_config['conditions_dim']: checkpoint {config.get('conditions_dim')!r} -> config {want} "
+                  f"(the temperature column, added with zero weight)")
+            config['conditions_dim'] = want
         for key in self.RECONFIGURABLE_GFN_KEYS + self.FORCE_DRIFT_GFN_KEYS:
             if key not in current:
                 continue
@@ -1022,6 +1027,69 @@ class Checkpointer:
                 out[key] = torch.cat([old[:1], pad, old[1 + k_old:]])
                 print(f"{what}: {key} re-laid for {k_new} frame columns (checkpoint {k_old}); the condition "
                       f"columns' scaling carries over")
+        return state if out is None else out
+
+    def _adds_temperature_column(self, config) -> bool:
+        """Whether this run asks for exactly one condition column more than the checkpoint's gfn_config, the temperature
+        column: temperature_conditioning on here, and the run's condition width the checkpoint's plus one."""
+        m = self.modeller
+        if not bool(getattr(m.args, 'temperature_conditioning', False)) or not hasattr(m, 'get_conditioning_dim'):
+            return False
+        return int(m.get_conditioning_dim()) == int(config.get('conditions_dim') or 0) + 1
+
+    def _retempered_state(self, model, state, what):
+        """`state` with the temperature condition column added to each NF conditional flow (models/spline_flow.py::
+        _ContextFlow), when the model has one condition column more than the checkpoint (_adds_temperature_column).
+
+        Temperature is the first condition column (MolecularCrystal.condition_samples), and the condition columns are
+        the tail of the context and level heads' inputs (_ContextFlow.context_input), so the column goes in at the start
+        of that tail: a zero column in `context.inp.weight` and `level.inp.weight`, so the loaded policy is the
+        checkpoint's at every temperature. The condition scaler (c_mu, c_sd: [row id, frame columns, condition
+        columns]) gets the column's mean and spread over energy_config.log_temperature_range, as a fresh fit over a
+        uniform draw would. Shared modules are walked under every name, as the state dict lists them. Prints what it
+        added."""
+        from models.spline_flow import _ContextFlow
+        rng = getattr(self.modeller.args.energy_config, 'log_temperature_range', None)
+        out = None
+        names, done = {}, set()
+        for name, mod in model.named_modules(remove_duplicate=False):
+            names.setdefault(id(mod), []).append(name)
+        for name, mod in model.named_modules(remove_duplicate=False):
+            if not isinstance(mod, _ContextFlow):
+                continue
+            pre = f'{name}.' if name else ''
+            mu_key, sd_key = f'{pre}c_mu', f'{pre}c_sd'
+            if mu_key not in state or state[mu_key].numel() + 1 != mod.c_mu.numel():
+                continue
+            if rng is None:
+                raise RuntimeError(f"{what}: adding the temperature column needs energy_config.log_temperature_range")
+            if not getattr(mod, 'atoms', False):
+                raise NotImplementedError(f"{what}: adding the temperature column is implemented for the molecule "
+                                          f"(atom-token) flow only, whose condition columns follow the row id")
+            lo, hi = (float(v) for v in rng)
+            at = 1 + int(mod.frame_cols)                         # the first condition column in the scaler
+            n_cond_old = state[mu_key].numel() - at
+            out = dict(state) if out is None else out
+            for key, val in ((mu_key, 0.5 * (lo + hi)), (sd_key, max((hi - lo) / 12 ** 0.5, 1e-4))):
+                old = state[key]
+                out[key] = torch.cat([old[:at], old.new_tensor([val]), old[at:]])
+            for head in ('context', 'level'):
+                sub_mod = getattr(mod, head)
+                # the head is registered under other names too (e.g. flow_model.head, conditions_embedding_model.context):
+                # every name the state dict lists for it gets the column
+                for key in [f'{n}.inp.weight' if n else 'inp.weight' for n in names[id(sub_mod)]]:
+                    if key not in state or key in done:
+                        continue
+                    w = state[key]
+                    want = sub_mod.inp.weight.shape[1]
+                    if w.shape[1] + 1 != want:
+                        raise RuntimeError(f"{what}: {key} has {w.shape[1]} inputs and this model's {want}; adding "
+                                           f"the temperature column accounts for one")
+                    col = w.shape[1] - n_cond_old                     # the start of the condition columns' tail
+                    out[key] = torch.cat([w[:, :col], w.new_zeros(w.shape[0], 1), w[:, col:]], 1)
+                    done.add(key)
+            print(f"{what}: {pre or 'flow '}temperature column added (zero weight; scaler mean {0.5 * (lo + hi):.3g}, "
+                  f"sd {(hi - lo) / 12 ** 0.5:.3g} in log10 kT)")
         return state if out is None else out
 
     def _load_state(self, model, state, what, in_place: bool = False):
@@ -1193,7 +1261,12 @@ class Checkpointer:
     #: in it) is exemptible because the MLE stage is reward-free, so its weights do
     #: not depend on T, and the weights-only path restores no stored reward, buffer or
     #: Z level: a TB stage entered on them re-levels log Z (bootstrap_z) at its own T.
-    WARM_START_EXEMPTIBLE = ('prior_path', 'energy_config.temperature')
+    #: temp_cond and energy_config.log_temperature_range are exemptible so a run with
+    #: temperature conditioning can start from weights trained without it: the load adds
+    #: the temperature column with zero weight (_retempered_state), so the loaded policy
+    #: is the checkpoint's at every temperature until it trains.
+    WARM_START_EXEMPTIBLE = ('prior_path', 'energy_config.temperature', 'temp_cond',
+                             'energy_config.log_temperature_range')
 
     def _warm_start_ignore_keys(self):
         """Problem-def keys this run is permitted to warm-start ACROSS.
@@ -1248,7 +1321,8 @@ class Checkpointer:
         self.assert_problem_match(checkpoint, path, 'checkpoint_name', ignore_keys=ignore)
         m.gfn_config = self._gfn_config_from(checkpoint, frames_follow_run=True)
         m.gfn_model = self._build_gfn(m.gfn_config).to(m.device)
-        self._load_state(m.gfn_model, self._reframed_state(m.gfn_model, checkpoint['model_train'], path),
+        self._load_state(m.gfn_model, self._reframed_state(
+            m.gfn_model, self._retempered_state(m.gfn_model, checkpoint['model_train'], path), path),
                          f'{path} (model_train)')
         self._install_ema(checkpoint, path)
         self._restore_pb_snapshot(checkpoint)
