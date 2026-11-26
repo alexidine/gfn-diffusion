@@ -752,8 +752,11 @@ class MolecularCrystal(BaseSet):
                 delattr(crystal_batch, 'fd_state')
             params, hand, log_ref = self.fd_rows_to_params(x, crystal_batch)
             crystal_batch.set_cell_parameters(params)
-            crystal_batch.aunit_handedness = hand.reshape(crystal_batch.aunit_handedness.shape).to(
-                crystal_batch.aunit_handedness.dtype)
+            # an MLIP route clones mol_batch (no blank crystal batch), and a molecule batch may hold no handedness:
+            # then the slot is made as init_blank_crystal_batch makes it, [B, max_z_prime]
+            old = getattr(crystal_batch, 'aunit_handedness', None)
+            shape = old.shape if old is not None else (crystal_batch.num_graphs, self.max_z_prime)
+            crystal_batch.aunit_handedness = hand.reshape(shape).to(old.dtype if old is not None else torch.float32)
             crystal_batch.fd_log_reference = log_ref
             # the chart row this crystal was built from (as clamped by fd_rows_to_params), so a stored draw is never
             # canonicalised again (train.py _batch_latents reads it)

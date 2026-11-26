@@ -24,7 +24,7 @@ the search's endpoint mode) carries no basin_H, and --child_kernel basin refuses
 
 CHILDREN. Each anchor is kicked K times by MolCrystalOps.log_noise_latent_parameters(log_lo, log_hi) (a unit
 direction in the gauge-free latent times 10^U(log_lo, log_hi), clipped, decoded, hard-cleaned) and scored. With
---log_hi auto, log_hi is calibrated first: a pilot of PILOT_ROWS training anchors is kicked at each fixed radius
+--log_hi auto, log_hi is calibrated first (not at --k 0: no children, no pilot): a pilot of PILOT_ROWS training anchors is kicked at each fixed radius
 10^h for h in PILOT_GRID, and log_hi is the h whose median seed-energy excess over the parent
 (MolecularCrystal.seed_energy_from, in kT at the run's temperature) lies nearest --window_kT; the table goes in the
 manifest. Every finite child is kept whatever its energy: the energy and packing windows are load-time settings.
@@ -36,6 +36,11 @@ With --basins and --child_kernel basin, the K children of a basin are instead dr
 drawn trainer-box image; basin_kick): no calibration, no image step, a draw with no chart point after --redraws
 redraws dropped and counted (manifest basin_kernel.misses). The manifest's child_kernel 'basin' makes the loader's energy
 window read each child at its basin's energy (noised_prior.window_energy); the packing window still cuts draws one by one.
+
+SELF CHILDREN (--self_children, --k 0 only). The store route's MLE kicks anchors live and its TB stage draws its
+backward rows from children only (train.py::Modeller._store_draw); a band set's anchors are scored states already (a
+search's recorded descent states), so each is also written as a child of itself, noised_radius 0, every scored term
+copied, no energy call (manifest self_children). The TB stage's dataset growth adds kicked children beside them.
 
 IMAGES (owner rule 2026-09-28: noise first, then the normaliser images). On space group 2, Z' 1, handedness +1
 (data_processing/symmetrize_prior.py's scope), each child is written as one of its valid descriptions drawn
@@ -124,6 +129,9 @@ def build_parser():
     p.add_argument('--harvest', default=None, help='a glob of train.py harvest shards (cfg:harvest) to merge in')
     p.add_argument('--forces', action='store_true',
                    help="FD chart only: store each row's force, d mol_energy / d its FD chart point (score)")
+    p.add_argument('--self_children', action='store_true',
+                   help='with --k 0: write each anchor again as a child of itself at radius 0, its scored terms copied '
+                        '(no energy call), so a store-route run has scored rows for its TB stage; see SELF CHILDREN')
     return p
 
 
@@ -576,6 +584,8 @@ def main(argv=None):
         raise SystemExit('give exactly one of --source and --basins')
     basin_children = args.child_kernel == 'basin'
     check_child_kernel_args(args)
+    if args.self_children and args.k != 0:
+        raise SystemExit('--self_children writes each anchor as its own child: it takes --k 0')
     basins = None
     if args.basins is not None:
         anchors, tsf, what, basins = load_basin_anchors(args, run_args)
@@ -659,15 +669,19 @@ def main(argv=None):
         print(f"children: K {args.k} per basin from its kernel ({args.shape}, tau {args.tau:g}, caps "
               f"{list(args.caps)}): width medians per block (A, rad, frac, rad) "
               f"{[round(float(widths[:, 3 * j:3 * j + 3].median()), 4) for j in range(4)]}", flush=True)
+    elif args.k == 0:   # no children: no kick, so nothing to calibrate (the pilot would score PILOT_ROWS x the grid)
+        log_hi, table = None, None
     elif str(args.log_hi) == 'auto':
         print(f"calibrating log_hi on {min(PILOT_ROWS, len(train_idx))} training anchors (target median excess "
               f"{args.window_kT:g} kT at T {T:g})", flush=True)
         log_hi, table = calibrate(ef, anchors, e_anchor, train_idx, T, args, rng)
     else:
         log_hi, table = float(args.log_hi), None
-    if not basin_children:
+    if not basin_children and args.k > 0:
         print(f"children: K {args.k} per anchor, {args.child_kernel} kick at 10^U({args.log_lo:g}, {log_hi:g}) "
               f"({KICK_UNITS[args.child_kernel]})", flush=True)
+    elif args.k == 0:
+        print("children: no kicked children (K 0), no kick calibration", flush=True)
 
     sg = set(torch.as_tensor(anchors.sg_ind).reshape(-1).tolist())
     zp = set(torch.as_tensor(anchors.z_prime).reshape(-1).tolist())
@@ -709,6 +723,11 @@ def main(argv=None):
         if (lo // per_call) % 20 == 0:
             done = min(lo + per_call, anchors.num_graphs)
             print(f"  children of {done} / {anchors.num_graphs} anchors, {time.time() - t0:.0f} s", flush=True)
+    if args.self_children:   # each anchor once more as its own radius-0 child: the scored terms, copied
+        children = [anchors.subsample_new_batch(torch.arange(anchors.num_graphs))]
+        parents.append(torch.arange(anchors.num_graphs))
+        mags.append(torch.zeros(anchors.num_graphs))
+        print(f"children: {anchors.num_graphs} self children (each anchor at radius 0, no energy call)", flush=True)
     children = collate(children) if children else None
     parents = torch.cat(parents) if parents else torch.zeros(0, dtype=torch.long)
     mags = torch.cat(mags) if mags else torch.zeros(0)
@@ -778,7 +797,8 @@ def main(argv=None):
         forces=None if not args.forces else dict(
             column='force', of='mol_energy', wrt='the FD chart point (noised_prior.fd_chart_points)',
             units='run energy units per chart unit', lj_envelope=ef.analyze_kwargs.get('lj_envelope')),
-        k=args.k, log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
+        k=args.k, self_children=bool(args.self_children),
+        log_lo=None if basin_children else args.log_lo, log_hi=log_hi, calibration=table,
         kick_units=KICK_UNITS.get(args.child_kernel),
         window_kT_target=args.window_kT,
         temperature=T, heldout_frac=None if args.heldout_units else args.heldout_frac,

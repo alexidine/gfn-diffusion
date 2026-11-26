@@ -9588,7 +9588,10 @@ class Modeller:
         """smoke: for each origin present, re-scores STORE_CURRENCY_ROWS stored rows through st.x and st.mol_batch and
         raises when log R differs by more than STORE_CURRENCY_TOL nats or a row's mol_energy by more than
         STORE_CURRENCY_TOL x T + STORE_CURRENCY_REL x |E| (float32 pair sums at |E| ~ 1e4 differ by ~0.05 between two
-        re-score batch sizes). Reads no global generator."""
+        re-score batch sizes). The energy bar judges only rows at or below the energy clip (energy_function.energy_clip,
+        when armed): above it the reward reads the energy log-compressed, and an MLIP's float32 energy of an overlapping
+        cell (MACE-CSP on acridine, 2026-11-25: a row at 9e5 kJ/mol moved by ~2e2 between batches, its log R by 1e-4
+        nats) is judged by log R alone. Reads no global generator."""
         st, ef = self.row_store, self.energy_function
         T = float(self.args.energy_config.temperature)
         live = torch.nonzero(st.kind[:st.high_water] != crystal_store.FREE).flatten()
@@ -9609,8 +9612,15 @@ class Modeller:
             d_r = float((log_r.detach().float().flatten().cpu() - st.log_r[at]).abs().max())
             gap = (torch.as_tensor(scored.mol_energy).detach().float().flatten().cpu() - st.energy[at]).abs()
             bar = self.STORE_CURRENCY_TOL * T + self.STORE_CURRENCY_REL * st.energy[at].abs()
+            clip = getattr(ef, 'energy_clip', None)
+            judged = torch.ones_like(gap, dtype=torch.bool) if clip is None else st.energy[at] <= float(clip)
+            gap = torch.where(judged, gap, torch.zeros_like(gap))
             d_e = float(gap.max())
-            line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e}")
+            w = int((gap / bar).argmax())
+            line.append(f"{names[o]} {at.numel()} rows, |d log R| {d_r:.2e} nats, |d E| {d_e:.2e} over the "
+                        f"{int(judged.sum())} at or below the energy clip (row furthest past its bar: stored "
+                        f"{float(st.energy[at][w]):.4g}, re-scored {float(torch.as_tensor(scored.mol_energy).flatten()[w]):.4g}, "
+                        f"packing {float(torch.as_tensor(scored.packing_coeff).flatten()[w]):.3g})")
             if not (d_r <= self.STORE_CURRENCY_TOL and bool((gap <= bar).all())):
                 raise RuntimeError(f"store currency check at step {int(self.step_ind)}: {line[-1]} (bars "
                                    f"{self.STORE_CURRENCY_TOL:g} nats, {self.STORE_CURRENCY_TOL * T:g} energy units + "

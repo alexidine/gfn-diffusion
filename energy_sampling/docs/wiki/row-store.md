@@ -129,7 +129,7 @@ The divergence rewind calls `Modeller._store_rewind`, which runs `CrystalStore.i
 
 *The store's readouts. The counters from `store/rows` to `store/kick_in_window_frac` run over the whole run; the `*_draw_*` keys cover the training draws since the last eval (`Modeller._tally_store_draw`, in `Modeller._store_draw` before rows are tiled by `repeats`, counting the rows of a step that then fails; `Modeller._store_draw_readouts` clears them at each read); the on-policy, weight and `conditions_improved` keys read the store as it stands (`Modeller._store_population_readouts`, O(rows)).*
 
-Under `cfg:smoke`, `Modeller._store_check_currency` re-scores up to `Modeller.STORE_CURRENCY_ROWS` rows of each origin present through `x` and the template at every eval, and raises when $\log R$ differs by more than `Modeller.STORE_CURRENCY_TOL` nats or `mol_energy` by more than that times $T$.
+Under `cfg:smoke`, `Modeller._store_check_currency` re-scores up to `Modeller.STORE_CURRENCY_ROWS` rows of each origin present through `x` and the template at every eval, and raises when $\log R$ differs by more than `Modeller.STORE_CURRENCY_TOL` nats or `mol_energy` by more than that times $T$ plus `Modeller.STORE_CURRENCY_REL` times $|E|$. The energy bar judges only rows at or below the armed energy clip (`energy_clip` of the energy function): above it the reward reads the energy log-compressed, and an MLIP's float32 energy of an overlapping cell moves with the batch it is scored in (MACE-CSP on acridine, 2026-11-25: a row at 9e5 kJ/mol by about 2e2, its $\log R$ by 1e-4 nats), so such rows are judged by $\log R$ alone. Its message names the row furthest past its bar, with both energies and the row's packing coefficient.
 
 ## Refusals
 

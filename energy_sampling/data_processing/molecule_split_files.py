@@ -63,7 +63,7 @@ def conditions(src, out):
     first[1:] = ids[rows][1:] != ids[rows][:-1]
     keep = torch.as_tensor(np.sort(rows[first]))
     sub = b.subsample_new_batch(keep)
-    torch.save({'prior': sub, 'thermal_scaling_factor': d['thermal_scaling_factor'],
+    torch.save({'prior': sub, 'thermal_scaling_factor': d.get('thermal_scaling_factor'),   # None on an MLIP prior
                 'note': f'one condition row per training molecule: its lowest training anchor; from {src}'}, out)
     print(f'{out}: {len(keep)} rows; {len(set(ids.tolist()))} molecules in the prior, '
           f'{len(set(ids.tolist())) - len(keep)} without a training anchor in the packing window')
@@ -95,7 +95,7 @@ def heldout(src, stem, windows, per_molecule=None, max_molecules=None, seed=0):
         keep = torch.as_tensor(np.sort(rows))
         sub = b.subsample_new_batch(keep)
         out = f'{stem}_w{w:g}.pt'
-        torch.save({'prior': sub, 'thermal_scaling_factor': d['thermal_scaling_factor'],
+        torch.save({'prior': sub, 'thermal_scaling_factor': d.get('thermal_scaling_factor'),   # None on an MLIP prior
                     'note': f'held-out molecules: anchors within {w:g} kT (T {T_KT}) of each molecule floor, packing '
                             f'in {PW}, at most {per_molecule} per molecule, {len(mols)} molecules; from {src}'}, out)
         counts = np.unique(ids[keep.numpy()], return_counts=True)[1]
