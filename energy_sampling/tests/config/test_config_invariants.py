@@ -1349,6 +1349,16 @@ def test_an_unknown_z_feed_or_a_non_positive_eval_half_life_is_an_error(canonica
     assert not _fires(canonical, 'z_feed_is_well_formed')
 
 
+def test_an_unknown_or_dead_weight_decay_kind_is_an_error(canonical):
+    # full coverage: tests/infra/test_weight_decay_kind.py
+    assert not _fires(canonical, 'weight_decay_is_well_formed')
+    assert _fires(broken(canonical, weight_decay_kind='adamw'), 'weight_decay_is_well_formed')
+    assert _fires(broken(canonical, weight_decay_kind='decoupled', use_weight_decay=False),
+                  'weight_decay_is_well_formed')
+    assert not _fires(broken(canonical, weight_decay_kind='decoupled', use_weight_decay=True),
+                      'weight_decay_is_well_formed')
+
+
 def test_an_nf_policy_refuses_sde_only_settings(canonical):
     """Under model.kind nf an SDE-only setting refuses at load; the canonical keys pass once the auto clip (fitted
     to SDE gradients) is given a number. Full coverage: tests/models/test_nf_policy.py."""

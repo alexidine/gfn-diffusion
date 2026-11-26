@@ -2971,6 +2971,27 @@ def z_feed_is_well_formed(cfg: dict) -> list[Violation]:
                              f"condition_log_z.eval_half_life_visits {hl!r} is not a finite number > 0"))
     return out
 
+
+def weight_decay_is_well_formed(cfg: dict) -> list[Violation]:
+    """weight_decay_kind is 'l2' (Adam, the decay term added to the gradient) or 'decoupled' (AdamW on the policy,
+    none on the Z head); Modeller's optimizer setup raises on any other value. 'decoupled' with use_weight_decay
+    false decays nothing (a dead key). use_weight_decay true needs a finite weight_decay >= 0. Absence is judged:
+    an unset weight_decay_kind is the code default 'l2'."""
+    out = []
+    kind = _get(cfg, 'weight_decay_kind', 'l2')
+    on = _get(cfg, 'use_weight_decay', False) is True
+    if kind not in ('l2', 'decoupled'):
+        out.append(Violation(ERROR, 'weight_decay_is_well_formed',
+                             f"weight_decay_kind {kind!r} is not one of ('l2', 'decoupled')"))
+    elif kind == 'decoupled' and not on:
+        out.append(Violation(ERROR, 'weight_decay_is_well_formed',
+                             "weight_decay_kind 'decoupled' with use_weight_decay false decays nothing"))
+    wd = _get(cfg, 'weight_decay', None)
+    if on and not (_real(wd) and wd >= 0):
+        out.append(Violation(ERROR, 'weight_decay_is_well_formed',
+                             f"use_weight_decay true needs a finite weight_decay >= 0, got {wd!r}"))
+    return out
+
 def heldout_gate_is_well_formed(cfg: dict) -> list[Violation]:
     """`heldout_gate` parses through progress_metrics.parse_heldout_gate, the parser
     Modeller.__init__ runs (absent = the code defaults, progress_metrics._HELDOUT_GATE)."""
@@ -3038,6 +3059,7 @@ RULES = (
     conditional_z_settings_are_conditional,
     energy_reference_is_consistent,
     z_feed_is_well_formed,
+    weight_decay_is_well_formed,
     heldout_gate_is_well_formed,
     zsg_panel_is_well_formed,
     auto_lr_requires_lr_control,

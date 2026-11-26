@@ -4522,6 +4522,15 @@ class Modeller:
 
         self.optimizers = {}
         weight_decay = self.args.weight_decay if self.args.use_weight_decay else 0
+        # weight_decay_kind: 'l2' adds weight_decay x w to the gradient inside Adam (torch Adam), so its strength is
+        # relative to the loss gradient and it reaches the Z head; 'decoupled' shrinks every policy weight by
+        # lr x weight_decay per optimizer step (torch AdamW), and the Z head (flow_model) gets none: its level must
+        # not be pulled toward zero.
+        wd_kind = getattr(self.args, 'weight_decay_kind', 'l2')
+        if wd_kind not in ('l2', 'decoupled'):
+            raise ValueError(f"weight_decay_kind must be 'l2' or 'decoupled', got {wd_kind!r}")
+        PolicyAdam = torch.optim.AdamW if wd_kind == 'decoupled' else torch.optim.Adam
+        flow_weight_decay = 0.0 if wd_kind == 'decoupled' else weight_decay
         # FUSED ADAM ON CUDA. The default (foreach) path computes its bias
         # corrections in Python -- `1 - beta1 ** _get_value(step)` per parameter
         # tensor, and `_get_value` is `.item()` -- so it performs TWO
@@ -4542,11 +4551,11 @@ class Modeller:
         fused_ok = (str(getattr(self, 'device', 'cpu')).startswith('cuda')
                     and os.environ.get('MXT_FUSED_ADAM', '1') != '0')
         adam_kw = {'fused': True} if fused_ok else {}
-        print(f'optimizers: Adam fused={fused_ok}')
+        print(f'optimizers: {PolicyAdam.__name__} fused={fused_ok} weight_decay={weight_decay} ({wd_kind})')
         # the turn-taking policy optimizers are identical up to their LR
         for mode in ('fwd', 'bwd', 'replay'):
-            self.optimizers[mode] = torch.optim.Adam(get_policy_params(self.gfn_model), init_policy_lrs[mode],
-                                                     weight_decay=weight_decay, **adam_kw)
+            self.optimizers[mode] = PolicyAdam(get_policy_params(self.gfn_model), init_policy_lrs[mode],
+                                               weight_decay=weight_decay, **adam_kw)
         # a fused stage fires fwd/bwd/replay in one backward(), so -- unlike the
         # turn-taking fwd/bwd/replay optimizers, which piggyback on optimizers['flow']
         # via step_loss's non-fused branch -- the flow (Z head) params must ride the
@@ -4557,13 +4566,13 @@ class Modeller:
         # anneal. On a fused step where the fwd sub-loss (the only Z-training branch) is
         # skipped, these params simply get grad=None and Adam skips them -- no spurious
         # update.
-        self.optimizers['fused'] = torch.optim.Adam(
+        self.optimizers['fused'] = PolicyAdam(
             get_policy_params(self.gfn_model) + [{'params': self.gfn_model.flow_model.parameters(),
-                                                  'lr': init_flow_lr}],
+                                                  'lr': init_flow_lr, 'weight_decay': flow_weight_decay}],
             init_policy_lrs['fused'], weight_decay=weight_decay, **adam_kw)
         flow_params = self.gfn_model.flow_model.parameters()
         self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr,
-                                                   weight_decay=weight_decay, **adam_kw)
+                                                   weight_decay=flow_weight_decay, **adam_kw)
 
         # The ray probe -- DIAGNOSTIC ONLY, and off unless a stage declares
         # `lr_sensor: {kind: ray}`. It reaches no learning rate: alpha* was

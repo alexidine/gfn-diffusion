@@ -74,6 +74,7 @@ max_lr: null                 # hard ceiling on every group's rate, applied AFTER
 
 weight_decay: 1.0e-4
 use_weight_decay: false
+weight_decay_kind: l2        # l2: Adam, weight_decay x w added to the gradient (Z head included); decoupled: AdamW on the policy, w shrinks by lr x weight_decay per step, Z head none
 # ============================================================================
 # CONVERGENCE / EXIT CRITERION -- rate of improvement, not slope.
 # PUBLISHED AND NOT CONSUMED unless a stage names `gates/progress_done` in its
