@@ -290,6 +290,18 @@ def test_stamp_compare_reads_nan_as_equal_and_names_the_key():
     assert stamp_diff(None, STAMP) == ['<whole stamp>']
 
 
+def test_a_setting_added_later_at_none_leaves_an_older_stamp_valid():
+    """noised_prior.DEFAULTS gained kick_kappa_per_atom (None) in 8c246f74: a store written before it must still
+    restore into its own run, and a setting that is actually set still refuses."""
+    old = {'noised_prior_settings': {'window_kT': 6.0, 'train_kinds': ['child']},
+           'noised_prior_identity': {'energy_function': 'molecular_crystal'}}
+    new = {'noised_prior_settings': {'window_kT': 6.0, 'train_kinds': ['child'], 'kick_kappa_per_atom': None},
+           'noised_prior_identity': {'energy_function': 'molecular_crystal', 'mlip_dispersion': None}}
+    assert stamp_diff(old, new) == []
+    assert stamp_diff(old, dict(new, noised_prior_settings=dict(new['noised_prior_settings'],
+                                                                 kick_kappa_per_atom=14.9))) == ['noised_prior_settings']
+
+
 # ---- rewind --------------------------------------------------------------------------------------------------
 
 

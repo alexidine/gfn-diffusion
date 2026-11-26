@@ -135,11 +135,22 @@ def _stamp_close(a, b):
                                                      equal_nan=True).all())
 
 
+def _drop_unset(v):
+    """v with every None-valued dict entry removed, at any depth: a setting stored as None reads the same as one the
+    stamp's writer did not know, so a key added later at a None default leaves older stamps valid."""
+    if isinstance(v, dict):
+        return {k: _drop_unset(x) for k, x in v.items() if x is not None}
+    if isinstance(v, (list, tuple)):
+        return [_drop_unset(x) for x in v]
+    return v
+
+
 def stamp_diff(a, b):
-    """The top-level keys on which two stamps differ. Tuples read as lists and NaN equals NaN. The _STAMP_CLOSE keys are
-    recomputed from the rows at each launch, so they are compared within the seed digest's tolerances."""
+    """The top-level keys on which two stamps differ. Tuples read as lists, NaN equals NaN, and inside a nested dict a
+    None-valued entry equals an absent one (_drop_unset). The _STAMP_CLOSE keys are recomputed from the rows at each
+    launch, so they are compared within the seed digest's tolerances."""
     def canon(v):
-        return json.dumps(v, sort_keys=True, default=str)
+        return json.dumps(_drop_unset(v), sort_keys=True, default=str)
     if not (isinstance(a, dict) and isinstance(b, dict)):
         return [] if canon(a) == canon(b) else ['<whole stamp>']
 

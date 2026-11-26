@@ -1049,7 +1049,7 @@ class Checkpointer:
         uniform draw would. Shared modules are walked under every name, as the state dict lists them. Prints what it
         added."""
         from models.spline_flow import _ContextFlow
-        rng = getattr(self.modeller.args.energy_config, 'log_temperature_range', None)
+        rng = getattr(getattr(self.modeller.args, 'energy_config', None), 'log_temperature_range', None)
         out = None
         names, done = {}, set()
         for name, mod in model.named_modules(remove_duplicate=False):
