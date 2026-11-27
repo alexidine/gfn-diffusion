@@ -1415,23 +1415,28 @@ def nf_orient_split_is_well_formed(cfg: dict) -> list[Violation]:
 
 
 # ---------------------------------------------------------------------------
-# NF score matching and pathwise reverse KL (gflownet_losses.py::score_matching_rows / ::pathwise_rows):
-# <branch>_loss_coeffs.score (fwd, bwd, replay), .score_beta, .score_force (bwd, replay); fwd_loss_coeffs.pathwise,
-# .pathwise_grad_clip. Trained outside the frac mix by train.py::Modeller.fused_train_step.
+# NF score matching and pathwise reverse KL (gflownet_losses.py::score_matching_rows / ::pathwise_term):
+# <branch>_loss_coeffs.score (fwd, bwd, replay), .score_beta, .score_rows, .score_force (bwd, replay); the pathwise keys
+# PATHWISE_KEYS on every branch (gflownet_losses.py::PATHWISE_DEFAULTS). Score is trained outside the frac mix by
+# train.py::Modeller.fused_train_step, pathwise by ::Modeller._apply_pathwise_grads after the fused backward.
 # ---------------------------------------------------------------------------
-AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip', 'pathwise_entropy'),
-                 'bwd': ('score', 'score_beta', 'score_rows', 'score_force'),
-                 'replay': ('score', 'score_beta', 'score_rows', 'score_force')}
+PATHWISE_KEYS = ('pathwise', 'pathwise_norm_frac', 'pathwise_entropy', 'pathwise_grad_clip', 'pathwise_rows',
+                 'pathwise_row_cap')
+AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows') + PATHWISE_KEYS,
+                 'bwd': ('score', 'score_beta', 'score_rows', 'score_force') + PATHWISE_KEYS,
+                 'replay': ('score', 'score_beta', 'score_rows', 'score_force') + PATHWISE_KEYS}
 AUX_SCORE_FORCE = ('live', 'stored')
 
 
 def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
     """<branch>_loss_coeffs score / pathwise (NF score matching and pathwise reverse KL), per active stage: a negative
-    or non-finite weight, knee or clip; pathwise off the fwd branch; score_force not one of AUX_SCORE_FORCE, or
-    'stored' on bwd (the prior's force column is not wired); a term on a stage that does not train fused (only
-    fused_train_step adds them: train.py::Modeller.step_loss raises on a leftover); a term on the SDE policy; a term
-    with rotate_frames / mirror_frames / canonical_frame (standard frame only); a fwd term with reward_grads,
-    traj_grads or path_grad_last_k. Unresolvable stages: abstains."""
+    or non-finite weight, knee, clip, fraction, row count or cap; a fractional pathwise_rows; pathwise and
+    pathwise_norm_frac both > 0 (two doses); pathwise_row_cap > 0 on bwd or replay with pathwise_rows 0 (one backward
+    per row of the whole batch); score_force not one of AUX_SCORE_FORCE, or 'stored' on bwd (the prior's force column
+    is not wired); a term on a stage that does not train fused (only fused_train_step adds them: train.py::
+    Modeller.step_loss raises on a leftover); a term on the SDE policy; a term with rotate_frames / mirror_frames /
+    canonical_frame (standard frame only); a fwd score with reward_grads, traj_grads or path_grad_last_k.
+    Unresolvable stages: abstains."""
     cfg = canonical_model_section(cfg)
     rule = 'nf_aux_terms_are_well_formed'
     out = []
@@ -1440,29 +1445,41 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
         return out
     nf = _get(cfg, 'policy.nf') or {}
     kind = _get(cfg, 'policy.kind', 'sde')
+
+    def bad_number(v):
+        return isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
+
     for st in stages:
         name = st.get('name', '?')
         on = []
         for mode, keys in AUX_TERM_KEYS.items():
-            for k in ('score', 'pathwise'):
+            for k in ('score', 'pathwise', 'pathwise_norm_frac'):
                 v = _coeff_raw(cfg, st, mode, k)
                 if v is None:
                     continue
-                if mode != 'fwd' and k == 'pathwise':
-                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.pathwise: the pathwise "
-                                                      f"term draws fresh rows, fwd only"))
-                    continue
-                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                if bad_number(v):
                     out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.{k} = {v!r}: a finite "
                                                       f"number >= 0"))
                 elif v > 0:
                     on.append(f'{mode}.{k}')
-            for k in ('score_beta', 'score_rows', 'pathwise_grad_clip', 'pathwise_entropy'):
+            for k in ('score_beta', 'score_rows', 'pathwise_grad_clip', 'pathwise_entropy', 'pathwise_rows',
+                      'pathwise_row_cap'):
                 v = _coeff_raw(cfg, st, mode, k) if k in keys else None
-                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
-                                      or not math.isfinite(v) or v < 0):
+                if v is not None and bad_number(v):
                     out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.{k} = {v!r}: a finite "
                                                       f"number >= 0"))
+                elif k == 'pathwise_rows' and v is not None and float(v) != int(v):
+                    out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.pathwise_rows = {v!r}: "
+                                                      f"a whole number of rows"))
+            pw, frac = (_num(_coeff_raw(cfg, st, mode, k)) or 0 for k in ('pathwise', 'pathwise_norm_frac'))
+            if pw > 0 and frac > 0:
+                out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.pathwise {pw:g} and "
+                                                  f"pathwise_norm_frac {frac:g}: one dose, not both"))
+            if (mode != 'fwd' and (pw > 0 or frac > 0) and (_num(_coeff_raw(cfg, st, mode, 'pathwise_row_cap')) or 0) > 0
+                    and not (_num(_coeff_raw(cfg, st, mode, 'pathwise_rows')) or 0) > 0):
+                out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.pathwise_row_cap with "
+                                                  f"pathwise_rows 0: one backward per row of the whole batch; set "
+                                                  f"pathwise_rows"))
             if 'score_force' in keys:
                 v = _coeff_raw(cfg, st, mode, 'score_force')
                 if v is not None and v not in AUX_SCORE_FORCE:
@@ -1484,12 +1501,12 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
             framed.append('canonical_frame')
         if framed:
             out.append(Violation(ERROR, rule, f"stage '{name}': {on} with model.nf {framed}: standard frame only"))
-        if any(o.startswith('fwd.') for o in on):
+        if 'fwd.score' in on:
             bad = [k for k in ('reward_grads', 'traj_grads', 'path_grad_last_k')
                    if (_coeff(cfg, st, 'fwd', k) or 0) != 0]
             if bad:
-                out.append(Violation(ERROR, rule, f"stage '{name}': fwd {[o for o in on if o.startswith('fwd.')]} "
-                                                  f"with fwd {bad}: the aux terms own the reward's gradient"))
+                out.append(Violation(ERROR, rule, f"stage '{name}': fwd score with fwd {bad}: the score term owns "
+                                                  f"the reward's gradient"))
     return out
 
 

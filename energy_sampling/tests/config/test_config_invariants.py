@@ -1494,8 +1494,18 @@ def test_malformed_or_unconsumable_nf_aux_terms_are_an_error(canonical):
     assert _fires(cfg, rule)                                              # unknown force source
     st['loss_coeffs']['replay']['score_force'] = 'stored'
     st['loss_coeffs'].setdefault('bwd', {})['pathwise'] = 0.1
-    assert _fires(cfg, rule)                                              # pathwise off the fwd branch
-    del st['loss_coeffs']['bwd']['pathwise']
+    assert not _fires(cfg, rule)                                          # off-policy pathwise on bwd
+    st['loss_coeffs']['bwd']['pathwise_norm_frac'] = 0.1
+    assert _fires(cfg, rule)                                              # two doses
+    st['loss_coeffs']['bwd'].update(pathwise=0.0, pathwise_row_cap=3.0)
+    assert _fires(cfg, rule)                                              # per-row cap over the whole batch
+    st['loss_coeffs']['bwd']['pathwise_rows'] = 32
+    assert not _fires(cfg, rule)
+    st['loss_coeffs']['bwd']['pathwise_rows'] = 2.5
+    assert _fires(cfg, rule)                                              # a fractional row count
+    st['loss_coeffs']['bwd'].update(pathwise_rows=32, pathwise_entropy=-1.0)
+    assert _fires(cfg, rule)                                              # malformed
+    del st['loss_coeffs']['bwd']
     cfg['policy']['kind'] = 'sde'
     assert _fires(cfg, rule)                                              # SDE policy
 

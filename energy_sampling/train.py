@@ -75,7 +75,7 @@ from energy_sampling.utils import is_cuda_oom, \
     cal_subtb_coef_matrix, per_condition_fraction, trajectory_T
 from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate, combine_block_grads,
                              winsorized_z_root, pooled_condition_vargrad, tb_z_per_traj, untrusted_z_for,
-                             bwd_loss_reads_reward)
+                             bwd_loss_reads_reward, pathwise_settings, pathwise_term)
 from progress_metrics import parse_heldout_gate, resolve_heldout_source, heldout_plateau, HELDOUT_AUTO_SOURCES
 from models import GFN
 from models.nf_policy import build_policy, resolve_policy_entry
@@ -6421,7 +6421,8 @@ class Modeller:
         elif accumulating:
             self.fused_accum_count += self.batch_size
             do_step = self.fused_accum_count >= accum_target
-            self.step_loss(step_type, loss * (self.batch_size / accum_target), do_step=do_step)
+            self.step_loss(step_type, loss * (self.batch_size / accum_target), do_step=do_step,
+                           aux_scale=self.batch_size / accum_target)
             if do_step:
                 self.fused_accum_count = 0
         else:
@@ -6713,8 +6714,11 @@ class Modeller:
         self.gfn_model._live_fwd = None
         self.gfn_model._live_bwd = None
         self.gfn_model._live_replay = None
-        # score matching / pathwise (gflownet_losses.py aux terms): each branch call below writes its own
+        # score matching (gflownet_losses.py aux terms) and the pathwise terms' gradients: each branch call below
+        # writes its own
         self.gfn_model._aux_terms = None
+        self.gfn_model._pathwise_grads = None
+        self._pathwise_pending = None
         # which branch's live rows pair with bwd's in the pooled term below
         pooled_src = getattr(self.args.fwd_loss_coeffs, 'pooled_source', 'fwd') or 'fwd'
         if pooled_src not in POOLED_SOURCES:
@@ -6897,10 +6901,9 @@ class Modeller:
         if sidecar:
             fused_loss = fused_loss + sub_losses['fwd'][0]
             self._sidecar_count = getattr(self, '_sidecar_count', 0) + 1
-        # SCORE MATCHING / PATHWISE REVERSE KL (<branch>_loss_coeffs.score, fwd_loss_coeffs.pathwise): added OUTSIDE
-        # the frac mix at their own coefficients, like the pooled term, and only from a branch that trained this step
-        # (a force-refresh-only branch's terms are dropped with its loss). fwd trains here on its rollouts whether or
-        # not its TB terms are frozen to a Z sidecar.
+        # SCORE MATCHING (<branch>_loss_coeffs.score): added OUTSIDE the frac mix at its own coefficient, like the
+        # pooled term, and only from a branch that trained this step (a force-refresh-only branch's terms are dropped
+        # with its loss). fwd trains here on its rollouts whether or not its TB terms are frozen to a Z sidecar.
         aux = self.gfn_model._aux_terms or {}
         self.gfn_model._aux_terms = None
         trained = {'fwd': fwd_ran and (fwd_active or sidecar),
@@ -6909,6 +6912,19 @@ class Modeller:
         for name, term in aux.items():
             if term is not None and trained.get(name.split('_')[0], False):
                 fused_loss = fused_loss + term
+        # PATHWISE REVERSE KL (<branch>_loss_coeffs.pathwise / pathwise_norm_frac): parameter gradients, added by
+        # step_loss after the fused backward at each term's dose (_apply_pathwise_grads), OUTSIDE the frac mix. bwd
+        # and replay (off-policy: their stored rows regenerated) only from a branch that trained this step; fwd
+        # (on-policy) draws its own rows here on EVERY fused step, not on the rollout cadence, whatever the forward
+        # branch's freeze_policy or sidecar: it is a policy term of its own.
+        fwd_pw = pathwise_settings(self.args.fwd_loss_coeffs)
+        if fwd_pw is not None:
+            self._pathwise_fresh_step(fwd_pw)
+        pw_terms = self.gfn_model._pathwise_grads or {}
+        self.gfn_model._pathwise_grads = None
+        pw_trained = {**trained, 'fwd': fwd_pw is not None}
+        pw_terms = {k: v for k, v in pw_terms.items() if pw_trained.get(k, False) and v['grads'] is not None}
+        self._pathwise_pending = pw_terms or None
         # NOTHING TO DESCEND. The aligned draw's zero-eligible fallback on a stage
         # whose bwd and replay blocks carry no term of their own (the pooled term
         # and the sidecar are the whole gradient -- var_conditioning): off the
@@ -6920,7 +6936,8 @@ class Modeller:
         # still raises in step_loss.
         self._fused_step_gradless = (bool(cond_spec) and cond_draw is None
                                      and torch.is_tensor(fused_loss)
-                                     and not fused_loss.requires_grad)
+                                     and not fused_loss.requires_grad
+                                     and not self._pathwise_pending)
         if self._fused_step_gradless and not getattr(self, '_gradless_announced', False):
             self._gradless_announced = True
             print(f"fused step {getattr(self, 'step_ind', None)}: no condition eligible for "
@@ -7458,12 +7475,27 @@ class Modeller:
         out['composite'] = total
         return out
 
-    def step_loss(self, step_type, loss, do_step: bool = True):
+    def step_loss(self, step_type, loss, do_step: bool = True, aux_scale: float = 1.0):
+        """aux_scale: the factor the caller scaled `loss` by (fused gradient accumulation), applied to the pathwise
+        terms' gradients at a coefficient dose (_apply_pathwise_grads)."""
         aux = getattr(self.gfn_model, '_aux_terms', None)
         if aux:
             self.gfn_model._aux_terms = None
-            raise RuntimeError(f"score / pathwise terms {sorted(aux)} were computed on a '{step_type}' step and not "
+            raise RuntimeError(f"score terms {sorted(aux)} were computed on a '{step_type}' step and not "
                                f"consumed: they are added by fused_train_step only (train_mode fused)")
+        left = getattr(self.gfn_model, '_pathwise_grads', None)
+        if left:
+            self.gfn_model._pathwise_grads = None
+            raise RuntimeError(f"pathwise terms {sorted(left)} were computed on a '{step_type}' step and not "
+                               f"consumed: they are added by fused_train_step only (train_mode fused)")
+        pending, self._pathwise_pending = getattr(self, '_pathwise_pending', None), None
+        if pending and step_type != 'fused':
+            raise RuntimeError(f"pathwise terms {sorted(pending)} pending on a '{step_type}' step")
+        pre = None
+        if pending:   # mid-accumulation the policy already holds gradients: the main norm is this backward's own
+            params = next(iter(pending.values()))['params']
+            if any(q.grad is not None for q in params):
+                pre = [None if q.grad is None else q.grad.detach().clone() for q in params]
         parts = getattr(self.gfn_model, '_mle_parts', None)
         if parts is not None:
             self.gfn_model._mle_parts = None
@@ -7474,8 +7506,10 @@ class Modeller:
                                       "branch's MLE gradient")
         if parts is not None and parts[0] is loss:
             self._balanced_backward(*parts[1:])
-        else:
+        elif not (pending and not loss.requires_grad):   # the pathwise terms alone may carry this step's gradient
             loss.backward()
+        if pending:
+            self._apply_pathwise_grads(pending, pre, aux_scale)
         if not do_step:
             return  # mid-accumulation: keep piling up gradients, don't clip/step yet
 
@@ -7485,6 +7519,7 @@ class Modeller:
         if self.step_ind % 10 == 0:
             self._last_grad_norms = self._submodel_grad_norms()
             self._last_grad_norms.update(getattr(self, '_grad_balance_stats', None) or {})
+            self._last_grad_norms.update(self._drain_pathwise_running())
 
         # THE BAR IS PER-BRANCH when grad_clip_guard is enabled: fwd/bwd/replay/
         # fused reach their own optimizer step here and an MLE gradient and a TB
@@ -7573,6 +7608,90 @@ class Modeller:
         if self.step_ind % 10 == 0:
             stats['ratio'] = stats['norm_C'] / max(stats['norm_O'], 1e-30)
             self._grad_balance_stats = {f'gradbal/{k}': v for k, v in stats.items()}
+
+    def _apply_pathwise_grads(self, pending, pre, aux_scale: float = 1.0):
+        """THE PATHWISE DOSE. Adds each pending pathwise term's parameter gradient (gflownet_losses.py::pathwise_term,
+        at unit weight) into the policy's .grad, after the fused backward, at a scale per term:
+          pathwise > 0            the coefficient (times aux_scale, the accumulation factor the fused loss carries);
+          pathwise_norm_frac > 0  frac * |g_main| / |g_term|, so the term's gradient norm is that fraction of g_main's.
+        g_main is the gradient the fused loss's backward just left on the same parameters (gflownet_losses.py::
+        policy_parameters; mid-accumulation, minus the gradient `pre` held before it): every other term of the step,
+        TB and the rest. A norm-fraction term on a step whose g_main is 0 or not finite adds nothing. The clip guards
+        downstream see the sum. Each term's readouts, with main_grad_norm, scale and frac (|scale g_term| / |g_main|,
+        the realised fraction), accumulate into the running means _drain_pathwise_running publishes."""
+        params = next(iter(pending.values()))['params']
+        main_sq = torch.zeros((), dtype=torch.float64)
+        for i, q in enumerate(params):
+            if q.grad is None:
+                continue
+            d = q.grad.detach() if pre is None or pre[i] is None else q.grad.detach() - pre[i]
+            main_sq = main_sq + (d.double() ** 2).sum().cpu()
+        main = float(main_sq.sqrt())
+        run = self.__dict__.setdefault('_pathwise_running', {})
+        for branch, term in pending.items():
+            st, g_norm = term['settings'], float(term['stats']['grad_norm'])
+            if st['pathwise_norm_frac'] > 0:
+                ok = g_norm > 0 and math.isfinite(g_norm) and main > 0 and math.isfinite(main)
+                scale = st['pathwise_norm_frac'] * main / g_norm if ok else 0.0
+            else:
+                scale = st['pathwise'] * float(aux_scale)
+            if scale > 0 and math.isfinite(scale):
+                for q, g in zip(term['params'], term['grads']):
+                    if g is None:
+                        continue
+                    if q.grad is None:
+                        q.grad = (scale * g.detach()).to(q.dtype)
+                    else:
+                        q.grad.add_(g.detach().to(q.grad.dtype), alpha=scale)
+            frac = scale * g_norm / main if main > 0 else float('nan')
+            for key, v in {**term['stats'], 'main_grad_norm': main, 'scale': scale, 'frac': frac}.items():
+                v = float(v)
+                if math.isfinite(v):
+                    tot, n = run.get(f'pathwise/{branch}_{key}', (0.0, 0))
+                    run[f'pathwise/{branch}_{key}'] = (tot + v, n + 1)
+            tot, n = run.get(f'pathwise/{branch}_steps', (0.0, 0))
+            run[f'pathwise/{branch}_steps'] = (tot + 1.0, 1)
+
+    def _drain_pathwise_running(self):
+        """The pathwise terms' readouts (_apply_pathwise_grads), each the mean over the steps since the last drain
+        (pathwise/<branch>_steps: their count), cleared on read. Empty when no term ran."""
+        run = getattr(self, '_pathwise_running', None) or {}
+        self._pathwise_running = {}
+        return {k: tot / max(n, 1) for k, (tot, n) in run.items()}
+
+    def _pathwise_fresh_batch(self, k):
+        """k fresh conditions for the on-policy pathwise term: mol_dataset rows drawn uniformly (with replacement only
+        past its size), each in a uniformly drawn space group and Z' as the forward rollout draws them, at the stage's
+        temperatures (or condition_samples' own draw), one row per condition. Returns (mol_batch, log_T [k],
+        condition)."""
+        n_rows = len(self.mol_dataset)
+        rows = np.random.choice(n_rows, size=k, replace=k > n_rows).astype(np.int64)
+        mols = self.mol_dataset.sample_graphs_at(rows)
+        ef = self.energy_function
+        if getattr(self, 'row_store', None) is not None:
+            mol_batch = self._store_condition_batch(mols, 1).to(self.device)
+            temps = self._stage_temperatures()
+            temperature = None if temps is None else self._draw_temperatures(temps, k).to(self.device)
+            mol_batch, log_T, condition, _ = ef.condition_samples(
+                mol_batch, repeats=1, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
+                z_primes=mol_batch.z_prime.reshape(-1).long(),
+                **({} if temperature is None else {'temperature': temperature}))
+        else:
+            mol_batch = mols.to(self.device)
+            mol_batch.orient_molecule(mode='std')
+            mol_batch, log_T, condition, _ = ef.condition_samples(mol_batch, repeats=1)
+        return mol_batch, log_T, condition
+
+    def _pathwise_fresh_step(self, settings):
+        """The ON-POLICY pathwise term (fwd_loss_coeffs.pathwise / pathwise_norm_frac): pathwise_rows fresh draws (0:
+        batch_size) at fresh conditions (_pathwise_fresh_batch), one grad-enabled reward call on them, the gradients
+        into gfn._pathwise_grads['fwd'] (gflownet_losses.py::pathwise_term with x None). Run by fused_train_step on
+        every step."""
+        k = int(settings['pathwise_rows']) or int(self.batch_size)
+        mol_batch, log_T, condition = self._pathwise_fresh_batch(k)
+        out = pathwise_term(dict(settings, pathwise_rows=0), self.gfn_model, self.energy_function.log_reward,
+                            condition, mol_batch, log_T)
+        self.gfn_model._pathwise_grads = {**(self.gfn_model._pathwise_grads or {}), 'fwd': out}
 
     def z_calibration_tick(self, step_type):
         """
@@ -9714,6 +9833,8 @@ class Modeller:
             log_reward = ef.log_r_from_terms(st.energy[idx], st.terms(idx), log_T.detach().flatten().cpu()).to(dev)
             mol.row_log_T = log_T.detach()
         traj = None
+        if kind != 'mle':   # each row's temperature, for a live reward call at it (the off-policy pathwise term)
+            mol.draw_log_T = log_T.detach()
         if kind == 'replay':
             traj = torch.stack([torch.zeros_like(latents), latents], 1)
             mol.replay_log_T = log_T.detach()

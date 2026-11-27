@@ -497,6 +497,12 @@ fwd_loss_coeffs:
   pooled_bridge_only: 0.0 # > 0.5 = restrict the buffer side of the draw to rows whose CONDITION the forward batch also holds. A kept row with no forward partner forms a single-source group, where the term degenerates to the backward branch's own and buys dilution instead of bridge. Read pooled_pairable_frac for the ceiling and pooled_lambda_b for what the ratio actually got
   pooled_source: fwd      # 'fwd' | 'replay': which branch's live rows pair with bwd's in the pooled term; pooled_ratio is then bwd's share against that branch. KEEP 'fwd' HERE and set 'replay' on the stage that runs the term: it is refused wherever pooled_vg is 0, where replay cannot carry weight, or with buffers.replay_buffer.prioritise.enabled. Published as pooled/pooled_source_replay
   pooled_center: mean     # 'mean' | 'head' | 'head_stored': what the pooled term scores each group's rows against. mean = the group's own row mean, in the graph (VarGrad); head = the detached Z(c) head; head_stored = the detached 1/2 head + 1/2 mean of the group's stored rows. The two detached centres make the term per-row TB
+  pathwise: 0.0           # NF policy, fused stages: weight of the pathwise reverse-KL term on fwd (gflownet_losses.py::pathwise_term), its parameter gradient added after the fused backward. 0 with pathwise_norm_frac 0 = off
+  pathwise_norm_frac: 0.0 # > 0, in place of pathwise: the term's gradient on the policy parameters is scaled each step to this fraction of the norm of the step's other gradient on them; logged as pathwise/fwd_frac. Exclusive with pathwise > 0
+  pathwise_entropy: 1.0   # weight of log q in the row loss entropy * log q - log R: 1 = reverse KL, 0 = energy descent along the draw
+  pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
+  pathwise_rows: 0        # fresh draws per fused step at fresh conditions, every step whatever the rollout cadence, one grad-enabled reward call on them; 0 = batch_size
+  pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
 bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
@@ -520,6 +526,12 @@ bwd_loss_coeffs:
   traj_grads: 1.0
   loss_clip: 1.0E+9
   beta: 10.0
+  pathwise: 0.0           # NF policy, fused stages: weight of the pathwise reverse-KL term on bwd (gflownet_losses.py::pathwise_term), its parameter gradient added after the fused backward. 0 with pathwise_norm_frac 0 = off
+  pathwise_norm_frac: 0.0 # > 0, in place of pathwise: the term's gradient on the policy parameters is scaled each step to this fraction of the norm of the step's other gradient on them; logged as pathwise/bwd_frac. Exclusive with pathwise > 0
+  pathwise_entropy: 1.0   # weight of log q in the row loss entropy * log q - log R: 1 = reverse KL, 0 = energy descent along the draw
+  pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
+  pathwise_rows: 0        # rows per step the term draws from the branch's batch, each regenerated from its stored terminal with one grad-enabled reward call; 0 = every row
+  pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
 replay_loss_coeffs:       # applied to trajectories pulled from the replay buffer
   tb: 1.0
   freeze_policy: 0.0
@@ -543,6 +555,12 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
   reward_grads: 0.0       # replay tail only (needs resample_last_k > 0): nonzero lets d log R / d x_T reach the policy through the re-sampled tail
   reward_grad_clip: 0.0   # per-row clip on d loss / d log R for that tail, after nan_to_num; 0 = off. Logged as replayforce/rewardgrad_*
   condition_block_m: 0    # >= 2: replay draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while replay vg_by_condition > 0 and vg_lb/vg_lme > 0. 0 = off. Mutually exclusive with buffers.replay_buffer.prioritise (blocked draws bypass p); the draw raises if both are on
+  pathwise: 0.0           # NF policy, fused stages: weight of the pathwise reverse-KL term on replay (gflownet_losses.py::pathwise_term), its parameter gradient added after the fused backward. 0 with pathwise_norm_frac 0 = off
+  pathwise_norm_frac: 0.0 # > 0, in place of pathwise: the term's gradient on the policy parameters is scaled each step to this fraction of the norm of the step's other gradient on them; logged as pathwise/replay_frac. Exclusive with pathwise > 0
+  pathwise_entropy: 1.0   # weight of log q in the row loss entropy * log q - log R: 1 = reverse KL, 0 = energy descent along the draw
+  pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
+  pathwise_rows: 0        # rows per step the term draws from the branch's batch, each regenerated from its stored terminal with one grad-enabled reward call; 0 = every row
+  pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
   traj_grads: 0.0
   loss_clip: 1.0E+9
   beta: 10.0

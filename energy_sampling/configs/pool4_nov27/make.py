@@ -1,6 +1,17 @@
 """pool4_nov27: convergence at T 10, the temperature-first runs continued, greedier TB at T 2.5, and a large model
 (configs/pool4_nov24, pool4_nov26 and pool4_nov26b make.py; owner go 2026-11-27).
 
+Pathwise first (submit_pool4_nov27_pw.sbatch, its own array so it can be submitted ahead of the rest; smokes first): TB
+at T 2.5 from mle4 as tb_ctrl, plus the pathwise reverse-KL term (gflownet_losses.py::pathwise_term) on PW_ROWS rows per
+step per branch, each row's parameter gradient capped at PW_ROW_CAP x the rows' median, pathwise_entropy 1 (reverse KL),
+no x clip, each branch's term scaled every step to pathwise_norm_frac x the norm of the step's other gradient on the
+policy parameters (read pathwise/<branch>_frac). Compare each with tb_ctrl:
+  pw_on           on-policy only: fwd, fresh draws at fresh conditions every fused step, fraction PW_FRAC
+  pw_off          off-policy only: bwd (stored children) and replay (stored on-policy rows), each row regenerated
+                  through the flow, fraction PW_FRAC per branch
+  pw_both         pw_on and pw_off together, PW_FRAC per branch
+  pw_both_hi      pw_both at PW_FRAC_HI per branch
+
 Now (submit_pool4_nov27.sbatch; smokes first, then the arms in this order):
   mle_T10         mle4's weights, MLE_WARM_STEPS of MLE at energy_config.temperature 10 (density_coeff x T / 2.5, as
                   pool4_nov24 tb_m4_T10), each kick drawn as a Gaussian at T 10 (noised_prior.live_temperature_range
@@ -141,6 +152,27 @@ def tb_T10_mleT10(name, steps):
     return cfg
 
 
+#: the pathwise arms (PW_ARMS): rows per step per branch, the per-row parameter-gradient cap (multiples of the median),
+#: the norm fractions
+PW_ROWS, PW_ROW_CAP, PW_FRAC, PW_FRAC_HI = 32, 3.0, 0.1, 0.3
+#: every pathwise key at its code default (gflownet_losses.py::PATHWISE_DEFAULTS), carried by each base block a stage
+#: overrides
+PW_OFF = dict(pathwise=0.0, pathwise_norm_frac=0.0, pathwise_entropy=1.0, pathwise_grad_clip=0.0, pathwise_rows=0,
+              pathwise_row_cap=0.0)
+
+
+def pw(name, steps, branches, frac):
+    """tb_ctrl with the pathwise term on `branches` at norm fraction `frac` each (PW_ROWS rows, PW_ROW_CAP)."""
+    on = dict(pathwise=0.0, pathwise_norm_frac=frac, pathwise_entropy=1.0, pathwise_grad_clip=0.0,
+              pathwise_rows=PW_ROWS, pathwise_row_cap=PW_ROW_CAP)
+    cfg = tb(name, steps, [(f'tb.loss_coeffs.{b}.{k}', v) for b in branches for k, v in on.items()])
+    for b in ('fwd', 'bwd', 'replay'):
+        block = cfg[f'{b}_loss_coeffs']
+        for k, v in PW_OFF.items():
+            block.setdefault(k, v)
+    return cfg
+
+
 #: tb_m4_onpol's forward branch (pool4_nov24 ONPOL) beside bwd and replay: TB on a fresh rollout every step against
 #: the detached learned head, with emp_z fitting Z(c) on the same rollouts
 FWD_POLICY = [('fwd_loss_coeffs.tb_detach_z', 0.0), ('tb.fracs', {'fwd': 0.25, 'bwd': 0.375, 'replay': 0.375}),
@@ -168,6 +200,12 @@ ARMS = {
     'tb_bwd25': lambda s: tb('tb_bwd25', s, [('tb.fracs', {'fwd': 0.0, 'bwd': 0.25, 'replay': 0.75})]),
     'tb_fwd_alpha25': lambda s: tb('tb_fwd_alpha25', s, FWD_POLICY + [('tb.loss_coeffs.fwd.z_level_alpha', 0.25)]),
     'cap_big': lambda s: _tag(n26.fresh('cap_big', s, dict(CAP_BIG))),
+}
+PW_ARMS = {
+    'pw_on': lambda s: pw('pw_on', s, ('fwd',), PW_FRAC),
+    'pw_off': lambda s: pw('pw_off', s, ('bwd', 'replay'), PW_FRAC),
+    'pw_both': lambda s: pw('pw_both', s, ('fwd', 'bwd', 'replay'), PW_FRAC),
+    'pw_both_hi': lambda s: pw('pw_both_hi', s, ('fwd', 'bwd', 'replay'), PW_FRAC_HI),
 }
 CHAINED = {
     'tb_T10_mleT10': lambda s: tb_T10_mleT10('tb_T10_mleT10', s),
@@ -204,7 +242,7 @@ def _configs(arms):
 
 
 def configs():
-    return _configs(ARMS), _configs(CHAINED)
+    return _configs(ARMS), _configs(CHAINED), _configs(PW_ARMS)
 
 
 def _write(cfgs, suffix=''):
@@ -224,6 +262,7 @@ def _write(cfgs, suffix=''):
 
 
 if __name__ == '__main__':
-    now, chained = configs()
+    now, chained, pw_arms = configs()
+    print('pw:', ' '.join(_write(pw_arms, '_pw')))
     print('now:', ' '.join(_write(now)))
     print('chained:', ' '.join(_write(chained, '_chained')))

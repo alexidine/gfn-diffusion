@@ -31,14 +31,16 @@ POLICY_ATTRIBUTES = (
 # construction (GFN does not have them then either), but the trajectory calls must write the ones they own
 WRITTEN_STATE = ('_mle_parts', '_pb_frozen', '_stash_live_branches', '_live_fwd', '_live_bwd', '_live_replay',
                  'path_grad_scale_live', '_reward_grad_stats', '_path_grad_stats', '_replay_force_stats',
-                 '_force_stats', '_z_cal_embedding', '_aux_terms', '_pathwise')
+                 '_force_stats', '_z_cal_embedding', '_aux_terms', '_pathwise_grads')
 
 # read only through getattr with a default (absent = the z-calibration step silently does nothing)
 GETATTR_ONLY = ('_z_cal_embedding',)
 
 # optional hooks: the trainer checks for them first (train.py::Modeller.fit_policy_data_scalers, ::density_readouts,
-# ::log_xcond_metrics), and a policy without them skips that step or takes its estimated path (the SDE policy has none)
-OPTIONAL_HOOKS = ('fit_data_scalers', 'log_density', 'mle_orient_split', 'take_orient_log_q', 'score')
+# ::log_xcond_metrics), and a policy without them skips that step or takes its estimated path (the SDE policy has none).
+# score and pathwise_draw serve the NF-only score and pathwise terms (config_invariants.py::nf_aux_terms_are_well_formed
+# refuses them on the SDE policy)
+OPTIONAL_HOOKS = ('fit_data_scalers', 'log_density', 'mle_orient_split', 'take_orient_log_q', 'score', 'pathwise_draw')
 
 
 def missing_policy_attributes(model):

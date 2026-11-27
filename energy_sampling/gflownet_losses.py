@@ -343,9 +343,10 @@ SCORE_FORCE_SOURCES = ('live', 'stored')
 
 
 def aux_term_coeffs(loss_coeffs):
-    """(score, pathwise) weights of a branch's loss_coeffs (0.0 when absent). The terms are trained OUTSIDE the
-    frac-weighted branch mix (train.py::Modeller.fused_train_step adds gfn._aux_terms), like the pooled term."""
-    return (float(getattr(loss_coeffs, 'score', 0.0) or 0.0), float(getattr(loss_coeffs, 'pathwise', 0.0) or 0.0))
+    """(score,): the score-matching weight of a branch's loss_coeffs (0.0 when absent). Trained OUTSIDE the
+    frac-weighted branch mix (train.py::Modeller.fused_train_step adds gfn._aux_terms), like the pooled term. The
+    pathwise term has its own settings (pathwise_settings) and returns parameter gradients (pathwise_term)."""
+    return (float(getattr(loss_coeffs, 'score', 0.0) or 0.0),)
 
 
 def live_reward_force(log_reward_fn, x, mol_batch, log_T_tensor):
@@ -413,28 +414,142 @@ def branch_score_term(loss_coeffs, gfn, x, condition, mol_batch, g_r):
     return coeff * loss, stats
 
 
-def pathwise_rows(log_r_live, log_q_stl, x_live, grad_clip: float = 0.0, entropy: float = 1.0):
-    """Pathwise reverse KL per row, entropy * log q_theta-bar(x) - log R(x) at a reparameterised draw x (sticking the
-    landing: log q's parameters detached, so the gradient is d(entropy log q - log R)/dx . dx/dtheta). entropy 1 is the
-    reverse KL; 0 is energy descent along the draw alone (no entropy term: collapses toward the reward's modes).
-    Rows with a non-finite reward are dropped. grad_clip > 0 caps each row's own gradient norm in x. Returns (loss:
-    the mean, stats)."""
-    ok = torch.isfinite(log_r_live) & torch.isfinite(log_q_stl)
-    n_ok = int(ok.sum())
-    if grad_clip > 0 and x_live.requires_grad:
-        n = max(n_ok, 1)
+#: <branch>_loss_coeffs pathwise keys (fwd, bwd, replay) and their code defaults (pathwise_settings). pathwise: the
+#: term's weight; pathwise_norm_frac: in its place, the term's policy-gradient norm as a fraction of the norm of the
+#: step's other gradient on the same parameters (train.py::Modeller._apply_pathwise_grads); pathwise_entropy: the
+#: weight of log q in the row loss (1 = reverse KL, 0 = energy descent); pathwise_grad_clip: cap on each row's
+#: |d(row loss)/dx| (0 = off); pathwise_rows: rows per step (0 = every row of the branch's batch; fwd: batch_size);
+#: pathwise_row_cap: cap on each row's parameter-gradient norm, in multiples of the rows' median (0 = off).
+PATHWISE_DEFAULTS = dict(pathwise=0.0, pathwise_norm_frac=0.0, pathwise_entropy=1.0, pathwise_grad_clip=0.0,
+                         pathwise_rows=0, pathwise_row_cap=0.0)
 
-        def _clip(g, _c=float(grad_clip), _n=n):
-            gn = g.norm(dim=-1, keepdim=True) * _n
-            return g * torch.clamp(_c / gn.clamp_min(1e-12), max=1.0)
-        x_live.register_hook(_clip)
-    rows = torch.where(ok, float(entropy) * log_q_stl - log_r_live, torch.zeros_like(log_r_live))
-    loss = rows.sum() / max(n_ok, 1)
+
+def pathwise_settings(loss_coeffs):
+    """A branch's pathwise settings (PATHWISE_DEFAULTS under its loss_coeffs; None reads the default), or None when
+    the term is off: pathwise and pathwise_norm_frac both 0. Both > 0 is refused (two doses)."""
+    s = {}
+    for k, d in PATHWISE_DEFAULTS.items():
+        v = getattr(loss_coeffs, k, None)
+        s[k] = type(d)(d if v is None else v)
+    if s['pathwise'] <= 0 and s['pathwise_norm_frac'] <= 0:
+        return None
+    if s['pathwise'] > 0 and s['pathwise_norm_frac'] > 0:
+        raise ValueError(f"pathwise {s['pathwise']:g} and pathwise_norm_frac {s['pathwise_norm_frac']:g}: one dose, "
+                         f"not both")
+    return s
+
+
+def policy_parameters(gfn):
+    """The policy's trainable parameters, the set the pathwise term's gradient and its dose are measured on: the
+    forward_policy and conditions_embedding_model groups (an NF policy's flow blocks and condition encoders; not its
+    level head, flow_model). Deduplicated, in module order."""
+    seen, out = set(), []
+    for name in ('forward_policy', 'conditions_embedding_model'):
+        mod = getattr(gfn, name, None)
+        if mod is None:
+            continue
+        for p in mod.parameters():
+            if p.requires_grad and id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
+    return out
+
+
+def grad_sq_norm(grads):
+    """sum of |g|^2 over a list of gradients (None skipped), float64 0-d."""
+    total = torch.zeros((), dtype=torch.float64)
+    for g in grads:
+        if g is not None:
+            total = total + (g.detach().double() ** 2).sum().cpu()
+    return total
+
+
+def pathwise_param_grads(x_live, g, ok, params, row_cap: float = 0.0):
+    """The parameter gradient of the mean over the ok rows of g_i . x_i(theta): x_live [n, dim] carries its graph to
+    params, g [n, dim] is each row's d(row loss)/dx (detached, 0 off ok), so this is the gradient of the mean row loss
+    through x. row_cap > 0: each ok row's parameter-gradient norm |J_i^T g_i| is measured (one backward per row) and
+    capped at row_cap times the rows' median, then one weighted backward forms the sum. Returns (grads [one per param,
+    None where unreached], or None when no row is ok; stats: row_norm_median, row_top_share = the largest row's share
+    of the summed squared row norms before the cap, row_capped_frac)."""
+    n_ok = int(ok.sum())
+    if n_ok == 0:
+        return None, {}
+    w = ok.to(g.dtype) / n_ok
+    stats = {}
+    if row_cap > 0:
+        rows = ok.nonzero().flatten().tolist()
+        norms = []
+        for i in rows:
+            gi = torch.autograd.grad((x_live[i] * g[i]).sum(), params, retain_graph=True, allow_unused=True)
+            norms.append(grad_sq_norm(gi).sqrt())
+        nu = torch.stack(norms)
+        keep = torch.clamp(float(row_cap) * nu.median() / nu.clamp_min(1e-300), max=1.0)
+        w = w.clone()
+        w[rows] = w[rows] * keep.to(w.device, w.dtype)
+        sq = nu * nu
+        stats = {'row_norm_median': float(nu.median()),
+                 'row_top_share': float(sq.max() / sq.sum().clamp_min(1e-300)),
+                 'row_capped_frac': float((keep < 1.0).double().mean())}
+    grads = torch.autograd.grad((x_live * (g * w.unsqueeze(-1))).sum(), params, allow_unused=True)
+    return list(grads), stats
+
+
+def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tensor, x=None):
+    """THE PATHWISE REVERSE-KL TERM on one branch's rows, returned as parameter gradients (NF policy). Row loss
+    l = entropy * log q(x | c) - log R(x) at a reparameterised x = T_theta(z | c), differentiated through x only (log
+    q's parameters held fixed: sticking the landing), so d mean(l) / d theta = mean_i (entropy d log q/dx - d log R/dx)_i
+    . dx_i/d theta. x None (on-policy): z drawn from the base. x [n, dim] (off-policy, stored rows): z = T_theta^-1(x | c)
+    without gradient, so the regenerated x' equals x up to float error and carries dx'/d theta (NFPolicy.pathwise_draw).
+    log R and its force come from one grad-enabled reward call at a detached copy of x' (live_reward_force) at
+    log_T_tensor [n] (log10 T per row). A row whose reward, density or force is not finite is dropped. settings
+    (pathwise_settings): pathwise_rows draws that many rows uniformly without replacement (0: all); pathwise_grad_clip
+    caps each row's |dl/dx|; pathwise_row_cap bounds each row's parameter gradient (pathwise_param_grads). Returns
+    {'params' (policy_parameters), 'grads' (at unit weight; None when no row survived), 'settings', 'stats'}, stats
+    (floats): loss (mean l), log_r, log_q, bad_frac, force_norm (mean |dl/dx| before the clip), x_clipped_frac, rows,
+    grad_norm (|grads|), the row_* stats under a row cap and, off-policy, regen_err (max |x' - x|, angles wrapped)."""
+    n = int(condition.shape[0])
+    k = int(settings['pathwise_rows'])
+    if 0 < k < n:
+        idx = torch.randperm(n, device=condition.device)[:k].sort().values
+        condition = condition[idx]
+        log_T_tensor = log_T_tensor.reshape(-1)[idx.to(log_T_tensor.device)]
+        x = None if x is None else x[idx.to(x.device)]
+        if mol_batch is not None:
+            mol_batch = mol_batch.subsample_new_batch(idx.to(mol_batch.pos.device) if hasattr(mol_batch, 'pos')
+                                                      else idx)
+    x_live, log_q, g_q = gfn.pathwise_draw(condition, mol_batch, x)
+    g_r, log_r = live_reward_force(log_reward_fn, x_live.detach(), mol_batch, log_T_tensor.reshape(-1))
+    ent = float(settings['pathwise_entropy'])
+    log_r = log_r.reshape(-1).to(x_live.device, log_q.dtype)
+    g = ent * g_q.to(x_live.dtype) - g_r.to(x_live.device, x_live.dtype)
+    ok = torch.isfinite(log_r) & torch.isfinite(log_q) & torch.isfinite(g).all(-1)
+    g = torch.where(ok.unsqueeze(-1), g, torch.zeros_like(g))
+    gn = g.norm(dim=-1)
+    clip = float(settings['pathwise_grad_clip'])
+    clipped = torch.zeros_like(ok)
+    if clip > 0:
+        scale = torch.clamp(clip / gn.clamp_min(1e-30), max=1.0)
+        clipped = ok & (scale < 1.0)
+        g = g * scale.unsqueeze(-1)
+    params = policy_parameters(gfn)
+    grads, row_stats = pathwise_param_grads(x_live, g, ok, params, float(settings['pathwise_row_cap']))
+    n_ok = int(ok.sum())
     with torch.no_grad():
-        stats = {'pathwise': loss.detach(), 'pathwise_bad_frac': 1.0 - ok.float().mean(),
-                 'pathwise_log_r': log_r_live.detach()[ok].mean() if n_ok else torch.zeros(()),
-                 'pathwise_log_q': log_q_stl.detach()[ok].mean() if n_ok else torch.zeros(())}
-    return loss, stats
+        rows = ent * log_q - log_r
+
+        def _mean(t):
+            return float(t[ok].mean()) if n_ok else float('nan')
+        stats = {'loss': _mean(rows), 'log_r': _mean(log_r), 'log_q': _mean(log_q), 'force_norm': _mean(gn),
+                 'bad_frac': 1.0 - float(ok.float().mean()), 'rows': float(ok.numel()),
+                 'x_clipped_frac': float(clipped.float().mean()),
+                 'grad_norm': float(grad_sq_norm(grads).sqrt()) if grads is not None else 0.0, **row_stats}
+        if x is not None:
+            d = x_live.detach() - x.detach().to(x_live.device, x_live.dtype)
+            ang = getattr(gfn, 'ang_idx', None)
+            if ang is not None and ang.numel():
+                d[:, ang] = torch.remainder(d[:, ang] + 1.0, 2.0) - 1.0
+            stats['regen_err'] = float(d.abs().max()) if d.numel() else 0.0
+    return {'params': params, 'grads': grads, 'settings': settings, 'stats': stats}
 
 
 def get_gfn_forward_loss(loss_coeffs,
@@ -513,17 +628,17 @@ def get_gfn_forward_loss(loss_coeffs,
     if _rg_reshape and freeze_policy:
         raise ValueError("fwd_loss_coeffs.reward_grad_gate / reward_grad_force_clip need a trained "
                          "policy on this branch: freeze_policy must be 0")
-    # SCORE MATCHING / PATHWISE REVERSE KL on the fresh draws (fwd_loss_coeffs.score / .pathwise; NF policy). Both
-    # train the policy whatever freeze_policy says (freeze_policy detaches this branch's TB terms only) and both land
-    # in gfn._aux_terms, which fused_train_step adds OUTSIDE the frac mix. One grad-enabled reward call at the draw
-    # serves the TB reward (detached), the rows' force and the pathwise term; no call when neither is on, or under
-    # no_grad (a readout).
-    _sm_coeff, _pw_coeff = aux_term_coeffs(loss_coeffs)
-    _aux_on = (_sm_coeff > 0 or _pw_coeff > 0) and torch.is_grad_enabled()
+    # SCORE MATCHING on the fresh draws (fwd_loss_coeffs.score; NF policy). It trains the policy whatever
+    # freeze_policy says (freeze_policy detaches this branch's TB terms only) and lands in gfn._aux_terms, which
+    # fused_train_step adds OUTSIDE the frac mix. One grad-enabled reward call at the draw serves the TB reward
+    # (detached) and the rows' force; no call when it is off, or under no_grad (a readout). The forward pathwise term
+    # is not made here: train.py::Modeller._pathwise_fresh_step draws its own rows every fused step (pathwise_term).
+    _sm_coeff = aux_term_coeffs(loss_coeffs)[0]
+    _aux_on = _sm_coeff > 0 and torch.is_grad_enabled()
     _aux_stats = {}
     if _aux_on and (_rg_on or _path_live):
-        raise ValueError("fwd_loss_coeffs.score / pathwise with reward_grads, traj_grads or path_grad_last_k: the "
-                         "aux terms own the reward's gradient on this branch")
+        raise ValueError("fwd_loss_coeffs.score with reward_grads, traj_grads or path_grad_last_k: the score term "
+                         "owns the reward's gradient on this branch")
     # PATH-GRADIENT DIAGNOSTIC. When any rollout step is live, record the
     # per-step ||dL/dx_{i+1}|| (batch mean) as it flows back through the
     # reparameterised chain. Consumed by train.py's ten-step report as
@@ -554,16 +669,13 @@ def get_gfn_forward_loss(loss_coeffs,
                                                                 freeze_policy=freeze_policy,
                                                                 path_grad_last_k=_path_k,
                                                                 state_grad_hook=_state_grad_hook,
-                                                                **({'pathwise': True}
-                                                                   if (_aux_on and _pw_coeff > 0) else {}),
                                                                 )
     finally:
         gfn.path_grad_scale_live = True
     log_Z_learned = log_flow[:, 0]
 
     if _aux_on:
-        _x_src = (gfn._pathwise['x'] if _pw_coeff > 0
-                  else states[:, -1].detach().clone().requires_grad_(True))
+        _x_src = states[:, -1].detach().clone().requires_grad_(True)
         with torch.enable_grad():
             if return_exp:
                 _log_r_live, crystal_batch = log_reward_fn(_x_src, mol_batch, log_T_tensor, return_exp,
@@ -574,20 +686,11 @@ def get_gfn_forward_loss(loss_coeffs,
                 crystal_batch = None
         log_r = _log_r_live.detach()
         _aux = {}
-        if _sm_coeff > 0:
-            _g_r = torch.autograd.grad(_log_r_live.sum(), _x_src, retain_graph=_pw_coeff > 0, allow_unused=True)[0]
-            _g_r = torch.zeros_like(_x_src) if _g_r is None else _g_r.detach().clone()
-            _g_r[~torch.isfinite(log_r)] = float('nan')
-            _aux['fwd_score'], _st = branch_score_term(loss_coeffs, gfn, _x_src.detach(), condition, mol_batch, _g_r)
-            _aux_stats.update(_st)
-        if _pw_coeff > 0:
-            _pw = gfn._pathwise
-            _l, _st = pathwise_rows(_log_r_live, _pw['log_q_stl'], _pw['x'],
-                                    float(getattr(loss_coeffs, 'pathwise_grad_clip', 0.0) or 0.0),
-                                    entropy=float(getattr(loss_coeffs, 'pathwise_entropy', 1.0)))
-            _aux['fwd_pathwise'] = _pw_coeff * _l
-            _aux_stats.update(_st)
-            gfn._pathwise = None
+        _g_r = torch.autograd.grad(_log_r_live.sum(), _x_src, allow_unused=True)[0]
+        _g_r = torch.zeros_like(_x_src) if _g_r is None else _g_r.detach().clone()
+        _g_r[~torch.isfinite(log_r)] = float('nan')
+        _aux['fwd_score'], _st = branch_score_term(loss_coeffs, gfn, _x_src.detach(), condition, mol_batch, _g_r)
+        _aux_stats.update(_st)
         gfn._aux_terms = {**(getattr(gfn, '_aux_terms', None) or {}), **_aux}
     elif _rg_reshape:
         # the reward is scored on a LEAF copy of the terminal: its graph ends
@@ -1119,6 +1222,22 @@ def get_gfn_backward_loss(loss_coeffs,
             _g_r, _ = live_reward_force(log_reward_fn, _x_t, mol_batch, log_T_tensor)
         _t, _aux_stats = branch_score_term(loss_coeffs, gfn, _x_t, condition, mol_batch, _g_r)
         gfn._aux_terms = {**(getattr(gfn, '_aux_terms', None) or {}), f'{live_stash}_score': _t}
+
+    # OFF-POLICY PATHWISE REVERSE KL on this branch's stored rows (bwd/replay_loss_coeffs.pathwise or
+    # pathwise_norm_frac; NF policy): each row is regenerated x' = T_theta(T_theta^-1(x)) with dx'/dtheta and pushed
+    # along -d(entropy log q - log R)/dx' (pathwise_term), log R from a grad-enabled reward call at x' at the row's
+    # own temperature (the draw's `draw_log_T` when it carries one, else log_T_tensor). Trained call only, as the
+    # score; the parameter gradients go to gfn._pathwise_grads, which train.py::Modeller.step_loss adds after the
+    # fused backward at the term's dose.
+    _pw = pathwise_settings(loss_coeffs)
+    if _pw is not None and live_stash is not None and torch.is_grad_enabled():
+        _lt = getattr(mol_batch, 'draw_log_T', None)
+        _lt = log_T_tensor if _lt is None else _lt
+        if log_reward_fn is None or _lt is None:
+            raise ValueError(f"{live_stash}_loss_coeffs pathwise needs the caller to pass log_reward_fn and each "
+                             f"row's temperature (mol_batch.draw_log_T or log_T_tensor)")
+        _out = pathwise_term(_pw, gfn, log_reward_fn, condition, mol_batch, _lt, x=states[:, -1].detach())
+        gfn._pathwise_grads = {**(getattr(gfn, '_pathwise_grads', None) or {}), live_stash: _out}
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)

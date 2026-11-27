@@ -1,6 +1,6 @@
 # Loss composition
 
-*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them. Sources at the end.*
+*Drift: **M** (mixed). Verified against commit `78de930`, 2026-10-04; the store-route clauses written 2026-11-23 against commit `6dc6aa6a` plus the change that adds them; the score and pathwise rows 2026-11-27 against commit `70edbd5a` plus the working-tree change that adds the pathwise term. Sources at the end.*
 
 A fused training step assembles one scalar loss out of three branches: forward, backward and replay. This page is about that assembly, from the branch draws up through the per-branch coefficient blocks to the weighted sum, and what each branch's residual can and cannot see. The controllers that move the weights during a stage are on [balance-controllers](balance-controllers.md); the VarGrad objective is on [vargrad](vargrad.md); the trajectory-balance residual and its fixed point are on [trajectory-balance](trajectory-balance.md); the coupling between the rollout that fills the replay buffer and the branch that drains it is on [on-policy-and-off-policy-training](on-policy-and-off-policy-training.md).
 
@@ -8,7 +8,7 @@ A fused training step assembles one scalar loss out of three branches: forward, 
 
 Each branch is a separate draw, a separate pass and a separate per-row loss, fired by `train.py::Modeller.fused_train_step`.
 
-The **forward** branch rolls out its own trajectories. `train.py::Modeller.fwd_train_step` draws $B$ rows from `mol_dataset`, tiles each `repeats` times, samples forward under $P_F$ and calls the energy function on the terminals. Its loss is built by `gflownet_losses.py::get_gfn_forward_loss`. It is the only branch that calls the energy function inside a training step, except that the replay branch at `resample_last_k` above zero re-scores the reward on each re-sampled terminal.
+The **forward** branch rolls out its own trajectories. `train.py::Modeller.fwd_train_step` draws $B$ rows from `mol_dataset`, tiles each `repeats` times, samples forward under $P_F$ and calls the energy function on the terminals. Its loss is built by `gflownet_losses.py::get_gfn_forward_loss`. It is the only branch that calls the energy function inside a training step, except that the replay branch at `resample_last_k` above zero re-scores the reward on each re-sampled terminal, and that on the NF policy a live `score_force` and the pathwise term make grad-enabled reward calls on bwd and replay rows and, for the forward pathwise term, on fresh draws every fused step.
 
 The **backward** branch draws terminal states, not trajectories: from the prior buffer under `cfg:stage.bwd_sampling_mode` `prior`, or from the fixed prior dataset under `dataset` (`train.py::Modeller.draw_bwd_sample`). A trajectory is then sampled backward from each terminal under $P_B$, and the reward is recomposed from the energy terms stored on the drawn rows by the energy function's `prebuilt_sample_to_reward` (`energies/molecular_crystal.py::MolecularCrystal.prebuilt_sample_to_reward` on the crystal route), without re-analysing the crystal.
 
@@ -68,6 +68,8 @@ The table lists each key of the three coefficient blocks against the branches th
 | `condition_block_m` | bwd, replay | makes the draw condition-blocked, M distinct same-condition terminals per block; applied only while `config_invariants.py::runs_grouped_vargrad` holds for the branch, and on replay only with `vg_by_condition` on | `buffer.py::CrystalBuffer._sample_indices` |
 | `vg_by_condition`, `vg_detach_center` | fwd, bwd, replay | group by `condition_id` rather than by K-tile; treat the group centre as constant | `gflownet_losses.py::condition_grouped_empirical_z` |
 | `exploration_std` | fwd | additive per-step log-std on the sampling kernel only | `train.py::Modeller._fwd_exploration_std` |
+| `score` (`score_beta`, `score_rows`, `score_force` on bwd and replay) | fwd, bwd, replay | NF policy: score matching of $\partial_x \log q$ to $\partial_x \log R$, added outside the mix | `gflownet_losses.py::branch_score_term` |
+| `pathwise` or `pathwise_norm_frac` (`pathwise_entropy`, `pathwise_grad_clip`, `pathwise_rows`, `pathwise_row_cap`) | fwd (fresh draws every fused step), bwd and replay (their stored rows, regenerated) | NF policy: pathwise reverse KL, parameter gradients added after the fused backward at a weight or at a fraction of the other gradient's norm; see [gradient-routes-and-terminal-force](gradient-routes-and-terminal-force.md) | `gflownet_losses.py::pathwise_term`, `train.py::Modeller._apply_pathwise_grads` |
 
 The backward and replay branches share `gflownet_losses.py::get_gfn_backward_loss`, which reads `mle`, `tbc`, `pf_boost` and `level_gap` from whichever block it is handed. The canonical `cfg:replay_loss_coeffs` block carries no `tbc` or `level_gap` key, and `protocol.py::StageProtocol.coeffs` raises on a stage override of a key the base block lacks.
 

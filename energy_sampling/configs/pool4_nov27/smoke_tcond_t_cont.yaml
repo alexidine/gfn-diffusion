@@ -261,6 +261,7 @@ fwd_loss_coeffs:
   emp_z_persistent: 0
   tb_z_source: learned
   tb_detach_z: 0.0
+  z_level_alpha: 0.0
   traj_grads: 0.0
   reward_grads: 0.0
   path_grad_last_k: 0

@@ -15,9 +15,10 @@ conditions_embedding_model = what reads the condition (the context network, and 
 flow_model = the level head; t_model, s_model and backward_policy are empty (a one-step flow has no time or state
 embedding and a fixed P_B).
 
-The pathwise draw and the score: get_traj_fwd(pathwise=True) keeps a reparameterised draw (ConditionalLatentFlow.rsample)
-and its sticking-the-landing log q for the pathwise reverse-KL term; score() is d log q / d x with the graph kept, for
-score matching (both standard frame only).
+The pathwise draw and the score: pathwise_draw() makes a reparameterised draw (ConditionalLatentFlow.rsample), fresh or
+regenerated from stored rows through their base points, with d log q / d x at fixed parameters, for the pathwise
+reverse-KL term (gflownet_losses.py::pathwise_term); score() is d log q / d x with the graph kept, for score matching
+(both standard frame only).
 
 Not supported (raise): a gradient through the trajectory's states (detach_traj False, path_grad_last_k > 0), replay-
 tail re-propagation (resample_last_k, implied_noise_last_k), state forces and features, exploration noise.
@@ -171,18 +172,6 @@ FRAME_ONLY_KEYS = ('rotate_frames', 'mirror_frames')
 LOSS_ONLY_KEYS = ('orient_loss_weight', 'orient_grad_balance', 'orient_grad_rho')
 # the parser lives with the loader's rule (no torch): config_invariants.py::nf_orient_split_is_well_formed
 from config_invariants import orient_split_active, orient_split_problems  # noqa: E402
-
-
-class _LogProb(nn.Module):
-    """sampler.log_prob(x, c) as a module's forward, for torch.func.functional_call with detached parameters
-    (NFPolicy._pathwise_draw)."""
-
-    def __init__(self, sampler):
-        super().__init__()
-        self.sampler = sampler
-
-    def forward(self, x, c):
-        return self.sampler.log_prob(x, c)
 
 
 def resolve_policy_entry(policy, gfn_config: dict):
@@ -522,7 +511,7 @@ class NFPolicy(nn.Module):
         self._stash_live_branches = False
         self._live_fwd = self._live_bwd = self._live_replay = None
         self._z_cal_embedding = None
-        self._pathwise = None        # get_traj_fwd(pathwise=True): the live draw and its STL log q, read by the loss
+        self._pathwise_grads = None  # {branch: pathwise_term's gradients}, written by the losses, read by step_loss
         self._split_orient = False   # mle_orient_split armed the next backward/replay step to score x_O apart
         self._orient_log_q = None    # that step's [n] log q(x_O | x_C, c) (take_orient_log_q)
         self._mle_parts = None       # (loss, L_C, L_O) of a balanced MLE step (get_gfn_backward_loss -> step_loss)
@@ -956,8 +945,7 @@ class NFPolicy(nn.Module):
     @contextlib.contextmanager
     def _layers_stored(self):
         """The transformer conditioners' layers keep their activations (no checkpointing) inside the block. score()'s
-        graph is backpropagated after the block exits, where a recomputed layer would run a different SDPA kernel; the
-        pathwise draw's STL density runs on detached parameters a recompute would no longer see."""
+        graph is backpropagated after the block exits, where a recomputed layer would run a different SDPA kernel."""
         mades = [m for m in self.sampler.modules() if hasattr(m, 'checkpoint_layers')]
         old = [m.checkpoint_layers for m in mades]
         for m in mades:
@@ -968,22 +956,31 @@ class NFPolicy(nn.Module):
             for m, o in zip(mades, old):
                 m.checkpoint_layers = o
 
-    def _pathwise_draw(self, n, c):
-        """A draw x = T_theta(z) [n, dim] differentiable in the parameters (ConditionalLatentFlow.rsample; angles
-        wrapped, dead rows pinned) and log q_theta-bar(x) [n]: the density with every parameter detached (the context
-        c too), so its gradient reaches the parameters only through x (sticking the landing). Conditional route only."""
+    def pathwise_draw(self, condition, mol_batch, x=None):
+        """A reparameterised draw for the pathwise term (gflownet_losses.py::pathwise_term): (x' [n, dim] carrying
+        dx'/dtheta through ConditionalLatentFlow.rsample (angles wrapped, dead rows pinned), log q(x' | c) [n] and
+        d log q / d x at x' [n, dim], both detached and taken at fixed parameters: the sticking-the-landing parts).
+        x None: base points from ConditionalLatentFlow.base_sample (on-policy). x [n, dim], standard-frame stored rows:
+        base points z = T_theta^-1(x | c) by ConditionalLatentFlow.to_base without gradient, so x' equals x (wrapped,
+        pinned) up to float error. One noise-free condition (clean_condition). Conditional route, standard frame."""
         if not self.conditional:
             raise NotImplementedError("a pathwise draw on the unconditional route")
         self._refuse_framed('a pathwise draw')
-        z0 = self.sampler.base_sample(n)
-        x = self._pin_dead(self._wrap_ang(self.sampler.rsample(z0, c)))
-        frozen = {k: v.detach() for k, v in self.sampler.named_parameters()}
-        # layers stored: a checkpointed layer would be recomputed in backward after functional_call has put the live
-        # parameters back, and save a different set of tensors than the detached forward did
-        with self._layers_stored():
-            log_q = torch.func.functional_call(_LogProb(self.sampler), {f'sampler.{k}': v for k, v in frozen.items()},
-                                               (x, c.detach()), strict=False)
-        return x, log_q
+        n = int(condition.shape[0])
+        with self.clean_condition():
+            c = self._context(condition, mol_batch, n)
+            if x is None:
+                z0 = self.sampler.base_sample(n)
+            else:
+                with torch.no_grad():
+                    xs = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
+                    z0 = self.sampler.to_base(xs, c)[0]
+            x_live = self._pin_dead(self._wrap_ang(self.sampler.rsample(z0, c)))
+            leaf = x_live.detach().clone().requires_grad_(True)
+            with torch.enable_grad():
+                log_q = self.sampler.log_prob(leaf, c)
+                g_q, = torch.autograd.grad(log_q.sum(), leaf)
+        return x_live, log_q.detach(), g_q.detach()
 
     @torch.no_grad()
     def log_density(self, x, condition, mol_batch, frames=None):
@@ -1003,29 +1000,20 @@ class NFPolicy(nn.Module):
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True, freeze_policy: bool = False,
-                     path_grad_last_k: int = 0, state_grad_hook=None, drift_context=None, pathwise: bool = False):
-        """pathwise (fwd_loss_coeffs.pathwise > 0): the draw is made by _pathwise_draw and its live form kept in
-        self._pathwise = {'x', 'log_q_stl'} for the pathwise reverse-KL term (gflownet_losses.py::
-        get_gfn_forward_loss); the returned trajectory holds the detached draw, scored as any other. The draw and its
-        log q read one noise-free condition (clean_condition)."""
+                     path_grad_last_k: int = 0, state_grad_hook=None, drift_context=None):
+        """The draw and its log q read one noise-free condition (clean_condition)."""
         with self.clean_condition():
             return self._traj_fwd(initial_state, condition, mol_batch, return_gauss_params, detach_traj, freeze_policy,
-                                  path_grad_last_k, exploration_std, pathwise)
+                                  path_grad_last_k, exploration_std)
 
     def _traj_fwd(self, initial_state, condition, mol_batch, return_gauss_params, detach_traj, freeze_policy,
-                  path_grad_last_k, exploration_std, pathwise):
+                  path_grad_last_k, exploration_std):
         if not detach_traj or path_grad_last_k > 0:
             raise NotImplementedError("a gradient through the trajectory's states (traj_grads, path_grad_last_k) on "
                                       "the flow policy: use fwd_loss_coeffs.pathwise")
         if exploration_std:
             raise NotImplementedError("exploration noise on the flow policy")
         n = initial_state.shape[0]
-        self._pathwise = None
-        if pathwise:
-            c = self._context(condition, mol_batch, n)
-            x_live, log_q_stl = self._pathwise_draw(n, c)
-            self._pathwise = {'x': x_live, 'log_q_stl': log_q_stl}
-            return self._one_step(initial_state, x_live.detach(), c, freeze_policy, return_gauss_params)
         q = self._frames(n) if self.conditional else None
         c = self._context(condition, mol_batch, n, frames=q)
         with torch.no_grad():
