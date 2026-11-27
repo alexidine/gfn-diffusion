@@ -466,16 +466,16 @@ def test_checkpoint_dead_row_mismatch_is_loud():
     class StubModeller:
         _resolve_dead_latent_rows = train_mod.Modeller._resolve_dead_latent_rows
 
-        def __init__(self, sgs):
+        def __init__(self, sgs, chart='latent'):
             self.args = Namespace(model=Namespace(hold_dead_latent_rows=True),
                                   space_groups=list(sgs), z_primes=[1])
-            self.energy_function = Namespace(is_crystal=True)
+            self.energy_function = Namespace(is_crystal=True, crystal_coordinates=chart)
 
     class StubCkpt:
         _assert_dead_rows_match = ckpt_mod.Checkpointer._assert_dead_rows_match
 
-        def __init__(self, sgs):
-            self.modeller = StubModeller(sgs)
+        def __init__(self, sgs, chart='latent'):
+            self.modeller = StubModeller(sgs, chart)
 
     cases = [
         # triclinic sg 2 has nothing dead, so a pre-change checkpoint (no key) matches
@@ -494,6 +494,15 @@ def test_checkpoint_dead_row_mismatch_is_loud():
         except ValueError:
             raised = True
         assert raised == should_raise, (sgs, stored, raised, should_raise)
+    # the FD chart builds the policy with no dead rows: an sg-14 FD checkpoint stores () and loads; a latent
+    # sg-14 checkpoint's rows do not
+    for stored, should_raise in ((None, False), ((), False), ((3, 5), True)):
+        try:
+            StubCkpt((14,), chart='fd')._assert_dead_rows_match({'dead_latent_rows': stored})
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised == should_raise, ('fd', stored, raised, should_raise)
     print("PASS stale checkpoint dead rows are refused; triclinic resumes still load")
 
 
