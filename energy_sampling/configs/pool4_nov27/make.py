@@ -30,8 +30,8 @@ Now (submit_pool4_nov27.sbatch; smokes first, then the arms in this order):
   tb_fwd_alpha25  tb_ctrl with fresh rollouts training the policy by TB against the detached head (pool4_nov24
                   tb_m4_onpol's forward branch) at a share of 0.25 beside bwd and replay (0.375 each), every step, and
                   z_level_alpha 0.25. Compare with tb_alpha25
-  cap_big         fresh MLE as mle_live with a larger flow (CAP_BIG: conditioner width, depth and heads, two spline
-                  blocks, 64 bins, wider context), MLE_FRESH_STEPS: meant to overfit. Compare with mle_live and
+  cap_big         fresh MLE as mle_live with a larger flow (CAP_BIG: conditioner width, depth and heads, 64 bins
+                  (one spline block: typed rows allow no other), wider context), MLE_FRESH_STEPS: meant to overfit. Compare with mle_live and
                   pool4_nov26 cap_policy. Its smoke reports the batch it holds (`Batch Size`, `batch/oom_events`)
 Chained (submit_pool4_nov27_chained.sbatch; each needs a checkpoint that does not exist yet, and its sbatch stops on a
 missing source checkpoint):
@@ -66,7 +66,7 @@ MLE_WARM_STEPS, MLE_FRESH_STEPS, TB_STEPS = 80000, 150000, 40000
 SMOKE_MLE_STEPS = 300
 SMOKE_TB_STEPS = p4.RAMP_STEPS + 1000          # the TB LR ramp, then 1,000 steps at its full value
 T_HOT = 10.0
-CAP_BIG = dict(tf_width=1024, tf_layers=12, tf_heads=16, n_blocks=2, n_bins=64, context_dim=512,
+CAP_BIG = dict(tf_width=1024, tf_layers=12, tf_heads=16, n_blocks=1, n_bins=64, context_dim=512,
                context_hidden=1024, hidden=1024)
 #: checkpoint names as the trainer writes a snapshot, <tag>_<run_name>_<problem slug>_<snapshot>.pt, with the slug
 #: utils.problem_slug of the writing yaml (computed 2026-11-27 from the generated yamls; T and the temperature-column

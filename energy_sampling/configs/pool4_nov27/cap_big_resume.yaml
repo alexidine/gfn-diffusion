@@ -174,7 +174,7 @@ model:
     state_force_input: false
   nf:
     conditioner: transformer
-    n_blocks: 2
+    n_blocks: 1
     n_bins: 64
     bound: 5.0
     hidden: 1024
