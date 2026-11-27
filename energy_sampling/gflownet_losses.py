@@ -498,15 +498,15 @@ def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tens
     """THE PATHWISE REVERSE-KL TERM on one branch's rows, returned as parameter gradients (NF policy). Row loss
     l = entropy * log q(x | c) - log R(x) at a reparameterised x = T_theta(z | c), differentiated through x only (log
     q's parameters held fixed: sticking the landing), so d mean(l) / d theta = mean_i (entropy d log q/dx - d log R/dx)_i
-    . dx_i/d theta. x None (on-policy): z drawn from the base. x [n, dim] (off-policy, stored rows): z = T_theta^-1(x | c)
-    without gradient, so the regenerated x' equals x up to float error and carries dx'/d theta (NFPolicy.pathwise_draw).
-    log R and its force come from one grad-enabled reward call at a detached copy of x' (live_reward_force) at
+    . dx_i/d theta, x's derivative at its base point z held fixed (NFPolicy.pathwise_draw, by the implicit function
+    theorem). x None (on-policy): a fresh draw. x [n, dim] (off-policy, stored rows): the rows themselves.
+    log R and its force come from one grad-enabled reward call at a detached copy of x (live_reward_force) at
     log_T_tensor [n] (log10 T per row). A row whose reward, density or force is not finite is dropped. settings
     (pathwise_settings): pathwise_rows draws that many rows uniformly without replacement (0: all); pathwise_grad_clip
     caps each row's |dl/dx|; pathwise_row_cap bounds each row's parameter gradient (pathwise_param_grads). Returns
     {'params' (policy_parameters), 'grads' (at unit weight; None when no row survived), 'settings', 'stats'}, stats
     (floats): loss (mean l), log_r, log_q, bad_frac, force_norm (mean |dl/dx| before the clip), x_clipped_frac, rows,
-    grad_norm (|grads|), the row_* stats under a row cap and, off-policy, regen_err (max |x' - x|, angles wrapped)."""
+    grad_norm (|grads|) and the row_* stats under a row cap."""
     n = int(condition.shape[0])
     k = int(settings['pathwise_rows'])
     if 0 < k < n:
@@ -543,12 +543,6 @@ def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tens
                  'bad_frac': 1.0 - float(ok.float().mean()), 'rows': float(ok.numel()),
                  'x_clipped_frac': float(clipped.float().mean()),
                  'grad_norm': float(grad_sq_norm(grads).sqrt()) if grads is not None else 0.0, **row_stats}
-        if x is not None:
-            d = x_live.detach() - x.detach().to(x_live.device, x_live.dtype)
-            ang = getattr(gfn, 'ang_idx', None)
-            if ang is not None and ang.numel():
-                d[:, ang] = torch.remainder(d[:, ang] + 1.0, 2.0) - 1.0
-            stats['regen_err'] = float(d.abs().max()) if d.numel() else 0.0
     return {'params': params, 'grads': grads, 'settings': settings, 'stats': stats}
 
 
@@ -1224,8 +1218,8 @@ def get_gfn_backward_loss(loss_coeffs,
         gfn._aux_terms = {**(getattr(gfn, '_aux_terms', None) or {}), f'{live_stash}_score': _t}
 
     # OFF-POLICY PATHWISE REVERSE KL on this branch's stored rows (bwd/replay_loss_coeffs.pathwise or
-    # pathwise_norm_frac; NF policy): each row is regenerated x' = T_theta(T_theta^-1(x)) with dx'/dtheta and pushed
-    # along -d(entropy log q - log R)/dx' (pathwise_term), log R from a grad-enabled reward call at x' at the row's
+    # pathwise_norm_frac; NF policy): each stored row x, carrying dx/dtheta at its base point held fixed, is pushed
+    # along -d(entropy log q - log R)/dx (pathwise_term), log R from a grad-enabled reward call at x at the row's
     # own temperature (the draw's `draw_log_T` when it carries one, else log_T_tensor). Trained call only, as the
     # score; the parameter gradients go to gfn._pathwise_grads, which train.py::Modeller.step_loss adds after the
     # fused backward at the term's dose.

@@ -1186,6 +1186,44 @@ class ConditionalLatentFlow(nn.Module):
             x = self._row_turn(x, F, inverse=True)[0]
         return x
 
+    def implicit_draw(self, x, c):
+        """x [n, dim] (wrapped, pinned rows) as a tensor whose value is x and whose derivative in the parameters is that
+        of the draw rsample makes from its base point z = to_base(x | c) with z held fixed: by the implicit function
+        theorem dx/dtheta = -J^-1 dz/dtheta, J = dz/dx [n, d, d] on the live rows (one parallel pass of to_base, its
+        Jacobian by one batched backward over the d outputs; pad slots, which rsample pins at 0, carry none, nor does a
+        row where J is singular, e.g. a bounded row past its face, where the spline clamps and log q is -inf, nor a
+        non-finite row, whose value stays as given so the term drops it). So the
+        pathwise term is exact at the row itself (no regeneration error) and costs a parallel pass where rsample runs d
+        sequential ones. Standard frame only (no canonical frame)."""
+        if self._frame_rows is not None:
+            raise NotImplementedError("implicit_draw with a canonical frame")
+        f = self.flow
+        n = x.shape[0]
+        li = self.live_idx
+        fin = torch.isfinite(x).all(-1)                    # a non-finite row would poison every parameter's gradient
+        xr = torch.where(fin[:, None], x.detach(), torch.zeros_like(x)).requires_grad_(True)   # (0 x NaN in backward)
+        with torch.enable_grad():
+            z = self.to_base(xr, c)[0]                                         # [n, d]: graph to x and theta
+            d = z.shape[1]
+            eye = torch.eye(d, device=z.device, dtype=z.dtype).unsqueeze(1).expand(d, n, d)
+            jac, = torch.autograd.grad(z, xr, grad_outputs=eye, retain_graph=True, is_grads_batched=True)
+        J = jac[:, :, li].permute(1, 0, 2).detach().double()                  # [n, d (z_k), d (x_j)]
+        live = f.live_rows(n)
+        dz = z - z.detach()                                                    # value 0, d/dtheta = dz/dtheta at fixed x
+        if live is not None:
+            both = live.unsqueeze(-1) & live.unsqueeze(-2)
+            J = torch.where(both, J, torch.diag_embed((~live).double()))       # identity on pad slots
+            dz = _pin(dz, live)
+        sign, logabs = torch.linalg.slogdet(J)
+        flat = (sign == 0) | ~torch.isfinite(logabs) | ~fin   # e.g. a bounded row past its face (the spline clamps:
+        if flat.any():                                     # no derivative; its log q is not finite, so the term drops it)
+            J = torch.where(flat[:, None, None], torch.eye(d, dtype=J.dtype, device=J.device), J)
+            dz = torch.where(flat[:, None], torch.zeros_like(dz), dz)
+        step = torch.linalg.solve(J, -dz.double().unsqueeze(-1)).squeeze(-1).to(x.dtype)   # -J^-1 dz/dtheta, value 0
+        out = x.detach().clone()
+        out[:, li] = out[:, li] + step
+        return out
+
     def level(self, c):
         """log Z(c) up to the batch's shared level: the head, zero at initialisation. It reads a detached copy of
         the condition features, so its regression trains the head alone and not the atom encoder every flow block

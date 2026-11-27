@@ -15,9 +15,9 @@ conditions_embedding_model = what reads the condition (the context network, and 
 flow_model = the level head; t_model, s_model and backward_policy are empty (a one-step flow has no time or state
 embedding and a fixed P_B).
 
-The pathwise draw and the score: pathwise_draw() makes a reparameterised draw (ConditionalLatentFlow.rsample), fresh or
-regenerated from stored rows through their base points, with d log q / d x at fixed parameters, for the pathwise
-reverse-KL term (gflownet_losses.py::pathwise_term); score() is d log q / d x with the graph kept, for score matching
+The pathwise draw and the score: pathwise_draw() hands a row (a fresh draw, or a stored row) carrying the derivative of
+the reparameterised draw through its base point (ConditionalLatentFlow.implicit_draw), with d log q / d x at fixed
+parameters, for the pathwise reverse-KL term (gflownet_losses.py::pathwise_term); score() is d log q / d x with the graph kept, for score matching
 (both standard frame only).
 
 Not supported (raise): a gradient through the trajectory's states (detach_traj False, path_grad_last_k > 0), replay-
@@ -958,24 +958,22 @@ class NFPolicy(nn.Module):
 
     def pathwise_draw(self, condition, mol_batch, x=None):
         """A reparameterised draw for the pathwise term (gflownet_losses.py::pathwise_term): (x' [n, dim] carrying
-        dx'/dtheta through ConditionalLatentFlow.rsample (angles wrapped, dead rows pinned), log q(x' | c) [n] and
-        d log q / d x at x' [n, dim], both detached and taken at fixed parameters: the sticking-the-landing parts).
-        x None: base points from ConditionalLatentFlow.base_sample (on-policy). x [n, dim], standard-frame stored rows:
-        base points z = T_theta^-1(x | c) by ConditionalLatentFlow.to_base without gradient, so x' equals x (wrapped,
-        pinned) up to float error. One noise-free condition (clean_condition). Conditional route, standard frame."""
+        dx'/dtheta, the derivative of x' = T_theta(z) at its base point z held fixed, by the implicit function theorem
+        (ConditionalLatentFlow.implicit_draw; angles wrapped, dead rows pinned), log q(x' | c) [n] and d log q / d x at
+        x' [n, dim], both detached and taken at fixed parameters: the sticking-the-landing parts). x None: a fresh draw,
+        sample()'s (on-policy). x [n, dim], standard-frame stored rows: x' is x itself (wrapped, pinned), z its base
+        point. One noise-free condition (clean_condition). Conditional route, standard frame."""
         if not self.conditional:
             raise NotImplementedError("a pathwise draw on the unconditional route")
         self._refuse_framed('a pathwise draw')
         n = int(condition.shape[0])
         with self.clean_condition():
             c = self._context(condition, mol_batch, n)
-            if x is None:
-                z0 = self.sampler.base_sample(n)
-            else:
-                with torch.no_grad():
-                    xs = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
-                    z0 = self.sampler.to_base(xs, c)[0]
-            x_live = self._pin_dead(self._wrap_ang(self.sampler.rsample(z0, c)))
+            with torch.no_grad():
+                if x is None:
+                    x = self.sampler.sample(n, c)
+                xs = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
+            x_live = self.sampler.implicit_draw(xs, c)
             leaf = x_live.detach().clone().requires_grad_(True)
             with torch.enable_grad():
                 log_q = self.sampler.log_prob(leaf, c)

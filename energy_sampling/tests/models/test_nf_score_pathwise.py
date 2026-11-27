@@ -3,8 +3,9 @@
 backward at its dose by train.py::Modeller._apply_pathwise_grads). So:
   * the policy's score is d log q / d x (finite differences), zero on dead rows, and a loss on it trains the policy;
   * the score-matching row loss is the Huber of |g_q - g_R| over the live rows, a row with no force dropped;
-  * the fresh pathwise draw is the draw sample() makes from the same base points with its log q and score; the
-    off-policy draw regenerates stored rows (x' = x) with dx'/dtheta reaching the flow and the condition's encoder;
+  * the fresh pathwise draw is the draw sample() makes with its log q and score; the off-policy draw is the stored row;
+    either carries the d-pass inverse's parameter derivative (implicit function theorem), reaching the flow and the
+    condition's encoder;
   * the term's gradient is the sticking-the-landing estimator (on- and off-policy, entropy 1 and 0); a row with no
     reward is dropped; the x clip, the row subsample and the per-row parameter cap act as stated; descending the term
     alone lowers fresh draws' energy on a toy target, on- and off-policy;
@@ -235,12 +236,57 @@ def test_the_fresh_draw_is_samples_draw_with_its_log_q_and_score():
     assert torch.allclose(g_q, pol.score(x.detach(), c, None).detach(), atol=1e-4)    # d log q / dx, fixed theta
 
 
-def test_the_off_policy_draw_regenerates_the_stored_rows():
-    """z = T^-1(x) without gradient, x' = T(z) with it: x' equals the stored x (wrapped, pinned) to float error and
-    carries dx'/dtheta into the flow blocks and the condition's encoder."""
+@pytest.mark.parametrize('dtype', [torch.float64])
+def test_the_implicit_draw_carries_the_d_pass_inverse_derivative(dtype):
+    """ConditionalLatentFlow.implicit_draw at x = rsample(z0) has rsample's value and, for any cotangent g, rsample's
+    parameter gradient of g . x (the implicit function theorem against autograd through the d differentiable passes),
+    reaching the flow blocks and the condition's encoder."""
+    pol, c, _ = _setup(dtype)
+    params = _policy_params(pol)
+    torch.manual_seed(2)
+    with pol.clean_condition():
+        ctx = pol._context(c, None, N)
+        z0 = pol.sampler.base_sample(N).to(dtype)
+        x_r = pol.sampler.rsample(z0, ctx)
+        x_i = pol.sampler.implicit_draw(x_r.detach(), ctx)
+    assert torch.equal(x_i.detach(), x_r.detach())
+    g = torch.randn(x_r.shape, generator=torch.Generator().manual_seed(4), dtype=dtype)
+    want = torch.autograd.grad((x_r * g).sum(), params, allow_unused=True)
+    got = torch.autograd.grad((x_i * g).sum(), params, allow_unused=True)
+    reached = 0
+    for a, b in zip(got, want):
+        assert (a is None) == (b is None) or (a if a is not None else b).abs().max() < 1e-12
+        if a is not None and b is not None:
+            assert torch.allclose(a, b, atol=1e-9, rtol=1e-6), float((a - b).abs().max())
+            reached += int(a.abs().sum() > 0)
+    assert reached
+
+
+def test_a_stored_row_past_a_bounded_face_is_dropped_not_fatal():
+    """A bounded row just past its face (the spline clamps: dz/dx = 0 there, J singular, log q -inf) or a non-finite row
+    carries no derivative and the term drops it; the gradient is the term over the other rows."""
+    from gflownet_losses import pathwise_term
+    pol, c, x = _setup()
+    b = int(pol.sampler.bounded_rows[0]) if getattr(pol.sampler, 'bounded_rows', None) else None
+    if b is None:
+        pytest.skip('test policy has no bounded row')
+    ref = pathwise_term(_pw(), pol, _reward, c[1:], None, torch.zeros(N - 1), x=x[1:])
+    for val in (1.001, float('nan')):                      # past the face; a non-finite row (0 x NaN in backward)
+        bad = x.clone()
+        bad[0, b] = val
+        out = pathwise_term(_pw(), pol, _reward, c, None, torch.zeros(N), x=bad)
+        assert out['stats']['bad_frac'] == pytest.approx(1 / N)
+        for a, r in zip(out['grads'], ref['grads']):
+            if a is not None:
+                assert torch.isfinite(a).all() and torch.allclose(a, r, atol=1e-5, rtol=1e-4)
+
+
+def test_the_off_policy_draw_is_the_stored_row():
+    """x' is the stored x (wrapped, pinned) exactly and carries dx'/dtheta into the flow blocks and the condition's
+    encoder."""
     pol, c, x = _setup()
     x2, log_q, _ = pol.pathwise_draw(c, None, x)
-    assert torch.allclose(x2.detach(), x, atol=2e-4)
+    assert torch.equal(x2.detach(), pol._pin_dead(pol._wrap_ang(x)))
     assert torch.allclose(log_q, pol.sampler.log_prob(x, c), atol=1e-3)
     grads = torch.autograd.grad(x2.sum(), _policy_params(pol), allow_unused=True)
     names = [n for n, p in pol.named_parameters() if any(p is q for q in _policy_params(pol))]
@@ -276,7 +322,7 @@ def test_the_term_is_the_sticking_the_landing_gradient(off_policy, entropy):
     st = out['stats']
     assert st['grad_norm'] > 0 and st['bad_frac'] == 0.0 and st['rows'] == N
     assert st['log_r'] == pytest.approx(float(lr.mean()), abs=1e-3)
-    assert ('regen_err' in st) == off_policy and st.get('regen_err', 0.0) < 2e-4
+    assert 'regen_err' not in st
 
 
 def test_a_row_with_no_reward_is_dropped_the_clip_caps_dl_dx_and_rows_subsample():
@@ -371,7 +417,7 @@ def test_the_backward_loss_stashes_the_off_policy_term_on_trained_calls_only():
                           log_T_tensor=torch.zeros(N))
     assert set(pol._pathwise_grads) == {'replay'} and calls['n'] == 1
     term = pol._pathwise_grads['replay']
-    assert term['stats']['rows'] == 4 and term['stats']['regen_err'] < 2e-4 and term['settings']['pathwise'] == 0.0
+    assert term['stats']['rows'] == 4 and term['settings']['pathwise'] == 0.0
     pol._pathwise_grads = None
     get_gfn_backward_loss(_bwd_coeffs(mle=1, pathwise=1.0), x, pol, log_r, None, None, condition=c, repeats=1,
                           live_stash=None, log_reward_fn=reward, log_T_tensor=torch.zeros(N))
