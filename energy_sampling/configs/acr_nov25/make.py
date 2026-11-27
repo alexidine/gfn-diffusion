@@ -16,6 +16,9 @@
   mle_*     the MLE stage alone (owner 2026-11-26): MLE_ONLY_STEPS steps on the live kernel, then snapshot phase1_exit
             and stop; evaluations every MLE_EVAL_PERIOD steps on MLE_EVAL_SAMPLES draws (the only MLIP calls of an
             MLE stage), so the compute goes to MLE steps. submit_acr_nov25_mle.sbatch: indices 0-4 in MODELS order.
+  tb_*      the TB stage alone (phase 2), weights-only from mle_<model>'s phase1_exit, the full arm's TB settings,
+            evaluations as mle_*'s. submit_acr_nov25_tb.sbatch: indices 0-4 in MODELS order. Each has a next leg,
+            tb_<model>_resume.yaml (its own running checkpoint), run by submit_acr_nov25_tb_resume.sbatch, same indices.
 
 usage: python configs/acr_nov25/make.py                       (cluster arms and the sbatch file)
        python configs/acr_nov25/make.py --local DIR --prior P --conditions C [--model M]
@@ -105,6 +108,37 @@ def mle_arm(model, files, steps=MLE_ONLY_STEPS, local=False):
     return cfg
 
 
+def problem_slug(yaml_path):
+    """The trainer's problem slug for a written arm yaml (the stem of its checkpoint names: checkpointing.path_for)."""
+    import sys
+    for p in (str(HERE.parent.parent.parent), str(HERE.parent.parent)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import utils
+    a = utils.resolve_derived_config(utils.preflight_config(utils.dict2namespace(utils.load_yaml(str(yaml_path)))))
+    return utils.problem_slug(a, utils.get_problem_definition(a))
+
+
+def tb_arm(model, files, slug):
+    """arm()'s TB stage alone, weights-only from mle_<model>'s phase1_exit snapshot (the MLE stage's skip_if
+    weights_loaded skips it; step_offset continues the curves from the source's step); evaluations as the MLE arm's."""
+    cfg = arm(model, files)
+    assert p4._mle(cfg).get('skip_if') == 'weights_loaded'
+    cfg.update(run_name=f'tb_{model}', checkpoint_name=f'{TAG}_mle_{model}_{slug}_phase1_exit.pt',
+               load_weights_only=True, eval_period=MLE_EVAL_PERIOD,   # epochs: the full arm's (the invariant counts
+               # the skipped MLE stage's cap); the TB stage's max_steps ends the run
+               eval_num_samples=MLE_EVAL_SAMPLES, test_eval_num_samples=min(MLE_EVAL_SAMPLES,
+                                                                            cfg['test_eval_num_samples']))
+    return cfg
+
+
+def resume(cfg):
+    """the next leg of a run: its own running checkpoint, not its source weights"""
+    cfg = copy.deepcopy(cfg)
+    cfg.update(continue_from_checkpoint=True, checkpoint_name=None, load_weights_only=False)
+    return cfg
+
+
 def sbatch(arms, tag=TAG):
     """submit_acr_nov25.sbatch from unified_nov23's template: one arm per array index (smokes first), no held-out
     molecule file, an arm's model's extra PYTHONPATH (PYEXTRA: torch-dftd for MACE-CSP, fairchem 2.16 for UMA-s 1.2)."""
@@ -116,7 +150,7 @@ def sbatch(arms, tag=TAG):
     text = text.replace(old, '    for KEY in prior_path molecules_path; do')
     old = 'GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"'
     assert text.count(old) == 1
-    cases = ''.join(f'    *{m}) PYEXTRA={p} ;;\n' for m, p in PYEXTRA.items())
+    cases = ''.join(f'    *{m}*) PYEXTRA={p} ;;\n' for m, p in PYEXTRA.items())   # *: tb_<model>_resume
     text = text.replace(old, old + "\ncase ${GROUP} in   # the model's extra PYTHONPATH (make.py PYEXTRA)\n" + cases
                         + '    *) PYEXTRA= ;;\nesac')
     old = 'export PYTHONPATH=${PROJECT_ROOT}/MXtalTools'
@@ -160,3 +194,14 @@ if __name__ == '__main__':
         mle_arms = [f'mle_{m}' for m in MODELS]
         (HERE / f'submit_{TAG}_mle.sbatch').write_text(sbatch(mle_arms), encoding='utf-8', newline='\n')
         print(HERE / f'submit_{TAG}_mle.sbatch', ': indices', ', '.join(f'{i} {a}' for i, a in enumerate(mle_arms)))
+        tb_arms = []
+        for m in MODELS:
+            slug = problem_slug(HERE / f'mle_{m}.yaml')
+            c = tb_arm(m, prior_files(m), slug)
+            write(f'tb_{m}', c)
+            assert problem_slug(HERE / f'tb_{m}.yaml') == slug, m   # the TB arm is the MLE arm's problem
+            write(f'tb_{m}_resume', resume(c))
+            tb_arms.append(f'tb_{m}')
+        for name, arms in ((f'{TAG}_tb', tb_arms), (f'{TAG}_tb_resume', [f'{a}_resume' for a in tb_arms])):
+            (HERE / f'submit_{name}.sbatch').write_text(sbatch(arms), encoding='utf-8', newline='\n')
+            print(HERE / f'submit_{name}.sbatch', ': indices', ', '.join(f'{i} {a}' for i, a in enumerate(arms)))
