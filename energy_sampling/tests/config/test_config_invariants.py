@@ -1439,6 +1439,16 @@ def test_live_temperature_range_is_refused_malformed_or_off_the_store_route(cano
         assert _fires(cfg, rule, severity=ERROR), bad
 
 
+def test_z_level_alpha_outside_zero_one_or_unread_is_an_error(canonical):
+    """fwd z_level_alpha: in [0, 1], and read only by the condition-grouped fwd emp_z. Full coverage:
+    tests/losses/test_z_level_alpha.py."""
+    rule = 'z_level_alpha_is_read'
+    cfg = copy.deepcopy(canonical)
+    assert cfg['fwd_loss_coeffs']['z_level_alpha'] == 0.0 and not _fires(cfg, rule)
+    cfg['fwd_loss_coeffs']['z_level_alpha'] = 1.5
+    assert _fires(cfg, rule, severity=ERROR)
+
+
 def test_a_malformed_heldout_gate_is_an_error(canonical):
     """Full coverage: tests/protocol/test_heldout_gate.py."""
     cfg = copy.deepcopy(canonical)

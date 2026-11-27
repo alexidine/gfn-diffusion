@@ -9611,10 +9611,12 @@ class Modeller:
         return float(self._noised_prior_settings['kick_kappa_per_atom']) * atoms[t]
 
     def _kick_temperature_range(self):
-        """cfg:noised_prior.live_temperature_range as (T_lo, T_hi) when the MLE draw labels its kicks
-        (_kick_labels_temperature) and the key is set, else None."""
-        rng = (getattr(self, '_noised_prior_settings', None) or {}).get('live_temperature_range')
-        if rng is None or not self._kick_labels_temperature():
+        """cfg:noised_prior.live_temperature_range as (T_lo, T_hi) when it and noised_prior.kick_kappa_per_atom are set,
+        else None. The MLE draw then kicks each row at its drawn T; it labels the row with that T only under
+        temperature_conditioning (_kick_labels_temperature)."""
+        s = getattr(self, '_noised_prior_settings', None) or {}
+        rng = s.get('live_temperature_range')
+        if rng is None or s.get('kick_kappa_per_atom') is None:
             return None
         return float(rng[0]), float(rng[1])
 
@@ -9655,10 +9657,20 @@ class Modeller:
                                  "log R")
             labelled = self._kick_labels_temperature()
             t_first = None
-            if labelled and self._kick_temperature_range() is not None:
+            if self._kick_temperature_range() is not None:
                 # noised_prior.live_temperature_range: each row's temperature first, then a Gaussian kick at it
+                # (labelled with it only under temperature_conditioning)
                 rows, x, rho, t_first = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']),
                                                          with_rho=True, temperature=self._draw_kick_temperatures(B))
+                if not labelled and not getattr(self, '_kick_temperature_shown', False):
+                    qs = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
+                    q, r = torch.quantile(t_first, qs).tolist(), torch.quantile(rho.double(), qs).tolist()
+                    print(f"MLE kick temperatures (drawn log-uniform over noised_prior.live_temperature_range, each "
+                          f"kicked at its own, unlabelled: no temperature_conditioning; first draw, {t_first.numel()} "
+                          f"rows): P10 {q[0]:.3g}, median {q[1]:.3g}, P90 {q[2]:.3g} (energy_config.temperature "
+                          f"{float(self.args.energy_config.temperature):g}); kick lengths P10 {r[0]:.3g}, median "
+                          f"{r[1]:.3g}, P90 {r[2]:.3g} A", flush=True)
+                    self._kick_temperature_shown = True
             elif labelled:
                 rows, x, rho = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']), with_rho=True)
             else:

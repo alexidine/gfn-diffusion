@@ -652,6 +652,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                  crystal_batch=crystal_batch, anchor_energy_fn=anchor_energy_fn, rows=tracker_rows)
     group_id = (condition_temperature_groups(condition_id, log_T_tensor)
                 if group_by_temperature and condition_id is not None else condition_id)
+    z_alpha_shift = None   # set by the condition-grouped emp_z when fwd z_level_alpha shifts its target
 
     # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
     # branches' log-weights in one scope. Stashed on the model rather than
@@ -710,8 +711,11 @@ def get_gfn_forward_loss(loss_coeffs,
         if loss_coeffs.emp_z > 0:
             # regress Z(c) onto this batch's per-condition estimate; the target's
             # flavor follows the active VG branch (mean under vg_lb, lme under
-            # vg_lme), same inheritance as the repeats-grouped path below
-            emp_z_loss = beta * F.smooth_l1_loss(log_Z_emp_rows, log_Z_learned,
+            # vg_lme), same inheritance as the repeats-grouped path below.
+            # z_level_alpha moves it that share of the way toward the backward level
+            target, z_alpha_shift = z_level_target(log_Z_emp_rows, condition_log_z, condition_id,
+                                                   getattr(loss_coeffs, 'z_level_alpha', 0))
+            emp_z_loss = beta * F.smooth_l1_loss(target, log_Z_learned,
                                                  reduction='none', beta=beta) * emp_mask.float()
             losses.append(emp_z_loss * loss_coeffs.emp_z)
         else:
@@ -863,6 +867,8 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['vg_lme'] = vg_loss.mean().detach()
         if loss_coeffs.emp_z > 0:
             loss_dict['emp_z'] = emp_z_loss.mean().detach()
+            if z_alpha_shift is not None:
+                loss_dict['z_level_alpha_shift'] = z_alpha_shift.mean()
         if loss_coeffs.db > 0:
             loss_dict['db'] = db_loss.mean().detach()
         if loss_coeffs.subtb > 0:
@@ -1822,6 +1828,20 @@ def z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id):
     group_mean = torch.zeros(k, device=err.device, dtype=err.dtype).scatter_add_(
         0, inverse, err) / counts.clamp(min=1)
     return (group_mean ** 2).mean()
+
+
+def z_level_target(log_Z_emp_rows, condition_log_z, condition_id, alpha):
+    """(target [N], shift [N] or None) for the condition-grouped emp_z regression of Z(c): the batch's per-condition
+    level log_Z_emp_rows (the forward level J_F(c) on forward rows), plus alpha x the tracker's detached
+    delta(c) = J_B(c) - J_F(c) (ConditionLogZTracker.lookup_delta), on rows whose condition has both levels trusted and
+    0 on the rest. alpha 0 (or no tracker) returns the rows unchanged and shift None: Z(c) at the forward level, as
+    before; alpha 1 targets the backward level."""
+    alpha = float(alpha or 0.0)
+    if alpha == 0.0 or condition_log_z is None or condition_id is None:
+        return log_Z_emp_rows, None
+    delta, mask = condition_log_z.lookup_delta(condition_id)
+    shift = (alpha * delta * mask.to(delta.dtype)).to(device=log_Z_emp_rows.device, dtype=log_Z_emp_rows.dtype)
+    return log_Z_emp_rows + shift, shift.detach()
 
 
 def condition_temperature_groups(condition_id, log_T_tensor):

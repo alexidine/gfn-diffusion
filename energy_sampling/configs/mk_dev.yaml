@@ -38,8 +38,8 @@ noised_prior:                # read only when prior_path is a pre-noised build (
   live_bank: 1024            # live_kernel 'basin': chart points kept per prior row, drawn at the first MLE step, unscored, not checkpointed (0 = every draw fresh)
   live_fresh_frac: 0.0       # live_kernel 'basin': share of each batch drawn fresh and written into the bank (0 = the bank is a fixed set)
   live_shape: hessian        # live_kernel 'basin': the draw's covariance, 'hessian' (live_tau x the thermal ellipsoid, modes capped by live_caps) or 'iso' (one width per row in live_caps-scaled coordinates, same expected excess); refused with any other live_kernel
-  kick_kappa_per_atom: null  # temperature_conditioning on the store route: kick stiffness per atom (energy per molecule per A^2); each live physical kick is labelled T_eff = kick_kappa_per_atom x atoms x rho^2 / d (d = the group's live coordinates). null = no labels
-  live_temperature_range: null  # with kick_kappa_per_atom: [T_lo, T_hi] kT; each MLE row draws T log-uniform over it, then a Gaussian kick of variance T / (kick_kappa_per_atom x atoms) per live coordinate, labelled T. null = kick length log-uniform over live_log_range, labelled T_eff. Store growth kicks read live_log_range either way
+  kick_kappa_per_atom: null  # store route: kick stiffness per atom (energy per molecule per A^2); under temperature_conditioning each live physical kick is labelled T_eff = kick_kappa_per_atom x atoms x rho^2 / d (d = the group's live coordinates); live_temperature_range reads it for the kick widths. null = no labels
+  live_temperature_range: null  # with kick_kappa_per_atom: [T_lo, T_hi] kT; each MLE row draws T log-uniform over it, then a Gaussian kick of variance T / (kick_kappa_per_atom x atoms) per live coordinate, labelled T under temperature_conditioning (unlabelled without it). null = kick length log-uniform over live_log_range, labelled T_eff under temperature_conditioning. Store growth kicks read live_log_range either way
   train_molecules: null      # buffers.store only: train on the N molecules_path molecules with the lowest (molecule_u, identifier) and every prior row of them, both splits; the energy clip is armed over every molecule's rows; test_molecules_path is unchanged. null = every molecule
 harvest:                     # scored rollout rows kept for the next prior build (train.py::Modeller.harvest_scored_rows)
   enabled: false
@@ -479,6 +479,7 @@ fwd_loss_coeffs:
   emp_z_persistent: 0
   tb_z_source: learned    # 'learned' | 'persistent'. CONDITIONAL routes want persistent -- set it in the stage, not here
   tb_detach_z: 0.0        # > 0.5 = the forward TB term reads the Z head detached; the branch's other terms (emp_z) keep it live
+  z_level_alpha: 0.0      # condition-grouped emp_z: Z(c)'s target = the batch's per-condition mean log w + z_level_alpha x the tracker's J_B(c) - J_F(c) (0 where either level is untrusted). 0 = the forward level, 1 = the backward level
   traj_grads: 0.0
   reward_grads: 0.0
   path_grad_last_k: 0     # > 0: the reparameterised state gradient stays live for the LAST k rollout steps only (0 = every step detached unless traj_grads). With reward_grads this is the truncated terminal-force path. NOT INERT ALONE: the reward half is (get_loss_reward detaches x_T and log_r at reward_grads 0), but log_pf and log_pb still differentiate through the live next_state on the last step (gfn.py:916, :919), so k>0 at reward_grads 0 is NOT the same gradient as k=0

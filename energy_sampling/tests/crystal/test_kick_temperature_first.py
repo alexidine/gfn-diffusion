@@ -201,6 +201,39 @@ def test_a_range_outside_the_temperature_column_is_refused(monkeypatch, t_rng):
     assert any('outside' in m for m in _problems(monkeypatch, t_rng))
 
 
-@pytest.mark.parametrize('tcond, kappa', [(False, None), (True, None)])
-def test_the_range_without_labelled_kicks_is_a_dead_key(monkeypatch, tcond, kappa):
-    assert any('dead key' in m for m in _problems(monkeypatch, [2.5, 10.0], tcond=tcond, kappa=kappa))
+@pytest.mark.parametrize('tcond', [False, True])
+def test_the_range_without_kappa_is_a_dead_key(monkeypatch, tcond):
+    assert any('dead key' in m for m in _problems(monkeypatch, [2.5, 10.0], tcond=tcond, kappa=None))
+
+
+def test_the_range_without_temperature_conditioning_sets_the_kick_widths_and_is_not_dead(monkeypatch):
+    """Unlabelled temperature-first kicks (an MLE run at one temperature's kick widths): no refusal, and the column's
+    span is not judged, since there is no column."""
+    assert _problems(monkeypatch, [10.0, 10.0], tcond=False, kappa=15.0, rng=(0.0, 0.5)) == []
+
+
+def test_kappa_without_temperature_conditioning_or_the_range_is_still_a_dead_key(monkeypatch):
+    store = dict(ci.ROW_STORE_DEFAULTS, enabled=True)
+    cfg = {'buffers': {'store': store}, 'temperature_conditioning': False,
+           'noised_prior': {'kick_kappa_per_atom': 15.0}, 'bwd_loss_coeffs': {'mle': 1.0, 'tb': 0.0}}
+    monkeypatch.setattr(ci, 'active_stages', lambda c: [])
+    assert any('kick_kappa_per_atom' in m and 'dead key' in m
+               for sev, m in ci.row_store_problems(cfg) if sev == ci.ERROR)
+
+
+def test_without_temperature_conditioning_the_kicks_are_drawn_at_t_and_left_unlabelled(monkeypatch, capsys):
+    m, calls = _tfirst(monkeypatch, rng=(10.0, 10.0))
+    m.energy_function.temperature_conditioning = False
+    ef, seen = m.energy_function, {}
+    orig = ef.condition_samples
+
+    def condition_samples(mol, temperature=None, **kw):
+        seen['T'] = temperature
+        return orig(mol, temperature=temperature, **kw)
+    ef.condition_samples = condition_samples
+    _, cid, *_ = m.draw_bwd_sample(1)
+    st = m.row_store
+    kappa = 15.0 * m._template_atoms[st.tmpl_of[cid].long()]
+    assert seen['T'] is None                                       # no label: the condition is the run's temperature
+    assert torch.allclose(calls[0]['sigma'], torch.sqrt(10.0 / kappa))
+    assert 'unlabelled' in capsys.readouterr().out

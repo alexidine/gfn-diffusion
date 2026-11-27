@@ -55,11 +55,12 @@ WINDOW_BY = ('row', 'parent')
 #: kick_kappa_per_atom: kick stiffness per atom (energy units per molecule per A^2) that labels each live physical
 #: kick with an effective temperature T_eff = kappa_per_atom x atoms x rho^2 / d (train.py::Modeller._kick_temperature),
 #: the condition the MLE draw passes under temperature_conditioning. null = no labels
-#: live_temperature_range: [T_lo, T_hi] (kT, energy units, as energy_config.temperature): the MLE draw takes each row's
-#: temperature first, log-uniform over the range, and then its live physical kick as a Gaussian step of variance
-#: T / kappa per live coordinate (kappa = kick_kappa_per_atom x atoms), so rho^2 = (T / kappa) chi^2_d and the row's
-#: label is the drawn T (train.py::Modeller._kick_fresh). null = the kick length first, log-uniform over
-#: live_log_range, labelled T_eff (above). Store growth kicks read live_log_range either way
+#: live_temperature_range: [T_lo, T_hi] (kT, energy units, as energy_config.temperature), with kick_kappa_per_atom set:
+#: the MLE draw takes each row's temperature first, log-uniform over the range, and then its live physical kick as a
+#: Gaussian step of variance T / kappa per live coordinate (kappa = kick_kappa_per_atom x atoms), so
+#: rho^2 = (T / kappa) chi^2_d; under temperature_conditioning the row's label is the drawn T, without it the row is
+#: unlabelled (train.py::Modeller._kick_fresh). null = the kick length first, log-uniform over live_log_range,
+#: labelled T_eff (above) under temperature_conditioning. Store growth kicks read live_log_range either way
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
 #: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation;

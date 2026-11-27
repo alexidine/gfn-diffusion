@@ -1624,15 +1624,16 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
         if not (isinstance(rng, (list, tuple)) and len(rng) == 2 and all(_real(v) for v in rng) and rng[0] < rng[1]):
             err(f"temperature_conditioning needs energy_config.log_temperature_range [lo, hi] (log10 of kT, lo < hi): "
                 f"the condition scaler is fitted over it; got {rng!r}")
-    elif kappa is not None:
-        err('noised_prior.kick_kappa_per_atom without temperature_conditioning labels nothing (a dead key)')
     t_rng = _get(cfg, 'noised_prior.live_temperature_range')
+    if not tcond and kappa is not None and t_rng is None:
+        err('noised_prior.kick_kappa_per_atom without temperature_conditioning or noised_prior.live_temperature_range '
+            'is read by nothing (a dead key)')
     if t_rng is not None:
-        if not (tcond and kappa is not None):
-            err('noised_prior.live_temperature_range draws the MLE kick temperatures, read only with '
-                'temperature_conditioning and noised_prior.kick_kappa_per_atom (a dead key otherwise)')
+        if kappa is None:
+            err('noised_prior.live_temperature_range draws each MLE kick at a temperature through '
+                'noised_prior.kick_kappa_per_atom, which is unset (a dead key otherwise)')
         rng = _get(cfg, 'energy_config.log_temperature_range')
-        if (isinstance(t_rng, (list, tuple)) and len(t_rng) == 2 and all(_real(v) and v > 0 for v in t_rng)
+        if (tcond and isinstance(t_rng, (list, tuple)) and len(t_rng) == 2 and all(_real(v) and v > 0 for v in t_rng)
                 and isinstance(rng, (list, tuple)) and len(rng) == 2 and all(_real(v) for v in rng)):
             lt = [math.log10(float(v)) for v in t_rng]
             if lt[0] < float(rng[0]) - 1e-9 or lt[1] > float(rng[1]) + 1e-9:
@@ -1841,6 +1842,29 @@ def stage_temperatures_are_read(cfg: dict) -> list[Violation]:
             out.append(Violation(ERROR, 'stage_temperatures_are_read',
                                  f"stage '{name}': temperatures on a stage that reads no reward (the MLE draw labels "
                                  f"each kick with its own temperature)"))
+    return out
+
+
+def z_level_alpha_is_read(cfg: dict) -> list[Violation]:
+    """fwd_loss_coeffs.z_level_alpha (gflownet_losses.z_level_target) lies in [0, 1] and is read only by the
+    condition-grouped emp_z of the forward branch: a stage resolving it above 0 needs fwd emp_z > 0 and fwd
+    vg_by_condition > 0 (the condition-grouped path), else it is a dead key. Every route; the base block is judged when
+    the protocol has no stage."""
+    out = []
+    stages = [st for st in active_stages(cfg) if isinstance(st, dict)] or [{}]
+    for st in stages:
+        a = _coeff(cfg, st, 'fwd', 'z_level_alpha')
+        if a is None or a == 0:
+            continue
+        name = st.get('name', 'base block')
+        if not 0 <= a <= 1:
+            out.append(Violation(ERROR, 'z_level_alpha_is_read',
+                                 f"stage '{name}': fwd z_level_alpha {a!r} is outside [0, 1] (0 = the forward level, 1 = "
+                                 f"the backward level)"))
+        if not ((_coeff(cfg, st, 'fwd', 'emp_z') or 0) > 0 and (_coeff(cfg, st, 'fwd', 'vg_by_condition') or 0) > 0):
+            out.append(Violation(ERROR, 'z_level_alpha_is_read',
+                                 f"stage '{name}': fwd z_level_alpha {a} is read only by the condition-grouped fwd emp_z "
+                                 f"(fwd emp_z > 0 and vg_by_condition > 0): a dead key here"))
     return out
 
 
@@ -3274,6 +3298,7 @@ RULES = (
     row_store_is_well_formed,
     # every route; returns [] when noised_prior.train_molecules is null or absent
     train_molecules_is_well_formed,
+    z_level_alpha_is_read,
     live_temperature_range_is_well_formed,
     # every route; returns [] when no active stage sets temperatures
     stage_temperatures_are_read,
