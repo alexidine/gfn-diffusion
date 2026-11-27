@@ -4788,17 +4788,19 @@ class Modeller:
 
     @torch.no_grad()
     def _stored_reward_terms(self, batch, chunk: int = 8192, with_mol_energy: bool = False, rows=None, cids=None,
-                             prior_path=None):
+                             prior_path=None, with_store_terms: bool = False):
         """([n] seed energy, [n] log R at the run's temperature) of stored, scored rows, from their stored terms alone
         (prebuilt_sample_to_reward; MolecularCrystal.seed_energy_from), both float64 on the CPU. with_mol_energy adds a
-        third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced). rows: the rows to read, in
-        this order (default every row); cids: their condition ids, attached for an energy reference to read.
+        third, the ens_dict's [n] mol_energy (physical energy per molecule, unreferenced). with_store_terms adds a last,
+        the [n, 4] float32 MolecularCrystal.store_terms_from of each row. rows: the rows to read, in this order (default
+        every row); cids: their condition ids, attached for an energy reference to read.
         prior_path: `batch` is that pre-noised prior file's batch, and the result goes through the sidecar cache beside
         it (noised_prior.cache_path 'rewards'), keyed on the file, the rows, the condition ids, the temperature and the
-        energy function's settings, clip and reference. A cached result is used only after a fresh scoring of
-        REWARD_CACHE_CHECK_ROWS rows (random, plus the highest-energy rows, which the clip acts on) agrees with it."""
+        energy function's settings, clip and reference (and store_terms, when asked). A cached result is used only after
+        a fresh scoring of REWARD_CACHE_CHECK_ROWS rows (random, plus the highest-energy rows, which the clip acts on)
+        agrees with it."""
         if prior_path is None:
-            return self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+            return self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids, with_store_terms)
         import json
         from utils import _namespace_to_dict
         ef, T =self.energy_function, float(self.args.energy_config.temperature)
@@ -4811,7 +4813,10 @@ class Modeller:
                    energy_config=json.dumps(_namespace_to_dict(self.args.energy_config), sort_keys=True, default=str),
                    clip=getattr(ef, 'energy_clip', None), physical_clip=getattr(ef, 'physical_energy_clip', None),
                    reference=None if ref is None else noised_prior.digest(torch.as_tensor(ref).double()),
-                   fd_chart=getattr(self, '_fd_chart_digest', None), code=self._reward_code_digest())
+                   fd_chart=getattr(self, '_fd_chart_digest', None),
+                   code=self._reward_code_digest(with_store_terms))
+        if with_store_terms:
+            key['store_terms'] = True
         side = noised_prior.cache_path(prior_path, 'rewards', key)
         hit = noised_prior.load_cache(side, key)
         if hit is not None:
@@ -4831,26 +4836,32 @@ class Modeller:
             idx = torch.unique(torch.cat([idx, strat, top]))
             sub_rows = idx if rows is None else torch.as_tensor(rows)[idx]
             fresh = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, sub_rows,
-                                                    None if cids is None else torch.as_tensor(cids)[idx])
+                                                    None if cids is None else torch.as_tensor(cids)[idx],
+                                                    with_store_terms)
             if all(torch.allclose(f, c[idx], atol=1e-4, rtol=1e-5, equal_nan=True) for f, c in zip(fresh, terms)):
                 print(f"reward cache: {n} rows read from {side} ({idx.numel()} rows re-scored and agree)", flush=True)
                 return tuple(terms)
             print(f"reward cache {side}: {idx.numel()} re-scored rows disagree with the cache; recomputing every row",
                   flush=True)
         t0 = time()
-        terms = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids)
+        terms = self._stored_reward_terms_fresh(batch, chunk, with_mol_energy, rows, cids, with_store_terms)
         wrote = noised_prior.save_cache(side, key, terms=list(terms))
         print(f"reward cache: {n} rows scored in {time() - t0:.0f} s" + (f", written to {side}" if wrote else ''),
               flush=True)
         return terms
 
-    def _reward_code_digest(self):
-        """A digest of the source of the energy function's reward path (generator_energy, prebuilt_sample_to_reward,
-        seed_energy_from), so an edit to it misses the reward cache."""
+    #: the energy-function methods whose source _reward_code_digest hashes on every call, and with store terms
+    REWARD_CODE = ('generator_energy', 'prebuilt_sample_to_reward', 'seed_energy_from', '_tempered_density')
+    REWARD_CODE_TERMS = ('store_terms_from',)
+
+    def _reward_code_digest(self, with_store_terms=False):
+        """A digest of the source of the code that computes the cached values (REWARD_CODE: the reward path, with
+        _tempered_density, which generator_energy calls; and REWARD_CODE_TERMS, the term columns, only when the cache
+        holds them), so an edit to it misses the reward cache."""
         import hashlib
         import inspect
         ef, h = self.energy_function, hashlib.sha1()
-        for name in ('generator_energy', 'prebuilt_sample_to_reward', 'seed_energy_from'):
+        for name in self.REWARD_CODE + (self.REWARD_CODE_TERMS if with_store_terms else ()):
             fn = getattr(ef, name, None)
             try:
                 h.update(inspect.getsource(fn).encode())
@@ -4859,11 +4870,11 @@ class Modeller:
         return h.hexdigest()[:16]
 
     @torch.no_grad()
-    def _stored_reward_terms_fresh(self, batch, chunk, with_mol_energy, rows, cids):
+    def _stored_reward_terms_fresh(self, batch, chunk, with_mol_energy, rows, cids, with_store_terms=False):
         """_stored_reward_terms computed row by row, chunk by chunk. Each chunk drops ROW_LIST_KEYS before its device
         move: torch_geometric's move walks a Python list element by element, and the reward reads neither list."""
         ef, T = self.energy_function, float(self.args.energy_config.temperature)
-        seed, log_r, mol = [], [], []
+        seed, log_r, mol, store_terms = [], [], [], []
         n = int(batch.num_graphs) if rows is None else int(rows.numel())
         for lo in range(0, n, chunk):
             at = (torch.arange(lo, min(lo + chunk, n)) if rows is None else rows[lo:lo + chunk]).to(batch.ptr.device)
@@ -4879,9 +4890,10 @@ class Modeller:
             log_r.append(lr.double().flatten().cpu())
             if with_mol_energy:
                 mol.append(torch.as_tensor(ens['mol_energy']).double().flatten().cpu())
-        if with_mol_energy:
-            return torch.cat(seed), torch.cat(log_r), torch.cat(mol)
-        return torch.cat(seed), torch.cat(log_r)
+            if with_store_terms:
+                store_terms.append(ef.store_terms_from(ens))
+        out = (torch.cat(seed), torch.cat(log_r)) + ((torch.cat(mol),) if with_mol_energy else ())
+        return out + ((torch.cat(store_terms),) if with_store_terms else ())
 
     @torch.no_grad()
     def _fd_chart_points(self, batch):
@@ -5051,12 +5063,16 @@ class Modeller:
         it holds. cfg:noised_prior is read through noised_prior.settings for every prior, so an unknown key raises on
         either kind; on a prior that is not a build a present block prints that it is inert. A build whose manifest
         temperature differs from energy_config.temperature prints a warning. live_kernel 'physical' on a prior that is
-        not a build raises: _load_noised_prior would never run, and MLE would train on the stored rows with no kick."""
+        not a build raises: _load_noised_prior would never run, and MLE would train on the stored rows with no kick.
+        So does train_molecules: the prior's rows would not be cut to the chosen molecules."""
         s = noised_prior.settings(self.args)
         if manifest is None:
             if s['live_kernel'] == 'physical':
                 raise ValueError(f"noised_prior.live_kernel 'physical' needs a pre-noised prior: {self.args.prior_path} "
                                  f"has no noised manifest, so no draw would be kicked")
+            if s['train_molecules'] is not None:
+                raise ValueError(f"noised_prior.train_molecules needs a pre-noised prior: {self.args.prior_path} has "
+                                 f"no noised manifest, so its rows would not be cut to the chosen molecules")
             if getattr(self.args, 'noised_prior', None) is not None:
                 print("noised_prior block inert: prior_path is not a pre-noised build", flush=True)
             return {'data/prior_prenoised': 0}
@@ -5283,9 +5299,46 @@ class Modeller:
         return data
 
     def subset_training_molecules(self, batch, what):
-        """The rows of a training-molecule file (`what`: 'molecules_path' or 'prior_path') this run keeps: every row
-        here. inn_modeller.py's --molecule_fraction keeps a nested subset of the molecules, from both files alike."""
-        return batch
+        """The rows of a training-molecule file (`what`: 'molecules_path' or 'prior_path') this run keeps. The prior's
+        batch is returned whole: on a pre-noised prior noised_parent holds file row indices, so _store_take_rows cuts
+        it by mask instead. With cfg:noised_prior.train_molecules N (null: every row), the molecules_path rows of the N
+        molecules with the lowest (molecule_u, identifier) (data_processing/molecule_subset.py::lowest_molecules),
+        whose identifiers are kept in self._train_molecule_set for that mask. Raises when N is set without
+        buffers.store enabled, or exceeds the molecules of molecules_path. inn_modeller.py's --molecule_fraction keeps
+        a nested subset of the molecules, from both files alike."""
+        if what != 'molecules_path':
+            return batch
+        self._train_molecule_set = None
+        n_mol = noised_prior.settings(self.args)['train_molecules']
+        if n_mol is None:
+            return batch
+        if Modeller.store_settings(self) is None:
+            raise ValueError(f"noised_prior.train_molecules {n_mol} is read on the store route only: buffers.store is "
+                             f"not enabled")
+        from data_processing.molecule_subset import lowest_molecules
+        ids = [str(m) for m in batch.identifier]
+        try:
+            kept = frozenset(lowest_molecules(ids, n_mol))
+        except ValueError as e:
+            raise ValueError(f"noised_prior.train_molecules {n_mol}: {self.args.molecules_path}: {e}") from None
+        rows = [i for i, m in enumerate(ids) if m in kept]
+        print(f"training molecules (noised_prior.train_molecules): {n_mol} of {len(set(ids))} molecules of "
+              f"molecules_path, the lowest molecule_u; {len(rows)} of {len(ids)} rows kept; the prior's rows are cut "
+              f"to them at load", flush=True)
+        self._train_molecule_set = kept
+        return batch.subsample_new_batch(rows)
+
+    def _train_molecule_rows(self, prior):
+        """[n] bool over the prior file's rows: the rows of the molecules cfg:noised_prior.train_molecules keeps
+        (subset_training_molecules), or None when the key is null."""
+        n_mol = self._noised_prior_settings.get('train_molecules')
+        if n_mol is None:
+            return None
+        kept = getattr(self, '_train_molecule_set', None)
+        if kept is None or len(kept) != n_mol:
+            raise ValueError(f"noised_prior.train_molecules {n_mol}: the molecules_path hook "
+                             f"(subset_training_molecules) chose {None if kept is None else len(kept)} molecules")
+        return noised_prior.molecule_rows(prior, kept)
 
     def init_mol_dataset(self):
         mols = self._load_condition_file(self.args.molecules_path)
@@ -5584,6 +5637,10 @@ class Modeller:
             if (getattr(self.energy_function, 'temperature_conditioning', False)
                     and self.store_settings() is not None):
                 self.energy_function.untagged_temperature = float(self.args.energy_config.temperature)
+                # a stage setting `temperatures`: the density wall costs the same nats at every T
+                # (MolecularCrystal.density_reference_temperature)
+                if self._store_terms_on():
+                    self.energy_function.density_reference_temperature = float(self.args.energy_config.temperature)
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
             # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
@@ -7883,12 +7940,18 @@ class Modeller:
                        repeats: int = 1,
                        report_losses: bool = False,
                        ):
+        temps = None
         if getattr(self, 'row_store', None) is not None:
             mol_batch = self._store_condition_batch(self._rollout_mol_batch(1), repeats).to(self.device)
             init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
+            # a stage setting `temperatures`: one temperature per molecule, shared by its `repeats` rows
+            temps = self._stage_temperatures()
+            temperature = (None if temps is None else self._draw_temperatures(
+                temps, int(mol_batch.num_graphs) // max(1, int(repeats))).repeat_interleave(max(1, int(repeats))))
             mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
                 mol_batch, repeats=repeats, sg_inds=mol_batch.sg_ind.reshape(-1).long(),
-                z_primes=mol_batch.z_prime.reshape(-1).long())
+                z_primes=mol_batch.z_prime.reshape(-1).long(),
+                **({} if temperature is None else {'temperature': temperature.to(self.device)}))
         else:
             mol_batch = self._rollout_mol_batch(repeats)
             mol_batch = mol_batch.to(self.device)
@@ -7921,6 +7984,11 @@ class Modeller:
                                    tb_z_source=self.tb_z_source('fwd'),
                                    step=self.step_ind,
                                    anchor_energy_fn=self._anchor_energy_phys,
+                                   # a stage setting `temperatures`: only rows at the run's temperature feed the
+                                   # tracker, and emp_z / z_level group by (condition, temperature)
+                                   **({} if temps is None else {
+                                       'tracker_rows': self._at_run_temperature(log_T_tensor),
+                                       'group_by_temperature': True}),
                                    )
         self._stash_z_cal_cache(condition_id)
         if report_losses:
@@ -8245,14 +8313,22 @@ class Modeller:
         are written to the store, tagged and undrawn. Applied to every policy copy (_policies). Left as loaded, with a
         line saying so, when the draw has under two finite rows or the root is not identified (winsorized_z_root's
         ValueError, or a non-finite root).
+
+        In a stage setting `temperatures` the rows are drawn over the stage's list (fwd_eval_sampling temperatures).
+        With one temperature listed, the root is the one above. With several, one root is taken per listed temperature
+        (a temperature with under two finite rows or no root is skipped, with a printed line) and the shift is the
+        smallest of them, so the head opens at or under every temperature's root; every root is printed and kept as
+        boot/root@T for the next readout (_temperature_readouts).
         """
         n = int(n_samples or getattr(self.args, 'eval_num_samples', 0) or self.batch_size)
         if not all(hasattr(p, 'shift_level') for p in self._policies()):
             raise NotImplementedError("bootstrap_z:offset needs a policy with shift_level (models/nf_policy.py::"
                                       "NFPolicy); use bootstrap_z:rollout on this route")
+        temps = self._stage_temperatures() if getattr(self, 'row_store', None) is not None else None
         eval_discretizer = get_discretizer(trajectory_T(self.args))
         fwd_stats, boot_batch = self.fwd_eval_sampling(
-            self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False)
+            self.gfn_model, eval_discretizer, override_num_samples=n, side_effects=False,
+            **({} if temps is None else {'temperatures': temps}))
         if getattr(self, 'row_store', None) is not None:
             self._store_admit(fwd_stats, boot_batch, ORIGIN_BOOTSTRAP, eval_row=True, drawable=False)
         logw = (fwd_stats['log_r'] + fwd_stats['log_pbs'].sum(-1)
@@ -8260,6 +8336,9 @@ class Modeller:
         head = fwd_stats['log_flow'][:, 0].detach().flatten().double()
         resid = logw - head
         finite = torch.isfinite(resid)
+        if temps is not None and len(set(temps)) > 1:
+            self._bootstrap_z_offset_per_temperature(temps, fwd_stats, logw, head, resid, n)
+            return
         if int(finite.sum()) < 2:
             print(f"bootstrap_z_offset: {n} samples produced {int(finite.sum())} finite log w -- log Z left as loaded")
             return
@@ -8279,6 +8358,45 @@ class Modeller:
               f"mean log Z(c) {float(head[finite].mean()):.3f} -> {float(head[finite].mean()) + delta:.3f} "
               f"(shift {delta:+.3f} = Huber root of log w - log Z(c), knee {beta:g}, se {se:.3f}, "
               f"{frac:.0%} of rows inside the knee; mean residual {float(resid[finite].mean()):+.3f})")
+
+    def _bootstrap_z_offset_per_temperature(self, temps, fwd_stats, logw, head, resid, n):
+        """bootstrap_z_offset in a stage listing several temperatures: one winsorized-Huber root of log w - log Z(c) per
+        listed temperature (rows counted at the listed temperature nearest their log10 T), the head shifted by the
+        smallest. A temperature with under two finite rows or no finite root is skipped; with none left, log Z is left
+        as loaded."""
+        beta = float(self.args.fwd_loss_coeffs.beta)
+        listed = sorted(set(float(v) for v in temps))
+        lt = torch.as_tensor(fwd_stats['log_T_tensor']).detach().double().flatten()
+        which = (lt[:, None] - torch.log10(torch.tensor(listed, dtype=torch.float64))[None, :]).abs().argmin(1)
+        finite = torch.isfinite(resid)
+        roots, lines = {}, []
+        for j, T in enumerate(listed):
+            m = finite & (which == j)
+            if int(m.sum()) < 2:
+                lines.append(f"T {T:g}: {int(m.sum())} finite rows, skipped")
+                continue
+            try:
+                delta, se, frac = (float(v) for v in winsorized_z_root(resid[m], beta))
+            except ValueError as e:
+                lines.append(f"T {T:g}: no Huber root on {int(m.sum())} rows ({e}), skipped")
+                continue
+            if not math.isfinite(delta):
+                lines.append(f"T {T:g}: Huber root {delta} on {int(m.sum())} rows, skipped")
+                continue
+            roots[T] = delta
+            lines.append(f"T {T:g}: root {delta:+.3f} (se {se:.3f}, {frac:.0%} inside the knee, {int(m.sum())} rows, "
+                         f"mean log w {float(logw[m].mean()):.3f}, mean log Z(c) {float(head[m].mean()):.3f})")
+        self._boot_roots = {f'boot/root@{T:g}': v for T, v in roots.items()}
+        if not roots:
+            print(f"bootstrap_z_offset: no temperature of {listed} has a root on {n} samples -- log Z left as loaded; "
+                  + '; '.join(lines))
+            return
+        delta = min(roots.values())
+        for p in self._policies():
+            p.shift_level(delta)
+        print(f"bootstrap_z_offset: {int(finite.sum())}/{n} finite forward samples over temperatures {listed}; shift "
+              f"{delta:+.3f} = the smallest per-temperature Huber root of log w - log Z(c) (knee {beta:g}, spread "
+              f"{max(roots.values()) - delta:.3f}); " + '; '.join(lines))
 
     def _bootstrap_scalar_by_rollout(self, logw):
         before = float(self.gfn_model.flow_model.scalar.detach())
@@ -8434,12 +8552,15 @@ class Modeller:
                                                 # force now, at the route's temperature
                                                 log_reward_fn=getattr(getattr(self, 'energy_function', None),
                                                                       'log_reward', None),
-                                                log_T_tensor=self._bwd_log_T(latents))
+                                                log_T_tensor=self._bwd_log_T(latents),
+                                                tracker_rows=self._row_tracker_rows(mol_batch))
 
         if self.row_store is not None:
             # a scrambled condition's log q is not the row's own: no write
             if not scramble_tiles:
                 self._store_touch(inds, loss_dict)
+            if getattr(mol_batch, 'row_log_T', None) is not None and loss_dict is not None:
+                self._tally_temperature_rows('bwd', mol_batch.row_log_T, loss_dict.get('resid'))
         elif 'resid' in loss_dict:   # a reward-free draw has no residual to rank rows by
             priority = self._bwd_retention_priority(loss_dict)
             if self.bwd_sampling_mode == 'dataset':
@@ -8542,13 +8663,16 @@ class Modeller:
                                                 # carry no energy function; the term is off there
                                                 log_reward_fn=getattr(getattr(self, 'energy_function', None),
                                                                       'log_reward', None),
-                                                log_T_tensor=getattr(mol_batch, 'replay_log_T', None))
+                                                log_T_tensor=getattr(mol_batch, 'replay_log_T', None),
+                                                tracker_rows=self._row_tracker_rows(mol_batch))
 
         if not side_effects:
             return loss, loss_dict
 
         if self.row_store is not None:
             self._store_touch(inds, loss_dict)
+            if getattr(mol_batch, 'row_log_T', None) is not None and loss_dict is not None:
+                self._tally_temperature_rows('replay', mol_batch.row_log_T, loss_dict.get('resid'))
             self._larder_harvest('replay', loss_dict, condition, condition_id,
                                  mol_batch, traj, repeats,
                                  sample_weights=self._replay_is_w)
@@ -8827,6 +8951,12 @@ class Modeller:
             return None
         return torch.full((latents.shape[0],), math.log10(float(T)))
 
+    def _row_tracker_rows(self, mol_batch):
+        """The bwd or replay rows that feed condition_log_z: under a stage setting `temperatures`, those drawn at the run's
+        temperature (the batch's `row_log_T`, _store_draw); None, every row, otherwise."""
+        row_log_T = getattr(mol_batch, 'row_log_T', None)
+        return None if row_log_T is None else self._at_run_temperature(row_log_T)
+
     def draw_bwd_sample(self, repeats, target_cids=None, condition_draw=None):
         if self.row_store is not None:   # MLE: fresh kicks of anchors; TB: stored children
             return self._store_draw('mle' if self.bwd_sampling_mode == 'dataset' else 'bwd', repeats)
@@ -9003,7 +9133,80 @@ class Modeller:
             'energy_reference_mode': getattr(ef, 'energy_reference_mode', None),
             'energy_reference_table': (None if ref is None
                                        else [round(float(v), 6) for v in torch.as_tensor(ref).flatten().tolist()]),
+            # the term columns (crystal_store.TERM_COLUMNS), held only when a stage sets `temperatures`; None reads as
+            # absent (crystal_store.stamp_diff), so a store without them keeps the stamp it had before the key existed
+            'store_terms': True if self._store_terms_on() else None,
         }
+
+    def _store_terms_on(self):
+        """Whether this run's store holds the term columns: the built store's own flag, else
+        config_invariants.store_terms_on (buffers.store enabled and an active stage setting `temperatures`)."""
+        st = getattr(self, 'row_store', None)
+        if st is not None:
+            return bool(getattr(st, 'with_terms', False))
+        from config_invariants import store_terms_on
+        from utils import _namespace_to_dict
+        return store_terms_on(_namespace_to_dict(self.args))
+
+    #: |log10 T - log10 T_run| at or under which a row counts as drawn at the run's temperature
+    RUN_TEMPERATURE_ATOL = 1e-6
+
+    def _stage_temperatures(self):
+        """The current stage's `temperatures` (protocol.Stage.temperatures: kT values), or None. Raises when it is set
+        and the store holds no term columns, which only a protocol changed after the store was built can cause."""
+        temps = getattr(getattr(getattr(self, 'protocol', None), 'stage', None), 'temperatures', None)
+        if temps is None:
+            return None
+        if not getattr(getattr(self, 'row_store', None), 'with_terms', False):
+            raise RuntimeError(f"stage {getattr(self.protocol.stage, 'name', '?')!r} sets temperatures but the row store "
+                               f"was built without its term columns")
+        return tuple(temps)
+
+    @staticmethod
+    def _draw_temperatures(temps, n):
+        """[n] float32 kT values over the list `temps`, stratified: entry k = (i + r) mod K for a random offset r, then
+        a random permutation, so the counts of any two entries differ by at most one. Reads the global torch
+        generator, as condition_samples' own temperature draw does."""
+        K = len(temps)
+        k = (torch.arange(n) + int(torch.randint(K, (1,)))) % K
+        return torch.tensor(temps, dtype=torch.float32)[k[torch.randperm(n)]]
+
+    def _at_run_temperature(self, log_T):
+        """[n] bool, the rows whose log10 T is the run's (energy_config.temperature) within RUN_TEMPERATURE_ATOL."""
+        lt = torch.as_tensor(log_T).detach().reshape(-1).double()
+        return (lt - math.log10(float(self.args.energy_config.temperature))).abs() <= self.RUN_TEMPERATURE_ATOL
+
+    def _check_store_terms(self, live_log_r, energy, terms, log_T, where):
+        """The terms a write site stores must rebuild its live log R (MolecularCrystal.log_r_from_terms at log_T, the
+        temperature the rows were scored at). Raises RuntimeError, with counts, when a row with a finite log R and
+        energy has a non-finite term, or when the rebuild of such a row is non-finite or further than
+        STORE_CURRENCY_TOL nats (x STORE_CURRENCY_UMA on uma) from its live log R. Never retries. Returns the largest
+        gap (nats)."""
+        live = torch.as_tensor(live_log_r).detach().float().flatten().cpu()
+        e = torch.as_tensor(energy).detach().float().flatten().cpu()
+        t = torch.as_tensor(terms).detach().float().cpu()
+        lt = torch.as_tensor(log_T).detach().float().flatten().cpu()
+        if lt.numel() == 1:
+            lt = lt.expand(live.numel())
+        ok = torch.isfinite(live) & torch.isfinite(e)
+        bad = ok & ~torch.isfinite(t).all(1)
+        if bool(bad.any()):
+            raise RuntimeError(f"store terms ({where}): {int(bad.sum())} of {int(ok.sum())} rows with a finite log R and "
+                               f"energy have a non-finite term {crystal_store.TERM_COLUMNS}")
+        if not bool(ok.any()):
+            return 0.0
+        rebuilt = self.energy_function.log_r_from_terms(e[ok], t[ok], lt[ok]).float().cpu()
+        gap = (rebuilt - live[ok]).abs()
+        wide = self.STORE_CURRENCY_UMA if getattr(self.args, 'energy_function', None) == 'uma' else 1.0
+        tol = self.STORE_CURRENCY_TOL * wide
+        off = ~torch.isfinite(rebuilt) | (gap > tol)
+        if bool(off.any()):
+            w = int(torch.nan_to_num(gap, nan=math.inf).argmax())
+            raise RuntimeError(f"store terms ({where}): the rebuilt log R of {int(off.sum())} of {int(ok.sum())} rows is "
+                               f"non-finite or more than {tol:g} nats from the live one (worst: live "
+                               f"{float(live[ok][w]):.6g}, rebuilt {float(rebuilt[w]):.6g}, at log10 T "
+                               f"{float(lt[ok][w]):.4f})")
+        return float(gap.max())
 
     def _store_template_batch(self, batch):
         """`batch` cut down to STORE_TEMPLATE_KEYS, never oriented."""
@@ -9039,7 +9242,11 @@ class Modeller:
         is stored undrawn, so it holds the link and is never kicked). A child whose parent has no chart point is
         dropped and counted. Holds the file batch and the row tables in self._store_load until init_row_store; the
         frozen readout panels (prior_dataset, prior_heldout_batch, prior_anchor_batch) are cut here, each capped at
-        4 * eval_num_samples rows, deterministic in the file and seed."""
+        4 * eval_num_samples rows, deterministic in the file and seed.
+        Under cfg:noised_prior.train_molecules only the rows of the chosen molecules are stored and cut into panels
+        (_train_molecule_rows, noised_prior.cut_masks; the file's rows keep their indices, which noised_parent reads),
+        while the seed row mask a sidecar saves and the returned energies, which arm the reward clip and its outlier
+        bar, are those of every molecule, so every subset shares the whole file's clip."""
         ef, T, s = self.energy_function, float(self.args.energy_config.temperature), self._noised_prior_settings
         if fd_ok is None:
             raise ValueError("buffers.store needs energy_config.crystal_coordinates 'fd'")
@@ -9058,10 +9265,16 @@ class Modeller:
         if bool((groups[par] != groups[kids]).any()) or bool((splits[par] != noised_prior.SPLIT_TRAIN).any()):
             raise ValueError("buffers.store: a kept child's parent anchor is in another condition or split")
         usable = fd_ok[par] & torch.isfinite(state[par]).all(1) & finite[par]
+        keep[kids[~usable]] = False
+        clip_rows = keep                       # every molecule's scored rows: the reward clip's
+        subset = self._train_molecule_rows(prior)
+        if subset is not None:
+            masks = noised_prior.cut_masks(masks, subset)
+            keep = keep & subset
+            ours = subset[kids]
+            kids, par, usable = kids[ours], par[ours], usable[ours]
         n_lost = int((~usable).sum())
-        if n_lost:
-            keep[kids[~usable]] = False
-            kids, par = kids[usable], par[usable]
+        kids, par = kids[usable], par[usable]
         if not kids.numel():
             raise ValueError("buffers.store: no child survives the load-time selection")
         stored = keep.clone()
@@ -9112,7 +9325,11 @@ class Modeller:
               f"{0 if self.prior_heldout_batch is None else int(self.prior_heldout_batch.num_graphs)} held-out "
               f"children, {0 if self.prior_anchor_batch is None else int(self.prior_anchor_batch.num_graphs)} anchors",
               flush=True)
-        return (-log_r[keep] * T).float().to(self.device), train_panel.to(self.device)
+        if subset is not None:
+            print(f"crystal store load: noised_prior.train_molecules {s['train_molecules']}: {int(subset.sum())} of "
+                  f"{n} file rows are the chosen molecules' and only those are stored; the energy clip is armed over the "
+                  f"{int(clip_rows.sum())} scored training rows of every molecule", flush=True)
+        return (-log_r[clip_rows] * T).float().to(self.device), train_panel.to(self.device)
 
     def _store_after_identifiers(self):
         """The store load once mol_id exists: each stored row's condition id, and one template per training condition.
@@ -9196,7 +9413,7 @@ class Modeller:
                       flush=True)
                 self._row_store_state = None
             return
-        from config_invariants import row_store_problems, store_row_limit, ERROR
+        from config_invariants import row_store_problems, store_row_limit, store_terms_on, ERROR
         from utils import _namespace_to_dict
         bad = [m for sev, m in row_store_problems(_namespace_to_dict(self.args)) if sev == ERROR]
         if bad:
@@ -9209,23 +9426,29 @@ class Modeller:
             raise ValueError(f"buffers.store.ram_gb {s['ram_gb']} exceeds the job's SLURM_MEM_PER_NODE {slurm_mb} MB")
         ef = self.energy_function
         H = self._store_headroom()
-        max_rows = store_row_limit(float(s['ram_gb']), int(ef.data_ndim), float(s['ram_frac']))
+        terms_on = store_terms_on(_namespace_to_dict(self.args))
+        max_rows = store_row_limit(float(s['ram_gb']), int(ef.data_ndim), float(s['ram_frac']), with_terms=terms_on)
         n_anchors = int((load['kinds'] == noised_prior.KIND_ANCHOR).sum())
         if n_anchors + 2 * H > max_rows:
             raise ValueError(f"buffers.store: {n_anchors} anchors + 2 x headroom {H} exceed the row limit {max_rows} "
                              f"(ram_gb {s['ram_gb']}, ram_frac {s['ram_frac']}): raise ram_gb")
         rows, cid = load['rows'], load['cid']
-        _, log_r, energy = self._stored_reward_terms(load['batch'], with_mol_energy=True, rows=rows, cids=cid,
-                                                     prior_path=getattr(self.args, 'prior_path', None))
+        got = self._stored_reward_terms(load['batch'], with_mol_energy=True, rows=rows, cids=cid,
+                                        prior_path=getattr(self.args, 'prior_path', None), with_store_terms=terms_on)
+        _, log_r, energy = got[:3]
+        terms = got[3] if terms_on else None
+        if terms_on:   # the seed rows were scored at the run's temperature
+            self._check_store_terms(log_r, energy, terms, math.log10(float(self.args.energy_config.temperature)),
+                                    'seed')
         x = torch.as_tensor(load['batch'].fd_state).float().cpu()[rows]
         n_cond = int(ef.condition_library_size)
         floor = torch.full((n_cond,), float('inf'), dtype=torch.float64)
         floor[load['floor_cids']] = load['floor']
         kind = torch.where(load['kinds'] == noised_prior.KIND_ANCHOR, torch.tensor(crystal_store.ANCHOR),
                            torch.tensor(crystal_store.CHILD))
-        store = CrystalStore(int(x.shape[1]), n_cond, max_rows, H, seed=int(self.args.seed))
+        store = CrystalStore(int(x.shape[1]), n_cond, max_rows, H, seed=int(self.args.seed), with_terms=terms_on)
         store.seed(x, cid, kind, log_r, energy, load['parent'], load['undrawn'], load['templates'],
-                   load['template_cids'], floor)
+                   load['template_cids'], floor, **({'terms': terms} if terms_on else {}))
         store.check()
         self.row_store = store
         self._store_seed_best = store.best_energy.clone()     # per-condition seed minimum, read before any restore
@@ -9373,7 +9596,10 @@ class Modeller:
         """draw_bwd_sample's 7-tuple from the store. 'mle': fresh kicks of uniformly drawn anchors, reward-free, with no
         store write (inds None). 'bwd': a uniform condition, then a uniform drawable child. 'replay': a uniform
         condition, then an on-policy row by _store_replay_rows. Molecules come from each condition's template.
-        inds is (rows tiled `repeats` times, store epoch)."""
+        inds is (rows tiled `repeats` times, store epoch). In a stage setting `temperatures`, each bwd or replay row
+        takes a fresh temperature from the stage's list (_draw_temperatures, tiled with the row), its log R is
+        rebuilt there from the stored terms (MolecularCrystal.log_r_from_terms, no energy call) and the batch carries
+        the rows' log10 T as `row_log_T`."""
         st, ef, dev = self.row_store, self.energy_function, self.device
         B, R = int(self.batch_size), max(1, int(repeats))
         if kind == 'mle':
@@ -9400,6 +9626,9 @@ class Modeller:
             latents, log_reward, inds = st.x[idx].to(dev), st.log_r[idx].to(dev), (idx, st.epoch)
         mol = st.mol_batch(st.cid[idx]).to(dev)
         temperature = None
+        temps = self._stage_temperatures() if kind != 'mle' else None
+        if temps is not None:
+            temperature = self._draw_temperatures(temps, int(rows.numel())).repeat_interleave(R).to(dev)
         if kind == 'mle' and labelled:   # each kicked row conditions on its own effective temperature
             t_eff = self._kick_temperature(rows, rho, st.mol_batch(st.cid[rows]))
             if not getattr(self, '_kick_temperature_shown', False):
@@ -9412,6 +9641,9 @@ class Modeller:
         mol, log_T, condition, cid = ef.condition_samples(mol, temperature=temperature, repeats=R,
                                                           sg_inds=mol.sg_ind.reshape(-1).long(),
                                                           z_primes=mol.z_prime.reshape(-1).long())
+        if temps is not None:
+            log_reward = ef.log_r_from_terms(st.energy[idx], st.terms(idx), log_T.detach().flatten().cpu()).to(dev)
+            mol.row_log_T = log_T.detach()
         traj = None
         if kind == 'replay':
             traj = torch.stack([torch.zeros_like(latents), latents], 1)
@@ -9433,7 +9665,9 @@ class Modeller:
 
         Under buffers.store.keep_rollouts false a training rollout writes no row: it feeds the eval's trailing pool,
         lowers best_energy (invariant I6 counts every row given), owes kicks for its finite rows on the same cadence, and
-        returns an empty index. Eval and bootstrap rows are written as before."""
+        returns an empty index. Eval and bootstrap rows are written as before. In a stage setting `temperatures` a
+        training rollout's rows join the per-temperature tally (_tally_temperature_rows) whether or not they are
+        written."""
         st = self.row_store
         cid = fwd_stats.get('condition_id')
         if cid is None:
@@ -9449,6 +9683,15 @@ class Modeller:
             raise RuntimeError(f"store admission: mol_energy has {energy.numel()} rows, the rollout {cid.numel()}")
         x = fwd_stats['flow_states'][:, -1].detach().float().cpu()
         log_r = fwd_stats['log_r'].detach().float().flatten().cpu()
+        log_pf = fwd_stats['log_pf'].detach().float().flatten().cpu()
+        log_pb = fwd_stats['log_pb'].detach().float().flatten().cpu()
+        log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
+        log_z = torch.as_tensor(log_z).detach().float().cpu()
+        resid = (log_pf - log_pb) - (log_r - log_z.flatten())   # the live log R, at the row's own temperature
+        if origin == ORIGIN_ROLLOUT and self._stage_temperatures() is not None:
+            # every row the training rollout scored, written or not (keep_rollouts false writes none)
+            self._tally_temperature_rows('fwd', fwd_stats['log_T_tensor'], resid,
+                                         getattr(sample_batch, 'packing_coeff', None))
         if origin == ORIGIN_ROLLOUT and not self._store_cfg.get('keep_rollouts', True):
             ok = torch.isfinite(energy) & torch.isfinite(log_r) & torch.isfinite(x).all(1)   # add()'s finite rows
             if bool(ok.any()):
@@ -9456,15 +9699,24 @@ class Modeller:
             self._owe_growth(int(ok.sum()))
             self._eval_pool_add(fwd_stats, sample_batch)
             return torch.empty(0, dtype=torch.long)
-        log_pf = fwd_stats['log_pf'].detach().float().flatten().cpu()
-        log_pb = fwd_stats['log_pb'].detach().float().flatten().cpu()
-        log_z = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
-        log_z = torch.as_tensor(log_z).detach().float().cpu()
-        resid = (log_pf - log_pb) - (log_r - log_z.flatten())
         self._store_growth['out_of_box'] += int((x.abs() > 1.0 + 1e-6).any(1).sum())
+        extra = {}
+        if st.with_terms:
+            # the terms rebuild the row's log R at any temperature; the stored log R is at the run's temperature (the
+            # live one on rows scored there, the rebuild elsewhere), while log q and the residual stay at the row's own
+            terms = self.energy_function.store_terms_from(sample_batch)
+            log_T = torch.as_tensor(fwd_stats['log_T_tensor']).detach().float().flatten().cpu()
+            self._check_store_terms(log_r, energy, terms, log_T, 'admission')
+            # a row with a non-finite live log R keeps it, so add() drops exactly the rows it drops without terms
+            keep_live = self._at_run_temperature(log_T) | ~torch.isfinite(log_r)
+            if not bool(keep_live.all()):
+                run_lt = math.log10(float(self.args.energy_config.temperature))
+                log_r = torch.where(keep_live, log_r,
+                                    self.energy_function.log_r_from_terms(energy, terms, run_lt).cpu())
+            extra['terms'] = terms
         written = st.add(x, cid, crystal_store.ONPOLICY, int(origin), log_r, energy, int(self.step_ind),
                          undrawn=torch.full((cid.numel(),), not drawable), log_q=log_pf, resid=resid,
-                         eval_row=eval_row, durable=durable)
+                         eval_row=eval_row, durable=durable, **extra)
         if origin == ORIGIN_ROLLOUT:
             self._owe_growth(int(written.numel()))
             self._eval_pool_add(fwd_stats, sample_batch)
@@ -9488,6 +9740,13 @@ class Modeller:
         rows = {k: fwd_stats[k].detach().flatten() for k in ('log_r', 'log_pf', 'log_pb', 'log_Z', 'condition_id',
                                                              'log_T_tensor')}
         rows['flow_states'] = fwd_stats['flow_states'].detach()
+        if self._stage_temperatures() is not None:   # the eval reads the run's temperature only
+            keep = torch.nonzero(self._at_run_temperature(rows['log_T_tensor'])).flatten()
+            if not keep.numel():
+                return
+            if keep.numel() < rows['log_r'].numel():
+                rows = {k: v[keep.to(v.device)] for k, v in rows.items()}
+                sample_batch = sample_batch.subsample_new_batch(keep.to(sample_batch.ptr.device))
         pool.add(rows, sample_batch, int(self.step_ind))
 
     def _eval_pool_refusal(self):
@@ -9639,8 +9898,12 @@ class Modeller:
         in_window = (packing >= lo) & (packing <= hi) & torch.isfinite(e_win)
         if np_cfg['window_kT'] is not None:
             in_window &= e_win <= st.window_floor[cid] + float(np_cfg['window_kT']) * T
+        terms = None
+        if st.with_terms:   # scored at the run's temperature (the untagged draw above)
+            terms = ef.store_terms_from(scored)
+            self._check_store_terms(log_r, mol_energy, terms, log_T.detach().flatten().cpu(), 'growth')
         written = st.add(x, cid, crystal_store.CHILD, crystal_store.ORIGIN_KICK, log_r, mol_energy, int(self.step_ind),
-                         parent=rows, undrawn=~in_window)
+                         parent=rows, undrawn=~in_window, **({'terms': terms} if terms is not None else {}))
         finite = torch.isfinite(log_r) & torch.isfinite(mol_energy) & torch.isfinite(x).all(1)
         tally['scored'] += int(written.numel())
         tally['in_window'] += int((in_window & finite).sum())
@@ -9657,12 +9920,13 @@ class Modeller:
         re-score batch sizes). The energy bar judges only rows at or below the energy clip (energy_function.energy_clip,
         when armed): above it the reward reads the energy log-compressed, and an MLIP's float32 energy of an overlapping
         cell (MACE-CSP on acridine, 2026-11-25: a row at 9e5 kJ/mol moved by ~2e2 between batches, its log R by 1e-4
-        nats) is judged by log R alone. On the uma route both bars are STORE_CURRENCY_UMA times wider (TF32). Reads no
-        global generator."""
+        nats) is judged by log R alone. On the uma route both bars are STORE_CURRENCY_UMA times wider (TF32). In a stage
+        setting `temperatures`, each origin's rows also take _store_check_terms_currency. Reads no global generator."""
         st, ef = self.row_store, self.energy_function
         T = float(self.args.energy_config.temperature)
         wide = self.STORE_CURRENCY_UMA if getattr(self.args, 'energy_function', None) == 'uma' else 1.0
         tol = self.STORE_CURRENCY_TOL * wide
+        temps = self._stage_temperatures()
         live = torch.nonzero(st.kind[:st.high_water] != crystal_store.FREE).flatten()
         rng = np.random.default_rng([int(self.args.seed), int(self.step_ind)])
         names = {crystal_store.ORIGIN_ROLLOUT: 'rollout', crystal_store.ORIGIN_EVAL: 'eval',
@@ -9693,7 +9957,37 @@ class Modeller:
             if not (d_r <= tol and bool((gap <= bar).all())):
                 raise RuntimeError(f"store currency check at step {int(self.step_ind)}: {line[-1]} (bars "
                                    f"{tol:g} nats, {tol * T:g} energy units + {self.STORE_CURRENCY_REL * wide:g} |E|)")
+            if temps is not None:
+                line[-1] += '; ' + self._store_check_terms_currency(at, temps, tol)
         print(f"store currency check at step {int(self.step_ind)}: " + '; '.join(line), flush=True)
+
+    @torch.no_grad()
+    def _store_check_terms_currency(self, at, temps, tol):
+        """_store_check_currency in a stage setting `temperatures`, for the stored rows `at`: the rebuild from the term
+        columns at the run's temperature must equal the stored log R, and a live re-score at the hottest listed
+        temperature other than the run's must equal the rebuild there, each within `tol` nats. Returns the line."""
+        st, ef = self.row_store, self.energy_function
+        T = float(self.args.energy_config.temperature)
+        e, terms = st.energy[at], st.terms(at)
+        d_run = float((ef.log_r_from_terms(e, terms, math.log10(T)).cpu() - st.log_r[at]).abs().max())
+        if not d_run <= tol:
+            raise RuntimeError(f"store currency check at step {int(self.step_ind)}: the term rebuild at T {T:g} is "
+                               f"{d_run:.2e} nats from the stored log R (bar {tol:g})")
+        hot = [v for v in temps if not bool(self._at_run_temperature(torch.tensor([math.log10(v)]))[0])]
+        if not hot:
+            return f"terms at T {T:g} |d log R| {d_run:.2e}"
+        Th = max(hot)
+        mol = st.mol_batch(st.cid[at].long()).to(self.device)
+        mol, log_T, _, _ = ef.condition_samples(mol, temperature=torch.full((at.numel(),), float(Th)).to(self.device),
+                                                sg_inds=mol.sg_ind.reshape(-1).long(),
+                                                z_primes=mol.z_prime.reshape(-1).long())
+        live = ef.log_reward(st.x[at].to(self.device), mol, log_T, internal_oom_recovery=True)
+        rebuilt = ef.log_r_from_terms(e, terms, log_T.detach().flatten().cpu())
+        d_hot = float((live.detach().float().flatten().cpu() - rebuilt.cpu()).abs().max())
+        if not d_hot <= tol:
+            raise RuntimeError(f"store currency check at step {int(self.step_ind)}: a live re-score at T {Th:g} is "
+                               f"{d_hot:.2e} nats from the term rebuild there (bar {tol:g})")
+        return f"terms at T {T:g} |d log R| {d_run:.2e}, live at T {Th:g} |d log R| {d_hot:.2e}"
 
     STORE_IMPROVED_RTOL = 1e-5
 
@@ -9723,9 +10017,68 @@ class Modeller:
         t = getattr(self, '_store_draw_tally', None) or {}
         self._store_draw_tally = None
         bn, rn, nan = t.get('bwd_n', 0), t.get('replay_n', 0), float('nan')
-        return {'store/bwd_draw_kicked_frac': t['bwd_kicked'] / bn if bn else nan,
-                'store/replay_draw_age_mean': t['replay_age'] / rn if rn else nan,
-                'store/replay_draw_reuse_mean': t['replay_reuse'] / rn if rn else nan}
+        out = {'store/bwd_draw_kicked_frac': t['bwd_kicked'] / bn if bn else nan,
+               'store/replay_draw_age_mean': t['replay_age'] / rn if rn else nan,
+               'store/replay_draw_reuse_mean': t['replay_reuse'] / rn if rn else nan}
+        out.update(self._temperature_readouts())
+        return out
+
+    #: fwd packing values _tally_temperature_rows keeps per temperature between two reads (the newest)
+    TEMPERATURE_TALLY_PACKING_ROWS = 100000
+
+    def _tally_temperature_rows(self, branch, log_T, resid, packing=None):
+        """In a stage setting `temperatures`: add one draw's rows (bwd, replay: the trained rows; fwd: every row a
+        training rollout scored, written or not under buffers.store.keep_rollouts false) to the per-temperature tally
+        _temperature_readouts drains. Each row is counted at the
+        listed temperature nearest its log10 T. resid: the signed TB residual log P_F - log P_B - log R + log Z
+        (nats; on fwd rows, log Z(c) - log w); packing: the rows' packing coefficients (fwd)."""
+        temps = self._stage_temperatures()
+        if temps is None or resid is None:
+            return
+        listed = sorted(set(float(v) for v in temps))
+        lt = torch.as_tensor(log_T).detach().double().flatten().cpu()
+        which = (lt[:, None] - torch.log10(torch.tensor(listed, dtype=torch.float64))[None, :]).abs().argmin(1)
+        r = torch.as_tensor(resid).detach().double().flatten().cpu()
+        pk = None if packing is None else torch.as_tensor(packing).detach().double().flatten().cpu()
+        tally = getattr(self, '_temperature_tally', None)
+        if tally is None:
+            tally = self._temperature_tally = {}
+        for j, T in enumerate(listed):
+            m = which == j
+            e = tally.setdefault((branch, T), dict(rows=0, n=0, s=0.0, s2=0.0, packing=[]))
+            rr = r[m]
+            rr = rr[torch.isfinite(rr)]
+            e['rows'] += int(m.sum())
+            e['n'] += int(rr.numel())
+            e['s'] += float(rr.sum())
+            e['s2'] += float((rr * rr).sum())
+            if pk is not None and pk.numel() == m.numel():
+                p = pk[m]
+                e['packing'].append(p[torch.isfinite(p)])
+                kept = torch.cat(e['packing'])[-self.TEMPERATURE_TALLY_PACKING_ROWS:]
+                e['packing'] = [kept]
+
+    def _temperature_readouts(self):
+        """The per-temperature tally since the last read, then cleared: tbT/{bwd,replay,fwd}/rows@T (rows),
+        tbT/<branch>/resid_mean@T and resid_rms@T (nats; NaN without a finite residual), and on fwd packing_p50@T and
+        packing_p10@T; plus boot/root@T, the last bootstrap_z:offset Huber root at each temperature (nats)."""
+        out = {}
+        tally = getattr(self, '_temperature_tally', None) or {}
+        self._temperature_tally = None
+        nan = float('nan')
+        for (branch, T), e in sorted(tally.items()):
+            at = f'@{T:g}'
+            out[f'tbT/{branch}/rows{at}'] = e['rows']
+            out[f'tbT/{branch}/resid_mean{at}'] = e['s'] / e['n'] if e['n'] else nan
+            out[f'tbT/{branch}/resid_rms{at}'] = math.sqrt(e['s2'] / e['n']) if e['n'] else nan
+            if branch == 'fwd':
+                p = torch.cat(e['packing']) if e['packing'] else torch.zeros(0, dtype=torch.float64)
+                q = (torch.quantile(p, torch.tensor([0.5, 0.1], dtype=torch.float64)).tolist() if p.numel()
+                     else [nan, nan])
+                out[f'tbT/fwd/packing_p50{at}'], out[f'tbT/fwd/packing_p10{at}'] = q
+        out.update(getattr(self, '_boot_roots', None) or {})
+        self._boot_roots = None
+        return out
 
     def _store_population_readouts(self):
         """O(rows) readouts over the store as it stands: on-policy reuse and coverage, the replay rule's weights over
@@ -14461,7 +14814,7 @@ class Modeller:
 
     @torch.no_grad()
     def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None,
-                          dataset=None, side_effects: bool = True, panel=None):
+                          dataset=None, side_effects: bool = True, panel=None, temperatures=None):
         """
         On-policy evaluation sampling.
 
@@ -14478,6 +14831,9 @@ class Modeller:
         panel: (rows, space groups), a fixed draw of `dataset`'s rows, each row scored in its given group
         (_store_heldout_panel). On the store route the training draw reads the condition's template and is never
         oriented.
+
+        temperatures: kT values; each row takes one, stratified (_draw_temperatures), in place of the run's
+        temperature (bootstrap_z_offset in a stage setting `temperatures`).
         """
         dataset = self.mol_dataset if dataset is None else dataset
         if side_effects:
@@ -14526,12 +14882,14 @@ class Modeller:
                                                        0]))
 
                     random_temperatures = 10 ** random_log_T_tensor
-                    temperatures = random_temperatures
+                    temperatures_i = random_temperatures
 
+                elif temperatures is not None:
+                    temperatures_i = self._draw_temperatures(temperatures, int(mol_batch.num_graphs)).to(self.device)
                 else:   # the store route's untagged draws take the run's temperature (MolecularCrystal.untagged_temperature)
-                    temperatures = self.energy_function.temperature * torch.ones(mol_batch.num_graphs,
-                                                                                 dtype=torch.float32,
-                                                                                 device=self.device)
+                    temperatures_i = self.energy_function.temperature * torch.ones(mol_batch.num_graphs,
+                                                                                   dtype=torch.float32,
+                                                                                   device=self.device)
 
                 # the policy stays in training mode here; under NF frames the draws present the standard frame
                 # (NFPolicy.standard_frames), as the density readouts' eval mode does
@@ -14541,7 +14899,7 @@ class Modeller:
                                                 self.energy_function, mol_batch,
                                                 no_conditioning=False,
                                                 sg_inds=sg_inds, z_primes=z_primes,
-                                                temperatures=temperatures)
+                                                temperatures=temperatures_i)
             except (RuntimeError, ValueError) as e:
                 self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
@@ -14567,7 +14925,7 @@ class Modeller:
                 acc[k].append(v)
             for k, v in out.items():
                 acc[k].append(v)
-            acc['temperature'].append(temperatures.cpu().detach())
+            acc['temperature'].append(temperatures_i.cpu().detach())
 
         pooled = {k: torch.cat(v) for k, v in acc.items()}
         log_weight = self._fwd_eval_summary(pooled)

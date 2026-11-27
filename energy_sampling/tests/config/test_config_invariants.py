@@ -1396,6 +1396,32 @@ def test_a_row_store_off_the_nf_route_is_an_error(canonical):
     assert not _fires(cfg, 'row_store_is_well_formed')
 
 
+def test_a_stage_temperatures_key_off_the_store_route_is_a_dead_key(canonical):
+    """`temperatures` on a stage of a run without temperature_conditioning and buffers.store is refused. Full coverage:
+    tests/config/test_stage_temperatures.py."""
+    cfg = copy.deepcopy(canonical)
+    assert not _fires(cfg, 'stage_temperatures_are_read')
+    cfg['protocols'][cfg['protocol']]['stages'][-1]['temperatures'] = [2.5, 25.0]
+    assert _fires(cfg, 'stage_temperatures_are_read')
+
+
+def test_train_molecules_is_refused_malformed_or_off_the_store_route(canonical):
+    """noised_prior.train_molecules: null or an integer >= 1, and a set value only with buffers.store enabled. Full
+    coverage: tests/crystal/test_train_molecules.py."""
+    rule = 'train_molecules_is_well_formed'
+    cfg = copy.deepcopy(canonical)
+    assert cfg['noised_prior']['train_molecules'] is None and not _fires(cfg, rule)
+    del cfg['noised_prior']['train_molecules']
+    assert not _fires(cfg, rule)                                          # absent = null
+    cfg['noised_prior']['train_molecules'] = 1000
+    assert ci.row_store_settings(cfg) is None and _fires(cfg, rule, severity=ERROR)   # store off
+    cfg['buffers']['store'] = {'enabled': True, 'ram_gb': 16}
+    assert not _fires(cfg, rule)
+    for bad in (0, -1, 1.5, True, '10'):
+        cfg['noised_prior']['train_molecules'] = bad
+        assert _fires(cfg, rule, severity=ERROR), bad
+
+
 def test_a_malformed_heldout_gate_is_an_error(canonical):
     """Full coverage: tests/protocol/test_heldout_gate.py."""
     cfg = copy.deepcopy(canonical)

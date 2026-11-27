@@ -17,6 +17,16 @@ Row columns are host tensors preallocated to `max_rows` and written by slot:
     draws        i32      times trained on, by occurrence
     birth_step   i32      step the row was written; 0 for seed rows
 
+A store built with with_terms=True also holds the terms that rebuild log R at any temperature
+(MolecularCrystal.store_terms_from, .log_r_from_terms), written once at seed or add:
+
+    dens         f32      density wall, density_penalty(packing) (dimensionless; x density_coeff = energy units)
+    pv           f32      PV term, energy units
+    pen          f32      bounding + reduction penalties, nats
+    logref       f32      the FD chart's log reference density, nats
+
+A store built without them allocates, saves and restores none of the four.
+
 Per-condition tables: tmpl_of, cond_sg, cond_radius, cond_rg, best_energy, window_floor, cond_stats.
 
 Invariants, verified by check():
@@ -36,6 +46,7 @@ Invariants, verified by check():
     I10 touch refuses anchors, so no reward or log q column of an anchor is written after its seed.
     I11 max_rows >= n_anchors + 2 * headroom. add raises on a single add above headroom.
     I12 log_q_birth is written once, at on-policy admission. A drawable on-policy row has a finite log_q and log_q_birth.
+    I13 With terms: every live row has finite dens, pv, pen and logref (seed and add raise on a kept row without).
 
 The store owns one numpy Generator. It never reads or advances the global torch or numpy generators.
 
@@ -67,7 +78,10 @@ _COLUMNS = (('x', torch.float32), ('cid', torch.int32), ('kind', torch.int8), ('
             ('origin', torch.int8), ('parent', torch.int32), ('log_r', torch.float32), ('energy', torch.float32),
             ('log_q', torch.float32), ('log_q_birth', torch.float32), ('q_step', torch.int32),
             ('resid', torch.float32), ('draws', torch.int32), ('birth_step', torch.int32))
-_TABLES = ('tmpl_of', 'cond_sg', 'cond_radius', 'cond_rg', 'best_energy', 'window_floor')
+#: the term columns of a store built with with_terms, in MolecularCrystal.STORE_TERM_KEYS order
+TERM_COLUMNS = ('dens', 'pv', 'pen', 'logref')
+_TERM_COLUMNS = tuple((name, torch.float32) for name in TERM_COLUMNS)
+_TABLES =('tmpl_of', 'cond_sg', 'cond_radius', 'cond_rg', 'best_energy', 'window_floor')
 _COUNTERS = ('n_free', 'high_water', 'epoch', 'generation', 'n_seed_given', 'n_seed_kept', 'seed_nonfinite',
              'seed_orphans', 'thinned_total', 'nonfinite_rows', 'seeded', 'seed_intact')
 _SEED_MUTABLE = ('log_q', 'q_step', 'resid', 'draws')   # the only columns of a seed row written after seed()
@@ -385,10 +399,13 @@ class RolloutPool:
 
 
 class CrystalStore:
-    """See the module docstring. `headroom` is H of I11, the largest single add."""
+    """See the module docstring. `headroom` is H of I11, the largest single add. with_terms: also hold the TERM_COLUMNS,
+    which seed and add then require."""
 
-    def __init__(self, dim, n_cond, max_rows, headroom, seed=0):
+    def __init__(self, dim, n_cond, max_rows, headroom, seed=0, with_terms=False):
         self.dim, self.n_cond, self.max_rows, self.headroom = int(dim), int(n_cond), int(max_rows), int(headroom)
+        self.with_terms = bool(with_terms)
+        self._columns = _COLUMNS + (_TERM_COLUMNS if self.with_terms else ())
         if self.dim < 1 or self.n_cond < 1 or self.headroom < 1:
             raise CrystalStoreError(f'dim, n_cond and headroom must be >= 1, got {dim}, {n_cond}, {headroom}')
         if self.max_rows < 2 * self.headroom:
@@ -397,7 +414,7 @@ class CrystalStore:
             raise CrystalStoreError(f'max_rows {max_rows} is above the int32 slot limit {MAX_ROWS_LIMIT}')
         self.base_seed = self._seed_word(seed)
         self.rng = np.random.default_rng(self.base_seed)
-        for name, dtype in _COLUMNS:
+        for name, dtype in self._columns:
             shape = (self.max_rows, self.dim) if name == 'x' else (self.max_rows,)
             setattr(self, name, torch.empty(shape, dtype=dtype, device='cpu'))
         n = self.n_cond
@@ -474,6 +491,31 @@ class CrystalStore:
     def _rows(self, rows):
         return torch.as_tensor(rows).detach().cpu().long().reshape(-1)
 
+    def _terms_arg(self, terms, n, finite, where):
+        """`terms` [n, 4] float32 on a store with terms, None on one without (either mismatch raises). A row the finite
+        mask keeps (finite x, log_r and energy) whose terms are not all finite raises, with the count."""
+        if not self.with_terms:
+            if terms is not None:
+                raise CrystalStoreError(f'{where}: terms given to a store built without the term columns')
+            return None
+        if terms is None:
+            raise CrystalStoreError(f'{where}: this store holds the term columns {TERM_COLUMNS} and needs terms')
+        t = torch.as_tensor(terms).detach().cpu().to(torch.float32)
+        if tuple(t.shape) != (n, len(TERM_COLUMNS)):
+            raise CrystalStoreError(f'{where}: terms of shape {tuple(t.shape)}, expected ({n}, {len(TERM_COLUMNS)})')
+        bad = finite & ~torch.isfinite(t).all(1)
+        if bool(bad.any()):
+            raise CrystalStoreError(f'{where}: {int(bad.sum())} of {int(finite.sum())} rows with a finite x, log_r and '
+                                    f'energy have a non-finite term ({TERM_COLUMNS})')
+        return t
+
+    def terms(self, rows):
+        """[len(rows), 4] float32, the TERM_COLUMNS of `rows`. Raises on a store built without them."""
+        if not self.with_terms:
+            raise CrystalStoreError('terms(): this store was built without the term columns')
+        rows = self._rows(rows)
+        return torch.stack([getattr(self, name)[rows] for name in TERM_COLUMNS], 1)
+
     def _check_kind(self, kind):
         if int(kind) not in (ANCHOR, CHILD, ONPOLICY):
             raise CrystalStoreError(f'kind must be one of ANCHOR, CHILD, ONPOLICY, got {kind}')
@@ -513,11 +555,12 @@ class CrystalStore:
 
     # ---- seeding --------------------------------------------------------------------
 
-    def seed(self, x, cid, kind, log_r, energy, parent, undrawn, templates, template_cids, window_floor):
+    def seed(self, x, cid, kind, log_r, energy, parent, undrawn, templates, template_cids, window_floor, terms=None):
         """Load the data rows once, into an empty store, in the given order.
 
         kind: ANCHOR or CHILD per row. parent: for a child, the position of its anchor among these rows; ignored on an
-        anchor. templates: one graph per entry of template_cids. window_floor: [n_cond], written once.
+        anchor. templates: one graph per entry of template_cids. window_floor: [n_cond], written once. terms: [n, 4],
+        required on a store with terms and refused on one without (_terms_arg).
 
         best_energy is taken over every row with a finite x, log_r and energy. Rows with a non-finite value are dropped,
         and so are children of a dropped anchor. When more than max_rows - headroom rows remain, all anchors are kept
@@ -548,6 +591,7 @@ class CrystalStore:
                 raise CrystalStoreError('a child and its parent anchor have different conditions')
 
         finite = torch.isfinite(x).all(1) & torch.isfinite(log_r) & torch.isfinite(energy)
+        terms = self._terms_arg(terms, n, finite, 'seed')
         self.best_energy.scatter_reduce_(0, cid[finite], energy[finite], reduce='amin', include_self=True)
         keep = finite.clone()
         keep[is_child] &= finite[p]
@@ -585,6 +629,9 @@ class CrystalStore:
                                       torch.full((m,), -1, dtype=torch.int64)).to(torch.int32)
         self.log_r[:m] = log_r[rows]
         self.energy[:m] = energy[rows]
+        if terms is not None:
+            for j, name in enumerate(TERM_COLUMNS):
+                getattr(self, name)[:m] = terms[rows, j]
         for name in ('log_q', 'log_q_birth', 'resid'):
             getattr(self, name)[:m] = math.nan
         self.q_step[:m] = -1
@@ -620,12 +667,12 @@ class CrystalStore:
         return np.concatenate([reused, fresh])
 
     def add(self, x, cid, kind, origin, log_r, energy, step, parent=None, undrawn=None,
-            log_q=None, resid=None, eval_row=False, durable=True):
+            log_q=None, resid=None, eval_row=False, durable=True, terms=None):
         """Write rows; returns the slots written, in input order. Rows with a non-finite x, log_r or energy are dropped
         and counted (nonfinite_rows). kind and origin: one value or one per row. log_q: required on on-policy rows,
         refused elsewhere; an on-policy row with a non-finite log_q is stored UNDRAWN. A finite row of a condition with
         no template raises before any write. best_energy is updated before any thin. Thins first when the rows do not
-        fit."""
+        fit. terms: [n, 4], required on a store with terms and refused on one without (_terms_arg)."""
         if not self.seeded:
             raise CrystalStoreError('add() before seed()')
         x = self._states(x)
@@ -656,6 +703,7 @@ class CrystalStore:
             raise CrystalStoreError('log_q and resid are written on on-policy rows only')
 
         finite = torch.isfinite(x).all(1) & torch.isfinite(log_r) & torch.isfinite(energy)
+        terms = self._terms_arg(terms, n, finite, 'add')
         at = torch.nonzero(finite).flatten()
         k = at.numel()
         no_template = self.tmpl_of[cid[at]] < 0
@@ -688,6 +736,9 @@ class CrystalStore:
         self.parent[s] = par[at].to(torch.int32)
         self.log_r[s] = log_r[at]
         self.energy[s] = energy[at]
+        if terms is not None:
+            for j, name in enumerate(TERM_COLUMNS):
+                getattr(self, name)[s] = terms[at, j]
         nan = torch.full((k,), math.nan, dtype=torch.float32)
         self.log_q[s] = torch.where(good_q, lq_at, nan)
         self.log_q_birth[s] = torch.where(good_q, lq_at, nan)
@@ -1045,7 +1096,7 @@ class CrystalStore:
     def bytes_per_row(self):
         """Bytes per live row of the occupied columns and of the index in use."""
         n = max(self.n_rows, 1)
-        col = sum(getattr(self, name)[:0].element_size() * (self.dim if name == 'x' else 1) for name, _ in _COLUMNS)
+        col = sum(getattr(self, name)[:0].element_size() * (self.dim if name == 'x' else 1) for name, _ in self._columns)
         index = 4 * self.high_water + 4 * self.index.tail
         tables = 3 * 8 * len(self.index.count) + sum(4 * 2 * s.items.size for s in self.active)
         return col * self.high_water / n + (index + tables) / n
@@ -1061,7 +1112,8 @@ class CrystalStore:
         return {prefix + k: v for k, v in out.items()}
 
     def check(self):
-        """Verify I1, I2, I4-I8, I11, I12 and the counters over the whole store, O(n). Raises on the first failure."""
+        """Verify I1, I2, I4-I8, I11, I12, I13 (with terms) and the counters over the whole store, O(n). Raises on the
+        first failure."""
         def need(ok, what):
             if not ok:
                 raise CrystalStoreError(f'store check failed: {what}')
@@ -1132,15 +1184,19 @@ class CrystalStore:
         need(bool(torch.isfinite(self.log_q_birth[:hw][drawn_on]).all()),
              'I12: a drawable on-policy row has no finite log_q_birth')
         need(bool(torch.isfinite(self.log_q[:hw][drawn_on]).all()), 'I12: a drawable on-policy row has no finite log_q')
+        if self.with_terms:
+            for name in TERM_COLUMNS:
+                need(bool(torch.isfinite(getattr(self, name)[:hw][lv]).all()), f'I13: a live row has a non-finite {name}')
 
     # ---- persistence ----------------------------------------------------------------
 
     def seed_digest(self):
         """What identifies the seed rows: 'exact', a sha1 of the discrete seed columns (_SEED_EXACT), the template map
         and the template atom types; 'close', [n_cond, dim + 2 + 3] float64, each condition's mean x, log_r and energy
-        over its seed rows (NaN without one) and its _SEED_CLOSE_TABLES entries. x, log_r and energy are recomputed at
-        every launch on that launch's device, so they are compared within SEED_CLOSE_RTOL and SEED_CLOSE_ATOL. Cached:
-        none of this is written while seed_intact holds."""
+        over its seed rows (NaN without one) and its _SEED_CLOSE_TABLES entries; with terms, [n_cond, dim + 2 + 4 + 3],
+        the means of the TERM_COLUMNS after energy's. x, log_r, energy and the terms are recomputed at every launch on
+        that launch's device, so they are compared within SEED_CLOSE_RTOL and SEED_CLOSE_ATOL. Cached: none of this is
+        written while seed_intact holds."""
         if self._seed_digest is None:
             n = self.n_seed_kept
             h = hashlib.sha1(repr((self.dim, self.n_cond, n)).encode())
@@ -1151,13 +1207,14 @@ class CrystalStore:
             z = getattr(self.templates, 'z', None)
             if z is not None:
                 h.update(z.detach().cpu().contiguous().numpy())
-            sums = torch.zeros((self.n_cond, self.dim + 2), dtype=torch.float64)
+            extra = TERM_COLUMNS if self.with_terms else ()
+            sums = torch.zeros((self.n_cond, self.dim + 2 + len(extra)), dtype=torch.float64)
             counts = torch.zeros(self.n_cond, dtype=torch.float64)
             for lo in range(0, n, _DIGEST_CHUNK):
                 hi = min(lo + _DIGEST_CHUNK, n)
                 c = self.cid[lo:hi].long()
-                sums.index_add_(0, c, torch.cat([self.x[lo:hi], self.log_r[lo:hi, None], self.energy[lo:hi, None]],
-                                                1).double())
+                sums.index_add_(0, c, torch.cat([self.x[lo:hi], self.log_r[lo:hi, None], self.energy[lo:hi, None]]
+                                                + [getattr(self, name)[lo:hi, None] for name in extra], 1).double())
                 counts.index_add_(0, c, torch.ones(hi - lo, dtype=torch.float64))
             tables = torch.stack([getattr(self, name).double() for name in _SEED_CLOSE_TABLES], 1)
             self._seed_digest = {'exact': h.hexdigest()[:16], 'close': torch.cat([sums / counts[:, None], tables], 1)}
@@ -1189,7 +1246,7 @@ class CrystalStore:
         pools = np.arange(len(self.index.count), dtype=np.int64)
         state = {'format_version': FORMAT_VERSION, 'stamp': stamp, 'dim': self.dim, 'max_rows': self.max_rows,
                  'headroom': self.headroom, 'n_cond': self.n_cond, 'base_seed': self.base_seed,
-                 'columns': {name: getattr(self, name)[first:hw].clone() for name, _ in _COLUMNS},
+                 'columns': {name: getattr(self, name)[first:hw].clone() for name, _ in self._columns},
                  'tables': {name: getattr(self, name).clone() for name in _TABLES},
                  'cond_stats': {k: v.clone() for k, v in self.cond_stats.items()},
                  'free': torch.from_numpy(self._free[:self.n_free].copy()),
@@ -1215,6 +1272,13 @@ class CrystalStore:
         for name in ('dim', 'max_rows'):
             if state.get(name) != getattr(self, name):
                 return f'crystal store {name}: state {state.get(name)}, this store {getattr(self, name)}'
+        present = [name for name in TERM_COLUMNS if name in (state.get('columns') or {})]
+        has_terms = bool(present)
+        if has_terms and len(present) != len(TERM_COLUMNS):
+            return f'crystal store term columns: the state holds {present} of {TERM_COLUMNS}'
+        if has_terms != self.with_terms:
+            return (f"crystal store term columns: the state {'holds' if has_terms else 'has no'} {TERM_COLUMNS}, this "
+                    f"store {'holds' if self.with_terms else 'has no'} them")
         if int(state['n_kind'][ANCHOR]) + 2 * self.headroom > self.max_rows:     # I11 under this store's headroom
             return (f"crystal store: {int(state['n_kind'][ANCHOR])} anchors + 2 * headroom {self.headroom} exceed "
                     f"max_rows {self.max_rows}")
@@ -1251,7 +1315,7 @@ class CrystalStore:
         hw = int(state['counters']['high_water'])
         compact = state.get('seed_digest') is not None
         first = int(state['counters']['n_seed_kept']) if compact else 0
-        for name, _ in _COLUMNS:
+        for name, _ in self._columns:
             getattr(self, name)[first:hw] = state['columns'][name]
         if compact:
             for name in _SEED_MUTABLE:

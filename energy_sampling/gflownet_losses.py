@@ -29,7 +29,7 @@ def diagonal_gaussian_log_density(x, mu, sigma):
 
 def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_pb, log_pf, device,
                                       step: int, log_Z_learned=None, do_update: bool = True,
-                                      mode_level_stream: Optional[str] = None):
+                                      mode_level_stream: Optional[str] = None, rows=None):
     """
     Shared by get_gfn_forward_loss/get_gfn_backward_loss: whenever a
     ConditionLogZTracker is supplied, optionally feed it this step's
@@ -59,23 +59,36 @@ def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_
     ema_logw (a gradient-feeding blend of whatever touches it), while the
     level streams are pure measurements of the CURRENT policy's mean log w on
     that stream, which is exactly what delta(c) = J_B(c) - J_F(c) compares.
+    rows (bool [N], None = every row): only these rows feed the tracker (the
+    level stream, ema_logw and the z residual), and none when it is all false;
+    the lookup is of every row. A stage setting `temperatures` passes the rows
+    drawn at the run's temperature, the tracker's one currency.
     """
     if condition_log_z is None or condition_id is None:
         return None, None
 
     logw = (log_r + log_pb - log_pf).detach()
-    if mode_level_stream is not None:
-        condition_log_z.update_mode_level(mode_level_stream, condition_id, logw, step=step)
-    if do_update:
-        condition_log_z.update(condition_id, logw, step=step)
-        if log_Z_learned is not None:
-            condition_log_z.update_z_residual(condition_id, logw, log_Z_learned, step=step)
+    feed_cid, feed_logw, feed_z = condition_id, logw, log_Z_learned
+    feed = True
+    if rows is not None:
+        rows = torch.as_tensor(rows, dtype=torch.bool).reshape(-1)
+        feed = bool(rows.any())
+        if feed:
+            feed_cid = condition_id[rows.to(condition_id.device)]
+            feed_logw = logw[rows.to(logw.device)]
+            feed_z = None if log_Z_learned is None else log_Z_learned[rows.to(log_Z_learned.device)]
+    if feed and mode_level_stream is not None:
+        condition_log_z.update_mode_level(mode_level_stream, feed_cid, feed_logw, step=step)
+    if feed and do_update:
+        condition_log_z.update(feed_cid, feed_logw, step=step)
+        if feed_z is not None:
+            condition_log_z.update_z_residual(feed_cid, feed_logw, feed_z, step=step)
     log_z_target, target_mask = condition_log_z.lookup(condition_id)
     return log_z_target.to(device), target_mask.to(device)
 
 
 def update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor,
-                                 crystal_batch=None, anchor_energy_fn=None):
+                                 crystal_batch=None, anchor_energy_fn=None, rows=None):
     """
     Feed this step's implied energy back to ConditionLogZTracker's running
     per-condition minimum (see ConditionLogZTracker.update_best_energy).
@@ -92,7 +105,8 @@ def update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_ten
     two minima. With a prior_flow and no batch (return_exp=False) it raises.
     anchor_energy_fn=None passes no physical leg at all, which the tracker
     refuses on a run with a prior_flow. No-op when no tracker/condition_id is
-    provided.
+    provided. rows (bool [N], None = every row): only these rows are fed, and
+    none when it is all false (update_and_lookup_condition_log_z).
     """
     if condition_log_z is None or condition_id is None:
         return
@@ -100,6 +114,14 @@ def update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_ten
     temperature = 10 ** log_T_tensor.detach()
     energy = -log_r.detach() * temperature
     energy_phys = anchor_energy_fn(crystal_batch) if anchor_energy_fn is not None else None
+    if rows is not None:
+        rows = torch.as_tensor(rows, dtype=torch.bool).reshape(-1)
+        if not bool(rows.any()):
+            return
+        condition_id = condition_id[rows.to(condition_id.device)]
+        energy = energy.reshape(-1)[rows.to(energy.device)]
+        if energy_phys is not None:
+            energy_phys = torch.as_tensor(energy_phys).reshape(-1)[rows.to(torch.as_tensor(energy_phys).device)]
     condition_log_z.update_best_energy(condition_id, energy, energy_phys=energy_phys)
 
 
@@ -432,11 +454,20 @@ def get_gfn_forward_loss(loss_coeffs,
                          tb_z_source: str = 'learned',
                          step: int = 0,
                          anchor_energy_fn=None,
+                         tracker_rows=None,
+                         group_by_temperature: bool = False,
                          ):
     """
     anchor_energy_fn: reads the per-row anchor currency off the scored batch for
     condition_log_z's physical minimum -- see update_condition_best_energy. Needs
     return_exp=True whenever the energy function carries a prior_flow.
+
+    tracker_rows (bool [N], None = every row): the rows that feed condition_log_z
+    (update_and_lookup_condition_log_z, update_condition_best_energy).
+    group_by_temperature: the condition-grouped emp_z / VarGrad estimate, z_level
+    and the group stats group rows by (condition_id, log_T_tensor)
+    (condition_temperature_groups) instead of condition_id; with one temperature
+    the groups and their order are condition_id's.
 
     freeze_policy/freeze_z (read from loss_coeffs, the single source of
     truth -- scheduled per phase like every other coefficient): forcibly
@@ -616,9 +647,11 @@ def get_gfn_forward_loss(loss_coeffs,
     # side of the z_match delta gate
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
-        log_Z_learned=log_Z_learned, mode_level_stream='fwd')
+        log_Z_learned=log_Z_learned, mode_level_stream='fwd', rows=tracker_rows)
     update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor,
-                                 crystal_batch=crystal_batch, anchor_energy_fn=anchor_energy_fn)
+                                 crystal_batch=crystal_batch, anchor_energy_fn=anchor_energy_fn, rows=tracker_rows)
+    group_id = (condition_temperature_groups(condition_id, log_T_tensor)
+                if group_by_temperature and condition_id is not None else condition_id)
 
     # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
     # branches' log-weights in one scope. Stashed on the model rather than
@@ -658,20 +691,20 @@ def get_gfn_forward_loss(loss_coeffs,
         """VarGrad - lower bound loss (condition-grouped): center = group MEAN of log w"""
         if loss_coeffs.vg_lb > 0:
             log_Z_emp_rows, emp_mask, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta,
+                log_pb, log_pf, log_r, group_id, lme=False, beta=beta,
                 detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lb)
 
             """VarGrad - log mean exp loss (condition-grouped): center = group LOGMEANEXP of log w"""
         elif loss_coeffs.vg_lme > 0:
             log_Z_emp_rows, emp_mask, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=True, beta=beta,
+                log_pb, log_pf, log_r, group_id, lme=True, beta=beta,
                 detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lme)
 
         else:  # emp_z standalone: Jensen-mean target (the vargrad-Z experiment -- drive Z exactly at the empirical lower bound)
             log_Z_emp_rows, emp_mask, _ = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta,
+                log_pb, log_pf, log_r, group_id, lme=False, beta=beta,
                 detach_center=vg_detach_center)
 
         if loss_coeffs.emp_z > 0:
@@ -747,7 +780,7 @@ def get_gfn_forward_loss(loss_coeffs,
     # per-row for the shared stack/sum below (the final row mean recovers it exactly).
     z_level_coeff = getattr(loss_coeffs, 'z_level', 0)
     if z_level_coeff > 0 and condition_id is not None:
-        z_lvl = z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id)
+        z_lvl = z_level_loss(log_pf, log_pb, log_r, log_Z_learned, group_id)
         losses.append(z_lvl.expand(log_pf.shape[0]) * z_level_coeff)
 
     # A branch may legitimately carry NO terms of its own -- e.g. under a
@@ -821,7 +854,7 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict['logpf_mean'] = log_pf.detach().mean()
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
-            loss_dict.update(condition_group_stats(condition_id))
+            loss_dict.update(condition_group_stats(group_id))
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -893,8 +926,12 @@ def get_gfn_backward_loss(loss_coeffs,
                           live_stash: Optional[str] = 'bwd',
                           log_reward_fn=None,
                           log_T_tensor=None,
+                          tracker_rows=None,
                           ):
     """
+    tracker_rows (bool [N], None = every row): the rows that feed condition_log_z
+    (update_and_lookup_condition_log_z).
+
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
     docstring -- same contract, applied here right after log_pf/log_pb/
     log_Z_learned are computed, and freeze_policy threaded into the traj
@@ -1097,7 +1134,8 @@ def get_gfn_backward_loss(loss_coeffs,
     # the Z model's, which is trained and judged on forward rollouts only.
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
-        do_update=update_log_z and not no_reward, mode_level_stream=None if no_reward else mode_level_stream)
+        do_update=update_log_z and not no_reward, mode_level_stream=None if no_reward else mode_level_stream,
+        rows=tracker_rows)
 
     # LIVE tensors for the cross-branch pooled VarGrad term, which needs both
     # branches' log-weights in one scope. Stashed on the model rather than
@@ -1784,6 +1822,15 @@ def z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id):
     group_mean = torch.zeros(k, device=err.device, dtype=err.dtype).scatter_add_(
         0, inverse, err) / counts.clamp(min=1)
     return (group_mean ** 2).mean()
+
+
+def condition_temperature_groups(condition_id, log_T_tensor):
+    """[N] long group id of each row over (condition_id, log10 T): the inverse of a lexicographic unique, so the groups
+    are numbered in (condition, temperature) order. Rows of one repeats tile share one temperature value, so float
+    equality groups them. With a single temperature the partition and its order are condition_id's."""
+    cid = torch.as_tensor(condition_id).reshape(-1)
+    key = torch.stack([cid.double(), torch.as_tensor(log_T_tensor).to(cid.device).reshape(-1).double()], 1)
+    return torch.unique(key, dim=0, return_inverse=True)[1]
 
 
 def condition_group_stats(condition_id, min_group_count: int = 2):

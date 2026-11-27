@@ -8,11 +8,11 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=pool4_nov26b
-#SBATCH --array=0-3
+#SBATCH --array=0-15
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/pool4_nov26b/joblogs/%x_%A_%a.out
 
-# pool4_nov26b (make.py, from submit_template.sbatch): one arm per array index: smoke_wd5e2 smoke_wd1e1 wd5e2 wd1e1 (settings in each arm yaml).
-# Submit: sbatch --array=0-3. Each arm's prior, conditions and test file are read from
+# pool4_nov26b (make.py, from submit_template.sbatch): one arm per array index: smoke_wd5e2 smoke_wd1e1 smoke_mt_ctrl smoke_mt_all smoke_mt_ladder smoke_mol1k smoke_mol10k smoke_mol1k_cap wd5e2 wd1e1 mt_ctrl mt_all mt_ladder mol1k mol10k mol1k_cap (settings in each arm yaml).
+# Submit: sbatch --array=0-15. Each arm's prior, conditions and test file are read from
 # its own yaml and checked here; an arm naming a source checkpoint stops here if the file is missing.
 module purge
 
@@ -25,7 +25,7 @@ GROUP_SH=${WORKDIR}/configs/cap_size_nov01/run_group.sh
 LOGS=${ARMS}/joblogs
 mkdir -p ${LOGS}
 
-ARM_LIST=(smoke_wd5e2 smoke_wd1e1 wd5e2 wd1e1)
+ARM_LIST=(smoke_wd5e2 smoke_wd1e1 smoke_mt_ctrl smoke_mt_all smoke_mt_ladder smoke_mol1k smoke_mol10k smoke_mol1k_cap wd5e2 wd1e1 mt_ctrl mt_all mt_ladder mol1k mol10k mol1k_cap)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 CKDIR=${WORKDIR}/checkpoints
 

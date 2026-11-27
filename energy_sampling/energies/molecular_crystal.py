@@ -26,6 +26,12 @@ from mxtaltools.mlip_interfaces.uma_utils import (init_uma_crystal_predictor,
 
 #: MolecularCrystal(crystal_coordinates=...): the trainer latent, or crystal_fd's fundamental-domain chart
 CRYSTAL_COORDINATES = ('latent', 'fd')
+#: the ens_dict keys MolecularCrystal.store_terms_from reads, in column order: the density wall and the PV term (energy
+#: units, as mol_energy), the bounding plus reduction penalties and the FD chart's log reference (nats)
+STORE_TERM_KEYS = ('density_energy', 'pressure_energy', 'penalty_nats', 'log_reference_nats')
+#: the STORE_TERM_KEYS an analysed batch carries only for store_terms_from: noised_prior.strip_analysis_helpers drops
+#: them before a batch is saved (density_energy and pressure_energy are row data a prior file has always held)
+ANALYSIS_ONLY_KEYS = ('penalty_nats', 'log_reference_nats')
 # The LJ-family computes are switched off smoothly over the last LJ_ENVELOPE_A Angstrom before the analysis cutoff
 # (MXtalTools vdw_analysis.lj_cutoff_envelope) unless energy_config.analyze_kwargs sets lj_envelope itself (null =
 # the hard cutoff). Owner 2026-11-19: the searches' value, so the energy is continuous and its gradient is the
@@ -378,6 +384,10 @@ class MolecularCrystal(BaseSet):
         # temperature_conditioning: the temperature a condition draw takes when none is passed; None = a log-uniform draw
         # over log_temperature_range (log10 of kT). Set by the trainer (train.py), not the config
         self.untagged_temperature = None
+        # the temperature T_ref at which the density wall costs density_coeff * density_energy; at any other T it costs
+        # that x T / T_ref, so its share of log R is the same at every T. None = the untempered wall. Set by the trainer
+        # (train.py, the store route with a stage that sets `temperatures`), not the config
+        self.density_reference_temperature = None
         self.internal_oom_recovery = internal_oom_recovery
         self.analyze_kwargs = effective_analyze_kwargs(energy_function, analyze_kwargs)   # yaml nests dicts as Namespaces
         self.host_gas_phase_reference = bool(host_gas_phase_reference)
@@ -1200,6 +1210,7 @@ class MolecularCrystal(BaseSet):
         # energy() divides the total energy by temperature before use; pre-multiply here so
         # this domain-validity constraint stays equally stiff across sampling temperatures,
         # matching the same compensation already applied to jacobian_energy below
+        bounding_nats = bounding_energy   # before the x T: the term's share of -log R, the same at every T
         bounding_energy = bounding_energy * temperature
 
         # `and not self.latent_energy`: a latent-scored crystal (latent_gaussian) has a
@@ -1222,6 +1233,7 @@ class MolecularCrystal(BaseSet):
                 self.implausible_rows += int(flagged.sum())
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
+            reduction_nats = reduction_energy
             # same temperature compensation as bounding_energy above -- this is a validity
             # constraint, not part of the target Boltzmann distribution, so it shouldn't soften at high T
             reduction_energy = reduction_energy * temperature
@@ -1235,6 +1247,9 @@ class MolecularCrystal(BaseSet):
             ens_dict['density_energy'] = density_energy
             ens_dict['bounding_energy'] = bounding_energy
             ens_dict['pressure_energy'] = pressure_energy
+            # the two validity penalties in nats (their x T cancels in log R): read by store_terms_from. Neither key
+            # name holds 'energy', so log_thermo_properties does not log them
+            ens_dict['penalty_nats'] = self.bounding_coeff * bounding_nats + self.reduction_coeff * reduction_nats
         else:
             # reduction_energy is structurally zero for a latent-scored problem, which is
             # what keeps the analytic log Z exact. It matters: on P-1 the reduced region
@@ -1248,6 +1263,7 @@ class MolecularCrystal(BaseSet):
             # active penalty, so dropping it from ens_dict would leave the run with no
             # visibility into the one thing constraining the box
             ens_dict['bounding_energy'] = bounding_energy
+            ens_dict['penalty_nats'] = self.bounding_coeff * bounding_nats
 
         if self.energy_function == 'latent_harmonic':
             crystal_energy = getattr(crystal_batch, 'latent_harmonic')
@@ -1277,7 +1293,9 @@ class MolecularCrystal(BaseSet):
             # calibration -- 0.132 instead of 0.364 on mipcas -- and stay finite
             # and plausible the whole way. The composite total is unchanged: the
             # same product, formed one step earlier.
-            crystal_energy = mol_energy + self.density_coeff * density_energy + pressure_energy
+            # density_reference_temperature set: the wall x T / T_ref, the same nats at every T (log_r_from_terms)
+            crystal_energy = mol_energy + self.density_coeff * self._tempered_density(density_energy, temperature) \
+                + pressure_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
@@ -1294,14 +1312,17 @@ class MolecularCrystal(BaseSet):
         # stops being log 2 per dim.
         if not self.is_crystal or self.latent_energy:
             jacobian_energy = torch.zeros_like(bounding_energy)
+            ens_dict['log_reference_nats'] = torch.zeros_like(bounding_nats)
         elif self.crystal_coordinates == 'fd':
             # the same change of measure, from Lebesgue on the FD chart's s to the reference measure (Haar
             # orientation, fractional centre x Z' log V, the latent's cell measure): fd_coordinates.log_reference
             jacobian_energy = -temperature * crystal_batch.fd_log_reference
             ens_dict['jacobian_energy'] = jacobian_energy
+            ens_dict['log_reference_nats'] = torch.as_tensor(crystal_batch.fd_log_reference)   # its share of log R
         else:
             jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)
             ens_dict.update(jacobian_components)
+            ens_dict['log_reference_nats'] = torch.zeros_like(bounding_nats)
 
         # THE PATH'S TWO LEGS. The mix is EXACTLY LINEAR in them:
         #
@@ -1691,6 +1712,70 @@ class MolecularCrystal(BaseSet):
         if return_ens_dict:
             return -energy / sample_temperature, ens_dict
         return -energy / sample_temperature
+
+    def _tempered_density(self, density_energy, temperature):
+        """density_energy x T / density_reference_temperature, broadcast as reduction_energy x temperature is in
+        generator_energy; density_energy itself when density_reference_temperature is None."""
+        if self.density_reference_temperature is None:
+            return density_energy
+        return density_energy * (temperature / self.density_reference_temperature)
+
+    def store_terms_from(self, src) -> torch.Tensor:
+        """[n, 4] float32 on the CPU, columns STORE_TERM_KEYS (density_energy, pressure_energy, penalty_nats,
+        log_reference_nats): the terms of a scored row that do not depend on the temperature it was scored at, read off
+        a generator_energy ens_dict or a batch analyze_crystal_batch scored (which carries the ens_dict's keys).
+        log_r_from_terms rebuilds log R at any temperature from them and the row's mol_energy."""
+        cols = []
+        for key in STORE_TERM_KEYS:
+            v = src.get(key) if isinstance(src, dict) else getattr(src, key, None)
+            if v is None:
+                raise ValueError(f"store_terms_from: the scored rows carry no {key!r} (a crystal energy on the FD "
+                                 f"chart writes it in generator_energy)")
+            cols.append(torch.as_tensor(v).detach().float().flatten().cpu())
+        if len({c.numel() for c in cols}) != 1:
+            raise ValueError(f"store_terms_from: term columns of {[c.numel() for c in cols]} rows")
+        return torch.stack(cols, 1)
+
+    @torch.no_grad()
+    def log_r_from_terms(self, energy, terms, log_T) -> torch.Tensor:
+        """[n] float32 log R at log10 kT = log_T of rows whose mol_energy is `energy` [n] and whose store_terms_from
+        terms are `terms` [n, 4], with no energy call. With T = 10 ** log_T, w = T / density_reference_temperature (1
+        when that is None) and U = energy + density_coeff x (dens x w) + pv:
+
+            energy_clip armed:  E = lrp(lrp(U, clip) + T pen, clip + 0.1 |clip|) - T logref
+            otherwise:          E = C(U) + T pen - T logref,  C = lrp(., physical_energy_clip) or the identity
+
+        and log R = -E / T, generator_energy's composition term for term (lrp = log_rescale_positive). log_T: [n] or
+        one value. Raises under a prior_flow, an energy reference, a latent or non-crystal energy, or a chart other
+        than fd, where those terms do not determine log R."""
+        if self.prior_flow is not None:
+            raise ValueError("log_r_from_terms: a prior_flow mixes a flow leg the stored terms do not hold")
+        if self.energy_reference_mode is not None:
+            raise ValueError("log_r_from_terms: an energy reference is not among the stored terms")
+        if self.latent_energy or not self.is_crystal:
+            raise ValueError(f"log_r_from_terms needs a physical crystal energy, not {self.energy_function!r}")
+        if self.crystal_coordinates != 'fd':
+            raise ValueError("log_r_from_terms needs crystal_coordinates 'fd' (the log reference is the FD chart's)")
+        energy = torch.as_tensor(energy).detach().float().flatten()
+        terms = torch.as_tensor(terms).detach().float().to(energy.device)
+        n = energy.numel()
+        if terms.shape != (n, len(STORE_TERM_KEYS)):
+            raise ValueError(f"log_r_from_terms: terms of shape {tuple(terms.shape)} for {n} rows")
+        log_T = torch.as_tensor(log_T).detach().float().to(energy.device).reshape(-1)
+        if log_T.numel() == 1:
+            log_T = log_T.expand(n)
+        elif log_T.numel() != n:
+            raise ValueError(f"log_r_from_terms: {log_T.numel()} temperatures for {n} rows")
+        T = 10 ** log_T
+        dens, pv, pen, logref = terms.unbind(1)
+        u = energy + self.density_coeff * self._tempered_density(dens, T) + pv
+        if self.energy_clip is not None:
+            clipped = log_rescale_positive(u, self.energy_clip) + T * pen
+            total = log_rescale_positive(clipped, self.energy_clip + 0.1 * np.abs(self.energy_clip)) - T * logref
+        else:
+            leg = u if self.physical_energy_clip is None else log_rescale_positive(u, self.physical_energy_clip)
+            total = leg + T * pen - T * logref
+        return -total / T
 
     def energy(self,
                x,

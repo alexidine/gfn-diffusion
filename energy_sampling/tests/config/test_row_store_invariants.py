@@ -124,6 +124,20 @@ def test_store_row_limit_counts_the_store_allocation():
     assert cs.MAX_ROWS_LIMIT == 2 ** 31 - 1
 
 
+def test_store_row_limit_without_terms_is_unchanged_and_terms_add_their_four_columns():
+    """A store without term columns keeps the row limit a live run's sidecar was sized by (a resume requires max_rows to
+    match); one with them is charged 16 more bytes per slot, twice (the columns and their state_dict clone)."""
+    from energy_sampling import crystal_store as cs
+    for ram_gb, ndim, frac in ((224, 12, 0.5), (16, 12, 0.5), (224, 9, 1.0)):
+        assert ci.store_row_limit(ram_gb, ndim, frac, with_terms=False) == ci.store_row_limit(ram_gb, ndim, frac)
+        plain = 2 * (4 * ndim + 43) + 16 + 4
+        assert ci.store_row_limit(ram_gb, ndim, frac, with_terms=True) == int(frac * ram_gb * 2 ** 30 / (plain + 32))
+    ndim, slots = 12, 1000
+    st = cs.CrystalStore(ndim, 3, slots, 5, with_terms=True)
+    columns = sum(getattr(st, name).numel() * getattr(st, name).element_size() for name, _ in st._columns)
+    assert columns == slots * (4 * ndim + 43 + 16)
+
+
 def test_store_row_limit_needs_no_torch():
     import ast
     tree = ast.parse(pathlib.Path(ci.__file__).read_text(encoding='utf-8'))

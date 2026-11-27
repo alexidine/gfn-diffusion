@@ -993,3 +993,138 @@ def test_round_trip_keeps_the_index_layout_and_compaction_count():
         assert torch.equal(add_onpolicy(st, c, step=100 + i), add_onpolicy(other, c, step=100 + i))
         assert torch.equal(st.draw(CHILD, 16), other.draw(CHILD, 16))
     assert other.stats() == st.stats()
+
+
+# ---- term columns (with_terms) ----------------------------------------------------------------------------------
+
+#: the state_dict and column layout of a store without terms, as at the commit before the term columns existed: a
+#: resume of a live run on that layout restores exactly
+HEAD_STATE_KEYS = {'format_version', 'stamp', 'dim', 'max_rows', 'headroom', 'n_cond', 'base_seed', 'columns',
+                   'tables', 'cond_stats', 'free', 'index_count', 'index_start', 'index_cap', 'index_tail',
+                   'index_compactions', 'index_rows', 'active', 'counters', 'n_kind', 'n_drawable', 'n_undrawn',
+                   'rng_state', 'templates', 'seed_digest'}
+HEAD_COLUMNS = ('x', 'cid', 'kind', 'flags', 'origin', 'parent', 'log_r', 'energy', 'log_q', 'log_q_birth', 'q_step',
+                'resid', 'draws', 'birth_step')
+
+
+def _terms_of(n, base=0.0):
+    v = torch.arange(n, dtype=torch.float32) + base
+    return torch.stack([v / 10, v / 100, v / 1000, -v / 7], 1)
+
+
+def make_terms(spec=((2, 6), (1, 3)), max_rows=100, H=5, seed=0, terms=None):
+    cid, kind, parent = _layout(spec)
+    n = cid.numel()
+    x = torch.linspace(-0.9, 0.9, n * DIM).reshape(n, DIM)
+    e = torch.arange(n, dtype=torch.float32) + 10.0
+    st = CrystalStore(DIM, len(spec), max_rows, H, seed=seed, with_terms=True)
+    st.seed(x, cid, kind, -e / 2.5, e, parent, torch.zeros(n, dtype=torch.bool), _templates(len(spec)),
+            torch.arange(len(spec)), torch.zeros(len(spec), dtype=torch.float64),
+            terms=_terms_of(n) if terms is None else terms)
+    return st
+
+
+def add_onpolicy_terms(st, cids, step=1, base=500.0, **kw):
+    cids = torch.as_tensor(cids)
+    return add_onpolicy(st, cids, step=step, terms=_terms_of(cids.numel(), base), **kw)
+
+
+def test_a_store_without_terms_keeps_the_layout_it_had_before_them():
+    st = make()
+    assert not st.with_terms and tuple(n for n, _ in st._columns) == HEAD_COLUMNS == tuple(n for n, _ in CS._COLUMNS)
+    assert not any(hasattr(st, name) for name in CS.TERM_COLUMNS)
+    full, compact = st.state_dict(stamp={'k': 1}), st.state_dict(stamp={'k': 1}, compact=True)
+    assert set(full) == HEAD_STATE_KEYS and set(compact) == HEAD_STATE_KEYS | {'seed_columns'}
+    assert tuple(full['columns']) == HEAD_COLUMNS and tuple(compact['columns']) == HEAD_COLUMNS
+    assert compact['seed_digest']['close'].shape == (2, DIM + 2 + 3)
+    assert CS.FORMAT_VERSION == 3
+    with pytest.raises(CrystalStoreError, match='built without the term columns'):
+        st.terms([0])
+
+
+def test_terms_round_trip_through_seed_add_and_state():
+    st = make_terms(max_rows=120, H=10)
+    st.check()
+    assert torch.equal(st.terms(torch.arange(12)), _terms_of(12))
+    slots = add_onpolicy_terms(st, [0, 1, 1])
+    assert torch.equal(st.terms(slots), _terms_of(3, 500.0))
+    kids = add_children(st, [0, 1], terms=_terms_of(2, 900.0))
+    assert torch.equal(st.terms(kids), _terms_of(2, 900.0))
+    for compact in (False, True):
+        state = st.state_dict(stamp={'k': 1}, compact=compact)
+        assert all(name in state['columns'] for name in CS.TERM_COLUMNS)
+        other = make_terms(max_rows=120, H=10, seed=9) if compact else CrystalStore(DIM, 2, 120, 10, with_terms=True)
+        other.apply_state(state)
+        other.check()
+        hw = st.high_water
+        assert torch.equal(other.terms(torch.arange(hw)), st.terms(torch.arange(hw)))
+    assert st.seed_digest()['close'].shape == (2, DIM + 2 + 4 + 3)
+
+
+def test_a_finite_row_with_a_non_finite_term_raises_and_a_dropped_row_drops_as_before():
+    bad = _terms_of(12)
+    bad[3, 1] = float('nan')
+    with pytest.raises(CrystalStoreError, match='1 of 12 rows .* non-finite term'):
+        make_terms(terms=bad)
+    st = make_terms()
+    before = (st.n_rows, st.generation, st.nonfinite_rows)
+    t = _terms_of(2, 500.0)
+    t[1, 2] = float('inf')
+    with pytest.raises(CrystalStoreError, match='1 of 2 rows'):
+        add_onpolicy(st, [0, 1], terms=t)
+    assert (st.n_rows, st.generation, st.nonfinite_rows) == before
+    # a row the finite mask drops (non-finite log R) is dropped and counted whatever its terms
+    n = 2
+    t[1, 2] = float('nan')
+    slots = st.add(torch.zeros(n, DIM), torch.tensor([0, 1]), ONPOLICY, ORIGIN_ROLLOUT,
+                   torch.tensor([-20.0, float('nan')]), torch.full((n,), 50.0), 1, log_q=torch.full((n,), -1.0),
+                   resid=torch.full((n,), 0.5), terms=t)
+    assert slots.numel() == 1 and st.nonfinite_rows == before[2] + 1
+    st.check()
+
+
+def test_terms_are_required_with_the_columns_and_refused_without():
+    st = make_terms()
+    with pytest.raises(CrystalStoreError, match='needs terms'):
+        add_onpolicy(st, [0])
+    with pytest.raises(CrystalStoreError, match='shape'):
+        add_onpolicy(st, [0, 1], terms=_terms_of(3))
+    plain = make()
+    with pytest.raises(CrystalStoreError, match='built without the term columns'):
+        add_onpolicy(plain, [0], terms=_terms_of(1))
+    cid, kind, parent = _layout(((2, 6), (1, 3)))
+    n = cid.numel()
+    fresh = CrystalStore(DIM, 2, 100, 5, with_terms=True)
+    with pytest.raises(CrystalStoreError, match='needs terms'):
+        fresh.seed(torch.zeros(n, DIM), cid, kind, torch.zeros(n), torch.zeros(n), parent,
+                   torch.zeros(n, dtype=torch.bool), _templates(2), torch.arange(2), torch.zeros(2, dtype=torch.float64))
+
+
+def test_a_state_whose_term_columns_differ_from_the_store_is_refused():
+    with_terms, plain = make_terms(), make()
+    stamp = {'k': 1}
+    why = CrystalStore(DIM, 2, 100, 5).state_mismatch(with_terms.state_dict(stamp=stamp), stamp)
+    assert why is not None and 'term columns' in why
+    why = CrystalStore(DIM, 2, 100, 5, with_terms=True).state_mismatch(plain.state_dict(stamp=stamp), stamp)
+    assert why is not None and 'term columns' in why
+    with pytest.raises(CrystalStoreError, match='term columns'):
+        CrystalStore(DIM, 2, 100, 5).apply_state(with_terms.state_dict())
+
+
+def test_the_compact_digest_moves_when_a_seed_term_moves():
+    st = make_terms()
+    state = st.state_dict(compact=True)
+    moved = _terms_of(12)
+    moved[0, 0] += 50 * CS.SEED_CLOSE_ATOL * 12      # one row of condition 0, far past the tolerance on its mean
+    other = make_terms(terms=moved)
+    why = other.state_mismatch(state, None)
+    assert why is not None and 'seed digest' in why
+    same = make_terms(terms=_terms_of(12) + 1e-6)
+    assert same.state_mismatch(state, None) is None
+
+
+def test_check_detects_a_non_finite_term_on_a_live_row():
+    st = make_terms()
+    st.pv[2] = float('nan')
+    with pytest.raises(CrystalStoreError, match='I13'):
+        st.check()

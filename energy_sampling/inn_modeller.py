@@ -806,6 +806,9 @@ class InnModeller(Modeller):
         """Refusals for --stored_source buffer and buffers.anchor_buffer.tile, before any data is read. Sets pbuf_on.
         On this route both stages read the buffer: stage 1 fits its rows, stage 2 trains on them as stored rows."""
         inn, args = self.inn, self.args
+        if noised_prior.settings(args)['train_molecules'] is not None:
+            raise ValueError("noised_prior.train_molecules is read by Modeller.subset_training_molecules, which this "
+                             "route replaces: subset the molecules with --molecule_fraction")
         if Modeller.store_settings(self) is not None:
             raise ValueError("buffers.store is read by Modeller.init_row_store, which this route never calls: the key "
                              "would have no effect")

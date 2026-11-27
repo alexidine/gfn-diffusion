@@ -150,3 +150,72 @@ def test_a_sidecar_that_cannot_be_written_leaves_the_run_running(tmp_path, monke
     out = m._stored_reward_terms(b, prior_path=path)
     assert torch.equal(out[0], torch.arange(120, dtype=torch.float32).double())
     assert not list(tmp_path.glob('*.rewards-*.pt'))
+
+
+class TermEnergy(Energy):
+    """Energy with the store's T-free terms (MolecularCrystal.store_terms_from): four columns of the row's value."""
+
+    @staticmethod
+    def store_terms_from(ens):
+        v = ens['mol_energy'].float().flatten() / 2
+        return torch.stack([v, v + 1, v + 2, v + 3], 1)
+
+
+def test_store_terms_round_trip_through_the_cache_under_their_own_key(tmp_path):
+    m, b, path = modeller(tmp_path, n=300)
+    m.energy_function = TermEnergy()
+    plain = m._stored_reward_terms(b, with_mol_energy=True, prior_path=path)
+    assert len(plain) == 3
+    m.energy_function.rows_scored = 0
+    first = m._stored_reward_terms(b, with_mol_energy=True, prior_path=path, with_store_terms=True)
+    assert m.energy_function.rows_scored == 300                   # its key is not the plain call's: scored in full
+    assert len(first) == 4 and first[3].shape == (300, 4) and first[3].dtype == torch.float32
+    assert torch.equal(first[3][:, 0], torch.arange(300, dtype=torch.float32))
+    assert all(torch.equal(x, y) for x, y in zip(plain, first[:3]))
+    m.energy_function.rows_scored = 0
+    second = m._stored_reward_terms(b, with_mol_energy=True, prior_path=path, with_store_terms=True)
+    assert all(torch.equal(x, y) for x, y in zip(first, second))
+    assert 0 < m.energy_function.rows_scored <= Modeller.REWARD_CACHE_CHECK_ROWS + 32   # read from the cache
+    assert len(list(tmp_path.glob('*.rewards-*.pt'))) == 2
+
+
+class Coded(TermEnergy):
+    """A reward path with every method the code digest may hash."""
+
+    def _tempered_density(self, density_energy, temperature):
+        return density_energy
+
+    @staticmethod
+    def store_terms_from(ens):
+        return 1
+
+    def log_r_from_terms(self, energy, terms, log_T):
+        return 1
+
+
+class TermsEdited(Coded):
+    @staticmethod
+    def store_terms_from(ens):
+        return 2
+
+    def log_r_from_terms(self, energy, terms, log_T):
+        return 2
+
+
+class DensityEdited(Coded):
+    def _tempered_density(self, density_energy, temperature):
+        return density_energy * 1
+
+
+def test_the_code_digest_hashes_the_term_code_only_when_the_cache_holds_terms():
+    """A cache without term columns misses on an edit to the code computing its values (with _tempered_density, which
+    generator_energy calls on every run), not on an edit to the term code; one with them misses on both."""
+    def digest(ef, terms):
+        m = Modeller.__new__(Modeller)
+        m.energy_function = ef
+        return m._reward_code_digest(with_store_terms=terms)
+    assert digest(Coded(), False) == digest(TermsEdited(), False)
+    assert digest(Coded(), True) != digest(TermsEdited(), True)
+    assert digest(Coded(), False) != digest(Coded(), True)
+    assert digest(Coded(), False) != digest(DensityEdited(), False)
+    assert digest(Coded(), True) != digest(DensityEdited(), True)

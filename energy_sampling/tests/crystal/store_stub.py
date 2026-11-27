@@ -74,8 +74,10 @@ class Energy:
         return ens['mol_energy'] + ens['density_energy'] + ens['pressure_energy']
 
 
-def build(spec=((2, 4), (1, 3), (1, 2), (1, 2)), max_rows=2000, H=64, batch=8, store_seed=0, dim=DIM):
-    """A Modeller around a seeded store. spec: (anchors, children) per condition id."""
+def build(spec=((2, 4), (1, 3), (1, 2), (1, 2)), max_rows=2000, H=64, batch=8, store_seed=0, dim=DIM, ef=None):
+    """A Modeller around a seeded store. spec: (anchors, children) per condition id. ef: the energy function stub
+    (default Energy()); one with `with_terms` builds the store with the term columns, seeded from its
+    seed_terms(x, cid)."""
     cid, kind, parent = [], [], []
     for c, (na, nk) in enumerate(spec):
         first = len(cid)
@@ -87,15 +89,20 @@ def build(spec=((2, 4), (1, 3), (1, 2), (1, 2)), max_rows=2000, H=64, batch=8, s
     x = torch.linspace(-0.9, 0.9, n * dim).reshape(n, dim)
     energy = (x ** 2).sum(-1) + cid
     log_r = -(x ** 2).sum(-1) - cid / 10
+    ef = Energy() if ef is None else ef
+    terms = getattr(ef, 'with_terms', False)
+    if terms:
+        energy, log_r = ef.seed_rows(x, cid)
     t = templates()
-    st = CS.CrystalStore(dim, t.num_graphs, max_rows, H, seed=store_seed)
+    st = CS.CrystalStore(dim, t.num_graphs, max_rows, H, seed=store_seed, with_terms=terms)
     st.seed(x, cid, kind, log_r, energy, parent, torch.zeros(n, dtype=torch.bool), t, torch.arange(t.num_graphs),
-            torch.full((t.num_graphs,), 100.0, dtype=torch.float64))
+            torch.full((t.num_graphs,), 100.0, dtype=torch.float64),
+            **({'terms': ef.seed_terms(x, cid)} if terms else {}))
     m = Modeller.__new__(Modeller)
     m.row_store = st
     m._store_seed_best = st.best_energy.clone()
     m._store_draw_tally = None
-    m.energy_function = Energy()
+    m.energy_function = ef
     m.device = torch.device('cpu')
     m.batch_size = batch
     m.step_ind = 5

@@ -127,8 +127,10 @@ def test_temperature_conditioning_passes_on_an_mle_only_protocol(monkeypatch):
     assert not [m for m in _problems(monkeypatch, [MLE]) if 'temperature' in m or 'kick_kappa' in m]
 
 
-def test_temperature_conditioning_is_refused_with_a_stage_that_reads_rewards(monkeypatch):
-    assert any('reads rewards' in m for m in _problems(monkeypatch, [MLE, TB]))
+def test_single_temperature_tb_with_temperature_conditioning_passes(monkeypatch):
+    """A reward-reading stage without `temperatures` draws every row at the run's temperature, the store's currency
+    (the blanket refusal of a reward stage under temperature_conditioning is gone)."""
+    assert not [m for m in _problems(monkeypatch, [MLE, TB]) if 'temperature' in m or 'kick_kappa' in m]
 
 
 def test_temperature_conditioning_needs_the_kick_stiffness_and_a_range(monkeypatch):

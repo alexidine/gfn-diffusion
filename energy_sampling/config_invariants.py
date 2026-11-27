@@ -1533,14 +1533,36 @@ def row_store_settings(node) -> Optional[dict]:
     return {**ROW_STORE_DEFAULTS, **st}
 
 
-def store_row_limit(ram_gb, data_ndim, ram_frac=0.5) -> int:
+def store_row_limit(ram_gb, data_ndim, ram_frac=0.5, with_terms=False) -> int:
     """The most rows a crystal_store.CrystalStore may hold in `ram_frac` of `ram_gb` GiB, capped at its int32 slot limit.
 
-    Bytes per slot at the peak, a sidecar write: the columns (4 data_ndim + 43) and their clone in
-    CrystalStore.state_dict, 16 of index (PoolIndex.where 4, PoolIndex.arena 8, the free stack 4), and 4 for the
-    state_dict copy of the index order."""
-    bytes_per_row = 2 * (4 * data_ndim + 43) + 16 + 4
+    Bytes per slot at the peak, a sidecar write: the columns (4 data_ndim + 43, plus 16 for the four float32 term
+    columns of a store built with_terms) and their clone in CrystalStore.state_dict, 16 of index (PoolIndex.where 4,
+    PoolIndex.arena 8, the free stack 4), and 4 for the state_dict copy of the index order."""
+    bytes_per_row = 2 * (4 * data_ndim + 43 + (16 if with_terms else 0)) + 16 + 4
     return min(int(ram_frac * ram_gb * 2 ** 30 / bytes_per_row), 2 ** 31 - 1)
+
+
+def stage_temperatures(st) -> Optional[list]:
+    """A raw stage dict's `temperatures` list (protocol.Stage.temperatures), or None when absent or null."""
+    v = st.get('temperatures') if isinstance(st, dict) else None
+    return None if v is None else (list(v) if isinstance(v, (list, tuple)) else v)
+
+
+def store_terms_on(cfg) -> bool:
+    """Whether the row store holds its term columns (crystal_store.TERM_COLUMNS): buffers.store enabled and an active
+    stage setting `temperatures`. `cfg` is a raw config dict or the trainer's Namespace."""
+    try:
+        if row_store_settings(cfg) is None:
+            return False
+    except ValueError:
+        return False
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            st = vars(st) if hasattr(st, '__dict__') else None
+        if st is not None and stage_temperatures(st) is not None:
+            return True
+    return False
 
 
 @functools.lru_cache(maxsize=None)
@@ -1595,11 +1617,6 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
     tcond = _get(cfg, 'temperature_conditioning', False) is True
     kappa = _get(cfg, 'noised_prior.kick_kappa_per_atom')
     if tcond:
-        reward_stages = [st.get('name', '?') for st in active_stages(cfg) if isinstance(st, dict)
-                         and _stage_reads_reward(cfg, st)]
-        if reward_stages:
-            err(f"buffers.store stores log R at one temperature: temperature_conditioning is refused with a stage that "
-                f"reads rewards ({reward_stages}); an MLE-only protocol may take it")
         if kappa is None:
             err('buffers.store with temperature_conditioning needs noised_prior.kick_kappa_per_atom: it labels each MLE '
                 'kick with its effective temperature (train.py::Modeller._kick_temperature)')
@@ -1714,7 +1731,126 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
             err(f"stage {name!r}: z_calibration.mode replay draws from replay_buffer, which the store never fills "
                 f"(Modeller._z_replay_step returns without a step)")
 
+    out.extend((ERROR, m) for m in stage_temperatures_problems(cfg, s))
     return out
+
+
+#: the gates the condition log-Z tracker's two level streams publish (train.py: protocol.publish_gate after
+#: ConditionLogZTracker.delta_stats); in a stage setting `temperatures` only rows at energy_config.temperature feed them
+TRACKER_LEVEL_GATES = ('gates/delta_worst', 'gates/delta_mean')
+#: |log10 T - log10 T_run| at or under which a listed temperature is the run's (train.py Modeller.RUN_TEMPERATURE_ATOL)
+RUN_TEMPERATURE_ATOL = 1e-6
+
+
+def stage_temperatures_problems(cfg: dict, s: dict) -> list[str]:
+    """The store-route refusals of the stages that set `temperatures` (multi-temperature TB), given the merged
+    buffers.store settings `s`. [] when no active stage sets it. flags.weighted_condition_sampling is not refused: the
+    tracker fit error it reads is fed at energy_config.temperature only, but it moves only which conditions a rollout
+    draws, not the TB target of any row."""
+    stages = [st for st in active_stages(cfg) if isinstance(st, dict) and stage_temperatures(st) is not None]
+    if not stages:
+        return []
+    out = []
+    run_T = _get(cfg, 'energy_config.temperature')
+    run_T_ok = _real(run_T) and run_T > 0
+    names = [st.get('name', '?') for st in stages]
+    if s['replay_weight'] == 'duty':
+        out.append(f"buffers.store.replay_weight 'duty' with stage(s) {names} setting temperatures: duty compares log q "
+                   f"with its value at birth, and those stages write log q at a fresh temperature on every draw; use "
+                   f"'visits' or 'uniform'")
+    if _get(cfg, 'harvest.enabled', False) is True:
+        out.append(f"harvest.enabled with stage(s) {names} setting temperatures: the harvest reads every row at "
+                   f"energy_config.temperature (train.py::Modeller.harvest_scored_rows, noised_prior.harvest_mask)")
+    rng = _get(cfg, 'energy_config.log_temperature_range')
+    rng_ok = isinstance(rng, (list, tuple)) and len(rng) == 2 and all(_real(v) for v in rng) and rng[0] < rng[1]
+    for st in stages:
+        name = st.get('name', '?')
+        temps = stage_temperatures(st)
+        if rng_ok and isinstance(temps, list):
+            for T in temps:
+                if _real(T) and T > 0:
+                    lt = math.log10(T)
+                    if not (rng[0] <= lt <= rng[1]):
+                        out.append(f"stage '{name}': temperature {T:g} kT (log10 {lt:.3f}) is outside "
+                                   f"energy_config.log_temperature_range {list(rng)}, the span the condition scaler "
+                                   f"was fitted over")
+        for mode in ('fwd', 'bwd', 'replay'):
+            src = _coeff_raw(cfg, st, mode, 'tb_z_source')
+            if (_coeff(cfg, st, mode, 'tb') or 0) > 0 and src in ('persistent', 'batch_root'):
+                out.append(f"stage '{name}': {mode} tb with tb_z_source {src!r} in a stage setting temperatures: the "
+                           f"tracker target and the batch root pool a condition's temperatures; use 'learned'")
+            if (_coeff(cfg, st, mode, 'emp_z_persistent') or 0) > 0:
+                out.append(f"stage '{name}': {mode} emp_z_persistent > 0 in a stage setting temperatures: its target "
+                           f"is the tracker's per-condition level, which pools a condition's temperatures")
+        for mode in ('bwd', 'replay'):        # the two branches get_gfn_backward_loss computes level_gap on
+            if (_coeff(cfg, st, mode, 'level_gap') or 0) > 0:
+                out.append(f"stage '{name}': {mode} level_gap > 0 in a stage setting temperatures: its coefficient "
+                           f"is the tracker's J_B(c) - J_F(c), fed by rows at energy_config.temperature only and "
+                           f"applied to rows of every listed temperature")
+        if run_T_ok and isinstance(temps, list) and not any(
+                _real(T) and T > 0 and abs(math.log10(T) - math.log10(run_T)) <= RUN_TEMPERATURE_ATOL for T in temps):
+            gated = [('exit', t) for t in (st.get('exit') or [])] + \
+                    [('balance rule', r) for r in ((st.get('balance') or {}).get('rules') or [])]
+            for kind, term in gated:
+                metric = term.get('metric') if isinstance(term, dict) else None
+                if metric in TRACKER_LEVEL_GATES:
+                    out.append(f"stage '{name}': {kind} on {metric} in a stage whose temperatures {temps} leave out "
+                               f"energy_config.temperature {run_T:g}: the condition log-Z tracker's level streams are "
+                               f"fed only by rows at that temperature, so the gate stays at its last value (+inf on a "
+                               f"fresh tracker) and never changes in this stage")
+        reps = _coeff(cfg, st, 'fwd', 'repeats')
+        if (_coeff(cfg, st, 'fwd', 'emp_z') or 0) > 0 and (reps is None or reps < 2):
+            out.append(f"stage '{name}': fwd emp_z > 0 with fwd repeats {reps!r} in a stage setting temperatures: "
+                       f"emp_z groups rows by (condition, temperature) and needs >= 2 rows per group")
+        if (st.get('flags') or {}).get('z_calibration') is True:
+            out.append(f"stage '{name}': flags.z_calibration in a stage setting temperatures: it servos one level "
+                       f"from a gap pooled over temperatures")
+    return out
+
+
+def stage_temperatures_are_read(cfg: dict) -> list[Violation]:
+    """A stage's `temperatures` is read only on the store route under temperature_conditioning, and only by a stage that
+    reads rewards (config_invariants._stage_reads_reward); anywhere else it is a dead key. Every route."""
+    out = []
+    try:
+        store_on = row_store_settings(cfg) is not None
+    except ValueError:
+        store_on = True      # row_store_is_well_formed reports the block itself
+    tcond = _get(cfg, 'temperature_conditioning', False) is True
+    for st in active_stages(cfg):
+        if not isinstance(st, dict) or stage_temperatures(st) is None:
+            continue
+        name = st.get('name', '?')
+        if not (tcond and store_on):
+            out.append(Violation(ERROR, 'stage_temperatures_are_read',
+                                 f"stage '{name}': temperatures needs temperature_conditioning true and buffers.store "
+                                 f"enabled (a dead key otherwise)"))
+        elif not _stage_reads_reward(cfg, st):
+            out.append(Violation(ERROR, 'stage_temperatures_are_read',
+                                 f"stage '{name}': temperatures on a stage that reads no reward (the MLE draw labels "
+                                 f"each kick with its own temperature)"))
+    return out
+
+
+def train_molecules_is_well_formed(cfg: dict) -> list[Violation]:
+    """noised_prior.train_molecules is null or an integer >= 1 (noised_prior.settings raises on any other value), and a
+    set value needs buffers.store enabled: train.py::Modeller.subset_training_molecules raises without it, since only
+    the store route cuts the prior's rows to the chosen molecules. Absence is judged: an unset key is null."""
+    v = _get(cfg, 'noised_prior.train_molecules', None)
+    if v is None:
+        return []
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return [Violation(ERROR, 'train_molecules_is_well_formed',
+                          f"noised_prior.train_molecules {v!r} is not an integer >= 1 or null")]
+    try:
+        store_on = row_store_settings(cfg) is not None
+    except ValueError:
+        store_on = True      # row_store_is_well_formed reports the block itself
+    if not store_on:
+        return [Violation(ERROR, 'train_molecules_is_well_formed',
+                          f"noised_prior.train_molecules {v} needs buffers.store enabled (the prior's rows are cut to "
+                          f"the chosen molecules on the store route only)")]
+    return []
 
 
 def row_store_is_well_formed(cfg: dict) -> list[Violation]:
@@ -3102,6 +3238,10 @@ RULES = (
     nf_aux_terms_are_well_formed,
     # returns [] when buffers.store is absent or off
     row_store_is_well_formed,
+    # every route; returns [] when noised_prior.train_molecules is null or absent
+    train_molecules_is_well_formed,
+    # every route; returns [] when no active stage sets temperatures
+    stage_temperatures_are_read,
     # every route but the conformer one; returns [] on energy_function conformer_torsions
     crystal_prior_model_is_retired,
     # the conformer route; each returns [] off energy_function conformer_torsions

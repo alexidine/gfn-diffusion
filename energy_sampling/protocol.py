@@ -366,7 +366,7 @@ class Stage:
                                'mle_gate', 'hot_lr_sensor', 'fwd_rollout_every',
                                'fwd_rollout_triggers', 'z_pin_rollout_every',
                                'fwd_z_sidecar', 'replay_warmup_rows',
-                               'condition_draw',
+                               'condition_draw', 'temperatures',
                                # accepted here ONLY so Stage.__init__'s own check
                                # reports the rename; the generic unknown-key error
                                # would otherwise fire first and say nothing useful
@@ -564,8 +564,22 @@ class Stage:
         # after balance/fracs/loss_coeffs: every check below reads them
         self._parse_replay_seat(spec)
         self._parse_condition_draw(spec)
+        self.temperatures = self._parse_temperatures(spec.get('temperatures'))
 
     # ------------------------------------------------------------ sub-parsers
+
+    def _parse_temperatures(self, node):
+        """`temperatures`: the kT values (energy units, as energy_config.temperature) a store-route TB stage draws its
+        rows at, stratified, a repeated entry counting as a weight; a tuple of floats, or None (absent or null) for
+        every row at energy_config.temperature. Where it is read: config_invariants.stage_temperatures_are_read."""
+        if node is None:
+            return None
+        ok = isinstance(node, (list, tuple)) and len(node) > 0 and all(
+            not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in node)
+        if not ok:
+            raise ValueError(f"stage '{self.name}': temperatures must be a non-empty list of finite kT values > 0 "
+                             f"(energy units, as energy_config.temperature), got {node!r}")
+        return tuple(float(v) for v in node)
 
     def _parse_lr_schedule(self, node):
         """A list of {to, steps, kind} segments, normalized; None when absent."""

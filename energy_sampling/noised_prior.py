@@ -43,7 +43,11 @@ CHECK_ROWS = 512
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
                 live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row', live_log_range=None,
-                kick_kappa_per_atom=None)
+                kick_kappa_per_atom=None, train_molecules=None)
+#: train_molecules: on the store route, the number of molecules_path molecules the run trains on, the N with the lowest
+#: (molecule_u, identifier) (data_processing/molecule_subset.py::lowest_molecules; train.py::
+#: Modeller.subset_training_molecules), with every prior row of them in both splits (molecule_rows, cut_masks). null =
+#: every molecule. None-valued, so it is absent from a store stamp (crystal_store.stamp_diff) until it is set
 #: window_by: the energy a child's energy window reads (window_energy): 'row' its own (a basin-kernel build always
 #: reads its basin's anchor), 'parent' its parent anchor's (noised_parent), so a minimum passes or fails the window
 #: with every kick of it, long kicks included
@@ -161,6 +165,9 @@ def settings(args):
     v = s['kick_kappa_per_atom']
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0):
         raise ValueError(f"noised_prior.kick_kappa_per_atom must be a finite number > 0 or null, got {v!r}")
+    v = s['train_molecules']
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+        raise ValueError(f"noised_prior.train_molecules must be an integer >= 1 or null, got {v!r}")
     f = s['live_fresh_frac']
     if isinstance(f, bool) or not isinstance(f, (int, float)) or not 0 <= f <= 1:
         raise ValueError(f"noised_prior.live_fresh_frac must be a number in [0, 1], got {f!r}")
@@ -700,6 +707,19 @@ def select_rows(seed_energy, packing, kinds, splits, groups, T, s, window_e=None
                 anchors=(splits == SPLIT_TRAIN) & (kinds == KIND_ANCHOR) & good), floor
 
 
+def molecule_rows(batch, identifiers) -> torch.Tensor:
+    """[n] bool over the rows of `batch`: the rows whose identifier is in `identifiers` (a set of strings)."""
+    kept = identifiers if isinstance(identifiers, (set, frozenset)) else set(identifiers)
+    ids = batch.identifier
+    return torch.from_numpy(np.fromiter((m in kept for m in ids), dtype=bool, count=len(ids)))
+
+
+def cut_masks(masks, rows):
+    """select_rows' masks with every one but floor_ok ANDed with `rows` ([n] bool): each condition's floor stays where
+    the whole file puts it."""
+    return {k: (v if k == 'floor_ok' else v & rows) for k, v in masks.items()}
+
+
 def refuse_stale_atom_pointers(b, path):
     """Raise unless every atom-level value's batch bookkeeping (_slice_dict entry) equals ptr. A K 0 build written
     before build_noised_prior.score kept its own bookkeeping (2026-11-11) carries another batch's atom pointers, and
@@ -717,9 +737,11 @@ def refuse_stale_atom_pointers(b, path):
 def strip_analysis_helpers(b):
     """Drop what the analysis leaves on a batch that is not row data: the lazy space-group tables, and its
     dict-valued attributes (`computes` holds bound methods, which pickle the whole batch object they belong to, on
-    whatever device it was scored: a file saved with them is larger and does not load on a CPU-only host)."""
-    from energies.molecular_crystal import SG_LOOKUP_TABLES
-    for attr in SG_LOOKUP_TABLES:
+    whatever device it was scored: a file saved with them is larger and does not load on a CPU-only host), and
+    ANALYSIS_ONLY_KEYS (MolecularCrystal.store_terms_from reads them off a freshly scored batch only; a file holding
+    them would not merge with one built before they existed, since merge_batches requires the same keys)."""
+    from energies.molecular_crystal import SG_LOOKUP_TABLES, ANALYSIS_ONLY_KEYS
+    for attr in SG_LOOKUP_TABLES + ANALYSIS_ONLY_KEYS:
         if hasattr(b, attr):
             delattr(b, attr)
     for key in [k for k in b.keys() if isinstance(b[k], dict)]:

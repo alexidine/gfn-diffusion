@@ -39,6 +39,7 @@ noised_prior:                # read only when prior_path is a pre-noised build (
   live_fresh_frac: 0.0       # live_kernel 'basin': share of each batch drawn fresh and written into the bank (0 = the bank is a fixed set)
   live_shape: hessian        # live_kernel 'basin': the draw's covariance, 'hessian' (live_tau x the thermal ellipsoid, modes capped by live_caps) or 'iso' (one width per row in live_caps-scaled coordinates, same expected excess); refused with any other live_kernel
   kick_kappa_per_atom: null  # temperature_conditioning on the store route: kick stiffness per atom (energy per molecule per A^2); each live physical kick is labelled T_eff = kick_kappa_per_atom x atoms x rho^2 / d (d = the group's live coordinates). null = no labels
+  train_molecules: null      # buffers.store only: train on the N molecules_path molecules with the lowest (molecule_u, identifier) and every prior row of them, both splits; the energy clip is armed over every molecule's rows; test_molecules_path is unchanged. null = every molecule
 harvest:                     # scored rollout rows kept for the next prior build (train.py::Modeller.harvest_scored_rows)
   enabled: false
   min_abs_resid: 1.0         # nats: rows whose |TB residual| is at least this are kept, and rows at or below their condition's best known energy
@@ -811,6 +812,21 @@ protocols:
                                              # false, an effective bwd AND replay
                                              # condition_block_m 0, prioritise.enabled false and
                                              # one space group x Z'. Logged as cond_draw/*
+        # temperatures: null                 # [kT, ...], energy units as energy_config.temperature.
+                                             # buffers.store with temperature_conditioning only:
+                                             # each TB row draws one, stratified over the list (a
+                                             # repeated entry is a weight; fwd: one per molecule,
+                                             # shared by its repeats); bwd and replay rebuild log R
+                                             # there from the store's term columns, no energy call.
+                                             # Stored log R, the tracker feed and the evals stay at
+                                             # energy_config.temperature. Refused with replay_weight
+                                             # duty, harvest, flags.z_calibration, a persistent or
+                                             # batch_root tb_z_source, emp_z_persistent, bwd or
+                                             # replay level_gap, fwd emp_z with repeats < 2, a
+                                             # value outside log_temperature_range, and, on a list
+                                             # without energy_config.temperature, an exit or
+                                             # balance rule on gates/delta_worst or delta_mean.
+                                             # null = every row at energy_config.temperature
         fwd_rollout_triggers:                # off-cadence bars: fire a rollout EARLY when the
                                              # state says one is needed, each reported under
                                              # its own name. 0 = that bar off. The whole block

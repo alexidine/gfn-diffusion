@@ -60,6 +60,7 @@ min_lr: 1.0e-08
 max_lr: null
 weight_decay: 0.1
 use_weight_decay: true
+weight_decay_kind: decoupled
 progress_gate:
   mode: level
   level_window: 2500
@@ -525,4 +526,3 @@ energy_config:
 zsg_panel:
   enabled: true
   molecules: 64
-weight_decay_kind: decoupled
