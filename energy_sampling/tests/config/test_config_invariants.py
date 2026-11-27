@@ -1505,6 +1505,11 @@ def test_malformed_or_unconsumable_nf_aux_terms_are_an_error(canonical):
     assert _fires(cfg, rule)                                              # a fractional row count
     st['loss_coeffs']['bwd'].update(pathwise_rows=32, pathwise_entropy=-1.0)
     assert _fires(cfg, rule)                                              # malformed
+    st['loss_coeffs']['bwd'].update(pathwise_rows=0, pathwise_row_cap=0.0, pathwise_entropy=1.0,
+                                    pathwise_base_cap=3.0)
+    assert not _fires(cfg, rule)                                          # whole batch, base cap
+    st['loss_coeffs']['bwd']['pathwise_base_cap'] = -1.0
+    assert _fires(cfg, rule)                                              # malformed base cap
     del st['loss_coeffs']['bwd']
     cfg['policy']['kind'] = 'sde'
     assert _fires(cfg, rule)                                              # SDE policy

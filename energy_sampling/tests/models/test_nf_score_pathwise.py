@@ -8,7 +8,8 @@ backward at its dose by train.py::Modeller._apply_pathwise_grads). So:
     condition's encoder;
   * the term's gradient is the sticking-the-landing estimator (on- and off-policy, entropy 1 and 0); a row with no
     reward is dropped; the x clip, the row subsample and the per-row parameter cap act as stated; descending the term
-    alone lowers fresh draws' energy on a toy target, on- and off-policy;
+    alone lowers fresh draws' energy on a toy target, on- and off-policy; the base cap bounds each row's force carried into
+    base space at a multiple of the median;
   * the backward loss stashes the off-policy term only on trained calls, at the row's own temperature; zero dose is the
     loss without the keys (no reward call, same RNG); the forward loss no longer makes a pathwise term;
   * the dose: a norm fraction is realised against this backward's own main gradient (mid-accumulation too), a
@@ -339,12 +340,59 @@ def test_a_row_with_no_reward_is_dropped_the_clip_caps_dl_dx_and_rows_subsample(
     seen = {}
     real = pol.pathwise_draw
 
-    def spy(cc, mb, xx=None):
+    def spy(cc, mb, xx=None, **kw):
         seen['n'] = cc.shape[0]
-        return real(cc, mb, xx)
+        return real(cc, mb, xx, **kw)
     pol.pathwise_draw = spy
     sub = pathwise_term(_pw(pathwise_rows=4), pol, _reward, c, None, torch.zeros(N), x=x)
     assert seen['n'] == 4 and sub['stats']['rows'] == 4
+
+
+def test_the_base_cap_bounds_each_rows_base_space_force_at_a_multiple_of_the_median(monkeypatch):
+    """pathwise_base_cap r: the term's gradient is the plain term's with each row's force f_i scaled by
+    s_i = min(1, r x median_j |v_j| / |v_i|), v_i = J_i^-T f_i on the live rows (J_i = dz/dx of to_base): the cap acts on
+    the force carried into base space, inside the one backward. base_top_share / base_capped_frac report it;
+    force_top_share is the largest row's share of |f|^2; a cap no row reaches is the term without it."""
+    import gflownet_losses as gl
+    seen = []
+    real = gl.pathwise_param_grads
+
+    def spy(x_live, g, ok, params, row_cap=0.0):
+        seen.append(g.detach().clone())
+        return real(x_live, g, ok, params, row_cap)
+    monkeypatch.setattr(gl, 'pathwise_param_grads', spy)
+    pol, c, x = _setup(torch.float64)
+    x = x.double()
+    params = _policy_params(pol)
+    plain = gl.pathwise_term(_pw(), pol, _reward, c, None, torch.zeros(N), x=x)
+    capped = gl.pathwise_term(_pw(pathwise_base_cap=1.0), pol, _reward, c, None, torch.zeros(N), x=x)
+    loose = gl.pathwise_term(_pw(pathwise_base_cap=1e9), pol, _reward, c, None, torch.zeros(N), x=x)
+    f = seen[0]
+    li = pol.sampler.live_idx
+    with pol.clean_condition():
+        ctx = pol._context(c, None, N)
+        xs = pol._pin_dead(pol._wrap_ang(x))
+        J = torch.stack([torch.autograd.functional.jacobian(
+            lambda r: pol.sampler.to_base(r.unsqueeze(0), ctx[i:i + 1] if torch.is_tensor(ctx) else
+                                          tuple(t[i:i + 1] for t in ctx))[0][0], xs[i])[:, li] for i in range(N)])
+    v = torch.linalg.solve(J.transpose(1, 2).double(), f[:, li].double().unsqueeze(-1)).squeeze(-1).norm(dim=-1)
+    s = torch.clamp(v.median() / v, max=1.0)
+    assert 0 < float((s < 1).double().mean()) < 1
+    with pol.clean_condition():
+        x2, _, _ = pol.pathwise_draw(c, None, x)
+    want, _ = real(x2, f * s.unsqueeze(-1).to(f.dtype), torch.ones(N, dtype=torch.bool), params)
+    for g, w in zip(capped['grads'], want):
+        if g is not None:
+            assert torch.allclose(g, w, atol=1e-5, rtol=1e-4), float((g - w).abs().max() / w.abs().max())   # x enters as float32
+    st = capped['stats']
+    assert st['base_capped_frac'] == pytest.approx(float((s < 1).double().mean()))
+    assert st['base_top_share'] == pytest.approx(float((v ** 2).max() / (v ** 2).sum()), rel=1e-6)
+    assert 'base_capped_frac' not in plain['stats']
+    nf = f.norm(dim=-1)
+    assert plain['stats']['force_top_share'] == pytest.approx(float((nf ** 2).max() / (nf ** 2).sum()), rel=1e-6)
+    for a_, b_ in zip(loose['grads'], plain['grads']):
+        if a_ is not None:
+            assert torch.allclose(a_, b_)
 
 
 def test_the_row_cap_bounds_each_rows_parameter_gradient():

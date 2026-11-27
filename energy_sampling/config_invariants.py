@@ -1421,7 +1421,7 @@ def nf_orient_split_is_well_formed(cfg: dict) -> list[Violation]:
 # train.py::Modeller.fused_train_step, pathwise by ::Modeller._apply_pathwise_grads after the fused backward.
 # ---------------------------------------------------------------------------
 PATHWISE_KEYS = ('pathwise', 'pathwise_norm_frac', 'pathwise_entropy', 'pathwise_grad_clip', 'pathwise_rows',
-                 'pathwise_row_cap')
+                 'pathwise_row_cap', 'pathwise_base_cap')
 AUX_TERM_KEYS = {'fwd': ('score', 'score_beta', 'score_rows') + PATHWISE_KEYS,
                  'bwd': ('score', 'score_beta', 'score_rows', 'score_force') + PATHWISE_KEYS,
                  'replay': ('score', 'score_beta', 'score_rows', 'score_force') + PATHWISE_KEYS}
@@ -1463,7 +1463,7 @@ def nf_aux_terms_are_well_formed(cfg: dict) -> list[Violation]:
                 elif v > 0:
                     on.append(f'{mode}.{k}')
             for k in ('score_beta', 'score_rows', 'pathwise_grad_clip', 'pathwise_entropy', 'pathwise_rows',
-                      'pathwise_row_cap'):
+                      'pathwise_row_cap', 'pathwise_base_cap'):
                 v = _coeff_raw(cfg, st, mode, k) if k in keys else None
                 if v is not None and bad_number(v):
                     out.append(Violation(ERROR, rule, f"stage '{name}': {mode}_loss_coeffs.{k} = {v!r}: a finite "

@@ -421,7 +421,7 @@ def branch_score_term(loss_coeffs, gfn, x, condition, mol_batch, g_r):
 #: |d(row loss)/dx| (0 = off); pathwise_rows: rows per step (0 = every row of the branch's batch; fwd: batch_size);
 #: pathwise_row_cap: cap on each row's parameter-gradient norm, in multiples of the rows' median (0 = off).
 PATHWISE_DEFAULTS = dict(pathwise=0.0, pathwise_norm_frac=0.0, pathwise_entropy=1.0, pathwise_grad_clip=0.0,
-                         pathwise_rows=0, pathwise_row_cap=0.0)
+                         pathwise_rows=0, pathwise_row_cap=0.0, pathwise_base_cap=0.0)
 
 
 def pathwise_settings(loss_coeffs):
@@ -503,10 +503,14 @@ def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tens
     log R and its force come from one grad-enabled reward call at a detached copy of x (live_reward_force) at
     log_T_tensor [n] (log10 T per row). A row whose reward, density or force is not finite is dropped. settings
     (pathwise_settings): pathwise_rows draws that many rows uniformly without replacement (0: all); pathwise_grad_clip
-    caps each row's |dl/dx|; pathwise_row_cap bounds each row's parameter gradient (pathwise_param_grads). Returns
+    caps each row's |dl/dx|; pathwise_base_cap caps each row's force carried into base space, |J^-T dl/dx|, at that
+    multiple of the rows' median inside the one backward (NFPolicy.pathwise_draw); pathwise_row_cap bounds each row's
+    parameter gradient (pathwise_param_grads, one backward per row). Returns
     {'params' (policy_parameters), 'grads' (at unit weight; None when no row survived), 'settings', 'stats'}, stats
     (floats): loss (mean l), log_r, log_q, bad_frac, force_norm (mean |dl/dx| before the clip), x_clipped_frac, rows,
-    grad_norm (|grads|) and the row_* stats under a row cap."""
+    grad_norm (|grads|), force_top_share (the largest ok row's share of the summed |dl/dx|^2 before the clip), under a
+    base cap base_top_share (the same share of the base-space force) and base_capped_frac, and the row_* stats under a
+    row cap."""
     n = int(condition.shape[0])
     k = int(settings['pathwise_rows'])
     if 0 < k < n:
@@ -517,7 +521,10 @@ def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tens
         if mol_batch is not None:
             mol_batch = mol_batch.subsample_new_batch(idx.to(mol_batch.pos.device) if hasattr(mol_batch, 'pos')
                                                       else idx)
-    x_live, log_q, g_q = gfn.pathwise_draw(condition, mol_batch, x)
+    base_stats = {}
+    bcap = float(settings['pathwise_base_cap'])
+    x_live, log_q, g_q = (gfn.pathwise_draw(condition, mol_batch, x, base_cap=bcap, base_stats=base_stats) if bcap > 0
+                          else gfn.pathwise_draw(condition, mol_batch, x))
     g_r, log_r = live_reward_force(log_reward_fn, x_live.detach(), mol_batch, log_T_tensor.reshape(-1))
     ent = float(settings['pathwise_entropy'])
     log_r = log_r.reshape(-1).to(x_live.device, log_q.dtype)
@@ -542,6 +549,8 @@ def pathwise_term(settings, gfn, log_reward_fn, condition, mol_batch, log_T_tens
         stats = {'loss': _mean(rows), 'log_r': _mean(log_r), 'log_q': _mean(log_q), 'force_norm': _mean(gn),
                  'bad_frac': 1.0 - float(ok.float().mean()), 'rows': float(ok.numel()),
                  'x_clipped_frac': float(clipped.float().mean()),
+                 'force_top_share': float((gn[ok] ** 2).max() / (gn[ok] ** 2).sum().clamp_min(1e-30)) if n_ok else 0.0,
+                 **base_stats,
                  'grad_norm': float(grad_sq_norm(grads).sqrt()) if grads is not None else 0.0, **row_stats}
     return {'params': params, 'grads': grads, 'settings': settings, 'stats': stats}
 

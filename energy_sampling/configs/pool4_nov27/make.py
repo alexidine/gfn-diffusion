@@ -3,12 +3,12 @@
 
 Pathwise first (submit_pool4_nov27_pw.sbatch, its own array so it can be submitted ahead of the rest; smokes first): TB
 at T 2.5 from mle4 as tb_ctrl, plus the pathwise reverse-KL term (gflownet_losses.py::pathwise_term) on PW_ROWS rows per
-step per branch, each row's parameter gradient capped at PW_ROW_CAP x the rows' median, pathwise_entropy 1 (reverse KL),
+step per branch, each row's force carried into base space capped at PW_BASE_CAP x the rows' median, pathwise_entropy 1,
 no x clip, each branch's term scaled every step to pathwise_norm_frac x the norm of the step's other gradient on the
 policy parameters (read pathwise/<branch>_frac). Compare each with tb_ctrl:
   pw_on           on-policy only: fwd, fresh draws at fresh conditions every fused step, fraction PW_FRAC
-  pw_off          off-policy only: bwd (stored children) and replay (stored on-policy rows), each row regenerated
-                  through the flow, fraction PW_FRAC per branch
+  pw_off          off-policy only: bwd (stored children) and replay (stored on-policy rows), at the stored rows
+                  themselves, fraction PW_FRAC per branch
   pw_both         pw_on and pw_off together, PW_FRAC per branch
   pw_both_hi      pw_both at PW_FRAC_HI per branch
 
@@ -152,19 +152,19 @@ def tb_T10_mleT10(name, steps):
     return cfg
 
 
-#: the pathwise arms (PW_ARMS): rows per step per branch, the per-row parameter-gradient cap (multiples of the median),
-#: the norm fractions
-PW_ROWS, PW_ROW_CAP, PW_FRAC, PW_FRAC_HI = 32, 3.0, 0.1, 0.3
+#: the pathwise arms (PW_ARMS): rows per step per branch (the term's memory is ~25 MB per row), the cap on each row's
+#: force carried into base space (multiples of the median; no per-row backward), the norm fractions
+PW_ROWS, PW_BASE_CAP, PW_FRAC, PW_FRAC_HI = 256, 3.0, 0.1, 0.3
 #: every pathwise key at its code default (gflownet_losses.py::PATHWISE_DEFAULTS), carried by each base block a stage
 #: overrides
 PW_OFF = dict(pathwise=0.0, pathwise_norm_frac=0.0, pathwise_entropy=1.0, pathwise_grad_clip=0.0, pathwise_rows=0,
-              pathwise_row_cap=0.0)
+              pathwise_row_cap=0.0, pathwise_base_cap=0.0)
 
 
 def pw(name, steps, branches, frac):
-    """tb_ctrl with the pathwise term on `branches` at norm fraction `frac` each (PW_ROWS rows, PW_ROW_CAP)."""
+    """tb_ctrl with the pathwise term on `branches` at norm fraction `frac` each (PW_ROWS rows, PW_BASE_CAP)."""
     on = dict(pathwise=0.0, pathwise_norm_frac=frac, pathwise_entropy=1.0, pathwise_grad_clip=0.0,
-              pathwise_rows=PW_ROWS, pathwise_row_cap=PW_ROW_CAP)
+              pathwise_rows=PW_ROWS, pathwise_row_cap=0.0, pathwise_base_cap=PW_BASE_CAP)
     cfg = tb(name, steps, [(f'tb.loss_coeffs.{b}.{k}', v) for b in branches for k, v in on.items()])
     for b in ('fwd', 'bwd', 'replay'):
         block = cfg[f'{b}_loss_coeffs']

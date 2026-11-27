@@ -503,6 +503,7 @@ fwd_loss_coeffs:
   pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
   pathwise_rows: 0        # fresh draws per fused step at fresh conditions, every step whatever the rollout cadence, one grad-enabled reward call on them; 0 = batch_size
   pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
+  pathwise_base_cap: 0.0  # > 0: each row's force carried into the flow's base space, |J^-T d(row loss)/dx|, is capped at this multiple of the rows' median inside the one backward; 0 = off
 bwd_loss_coeffs:
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
@@ -532,6 +533,7 @@ bwd_loss_coeffs:
   pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
   pathwise_rows: 0        # rows per step the term draws from the branch's batch, each regenerated from its stored terminal with one grad-enabled reward call; 0 = every row
   pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
+  pathwise_base_cap: 0.0  # > 0: each row's force carried into the flow's base space, |J^-T d(row loss)/dx|, is capped at this multiple of the rows' median inside the one backward; 0 = off
 replay_loss_coeffs:       # applied to trajectories pulled from the replay buffer
   tb: 1.0
   freeze_policy: 0.0
@@ -561,6 +563,7 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
   pathwise_grad_clip: 0.0 # > 0: each row's |d(row loss)/dx| is capped at this value; 0 = off
   pathwise_rows: 0        # rows per step the term draws from the branch's batch, each regenerated from its stored terminal with one grad-enabled reward call; 0 = every row
   pathwise_row_cap: 0.0   # > 0: each row's parameter-gradient norm is capped at this multiple of the rows' median (one backward per row); 0 = off
+  pathwise_base_cap: 0.0  # > 0: each row's force carried into the flow's base space, |J^-T d(row loss)/dx|, is capped at this multiple of the rows' median inside the one backward; 0 = off
   traj_grads: 0.0
   loss_clip: 1.0E+9
   beta: 10.0

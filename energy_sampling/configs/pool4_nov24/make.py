@@ -45,7 +45,7 @@ AUX_KEYS = {'bwd': ('score', 'score_beta', 'score_rows', 'score_force'),
             'replay': ('score', 'score_beta', 'score_rows', 'score_force'),
             'fwd': ('score', 'score_beta', 'score_rows', 'pathwise', 'pathwise_grad_clip', 'pathwise_entropy')}
 AUX_OFF = {'score': 0.0, 'score_beta': 10.0, 'score_rows': 0, 'score_force': 'live', 'pathwise': 0.0,
-           'pathwise_grad_clip': 100.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
+           'pathwise_grad_clip': 0.0, 'pathwise_entropy': 1.0}   # entropy 1.0 = the code default: reverse KL
 # config paths an arm may change: every one is read on the store route (a legacy buffers.* key would sweep nothing)
 LIVE_PREFIXES = ('protocols.', 'model.nf.rotate_frames', 'model.nf.mirror_frames', 'model.nf.atom_tokens',
                  'buffers.store.replay_weight', 'buffers.store.keep_rollouts', 'buffers.store.growth_every', 'fwd_loss_coeffs.tb_detach_z', 'energy_config.temperature', 'energy_config.density_coeff', 'warm_start_ignore_problem_keys', 'lr_control.hard_failure.grad_abs', 'smoke',

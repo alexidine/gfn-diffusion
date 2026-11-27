@@ -275,15 +275,16 @@ fwd_loss_coeffs:
   pooled_bridge_only: 0.0
   pooled_source: fwd
   pooled_center: mean
+  pathwise: 0.0
+  pathwise_norm_frac: 0.0
+  pathwise_entropy: 1.0
+  pathwise_grad_clip: 0.0
+  pathwise_rows: 0
+  pathwise_row_cap: 0.0
   score: 0.0
   score_beta: 10.0
   score_rows: 0
-  pathwise: 0.0
-  pathwise_grad_clip: 100.0
-  pathwise_entropy: 1.0
-  pathwise_norm_frac: 0.0
-  pathwise_rows: 0
-  pathwise_row_cap: 0.0
+  pathwise_base_cap: 0.0
 bwd_loss_coeffs:
   tb: 0.0
   freeze_policy: 0.0
@@ -307,16 +308,17 @@ bwd_loss_coeffs:
   traj_grads: 1.0
   loss_clip: 1000000000.0
   beta: 10.0
-  score: 0.0
-  score_beta: 10.0
-  score_rows: 0
-  score_force: live
   pathwise: 0.0
   pathwise_norm_frac: 0.0
   pathwise_entropy: 1.0
   pathwise_grad_clip: 0.0
   pathwise_rows: 0
   pathwise_row_cap: 0.0
+  score: 0.0
+  score_beta: 10.0
+  score_rows: 0
+  score_force: live
+  pathwise_base_cap: 0.0
 replay_loss_coeffs:
   tb: 1.0
   freeze_policy: 0.0
@@ -340,6 +342,12 @@ replay_loss_coeffs:
   reward_grads: 0.0
   reward_grad_clip: 0.0
   condition_block_m: 0
+  pathwise: 0.0
+  pathwise_norm_frac: 0.0
+  pathwise_entropy: 1.0
+  pathwise_grad_clip: 0.0
+  pathwise_rows: 0
+  pathwise_row_cap: 0.0
   traj_grads: 0.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -347,12 +355,7 @@ replay_loss_coeffs:
   score_beta: 10.0
   score_rows: 0
   score_force: live
-  pathwise: 0.0
-  pathwise_norm_frac: 0.0
-  pathwise_entropy: 1.0
-  pathwise_grad_clip: 0.0
-  pathwise_rows: 0
-  pathwise_row_cap: 0.0
+  pathwise_base_cap: 0.0
 condition_log_z:
   min_visits: 20
   half_life_visits: 200.0
@@ -475,8 +478,9 @@ protocols:
           pathwise_norm_frac: 0.3
           pathwise_entropy: 1.0
           pathwise_grad_clip: 0.0
-          pathwise_rows: 32
-          pathwise_row_cap: 3.0
+          pathwise_rows: 256
+          pathwise_row_cap: 0.0
+          pathwise_base_cap: 3.0
         bwd:
           tb: 1.0
           beta: 80.0
@@ -490,8 +494,9 @@ protocols:
           pathwise_norm_frac: 0.3
           pathwise_entropy: 1.0
           pathwise_grad_clip: 0.0
-          pathwise_rows: 32
-          pathwise_row_cap: 3.0
+          pathwise_rows: 256
+          pathwise_row_cap: 0.0
+          pathwise_base_cap: 3.0
         replay:
           tb: 1.0
           beta: 10.0
@@ -503,8 +508,9 @@ protocols:
           pathwise_norm_frac: 0.3
           pathwise_entropy: 1.0
           pathwise_grad_clip: 0.0
-          pathwise_rows: 32
-          pathwise_row_cap: 3.0
+          pathwise_rows: 256
+          pathwise_row_cap: 0.0
+          pathwise_base_cap: 3.0
 controller:
   min_mode_frac: 0.001
   beta: 0.025

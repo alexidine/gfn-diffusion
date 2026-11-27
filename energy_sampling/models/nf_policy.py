@@ -956,13 +956,14 @@ class NFPolicy(nn.Module):
             for m, o in zip(mades, old):
                 m.checkpoint_layers = o
 
-    def pathwise_draw(self, condition, mol_batch, x=None):
+    def pathwise_draw(self, condition, mol_batch, x=None, base_cap: float = 0.0, base_stats=None):
         """A reparameterised draw for the pathwise term (gflownet_losses.py::pathwise_term): (x' [n, dim] carrying
         dx'/dtheta, the derivative of x' = T_theta(z) at its base point z held fixed, by the implicit function theorem
         (ConditionalLatentFlow.implicit_draw; angles wrapped, dead rows pinned), log q(x' | c) [n] and d log q / d x at
         x' [n, dim], both detached and taken at fixed parameters: the sticking-the-landing parts). x None: a fresh draw,
         sample()'s (on-policy). x [n, dim], standard-frame stored rows: x' is x itself (wrapped, pinned), z its base
-        point. One noise-free condition (clean_condition). Conditional route, standard frame."""
+        point. base_cap / base_stats: ConditionalLatentFlow.implicit_draw's cap on each row's base-space force in a
+        backward through x'. One noise-free condition (clean_condition). Conditional route, standard frame."""
         if not self.conditional:
             raise NotImplementedError("a pathwise draw on the unconditional route")
         self._refuse_framed('a pathwise draw')
@@ -973,7 +974,7 @@ class NFPolicy(nn.Module):
                 if x is None:
                     x = self.sampler.sample(n, c)
                 xs = self._pin_dead(self._wrap_ang(x.detach().to(self.device, torch.float32)))
-            x_live = self.sampler.implicit_draw(xs, c)
+            x_live = self.sampler.implicit_draw(xs, c, base_cap=base_cap, base_stats=base_stats)
             leaf = x_live.detach().clone().requires_grad_(True)
             with torch.enable_grad():
                 log_q = self.sampler.log_prob(leaf, c)

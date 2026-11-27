@@ -24,6 +24,30 @@ def quat_to_rotmat(q):
                        ).reshape(q.shape[:-1] + (3, 3))
 
 
+class _RowNormCap(torch.autograd.Function):
+    """Identity forward; backward scales each row's incoming gradient [n, d] to at most cap x the median row norm over
+    the rows whose gradient is not zero, and writes base_top_share / base_capped_frac into stats (a dict, or None)."""
+
+    @staticmethod
+    def forward(ctx, t, cap, stats):
+        ctx.cap, ctx.stats = cap, stats
+        return t.view_as(t)
+
+    @staticmethod
+    def backward(ctx, grad):
+        n = grad.norm(dim=-1)
+        on = n > 0
+        if not bool(on.any()):
+            return grad, None, None
+        scale = torch.where(on, torch.clamp(ctx.cap * n[on].median() / n.clamp_min(1e-30), max=1.0),
+                            torch.ones_like(n))
+        if ctx.stats is not None:
+            sq = n[on].double() ** 2
+            ctx.stats['base_top_share'] = float(sq.max() / sq.sum())
+            ctx.stats['base_capped_frac'] = float((scale[on] < 1.0).double().mean())
+        return grad * scale.unsqueeze(-1), None, None
+
+
 def _pin(x, live):
     """x with the rows live marks False (pad slots of a mixed-group FD state, energies/fd_coordinates.py::
     FDSlotLayout) set to 0; live None: x."""
@@ -1186,7 +1210,7 @@ class ConditionalLatentFlow(nn.Module):
             x = self._row_turn(x, F, inverse=True)[0]
         return x
 
-    def implicit_draw(self, x, c):
+    def implicit_draw(self, x, c, base_cap: float = 0.0, base_stats=None):
         """x [n, dim] (wrapped, pinned rows) as a tensor whose value is x and whose derivative in the parameters is that
         of the draw rsample makes from its base point z = to_base(x | c) with z held fixed: by the implicit function
         theorem dx/dtheta = -J^-1 dz/dtheta, J = dz/dx [n, d, d] on the live rows (one parallel pass of to_base, its
@@ -1194,7 +1218,11 @@ class ConditionalLatentFlow(nn.Module):
         row where J is singular, e.g. a bounded row past its face, where the spline clamps and log q is -inf, nor a
         non-finite row, whose value stays as given so the term drops it). So the
         pathwise term is exact at the row itself (no regeneration error) and costs a parallel pass where rsample runs d
-        sequential ones. Standard frame only (no canonical frame)."""
+        sequential ones. base_cap > 0: in a backward through the result, each row's cotangent arriving at its base
+        point, -J^-T (the row's cotangent on x), is scaled to at most base_cap x the median over the rows that carry one
+        (_RowNormCap), so a row whose J is nearly singular cannot dominate the parameter gradient; base_stats (a dict)
+        gets that backward's base_top_share (the largest row's share of the squared norms before the cap) and
+        base_capped_frac (the share of those rows scaled). Standard frame only (no canonical frame)."""
         if self._frame_rows is not None:
             raise NotImplementedError("implicit_draw with a canonical frame")
         f = self.flow
@@ -1219,6 +1247,8 @@ class ConditionalLatentFlow(nn.Module):
         if flat.any():                                     # no derivative; its log q is not finite, so the term drops it)
             J = torch.where(flat[:, None, None], torch.eye(d, dtype=J.dtype, device=J.device), J)
             dz = torch.where(flat[:, None], torch.zeros_like(dz), dz)
+        if base_cap > 0:
+            dz = _RowNormCap.apply(dz, float(base_cap), base_stats)
         step = torch.linalg.solve(J, -dz.double().unsqueeze(-1)).squeeze(-1).to(x.dtype)   # -J^-1 dz/dtheta, value 0
         out = x.detach().clone()
         out[:, li] = out[:, li] + step
