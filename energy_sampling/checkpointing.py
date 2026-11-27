@@ -1160,12 +1160,17 @@ class Checkpointer:
         So compare and refuse. Orphaning affected checkpoints is the accepted cost.
         Triclinic and toys resolve to (), which matches a pre-change checkpoint's absent
         key, so existing sg-1/sg-2 resumes are unaffected.
+
+        On the FD chart the policy is built with no dead rows (Modeller.init_gfn passes
+        dead_latent_rows None there: the chart drops a group's fixed rows itself), so an FD
+        run wants () whatever its space groups resolve to on the latent chart.
         """
         m = self.modeller
         if not hasattr(m, '_resolve_dead_latent_rows'):
             return
         try:
-            wanted = m._resolve_dead_latent_rows(quiet=True) or ()
+            fd = getattr(getattr(m, 'energy_function', None), 'crystal_coordinates', 'latent') == 'fd'
+            wanted = () if fd else (m._resolve_dead_latent_rows(quiet=True) or ())
         except Exception:
             return  # resolution itself is broken; let the normal path report it
         stored = tuple(config.get('dead_latent_rows') or ())

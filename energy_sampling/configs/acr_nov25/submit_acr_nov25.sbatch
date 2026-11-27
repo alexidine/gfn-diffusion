@@ -28,8 +28,8 @@ mkdir -p ${LOGS}
 ARM_LIST=(smoke_macecspl smoke_maceoff24m smoke_umas1p1 smoke_umas1p2 smoke_esens macecspl maceoff24m umas1p1 umas1p2 esens)
 GROUP="${ARM_LIST[${SLURM_ARRAY_TASK_ID:?array task id}]}"
 case ${GROUP} in   # the model's extra PYTHONPATH (make.py PYEXTRA)
-    *macecspl) PYEXTRA=/scratch/mk8347/pylibs_dftd ;;
-    *umas1p2) PYEXTRA=/scratch/mk8347/pylibs_fc216 ;;
+    *macecspl*) PYEXTRA=/scratch/mk8347/pylibs_dftd ;;
+    *umas1p2*) PYEXTRA=/scratch/mk8347/pylibs_fc216 ;;
     *) PYEXTRA= ;;
 esac
 CKDIR=${WORKDIR}/checkpoints
