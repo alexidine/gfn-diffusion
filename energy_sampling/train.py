@@ -12163,8 +12163,13 @@ class Modeller:
         log q(x | c, T), the condition built with T as condition_samples builds it, and fits y = log q - j on u within
         each condition (_within_condition_slope). A Boltzmann density at T has slope -1 / T, so
         eval_T/boltzmann_slope@T = -slope x T reads 1 for one (0 for a density blind to the energy), and
-        eval_T/boltzmann_r2@T is the share of y's within-condition variance the line explains. Empty off that route or
-        without a panel; prints one line."""
+        eval_T/boltzmann_r2@T is the share of y's within-condition variance the line explains.
+        eval_T/boltzmann_t_exponent (_log_log_slope) is the least-squares slope of log(readout) on log T over those
+        temperatures: 1 for a policy blind to its temperature input (the readout then grows as T), 0 for one whose
+        readout is the same at every T, as a Boltzmann density's is and a density trained to the temperature-first kicks'
+        is (cfg:noised_prior.live_temperature_range), whose readout is the within-basin share of the panel's energy
+        spread at every T; NaN when a readout is not finite and positive. Empty off that route or without a panel;
+        prints one line."""
         ef, policy, st = self.energy_function, self.gfn_model, getattr(self, 'row_store', None)
         if (st is None or not getattr(ef, 'temperature_conditioning', False) or not hasattr(policy, 'log_density')
                 or getattr(ef, 'crystal_coordinates', None) != 'fd'):
@@ -12192,10 +12197,27 @@ class Modeller:
             out[f'eval_T/boltzmann_slope@{T:g}'] = -slope * T
             out[f'eval_T/boltzmann_r2@{T:g}'] = r2
             line.append(f"T {T:g}: -slope x T {-slope * T:.3f} (r2 {r2:.2f})")
+        temps = [f * T_run for f in self.BOLTZMANN_T_FACTORS]
+        e = self._log_log_slope(temps, [out[f'eval_T/boltzmann_slope@{T:g}'] for T in temps])
+        out['eval_T/boltzmann_t_exponent'] = e
         print(f"Boltzmann slope readout at step {int(getattr(self, 'step_ind', 0))} ({n} stored rows over "
               f"{int(torch.unique(panel['cid']).numel())} conditions; 1 = Boltzmann at T, 0 = blind to the energy): "
-              + '; '.join(line), flush=True)
+              + '; '.join(line) + f"; T exponent {e:.3f} (1 = blind to T, 0 = the same at every T)", flush=True)
         return out
+
+    @staticmethod
+    def _log_log_slope(xs, ys):
+        """The least-squares slope of log y on log x over the pairs (xs, ys); NaN when a y is not finite and positive,
+        or the xs have no spread."""
+        if not all(math.isfinite(float(v)) and float(v) > 0 for v in ys):
+            return float('nan')
+        lx = [math.log(float(v)) for v in xs]
+        ly = [math.log(float(v)) for v in ys]
+        mx, my = sum(lx) / len(lx), sum(ly) / len(ly)
+        sxx = sum((a - mx) ** 2 for a in lx)
+        if not sxx > 0:
+            return float('nan')
+        return sum((a - mx) * (b - my) for a, b in zip(lx, ly)) / sxx
 
     #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature
     KERNEL_READOUT_TAU = 1.0

@@ -34,7 +34,16 @@ def test_the_slope_is_pooled_within_conditions():
     assert all(math.isnan(v) for v in Modeller._within_condition_slope(y, torch.ones(300), cid))
 
 
-def _modeller(blind=False, ref=0.0):
+def test_the_log_log_slope_is_the_power_of_t():
+    T = [2.5, 5.0, 10.0]
+    assert abs(Modeller._log_log_slope(T, [0.3 * t ** 0.5 for t in T]) - 0.5) < 1e-12
+    assert abs(Modeller._log_log_slope(T, [0.7, 0.7, 0.7])) < 1e-12
+    for bad in ([0.5, 0.0, 1.0], [0.5, -1.0, 1.0], [0.5, float('nan'), 1.0]):
+        assert math.isnan(Modeller._log_log_slope(T, bad))
+    assert math.isnan(Modeller._log_log_slope([5.0, 5.0, 5.0], [1.0, 2.0, 3.0]))
+
+
+def _modeller(blind=False, ref=0.0, t_blind=False):
     m = S.build()
     m.energy_function.temperature_conditioning = True
     m.energy_function.crystal_coordinates = 'fd'
@@ -49,11 +58,13 @@ def _modeller(blind=False, ref=0.0):
     T_run = float(m.args.energy_config.temperature)
 
     def log_density(x, condition, mol):
-        """Boltzmann at the condition's T in the stub's energy u = T_run (|x|^2 + cid / 10) plus the reference; or blind."""
+        """Boltzmann at the condition's T in the stub's energy u = T_run (|x|^2 + cid / 10) plus the reference; blind to
+        the energy; or (t_blind) Boltzmann at T_run whatever the condition's T."""
         if blind:
             return torch.zeros(x.shape[0])
         u = T_run * ((x.double() ** 2).sum(-1) + mol.condition_id.double() / 10)
-        return (-u / condition[:, -1].double() + ref).float()
+        T = torch.full_like(u, T_run) if t_blind else condition[:, -1].double()
+        return (-u / T + ref).float()
     m.gfn_model = SimpleNamespace(log_density=log_density)
     return m
 
@@ -65,13 +76,24 @@ def test_a_boltzmann_density_reads_one_at_every_temperature(capsys):
     for f in Modeller.BOLTZMANN_T_FACTORS:
         assert abs(out[f'eval_T/boltzmann_slope@{f * T:g}'] - 1.0) < 1e-4
         assert out[f'eval_T/boltzmann_r2@{f * T:g}'] > 0.9999
-    assert 'Boltzmann slope readout' in capsys.readouterr().out
+    assert abs(out['eval_T/boltzmann_t_exponent']) < 1e-4
+    assert 'T exponent' in capsys.readouterr().out
+
+
+def test_a_policy_blind_to_its_temperature_input_reads_exponent_one():
+    m = _modeller(t_blind=True)
+    out = m._boltzmann_slope_readouts(chunk=64)
+    T = float(m.args.energy_config.temperature)
+    for f in Modeller.BOLTZMANN_T_FACTORS:
+        assert abs(out[f'eval_T/boltzmann_slope@{f * T:g}'] - f) < 1e-4
+    assert abs(out['eval_T/boltzmann_t_exponent'] - 1.0) < 1e-4
 
 
 def test_a_density_blind_to_the_energy_reads_zero():
     m = _modeller(blind=True)
     out = m._boltzmann_slope_readouts(chunk=64)
     assert all(abs(v) < 1e-9 for k, v in out.items() if 'slope' in k)
+    assert math.isnan(out['eval_T/boltzmann_t_exponent'])
 
 
 def test_the_panel_is_fixed_between_evaluations():
