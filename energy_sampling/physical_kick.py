@@ -279,9 +279,13 @@ def gram(cell):
 # the step
 # ---------------------------------------------------------------------------
 
-def draw_step(k: GroupKit, n, log_lo, log_hi, generator=None):
-    """[n, 12] metric_kick's step rho u: rho = 10^U(log_lo, log_hi) Angstrom, u uniform on the live coordinates' sphere."""
+def draw_step(k: GroupKit, n, log_lo, log_hi, generator=None, sigma=None):
+    """[n, 12] metric_kick's step rho u: rho = 10^U(log_lo, log_hi) Angstrom, u uniform on the live coordinates' sphere.
+    sigma [n] (Angstrom, optional): instead sigma times a standard normal on the live coordinates, so rho^2 is
+    sigma^2 chi^2_d (d live coordinates) and u is uniform as before; log_lo and log_hi are not read."""
     y = torch.randn(n, 12, dtype=F64, generator=generator) * k.live
+    if sigma is not None:
+        return torch.as_tensor(sigma, dtype=F64).reshape(-1)[:, None] * y
     u = y / y.norm(dim=1, keepdim=True)
     rho = 10 ** (log_lo + (log_hi - log_lo) * torch.rand(n, dtype=F64, generator=generator))
     return rho[:, None] * u
@@ -433,11 +437,12 @@ def full_route(k: GroupKit, cell, t, R, radius):
 # the draw
 # ---------------------------------------------------------------------------
 
-def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None):
+def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None, sigma=None):
     """([n, d] float64 chart rows, counts) of fresh kicks of one group's anchors s [n, d] in [-1, 1]. Each row takes at
     most `tries` draws, then keeps its anchor. counts: rows, full_route (rows that used the full route in some draw),
     redrawn (rows whose first draw had no chart point), kept (rows that kept their anchor). rho_out [n] (optional):
-    filled with each row's accepted step length (Angstrom), 0 for a row that kept its anchor."""
+    filled with each row's accepted step length (Angstrom), 0 for a row that kept its anchor. sigma [n] (optional):
+    each row's Gaussian step scale (draw_step), kept through its redraws."""
     n = len(s)
     cell, t, R = decode(k, ((s + 1) / 2).clamp(0, 1), radius)
     T = t_fc(cell)
@@ -446,7 +451,7 @@ def kick_group(k: GroupKit, s, radius, rg, log_lo, log_hi, tries, generator=None
     todo = torch.arange(n)
     redrawn = 0
     for attempt in range(int(tries)):
-        st = draw_step(k, len(todo), log_lo, log_hi, generator)
+        st = draw_step(k, len(todo), log_lo, log_hi, generator, None if sigma is None else sigma[todo])
         c2, t2, R2 = apply_step(st, cell[todo], t[todo], R[todo], rg[todo], T[todo])
         u, state = certified_chart(k, c2, t2, R2, radius[todo])
         rest = torch.nonzero(state < 0).flatten()
@@ -481,11 +486,16 @@ def single_thread():
 
 
 @torch.no_grad()
-def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None):
+def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None, rho_out=None, sigma=None):
     """([n, dim] float32 CPU states in the run's slot layout, counts summed over the groups) of fresh kicks of the anchors
     `centres` [n, dim] (any device; only their chart slots are read) with space groups sg [n], molecule radii and radii
     of gyration [n]. Runs on the CPU on one thread; a row of a group outside `kits` raises. rho_out [n] float64 CPU
-    (optional): filled with each row's step length (Angstrom; 0 where the row kept its anchor), kick_group's."""
+    (optional): filled with each row's step length (Angstrom; 0 where the row kept its anchor), kick_group's. sigma [n]
+    (Angstrom, optional): each row's Gaussian step scale (draw_step) in place of the log-uniform length."""
+    if sigma is not None:
+        sigma = torch.as_tensor(sigma, dtype=F64).reshape(-1).cpu()
+        if sigma.numel() != len(centres) or not bool((torch.isfinite(sigma) & (sigma > 0)).all()):
+            raise ValueError(f"physical_kick.kick: sigma must be {len(centres)} finite values > 0")
     centres, sg = centres.cpu(), torch.as_tensor(sg).reshape(-1).long().cpu()
     radius, rg = torch.as_tensor(radius).cpu().to(F64), torch.as_tensor(rg).cpu().to(F64)
     radius = torch.round(radius * 1e6) / 1e6        # the production chart's radius (MolecularCrystal.fd_coordinates_rows)
@@ -499,7 +509,7 @@ def kick(kits, centres, sg, radius, rg, log_lo, log_hi, tries, generator=None, r
             k, at = kits[g], torch.nonzero(sg == g).flatten()
             rho_g = None if rho_out is None else torch.zeros(len(at), dtype=F64)
             out, counts = kick_group(k, centres[at][:, k.slots].to(F64), radius[at], rg[at], log_lo, log_hi, tries,
-                                     generator, rho_out=rho_g)
+                                     generator, rho_out=rho_g, sigma=None if sigma is None else sigma[at])
             if rho_out is not None:
                 rho_out[at] = rho_g
             row = torch.zeros(len(at), x.shape[1], dtype=torch.float32)

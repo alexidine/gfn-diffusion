@@ -9,7 +9,7 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints
-checkpoint_name: pool4_nov26_tcond_c2_elj-pool8_4sg_train_k4_metric-T2.5-fa971a_phase1_exit.pt
+checkpoint_name: pool4_nov26b_tcond_t_elj-pool8_4sg_train_k4_metric-T2.5-66603e_phase1_exit.pt
 load_weights_only: true
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8sg4_nov20/priors/pool8_4sg_train_k4_metric.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/pool8_nov09/priors/pool8_p1_train_conditions.pt
@@ -34,10 +34,14 @@ noised_prior:
   live_fresh_frac: 0.0
   live_shape: hessian
   kick_kappa_per_atom: 14.9
+  train_molecules: null
   live_log_range:
   - -2.0
   - -0.375
   window_by: row
+  live_temperature_range:
+  - 2.5
+  - 10.0
 harvest:
   enabled: false
   min_abs_resid: 1.0
@@ -473,7 +477,6 @@ protocols:
       - 2.5
       - 5.0
       - 10.0
-      - 25.0
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -572,8 +575,8 @@ energy_config:
   internal_oom_recovery: false
   temperature: 2.5
   log_temperature_range:
-  - -3.0
-  - 1.5
+  - 0.3979400086720376
+  - 1.0
   density_coeff: 10.0
   implausible_energy_below: null
   mlip_dispersion: null

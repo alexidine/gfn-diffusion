@@ -34,10 +34,14 @@ noised_prior:
   live_fresh_frac: 0.0
   live_shape: hessian
   kick_kappa_per_atom: 14.9
+  train_molecules: null
   live_log_range:
   - -2.0
   - -0.375
   window_by: row
+  live_temperature_range:
+  - 2.5
+  - 10.0
 harvest:
   enabled: false
   min_abs_resid: 1.0
@@ -217,7 +221,7 @@ max_batch_size: 20000
 eval_num_samples: 10000
 test_eval_num_samples: 1000
 fused_grad_accum_min_samples: 1000
-epochs: 190100
+epochs: 192100
 eval_period: 500
 figs_every_n_evals: 4
 xcond_eval:
@@ -438,7 +442,7 @@ protocols:
         drift_std_max: 0.0
         ess_min: 0.0
       fwd_z_sidecar: true
-      max_steps: 10000
+      max_steps: 14000
       on_exit:
       - snapshot:tb1_exit
       loss_coeffs:
@@ -469,7 +473,7 @@ protocols:
           condition_block_m: 0
           tb_z_source: learned
       temperatures:
-      - 25.0
+      - 10.0
     - name: tb2
       train_mode: fused
       bwd_sampling_mode: prior
@@ -503,7 +507,7 @@ protocols:
         drift_std_max: 0.0
         ess_min: 0.0
       fwd_z_sidecar: true
-      max_steps: 10000
+      max_steps: 14000
       on_exit:
       - snapshot:tb2_exit
       loss_coeffs:
@@ -534,8 +538,8 @@ protocols:
           condition_block_m: 0
           tb_z_source: learned
       temperatures:
-      - 25.0
       - 10.0
+      - 5.0
     - name: tb3
       train_mode: fused
       bwd_sampling_mode: prior
@@ -569,74 +573,7 @@ protocols:
         drift_std_max: 0.0
         ess_min: 0.0
       fwd_z_sidecar: true
-      max_steps: 10000
-      on_exit:
-      - snapshot:tb3_exit
-      loss_coeffs:
-        fwd:
-          tb: 0.0
-          vg_lb: 0.0
-          vg_by_condition: 1.0
-          emp_z: 1.0
-          freeze_policy: 1.0
-          repeats: 2.0
-          beta: 10.0
-          pooled_vg: 0.0
-          tb_z_source: learned
-        bwd:
-          tb: 1.0
-          beta: 80.0
-          freeze_z: 1.0
-          vg_lb: 0.0
-          condition_block_m: 0
-          repeats: 1.0
-          level_gap: 0.0
-          tb_z_source: learned
-        replay:
-          tb: 1.0
-          beta: 10.0
-          freeze_z: 1.0
-          vg_by_condition: 0.0
-          condition_block_m: 0
-          tb_z_source: learned
-      temperatures:
-      - 25.0
-      - 10.0
-      - 5.0
-    - name: tb4
-      train_mode: fused
-      bwd_sampling_mode: prior
-      flags:
-        update_log_z: true
-        buffers_active: true
-        weighted_bwd_sampling: false
-        weighted_condition_sampling: false
-      on_enter:
-      - set_lr_flow:1.0e-4
-      - bootstrap_z:offset
-      lr_schedule:
-      - to: 0.002
-        steps: 0
-        kind: hold
-      - to: 0.2
-        steps: 2000
-        kind: geometric
-      fracs:
-        fwd: 0.0
-        bwd: 0.5
-        replay: 0.5
-      min_fracs:
-        fwd: 0.0
-      deactivate_threshold: 0.01
-      fwd_rollout_every: 20
-      z_pin_rollout_every: 0
-      fwd_rollout_triggers:
-        occupancy_min_batches: 0.0
-        val_gap_max: 0.0
-        drift_std_max: 0.0
-        ess_min: 0.0
-      fwd_z_sidecar: true
-      max_steps: 10000
+      max_steps: 14000
       on_exit:
       - snapshot:tb_exit
       - stop
@@ -668,7 +605,6 @@ protocols:
           condition_block_m: 0
           tb_z_source: learned
       temperatures:
-      - 25.0
       - 10.0
       - 5.0
       - 2.5
@@ -770,8 +706,8 @@ energy_config:
   internal_oom_recovery: false
   temperature: 2.5
   log_temperature_range:
-  - -3.0
-  - 1.5
+  - 0.3979400086720376
+  - 1.0
   density_coeff: 10.0
   implausible_energy_below: null
   mlip_dispersion: null

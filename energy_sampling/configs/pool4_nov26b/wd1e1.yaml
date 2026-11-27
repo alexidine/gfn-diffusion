@@ -34,6 +34,7 @@ noised_prior:
   live_fresh_frac: 0.0
   live_shape: hessian
   kick_kappa_per_atom: null
+  train_molecules: null
   live_log_range:
   - -2.0
   - -0.375

@@ -34,10 +34,14 @@ noised_prior:
   live_fresh_frac: 0.0
   live_shape: hessian
   kick_kappa_per_atom: 14.9
+  train_molecules: null
   live_log_range:
   - -2.0
   - -0.375
   window_by: row
+  live_temperature_range:
+  - 2.5
+  - 10.0
 harvest:
   enabled: false
   min_abs_resid: 1.0
@@ -217,7 +221,7 @@ max_batch_size: 20000
 eval_num_samples: 10000
 test_eval_num_samples: 1000
 fused_grad_accum_min_samples: 1000
-epochs: 190100
+epochs: 192100
 eval_period: 500
 figs_every_n_evals: 4
 xcond_eval:
@@ -438,7 +442,7 @@ protocols:
         drift_std_max: 0.0
         ess_min: 0.0
       fwd_z_sidecar: true
-      max_steps: 40000
+      max_steps: 42000
       on_exit:
       - snapshot:tb_exit
       - stop
@@ -567,8 +571,8 @@ energy_config:
   internal_oom_recovery: false
   temperature: 2.5
   log_temperature_range:
-  - -3.0
-  - 1.5
+  - 0.3979400086720376
+  - 1.0
   density_coeff: 10.0
   implausible_energy_below: null
   mlip_dispersion: null

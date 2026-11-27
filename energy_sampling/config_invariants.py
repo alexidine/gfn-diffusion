@@ -1626,6 +1626,18 @@ def row_store_problems(cfg: dict) -> list[tuple[str, str]]:
                 f"the condition scaler is fitted over it; got {rng!r}")
     elif kappa is not None:
         err('noised_prior.kick_kappa_per_atom without temperature_conditioning labels nothing (a dead key)')
+    t_rng = _get(cfg, 'noised_prior.live_temperature_range')
+    if t_rng is not None:
+        if not (tcond and kappa is not None):
+            err('noised_prior.live_temperature_range draws the MLE kick temperatures, read only with '
+                'temperature_conditioning and noised_prior.kick_kappa_per_atom (a dead key otherwise)')
+        rng = _get(cfg, 'energy_config.log_temperature_range')
+        if (isinstance(t_rng, (list, tuple)) and len(t_rng) == 2 and all(_real(v) and v > 0 for v in t_rng)
+                and isinstance(rng, (list, tuple)) and len(rng) == 2 and all(_real(v) for v in rng)):
+            lt = [math.log10(float(v)) for v in t_rng]
+            if lt[0] < float(rng[0]) - 1e-9 or lt[1] > float(rng[1]) + 1e-9:
+                err(f"noised_prior.live_temperature_range {list(t_rng)} (log10 {lt[0]:.3f}, {lt[1]:.3f}) lies outside "
+                    f"energy_config.log_temperature_range {list(rng)}, the span the condition scaler is fitted over")
     if _get(cfg, 'energy_config.prior_flow_path') is not None:
         err('buffers.store stores log R at admission: refused with energy_config.prior_flow_path (a lambda path)')
     if _get(cfg, 'buffers.replay_buffer.prioritise.enabled', False) is True:

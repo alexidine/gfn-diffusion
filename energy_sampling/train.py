@@ -9512,38 +9512,50 @@ class Modeller:
             pool.clear()
         return self.row_store.invalidate_q_after(int(checkpoint_step))
 
-    def _kick_anchors(self, rows, rho_out=None):
+    def _kick_anchors(self, rows, rho_out=None, temperature=None):
         """(x [n, d] float32, kept [n] bool) for the anchor slots `rows`: a fresh physical kick of each, from this run's
         own generator (seeded with seed + the launch step), so the global generators are neither read nor advanced.
         kept: the kick ran out of tries and returned the anchor's own point. rho_out [n] float64 (optional): each row's
-        step length in Angstrom (physical_kick.kick)."""
+        step length in Angstrom (physical_kick.kick). temperature [n] (optional, kT in energy units): each row's step is
+        Gaussian with variance T / kappa per live coordinate (kappa = _kick_kappa), in place of a log-uniform length."""
         K, st = self._physical, self.row_store
         rows = torch.as_tensor(rows).long().flatten().cpu()
         cid = st.cid[rows].long()
+        sigma = None
+        if temperature is not None:
+            sigma = torch.sqrt(torch.as_tensor(temperature, dtype=torch.float64).reshape(-1).cpu()
+                               / self._kick_kappa(rows))
         x, counts = physical_kick.kick(K['kits'], st.x[rows], st.cond_sg[cid].long(), st.cond_radius[cid],
                                        st.cond_rg[cid], K['lo'], K['hi'],
                                        1 + int(self._noised_prior_settings['live_redraws']), generator=K['gen'],
-                                       **({} if rho_out is None else {'rho_out': rho_out}))
+                                       **({} if rho_out is None else {'rho_out': rho_out}),
+                                       **({} if sigma is None else {'sigma': sigma}))
         for name, v in counts.items():
             K[name] += v
         self._physical_warn_full_route(K)
         return x, (x == st.x[rows]).all(1)
 
-    def _kick_fresh(self, rows, with_rho=False):
+    def _kick_fresh(self, rows, with_rho=False, temperature=None):
         """(rows, x) of an MLE draw, which never holds an anchor point: a row whose kick kept its anchor is replaced by
         a kick of another uniformly drawn anchor, at most MLE_KICK_ROUNDS times, then dropped and counted. An empty
-        draw raises. with_rho: (rows, x, rho), rho [n] float64 each kept row's step length (Angstrom)."""
+        draw raises. with_rho: (rows, x, rho), rho [n] float64 each kept row's step length (Angstrom).
+        temperature [n] (optional): each slot's kick temperature (_kick_anchors), kept by the slot through its redraws;
+        the result then ends with the kept rows' temperatures [n] float64."""
         st = self.row_store
         rows = rows.clone()
+        temp = None if temperature is None else torch.as_tensor(temperature, dtype=torch.float64).reshape(-1).cpu()
+        if temp is not None and temp.numel() != rows.numel():
+            raise ValueError(f"_kick_fresh: {temp.numel()} temperatures for {rows.numel()} rows")
         rho = torch.zeros(rows.numel(), dtype=torch.float64) if with_rho else None
-        x, kept = self._kick_anchors(rows, rho_out=rho)
+        x, kept = self._kick_anchors(rows, rho_out=rho, temperature=temp)
         for _ in range(self.MLE_KICK_ROUNDS):
             at = torch.nonzero(kept).flatten()
             if not at.numel():
                 break
             rows[at] = st.draw_anchors(at.numel(), by=self._store_cfg['mle_draw'])
             rho_at = torch.zeros(at.numel(), dtype=torch.float64) if with_rho else None
-            x[at], again = self._kick_anchors(rows[at], rho_out=rho_at)
+            x[at], again = self._kick_anchors(rows[at], rho_out=rho_at,
+                                              temperature=None if temp is None else temp[at])
             if with_rho:
                 rho[at] = rho_at
             kept = torch.zeros_like(kept)
@@ -9552,10 +9564,12 @@ class Modeller:
             self._physical['mle_kept_dropped'] += int(kept.sum())
             rows, x = rows[~kept], x[~kept]
             rho = None if rho is None else rho[~kept]
+            temp = None if temp is None else temp[~kept]
             if not rows.numel():
                 raise RuntimeError("buffers.store: no MLE draw left the anchor point after "
                                    f"{self.MLE_KICK_ROUNDS} rounds of redraws")
-        return (rows, x, rho) if with_rho else (rows, x)
+        out = (rows, x, rho) if with_rho else (rows, x)
+        return out if temp is None else out + (temp,)
 
     def _kick_labels_temperature(self):
         """Whether the MLE draw conditions each live kick on its effective temperature: temperature_conditioning on,
@@ -9569,14 +9583,42 @@ class Modeller:
         """Each MLE row's effective temperature (energy units per molecule, as energy_config.temperature): a harmonic
         kick of length rho costs about 0.5 kappa rho^2 and a Boltzmann sample has excess d kT / 2, so
         T_eff = kappa rho^2 / d, with kappa = noised_prior.kick_kappa_per_atom x the molecule's atom count (the
-        stiffness grows about linearly with atoms) and d the live coordinates of the row's space group. mol: the rows'
-        molecule batch (one graph per row)."""
-        kits, st = self._physical['kits'], self.row_store
-        sg = st.cond_sg[st.cid[rows].long()].long()
-        d = torch.tensor([float(kits[int(g)].live.sum()) for g in sg.tolist()], dtype=torch.float64)
+        stiffness grows about linearly with atoms) and d the live coordinates of the row's space group (_kick_dof).
+        mol: the rows' molecule batch (one graph per row)."""
         atoms = torch.diff(mol.ptr.cpu()).to(torch.float64)
         kappa = float(self._noised_prior_settings['kick_kappa_per_atom']) * atoms
-        return (kappa * rho * rho / d).to(torch.float32)
+        return (kappa * rho * rho / self._kick_dof(rows)).to(torch.float32)
+
+    def _kick_dof(self, rows):
+        """[n] float64, the live coordinates d of each anchor slot's space group (physical_kick.GroupKit.live)."""
+        kits, st = self._physical['kits'], self.row_store
+        sg = st.cond_sg[st.cid[torch.as_tensor(rows).long().cpu()].long()].long()
+        return torch.tensor([float(kits[int(g)].live.sum()) for g in sg.tolist()], dtype=torch.float64)
+
+    def _kick_kappa(self, rows):
+        """[n] float64, each anchor slot's kick stiffness kappa = noised_prior.kick_kappa_per_atom x the atom count of its
+        condition's template (energy units per molecule per A^2), as _kick_temperature reads it."""
+        st = self.row_store
+        atoms = getattr(self, '_template_atoms', None)
+        if atoms is None or atoms.numel() != int(st.templates.num_graphs):
+            atoms = self._template_atoms = torch.diff(st.templates.ptr.cpu()).to(torch.float64)
+        t = st.tmpl_of[st.cid[torch.as_tensor(rows).long().cpu()].long()].long()
+        return float(self._noised_prior_settings['kick_kappa_per_atom']) * atoms[t]
+
+    def _kick_temperature_range(self):
+        """cfg:noised_prior.live_temperature_range as (T_lo, T_hi) when the MLE draw labels its kicks
+        (_kick_labels_temperature) and the key is set, else None."""
+        rng = (getattr(self, '_noised_prior_settings', None) or {}).get('live_temperature_range')
+        if rng is None or not self._kick_labels_temperature():
+            return None
+        return float(rng[0]), float(rng[1])
+
+    def _draw_kick_temperatures(self, n):
+        """[n] float64 kT values log-uniform over _kick_temperature_range, from the physical kick's own generator, so
+        the global generators are neither read nor advanced."""
+        lo, hi = self._kick_temperature_range()
+        u = torch.rand(int(n), dtype=torch.float64, generator=self._physical['gen'])
+        return torch.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * u)
 
     def _store_replay_rows(self, B):
         """(rows [B], importance weights [B] or None) of the replay draw over on-policy rows: conditions uniform, rows
@@ -9607,7 +9649,12 @@ class Modeller:
                 raise ValueError("buffers.store: the MLE draw is unscored fresh kicks, but this stage's bwd loss reads "
                                  "log R")
             labelled = self._kick_labels_temperature()
-            if labelled:
+            t_first = None
+            if labelled and self._kick_temperature_range() is not None:
+                # noised_prior.live_temperature_range: each row's temperature first, then a Gaussian kick at it
+                rows, x, rho, t_first = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']),
+                                                         with_rho=True, temperature=self._draw_kick_temperatures(B))
+            elif labelled:
                 rows, x, rho = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']), with_rho=True)
             else:
                 rows, x = self._kick_fresh(st.draw_anchors(B, by=self._store_cfg['mle_draw']))
@@ -9629,13 +9676,18 @@ class Modeller:
         temps = self._stage_temperatures() if kind != 'mle' else None
         if temps is not None:
             temperature = self._draw_temperatures(temps, int(rows.numel())).repeat_interleave(R).to(dev)
-        if kind == 'mle' and labelled:   # each kicked row conditions on its own effective temperature
-            t_eff = self._kick_temperature(rows, rho, st.mol_batch(st.cid[rows]))
+        if kind == 'mle' and labelled:   # each kicked row conditions on its own (drawn or effective) temperature
+            t_eff = (self._kick_temperature(rows, rho, st.mol_batch(st.cid[rows])) if t_first is None
+                     else t_first.to(torch.float32))
             if not getattr(self, '_kick_temperature_shown', False):
-                q = torch.quantile(t_eff.double(), torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)).tolist()
-                print(f"MLE kick temperatures (first draw, {t_eff.numel()} rows): P10 {q[0]:.3g}, median {q[1]:.3g}, "
-                      f"P90 {q[2]:.3g} (energy_config.temperature {float(self.args.energy_config.temperature):g})",
-                      flush=True)
+                qs = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)
+                q, r = torch.quantile(t_eff.double(), qs).tolist(), torch.quantile(rho.double(), qs).tolist()
+                how = ('drawn log-uniform over noised_prior.live_temperature_range, each kicked at its own'
+                       if t_first is not None else 'effective, from the kick lengths')
+                print(f"MLE kick temperatures ({how}; first draw, {t_eff.numel()} rows): P10 {q[0]:.3g}, median "
+                      f"{q[1]:.3g}, P90 {q[2]:.3g} (energy_config.temperature "
+                      f"{float(self.args.energy_config.temperature):g}); kick lengths P10 {r[0]:.3g}, median "
+                      f"{r[1]:.3g}, P90 {r[2]:.3g} A", flush=True)
                 self._kick_temperature_shown = True
             temperature = t_eff.repeat_interleave(R).to(dev)
         mol, log_T, condition, cid = ef.condition_samples(mol, temperature=temperature, repeats=R,
@@ -12020,6 +12072,7 @@ class Modeller:
                         out[f'{key}_ref'] = float(ref[ok_ref].mean())
                 out[f'{key}_nonfinite_frac'] = float((~ok).float().mean())
             out.update(self._kernel_readouts(n_rows, chunk))
+            out.update(self._boltzmann_slope_readouts(chunk))
         finally:
             policy.train(was_training)
         out.update(generalisation_gaps(out, self._fresh_gap_source()))
@@ -12028,6 +12081,120 @@ class Modeller:
                   ('mle', 'mle_heldout_rows', 'mle_anchors', 'mle_mol_crystals', 'mle_kernel', 'mle_kernel_heldout',
                    'mle_bank', '_ref', '_gap', '_frame_spread', '_frame_shift', '_frame_mean', '_frame_p90', '_mirror_shift'))),
               flush=True)
+        return out
+
+    #: the Boltzmann-slope readout (_boltzmann_slope_readouts): its panel's conditions, the stored rows it keeps per
+    #: condition, the fewest rows at or below the energy clip a condition needs to enter, and the temperatures it reads
+    #: at, as multiples of energy_config.temperature
+    BOLTZMANN_PANEL_CONDITIONS = 64
+    BOLTZMANN_PANEL_ROWS = 64
+    BOLTZMANN_PANEL_MIN_ROWS = 8
+    BOLTZMANN_T_FACTORS = (1.0, 2.0, 4.0)
+
+    @staticmethod
+    def _within_condition_slope(y, u, cid):
+        """(slope, r2) of the pooled within-condition least-squares line of y on u: both centred on their condition's
+        means, slope = sum(y~ u~) / sum(u~^2) and r2 = 1 - sum((y~ - slope u~)^2) / sum(y~^2). Rows with a non-finite y
+        or u are left out; (nan, nan) when no spread in u is left, r2 nan when none in y."""
+        y = torch.as_tensor(y).detach().double().flatten().cpu()
+        u = torch.as_tensor(u).detach().double().flatten().cpu()
+        cid = torch.as_tensor(cid).long().flatten().cpu()
+        ok = torch.isfinite(y) & torch.isfinite(u)
+        y, u, cid = y[ok], u[ok], cid[ok]
+        nan = float('nan')
+        if y.numel() < 2:
+            return nan, nan
+        g = torch.unique(cid, return_inverse=True)[1]
+        n = torch.bincount(g).double()
+        yt = y - (torch.zeros(n.numel(), dtype=torch.float64).index_add_(0, g, y) / n)[g]
+        ut = u - (torch.zeros(n.numel(), dtype=torch.float64).index_add_(0, g, u) / n)[g]
+        suu, syy = float((ut * ut).sum()), float((yt * yt).sum())
+        if not suu > 0:
+            return nan, nan
+        b = float((yt * ut).sum()) / suu
+        return b, (1.0 - float(((yt - b * ut) ** 2).sum()) / syy) if syy > 0 else nan
+
+    def _boltzmann_slope_panel(self):
+        """The fixed panel _boltzmann_slope_readouts reads, built at its first call and kept (False when no condition
+        qualifies): dict(x [n, d], cid [n], u [n], j [n]) of up to BOLTZMANN_PANEL_ROWS stored anchors and children in
+        each of up to BOLTZMANN_PANEL_CONDITIONS conditions (drawn with seed + 11) that hold at least
+        BOLTZMANN_PANEL_MIN_ROWS of them at or below the energy clip. j is the FD chart's log reference density of the
+        row (MolecularCrystal.fd_rows_to_params, no energy call) and u = -T_run (log R - j) the energy its stored log R
+        reads (energy units): exact where the clip is the identity and the validity penalties (bounding, reduction)
+        vanish, as they do on canonical in-box chart rows."""
+        st, ef = self.row_store, self.energy_function
+        T = float(self.args.energy_config.temperature)
+        hw = st.high_water
+        kind = st.kind[:hw]
+        live = torch.nonzero((kind == crystal_store.ANCHOR) | (kind == crystal_store.CHILD)).flatten()
+        cid_live = st.cid[live].long()
+        counts = torch.bincount(cid_live, minlength=int(st.n_cond))
+        cand = torch.nonzero(counts >= self.BOLTZMANN_PANEL_MIN_ROWS).flatten()
+        g = torch.Generator().manual_seed(int(self.args.seed) + 11)
+        # twice the conditions wanted, since the clip can take some below the floor
+        chosen = cand[torch.randperm(cand.numel(), generator=g)[:2 * self.BOLTZMANN_PANEL_CONDITIONS]]
+        rows = live[torch.isin(cid_live, chosen)]
+        if not rows.numel():
+            return False
+        x, cid = st.x[rows].float(), st.cid[rows].long()
+        mol = st.mol_batch(cid)
+        j = ef.fd_rows_to_params(x, mol)[2].detach().double().cpu()
+        u = -T * (st.log_r[rows].double() - j)
+        clip = getattr(ef, 'energy_clip', None)
+        ok = torch.isfinite(u) & torch.isfinite(j) & (u <= float(clip) if clip is not None else True)
+        keep = []
+        for c in chosen.tolist():
+            at = torch.nonzero(ok & (cid == c)).flatten()
+            if at.numel() < self.BOLTZMANN_PANEL_MIN_ROWS:
+                continue
+            keep.append(at[torch.randperm(at.numel(), generator=g)[:self.BOLTZMANN_PANEL_ROWS]].sort().values)
+            if len(keep) == self.BOLTZMANN_PANEL_CONDITIONS:
+                break
+        if not keep:
+            return False
+        at = torch.cat(keep)
+        return dict(x=x[at].clone(), cid=cid[at].clone(), u=u[at].clone(), j=j[at].clone())
+
+    @torch.no_grad()
+    def _boltzmann_slope_readouts(self, chunk):
+        """Under temperature_conditioning on the store route (FD chart, a policy with an exact density): how Boltzmann
+        the policy's temperature input is, on the fixed panel of stored crystals of _boltzmann_slope_panel, with no draw
+        and no energy call. At each T = f x energy_config.temperature (f in BOLTZMANN_T_FACTORS) it evaluates
+        log q(x | c, T), the condition built with T as condition_samples builds it, and fits y = log q - j on u within
+        each condition (_within_condition_slope). A Boltzmann density at T has slope -1 / T, so
+        eval_T/boltzmann_slope@T = -slope x T reads 1 for one (0 for a density blind to the energy), and
+        eval_T/boltzmann_r2@T is the share of y's within-condition variance the line explains. Empty off that route or
+        without a panel; prints one line."""
+        ef, policy, st = self.energy_function, self.gfn_model, getattr(self, 'row_store', None)
+        if (st is None or not getattr(ef, 'temperature_conditioning', False) or not hasattr(policy, 'log_density')
+                or getattr(ef, 'crystal_coordinates', None) != 'fd'):
+            return {}
+        panel = getattr(self, '_boltzmann_panel', None)
+        if panel is None:
+            panel = self._boltzmann_panel = self._boltzmann_slope_panel()
+        if panel is False:
+            return {}
+        T_run = float(self.args.energy_config.temperature)
+        out, line = {}, []
+        n = int(panel['cid'].numel())
+        for f in self.BOLTZMANN_T_FACTORS:
+            T = f * T_run
+            log_q = []
+            for i in range(0, n, chunk):
+                cid = panel['cid'][i:i + chunk]
+                mol = st.mol_batch(cid).to(self.device)
+                mol, _, condition, _ = ef.condition_samples(
+                    mol, temperature=torch.full((int(cid.numel()),), T, device=self.device),
+                    sg_inds=mol.sg_ind.reshape(-1).long(), z_primes=mol.z_prime.reshape(-1).long())
+                x = panel['x'][i:i + chunk].to(self.device)
+                log_q.append(policy.log_density(x, condition, mol).double().flatten().cpu())
+            slope, r2 = self._within_condition_slope(torch.cat(log_q) - panel['j'], panel['u'], panel['cid'])
+            out[f'eval_T/boltzmann_slope@{T:g}'] = -slope * T
+            out[f'eval_T/boltzmann_r2@{T:g}'] = r2
+            line.append(f"T {T:g}: -slope x T {-slope * T:.3f} (r2 {r2:.2f})")
+        print(f"Boltzmann slope readout at step {int(getattr(self, 'step_ind', 0))} ({n} stored rows over "
+              f"{int(torch.unique(panel['cid']).numel())} conditions; 1 = Boltzmann at T, 0 = blind to the energy): "
+              + '; '.join(line), flush=True)
         return out
 
     #: the fixed yardstick of the kernel readouts: draws of each basin's thermal ellipsoid at the run's temperature

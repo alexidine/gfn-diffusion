@@ -43,7 +43,7 @@ CHECK_ROWS = 512
 DEFAULTS = dict(window_kT=6.0, packing_window=None, train_kinds=('child',), check_rows=CHECK_ROWS,
                 live_kernel=None, live_tau=1.0, live_width_cap=0.25, live_caps=(1.0, 0.2, 0.1, 0.5), live_redraws=4,
                 live_bank=64, live_fresh_frac=0.1, live_shape='hessian', window_by='row', live_log_range=None,
-                kick_kappa_per_atom=None, train_molecules=None)
+                kick_kappa_per_atom=None, train_molecules=None, live_temperature_range=None)
 #: train_molecules: on the store route, the number of molecules_path molecules the run trains on, the N with the lowest
 #: (molecule_u, identifier) (data_processing/molecule_subset.py::lowest_molecules; train.py::
 #: Modeller.subset_training_molecules), with every prior row of them in both splits (molecule_rows, cut_masks). null =
@@ -55,6 +55,11 @@ WINDOW_BY = ('row', 'parent')
 #: kick_kappa_per_atom: kick stiffness per atom (energy units per molecule per A^2) that labels each live physical
 #: kick with an effective temperature T_eff = kappa_per_atom x atoms x rho^2 / d (train.py::Modeller._kick_temperature),
 #: the condition the MLE draw passes under temperature_conditioning. null = no labels
+#: live_temperature_range: [T_lo, T_hi] (kT, energy units, as energy_config.temperature): the MLE draw takes each row's
+#: temperature first, log-uniform over the range, and then its live physical kick as a Gaussian step of variance
+#: T / kappa per live coordinate (kappa = kick_kappa_per_atom x atoms), so rho^2 = (T / kappa) chi^2_d and the row's
+#: label is the drawn T (train.py::Modeller._kick_fresh). null = the kick length first, log-uniform over
+#: live_log_range, labelled T_eff (above). Store growth kicks read live_log_range either way
 #: live_kernel: the Gaussian the MLE draw adds to each drawn row (train.py::Modeller._live_kernel_draw); 'metric'
 #: redraws the prior's own build kick (metric_kick at the manifest's log_lo, log_hi) around each drawn row; 'chart' is
 #: arithmetic on the stored chart point of the drawn row's parent anchor (chart_kick), with no canonicalisation;
@@ -165,6 +170,12 @@ def settings(args):
     v = s['kick_kappa_per_atom']
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0):
         raise ValueError(f"noised_prior.kick_kappa_per_atom must be a finite number > 0 or null, got {v!r}")
+    v = s['live_temperature_range']
+    if v is not None and (not isinstance(v, (list, tuple)) or len(v) != 2 or any(
+            isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or t <= 0 for t in v)
+            or v[0] > v[1]):
+        raise ValueError(f"noised_prior.live_temperature_range must be [T_lo, T_hi] with 0 < T_lo <= T_hi, or null, "
+                         f"got {v!r}")
     v = s['train_molecules']
     if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
         raise ValueError(f"noised_prior.train_molecules must be an integer >= 1 or null, got {v!r}")

@@ -1,0 +1,97 @@
+"""The Boltzmann-slope readout (train.py Modeller._within_condition_slope, _boltzmann_slope_panel,
+_boltzmann_slope_readouts): under temperature_conditioning, log q(x | c, T) of a fixed panel of stored crystals regressed
+on their energy within each condition, at T = 1, 2 and 4 x the run's temperature. What each test would catch:
+
+  * a slope that reads per-condition offsets, or rows with a non-finite value;
+  * a readout that is not 1 for a Boltzmann density at each T, or not 0 for one blind to the energy;
+  * the condition built at another temperature than the one read, or the chart's log reference left in the regression;
+  * the readout running off its route, or a panel that moves between evaluations.
+
+CPU, a store-stub Modeller and a stub policy; no energy computed.
+
+    python -m pytest -q tests/crystal/test_boltzmann_slope.py
+"""
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from energy_sampling.tests.crystal import store_stub as S
+from energy_sampling.train import Modeller
+
+pytestmark = pytest.mark.fast
+
+
+def test_the_slope_is_pooled_within_conditions():
+    g = torch.Generator().manual_seed(0)
+    cid = torch.arange(6).repeat_interleave(50)
+    u = torch.rand(300, generator=g, dtype=torch.float64) * 20
+    y = -u / 2.5 + 100.0 * cid + 0.01 * torch.randn(300, generator=g, dtype=torch.float64)
+    y[3] = float('nan')
+    b, r2 = Modeller._within_condition_slope(y, u, cid)
+    assert abs(b + 1 / 2.5) < 1e-3 and r2 > 0.999
+    assert all(math.isnan(v) for v in Modeller._within_condition_slope(y, torch.ones(300), cid))
+
+
+def _modeller(blind=False, ref=0.0):
+    m = S.build()
+    m.energy_function.temperature_conditioning = True
+    m.energy_function.crystal_coordinates = 'fd'
+    m.energy_function.fd_rows_to_params = lambda x, mol: (None, None, torch.full((x.shape[0],), float(ref)))
+    m.BOLTZMANN_PANEL_MIN_ROWS = 2
+    orig = m.energy_function.condition_samples
+
+    def condition_samples(mol, temperature=None, **kw):
+        mol, log_T, cond, cid = orig(mol, temperature=temperature, **kw)
+        return mol, log_T, torch.cat([cond, temperature.reshape(-1, 1).float()], 1), cid
+    m.energy_function.condition_samples = condition_samples
+    T_run = float(m.args.energy_config.temperature)
+
+    def log_density(x, condition, mol):
+        """Boltzmann at the condition's T in the stub's energy u = T_run (|x|^2 + cid / 10) plus the reference; or blind."""
+        if blind:
+            return torch.zeros(x.shape[0])
+        u = T_run * ((x.double() ** 2).sum(-1) + mol.condition_id.double() / 10)
+        return (-u / condition[:, -1].double() + ref).float()
+    m.gfn_model = SimpleNamespace(log_density=log_density)
+    return m
+
+
+def test_a_boltzmann_density_reads_one_at_every_temperature(capsys):
+    m = _modeller(ref=0.7)
+    out = m._boltzmann_slope_readouts(chunk=5)
+    T = float(m.args.energy_config.temperature)
+    for f in Modeller.BOLTZMANN_T_FACTORS:
+        assert abs(out[f'eval_T/boltzmann_slope@{f * T:g}'] - 1.0) < 1e-4
+        assert out[f'eval_T/boltzmann_r2@{f * T:g}'] > 0.9999
+    assert 'Boltzmann slope readout' in capsys.readouterr().out
+
+
+def test_a_density_blind_to_the_energy_reads_zero():
+    m = _modeller(blind=True)
+    out = m._boltzmann_slope_readouts(chunk=64)
+    assert all(abs(v) < 1e-9 for k, v in out.items() if 'slope' in k)
+
+
+def test_the_panel_is_fixed_between_evaluations():
+    m = _modeller()
+    m._boltzmann_slope_readouts(chunk=64)
+    first = {k: v.clone() for k, v in m._boltzmann_panel.items()}
+    m.row_store.log_r[:] = 0.0                                   # the store moves; the panel does not
+    m._boltzmann_slope_readouts(chunk=64)
+    assert all(torch.equal(first[k], m._boltzmann_panel[k]) for k in first)
+
+
+@pytest.mark.parametrize('what', ['tcond', 'chart', 'density', 'store'])
+def test_off_its_route_the_readout_is_empty(what):
+    m = _modeller()
+    if what == 'tcond':
+        m.energy_function.temperature_conditioning = False
+    elif what == 'chart':
+        m.energy_function.crystal_coordinates = 'latent'
+    elif what == 'density':
+        m.gfn_model = SimpleNamespace()
+    else:
+        m.row_store = None
+    assert m._boltzmann_slope_readouts(chunk=64) == {}

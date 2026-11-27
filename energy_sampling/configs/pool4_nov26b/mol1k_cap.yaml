@@ -34,11 +34,11 @@ noised_prior:
   live_fresh_frac: 0.0
   live_shape: hessian
   kick_kappa_per_atom: null
+  train_molecules: 1000
   live_log_range:
   - -2.0
   - -0.375
   window_by: row
-  train_molecules: 1000
 harvest:
   enabled: false
   min_abs_resid: 1.0
