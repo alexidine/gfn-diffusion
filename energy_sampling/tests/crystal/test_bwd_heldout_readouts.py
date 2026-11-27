@@ -136,10 +136,14 @@ def test_absent_without_heldout_rows():
     assert m.gfn_model.seen == []
 
 
-def test_an_oom_that_never_shrinks_the_draw_is_bounded():
-    m = _modeller(fail=RuntimeError('CUDA out of memory. Tried to allocate'), step_ind=0)
+@pytest.mark.parametrize('step_ind', [0, 5])
+def test_an_oom_that_never_fits_drops_the_readout_at_a_draw_of_1(step_ind):
+    """each OOM halves the eval draw (16 8 4 2 1); at 1 the first set is dropped, and the second set, starting at the
+    draw of 1 the first left, drops on its first OOM. Step 0 as any other: the draw shrinks there too"""
+    m = _modeller(fail=RuntimeError('CUDA out of memory. Tried to allocate'), step_ind=step_ind)
     assert m.bwd_heldout_readouts(None) == {}
-    assert m.batch_oom_events == 2 * (Modeller.BWD_READOUT_MAX_RETRIES + 1)     # each set gave up after its bound
+    assert m.batch_oom_events == 5 + 1
+    assert m.eval_draw_size() == 1 and m.batch_size == 16                     # the train batch is untouched
 
 
 def test_a_non_oom_error_is_raised():

@@ -160,6 +160,11 @@ class FrozenTrainingState(RuntimeError):
     exception."""
 
 
+class EvalDrawFloor(RuntimeError):
+    """An eval loop ran out of memory at an eval draw of 1 (Modeller._cut_eval_draw): it cannot shrink further. Fatal
+    for the evaluation itself; an optional readout (bwd_heldout_readouts) catches it and drops its set instead."""
+
+
 def _runs_grouped_vargrad(args, branch_coeffs) -> bool:
     """Does a grouped-variance objective read THIS branch's condition groups?
 
@@ -10467,6 +10472,9 @@ class Modeller:
         # what the controller did about it. Which of the two it was is recoverable from
         # whether batch/oom_ceiling moved on the same step.
         self.batch_oom_events = getattr(self, 'batch_oom_events', 0) + 1
+        if step_type not in TRAIN_MODES:   # FIRST, before any early return: see _cut_eval_draw
+            return self._cut_eval_draw(step_type)
+        # step 0 (train steps only now): the train loop moves on to step 1, where the next OOM cuts
         if self.step_ind == 0:
             gc.collect()
             if torch.cuda.is_available():
@@ -10531,46 +10539,66 @@ class Modeller:
             if self.batch_size <= 1:
                 raise RuntimeError("Cascading OOM Failure")
             print(f"Reducing batch size to {self.batch_size}")
-        else:
-            # THE CUT IS TRAIN-ONLY TOO, not just the ceiling. Withholding the
-            # ceiling but still cutting left the training batch hostage to an
-            # allocation it has no relationship with: on the MLIP routes
-            # train_prior makes NO energy call, so MLE can hold thousands of
-            # samples, while eval scores eval_num_samples through the MLIP every
-            # eval_period steps. Measured on p4_mace_mle (2026-08-21): the ladder
-            # climbed 25 -> 400, an eval overflowed, the TRAIN batch was cut to
-            # 156, and the cycle repeated for 11 OOM events in 2 h -- the batch
-            # oscillating against a peak that training never produces.
-            #
-            # The existing justification for cutting was that eval OOMs are
-            # self-limiting because their own loops cut and retry. That is the
-            # reason the cut is unnecessary, not the reason it is safe: the retry
-            # already bounds the eval allocation, so the training batch buys
-            # nothing by shrinking and pays the whole MLE throughput for it.
-            # EVAL SHRINKS ITS OWN DRAW, NOT THE TRAIN BATCH.
-            #
-            # The train batch must not be hostage to an allocation training never
-            # makes: on the MLIP routes train_prior calls no energy function at
-            # all, so MLE can hold thousands while eval scores eval_num_samples
-            # through the MLIP. Cutting the train batch on an eval overflow made
-            # the two compete -- p4_mace_mle (2026-08-21) sawtoothed 25 -> 400 ->
-            # 156 for 11 OOM events in two hours.
-            #
-            # BUT THE CUT CANNOT SIMPLY BE DROPPED. Every eval retry loop
-            # (bwd_eval_sampling, fwd_eval_sampling, anchor_refresh) draws at
-            # `eval_draw_size()` and retries on OOM; the ONLY thing that makes the
-            # retry smaller is this branch. Removing the cut without giving eval
-            # its own size spun those loops forever at an unchanged size -- a
-            # 100%-GPU hang with no further logging, which is what the first
-            # attempt at this shipped and cost eight GPU-hours.
-            cur = self.eval_draw_size()
-            self.eval_batch_cap = max(1, int(cur * self.args.oom_batch_shrink_factor))
-            if cur <= 1:
-                raise RuntimeError(
-                    f"OOM in '{step_type}' at an eval draw of 1 -- the eval loop "
-                    f"cannot shrink further and would spin here forever")
-            print(f"OOM during '{step_type}': eval draw {cur} -> "
-                  f"{self.eval_batch_cap}; train batch stays {self.batch_size}")
+
+    def _cut_eval_draw(self, step_type):
+        """An OOM in an eval loop (eval_fwd, eval_bwd, anchor_refresh, or any step type outside TRAIN_MODES). Every eval
+        loop retries IN PLACE at eval_draw_size(), so termination rests on this method alone: each call either cuts
+        the eval draw to a strictly smaller size or raises at a draw of 1 -- a strictly falling positive integer, so a
+        retry loop ends after at most log(draw)/log(1/oom_batch_shrink_factor) + 1 OOMs. It runs before any early return
+        in handle_train_epoch_error: a step-0 bail there once skipped the cut, and a weights-only TB start (which
+        evaluates at step 0) spun its first eval at one draw size for hours (acr_nov25 tb_* arms, 2026-11-27)."""
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=True)
+        self.fused_accum_count = 0  # wiped along with the gradients above
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        # THE CUT IS TRAIN-ONLY TOO, not just the ceiling. Withholding the
+        # ceiling but still cutting left the training batch hostage to an
+        # allocation it has no relationship with: on the MLIP routes
+        # train_prior makes NO energy call, so MLE can hold thousands of
+        # samples, while eval scores eval_num_samples through the MLIP every
+        # eval_period steps. Measured on p4_mace_mle (2026-08-21): the ladder
+        # climbed 25 -> 400, an eval overflowed, the TRAIN batch was cut to
+        # 156, and the cycle repeated for 11 OOM events in 2 h -- the batch
+        # oscillating against a peak that training never produces.
+        #
+        # The existing justification for cutting was that eval OOMs are
+        # self-limiting because their own loops cut and retry. That is the
+        # reason the cut is unnecessary, not the reason it is safe: the retry
+        # already bounds the eval allocation, so the training batch buys
+        # nothing by shrinking and pays the whole MLE throughput for it.
+        # EVAL SHRINKS ITS OWN DRAW, NOT THE TRAIN BATCH.
+        #
+        # The train batch must not be hostage to an allocation training never
+        # makes: on the MLIP routes train_prior calls no energy function at
+        # all, so MLE can hold thousands while eval scores eval_num_samples
+        # through the MLIP. Cutting the train batch on an eval overflow made
+        # the two compete -- p4_mace_mle (2026-08-21) sawtoothed 25 -> 400 ->
+        # 156 for 11 OOM events in two hours.
+        #
+        # BUT THE CUT CANNOT SIMPLY BE DROPPED. Every eval retry loop
+        # (bwd_eval_sampling, fwd_eval_sampling, anchor_refresh) draws at
+        # `eval_draw_size()` and retries on OOM; the ONLY thing that makes the
+        # retry smaller is this branch. Removing the cut without giving eval
+        # its own size spun those loops forever at an unchanged size -- a
+        # 100%-GPU hang with no further logging, which is what the first
+        # attempt at this shipped and cost eight GPU-hours.
+        cur = self.eval_draw_size()
+        self.eval_batch_cap = max(1, int(cur * self.args.oom_batch_shrink_factor))
+        if cur <= 1:
+            raise EvalDrawFloor(
+                f"OOM in '{step_type}' at an eval draw of 1 -- the eval loop "
+                f"cannot shrink further and would spin here forever")
+        print(f"OOM during '{step_type}': eval draw {cur} -> "
+              f"{self.eval_batch_cap}; train batch stays {self.batch_size}")
+        if not self.eval_draw_size() < cur:   # the termination proof above, enforced
+            raise RuntimeError(f"OOM in '{step_type}': the eval draw did not shrink ({cur} -> "
+                               f"{self.eval_draw_size()}); its retry loop would spin forever")
 
     def eval_draw_size(self) -> int:
         """Batch size for EVAL draws, which shrinks independently of training.
@@ -10613,10 +10641,6 @@ class Modeller:
         flow_states, log_pfs, log_pbs, log_flow, gauss_params = self.gfn_model.get_traj_bwd(
             terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
         return mol_batch, condition_id, flow_states, log_pfs, log_pbs, log_flow[:, 0], gauss_params, log_r
-
-    #: OOM retries per set before bwd_heldout_readouts drops that set for the eval (handle_train_epoch_error returns
-    #: without shrinking the eval draw at step 0, so the retry loop needs its own bound)
-    BWD_READOUT_MAX_RETRIES = 8
 
     @torch.no_grad()
     def bwd_heldout_readouts(self, discretizer):
@@ -10670,7 +10694,7 @@ class Modeller:
         out = {}
         for name, batch in sets.items():
             idx = rows[name]
-            deltas, cids, sgs, i, retries = [], [], [], 0, 0
+            deltas, cids, sgs, i = [], [], [], 0
             while i < idx.numel():
                 chunk = max(1, int(self.eval_draw_size()))
                 try:
@@ -10680,11 +10704,10 @@ class Modeller:
                         ok = self._attach_fd_reference(sub).reshape(-1).cpu()   # on this sub-batch only
                     _, cid, _, log_pfs, log_pbs, log_z, _, log_r = self._bwd_eval_draw(sub, discretizer)
                 except (RuntimeError, ValueError) as e:
-                    self.handle_train_epoch_error(e, 'eval_bwd')   # re-raises anything but a CUDA OOM
-                    retries += 1
-                    if retries > self.BWD_READOUT_MAX_RETRIES:
-                        print(f"bwd_heldout_readouts: {name} dropped this eval after {retries - 1} OOM retries",
-                              flush=True)
+                    try:   # re-raises anything but a CUDA OOM; shrinks the eval draw, or raises EvalDrawFloor at 1
+                        self.handle_train_epoch_error(e, 'eval_bwd')
+                    except EvalDrawFloor:
+                        print(f"bwd_heldout_readouts: {name} dropped this eval: OOM at an eval draw of 1", flush=True)
                         deltas = None
                         break
                     continue
