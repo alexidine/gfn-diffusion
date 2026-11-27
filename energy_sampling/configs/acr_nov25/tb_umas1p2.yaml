@@ -33,6 +33,8 @@ noised_prior:
   live_bank: 1024
   live_fresh_frac: 0.0
   live_shape: hessian
+  kick_kappa_per_atom: null
+  train_molecules: null
   live_log_range:
   - -2.0
   - -0.375
@@ -59,6 +61,7 @@ min_lr: 1.0e-08
 max_lr: null
 weight_decay: 0.0001
 use_weight_decay: false
+weight_decay_kind: l2
 progress_gate:
   mode: level
   level_window: 2500
