@@ -1422,6 +1422,23 @@ def test_train_molecules_is_refused_malformed_or_off_the_store_route(canonical):
         assert _fires(cfg, rule, severity=ERROR), bad
 
 
+def test_live_temperature_range_is_refused_malformed_or_off_the_store_route(canonical):
+    """noised_prior.live_temperature_range: null or [T_lo, T_hi] with 0 < T_lo <= T_hi, and a set value only with
+    buffers.store enabled. Full coverage: tests/crystal/test_kick_temperature_first.py."""
+    rule = 'live_temperature_range_is_well_formed'
+    cfg = copy.deepcopy(canonical)
+    assert cfg['noised_prior']['live_temperature_range'] is None and not _fires(cfg, rule)
+    del cfg['noised_prior']['live_temperature_range']
+    assert not _fires(cfg, rule)                                          # absent = null
+    cfg['noised_prior']['live_temperature_range'] = [2.5, 10.0]
+    assert ci.row_store_settings(cfg) is None and _fires(cfg, rule, severity=ERROR)   # store off
+    cfg['buffers']['store'] = {'enabled': True, 'ram_gb': 16}
+    assert not _fires(cfg, rule)
+    for bad in ([10.0, 2.5], [0.0, 10.0], [2.5], 'hot', [True, 10.0]):
+        cfg['noised_prior']['live_temperature_range'] = bad
+        assert _fires(cfg, rule, severity=ERROR), bad
+
+
 def test_a_malformed_heldout_gate_is_an_error(canonical):
     """Full coverage: tests/protocol/test_heldout_gate.py."""
     cfg = copy.deepcopy(canonical)

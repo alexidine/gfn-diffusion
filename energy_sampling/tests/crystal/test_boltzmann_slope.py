@@ -117,3 +117,47 @@ def test_off_its_route_the_readout_is_empty(what):
     else:
         m.row_store = None
     assert m._boltzmann_slope_readouts(chunk=64) == {}
+
+
+def test_a_store_too_sparse_for_a_panel_is_retried_at_the_next_evaluation(capsys):
+    m = _modeller()
+    m.BOLTZMANN_PANEL_MIN_ROWS = 1000                           # no condition qualifies yet
+    assert m._boltzmann_slope_readouts(chunk=64) == {} and m._boltzmann_slope_readouts(chunk=64) == {}
+    assert capsys.readouterr().out.count('off until a condition holds') == 1     # said once, not every eval
+    assert getattr(m, '_boltzmann_panel', None) is None
+    m.BOLTZMANN_PANEL_MIN_ROWS = 2                              # growth brought conditions up to the floor
+    assert any(k.startswith('eval_T/boltzmann_slope@') for k in m._boltzmann_slope_readouts(chunk=64))
+    assert isinstance(m._boltzmann_panel, dict)
+
+
+def test_the_panel_gathers_at_most_spare_x_panel_rows_per_condition(monkeypatch):
+    m = _modeller()
+    m.BOLTZMANN_PANEL_ROWS, m.BOLTZMANN_PANEL_SPARE = 1, 2
+    st, seen = m.row_store, []
+    orig = st.mol_batch
+
+    def mol_batch(cids, repeats=1):
+        seen.append(torch.as_tensor(cids).clone())
+        return orig(cids, repeats)
+    monkeypatch.setattr(st, 'mol_batch', mol_batch)
+    panel = m._boltzmann_slope_panel()
+    assert int(torch.bincount(seen[0]).max()) <= 2              # the template batch before the clip filter
+    assert int(torch.bincount(panel['cid']).max()) <= 1
+
+
+def test_the_panel_rides_the_buffer_sidecar_to_its_own_runs_resume():
+    from energy_sampling.checkpointing import Checkpointer
+    m = _modeller()
+    m._boltzmann_slope_readouts(chunk=64)
+    panel = m._boltzmann_panel
+    mgr = Checkpointer.__new__(Checkpointer)
+    mgr.modeller = SimpleNamespace(_boltzmann_panel=panel, problem_def={'p': 1}, problem_hash='h', run_name='arm',
+                                   step_ind=7)
+    mgr._store_state = lambda name: None
+    mgr._row_store_entry = lambda: None
+    state = Checkpointer.buffer_state(mgr)
+    assert state['boltzmann_panel'] is panel
+    for run_name, kept in (('arm', True), ('other_arm', False)):
+        mgr.modeller = SimpleNamespace(problem_def={'p': 1}, problem_hash='h', run_name=run_name, args=None)
+        mgr.restore_buffers(state, 'sidecar')
+        assert (getattr(mgr.modeller, '_boltzmann_panel', None) is panel) is kept, run_name

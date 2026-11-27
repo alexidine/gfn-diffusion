@@ -1865,6 +1865,28 @@ def train_molecules_is_well_formed(cfg: dict) -> list[Violation]:
     return []
 
 
+def live_temperature_range_is_well_formed(cfg: dict) -> list[Violation]:
+    """noised_prior.live_temperature_range is null or [T_lo, T_hi] with 0 < T_lo <= T_hi (noised_prior.settings raises
+    on any other value), and a set value needs buffers.store enabled: only the store route's MLE draw reads it
+    (train.py::Modeller._kick_temperature_range). row_store_problems judges it against the store's other keys. Absence
+    is judged: an unset key is null."""
+    v = _get(cfg, 'noised_prior.live_temperature_range', None)
+    if v is None:
+        return []
+    if not (isinstance(v, (list, tuple)) and len(v) == 2 and all(_real(t) and t > 0 for t in v) and v[0] <= v[1]):
+        return [Violation(ERROR, 'live_temperature_range_is_well_formed',
+                          f"noised_prior.live_temperature_range {v!r} is not [T_lo, T_hi] with 0 < T_lo <= T_hi, or null")]
+    try:
+        store_on = row_store_settings(cfg) is not None
+    except ValueError:
+        store_on = True      # row_store_is_well_formed reports the block itself
+    if not store_on:
+        return [Violation(ERROR, 'live_temperature_range_is_well_formed',
+                          f"noised_prior.live_temperature_range {list(v)} is read only by the buffers.store route's MLE "
+                          f"draw (a dead key with the store off)")]
+    return []
+
+
 def row_store_is_well_formed(cfg: dict) -> list[Violation]:
     """buffers.store (crystal_store.py) on the raw config: row_store_problems. Modeller.init_row_store raises on the
     ERRORs, since this module only reports at load."""
@@ -3252,6 +3274,7 @@ RULES = (
     row_store_is_well_formed,
     # every route; returns [] when noised_prior.train_molecules is null or absent
     train_molecules_is_well_formed,
+    live_temperature_range_is_well_formed,
     # every route; returns [] when no active stage sets temperatures
     stage_temperatures_are_read,
     # every route but the conformer one; returns [] on energy_function conformer_torsions

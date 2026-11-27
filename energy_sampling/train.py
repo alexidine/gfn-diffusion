@@ -12112,6 +12112,7 @@ class Modeller:
     BOLTZMANN_PANEL_CONDITIONS = 64
     BOLTZMANN_PANEL_ROWS = 64
     BOLTZMANN_PANEL_MIN_ROWS = 8
+    BOLTZMANN_PANEL_SPARE = 8
     BOLTZMANN_T_FACTORS = (1.0, 2.0, 4.0)
 
     @staticmethod
@@ -12138,10 +12139,12 @@ class Modeller:
         return b, (1.0 - float(((yt - b * ut) ** 2).sum()) / syy) if syy > 0 else nan
 
     def _boltzmann_slope_panel(self):
-        """The fixed panel _boltzmann_slope_readouts reads, built at its first call and kept (False when no condition
-        qualifies): dict(x [n, d], cid [n], u [n], j [n]) of up to BOLTZMANN_PANEL_ROWS stored anchors and children in
-        each of up to BOLTZMANN_PANEL_CONDITIONS conditions (drawn with seed + 11) that hold at least
-        BOLTZMANN_PANEL_MIN_ROWS of them at or below the energy clip. j is the FD chart's log reference density of the
+        """The fixed panel _boltzmann_slope_readouts reads (False when no condition qualifies yet): dict(x [n, d],
+        cid [n], u [n], j [n]) of up to BOLTZMANN_PANEL_ROWS stored anchors and children in each of up to
+        BOLTZMANN_PANEL_CONDITIONS conditions (drawn with seed + 11) that hold at least BOLTZMANN_PANEL_MIN_ROWS of them
+        at or below the energy clip, from at most BOLTZMANN_PANEL_SPARE x BOLTZMANN_PANEL_ROWS rows per condition. The
+        readout keeps the first panel it gets, and the buffer sidecar keeps it for the run's own resume
+        (checkpointing.Checkpointer.buffer_state). j is the FD chart's log reference density of the
         row (MolecularCrystal.fd_rows_to_params, no energy call) and u = -T_run (log R - j) the energy its stored log R
         reads (energy units): exact where the clip is the identity and the validity penalties (bounding, reduction)
         vanish, as they do on canonical in-box chart rows."""
@@ -12159,6 +12162,15 @@ class Modeller:
         rows = live[torch.isin(cid_live, chosen)]
         if not rows.numel():
             return False
+        # at most BOLTZMANN_PANEL_SPARE x the panel's rows per condition (random within it) go on to the template batch
+        # and the chart, whatever the store holds per condition
+        c = st.cid[rows].long()
+        o = torch.randperm(rows.numel(), generator=g)
+        o = o[torch.argsort(c[o], stable=True)]
+        cs = c[o]
+        first = torch.searchsorted(cs, cs, right=False)
+        rows = rows[o[(torch.arange(cs.numel()) - first) < self.BOLTZMANN_PANEL_SPARE * self.BOLTZMANN_PANEL_ROWS]]
+        rows = rows.sort().values
         x, cid = st.x[rows].float(), st.cid[rows].long()
         mol = st.mol_batch(cid)
         j = ef.fd_rows_to_params(x, mol)[2].detach().double().cpu()
@@ -12199,9 +12211,15 @@ class Modeller:
             return {}
         panel = getattr(self, '_boltzmann_panel', None)
         if panel is None:
-            panel = self._boltzmann_panel = self._boltzmann_slope_panel()
-        if panel is False:
-            return {}
+            panel = self._boltzmann_slope_panel()
+            if panel is False:   # retried at the next evaluation: growth can bring a condition up to the floor
+                if not getattr(self, '_boltzmann_panel_wait_shown', False):
+                    print(f"Boltzmann slope readout at step {int(getattr(self, 'step_ind', 0))}: off until a "
+                          f"condition holds {self.BOLTZMANN_PANEL_MIN_ROWS} stored anchors and children at or below "
+                          f"the energy clip (retried at every evaluation)", flush=True)
+                    self._boltzmann_panel_wait_shown = True
+                return {}
+            self._boltzmann_panel = panel
         T_run = float(self.args.energy_config.temperature)
         out, line = {}, []
         n = int(panel['cid'].numel())

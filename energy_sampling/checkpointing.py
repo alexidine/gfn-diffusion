@@ -467,6 +467,10 @@ class Checkpointer:
             'anchor_buffer': self._store_state('anchor_buffer'),
             # buffers.store, stamped with what its rows depend on (Modeller._store_stamp)
             'row_store': self._row_store_entry(),
+            # the Boltzmann-slope readout's panel (Modeller._boltzmann_slope_panel), so the run's own resume reads the
+            # same rows; None until it is built
+            'boltzmann_panel': (getattr(m, '_boltzmann_panel', None)
+                                if isinstance(getattr(m, '_boltzmann_panel', None), dict) else None),
         }
 
     def _row_store_entry(self):
@@ -668,6 +672,9 @@ class Checkpointer:
         # parked for Modeller.init_row_store, which runs after the identifier registry and the energy reference exist
         m._row_store_state = state.get('row_store')
         m._row_store_source = (state.get('run_name'), state.get('step_ind'))
+        # the readout keeps reading the panel its own run built; another run builds its own at its first evaluation
+        if state.get('boltzmann_panel') is not None and state.get('run_name') == getattr(m, 'run_name', None):
+            m._boltzmann_panel = state['boltzmann_panel']
         if state.get('anchor_buffer') is not None:
             m.anchor_buffer = anchor_cls.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
             # CONFIG OWNS THE ANCHOR POLICY, the sidecar does not. from_state_dict
